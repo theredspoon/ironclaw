@@ -1157,6 +1157,9 @@ mod tests {
     async fn test_matrix_integration_e2ee_session_restore() {
         use crate::bootstrap::ironclaw_base_dir;
 
+        // Load .env.local for integration test credentials
+        let _ = dotenvy::from_filename(".env.local");
+
         let homeserver = std::env::var("TEST_MATRIX_HOMESERVER")
             .expect("TEST_MATRIX_HOMESERVER required for integration test");
         let access_token = std::env::var("TEST_MATRIX_ACCESS_TOKEN")
@@ -1208,6 +1211,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_matrix_integration_owner_id_mapping() {
+        // Load .env.local for integration test credentials
+        let _ = dotenvy::from_filename(".env.local");
+
         let homeserver = std::env::var("TEST_MATRIX_HOMESERVER")
             .expect("TEST_MATRIX_HOMESERVER required for integration test");
         let access_token = std::env::var("TEST_MATRIX_ACCESS_TOKEN")
@@ -1251,6 +1257,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_matrix_integration_health_check() {
+        // Load .env.local for integration test credentials
+        let _ = dotenvy::from_filename(".env.local");
+
         let homeserver = std::env::var("TEST_MATRIX_HOMESERVER")
             .expect("TEST_MATRIX_HOMESERVER required for integration test");
         let access_token = std::env::var("TEST_MATRIX_ACCESS_TOKEN")
