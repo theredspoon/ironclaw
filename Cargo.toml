@@ -96,6 +96,7 @@ termimad = "0.34"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
+matrix-sdk = { version = "0.7.1", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
 # Cron scheduling for routines
 cron = "0.13"
@@ -231,6 +232,7 @@ integration = []
 html-to-markdown = ["dep:html-to-markdown-rs", "dep:readabilityrs"]
 bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types"]
 import = ["dep:json5", "libsql"]
+channel-matrix = ["dep:matrix-sdk"]
 
 [[test]]
 name = "e2e_thread_scheduling"

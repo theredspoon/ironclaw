@@ -30,6 +30,8 @@
 mod channel;
 mod http;
 mod manager;
+#[cfg(feature = "channel-matrix")]
+mod matrix;
 pub mod relay;
 mod repl;
 mod signal;
@@ -43,6 +45,8 @@ pub use channel::{
 };
 pub use http::{HttpChannel, HttpChannelState};
 pub use manager::ChannelManager;
+#[cfg(feature = "channel-matrix")]
+pub use matrix::MatrixChannel;
 pub use repl::ReplChannel;
 pub use signal::SignalChannel;
 pub use web::GatewayChannel;

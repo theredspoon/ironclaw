@@ -128,6 +128,9 @@ pub enum ChannelError {
     #[error("Invalid message format: {0}")]
     InvalidMessage(String),
 
+    #[error("Invalid channel configuration: {0}")]
+    InvalidConfig(String),
+
     #[error("Authentication failed for channel {name}: {reason}")]
     AuthFailed { name: String, reason: String },
 

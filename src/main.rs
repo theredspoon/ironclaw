@@ -488,6 +488,26 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
+    // Add Matrix channel if configured and not CLI-only mode.
+    #[cfg(feature = "channel-matrix")]
+    if !cli.cli_only
+        && let Some(ref matrix_config) = config.channels.matrix
+    {
+        let matrix_channel = ironclaw::channels::MatrixChannel::new(matrix_config.clone())?;
+        channel_names.push("matrix".to_string());
+        channels.add(Box::new(matrix_channel)).await;
+        tracing::debug!(
+            homeserver = %matrix_config.homeserver,
+            room = %matrix_config.room_id,
+            "Matrix channel enabled"
+        );
+        if matrix_config.allowed_users.is_empty() {
+            tracing::warn!(
+                "Matrix channel has empty allowed_users list - ALL messages will be DENIED."
+            );
+        }
+    }
+
     // Add HTTP channel if configured and not CLI-only mode.
     let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
     #[cfg(unix)]
