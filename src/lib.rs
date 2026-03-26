@@ -38,6 +38,9 @@
 //! - **Prompt injection defense** - Sanitize all external data
 //! - **Continuous learning** - Improve estimates from historical data
 
+// Increase recursion limit for matrix-sdk 0.16 compilation
+#![recursion_limit = "512"]
+
 pub mod agent;
 pub mod app;
 pub mod boot_screen;
