@@ -35,6 +35,8 @@ use crate::settings::Settings;
 // Re-export all public types so `crate::config::FooConfig` continues to work.
 pub use self::agent::AgentConfig;
 pub use self::builder::BuilderModeConfig;
+#[cfg(feature = "channel-matrix")]
+pub use self::channels::MatrixConfig;
 pub use self::channels::{
     ChannelsConfig, CliConfig, DEFAULT_GATEWAY_PORT, GatewayConfig, HttpConfig, SignalConfig,
 };
@@ -141,6 +143,8 @@ impl Config {
                 http: None,
                 gateway: None,
                 signal: None,
+                #[cfg(feature = "channel-matrix")]
+                matrix: None,
                 wasm_channels_dir: std::env::temp_dir().join("ironclaw-test-channels"),
                 wasm_channels_enabled: false,
                 wasm_channel_owner_ids: HashMap::new(),

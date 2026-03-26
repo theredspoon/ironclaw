@@ -16,6 +16,8 @@ pub struct ChannelsConfig {
     pub http: Option<HttpConfig>,
     pub gateway: Option<GatewayConfig>,
     pub signal: Option<SignalConfig>,
+    #[cfg(feature = "channel-matrix")]
+    pub matrix: Option<MatrixConfig>,
     /// Directory containing WASM channel modules (default: ~/.ironclaw/channels/).
     pub wasm_channels_dir: std::path::PathBuf,
     /// Whether WASM channels are enabled.
@@ -66,6 +68,24 @@ pub struct UserTokenConfig {
     pub user_id: String,
     #[serde(default)]
     pub workspace_read_scopes: Vec<String>,
+}
+
+/// Matrix channel configuration (matrix-sdk E2EE).
+#[cfg(feature = "channel-matrix")]
+#[derive(Debug, Clone)]
+pub struct MatrixConfig {
+    /// Homeserver URL (e.g., `https://matrix.example.com`).
+    pub homeserver: String,
+    /// Access token for authentication.
+    pub access_token: String,
+    /// Room ID or alias (e.g., `#room:server` or `!abc123:server`).
+    pub room_id: String,
+    /// Comma-separated list of allowed Matrix user IDs (e.g., `@user:server`).
+    pub allowed_users: Vec<String>,
+    /// Optional session owner hint for E2EE session restore.
+    pub session_owner: Option<String>,
+    /// Optional device ID hint for E2EE session restore.
+    pub session_device_id: Option<String>,
 }
 
 /// Signal channel configuration (signal-cli daemon HTTP/JSON-RPC).
@@ -325,6 +345,48 @@ impl ChannelsConfig {
             None
         };
 
+        #[cfg(feature = "channel-matrix")]
+        let matrix = {
+            let homeserver = optional_env("MATRIX_HOMESERVER")?;
+            if let Some(homeserver) = homeserver {
+                let access_token =
+                    optional_env("MATRIX_ACCESS_TOKEN")?.ok_or(ConfigError::InvalidValue {
+                        key: "MATRIX_ACCESS_TOKEN".to_string(),
+                        message: "MATRIX_ACCESS_TOKEN is required when MATRIX_HOMESERVER is set"
+                            .to_string(),
+                    })?;
+                let room_id = optional_env("MATRIX_ROOM_ID")?.ok_or(ConfigError::InvalidValue {
+                    key: "MATRIX_ROOM_ID".to_string(),
+                    message: "MATRIX_ROOM_ID is required when MATRIX_HOMESERVER is set".to_string(),
+                })?;
+                let allowed_users = match optional_env("MATRIX_ALLOWED_USERS")? {
+                    None => {
+                        return Err(ConfigError::InvalidValue {
+                            key: "MATRIX_ALLOWED_USERS".to_string(),
+                            message:
+                                "MATRIX_ALLOWED_USERS is required when MATRIX_HOMESERVER is set"
+                                    .to_string(),
+                        });
+                    }
+                    Some(s) => s
+                        .split(',')
+                        .map(|e| e.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                };
+                Some(MatrixConfig {
+                    homeserver,
+                    access_token,
+                    room_id,
+                    allowed_users,
+                    session_owner: optional_env("MATRIX_SESSION_OWNER")?,
+                    session_device_id: optional_env("MATRIX_SESSION_DEVICE_ID")?,
+                })
+            } else {
+                None
+            }
+        };
+
         let cli_enabled = parse_bool_env("CLI_ENABLED", cs.cli_enabled)?;
 
         Ok(Self {
@@ -334,6 +396,8 @@ impl ChannelsConfig {
             http,
             gateway,
             signal,
+            #[cfg(feature = "channel-matrix")]
+            matrix,
             wasm_channels_dir: optional_env("WASM_CHANNELS_DIR")?
                 .map(PathBuf::from)
                 .or_else(|| cs.wasm_channels_dir.clone())
@@ -493,6 +557,8 @@ mod tests {
             http: None,
             gateway: None,
             signal: None,
+            #[cfg(feature = "channel-matrix")]
+            matrix: None,
             wasm_channels_dir: PathBuf::from("/tmp/channels"),
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
@@ -501,6 +567,8 @@ mod tests {
         assert!(cfg.http.is_none());
         assert!(cfg.gateway.is_none());
         assert!(cfg.signal.is_none());
+        #[cfg(feature = "channel-matrix")]
+        assert!(cfg.matrix.is_none());
         assert_eq!(cfg.wasm_channels_dir, PathBuf::from("/tmp/channels"));
         assert!(cfg.wasm_channels_enabled);
         assert!(cfg.wasm_channel_owner_ids.is_empty());
@@ -517,6 +585,8 @@ mod tests {
             http: None,
             gateway: None,
             signal: None,
+            #[cfg(feature = "channel-matrix")]
+            matrix: None,
             wasm_channels_dir: PathBuf::from("/opt/channels"),
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: ids,
