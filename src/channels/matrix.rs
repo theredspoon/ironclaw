@@ -1218,10 +1218,6 @@ mod tests {
         let session_owner = std::env::var("TEST_MATRIX_SESSION_OWNER").ok();
         let session_device_id = std::env::var("TEST_MATRIX_SESSION_DEVICE_ID").ok();
 
-        eprintln!("TEST_MATRIX_HOMESERVER={}", homeserver);
-        eprintln!("TEST_MATRIX_SESSION_OWNER={:?}", session_owner);
-        eprintln!("TEST_MATRIX_SESSION_DEVICE_ID={:?}", session_device_id);
-
         let config = MatrixConfig {
             homeserver,
             access_token,
