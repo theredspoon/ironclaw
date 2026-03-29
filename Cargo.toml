@@ -188,6 +188,7 @@ urlencoding = "2"
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = [
     "rustls-tls",
     "sqlite",
+    "e2e-encryption",
 ] }
 
 # Open URLs in browser
@@ -309,7 +310,7 @@ ironclaw_embeddings = { path = "crates/ironclaw_embeddings", version = "0.1.0", 
 rstest = "0.23"
 
 [features]
-default = ["postgres", "libsql", "html-to-markdown", "tui", "matrix-sdk-channel"]
+default = ["postgres", "libsql", "html-to-markdown", "tui", "matrix-e2ee"]
 postgres = [
     "dep:deadpool-postgres",
     "dep:tokio-postgres",
@@ -358,11 +359,24 @@ pr3180-ready = []
 # PR 7 must enable this feature in its merge commit.
 pr7-ready = []
 
-# matrix-sdk-channel: use the matrix-sdk event loop for the native Matrix
-# channel instead of the raw reqwest poll loop. Required for E2EE (step 2).
-# Enabled by default; disable with --no-default-features if you want the
-# minimal reqwest-only build.
+# matrix-sdk-channel: production Matrix channel implementation. Uses the
+# matrix-sdk event loop instead of the raw reqwest poll loop and is required
+# for E2EE. Enabled by default via matrix-e2ee; it can be enabled alone
+# for SDK-backed plaintext testing.
+#
+# The --no-default-features path intentionally falls back to the minimal raw
+# reqwest poll loop. That mode is a maintainer/downstream escape hatch for
+# dependency-light builds, bisects, or platforms where the matrix-sdk graph is
+# temporarily problematic. It is not the production Matrix canary path.
 matrix-sdk-channel = ["dep:matrix-sdk"]
+# matrix-e2ee: enable end-to-end encryption in the Matrix channel.
+# Requires and implies matrix-sdk-channel. Default on.
+# Disable with --no-default-features only for the minimal non-production build.
+# NOTE: vodozemac has an unpatched identity-element DH vulnerability as of
+# 2026-02-17. The threat model for a personal bot (trusted participants,
+# untrusted homeserver) makes E2EE still strictly better than plaintext.
+# Upgrade matrix-sdk when a patched vodozemac ships.
+matrix-e2ee = ["matrix-sdk-channel"]
 
 [[test]]
 name = "reborn_group_approvals"
