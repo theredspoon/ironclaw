@@ -88,7 +88,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | LINE | ✅ | ❌ | P3 | |
 | WeChat (iLink bot) | ✅ | 🚧 | P2 | Extension-first channel (`channels-src/wechat`), single-account DM flow with QR login, typing, image send/receive, inbound file/voice/video handling, outbound image/video/file media, and SILK-to-WAV voice fallback; multi-account remains deferred |
 | WebChat | ✅ | ✅ | - | Web gateway chat |
-| Matrix | ✅ | ❌ | P3 | E2EE support |
+| Matrix | ✅ | 🚧 | P3 | Native channel (SDK + poll fallback); E2EE via `matrix-e2ee` feature gate; WASM channel also available |
 | Mattermost | ✅ | ❌ | P3 | Emoji reactions, interactive buttons, model picker |
 | Google Chat | ✅ | ❌ | P3 | |
 | MS Teams | ✅ | ❌ | P3 | |
@@ -841,7 +841,7 @@ Trace Commons issuer/TenantCtx note: the server-side `zmanian/tracedao-server` s
 ### P3 - Lower Priority
 
 - ❌ Discord channel
-- ❌ Matrix channel
+- 🚧 Matrix channel (native SDK + poll fallback; E2EE enabled via feature gate; media and rich threading pending)
 - ❌ Other messaging platforms (Yuanbao, WeCom, Google Meet, Voice Call)
 - ❌ TTS/audio features (12+ providers added in OpenClaw; see Section 6 TTS/STT subsection)
 - ❌ Video support (OpenRouter/MiniMax/Veo/fal/Sora)
