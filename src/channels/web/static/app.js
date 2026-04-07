@@ -1000,6 +1000,32 @@ function sendMessage() {
   const content = input.value.trim();
   if (!content && stagedImages.length === 0) return;
 
+  // Intercept approval keywords when an unresolved approval card is pending.
+  // Find the most recent unresolved card (resolved cards linger 1.5s before removal).
+  const approvalCards = Array.from(document.querySelectorAll('.approval-card'));
+  const approvalCard = approvalCards.reverse().find(card => !card.querySelector('.approval-resolved'));
+  if (approvalCard && content) {
+    const lower = content.toLowerCase();
+    let action = null;
+    if (['yes', 'y', 'approve', 'ok', '/approve', '/yes', '/y'].includes(lower)) {
+      action = 'approve';
+    } else if (['always', 'a', 'yes always', 'approve always', '/always', '/a'].includes(lower)) {
+      action = 'always';
+    } else if (['no', 'n', 'deny', 'reject', 'cancel', '/deny', '/no', '/n'].includes(lower)) {
+      action = 'deny';
+    }
+    if (action) {
+      input.value = '';
+      autoResizeTextarea(input);
+      input.focus();
+      const requestId = approvalCard.getAttribute('data-request-id');
+      if (requestId) {
+        sendApprovalAction(requestId, action);
+      }
+      return;
+    }
+  }
+
   const userMsg = addMessage('user', content || '(images attached)');
   input.value = '';
   autoResizeTextarea(input);
