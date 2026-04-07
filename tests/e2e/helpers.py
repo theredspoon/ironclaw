@@ -19,8 +19,6 @@ SEL = {
     # Auth
     "auth_screen": "#auth-screen",
     "token_input": "#token-input",
-    # Connection
-    "sse_status": "#sse-status",
     # Tabs
     "tab_button": '.tab-bar button[data-tab="{tab}"]',
     "tab_panel": "#tab-{tab}",
