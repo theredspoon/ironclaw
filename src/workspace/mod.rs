@@ -86,7 +86,7 @@ use deadpool_postgres::Pool;
 use uuid::Uuid;
 
 use crate::error::WorkspaceError;
-use crate::safety::{Sanitizer, Severity};
+use ironclaw_safety::{Sanitizer, Severity};
 
 /// Files injected into the system prompt. Writes to these are scanned for
 /// prompt injection patterns and rejected if high-severity matches are found.
@@ -2112,7 +2112,7 @@ impl Workspace {
         }
 
         if count > 0 {
-            tracing::info!("Seeded {} workspace files", count);
+            tracing::debug!("Seeded {} workspace files", count);
         }
         Ok(count)
     }
