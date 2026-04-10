@@ -1000,6 +1000,32 @@ function sendMessage() {
   const content = input.value.trim();
   if (!content && stagedImages.length === 0) return;
 
+  // Intercept approval keywords when an unresolved approval card is pending.
+  // Find the most recent unresolved card (resolved cards linger 1.5s before removal).
+  const approvalCards = Array.from(document.querySelectorAll('.approval-card'));
+  const approvalCard = approvalCards.reverse().find(card => !card.querySelector('.approval-resolved'));
+  if (approvalCard && content) {
+    const lower = content.toLowerCase();
+    let action = null;
+    if (['yes', 'y', 'approve', 'ok', '/approve', '/yes', '/y'].includes(lower)) {
+      action = 'approve';
+    } else if (['always', 'a', 'yes always', 'approve always', '/always', '/a'].includes(lower)) {
+      action = 'always';
+    } else if (['no', 'n', 'deny', 'reject', 'cancel', '/deny', '/no', '/n'].includes(lower)) {
+      action = 'deny';
+    }
+    if (action) {
+      input.value = '';
+      autoResizeTextarea(input);
+      input.focus();
+      const requestId = approvalCard.getAttribute('data-request-id');
+      if (requestId) {
+        sendApprovalAction(requestId, action);
+      }
+      return;
+    }
+  }
+
   const userMsg = addMessage('user', content || '(images attached)');
   input.value = '';
   autoResizeTextarea(input);
@@ -6205,7 +6231,8 @@ function renderCatalogSkillCard(entry, installedNames) {
   actions.className = 'ext-actions';
 
   var slug = entry.slug || entry.name;
-  var isInstalled = installedNames[entry.name] || installedNames[slug];
+  var slugSuffix = slug.indexOf('/') >= 0 ? slug.split('/').pop() : slug;
+  var isInstalled = entry.installed || installedNames[entry.name] || installedNames[slug] || installedNames[slugSuffix];
 
   if (isInstalled) {
     var label = document.createElement('span');
@@ -6216,14 +6243,14 @@ function renderCatalogSkillCard(entry, installedNames) {
     var installBtn = document.createElement('button');
     installBtn.className = 'btn-ext install';
     installBtn.textContent = I18n.t('extensions.install');
-    installBtn.addEventListener('click', (function(s, btn) {
+    installBtn.addEventListener('click', (function(displayName, slugValue, btn) {
       return function() {
-        if (!confirm(I18n.t('skills.confirmInstallHub', { name: s }))) return;
+        if (!confirm(I18n.t('skills.confirmInstallHub', { name: displayName }))) return;
         btn.disabled = true;
         btn.textContent = I18n.t('extensions.installing');
-        installSkill(s, null, btn);
+        installSkill(displayName, null, btn, slugValue);
       };
-    })(slug, installBtn));
+    })(entry.name || slug, slug, installBtn));
     actions.appendChild(installBtn);
   }
 
@@ -6252,8 +6279,9 @@ function formatTimeAgo(epochMs) {
   return Math.floor(months / 12) + 'y ago';
 }
 
-function installSkill(nameOrSlug, url, btn) {
-  var body = { name: nameOrSlug, slug: nameOrSlug };
+function installSkill(name, url, btn, slug) {
+  var body = { name: name };
+  if (slug) body.slug = slug;
   if (url) body.url = url;
 
   apiFetch('/api/skills/install', {
@@ -6262,12 +6290,19 @@ function installSkill(nameOrSlug, url, btn) {
     body: body,
   }).then(function(res) {
     if (res.success) {
-      showToast(I18n.t('skills.installedSuccess', {name: nameOrSlug}), 'success');
+      showToast(I18n.t('skills.installedSuccess', {name: name}), 'success');
+      if (btn && btn.parentNode) {
+        var label = document.createElement('span');
+        label.className = 'ext-active-label';
+        label.textContent = I18n.t('status.installed');
+        btn.parentNode.innerHTML = '';
+        btn.parentNode.appendChild(label);
+      }
     } else {
       showToast(I18n.t('extensions.installFailed', { message: res.message || 'unknown error' }), 'error');
     }
     loadSkills();
-    if (btn) { btn.disabled = false; btn.textContent = I18n.t('extensions.install'); }
+    if (btn && !res.success) { btn.disabled = false; btn.textContent = I18n.t('extensions.install'); }
   }).catch(function(err) {
     showToast(I18n.t('extensions.installFailed', { message: err.message }), 'error');
     if (btn) { btn.disabled = false; btn.textContent = I18n.t('extensions.install'); }
