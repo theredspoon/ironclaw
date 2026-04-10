@@ -3897,6 +3897,7 @@ dependencies = [
  "flate2",
  "fs4",
  "futures",
+ "glob",
  "hex",
  "hkdf",
  "hmac",
@@ -3908,6 +3909,7 @@ dependencies = [
  "insta",
  "ironclaw_common",
  "ironclaw_engine",
+ "ironclaw_gateway",
  "ironclaw_safety",
  "ironclaw_skills",
  "ironclaw_tui",
@@ -3976,8 +3978,10 @@ dependencies = [
 name = "ironclaw_common"
 version = "0.1.0"
 dependencies = [
+ "chrono-tz",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -3986,6 +3990,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "cron",
+ "ironclaw_common",
  "ironclaw_skills",
  "monty",
  "pretty_assertions",
@@ -3997,6 +4003,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ironclaw_gateway"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
