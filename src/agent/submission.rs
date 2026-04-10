@@ -529,6 +529,9 @@ pub enum SubmissionResult {
 
     /// Turn was interrupted.
     Interrupted,
+
+    /// Auth flow initiated — config card sent, no text response needed.
+    AuthPending,
 }
 
 impl SubmissionResult {
@@ -550,6 +553,11 @@ impl SubmissionResult {
         Self::Ok {
             message: Some(message.into()),
         }
+    }
+
+    /// Create an auth-pending result (suppresses text response).
+    pub fn auth_pending() -> Self {
+        Self::AuthPending
     }
 
     /// Create an error result.
