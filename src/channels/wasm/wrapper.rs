@@ -972,6 +972,17 @@ impl WasmChannel {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn owner_actor_id_for_test(&self) -> Option<String> {
+        self.owner_actor_id.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn get_config(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        let guard = self.config_json.read().await;
+        serde_json::from_str(&guard).unwrap_or_default()
+    }
+
     /// Attach a message stream for integration tests.
     ///
     /// This primes any startup-persisted workspace state, but tolerates
