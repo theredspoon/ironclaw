@@ -96,6 +96,12 @@ const MAX_DOM_MESSAGES = 200;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 let stagedImages = [];
 let authFlowPending = false;
+// Tracks user messages sent but not yet persisted to DB (#2409).
+// When loadHistory() clears the DOM, pending messages are re-injected
+// so they don't vanish during the safety-pipeline processing window.
+const _pendingUserMessages = new Map(); // threadId -> [{id, content, images, timestamp}]
+const PENDING_MSG_TTL_MS = 60000; // discard after 60s
+let _nextPendingId = 0;
 let _ghostSuggestion = '';
 let currentSettingsSubtab = 'inference';
 let generatedImagesByThread = new Map();
@@ -1345,6 +1351,15 @@ function connectSSE(lastEventIdOverride) {
     // Refresh thread list so new titles appear after first message
     loadThreads();
 
+    // Turn complete — remove oldest pending entry for this thread (#2409).
+    // FIFO is safe here because the agent loop processes one turn at a time
+    // per thread, so the oldest pending entry is the one that just completed.
+    const pending = _pendingUserMessages.get(data.thread_id);
+    if (pending) {
+      pending.shift();
+      if (pending.length === 0) _pendingUserMessages.delete(data.thread_id);
+    }
+
     // Show restart modal if the response indicates restart was initiated
     if (data.content && data.content.toLowerCase().includes('restart initiated')) {
       setTimeout(() => tryShowRestartModal(), 500);
@@ -1808,7 +1823,13 @@ function sendMessage() {
     }
   }
 
+  // Snapshot attached images before the body block clears stagedImages, so the
+  // optimistic display and the pending entry both keep them.
+  const attachedImageDataUrls = stagedImages.map(img => img.dataUrl);
   const userMsg = addMessage('user', content || '(images attached)');
+  if (attachedImageDataUrls.length > 0) {
+    appendImagesToMessage(userMsg, attachedImageDataUrls);
+  }
   pruneOldMessages();
   if (currentThreadId) {
     activeWorkStore.updateThread(currentThreadId, {
@@ -1818,6 +1839,23 @@ function sendMessage() {
   input.value = '';
   autoResizeTextarea(input);
   input.focus();
+
+  // Track as pending so loadHistory() can re-inject if DB hasn't persisted yet (#2409)
+  let pendingId = null;
+  const pendingThreadId = currentThreadId;
+  if (currentThreadId) {
+    const displayContent = content || '(images attached)';
+    if (!_pendingUserMessages.has(currentThreadId)) {
+      _pendingUserMessages.set(currentThreadId, []);
+    }
+    pendingId = _nextPendingId++;
+    _pendingUserMessages.get(currentThreadId).push({
+      id: pendingId,
+      content: displayContent,
+      images: attachedImageDataUrls,
+      timestamp: Date.now(),
+    });
+  }
 
   const body = { content, thread_id: currentThreadId || undefined, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
   if (stagedImages.length > 0) {
@@ -1830,6 +1868,18 @@ function sendMessage() {
     method: 'POST',
     body: body,
   }).catch((err) => {
+    // Remove the pending entry so it won't be re-injected on thread switch (#2498)
+    if (pendingId !== null && pendingThreadId) {
+      const arr = _pendingUserMessages.get(pendingThreadId);
+      if (arr) {
+        const filtered = arr.filter(p => p.id !== pendingId);
+        if (filtered.length > 0) {
+          _pendingUserMessages.set(pendingThreadId, filtered);
+        } else {
+          _pendingUserMessages.delete(pendingThreadId);
+        }
+      }
+    }
     // Handle rate limiting (429)
     if (err.status === 429) {
       showToast(I18n.t('chat.rateLimited'), 'error');
@@ -2560,6 +2610,24 @@ function pruneOldMessages() {
     if (!remaining[i].classList.contains('time-separator')) break;
     remaining[i].remove();
   }
+}
+
+// Append image thumbnails to an existing user message bubble. Used by the
+// optimistic display in sendMessage() and by the pending re-inject path in
+// loadHistory() so attached images stay visible until DB persistence catches
+// up. Reuses the .image-preview class for thumbnail styling.
+function appendImagesToMessage(messageDiv, dataUrls) {
+  if (!messageDiv || !dataUrls || dataUrls.length === 0) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'message-images';
+  for (const dataUrl of dataUrls) {
+    const img = document.createElement('img');
+    img.className = 'image-preview';
+    img.src = dataUrl;
+    img.alt = 'Attached image';
+    wrap.appendChild(img);
+  }
+  messageDiv.appendChild(wrap);
 }
 
 function addMessage(role, content) {
@@ -3732,9 +3800,39 @@ function loadHistory(before) {
           addMessage('assistant', turn.response);
         }
       }
+      // Re-inject pending user messages not yet in DB (#2409)
+      const pending = _pendingUserMessages.get(currentThreadId);
+      let freshPending = [];
+      if (pending && pending.length > 0) {
+        const now = Date.now();
+        freshPending = pending.filter(p => now - p.timestamp < PENDING_MSG_TTL_MS);
+        if (freshPending.length > 0) {
+          const dbContentsCounts = new Map();
+          data.turns
+            .map(t => t.user_input)
+            .filter(Boolean)
+            .forEach(content => {
+              dbContentsCounts.set(content, (dbContentsCounts.get(content) || 0) + 1);
+            });
+          for (const p of freshPending) {
+            const count = dbContentsCounts.get(p.content) || 0;
+            if (count > 0) {
+              dbContentsCounts.set(p.content, count - 1);
+            } else {
+              const div = addMessage('user', p.content);
+              if (p.images && p.images.length > 0) {
+                appendImagesToMessage(div, p.images);
+              }
+            }
+          }
+          _pendingUserMessages.set(currentThreadId, freshPending);
+        } else {
+          _pendingUserMessages.delete(currentThreadId);
+        }
+      }
       container.scrollTop = container.scrollHeight;
       // Show welcome card when history is empty
-      if (data.turns.length === 0) {
+      if (data.turns.length === 0 && freshPending.length === 0) {
         showWelcomeCard();
       }
       // Show processing indicator if the last turn is still in-progress
