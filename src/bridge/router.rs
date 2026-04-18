@@ -122,7 +122,7 @@ async fn resolve_auth_gate_display_name(
             tools,
             &pending.action_name,
             &pending.parameters,
-            credential_name,
+            credential_name.as_str(),
             &pending.user_id,
         )
         .await
@@ -2018,7 +2018,7 @@ pub async fn resolve_gate(
                     state.effect_adapter.tools(),
                     &pending.action_name,
                     &pending.parameters,
-                    credential_name,
+                    credential_name.as_str(),
                     &message.user_id,
                 )
                 .await;
@@ -2135,7 +2135,8 @@ pub async fn resolve_gate(
                         }
                     }
                 } else if let Some(ref ss) = state.secrets_store {
-                    let params = crate::secrets::CreateSecretParams::new(credential_name, &token);
+                    let params =
+                        crate::secrets::CreateSecretParams::new(credential_name.as_str(), &token);
                     ss.create(&message.user_id, params)
                         .await
                         .map_err(|e| engine_err("secrets", e))?;
@@ -3197,7 +3198,9 @@ async fn await_thread_outcome(
                     display_parameters: None,
                     description: format!("Authentication required for '{}'.", cred_name),
                     resume_kind: ironclaw_engine::ResumeKind::Authentication {
-                        credential_name: cred_name.clone(),
+                        credential_name: ironclaw_common::CredentialName::from_trusted(
+                            cred_name.clone(),
+                        ),
                         instructions: setup_hint.clone(),
                         auth_url: None,
                     },
@@ -5211,7 +5214,8 @@ mod tests {
             "alice",
             thread_id,
             ironclaw_engine::ResumeKind::Authentication {
-                credential_name: expected_extension_name.clone(),
+                credential_name: ironclaw_common::CredentialName::new(&expected_extension_name)
+                    .unwrap(),
                 instructions: "Sign in with Google".to_string(),
                 auth_url: Some("https://example.test/oauth".to_string()),
             },
@@ -5368,7 +5372,7 @@ mod tests {
                 "alice",
                 thread_id,
                 ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "github".into(),
+                    credential_name: ironclaw_common::CredentialName::new("github").unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -5604,7 +5608,7 @@ mod tests {
                 "alice",
                 thread_a,
                 ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "github_token".into(),
+                    credential_name: ironclaw_common::CredentialName::new("github_token").unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -5617,7 +5621,7 @@ mod tests {
                 "alice",
                 thread_b,
                 ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "linear_token".into(),
+                    credential_name: ironclaw_common::CredentialName::new("linear_token").unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -5654,7 +5658,7 @@ mod tests {
                 "alice",
                 thread_a,
                 ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "github_token".into(),
+                    credential_name: ironclaw_common::CredentialName::new("github_token").unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -5667,7 +5671,7 @@ mod tests {
                 "alice",
                 thread_b,
                 ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "linear_token".into(),
+                    credential_name: ironclaw_common::CredentialName::new("linear_token").unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -5705,7 +5709,8 @@ mod tests {
                 thread_a,
                 auth_request_id,
                 ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "telegram_bot_token".into(),
+                    credential_name: ironclaw_common::CredentialName::new("telegram_bot_token")
+                        .unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -5757,7 +5762,8 @@ mod tests {
             thread_id,
             request_id,
             ironclaw_engine::ResumeKind::Authentication {
-                credential_name: "telegram_bot_token".into(),
+                credential_name: ironclaw_common::CredentialName::new("telegram_bot_token")
+                    .unwrap(),
                 instructions: "paste token".into(),
                 auth_url: None,
             },
@@ -5794,7 +5800,8 @@ mod tests {
             thread_id,
             request_id,
             ironclaw_engine::ResumeKind::Authentication {
-                credential_name: "telegram_bot_token".into(),
+                credential_name: ironclaw_common::CredentialName::new("telegram_bot_token")
+                    .unwrap(),
                 instructions: "paste token".into(),
                 auth_url: None,
             },
@@ -6222,7 +6229,7 @@ mod tests {
                 action_name: "shell".into(),
                 parameters: serde_json::json!({"cmd": "ls"}),
                 resume_kind: ironclaw_engine::ResumeKind::Authentication {
-                    credential_name: "github_token".into(),
+                    credential_name: ironclaw_common::CredentialName::new("github_token").unwrap(),
                     instructions: "paste token".into(),
                     auth_url: None,
                 },
@@ -6231,7 +6238,8 @@ mod tests {
                     "alice",
                     thread.id,
                     ironclaw_engine::ResumeKind::Authentication {
-                        credential_name: "github_token".into(),
+                        credential_name: ironclaw_common::CredentialName::new("github_token")
+                            .unwrap(),
                         instructions: "paste token".into(),
                         auth_url: None,
                     },
@@ -7070,7 +7078,7 @@ mod tests {
     fn clamp_auth_resume_kind_clamps_to_false() {
         // Auth resumes have no "always" semantics; clamp regardless.
         let rk = ironclaw_engine::ResumeKind::Authentication {
-            credential_name: "github_token".into(),
+            credential_name: ironclaw_common::CredentialName::new("github_token").unwrap(),
             instructions: String::new(),
             auth_url: None,
         };
