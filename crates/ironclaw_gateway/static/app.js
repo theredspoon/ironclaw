@@ -3759,6 +3759,24 @@ function setAuthFlowPending(pending, instructions) {
   }
 }
 
+function isSameInProgressTurn(lastTurn, inProgress) {
+  if (!lastTurn || !inProgress) return false;
+
+  if (lastTurn.user_message_id && inProgress.user_message_id) {
+    return lastTurn.user_message_id === inProgress.user_message_id;
+  }
+
+  if (!lastTurn.user_message_id && !inProgress.user_message_id) {
+    return !lastTurn.response && lastTurn.turn_number === inProgress.turn_number;
+  }
+
+  if (!inProgress.user_message_id && lastTurn.user_input && inProgress.user_input) {
+    return !lastTurn.response && lastTurn.user_input === inProgress.user_input;
+  }
+
+  return false;
+}
+
 function loadHistory(before) {
   clearSuggestionChips();
   let historyUrl = '/api/chat/history?limit=50';
@@ -3845,12 +3863,18 @@ function loadHistory(before) {
       }
       container.scrollTop = container.scrollHeight;
       // Show welcome card when history is empty
-      if (data.turns.length === 0 && freshPending.length === 0) {
+      if (data.turns.length === 0 && !data.in_progress && freshPending.length === 0) {
         showWelcomeCard();
       }
       // Show processing indicator if the last turn is still in-progress
       var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
-      if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
+      if (data.in_progress) {
+        const sameLastTurn = isSameInProgressTurn(lastTurn, data.in_progress);
+        if (!sameLastTurn && data.in_progress.user_input) {
+          addMessage('user', data.in_progress.user_input);
+        }
+        showActivityThinking(ActivityEntry.t('activity.processing', 'Processing...'));
+      } else if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
         showActivityThinking(ActivityEntry.t('activity.processing', 'Processing...'));
       }
       if (data.pending_gate) {
@@ -4139,12 +4163,19 @@ function loadThreads() {
       const el = document.getElementById('assistant-thread');
       const isActive = currentThreadId === assistantThreadId;
       el.className = 'assistant-item' + (isActive ? ' active' : '');
+      el.querySelectorAll('.thread-processing').forEach((node) => node.remove());
       const labelEl = document.getElementById('assistant-label');
       if (labelEl) {
         labelEl.textContent = I18n.t('thread.assistant');
       }
       const meta = document.getElementById('assistant-meta');
       meta.textContent = relativeTime(data.assistant_thread.updated_at);
+      if (data.assistant_thread.state === 'Processing' && !isActive) {
+        const spinner = document.createElement('span');
+        spinner.className = 'thread-processing';
+        spinner.innerHTML = '<div class="spinner"></div>';
+        el.appendChild(spinner);
+      }
     }
 
     // Regular threads
@@ -4185,7 +4216,7 @@ function loadThreads() {
       item.appendChild(meta);
 
       // Processing spinner
-      if (processingThreads.has(thread.id) && !isActive) {
+      if ((thread.state === 'Processing' || processingThreads.has(thread.id)) && !isActive) {
         const spinner = document.createElement('span');
         spinner.className = 'thread-processing';
         spinner.innerHTML = '<div class="spinner"></div>';
@@ -4219,6 +4250,10 @@ function loadThreads() {
         return;
       }
     }
+
+    // Preserve the currently open thread even when it falls outside the
+    // sidebar's recency window. The history view can still load that thread
+    // directly, and follow-up sends must stay attached to it.
 
     // Reopen the server's active thread on first load. This keeps the visible
     // chat attached to an in-flight agent turn after a browser refresh, even
