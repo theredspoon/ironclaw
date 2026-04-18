@@ -4739,49 +4739,6 @@ fn clamp_always_to_resume_kind(always: bool, resume_kind: &ironclaw_engine::Resu
 }
 
 #[cfg(test)]
-mod clamp_tests {
-    use super::clamp_always_to_resume_kind;
-
-    #[test]
-    fn approval_with_allow_always_passes_through() {
-        let rk = ironclaw_engine::ResumeKind::Approval { allow_always: true };
-        assert!(clamp_always_to_resume_kind(true, &rk));
-        assert!(!clamp_always_to_resume_kind(false, &rk));
-    }
-
-    #[test]
-    fn approval_without_allow_always_clamps_to_false() {
-        // Regression: PR #1958 round-4 review — caller-supplied `always: true`
-        // on an `Approval { allow_always: false }` gate (orchestrator self-
-        // modify write) must not install a session-wide auto-approval.
-        let rk = ironclaw_engine::ResumeKind::Approval {
-            allow_always: false,
-        };
-        assert!(!clamp_always_to_resume_kind(true, &rk));
-        assert!(!clamp_always_to_resume_kind(false, &rk));
-    }
-
-    #[test]
-    fn auth_resume_kind_clamps_to_false() {
-        // Auth resumes have no "always" semantics; clamp regardless.
-        let rk = ironclaw_engine::ResumeKind::Authentication {
-            credential_name: "github_token".into(),
-            instructions: String::new(),
-            auth_url: None,
-        };
-        assert!(!clamp_always_to_resume_kind(true, &rk));
-    }
-
-    #[test]
-    fn external_callback_clamps_to_false() {
-        let rk = ironclaw_engine::ResumeKind::External {
-            callback_id: "cb-123".into(),
-        };
-        assert!(!clamp_always_to_resume_kind(true, &rk));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -7089,5 +7046,45 @@ mod tests {
 
         let prior = super::persist_always_allow(&agent, &state, &pending).await;
         assert!(prior.is_none(), "Should return None when no settings_store");
+    }
+
+    // ── clamp_always_to_resume_kind ────────────────────────────────────
+
+    #[test]
+    fn clamp_approval_with_allow_always_passes_through() {
+        let rk = ironclaw_engine::ResumeKind::Approval { allow_always: true };
+        assert!(super::clamp_always_to_resume_kind(true, &rk));
+        assert!(!super::clamp_always_to_resume_kind(false, &rk));
+    }
+
+    #[test]
+    fn clamp_approval_without_allow_always_clamps_to_false() {
+        // Regression: PR #1958 round-4 review — caller-supplied `always: true`
+        // on an `Approval { allow_always: false }` gate (orchestrator self-
+        // modify write) must not install a session-wide auto-approval.
+        let rk = ironclaw_engine::ResumeKind::Approval {
+            allow_always: false,
+        };
+        assert!(!super::clamp_always_to_resume_kind(true, &rk));
+        assert!(!super::clamp_always_to_resume_kind(false, &rk));
+    }
+
+    #[test]
+    fn clamp_auth_resume_kind_clamps_to_false() {
+        // Auth resumes have no "always" semantics; clamp regardless.
+        let rk = ironclaw_engine::ResumeKind::Authentication {
+            credential_name: "github_token".into(),
+            instructions: String::new(),
+            auth_url: None,
+        };
+        assert!(!super::clamp_always_to_resume_kind(true, &rk));
+    }
+
+    #[test]
+    fn clamp_external_callback_clamps_to_false() {
+        let rk = ironclaw_engine::ResumeKind::External {
+            callback_id: "cb-123".into(),
+        };
+        assert!(!super::clamp_always_to_resume_kind(true, &rk));
     }
 }
