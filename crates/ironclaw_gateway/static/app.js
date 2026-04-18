@@ -697,9 +697,15 @@ const STREAM_DEBOUNCE_MS = 50;
 
 // --- Connection Status Banner State ---
 let _connectionLostTimer = null;
-let _connectionLostAt = null;
 let _reconnectAttempts = 0;
 let _lastSseEventId = null;
+// Timestamp of the most recent SSE disconnect (tab hide or onerror). Cleared
+// on successful reconnect. Used to decide whether to reload chat history on
+// reconnect — brief disconnects (<SSE_RELOAD_THRESHOLD_MS) preserve DOM and
+// rely on SSE catch-up + the "Done without response" safety net (#2079);
+// longer ones reload to catch missed events.
+let _sseDisconnectedAt = null;
+const SSE_RELOAD_THRESHOLD_MS = 10000;
 
 // --- Turn Response Tracking State ---
 // Safety net for lost SSE response events (see #2079): tracks whether we
@@ -893,6 +899,7 @@ window.addEventListener('beforeunload', () => {
 // the 3rd tab exhausts the browser's per-origin limit.
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    _sseDisconnectedAt = _sseDisconnectedAt || Date.now();
     cleanupConnectionState();
     if (eventSource) { eventSource.close(); eventSource = null; }
     if (logEventSource) { logEventSource.close(); logEventSource = null; }
@@ -1227,15 +1234,9 @@ function connectSSE(lastEventIdOverride) {
     }
     const lostBanner = document.getElementById('connection-banner');
     if (lostBanner) {
-      const wasDisconnectedLong = _connectionLostAt && (Date.now() - _connectionLostAt > 10000);
       lostBanner.textContent = I18n.t('connection.reconnected');
       lostBanner.className = 'connection-banner connection-banner-success';
       setTimeout(() => { lostBanner.remove(); }, 2000);
-      _connectionLostAt = null;
-      // If disconnected >10s, reload chat history to catch missed messages
-      if (wasDisconnectedLong && currentThreadId) {
-        loadHistory();
-      }
     }
 
     // If we were restarting, close the modal and reset button now that server is back
@@ -1251,8 +1252,16 @@ function connectSSE(lastEventIdOverride) {
 
     if (sseHasConnectedBefore && currentThreadId) {
       finalizeActivityGroup();
-      loadHistory();
+      // Only reload full history if disconnected beyond the threshold. Brief
+      // reconnects (tab visibility change, transient network blip) rely on
+      // SSE catch-up and the "Done without response" safety net (#2079).
+      // Full re-render loses scroll position and disrupts the user.
+      const disconnectMs = _sseDisconnectedAt ? Date.now() - _sseDisconnectedAt : 0;
+      if (disconnectMs > SSE_RELOAD_THRESHOLD_MS) {
+        loadHistory();
+      }
     }
+    _sseDisconnectedAt = null;
     // Clear stale processing state — agents may have finished during disconnect.
     // Refresh sidebar so stale spinners are removed immediately.
     processingThreads.clear();
@@ -1261,6 +1270,7 @@ function connectSSE(lastEventIdOverride) {
   };
 
   eventSource.onerror = () => {
+    _sseDisconnectedAt = _sseDisconnectedAt || Date.now();
     _reconnectAttempts++;
     document.getElementById('sse-dot').classList.add('disconnected');
     var statusEl2 = document.getElementById('sse-status');
@@ -1274,7 +1284,6 @@ function connectSSE(lastEventIdOverride) {
 
     // Start connection-lost banner timer (3s delay)
     if (!_connectionLostTimer && !existingBanner) {
-      _connectionLostAt = _connectionLostAt || Date.now();
       _connectionLostTimer = setTimeout(() => {
         _connectionLostTimer = null;
         // Only show if still disconnected
