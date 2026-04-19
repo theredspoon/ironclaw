@@ -3719,11 +3719,17 @@ async fn forward_event_to_channel(
             }
         }
         EventKind::SkillActivated { skill_names } => {
+            // The v2 engine event doesn't carry feedback notes yet — those
+            // would need to be produced by the Python orchestrator and
+            // threaded through `EventKind::SkillActivated`. The v1 dispatcher
+            // emits its own `StatusUpdate::SkillActivated` directly with
+            // populated feedback (see `agent::dispatcher`).
             let _ = channels
                 .send_status(
                     channel_name,
                     StatusUpdate::SkillActivated {
                         skill_names: skill_names.clone(),
+                        feedback: Vec::new(),
                     },
                     metadata,
                 )
@@ -3834,6 +3840,7 @@ fn thread_event_to_app_events(
         EventKind::SkillActivated { skill_names } => vec![AppEvent::SkillActivated {
             skill_names: skill_names.clone(),
             thread_id: Some(thread_id.into()),
+            feedback: Vec::new(),
         }],
         _ => vec![],
     }
