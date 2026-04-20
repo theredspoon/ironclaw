@@ -5613,7 +5613,7 @@ pub(crate) mod test_support {
 
         let store = Arc::new(ThreadTestStore::new());
         for thread in threads {
-            store.save_thread(&thread).await.expect("seed thread");
+            store.save_thread(&thread).await.expect("seed thread"); // safety: cfg(test) fixture
         }
         let store_dyn: Arc<dyn Store> = store;
 
