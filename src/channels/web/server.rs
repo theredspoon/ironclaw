@@ -1107,7 +1107,7 @@ mod tests {
             .await
             .expect("resolve identity")
             .expect("claimed identity");
-        assert_eq!(identity.owner_id.as_str(), "member-1");
+        assert_eq!(identity.as_str(), "member-1");
         assert!(
             pairing_store
                 .list_pending("telegram")
@@ -1368,7 +1368,10 @@ mod tests {
             .approve(
                 "telegram",
                 &request.code,
-                &crate::ownership::OwnerId::from("member-1"),
+                &crate::ownership::UserId::from_trusted(
+                    "member-1".into(),
+                    crate::ownership::UserRole::Regular,
+                ),
             )
             .await
             .expect("approve pairing");
