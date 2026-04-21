@@ -4603,6 +4603,8 @@ fn thread_event_to_app_events(
 pub struct EngineThreadInfo {
     pub id: String,
     pub goal: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub thread_type: String,
     pub state: String,
     pub project_id: String,
@@ -4849,9 +4851,18 @@ fn describe_cron(expression: &str) -> Option<String> {
 }
 
 fn thread_to_info(t: &ironclaw_engine::Thread) -> EngineThreadInfo {
+    // Fall back to a derived short label from `goal` for legacy threads
+    // persisted before the `title` field existed. Without this, frontend
+    // consumers of `EngineThreadInfo` (TUI, mission detail views) render
+    // a UUID prefix since the DTO lacks `turn_count`.
+    let title = t
+        .title
+        .clone()
+        .or_else(|| ironclaw_engine::Thread::derive_title_from_message(&t.goal));
     EngineThreadInfo {
         id: t.id.to_string(),
         goal: t.goal.clone(),
+        title,
         thread_type: format!("{:?}", t.thread_type),
         state: format!("{:?}", t.state),
         project_id: t.project_id.to_string(),
@@ -9640,5 +9651,61 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn thread_to_info_carries_title_and_goal_separately() {
+        // Regression: mission-spawned threads put `mission.name` in
+        // `title` and the multi-paragraph meta-prompt in `goal`. The
+        // DTO must carry both through so UI callers can render the
+        // short label without reading the full goal.
+        let long_goal = "a".repeat(500);
+        let mut thread = ironclaw_engine::Thread::new(
+            &long_goal,
+            ironclaw_engine::ThreadType::Mission,
+            ironclaw_engine::ProjectId::new(),
+            "user-1",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.title = Some("Daily summary".to_string());
+
+        let info = thread_to_info(&thread);
+        assert_eq!(info.title.as_deref(), Some("Daily summary"));
+        assert_eq!(info.goal.len(), 500);
+    }
+
+    #[test]
+    fn thread_to_info_derives_title_from_goal_when_absent() {
+        // Regression: legacy engine threads persisted before the `title`
+        // field existed deserialize as `title = None`. The DTO must
+        // derive a short label from `goal` so frontend consumers don't
+        // fall through `threadTitle()` to rendering a UUID prefix.
+        let thread = ironclaw_engine::Thread::new(
+            "plain goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "user-1",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        let info = thread_to_info(&thread);
+        assert_eq!(info.title.as_deref(), Some("plain goal"));
+        assert_eq!(info.goal, "plain goal");
+    }
+
+    #[test]
+    fn thread_to_info_derives_from_first_line_of_long_goal() {
+        // Multi-paragraph meta-prompt (mission pattern without explicit
+        // title set): derive from first non-empty line, truncated to
+        // the helper's char limit.
+        let long_goal = format!("Short first line\n\n{}\n", "x".repeat(500));
+        let thread = ironclaw_engine::Thread::new(
+            long_goal,
+            ironclaw_engine::ThreadType::Mission,
+            ironclaw_engine::ProjectId::new(),
+            "user-1",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        let info = thread_to_info(&thread);
+        assert_eq!(info.title.as_deref(), Some("Short first line"));
     }
 }
