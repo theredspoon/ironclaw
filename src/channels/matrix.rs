@@ -27,6 +27,7 @@ use matrix_sdk::{
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell, RwLock};
 use uuid::Uuid;
@@ -55,6 +56,13 @@ impl std::fmt::Debug for MatrixChannel {
 }
 
 impl MatrixChannel {
+    fn matrix_sdk_store_dir() -> PathBuf {
+        match std::env::var("MATRIX_SDK_STORE_PATH") {
+            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => crate::bootstrap::ironclaw_base_dir().join("matrix_crypto"),
+        }
+    }
+
     /// Create a new Matrix channel.
     pub fn new(config: MatrixConfig) -> Result<Self, ChannelError> {
         // Validate config
@@ -102,7 +110,7 @@ impl MatrixChannel {
                     .homeserver_url(&self.config.homeserver);
 
                 // Configure E2EE crypto store
-                let crypto_store_dir = crate::bootstrap::ironclaw_base_dir().join("matrix_crypto");
+                let crypto_store_dir = Self::matrix_sdk_store_dir();
                 tokio::fs::create_dir_all(&crypto_store_dir).await.map_err(|e| {
                     ChannelError::StartupFailed {
                         name: "matrix".to_string(),
@@ -1088,16 +1096,26 @@ mod tests {
         // BLOCKER from code review: E2EE crypto store must be configured
         // Brief requirement: "Enable E2EE with crypto store at ~/.ironclaw/matrix_crypto/"
 
-        use crate::bootstrap::ironclaw_base_dir;
-
-        let base_dir = ironclaw_base_dir();
-        let expected_crypto_store = base_dir.join("matrix_crypto");
+        std::env::remove_var("MATRIX_SDK_STORE_PATH");
+        let expected_crypto_store = MatrixChannel::matrix_sdk_store_dir();
 
         // Verify the path construction is correct
         assert!(
             expected_crypto_store.to_string_lossy().ends_with("matrix_crypto"),
             "crypto store should be at $IRONCLAW_DIR/matrix_crypto"
         );
+    }
+
+    #[test]
+    fn test_e2ee_crypto_store_path_honors_env_override() {
+        let override_path = "/tmp/ironclaw-matrix-sdk-store";
+        std::env::set_var("MATRIX_SDK_STORE_PATH", override_path);
+
+        let crypto_store_dir = MatrixChannel::matrix_sdk_store_dir();
+
+        assert_eq!(crypto_store_dir, PathBuf::from(override_path));
+
+        std::env::remove_var("MATRIX_SDK_STORE_PATH");
     }
 
     #[tokio::test]
@@ -1199,8 +1217,6 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_matrix_integration_e2ee_session_restore() {
-        use crate::bootstrap::ironclaw_base_dir;
-
         // Load .env.local for integration test credentials
         let _ = dotenvy::from_filename(".env.local");
 
@@ -1230,7 +1246,8 @@ mod tests {
         let channel = MatrixChannel::new(config).expect("should create channel");
 
         // Verify crypto store directory exists after initialization
-        let crypto_store_path = ironclaw_base_dir().join("matrix_crypto");
+        std::env::remove_var("MATRIX_SDK_STORE_PATH");
+        let crypto_store_path = MatrixChannel::matrix_sdk_store_dir();
 
         // Trigger client initialization by calling start (then immediately drop)
         let result = channel.start().await;
