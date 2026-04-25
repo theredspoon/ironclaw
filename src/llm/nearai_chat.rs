@@ -1925,6 +1925,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_bearer_token_session_beats_env_var() {
+        struct EnvLockGuard {
+            _guard: std::sync::MutexGuard<'static, ()>,
+        }
+        impl EnvLockGuard {
+            fn new() -> Self {
+                Self {
+                    _guard: crate::config::helpers::lock_env(),
+                }
+            }
+        }
+        struct EnvVarGuard {
+            key: &'static str,
+            original: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                #[allow(unused_unsafe)]
+                // SAFETY: serialized via ENV_MUTEX.
+                unsafe {
+                    match &self.original {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        let _guard = EnvLockGuard::new();
         // Session token takes priority over NEARAI_API_KEY env var.
         // This prevents unexpected auth mode switches mid-run.
         let mut cfg = test_nearai_config("http://localhost:8318");
@@ -1935,10 +1963,16 @@ mod tests {
             .await;
 
         // Set env var that should NOT be used when session token exists
+        let original = std::env::var_os("NEARAI_API_KEY");
         #[allow(unused_unsafe)]
+        // SAFETY: serialized via ENV_MUTEX.
         unsafe {
             std::env::set_var("NEARAI_API_KEY", "env-api-key-should-not-win");
         }
+        let _env_guard = EnvVarGuard {
+            key: "NEARAI_API_KEY",
+            original,
+        };
 
         let provider = NearAiChatProvider::new(cfg, session).expect("provider");
         let token = provider
@@ -1949,15 +1983,38 @@ mod tests {
             token, "oauth-token",
             "session token must take priority over env var"
         );
-
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::remove_var("NEARAI_API_KEY");
-        }
     }
 
     #[tokio::test]
     async fn test_resolve_bearer_token_config_beats_session_and_env() {
+        struct EnvLockGuard {
+            _guard: std::sync::MutexGuard<'static, ()>,
+        }
+        impl EnvLockGuard {
+            fn new() -> Self {
+                Self {
+                    _guard: crate::config::helpers::lock_env(),
+                }
+            }
+        }
+        struct EnvVarGuard {
+            key: &'static str,
+            original: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                #[allow(unused_unsafe)]
+                // SAFETY: serialized via ENV_MUTEX.
+                unsafe {
+                    match &self.original {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        let _guard = EnvLockGuard::new();
         // Config API key should win even when session token AND env var are set.
         let cfg = test_nearai_config("http://localhost:8318");
         let session = test_session();
@@ -1965,10 +2022,16 @@ mod tests {
             .set_token(secrecy::SecretString::from("session-tok".to_string()))
             .await;
 
+        let original = std::env::var_os("NEARAI_API_KEY");
         #[allow(unused_unsafe)]
+        // SAFETY: serialized via ENV_MUTEX.
         unsafe {
             std::env::set_var("NEARAI_API_KEY", "env-key");
         }
+        let _env_guard = EnvVarGuard {
+            key: "NEARAI_API_KEY",
+            original,
+        };
 
         let provider = NearAiChatProvider::new(cfg, session).expect("provider");
         let token = provider
@@ -1979,11 +2042,6 @@ mod tests {
             token, "test-key",
             "config api_key must win over session token and env var"
         );
-
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::remove_var("NEARAI_API_KEY");
-        }
     }
 
     #[test]
