@@ -1,0 +1,88 @@
+name: Matrix Rust Version Investigation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag, or commit SHA to check out
+        required: true
+        default: staging
+        type: string
+
+jobs:
+  matrix-compat:
+    name: ${{ matrix.check.name }} / ${{ matrix.os }} / Rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - macos-latest
+        rust:
+          - "1.92.0"
+          - "1.93.0"
+          - "1.94.1"
+        check:
+          - name: default-locked-check
+            command: cargo check --locked
+          - name: matrix-targeted-check
+            command: cargo check --locked --no-default-features --features postgres,html-to-markdown,channel-matrix
+
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: matrix-rust-investigation-${{ matrix.os }}-${{ matrix.rust }}-${{ matrix.check.name }}
+
+      - name: Record environment
+        shell: bash
+        run: |
+          {
+            echo "### Matrix Rust Version Investigation"
+            echo
+            echo "- source ref: \`${{ inputs.source_ref }}\`"
+            echo "- source sha: \`$(git rev-parse HEAD)\`"
+            echo "- runner OS: \`${{ matrix.os }}\`"
+            echo "- architecture: \`$(uname -m)\`"
+            echo "- rustc: \`$(rustc --version)\`"
+            echo "- cargo: \`$(cargo --version)\`"
+            echo "- check: \`${{ matrix.check.command }}\`"
+            if command -v sw_vers >/dev/null 2>&1; then
+              echo "- platform detail: \`$(sw_vers -productVersion)\`"
+            elif command -v lsb_release >/dev/null 2>&1; then
+              echo "- platform detail: \`$(lsb_release -ds)\`"
+            fi
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run cargo check
+        id: cargo-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="$RUNNER_TEMP/matrix-rust-investigation"
+          mkdir -p "$LOG_DIR"
+          LOG_FILE="$LOG_DIR/${{ matrix.check.name }}-${{ matrix.os }}-${{ matrix.rust }}.log"
+          echo "log_file=$LOG_FILE" >> "$GITHUB_OUTPUT"
+          echo "+ ${{ matrix.check.command }}" | tee "$LOG_FILE"
+          eval "${{ matrix.check.command }}" 2>&1 | tee -a "$LOG_FILE"
+
+      - name: Upload check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-rust-investigation-${{ matrix.check.name }}-${{ matrix.os }}-${{ matrix.rust }}
+          path: ${{ steps.cargo-check.outputs.log_file }}
+          retention-days: 14
