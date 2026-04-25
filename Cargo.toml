@@ -146,9 +146,9 @@ urlencoding = "2"
 # The `sqlite` feature provides a persistent state + crypto store backed by SQLite.
 # `e2e-encryption` is added separately in the matrix-e2ee feature below.
 #
-# NOTE: This pilot tracks matrix-rust-sdk main until the released SDK line includes
-# the vodozemac contributory-behavior checks and compiles cleanly with this feature set.
-matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", branch = "main", optional = true, default-features = false, features = [
+# NOTE: This pilot tracks a pinned matrix-rust-sdk commit until the released SDK line includes
+# the vodozemac contributory-behavior checks and the recursion-limit fix needed for this feature set.
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "211c9a7e05dc108d235a6c8301f503f4f77fa028", optional = true, default-features = false, features = [
     "sqlite",
     "e2e-encryption",
 ] }
