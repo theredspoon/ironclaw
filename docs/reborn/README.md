@@ -20,8 +20,6 @@ The `reborn-integration` branch currently exposes Reborn structure primarily thr
 | Authorization substrate | `crates/ironclaw_authorization/` |
 | Approval substrate | `crates/ironclaw_approvals/` |
 | Run-state substrate | `crates/ironclaw_run_state/` |
-| WASM runtime lane | `crates/ironclaw_wasm/` |
-| WASM runtime contract | `docs/reborn/contracts/wasm.md` |
 | Replay fixtures | `tests/fixtures/llm_traces/README.md` |
 | Replay workflow | `.github/workflows/replay-gate.yml` |
 | E2E test harness | `tests/e2e/README.md` |
@@ -40,7 +38,6 @@ docs/reborn/contracts/events-projections.md
 docs/reborn/contracts/memory.md
 docs/reborn/contracts/secrets.md
 docs/reborn/contracts/network.md
-docs/reborn/contracts/wasm.md
 docs/reborn/contracts/migration-compatibility.md
 ```
 
