@@ -4159,10 +4159,14 @@ name = "ironclaw_mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ironclaw_dispatcher",
+ "ironclaw_events",
  "ironclaw_extensions",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_resources",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -4235,12 +4239,18 @@ dependencies = [
 name = "ironclaw_scripts"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "ironclaw_dispatcher",
+ "ironclaw_events",
  "ironclaw_extensions",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_resources",
  "rust_decimal_macros",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -4309,9 +4319,17 @@ dependencies = [
 name = "ironclaw_wasm"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "ironclaw_dispatcher",
+ "ironclaw_events",
+ "ironclaw_extensions",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
+ "ironclaw_resources",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
