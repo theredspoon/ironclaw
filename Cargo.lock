@@ -4183,10 +4183,16 @@ dependencies = [
  "deadpool-postgres",
  "ironclaw_filesystem",
  "ironclaw_host_api",
+ "jsonschema",
  "libsql",
+ "pgvector",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "tracing",
  "uuid",
 ]
 
