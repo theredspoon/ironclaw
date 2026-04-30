@@ -4168,13 +4168,18 @@ dependencies = [
  "ironclaw_capabilities",
  "ironclaw_extensions",
  "ironclaw_host_api",
+ "ironclaw_network",
  "ironclaw_processes",
  "ironclaw_run_state",
+ "ironclaw_safety",
+ "ironclaw_secrets",
  "ironclaw_trust",
+ "secrecy",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4221,8 +4226,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ironclaw_host_api",
+ "reqwest",
  "thiserror 2.0.18",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -6648,6 +6655,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2 0.4.13",
