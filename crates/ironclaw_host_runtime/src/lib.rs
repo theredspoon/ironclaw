@@ -26,7 +26,8 @@
 use async_trait::async_trait;
 use ironclaw_host_api::{
     ApprovalRequestId, CapabilityDescriptor, CapabilityId, CorrelationId, ExecutionContext,
-    ProcessId, ResourceEstimate, ResourceScope, ResourceUsage, RuntimeKind, SecretHandle,
+    NetworkPolicy, ProcessId, ResourceEstimate, ResourceScope, ResourceUsage, RuntimeKind,
+    SecretHandle,
 };
 use ironclaw_host_api::{
     RuntimeCredentialInjection, RuntimeCredentialSource, RuntimeCredentialTarget,
@@ -597,24 +598,62 @@ impl HostRuntimeError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkPolicySource {
+    StagedObligation,
+    RequestPolicyFallback,
+}
+
 #[derive(Debug, Clone)]
 pub struct HostHttpEgressService<N, S> {
     network: N,
     secrets: S,
     secret_injections: Option<Arc<RuntimeSecretInjectionStore>>,
+    network_policy_store: Option<Arc<NetworkObligationPolicyStore>>,
+    network_policy_source: NetworkPolicySource,
 }
 
 impl<N, S> HostHttpEgressService<N, S> {
+    /// Construct host HTTP egress in production fail-closed mode.
+    ///
+    /// Callers must attach a [`NetworkObligationPolicyStore`] with
+    /// [`Self::with_network_policy_store`] before executing network requests.
+    /// Without that store, egress fails before transport rather than trusting a
+    /// caller-supplied policy.
     pub fn new(network: N, secrets: S) -> Self {
         Self {
             network,
             secrets,
             secret_injections: None,
+            network_policy_store: None,
+            network_policy_source: NetworkPolicySource::StagedObligation,
+        }
+    }
+
+    /// Construct host HTTP egress that uses the policy embedded in each request.
+    ///
+    /// This is intentionally named as a test/legacy seam: production Reborn
+    /// runtime egress must consume staged `ApplyNetworkPolicy` handoffs from
+    /// [`NetworkObligationPolicyStore`] instead of trusting runtime/caller
+    /// request policy fields.
+    pub fn new_with_request_policy_for_tests(network: N, secrets: S) -> Self {
+        Self {
+            network,
+            secrets,
+            secret_injections: None,
+            network_policy_store: None,
+            network_policy_source: NetworkPolicySource::RequestPolicyFallback,
         }
     }
 
     pub fn with_secret_injection_store(mut self, store: Arc<RuntimeSecretInjectionStore>) -> Self {
         self.secret_injections = Some(store);
+        self
+    }
+
+    pub fn with_network_policy_store(mut self, store: Arc<NetworkObligationPolicyStore>) -> Self {
+        self.network_policy_store = Some(store);
+        self.network_policy_source = NetworkPolicySource::StagedObligation;
         self
     }
 
@@ -624,6 +663,30 @@ impl<N, S> HostHttpEgressService<N, S> {
 
     pub fn secrets(&self) -> &S {
         &self.secrets
+    }
+
+    fn network_policy_for_request(
+        &self,
+        request: &RuntimeHttpEgressRequest,
+    ) -> Result<NetworkPolicy, RuntimeHttpEgressError> {
+        if let Some(store) = &self.network_policy_store {
+            return store
+                .take(&request.scope, &request.capability_id)
+                .ok_or_else(|| RuntimeHttpEgressError::Network {
+                    reason: "network_policy_missing".to_string(),
+                    request_bytes: 0,
+                    response_bytes: 0,
+                });
+        }
+
+        match self.network_policy_source {
+            NetworkPolicySource::StagedObligation => Err(RuntimeHttpEgressError::Network {
+                reason: "network_policy_missing".to_string(),
+                request_bytes: 0,
+                response_bytes: 0,
+            }),
+            NetworkPolicySource::RequestPolicyFallback => Ok(request.network_policy.clone()),
+        }
     }
 }
 
@@ -636,6 +699,7 @@ where
         &self,
         mut request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
+        let network_policy = self.network_policy_for_request(&request)?;
         validate_runtime_request(&request)?;
 
         let mut redaction_values = Vec::new();
@@ -664,7 +728,7 @@ where
                 url: request.url,
                 headers: request.headers,
                 body: request.body,
-                policy: request.network_policy,
+                policy: network_policy,
                 response_body_limit: request.response_body_limit,
                 timeout_ms: request.timeout_ms,
             })
