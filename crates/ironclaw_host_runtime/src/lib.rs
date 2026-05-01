@@ -46,12 +46,14 @@ use thiserror::Error;
 
 mod obligations;
 mod production;
+mod services;
 
 pub use obligations::{
     BuiltinObligationHandler, NetworkObligationPolicyStore, RuntimeSecretInjectionStore,
     RuntimeSecretInjectionStoreError,
 };
 pub use production::DefaultHostRuntime;
+pub use services::{HostRuntimeServices, RegisteredRuntimeHealth};
 
 /// Stable, validated idempotency key supplied by upper turn/loop services.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
