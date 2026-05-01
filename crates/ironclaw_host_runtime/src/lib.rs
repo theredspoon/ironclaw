@@ -29,9 +29,9 @@ use ironclaw_host_api::{
     ProcessId, ResourceEstimate, ResourceScope, ResourceUsage, RuntimeKind, SecretHandle,
 };
 use ironclaw_host_api::{
-    RuntimeCredentialTarget, RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressRequest,
-    RuntimeHttpEgressResponse, is_sensitive_runtime_request_header,
-    is_sensitive_runtime_response_header,
+    RuntimeCredentialInjection, RuntimeCredentialSource, RuntimeCredentialTarget,
+    RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressRequest, RuntimeHttpEgressResponse,
+    is_sensitive_runtime_request_header, is_sensitive_runtime_response_header,
 };
 use ironclaw_network::{
     NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse,
@@ -41,7 +41,7 @@ use ironclaw_secrets::{SecretMaterial, SecretStore, SecretStoreError};
 use ironclaw_trust::TrustDecision;
 use secrecy::ExposeSecret;
 use serde_json::Value;
-use std::fmt;
+use std::{fmt, sync::Arc};
 use thiserror::Error;
 
 mod obligations;
@@ -601,11 +601,21 @@ impl HostRuntimeError {
 pub struct HostHttpEgressService<N, S> {
     network: N,
     secrets: S,
+    secret_injections: Option<Arc<RuntimeSecretInjectionStore>>,
 }
 
 impl<N, S> HostHttpEgressService<N, S> {
     pub fn new(network: N, secrets: S) -> Self {
-        Self { network, secrets }
+        Self {
+            network,
+            secrets,
+            secret_injections: None,
+        }
+    }
+
+    pub fn with_secret_injection_store(mut self, store: Arc<RuntimeSecretInjectionStore>) -> Self {
+        self.secret_injections = Some(store);
+        self
     }
 
     pub fn network(&self) -> &N {
@@ -629,12 +639,19 @@ where
         validate_runtime_request(&request)?;
 
         let mut redaction_values = Vec::new();
-        for injection in request.credential_injections.clone() {
-            let Some(material) = lease_secret_for_injection(&self.secrets, &request, &injection)?
+        let mut credential_materials = Vec::new();
+        let credential_injections = std::mem::take(&mut request.credential_injections);
+        for injection in &credential_injections {
+            let Some(value) = credential_value_for_injection(
+                &mut credential_materials,
+                &self.secrets,
+                self.secret_injections.as_deref(),
+                &request,
+                injection,
+            )?
             else {
                 continue;
             };
-            let value = material.expose_secret().to_string();
             apply_credential_injection(&mut request, &injection.target, &value)?;
             redaction_values.extend(redaction_values_for_secret(&value));
         }
@@ -661,10 +678,116 @@ where
     }
 }
 
+struct RuntimeCredentialMaterialCacheEntry {
+    key: RuntimeCredentialMaterialKey,
+    value: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum RuntimeCredentialMaterialKey {
+    SecretStoreLease {
+        handle: SecretHandle,
+    },
+    StagedObligation {
+        capability_id: CapabilityId,
+        handle: SecretHandle,
+    },
+}
+
+impl RuntimeCredentialMaterialKey {
+    fn for_injection(injection: &RuntimeCredentialInjection) -> Self {
+        match &injection.source {
+            RuntimeCredentialSource::SecretStoreLease => Self::SecretStoreLease {
+                handle: injection.handle.clone(),
+            },
+            RuntimeCredentialSource::StagedObligation { capability_id } => Self::StagedObligation {
+                capability_id: capability_id.clone(),
+                handle: injection.handle.clone(),
+            },
+        }
+    }
+}
+
+fn credential_value_for_injection<S>(
+    cache: &mut Vec<RuntimeCredentialMaterialCacheEntry>,
+    secrets: &S,
+    secret_injections: Option<&RuntimeSecretInjectionStore>,
+    request: &RuntimeHttpEgressRequest,
+    injection: &RuntimeCredentialInjection,
+) -> Result<Option<String>, RuntimeHttpEgressError>
+where
+    S: SecretStore,
+{
+    let key = RuntimeCredentialMaterialKey::for_injection(injection);
+    if let Some(entry) = cache.iter().find(|entry| entry.key == key) {
+        return match &entry.value {
+            Some(value) => Ok(Some(value.clone())),
+            None => missing_runtime_credential(injection.required).map(|_| None),
+        };
+    }
+
+    let value = secret_material_for_injection(secrets, secret_injections, request, injection)?
+        .map(|material| material.expose_secret().to_string());
+    cache.push(RuntimeCredentialMaterialCacheEntry {
+        key,
+        value: value.clone(),
+    });
+    Ok(value)
+}
+
+fn secret_material_for_injection<S>(
+    secrets: &S,
+    secret_injections: Option<&RuntimeSecretInjectionStore>,
+    request: &RuntimeHttpEgressRequest,
+    injection: &RuntimeCredentialInjection,
+) -> Result<Option<SecretMaterial>, RuntimeHttpEgressError>
+where
+    S: SecretStore,
+{
+    match &injection.source {
+        RuntimeCredentialSource::SecretStoreLease => {
+            lease_secret_for_injection(secrets, request, injection)
+        }
+        RuntimeCredentialSource::StagedObligation { capability_id } => {
+            take_staged_secret_for_injection(secret_injections, request, capability_id, injection)
+        }
+    }
+}
+
+fn take_staged_secret_for_injection(
+    secret_injections: Option<&RuntimeSecretInjectionStore>,
+    request: &RuntimeHttpEgressRequest,
+    capability_id: &CapabilityId,
+    injection: &RuntimeCredentialInjection,
+) -> Result<Option<SecretMaterial>, RuntimeHttpEgressError> {
+    let Some(secret_injections) = secret_injections else {
+        return missing_runtime_credential(injection.required);
+    };
+    match secret_injections.take(&request.scope, capability_id, &injection.handle) {
+        Ok(Some(material)) => Ok(Some(material)),
+        Ok(None) => missing_runtime_credential(injection.required),
+        Err(_) => Err(RuntimeHttpEgressError::Credential {
+            reason: "runtime credential injection store unavailable".to_string(),
+        }),
+    }
+}
+
+fn missing_runtime_credential(
+    required: bool,
+) -> Result<Option<SecretMaterial>, RuntimeHttpEgressError> {
+    if required {
+        Err(RuntimeHttpEgressError::Credential {
+            reason: "required credential is unavailable".to_string(),
+        })
+    } else {
+        Ok(None)
+    }
+}
+
 fn lease_secret_for_injection<S>(
     secrets: &S,
     request: &RuntimeHttpEgressRequest,
-    injection: &ironclaw_host_api::RuntimeCredentialInjection,
+    injection: &RuntimeCredentialInjection,
 ) -> Result<Option<SecretMaterial>, RuntimeHttpEgressError>
 where
     S: SecretStore,
@@ -730,10 +853,20 @@ fn apply_credential_injection(
 ) -> Result<(), RuntimeHttpEgressError> {
     match target {
         RuntimeCredentialTarget::Header { name, prefix } => {
+            if !valid_injected_header_name(name) {
+                return Err(RuntimeHttpEgressError::Credential {
+                    reason: "credential injection header name is invalid".to_string(),
+                });
+            }
             let injected = match prefix {
                 Some(prefix) => format!("{prefix}{value}"),
                 None => value.to_string(),
             };
+            if injected.chars().any(char::is_control) {
+                return Err(RuntimeHttpEgressError::Credential {
+                    reason: "credential injection header value is invalid".to_string(),
+                });
+            }
             request.headers.push((name.clone(), injected));
         }
         RuntimeCredentialTarget::QueryParam { name } => {
@@ -746,6 +879,30 @@ fn apply_credential_injection(
         }
     }
     Ok(())
+}
+
+fn valid_injected_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn runtime_network_error(error: NetworkHttpError) -> RuntimeHttpEgressError {
