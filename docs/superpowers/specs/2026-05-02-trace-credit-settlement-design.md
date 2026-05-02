@@ -10,7 +10,7 @@ Build a production-shaped server-side credit system for Trace Commons where user
 
 The first version should not mint a transferable token. It should create an auditable internal credit balance backed by server review, downstream utility evidence, and frontier-lab or trusted-worker attestations.
 
-The later token path should be a tokenized receipt or claim over finalized credit batches, not the initial source of truth.
+The NEAR path should start as a non-transferable on-chain receipt or balance anchor over finalized credit batches. The server ledger remains the source of truth for v1; NEAR records provide public auditability and account binding, not transferability.
 
 ## Approved direction
 
@@ -22,7 +22,7 @@ Use a **shadow-to-settlement pipeline**:
 4. Reviewers, benchmark workers, ranker workers, process-evaluation workers, or frontier-lab attestations produce utility evidence.
 5. A settlement worker converts eligible utility evidence into append-only credit ledger events.
 6. The contributor sees estimated, pending, settled, reversed, and held credit balances.
-7. Future tokenization can mint or release non-transferable tokenized receipts for finalized settlement batches.
+7. Finalized settlements can enqueue NEAR transactions that mint or update non-transferable credit receipts for contributor account hashes.
 
 This keeps uploads from becoming a token faucet and makes credit defensible: credits are earned because reviewed traces were accepted or used in validated training/evaluation workflows.
 
@@ -37,6 +37,19 @@ They should be described as:
 > Non-transferable account credits representing reviewed contribution utility.
 
 They should not be marketed as appreciating, investable, or backed by future AI data demand.
+
+### NEAR non-transferable receipts
+
+NEAR interactions are in scope for the first production-shaped build, but only as non-transferable settlement receipts.
+
+The on-chain representation should be one of:
+
+- a non-transferable credit balance keyed by a contributor account hash; or
+- non-transferable settlement receipts keyed by settlement batch and contributor account hash.
+
+The server ledger remains authoritative for contributor balances, holds, reversals, redemption eligibility, and private evidence. The NEAR contract mirrors finalized settlement state for auditability and should never receive raw trace content, raw contributor identity, lab-private notes, or per-source details.
+
+The contract must not expose a general transfer path. Any standard token interface used for wallet/indexer compatibility must either omit transfer methods or make them always fail with a clear non-transferable error.
 
 ### Pending versus settled credit
 
@@ -73,6 +86,7 @@ The server owns:
 - credit holds and reversals
 - audit events
 - admin/operator reporting
+- NEAR settlement outbox, transaction submission, and chain reconciliation
 
 IronClaw owns:
 
@@ -81,6 +95,40 @@ IronClaw owns:
 - local credit notices and retry outbox
 
 IronClaw must not compute authoritative credit locally.
+
+### NEAR contract boundary
+
+The NEAR contract is a settlement mirror, not the primary accounting system.
+
+Contract responsibilities:
+
+- accept mints or balance updates only from an authorized TraceDAO settlement account
+- bind credit to a contributor account hash or explicit NEAR account link
+- record settlement batch id, policy version, source-list hash, attestation hash, credit amount, and issuer signature hash
+- reject duplicate batch/account/event idempotency keys
+- support deterministic reversal or burn events for settled credits that are later invalidated
+- expose read-only balance and batch-receipt views
+- emit safe events for indexing
+- provide an operator pause/freeze path for incident response
+
+Contract non-goals:
+
+- store raw trace payloads
+- store raw contributor identities by default
+- perform scoring, review, or settlement policy
+- allow contributor-to-contributor transfers
+- decide redemption eligibility
+
+Server integration responsibilities:
+
+- enqueue a NEAR transaction only after a settlement batch is finalized in the off-chain ledger
+- use a durable outbox so DB commit and chain submission are recoverable
+- use an idempotency key derived from settlement batch id, credit account hash, event type, policy version, and amount
+- poll transaction finality and update chain-anchor status on the settlement batch/account event
+- retry transient failures without double-minting
+- support dry-run settlement without submitting chain transactions
+- keep signing keys out of contributor-visible APIs and ordinary logs
+- allow operators to disable NEAR submission while leaving credit settlement active
 
 ### Server components
 
@@ -395,17 +443,17 @@ Rules:
 - Reversal rows must be deterministic negative ledger events linked to the original event id.
 - Contributor-facing explanations must be safe and must not expose trace bodies or lab-private notes.
 
-## Tokenization path
+## Tokenization and NEAR path
 
-Tokenization is out of scope for v1 implementation.
+Transferable tokenization is out of scope for v1 implementation.
 
-The later token path should use finalized settlement batches as backing evidence.
+NEAR non-transferable receipts are in scope as an optional settlement mirror once the off-chain ledger path is correct. The contract must be driven by finalized settlement batches as backing evidence.
 
 Preferred sequence:
 
 1. Internal non-transferable credits.
 2. Redeemable internal account credits.
-3. Non-transferable tokenized settlement receipts.
+3. NEAR non-transferable settlement receipts.
 4. Only after legal/product review, consider whether any transferability is appropriate.
 
 On-chain metadata, if introduced, should include only:
@@ -416,6 +464,7 @@ On-chain metadata, if introduced, should include only:
 - policy version
 - total settled amount
 - issuer signature
+- credit account hash or linked NEAR account id
 
 It must not include trace bodies, raw contributor identities, or per-source details that could reveal private corpus contents.
 
@@ -454,11 +503,11 @@ Credits can be redeemed only inside the product.
 
 Trusted lab/batch attestations become a production credit evidence source.
 
-### Stage 4: Tokenized receipts
+### Stage 4: NEAR non-transferable receipts
 
-Finalized settlement batches can optionally mint non-transferable receipts.
+Finalized settlement batches can mint or update non-transferable NEAR receipts.
 
-This stage requires separate legal/product review and a separate implementation plan.
+This stage can be developed with the first server implementation if transferability remains impossible and the off-chain ledger remains authoritative.
 
 ## Out of scope
 
@@ -469,6 +518,7 @@ This stage requires separate legal/product review and a separate implementation 
 - Immediate credit settlement on upload alone.
 - Open corpus downloads.
 - Raw lab-review payloads in contributor APIs.
+- Contributor-to-contributor credit transfers.
 
 ## Acceptance criteria
 
@@ -479,6 +529,7 @@ This stage requires separate legal/product review and a separate implementation 
 - Utility evidence can be recorded without exposing trace bodies or contributor identities.
 - Settlement batches can run in dry-run mode before writing ledger events.
 - Settled credits are non-transferable.
+- Optional NEAR receipts are minted or updated only after off-chain settlement finalization.
 
 ### Security and privacy
 
@@ -486,6 +537,7 @@ This stage requires separate legal/product review and a separate implementation 
 - Utility attestation ingestion validates actor role, tenant scope, consent, allowed use, and idempotency.
 - Settlement excludes revoked, expired, purged, rejected, quarantined, aggregate-only, and out-of-scope sources.
 - Credit events and audit rows store safe hashes/reasons, not raw traces or raw lab notes.
+- NEAR transaction payloads store only safe hashes, batch ids, policy versions, amounts, and account hashes.
 
 ### Accounting
 
@@ -494,6 +546,7 @@ This stage requires separate legal/product review and a separate implementation 
 - Reversal rows link back to original events.
 - Decimal arithmetic avoids float drift.
 - Settlement reports are deterministic for the same policy version and source set.
+- NEAR outbox processing is idempotent and cannot double-mint repeated settlement events.
 
 ### Operations
 
@@ -501,6 +554,7 @@ This stage requires separate legal/product review and a separate implementation 
 - Admins can place and release credit holds with reasons.
 - Canary tenants can run shadow settlements before enabling settled credits.
 - Rollback can disable redemption without deleting ledger/audit evidence.
+- Operators can disable NEAR submission without disabling off-chain credit settlement.
 
 ## Testing expectations
 
@@ -519,6 +573,10 @@ Required test families:
 - credit-account projection rebuild matches stored projection
 - lab attestation signature verification accepts valid signatures and rejects tampered payloads
 - IronClaw credit sync displays server states without calculating authority locally
+- NEAR contract accepts authorized settlement mints and rejects unauthorized mints
+- NEAR contract rejects or omits transfer operations
+- NEAR outbox retries do not double-submit or double-credit a settlement event
+- settlement finalization can run with NEAR submission disabled
 
 ## Files and repos likely involved
 
@@ -534,6 +592,12 @@ Likely server areas:
 - worker/admin routes
 - audit metadata and reconciliation
 - CLI helpers for settlement dry-run and batch inspection
+- NEAR transaction outbox, submitter, finality reconciler, and operator kill switch
+
+Likely contract areas:
+
+- NEAR contract crate or package for non-transferable settlement receipts
+- contract integration tests for authorized mint, duplicate prevention, reversal, pause, and transfer rejection
 
 IronClaw follow-up:
 
@@ -548,6 +612,8 @@ IronClaw follow-up:
 3. Should settlement batches be tenant-scoped only, or tenant plus agreement scoped?
 4. Which event types are allowed to produce settled credit during the first canary?
 5. What are the initial per-contributor and per-tenant caps?
+6. Should the first NEAR contract use aggregate balances, per-batch receipts, or both?
+7. Should users link a NEAR account in v1, or should receipts initially bind to server-side account hashes only?
 
 Default assumptions for the implementation plan:
 
@@ -556,3 +622,5 @@ Default assumptions for the implementation plan:
 - settlement batches are tenant plus optional agreement scoped.
 - first canary settles only `accepted_reviewed_trace`, `benchmark_conversion`, `ranking_utility`, and `training_utility`.
 - per-contributor caps are conservative and policy-configured.
+- the first NEAR contract records per-batch receipts plus an aggregate view.
+- v1 supports server-side account hashes first, with explicit NEAR account linking as a follow-up path.
