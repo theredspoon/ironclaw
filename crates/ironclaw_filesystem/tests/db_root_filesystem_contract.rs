@@ -172,6 +172,33 @@ async fn libsql_root_filesystem_write_file_rejects_implicit_directory() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn libsql_root_filesystem_append_file_rejects_implicit_directory() {
+    let filesystem = libsql_root().await;
+    let dir = VirtualPath::new("/engine/tenants/t1/users/u1/append-nested").unwrap();
+    let child = VirtualPath::new("/engine/tenants/t1/users/u1/append-nested/file.txt").unwrap();
+
+    filesystem.write_file(&child, b"child").await.unwrap();
+    let err = filesystem
+        .append_file(&dir, b"not a dir")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        FilesystemError::Backend {
+            operation: FilesystemOperation::AppendFile,
+            ..
+        }
+    ));
+    assert_eq!(
+        filesystem.stat(&dir).await.unwrap().file_type,
+        FileType::Directory
+    );
+    assert_eq!(filesystem.read_file(&child).await.unwrap(), b"child");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn libsql_root_filesystem_fails_closed_for_missing_paths_without_host_paths() {
     let filesystem = libsql_root().await;
     let path = VirtualPath::new("/projects/missing.txt").unwrap();

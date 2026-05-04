@@ -871,6 +871,15 @@ fn directory_write_error(path: VirtualPath) -> FilesystemError {
     }
 }
 
+#[cfg(any(feature = "postgres", feature = "libsql"))]
+fn directory_append_error(path: VirtualPath) -> FilesystemError {
+    FilesystemError::Backend {
+        path,
+        operation: FilesystemOperation::AppendFile,
+        reason: "cannot append to a directory".to_string(),
+    }
+}
+
 #[cfg(feature = "postgres")]
 /// PostgreSQL-backed [`RootFilesystem`] storing file contents by virtual path.
 pub struct PostgresRootFilesystem {
@@ -970,12 +979,9 @@ impl RootFilesystem for PostgresRootFilesystem {
         if matches!(
             self.exact_entry_with_client(&client, path).await?,
             Some((_, FileType::Directory))
-        ) {
-            return Err(FilesystemError::Backend {
-                path: path.clone(),
-                operation: FilesystemOperation::AppendFile,
-                reason: "cannot append to a directory".to_string(),
-            });
+        ) || self.has_child_entry_with_client(&client, path).await?
+        {
+            return Err(directory_append_error(path.clone()));
         }
         // TODO(reborn): append rewrites the whole DB row. Do not use this path
         // for high-volume JSONL/event streams; route those through typed event
@@ -1295,12 +1301,9 @@ impl RootFilesystem for LibSqlRootFilesystem {
         if matches!(
             self.exact_entry(path).await?,
             Some((_, FileType::Directory))
-        ) {
-            return Err(FilesystemError::Backend {
-                path: path.clone(),
-                operation: FilesystemOperation::AppendFile,
-                reason: "cannot append to a directory".to_string(),
-            });
+        ) || self.has_child_entry(path).await?
+        {
+            return Err(directory_append_error(path.clone()));
         }
         let conn = self.connect().await?;
         // TODO(reborn): append rewrites the whole DB row. Do not use this path
