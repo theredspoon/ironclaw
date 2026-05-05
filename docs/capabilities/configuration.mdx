@@ -1,10 +1,14 @@
 ---
 title: Configuration
 sidebarTitle: Configuration
-description: Complete environment variable reference for IronClaw
+description: Common operator configuration reference for IronClaw
 ---
 
-IronClaw is configured primarily through environment variables. This page documents all available configuration options.
+IronClaw is configured through bootstrap environment variables, database-backed settings, and a small set of advanced or provider-specific environment variables. This page documents the primary options used during setup and normal operation.
+
+<Info>
+This is an operator-focused reference, not an exhaustive inventory of every internal, test-only, experimental, or provider-registry variable. When changing configuration behavior, treat the code in `src/config/`, `providers.json`, and the setup specification in `src/setup/README.md` as the source of truth.
+</Info>
 
 ## Two-Layer Configuration
 
@@ -24,7 +28,7 @@ IronClaw uses a two-layer configuration system:
   </Accordion>
 
   <Accordion title="Layer 2: Database Settings" icon="database">
-    All other settings are stored in the database and loaded at runtime:
+    Most user-facing runtime settings are stored in the database and loaded at runtime:
 
     - Channel configuration
     - Model selection
@@ -32,11 +36,11 @@ IronClaw uses a two-layer configuration system:
     - Skills configuration
     - Heartbeat settings
 
-    Managed through the wizard or `ironclaw config` command.
+    Some security-sensitive and advanced options remain environment-only. Manage database-backed values through the wizard or `ironclaw config` command.
   </Accordion>
 </AccordionGroup>
 
-## Configuration Categories
+## Common Configuration Categories
 
 <CardGroup cols={2}>
   <Card title="Agent Settings" icon="bot" href="#agent-settings">
