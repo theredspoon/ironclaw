@@ -1463,7 +1463,14 @@ async fn cancel_recovery_required_run_releases_lock_and_allows_new_submit() {
         .unwrap();
     assert_eq!(cancelled.status, TurnStatus::Cancelled);
     assert!(!cancelled.already_terminal);
-    assert!(store.persistence_snapshot().active_locks.is_empty());
+    let snapshot = store.persistence_snapshot();
+    assert!(snapshot.active_locks.is_empty());
+    let run = snapshot
+        .runs
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(run.failure, None);
 
     let replacement = coordinator
         .submit_turn(submit_request("thread-a", "idem-submit-replacement"))
@@ -2293,6 +2300,25 @@ async fn observed_cancelled_loop_exit_without_recorded_cancel_enters_recovery_re
             .unwrap_err(),
         TurnError::ThreadBusy(_)
     ));
+
+    let cancelled = coordinator
+        .cancel_run(CancelRunRequest {
+            scope: scope("thread-a"),
+            actor: actor(),
+            run_id,
+            reason: SanitizedCancelReason::OperatorRequested,
+            idempotency_key: IdempotencyKey::new("idem-cancel-after-unrecorded-interrupt").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
+    let snapshot = store.persistence_snapshot();
+    let run = snapshot
+        .runs
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(run.failure, None);
 }
 
 #[tokio::test]

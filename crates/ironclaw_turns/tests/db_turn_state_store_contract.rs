@@ -390,6 +390,7 @@ async fn postgres_pool() -> Option<deadpool_postgres::Pool> {
     Some(pool)
 }
 
+#[cfg(feature = "postgres")]
 fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

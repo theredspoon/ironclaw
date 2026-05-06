@@ -950,6 +950,7 @@ impl Inner {
             let now = Utc::now();
             record.status = next_status;
             if record.status.is_terminal() {
+                record.failure = None;
                 self.release_active_lock(&record);
                 self.remove_queued_run(record.run_id);
             } else {
