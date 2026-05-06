@@ -2353,6 +2353,94 @@ async fn loop_exit_application_uses_single_atomic_transition_port_call() {
 }
 
 #[tokio::test]
+async fn non_cancelled_loop_exit_after_public_cancel_does_not_terminally_cancel() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator
+        .cancel_run(cancel_request("thread-a", run_id, "idem-cancel-a"))
+        .await
+        .unwrap();
+
+    let completed_after_cancel = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: completed_exit("exit:completed-after-cancel"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: true,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        completed_after_cancel,
+        TurnError::InvalidTransition {
+            from: TurnStatus::CancelRequested,
+            to: TurnStatus::Completed,
+        }
+    );
+
+    let recovered_after_cancel = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: completed_exit("exit:invalid-after-cancel"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered_after_cancel.status, TurnStatus::RecoveryRequired);
+    assert_eq!(
+        recovered_after_cancel
+            .failure
+            .as_ref()
+            .map(SanitizedFailure::category),
+        Some("driver_protocol_violation")
+    );
+    assert!(matches!(
+        coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-b"))
+            .await
+            .unwrap_err(),
+        TurnError::ThreadBusy(_)
+    ));
+}
+
+#[tokio::test]
 async fn observed_cancelled_loop_exit_without_recorded_cancel_enters_recovery_required() {
     let (coordinator, store) = coordinator();
     let run_id = accepted_run_id(

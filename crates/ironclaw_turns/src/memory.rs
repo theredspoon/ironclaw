@@ -1089,18 +1089,20 @@ impl Inner {
                     error,
                 };
             }
-            if record.status == TurnStatus::CancelRequested {
-                return self.cancel_claimed_record(record);
-            }
             match mapping {
                 LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Completed) => {
                     self.complete_claimed_record(record)
                 }
-                LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled) => self
-                    .recover_claimed_record(
-                        record,
-                        SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
-                    ),
+                LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled) => {
+                    if record.status == TurnStatus::CancelRequested {
+                        self.cancel_claimed_record(record)
+                    } else {
+                        self.recover_claimed_record(
+                            record,
+                            SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
+                        )
+                    }
+                }
                 LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
                     checkpoint_id,
                     reason,
@@ -1267,7 +1269,10 @@ impl Inner {
         mut record: RunRecord,
         failure: SanitizedFailure,
     ) -> AppliedLoopTransition {
-        if record.status != TurnStatus::Running {
+        if !matches!(
+            record.status,
+            TurnStatus::Running | TurnStatus::CancelRequested
+        ) {
             let from = record.status;
             return AppliedLoopTransition::Rejected {
                 record: Box::new(record),
