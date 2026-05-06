@@ -26,6 +26,18 @@ use ironclaw_turns::{
     },
 };
 
+#[test]
+fn turn_scope_agent_id_is_optional() {
+    let scope = TurnScope::new(
+        TenantId::new("tenant1").unwrap(),
+        None,
+        Some(ProjectId::new("project1").unwrap()),
+        ThreadId::new("thread-a").unwrap(),
+    );
+
+    assert_eq!(scope.agent_id, None);
+}
+
 #[tokio::test]
 async fn submit_turn_accepts_only_canonical_refs_and_returns_redacted_metadata() {
     let (coordinator, _store) = coordinator();
@@ -1916,7 +1928,7 @@ fn accepted_run_id(response: &SubmitTurnResponse) -> TurnRunId {
 fn scope(thread: &str) -> TurnScope {
     TurnScope::new(
         TenantId::new("tenant1").unwrap(),
-        AgentId::new("agent1").unwrap(),
+        Some(AgentId::new("agent1").unwrap()),
         Some(ProjectId::new("project1").unwrap()),
         ThreadId::new(thread).unwrap(),
     )
