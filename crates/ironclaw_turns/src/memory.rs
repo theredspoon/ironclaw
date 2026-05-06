@@ -8,19 +8,21 @@ use std::{
 use chrono::{Duration as ChronoDuration, Utc};
 
 use crate::{
-    AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
-    ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse, SanitizedFailure,
-    SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActiveLockKey,
-    TurnActiveLockRecord, TurnActor, TurnAdmissionPolicy, TurnCheckpointId, TurnCheckpointRecord,
-    TurnError, TurnEventKind, TurnIdempotencyErrorReplay, TurnIdempotencyOperationKind,
-    TurnIdempotencyOutcomeKind, TurnIdempotencyRecord, TurnIdempotencyReplay, TurnLifecycleEvent,
-    TurnLockVersion, TurnPersistenceSnapshot, TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord,
-    TurnRunState, TurnScope, TurnStateStore, TurnStatus,
+    AcceptedMessageRef, BlockedReason, CancelRunRequest, CancelRunResponse, GetRunStateRequest,
+    IdempotencyKey, LoopExitMapping, ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse,
+    SanitizedFailure, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy,
+    TurnActiveLockKey, TurnActiveLockRecord, TurnActor, TurnAdmissionPolicy, TurnCheckpointId,
+    TurnCheckpointRecord, TurnError, TurnEventKind, TurnIdempotencyErrorReplay,
+    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
+    TurnIdempotencyReplay, TurnLifecycleEvent, TurnLockVersion, TurnPersistenceSnapshot,
+    TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
+    TurnStatus,
     events::EventCursor,
     runner::{
-        BlockRunRequest, CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun,
-        CompleteRunRequest, FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
-        RecoverExpiredLeasesResponse, TurnRunTransitionPort,
+        ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
+        ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
+        RecordRecoveryRequiredRequest, RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse,
+        TurnRunTransitionPort, TurnRunnerOutcome,
     },
 };
 
@@ -79,6 +81,18 @@ struct Inner {
     idempotency_record_order: VecDeque<PersistedIdempotencyKey>,
     events: Vec<TurnLifecycleEvent>,
     limits: InMemoryTurnStateStoreLimits,
+}
+
+enum AppliedLoopTransition {
+    Applied {
+        record: Box<RunRecord>,
+        state: Box<TurnRunState>,
+        prune_terminal: bool,
+    },
+    Rejected {
+        record: Box<RunRecord>,
+        error: TurnError,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -480,6 +494,32 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
             TurnStatus::Failed,
             Some(request.failure),
             TurnEventKind::Failed,
+        )
+    }
+
+    async fn record_recovery_required(
+        &self,
+        request: RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut inner = self.lock_inner()?;
+        inner.recovery_required_transition(
+            request.run_id,
+            request.runner_id,
+            request.lease_token,
+            request.failure,
+        )
+    }
+
+    async fn apply_validated_loop_exit(
+        &self,
+        request: ApplyValidatedLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut inner = self.lock_inner()?;
+        inner.apply_validated_loop_exit_transition(
+            request.run_id,
+            request.runner_id,
+            request.lease_token,
+            request.mapping,
         )
     }
 }
@@ -937,6 +977,7 @@ impl Inner {
             let now = Utc::now();
             record.status = next_status;
             if record.status.is_terminal() {
+                record.failure = None;
                 self.release_active_lock(&record);
                 self.remove_queued_run(record.run_id);
             } else {
@@ -1030,6 +1071,272 @@ impl Inner {
         })();
         self.records.insert(record.run_id, record);
         self.prune_terminal_records();
+        result
+    }
+
+    fn apply_validated_loop_exit_transition(
+        &mut self,
+        run_id: TurnRunId,
+        runner_id: crate::TurnRunnerId,
+        lease_token: crate::TurnLeaseToken,
+        mapping: LoopExitMapping,
+    ) -> Result<TurnRunState, TurnError> {
+        let record = self.take_record(run_id)?;
+        let result = (|| {
+            if let Err(error) = ensure_active_lease(&record, runner_id, lease_token, Utc::now()) {
+                return AppliedLoopTransition::Rejected {
+                    record: Box::new(record),
+                    error,
+                };
+            }
+            match mapping {
+                LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Completed) => {
+                    self.complete_claimed_record(record)
+                }
+                LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled) => {
+                    if record.status == TurnStatus::CancelRequested {
+                        self.cancel_claimed_record(record)
+                    } else {
+                        self.recover_claimed_record(
+                            record,
+                            SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
+                        )
+                    }
+                }
+                LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
+                    checkpoint_id,
+                    reason,
+                }) => self.block_claimed_record(record, checkpoint_id, reason),
+                LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Failed { failure }) => {
+                    self.fail_claimed_record(record, failure)
+                }
+                LoopExitMapping::RecoveryRequired { failure } => {
+                    self.recover_claimed_record(record, failure)
+                }
+            }
+        })();
+        match result {
+            AppliedLoopTransition::Applied {
+                record,
+                state,
+                prune_terminal,
+            } => {
+                self.records.insert(record.run_id, *record);
+                if prune_terminal {
+                    self.prune_terminal_records();
+                }
+                Ok(*state)
+            }
+            AppliedLoopTransition::Rejected { record, error } => {
+                self.records.insert(record.run_id, *record);
+                Err(error)
+            }
+        }
+    }
+
+    fn complete_claimed_record(&mut self, mut record: RunRecord) -> AppliedLoopTransition {
+        if record.status != TurnStatus::Running {
+            let from = record.status;
+            return AppliedLoopTransition::Rejected {
+                record: Box::new(record),
+                error: TurnError::InvalidTransition {
+                    from,
+                    to: TurnStatus::Completed,
+                },
+            };
+        }
+        record.status = TurnStatus::Completed;
+        record.failure = None;
+        record.runner_id = None;
+        record.lease_token = None;
+        record.lease_expires_at = None;
+        record.event_cursor = self.next_cursor();
+        self.release_active_lock(&record);
+        self.remove_queued_run(record.run_id);
+        let state = record.state();
+        self.push_event(&record, TurnEventKind::Completed, None);
+        self.mark_terminal(record.run_id);
+        AppliedLoopTransition::Applied {
+            record: Box::new(record),
+            state: Box::new(state),
+            prune_terminal: true,
+        }
+    }
+
+    fn cancel_claimed_record(&mut self, mut record: RunRecord) -> AppliedLoopTransition {
+        if record.status != TurnStatus::CancelRequested {
+            let from = record.status;
+            return AppliedLoopTransition::Rejected {
+                record: Box::new(record),
+                error: TurnError::InvalidTransition {
+                    from,
+                    to: TurnStatus::Cancelled,
+                },
+            };
+        }
+        record.status = TurnStatus::Cancelled;
+        record.failure = None;
+        record.runner_id = None;
+        record.lease_token = None;
+        record.lease_expires_at = None;
+        record.event_cursor = self.next_cursor();
+        self.release_active_lock(&record);
+        self.remove_queued_run(record.run_id);
+        let state = record.state();
+        self.push_event(&record, TurnEventKind::Cancelled, None);
+        self.mark_terminal(record.run_id);
+        AppliedLoopTransition::Applied {
+            record: Box::new(record),
+            state: Box::new(state),
+            prune_terminal: true,
+        }
+    }
+
+    fn block_claimed_record(
+        &mut self,
+        mut record: RunRecord,
+        checkpoint_id: TurnCheckpointId,
+        reason: BlockedReason,
+    ) -> AppliedLoopTransition {
+        if record.status != TurnStatus::Running {
+            let from = record.status;
+            return AppliedLoopTransition::Rejected {
+                record: Box::new(record),
+                error: TurnError::InvalidTransition {
+                    from,
+                    to: reason.status(),
+                },
+            };
+        }
+        let now = Utc::now();
+        record.status = reason.status();
+        record.checkpoint_id = Some(checkpoint_id);
+        record.gate_ref = Some(reason.gate_ref().clone());
+        record.runner_id = None;
+        record.lease_token = None;
+        record.lease_expires_at = None;
+        record.event_cursor = self.next_cursor();
+        self.record_checkpoint(&record, checkpoint_id, reason.gate_ref().clone(), now);
+        self.update_active_lock(&record, now);
+        let state = record.state();
+        self.push_event(&record, TurnEventKind::Blocked, None);
+        AppliedLoopTransition::Applied {
+            record: Box::new(record),
+            state: Box::new(state),
+            prune_terminal: false,
+        }
+    }
+
+    fn fail_claimed_record(
+        &mut self,
+        mut record: RunRecord,
+        failure: SanitizedFailure,
+    ) -> AppliedLoopTransition {
+        if record.status != TurnStatus::Running {
+            let from = record.status;
+            return AppliedLoopTransition::Rejected {
+                record: Box::new(record),
+                error: TurnError::InvalidTransition {
+                    from,
+                    to: TurnStatus::Failed,
+                },
+            };
+        }
+        record.status = TurnStatus::Failed;
+        record.failure = Some(failure.clone());
+        record.runner_id = None;
+        record.lease_token = None;
+        record.lease_expires_at = None;
+        record.event_cursor = self.next_cursor();
+        self.release_active_lock(&record);
+        self.remove_queued_run(record.run_id);
+        let state = record.state();
+        self.push_event(
+            &record,
+            TurnEventKind::Failed,
+            Some(failure.into_category()),
+        );
+        self.mark_terminal(record.run_id);
+        AppliedLoopTransition::Applied {
+            record: Box::new(record),
+            state: Box::new(state),
+            prune_terminal: true,
+        }
+    }
+
+    fn recover_claimed_record(
+        &mut self,
+        mut record: RunRecord,
+        failure: SanitizedFailure,
+    ) -> AppliedLoopTransition {
+        if !matches!(
+            record.status,
+            TurnStatus::Running | TurnStatus::CancelRequested
+        ) {
+            let from = record.status;
+            return AppliedLoopTransition::Rejected {
+                record: Box::new(record),
+                error: TurnError::InvalidTransition {
+                    from,
+                    to: TurnStatus::RecoveryRequired,
+                },
+            };
+        }
+        record.status = TurnStatus::RecoveryRequired;
+        record.failure = Some(failure.clone());
+        record.runner_id = None;
+        record.lease_token = None;
+        record.lease_expires_at = None;
+        record.event_cursor = self.next_cursor();
+        self.update_active_lock(&record, Utc::now());
+        let state = record.state();
+        self.push_event(
+            &record,
+            TurnEventKind::RecoveryRequired,
+            Some(failure.into_category()),
+        );
+        AppliedLoopTransition::Applied {
+            record: Box::new(record),
+            state: Box::new(state),
+            prune_terminal: false,
+        }
+    }
+
+    fn recovery_required_transition(
+        &mut self,
+        run_id: TurnRunId,
+        runner_id: crate::TurnRunnerId,
+        lease_token: crate::TurnLeaseToken,
+        failure: SanitizedFailure,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut record = self.take_record(run_id)?;
+        let result = (|| {
+            ensure_active_lease(&record, runner_id, lease_token, Utc::now())?;
+            if !matches!(
+                record.status,
+                TurnStatus::Running | TurnStatus::CancelRequested
+            ) {
+                return Err(TurnError::InvalidTransition {
+                    from: record.status,
+                    to: TurnStatus::RecoveryRequired,
+                });
+            }
+            record.status = TurnStatus::RecoveryRequired;
+            record.failure = Some(failure.clone());
+            record.runner_id = None;
+            record.lease_token = None;
+            record.lease_expires_at = None;
+            record.event_cursor = self.next_cursor();
+            self.update_active_lock(&record, Utc::now());
+            let state = record.state();
+            self.push_event(
+                &record,
+                TurnEventKind::RecoveryRequired,
+                Some(failure.into_category()),
+            );
+            Ok(state)
+        })();
+        self.records.insert(record.run_id, record);
         result
     }
 

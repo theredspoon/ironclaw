@@ -12,17 +12,20 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_turns::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, BlockedReason,
     CancelRunRequest, DefaultTurnCoordinator, GateRef, GetRunStateRequest, IdempotencyKey,
-    InMemoryTurnEventSink, InMemoryTurnStateStore, InMemoryTurnStateStoreLimits,
-    ReplyTargetBindingRef, ResumeTurnRequest, RunProfileRequest, RunProfileVersion,
-    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, SubmitTurnRequest,
-    SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnCheckpointId,
-    TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventSink,
+    InMemoryTurnEventSink, InMemoryTurnStateStore, InMemoryTurnStateStoreLimits, LoopCompleted,
+    LoopCompletionKind, LoopExit, LoopExitInvalidHandling, LoopExitValidationPolicy, LoopGateRef,
+    LoopMessageRef, ReplyTargetBindingRef, ResumeTurnRequest, RunProfileId, RunProfileRequest,
+    RunProfileVersion, SanitizedCancelReason, SanitizedFailure, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy,
+    TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventSink,
     TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnLeaseToken, TurnLifecycleEvent,
-    TurnLockVersion, TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
+    TurnLockVersion, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     events::EventCursor,
     runner::{
-        BlockRunRequest, CancelRunCompletionRequest, ClaimRunRequest, CompleteRunRequest,
-        FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest, TurnRunTransitionPort,
+        ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
+        CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest,
+        FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
+        RecoverExpiredLeasesResponse, TurnRunTransitionPort, apply_loop_exit,
     },
 };
 
@@ -1461,7 +1464,14 @@ async fn cancel_recovery_required_run_releases_lock_and_allows_new_submit() {
         .unwrap();
     assert_eq!(cancelled.status, TurnStatus::Cancelled);
     assert!(!cancelled.already_terminal);
-    assert!(store.persistence_snapshot().active_locks.is_empty());
+    let snapshot = store.persistence_snapshot();
+    assert!(snapshot.active_locks.is_empty());
+    let run = snapshot
+        .runs
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(run.failure, None);
 
     let replacement = coordinator
         .submit_turn(submit_request("thread-a", "idem-submit-replacement"))
@@ -1938,6 +1948,83 @@ fn actor() -> TurnActor {
     TurnActor::new(UserId::new("user1").unwrap())
 }
 
+struct AtomicLoopExitPort {
+    state: Mutex<TurnStatus>,
+}
+
+#[async_trait::async_trait]
+impl TurnRunTransitionPort for AtomicLoopExitPort {
+    async fn claim_next_run(
+        &self,
+        _request: ClaimRunRequest,
+    ) -> Result<Option<ClaimedTurnRun>, TurnError> {
+        panic!("cancelled loop-exit application must not claim runs")
+    }
+
+    async fn heartbeat(&self, _request: HeartbeatRequest) -> Result<EventCursor, TurnError> {
+        panic!("cancelled loop-exit application must not heartbeat")
+    }
+
+    async fn recover_expired_leases(
+        &self,
+        _request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
+        panic!("cancelled loop-exit application must not recover leases")
+    }
+
+    async fn block_run(&self, _request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not block runs")
+    }
+
+    async fn complete_run(&self, _request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not complete runs")
+    }
+
+    async fn cancel_run(
+        &self,
+        _request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must use atomic cancelled-exit transition")
+    }
+
+    async fn fail_run(&self, _request: FailRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not fail runs")
+    }
+
+    async fn record_recovery_required(
+        &self,
+        _request: ironclaw_turns::runner::RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not use a separate recovery transition")
+    }
+
+    async fn apply_validated_loop_exit(
+        &self,
+        request: ApplyValidatedLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut status = self.state.lock().unwrap();
+        let next_status = *status;
+        *status = TurnStatus::Failed;
+        drop(status);
+        Ok(TurnRunState {
+            scope: scope("thread-a"),
+            turn_id: ironclaw_turns::TurnId::new(),
+            run_id: request.run_id,
+            status: next_status,
+            accepted_message_ref: AcceptedMessageRef::new("message-thread-a").unwrap(),
+            source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
+            resolved_run_profile_id: RunProfileId::new("default").unwrap(),
+            resolved_run_profile_version: RunProfileVersion::new(1),
+            received_at: received_at(),
+            checkpoint_id: None,
+            gate_ref: None,
+            failure: None,
+            event_cursor: EventCursor(1),
+        })
+    }
+}
+
 struct BlockingAdmissionPolicy {
     calls: AtomicUsize,
     entered: mpsc::Sender<()>,
@@ -2011,4 +2098,486 @@ impl TurnAdmissionPolicy for DenyAll {
             AdmissionRejectionReason::TenantLimit,
         ))
     }
+}
+
+#[tokio::test]
+async fn loop_exit_application_completes_after_validation_and_releases_lock() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let completed = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: completed_exit("exit:completed"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: true,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(completed.status, TurnStatus::Completed);
+    let next = coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-b"))
+        .await
+        .unwrap();
+    assert_ne!(accepted_run_id(&next), run_id);
+}
+
+#[tokio::test]
+async fn loop_exit_application_blocks_with_checkpoint_and_keeps_lock() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let checkpoint_id = TurnCheckpointId::new();
+    let gate_ref = LoopGateRef::new("gate:approval-gate").unwrap();
+
+    let blocked = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::Blocked(ironclaw_turns::LoopBlocked {
+                kind: ironclaw_turns::LoopBlockedKind::Approval,
+                gate_ref: gate_ref.clone(),
+                checkpoint_id,
+                exit_id: ironclaw_turns::LoopExitId::new("exit:blocked").unwrap(),
+            }),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: true,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(blocked.status, TurnStatus::BlockedApproval);
+    assert_eq!(blocked.checkpoint_id, Some(checkpoint_id));
+    assert_eq!(
+        blocked.gate_ref,
+        Some(GateRef::new(gate_ref.as_str()).unwrap())
+    );
+    assert!(matches!(
+        coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-b"))
+            .await
+            .unwrap_err(),
+        TurnError::ThreadBusy(_)
+    ));
+}
+
+#[tokio::test]
+async fn invalid_loop_exit_application_records_recovery_required_and_keeps_lock() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let recovered = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: completed_exit("exit:unverified-completed"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.status, TurnStatus::RecoveryRequired);
+    assert_eq!(
+        recovered.failure.as_ref().map(SanitizedFailure::category),
+        Some("driver_protocol_violation")
+    );
+    assert!(matches!(
+        coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-b"))
+            .await
+            .unwrap_err(),
+        TurnError::ThreadBusy(_)
+    ));
+}
+
+#[tokio::test]
+async fn loop_exit_application_fails_after_validation_and_releases_lock() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::failed(
+                ironclaw_turns::LoopFailureKind::IterationLimit,
+                ironclaw_turns::LoopExitId::new("exit:failed").unwrap(),
+            ),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert_eq!(
+        failed.failure.as_ref().map(SanitizedFailure::category),
+        Some("iteration_limit")
+    );
+    let next = coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-b"))
+        .await
+        .unwrap();
+    assert_ne!(accepted_run_id(&next), run_id);
+}
+
+#[tokio::test]
+async fn loop_exit_application_uses_single_atomic_transition_port_call() {
+    let port = AtomicLoopExitPort {
+        state: Mutex::new(TurnStatus::Cancelled),
+    };
+
+    let state = apply_loop_exit(
+        &port,
+        ApplyLoopExitRequest {
+            run_id: TurnRunId::new(),
+            runner_id: TurnRunnerId::new(),
+            lease_token: TurnLeaseToken::new(),
+            exit: completed_exit("exit:completed-cancel-race"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: true,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state.status, TurnStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn non_cancelled_loop_exit_after_public_cancel_does_not_terminally_cancel() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator
+        .cancel_run(cancel_request("thread-a", run_id, "idem-cancel-a"))
+        .await
+        .unwrap();
+
+    let completed_after_cancel = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: completed_exit("exit:completed-after-cancel"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: true,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        completed_after_cancel,
+        TurnError::InvalidTransition {
+            from: TurnStatus::CancelRequested,
+            to: TurnStatus::Completed,
+        }
+    );
+
+    let recovered_after_cancel = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: completed_exit("exit:invalid-after-cancel"),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered_after_cancel.status, TurnStatus::RecoveryRequired);
+    assert_eq!(
+        recovered_after_cancel
+            .failure
+            .as_ref()
+            .map(SanitizedFailure::category),
+        Some("driver_protocol_violation")
+    );
+    assert!(matches!(
+        coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-b"))
+            .await
+            .unwrap_err(),
+        TurnError::ThreadBusy(_)
+    ));
+}
+
+#[tokio::test]
+async fn observed_cancelled_loop_exit_without_recorded_cancel_enters_recovery_required() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let recovered = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::cancelled_for_observed_interrupt(
+                ironclaw_turns::LoopExitId::new("exit:cancelled-unrecorded").unwrap(),
+            ),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: true,
+                invalid_handling: LoopExitInvalidHandling::FailTerminal,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(recovered.status, TurnStatus::RecoveryRequired);
+    assert_eq!(
+        recovered.failure.as_ref().map(SanitizedFailure::category),
+        Some("interrupted_unexpectedly")
+    );
+    assert!(matches!(
+        coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-b"))
+            .await
+            .unwrap_err(),
+        TurnError::ThreadBusy(_)
+    ));
+
+    let cancelled = coordinator
+        .cancel_run(CancelRunRequest {
+            scope: scope("thread-a"),
+            actor: actor(),
+            run_id,
+            reason: SanitizedCancelReason::OperatorRequested,
+            idempotency_key: IdempotencyKey::new("idem-cancel-after-unrecorded-interrupt").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
+    let snapshot = store.persistence_snapshot();
+    let run = snapshot
+        .runs
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(run.failure, None);
+}
+
+#[tokio::test]
+async fn loop_exit_application_cancels_only_after_public_cancel_request() {
+    let (coordinator, store) = coordinator();
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator
+        .cancel_run(cancel_request("thread-a", run_id, "idem-cancel-a"))
+        .await
+        .unwrap();
+
+    let cancelled = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::cancelled_for_observed_interrupt(
+                ironclaw_turns::LoopExitId::new("exit:cancelled").unwrap(),
+            ),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: true,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
+    let next = coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-b"))
+        .await
+        .unwrap();
+    assert_ne!(accepted_run_id(&next), run_id);
+}
+
+fn completed_exit(exit_id: &str) -> LoopExit {
+    LoopExit::Completed(LoopCompleted {
+        completion_kind: LoopCompletionKind::FinalReply,
+        reply_message_refs: vec![LoopMessageRef::new("msg:assistant-final").unwrap()],
+        result_refs: vec![],
+        final_checkpoint_id: None,
+        usage_summary_ref: None,
+        exit_id: ironclaw_turns::LoopExitId::new(exit_id).unwrap(),
+    })
 }
