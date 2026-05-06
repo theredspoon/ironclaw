@@ -107,7 +107,10 @@ async fn replay_projection_updates_return_rebase_signal_for_foreign_or_stale_cur
     let error = service
         .updates(ProjectionRequest {
             scope: ProjectionScope::from_resource_scope(&scope),
-            after: Some(ProjectionCursor::new(EventCursor::new(99))),
+            after: Some(ProjectionCursor::for_scope(
+                ProjectionScope::from_resource_scope(&scope),
+                EventCursor::new(99),
+            )),
             limit: 16,
         })
         .await
@@ -167,7 +170,10 @@ async fn replay_projection_updates_resume_after_projection_cursor() {
     let replay = service
         .updates(ProjectionRequest {
             scope: ProjectionScope::from_resource_scope(&scope),
-            after: Some(ProjectionCursor::new(first.cursor)),
+            after: Some(ProjectionCursor::for_scope(
+                ProjectionScope::from_resource_scope(&scope),
+                first.cursor,
+            )),
             limit: 16,
         })
         .await
@@ -228,7 +234,10 @@ async fn replay_projection_updates_preserve_running_process_state_after_checkpoi
     let replay = service
         .updates(ProjectionRequest {
             scope: ProjectionScope::from_resource_scope(&scope),
-            after: Some(ProjectionCursor::new(started.cursor)),
+            after: Some(ProjectionCursor::for_scope(
+                ProjectionScope::from_resource_scope(&scope),
+                started.cursor,
+            )),
             limit: 16,
         })
         .await
@@ -654,7 +663,10 @@ async fn replay_projection_updates_with_small_limit_handles_long_prefix() {
 
     // Resume from "just before the tail" so `updates(limit=1)` returns one
     // new event and must fold the prefix to reconstruct the touched run.
-    let resume_after = ProjectionCursor::new(EventCursor::new(prefix_len as u64 - 1));
+    let resume_after = ProjectionCursor::for_scope(
+        ProjectionScope::from_resource_scope(&scope),
+        EventCursor::new(prefix_len as u64 - 1),
+    );
     let replay = service
         .updates(ProjectionRequest {
             scope: ProjectionScope::from_resource_scope(&scope),
@@ -778,4 +790,105 @@ async fn replay_projection_updates_rejects_limit_above_max() {
         .await
         .expect_err("updates() must enforce the same cap as snapshot()");
     assert!(matches!(err, ProjectionError::InvalidRequest { .. }));
+}
+
+// -----------------------------------------------------------------------------
+// Regression: PR #3212 review feedback — projection cursors must be scope-bound
+// -----------------------------------------------------------------------------
+//
+// Cursors returned by the projection service must not be reusable across
+// projection scopes. The durable runtime stream is partitioned by
+// `(tenant, user, agent)`, while project / mission / thread / process
+// filtering happens inside the read filter. A cursor minted while reading
+// thread B can carry a runtime number that lies inside the shared stream of
+// thread A — passing it to `updates(thread_a_scope, after=cursor_from_b)`
+// would make the durable log accept the cursor and return an empty replay,
+// silently skipping thread A's earlier events at lower runtime cursors
+// instead of forcing a snapshot/rebase.
+
+#[tokio::test]
+async fn replay_projection_rejects_cursor_minted_under_a_different_scope() {
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let service = ReplayEventProjectionService::new(Arc::clone(&log));
+    let capability = capability_id();
+    let thread_a = ThreadId::new("thread-a").unwrap();
+    let thread_b = ThreadId::new("thread-b").unwrap();
+    let scope_a = scope_for_thread(thread_a.clone());
+    let scope_b = scope_for_thread(thread_b.clone());
+
+    // Seed thread A first so it has an event at a low runtime cursor that
+    // a foreign cursor would otherwise jump over.
+    let thread_a_event = log
+        .append(RuntimeEvent::dispatch_requested(
+            scope_a.clone(),
+            capability.clone(),
+        ))
+        .await
+        .unwrap();
+    // Seed thread B and capture the cursor it returned.
+    let thread_b_event = log
+        .append(RuntimeEvent::dispatch_requested(
+            scope_b.clone(),
+            capability.clone(),
+        ))
+        .await
+        .unwrap();
+    assert!(thread_b_event.cursor > thread_a_event.cursor);
+
+    // Take the cursor minted for thread B's scope and try to use it as the
+    // resume cursor for thread A.
+    let projection_scope_a = ProjectionScope::from_resource_scope(&scope_a);
+    let projection_scope_b = ProjectionScope::from_resource_scope(&scope_b);
+    let foreign_cursor = ProjectionCursor::for_scope(projection_scope_b, thread_b_event.cursor);
+
+    let error = service
+        .updates(ProjectionRequest {
+            scope: projection_scope_a.clone(),
+            after: Some(foreign_cursor.clone()),
+            limit: 16,
+        })
+        .await
+        .expect_err("cross-scope cursor must be rejected, not silently consumed");
+
+    match error {
+        ProjectionError::RebaseRequired {
+            requested,
+            earliest,
+        } => {
+            assert_eq!(*requested, foreign_cursor);
+            assert_eq!(earliest.scope, projection_scope_a);
+        }
+        other => panic!("expected RebaseRequired for cross-scope cursor, got {other:?}"),
+    }
+
+    // Resume from the legitimate origin for thread A still sees thread A's
+    // earlier event — a positive control proving the rejection above did
+    // not paper over a real read failure.
+    let snapshot = service
+        .snapshot(ProjectionRequest {
+            scope: projection_scope_a.clone(),
+            after: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot.timeline.entries.len(), 1);
+    assert_eq!(
+        snapshot.timeline.entries[0].thread_id.as_ref(),
+        Some(&thread_a)
+    );
+
+    // The same foreign cursor must also be rejected by `snapshot()`.
+    let snapshot_error = service
+        .snapshot(ProjectionRequest {
+            scope: projection_scope_a,
+            after: Some(foreign_cursor),
+            limit: 16,
+        })
+        .await
+        .expect_err("snapshot() must enforce the same scope binding as updates()");
+    assert!(matches!(
+        snapshot_error,
+        ProjectionError::RebaseRequired { .. }
+    ));
 }
