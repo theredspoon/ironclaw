@@ -2046,7 +2046,6 @@ async fn loop_exit_application_completes_after_validation_and_releases_lock() {
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
                 host_cancellation_observed: false,
-                cancel_request_recorded: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: true,
                 blocked_evidence_verified: false,
@@ -2103,7 +2102,6 @@ async fn loop_exit_application_blocks_with_checkpoint_and_keeps_lock() {
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
                 host_cancellation_observed: false,
-                cancel_request_recorded: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
                 blocked_evidence_verified: true,
@@ -2160,7 +2158,6 @@ async fn invalid_loop_exit_application_records_recovery_required_and_keeps_lock(
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
                 host_cancellation_observed: false,
-                cancel_request_recorded: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
                 blocked_evidence_verified: false,
@@ -2219,7 +2216,6 @@ async fn loop_exit_application_fails_after_validation_and_releases_lock() {
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
                 host_cancellation_observed: false,
-                cancel_request_recorded: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
                 blocked_evidence_verified: false,
@@ -2275,8 +2271,7 @@ async fn observed_cancelled_loop_exit_without_recorded_cancel_enters_recovery_re
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
                 host_cancellation_observed: true,
-                cancel_request_recorded: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                invalid_handling: LoopExitInvalidHandling::FailTerminal,
                 completion_refs_verified: false,
                 blocked_evidence_verified: false,
                 failure_evidence_verified: false,
@@ -2337,7 +2332,6 @@ async fn loop_exit_application_cancels_only_after_public_cancel_request() {
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
                 host_cancellation_observed: true,
-                cancel_request_recorded: true,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
                 blocked_evidence_verified: false,

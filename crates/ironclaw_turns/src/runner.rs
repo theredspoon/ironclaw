@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BlockedReason, LoopExit, LoopExitMapping, LoopExitValidationPolicy, SanitizedFailure,
     TurnCheckpointId, TurnError, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope,
-    TurnTimestamp, events::EventCursor,
+    TurnStatus, TurnTimestamp, events::EventCursor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,12 +149,29 @@ where
             .await
         }
         LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled) => {
-            port.cancel_run(CancelRunCompletionRequest {
-                run_id: request.run_id,
-                runner_id: request.runner_id,
-                lease_token: request.lease_token,
-            })
-            .await
+            match port
+                .cancel_run(CancelRunCompletionRequest {
+                    run_id: request.run_id,
+                    runner_id: request.runner_id,
+                    lease_token: request.lease_token,
+                })
+                .await
+            {
+                Ok(state) => Ok(state),
+                Err(TurnError::InvalidTransition {
+                    from: TurnStatus::Running,
+                    to: TurnStatus::Cancelled,
+                }) => {
+                    port.record_recovery_required(RecordRecoveryRequiredRequest {
+                        run_id: request.run_id,
+                        runner_id: request.runner_id,
+                        lease_token: request.lease_token,
+                        failure: SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            }
         }
         LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
             checkpoint_id,
