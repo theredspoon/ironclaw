@@ -151,11 +151,81 @@ macro_rules! bounded_ref {
     };
 }
 
+macro_rules! loop_ref {
+    ($name:ident, $kind:literal, $prefix:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, String> {
+                let value = value.into();
+                validate_loop_ref($kind, $prefix, &value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
 bounded_ref!(AcceptedMessageRef, "accepted_message_ref");
 bounded_ref!(SourceBindingRef, "source_binding_ref");
 bounded_ref!(ReplyTargetBindingRef, "reply_target_binding_ref");
 bounded_ref!(GateRef, "gate_ref");
 bounded_ref!(IdempotencyKey, "idempotency_key");
+bounded_ref!(RunProfileRequest, "run_profile_request");
+bounded_ref!(RunProfileId, "run_profile_id");
+loop_ref!(LoopExitId, "loop_exit_id", "exit:");
+loop_ref!(LoopMessageRef, "loop_message_ref", "msg:");
+loop_ref!(LoopResultRef, "loop_result_ref", "result:");
+loop_ref!(LoopGateRef, "loop_gate_ref", "gate:");
+loop_ref!(LoopUsageSummaryRef, "loop_usage_summary_ref", "usage:");
+loop_ref!(LoopDiagnosticRef, "loop_diagnostic_ref", "diag:");
+
+impl RunProfileId {
+    pub fn default_profile() -> Self {
+        Self("default".to_string())
+    }
+
+    pub fn from_request(request: &RunProfileRequest) -> Self {
+        Self(request.as_str().to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunProfileVersion(u64);
+
+impl RunProfileVersion {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 
 fn validate_ref(kind: &'static str, value: &str) -> Result<(), String> {
     if value.is_empty() {
@@ -166,6 +236,25 @@ fn validate_ref(kind: &'static str, value: &str) -> Result<(), String> {
     }
     if value.chars().any(|c| c == '\0' || c.is_control()) {
         return Err(format!("{kind} must not contain control characters"));
+    }
+    Ok(())
+}
+
+fn validate_loop_ref(kind: &'static str, prefix: &'static str, value: &str) -> Result<(), String> {
+    validate_ref(kind, value)?;
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return Err(format!("{kind} must start with {prefix}"));
+    };
+    if suffix.is_empty() {
+        return Err(format!("{kind} must include an opaque id after {prefix}"));
+    }
+    if !suffix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(format!(
+            "{kind} opaque id must contain only ASCII letters, digits, _, -, or ."
+        ));
     }
     Ok(())
 }

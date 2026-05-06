@@ -93,6 +93,20 @@ fn reborn_turns_public_surface_keeps_runner_api_explicit() {
 }
 
 #[test]
+fn reborn_turns_public_surface_uses_turn_ids_not_runtime_or_process_ids() {
+    let root = workspace_root();
+    let turns_src = root.join("crates/ironclaw_turns/src");
+    let mut violations = Vec::new();
+    collect_forbidden_turns_identifier_uses(&turns_src, &root, &mut violations);
+
+    assert!(
+        violations.is_empty(),
+        "ironclaw_turns public API must use TurnId/TurnRunId instead of lower runtime/process identifiers:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn reborn_runtime_http_egress_has_single_network_boundary() {
     let forbidden = [
         ForbiddenRuntimeNetworkUse {
@@ -160,6 +174,36 @@ fn reborn_runtime_http_egress_has_single_network_boundary() {
 struct ForbiddenRuntimeNetworkUse {
     pattern: &'static str,
     reason: &'static str,
+}
+
+fn collect_forbidden_turns_identifier_uses(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    violations: &mut Vec<String>,
+) {
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|err| panic!("failed to read dir entry: {err}"));
+        let path = entry.path();
+        if path.is_dir() {
+            collect_forbidden_turns_identifier_uses(&path, root, violations);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        for pattern in ["InvocationId", "ProcessId"] {
+            if contents.contains(pattern) {
+                violations.push(format!(
+                    "{} contains forbidden lower identifier `{pattern}`",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                ));
+            }
+        }
+    }
 }
 
 struct BoundaryRule {
@@ -310,6 +354,26 @@ fn boundary_rules() -> Vec<BoundaryRule> {
             ],
         },
         BoundaryRule {
+            crate_name: "ironclaw_reborn_event_store",
+            forbidden: vec![
+                "ironclaw_authorization",
+                "ironclaw_approvals",
+                "ironclaw_capabilities",
+                "ironclaw_dispatcher",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_host_runtime",
+                "ironclaw_secrets",
+                "ironclaw_network",
+                "ironclaw_mcp",
+                "ironclaw_processes",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_scripts",
+                "ironclaw_wasm",
+            ],
+        },
+        BoundaryRule {
             crate_name: "ironclaw_secrets",
             forbidden: vec![
                 "ironclaw_authorization",
@@ -426,6 +490,7 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_dispatcher",
                 "ironclaw_extensions",
                 "ironclaw_filesystem",
+                "ironclaw_host_runtime",
                 "ironclaw_mcp",
                 "ironclaw_memory",
                 "ironclaw_network",

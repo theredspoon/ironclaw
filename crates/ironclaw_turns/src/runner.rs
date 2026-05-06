@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     BlockedReason, SanitizedFailure, TurnCheckpointId, TurnError, TurnLeaseToken, TurnRunId,
-    TurnRunState, TurnRunnerId, TurnScope, events::EventCursor,
+    TurnRunState, TurnRunnerId, TurnScope, TurnTimestamp, events::EventCursor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,17 @@ pub struct HeartbeatRequest {
     pub run_id: TurnRunId,
     pub runner_id: TurnRunnerId,
     pub lease_token: TurnLeaseToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverExpiredLeasesRequest {
+    pub now: TurnTimestamp,
+    pub scope_filter: Option<TurnScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverExpiredLeasesResponse {
+    pub recovered: Vec<TurnRunState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,8 +63,16 @@ pub struct FailRunRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRunCompletionRequest {
+    pub run_id: TurnRunId,
+    pub runner_id: TurnRunnerId,
+    pub lease_token: TurnLeaseToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnRunnerOutcome {
     Completed,
+    Cancelled,
     Blocked {
         checkpoint_id: TurnCheckpointId,
         reason: BlockedReason,
@@ -72,9 +91,19 @@ pub trait TurnRunTransitionPort: Send + Sync {
 
     async fn heartbeat(&self, request: HeartbeatRequest) -> Result<EventCursor, TurnError>;
 
+    async fn recover_expired_leases(
+        &self,
+        request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError>;
+
     async fn block_run(&self, request: BlockRunRequest) -> Result<TurnRunState, TurnError>;
 
     async fn complete_run(&self, request: CompleteRunRequest) -> Result<TurnRunState, TurnError>;
+
+    async fn cancel_run(
+        &self,
+        request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError>;
 
     async fn fail_run(&self, request: FailRunRequest) -> Result<TurnRunState, TurnError>;
 }
