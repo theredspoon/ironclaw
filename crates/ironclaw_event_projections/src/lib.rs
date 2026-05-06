@@ -85,27 +85,41 @@ impl ProjectionScope {
 /// This first slice is runtime-event backed. The wrapper keeps callers from
 /// treating raw durable cursors as a stable product API and leaves room for
 /// audit/materialized checkpoints later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Cursors are **scope-bound**: every cursor carries the
+/// [`ProjectionScope`] under which it was minted. The durable stream is
+/// partitioned by `(tenant, user, agent)` while project / mission /
+/// thread / process filtering happens inside the read filter, so a cursor
+/// returned for thread B may have a runtime value that lies inside the
+/// shared stream of thread A. Replaying it under thread A's scope without
+/// scope-matching would silently skip thread A's earlier events. Resume
+/// rejects mismatched-scope cursors with
+/// [`ProjectionError::RebaseRequired`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ProjectionCursor {
     pub runtime: EventCursor,
+    pub scope: ProjectionScope,
 }
 
 impl ProjectionCursor {
-    pub fn new(runtime: EventCursor) -> Self {
-        Self { runtime }
+    /// Construct a cursor bound to `scope` at the given runtime position.
+    ///
+    /// Production callers should let the service mint cursors via
+    /// [`EventProjectionService::snapshot`] / [`EventProjectionService::updates`]
+    /// and pass them straight back into the next request. Direct construction
+    /// is provided for tests and adapters that already hold authority for
+    /// the scope they pass in.
+    pub fn for_scope(scope: ProjectionScope, runtime: EventCursor) -> Self {
+        Self { runtime, scope }
     }
 
-    pub fn origin() -> Self {
+    /// Cursor that precedes every record in `scope`.
+    pub fn origin_for_scope(scope: ProjectionScope) -> Self {
         Self {
             runtime: EventCursor::origin(),
+            scope,
         }
-    }
-}
-
-impl Default for ProjectionCursor {
-    fn default() -> Self {
-        Self::origin()
     }
 }
 
@@ -212,8 +226,12 @@ pub enum ProjectionError {
         "projection rebase required: requested runtime cursor {requested:?} cannot replay from earliest retained runtime cursor {earliest:?}"
     )]
     RebaseRequired {
-        requested: ProjectionCursor,
-        earliest: ProjectionCursor,
+        // Boxed because `ProjectionCursor` carries the full
+        // `ProjectionScope` (stream + read scope) and inlining both
+        // into the error variant balloons every `Result` size on the
+        // happy path. Construction sites use `Box::new(..)`.
+        requested: Box<ProjectionCursor>,
+        earliest: Box<ProjectionCursor>,
     },
     #[error("projection source failed during {operation}")]
     Source { operation: &'static str },
@@ -264,13 +282,28 @@ impl ReplayEventProjectionService {
                 reason: "limit exceeds MAX_PROJECTION_PAGE_LIMIT",
             });
         }
+        // Reject cursors that were minted under a different scope. The
+        // durable stream is partitioned by `(tenant, user, agent)`, so a
+        // sibling thread/project/process within the same stream can mint
+        // a runtime cursor that the durable log accepts but that would
+        // silently skip records the requested scope had not yet seen.
+        // Force the consumer to rebase against a snapshot instead of
+        // returning a partial replay.
+        if let Some(cursor) = request.after.as_ref()
+            && cursor.scope != request.scope
+        {
+            return Err(ProjectionError::RebaseRequired {
+                requested: Box::new(cursor.clone()),
+                earliest: Box::new(ProjectionCursor::origin_for_scope(request.scope.clone())),
+            });
+        }
         let fetch_limit = request
             .limit
             .checked_add(1)
             .ok_or(ProjectionError::InvalidRequest {
                 reason: "limit is too large",
             })?;
-        let after = request.after.map(|cursor| cursor.runtime);
+        let after = request.after.as_ref().map(|cursor| cursor.runtime);
         let replay = self
             .runtime_log
             .read_after_cursor(
@@ -280,7 +313,9 @@ impl ReplayEventProjectionService {
                 fetch_limit,
             )
             .await
-            .map_err(|error| map_projection_error(error, after, "runtime replay"))?;
+            .map_err(|error| {
+                map_projection_error(error, after, "runtime replay", &request.scope)
+            })?;
         let mut entries = replay.entries;
         let truncated = entries.len() > request.limit;
         if truncated {
@@ -296,9 +331,70 @@ impl ReplayEventProjectionService {
         };
         Ok(ProjectedRuntimePage {
             entries,
-            next_cursor: ProjectionCursor::new(next_cursor),
+            next_cursor: ProjectionCursor::for_scope(request.scope.clone(), next_cursor),
             truncated,
         })
+    }
+
+    /// Fold the entire scoped runtime stream into the current run-state
+    /// projection for every invocation visible under `scope`.
+    ///
+    /// `snapshot()` uses this so the `runs` projection always reflects the
+    /// current scoped stream head, independent of how the timeline page was
+    /// paginated. Without this, a `snapshot(limit=1)` whose page contains
+    /// only `DispatchRequested` for a run that has already terminated would
+    /// surface a `Running` `RunStatusProjection` while the terminal event
+    /// sits unread on the next page — silently shipping stale run state to
+    /// consumers that use snapshots to rebase after a replay gap.
+    ///
+    /// The same bounded-memory contract applies: pages are folded
+    /// incrementally, allocation is `O(scoped runs)` regardless of stream
+    /// length, and scanning more than [`STATE_REPLAY_MAX_EVENTS`] events
+    /// surfaces [`ProjectionError::RebaseRequired`] instead of silently
+    /// returning a partial run-state view.
+    async fn fold_runtime_to_head(
+        &self,
+        scope: &ProjectionScope,
+    ) -> Result<HashMap<InvocationId, RunStatusProjection>, ProjectionError> {
+        let mut runs = HashMap::<InvocationId, RunStatusProjection>::new();
+        let mut after: Option<EventCursor> = None;
+        let mut scanned: usize = 0;
+        loop {
+            let replay = self
+                .runtime_log
+                .read_after_cursor(
+                    &scope.stream,
+                    &scope.read_scope,
+                    after,
+                    STATE_REPLAY_PAGE_LIMIT,
+                )
+                .await
+                .map_err(|error| {
+                    map_projection_error(error, after, "snapshot run-state replay", scope)
+                })?;
+            if replay.entries.is_empty() {
+                break;
+            }
+            for entry in &replay.entries {
+                scanned = scanned.saturating_add(1);
+                if scanned > STATE_REPLAY_MAX_EVENTS {
+                    return Err(ProjectionError::RebaseRequired {
+                        requested: Box::new(ProjectionCursor::origin_for_scope(scope.clone())),
+                        earliest: Box::new(ProjectionCursor::for_scope(
+                            scope.clone(),
+                            entry.cursor,
+                        )),
+                    });
+                }
+                apply_run_event(&mut runs, entry);
+            }
+            if after == Some(replay.next_cursor) {
+                // The durable log made no progress — stream exhausted.
+                break;
+            }
+            after = Some(replay.next_cursor);
+        }
+        Ok(runs)
     }
 
     /// Fold the runtime-event prefix `(origin, until]` for `scope` into the
@@ -334,7 +430,9 @@ impl ReplayEventProjectionService {
                     STATE_REPLAY_PAGE_LIMIT,
                 )
                 .await
-                .map_err(|error| map_projection_error(error, after, "runtime state replay"))?;
+                .map_err(|error| {
+                    map_projection_error(error, after, "runtime state replay", scope)
+                })?;
             if replay.entries.is_empty() {
                 break;
             }
@@ -346,8 +444,11 @@ impl ReplayEventProjectionService {
                 scanned = scanned.saturating_add(1);
                 if scanned > STATE_REPLAY_MAX_EVENTS {
                     return Err(ProjectionError::RebaseRequired {
-                        requested: ProjectionCursor::new(until),
-                        earliest: ProjectionCursor::new(entry.cursor),
+                        requested: Box::new(ProjectionCursor::for_scope(scope.clone(), until)),
+                        earliest: Box::new(ProjectionCursor::for_scope(
+                            scope.clone(),
+                            entry.cursor,
+                        )),
                     });
                 }
                 if touched.contains(&entry.record.scope.invocation_id) {
@@ -382,9 +483,17 @@ impl EventProjectionService for ReplayEventProjectionService {
         &self,
         request: ProjectionRequest,
     ) -> Result<ProjectionSnapshot, ProjectionError> {
+        let scope = request.scope.clone();
         let page = self.read_runtime(request).await?;
         let timeline = project_timeline(&page.entries);
-        let runs = project_runs(&page.entries);
+        // Snapshot's `runs` always reflect the current scoped stream head,
+        // not just the events present in `timeline`. A truncated timeline
+        // page (or a `limit=1` request) would otherwise surface a stale
+        // `Running` status for a run whose terminal event lives on the
+        // next page — see PR #3212 review feedback (discussion_r3195454963).
+        let folded = self.fold_runtime_to_head(&scope).await?;
+        let mut runs: Vec<RunStatusProjection> = folded.into_values().collect();
+        sort_runs_for_projection(&mut runs);
         Ok(ProjectionSnapshot {
             timeline,
             runs,
@@ -450,16 +559,6 @@ fn project_timeline_entry(entry: &EventLogEntry<RuntimeEvent>) -> TimelineEntry 
         output_bytes: event.output_bytes,
         error_kind: event.error_kind.clone().map(sanitize_error_kind),
     }
-}
-
-fn project_runs(entries: &[EventLogEntry<RuntimeEvent>]) -> Vec<RunStatusProjection> {
-    let mut runs = HashMap::<InvocationId, RunStatusProjection>::new();
-    for entry in entries {
-        apply_run_event(&mut runs, entry);
-    }
-    let mut runs = runs.into_values().collect::<Vec<_>>();
-    sort_runs_for_projection(&mut runs);
-    runs
 }
 
 fn sort_runs_for_projection(runs: &mut [RunStatusProjection]) {
@@ -564,14 +663,15 @@ fn map_projection_error(
     error: EventError,
     _requested_after: Option<EventCursor>,
     operation: &'static str,
+    scope: &ProjectionScope,
 ) -> ProjectionError {
     match error {
         EventError::ReplayGap {
             requested,
             earliest,
         } => ProjectionError::RebaseRequired {
-            requested: ProjectionCursor::new(requested),
-            earliest: ProjectionCursor::new(earliest),
+            requested: Box::new(ProjectionCursor::for_scope(scope.clone(), requested)),
+            earliest: Box::new(ProjectionCursor::for_scope(scope.clone(), earliest)),
         },
         EventError::InvalidReplayRequest { .. } => ProjectionError::InvalidRequest {
             reason: "invalid durable replay request",
