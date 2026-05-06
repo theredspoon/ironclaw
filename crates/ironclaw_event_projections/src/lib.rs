@@ -336,6 +336,67 @@ impl ReplayEventProjectionService {
         })
     }
 
+    /// Fold the entire scoped runtime stream into the current run-state
+    /// projection for every invocation visible under `scope`.
+    ///
+    /// `snapshot()` uses this so the `runs` projection always reflects the
+    /// current scoped stream head, independent of how the timeline page was
+    /// paginated. Without this, a `snapshot(limit=1)` whose page contains
+    /// only `DispatchRequested` for a run that has already terminated would
+    /// surface a `Running` `RunStatusProjection` while the terminal event
+    /// sits unread on the next page — silently shipping stale run state to
+    /// consumers that use snapshots to rebase after a replay gap.
+    ///
+    /// The same bounded-memory contract applies: pages are folded
+    /// incrementally, allocation is `O(scoped runs)` regardless of stream
+    /// length, and scanning more than [`STATE_REPLAY_MAX_EVENTS`] events
+    /// surfaces [`ProjectionError::RebaseRequired`] instead of silently
+    /// returning a partial run-state view.
+    async fn fold_runtime_to_head(
+        &self,
+        scope: &ProjectionScope,
+    ) -> Result<HashMap<InvocationId, RunStatusProjection>, ProjectionError> {
+        let mut runs = HashMap::<InvocationId, RunStatusProjection>::new();
+        let mut after: Option<EventCursor> = None;
+        let mut scanned: usize = 0;
+        loop {
+            let replay = self
+                .runtime_log
+                .read_after_cursor(
+                    &scope.stream,
+                    &scope.read_scope,
+                    after,
+                    STATE_REPLAY_PAGE_LIMIT,
+                )
+                .await
+                .map_err(|error| {
+                    map_projection_error(error, after, "snapshot run-state replay", scope)
+                })?;
+            if replay.entries.is_empty() {
+                break;
+            }
+            for entry in &replay.entries {
+                scanned = scanned.saturating_add(1);
+                if scanned > STATE_REPLAY_MAX_EVENTS {
+                    return Err(ProjectionError::RebaseRequired {
+                        requested: Box::new(ProjectionCursor::origin_for_scope(scope.clone())),
+                        earliest: Box::new(ProjectionCursor::for_scope(
+                            scope.clone(),
+                            entry.cursor,
+                        )),
+                    });
+                }
+                apply_run_event(&mut runs, entry);
+            }
+            if after == Some(replay.next_cursor) {
+                // The durable log made no progress — stream exhausted.
+                break;
+            }
+            after = Some(replay.next_cursor);
+        }
+        Ok(runs)
+    }
+
     /// Fold the runtime-event prefix `(origin, until]` for `scope` into the
     /// run-state projection for the invocations identified by `touched`.
     ///
@@ -422,9 +483,17 @@ impl EventProjectionService for ReplayEventProjectionService {
         &self,
         request: ProjectionRequest,
     ) -> Result<ProjectionSnapshot, ProjectionError> {
+        let scope = request.scope.clone();
         let page = self.read_runtime(request).await?;
         let timeline = project_timeline(&page.entries);
-        let runs = project_runs(&page.entries);
+        // Snapshot's `runs` always reflect the current scoped stream head,
+        // not just the events present in `timeline`. A truncated timeline
+        // page (or a `limit=1` request) would otherwise surface a stale
+        // `Running` status for a run whose terminal event lives on the
+        // next page — see PR #3212 review feedback (discussion_r3195454963).
+        let folded = self.fold_runtime_to_head(&scope).await?;
+        let mut runs: Vec<RunStatusProjection> = folded.into_values().collect();
+        sort_runs_for_projection(&mut runs);
         Ok(ProjectionSnapshot {
             timeline,
             runs,
@@ -490,16 +559,6 @@ fn project_timeline_entry(entry: &EventLogEntry<RuntimeEvent>) -> TimelineEntry 
         output_bytes: event.output_bytes,
         error_kind: event.error_kind.clone().map(sanitize_error_kind),
     }
-}
-
-fn project_runs(entries: &[EventLogEntry<RuntimeEvent>]) -> Vec<RunStatusProjection> {
-    let mut runs = HashMap::<InvocationId, RunStatusProjection>::new();
-    for entry in entries {
-        apply_run_event(&mut runs, entry);
-    }
-    let mut runs = runs.into_values().collect::<Vec<_>>();
-    sort_runs_for_projection(&mut runs);
-    runs
 }
 
 fn sort_runs_for_projection(runs: &mut [RunStatusProjection]) {

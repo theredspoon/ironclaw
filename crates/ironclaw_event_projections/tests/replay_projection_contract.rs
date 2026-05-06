@@ -892,3 +892,64 @@ async fn replay_projection_rejects_cursor_minted_under_a_different_scope() {
         ProjectionError::RebaseRequired { .. }
     ));
 }
+
+// -----------------------------------------------------------------------------
+// Regression: PR #3212 review feedback — `snapshot()` must not surface stale
+// run status when the timeline page is truncated.
+// -----------------------------------------------------------------------------
+//
+// `snapshot()` previously derived `runs` from the single timeline page
+// returned by `read_runtime`. A consumer using a snapshot to rebase after
+// a replay gap could therefore receive a current-looking
+// `RunStatusProjection` whose terminal event was actually sitting on the
+// next, unread page — masking failures and leaving UIs/workflows tracking
+// long-finished runs as still "Running".
+
+#[tokio::test]
+async fn replay_projection_snapshot_runs_reflect_current_stream_head_under_truncation() {
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let service = ReplayEventProjectionService::new(Arc::clone(&log));
+    let scope = scope_for_thread(ThreadId::new("thread-a").unwrap());
+    let capability = capability_id();
+    let provider = provider_id();
+
+    // Two events for the same invocation: a Dispatch* request followed by
+    // a Dispatch* terminal. The implicit `InvocationId` carried on both
+    // matches because they're built from the same `scope`.
+    log.append(RuntimeEvent::dispatch_requested(
+        scope.clone(),
+        capability.clone(),
+    ))
+    .await
+    .unwrap();
+    log.append(RuntimeEvent::dispatch_succeeded(
+        scope.clone(),
+        capability,
+        provider,
+        RuntimeKind::Script,
+        7,
+    ))
+    .await
+    .unwrap();
+
+    // `limit=1` truncates the timeline to the first event only — but the
+    // run-state projection must still reflect the terminal event sitting
+    // on the next page.
+    let snapshot = service
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.timeline.entries.len(), 1);
+    assert!(snapshot.truncated);
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(
+        snapshot.runs[0].status,
+        RunProjectionStatus::Completed,
+        "snapshot must fold runs through stream head; truncated timeline must not leak stale Running status"
+    );
+}
