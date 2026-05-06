@@ -79,11 +79,11 @@ pub struct RecordRecoveryRequiredRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplyCancelledLoopExitRequest {
+pub struct ApplyValidatedLoopExitRequest {
     pub run_id: TurnRunId,
     pub runner_id: TurnRunnerId,
     pub lease_token: TurnLeaseToken,
-    pub recovery_failure: SanitizedFailure,
+    pub mapping: LoopExitMapping,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,9 +138,9 @@ pub trait TurnRunTransitionPort: Send + Sync {
         request: RecordRecoveryRequiredRequest,
     ) -> Result<TurnRunState, TurnError>;
 
-    async fn apply_cancelled_loop_exit(
+    async fn apply_validated_loop_exit(
         &self,
-        request: ApplyCancelledLoopExitRequest,
+        request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError>;
 }
 
@@ -152,54 +152,11 @@ where
     P: TurnRunTransitionPort + ?Sized,
 {
     let decision = request.exit.validate(request.validation_policy);
-    match decision.mapping {
-        LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Completed) => {
-            port.complete_run(CompleteRunRequest {
-                run_id: request.run_id,
-                runner_id: request.runner_id,
-                lease_token: request.lease_token,
-            })
-            .await
-        }
-        LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled) => {
-            port.apply_cancelled_loop_exit(ApplyCancelledLoopExitRequest {
-                run_id: request.run_id,
-                runner_id: request.runner_id,
-                lease_token: request.lease_token,
-                recovery_failure: SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
-            })
-            .await
-        }
-        LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
-            checkpoint_id,
-            reason,
-        }) => {
-            port.block_run(BlockRunRequest {
-                run_id: request.run_id,
-                runner_id: request.runner_id,
-                lease_token: request.lease_token,
-                checkpoint_id,
-                reason,
-            })
-            .await
-        }
-        LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Failed { failure }) => {
-            port.fail_run(FailRunRequest {
-                run_id: request.run_id,
-                runner_id: request.runner_id,
-                lease_token: request.lease_token,
-                failure,
-            })
-            .await
-        }
-        LoopExitMapping::RecoveryRequired { failure } => {
-            port.record_recovery_required(RecordRecoveryRequiredRequest {
-                run_id: request.run_id,
-                runner_id: request.runner_id,
-                lease_token: request.lease_token,
-                failure,
-            })
-            .await
-        }
-    }
+    port.apply_validated_loop_exit(ApplyValidatedLoopExitRequest {
+        run_id: request.run_id,
+        runner_id: request.runner_id,
+        lease_token: request.lease_token,
+        mapping: decision.mapping,
+    })
+    .await
 }

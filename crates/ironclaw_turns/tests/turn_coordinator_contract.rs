@@ -22,7 +22,7 @@ use ironclaw_turns::{
     TurnLockVersion, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     events::EventCursor,
     runner::{
-        ApplyCancelledLoopExitRequest, ApplyLoopExitRequest, BlockRunRequest,
+        ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
         CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest,
         FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
         RecoverExpiredLeasesResponse, TurnRunTransitionPort, apply_loop_exit,
@@ -1948,12 +1948,12 @@ fn actor() -> TurnActor {
     TurnActor::new(UserId::new("user1").unwrap())
 }
 
-struct AtomicCancelledExitPort {
+struct AtomicLoopExitPort {
     state: Mutex<TurnStatus>,
 }
 
 #[async_trait::async_trait]
-impl TurnRunTransitionPort for AtomicCancelledExitPort {
+impl TurnRunTransitionPort for AtomicLoopExitPort {
     async fn claim_next_run(
         &self,
         _request: ClaimRunRequest,
@@ -1998,16 +1998,19 @@ impl TurnRunTransitionPort for AtomicCancelledExitPort {
         panic!("cancelled loop-exit application must not use a separate recovery transition")
     }
 
-    async fn apply_cancelled_loop_exit(
+    async fn apply_validated_loop_exit(
         &self,
-        request: ApplyCancelledLoopExitRequest,
+        request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
-        let status = *self.state.lock().unwrap();
+        let mut status = self.state.lock().unwrap();
+        let next_status = *status;
+        *status = TurnStatus::Failed;
+        drop(status);
         Ok(TurnRunState {
             scope: scope("thread-a"),
             turn_id: ironclaw_turns::TurnId::new(),
             run_id: request.run_id,
-            status,
+            status: next_status,
             accepted_message_ref: AcceptedMessageRef::new("message-thread-a").unwrap(),
             source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
@@ -2321,8 +2324,8 @@ async fn loop_exit_application_fails_after_validation_and_releases_lock() {
 }
 
 #[tokio::test]
-async fn cancelled_loop_exit_application_uses_single_atomic_transition_port_call() {
-    let port = AtomicCancelledExitPort {
+async fn loop_exit_application_uses_single_atomic_transition_port_call() {
+    let port = AtomicLoopExitPort {
         state: Mutex::new(TurnStatus::Cancelled),
     };
 
@@ -2332,14 +2335,12 @@ async fn cancelled_loop_exit_application_uses_single_atomic_transition_port_call
             run_id: TurnRunId::new(),
             runner_id: TurnRunnerId::new(),
             lease_token: TurnLeaseToken::new(),
-            exit: LoopExit::cancelled_for_observed_interrupt(
-                ironclaw_turns::LoopExitId::new("exit:cancelled-atomic").unwrap(),
-            ),
+            exit: completed_exit("exit:completed-cancel-race"),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
-                host_cancellation_observed: true,
+                host_cancellation_observed: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
+                completion_refs_verified: true,
                 blocked_evidence_verified: false,
                 failure_evidence_verified: false,
             },

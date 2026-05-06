@@ -9,7 +9,7 @@ use crate::{
     TurnIdempotencyRecord, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord, TurnRunState,
     TurnStateStore,
     runner::{
-        ApplyCancelledLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
+        ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
         RecordRecoveryRequiredRequest, RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse,
         TurnRunTransitionPort,
@@ -352,14 +352,14 @@ impl TurnRunTransitionPort for LibSqlTurnStateStore {
         finish_libsql_transaction(&conn, result).await?
     }
 
-    async fn apply_cancelled_loop_exit(
+    async fn apply_validated_loop_exit(
         &self,
-        request: ApplyCancelledLoopExitRequest,
+        request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
         let conn = self.begin_immediate().await?;
         let result = async {
             let store = self.load_store_from_conn(&conn).await?;
-            let result = store.apply_cancelled_loop_exit(request).await;
+            let result = store.apply_validated_loop_exit(request).await;
             libsql_replace_snapshot(&conn, &store.persistence_snapshot()).await?;
             Ok(result)
         }
@@ -588,15 +588,15 @@ impl TurnRunTransitionPort for PostgresTurnStateStore {
         result
     }
 
-    async fn apply_cancelled_loop_exit(
+    async fn apply_validated_loop_exit(
         &self,
-        request: ApplyCancelledLoopExitRequest,
+        request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
         let mut client = self.client().await?;
         let txn = client.transaction().await.map_err(db_error)?;
         lock_postgres_turn_tables(&txn, "SHARE ROW EXCLUSIVE MODE").await?;
         let store = self.load_store_from_txn(&txn).await?;
-        let result = store.apply_cancelled_loop_exit(request).await;
+        let result = store.apply_validated_loop_exit(request).await;
         postgres_replace_snapshot(&txn, &store.persistence_snapshot()).await?;
         txn.commit().await.map_err(db_error)?;
         result
