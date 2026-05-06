@@ -19,7 +19,8 @@ use ironclaw_turns::{
     SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy,
     TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventSink,
     TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnLeaseToken, TurnLifecycleEvent,
-    TurnLockVersion, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
+    TurnLockVersion, TurnRunId, TurnRunState, TurnRunWake, TurnRunWakeNotifier, TurnRunnerId,
+    TurnScope, TurnStatus,
     events::EventCursor,
     runner::{
         ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
@@ -143,6 +144,105 @@ async fn same_thread_active_run_returns_busy_but_different_threads_run_independe
         .await
         .unwrap();
     assert_ne!(accepted_run_id(&independent), first_run_id);
+}
+
+#[tokio::test]
+async fn submit_turn_wakes_runner_only_after_accepting_queued_run() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let notifier = Arc::new(RecordingWakeNotifier::default());
+    let coordinator = DefaultTurnCoordinator::new(store)
+        .with_wake_notifier(notifier.clone())
+        .with_admission_policy(Arc::new(DenyFirstThenAllow::default()));
+    let rejected_request = submit_request("thread-a", "idem-rejected");
+
+    let rejected = coordinator.submit_turn(rejected_request).await.unwrap_err();
+    assert!(matches!(rejected, TurnError::AdmissionRejected(_)));
+    assert!(notifier.wakes().is_empty());
+
+    let accepted_request = submit_request("thread-a", "idem-accepted");
+    let accepted = coordinator
+        .submit_turn(accepted_request.clone())
+        .await
+        .unwrap();
+    let run_id = accepted_run_id(&accepted);
+    assert_eq!(
+        notifier.wakes(),
+        vec![TurnRunWake {
+            scope: accepted_request.scope,
+            run_id,
+            status: TurnStatus::Queued,
+            event_cursor: EventCursor(1),
+        }]
+    );
+
+    let busy = coordinator
+        .submit_turn(submit_request("thread-a", "idem-busy"))
+        .await
+        .unwrap_err();
+    assert!(matches!(busy, TurnError::ThreadBusy(_)));
+    assert_eq!(notifier.wakes().len(), 1);
+}
+
+#[tokio::test]
+async fn resume_turn_wakes_runner_for_same_run_after_requeue() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let notifier = Arc::new(RecordingWakeNotifier::default());
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(notifier.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    notifier.clear();
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let gate_ref = GateRef::new("approval-gate").unwrap();
+    store
+        .block_run(BlockRunRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            checkpoint_id: TurnCheckpointId::new(),
+            reason: BlockedReason::Approval {
+                gate_ref: gate_ref.clone(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let resumed = coordinator
+        .resume_turn(ResumeTurnRequest {
+            scope: scope("thread-a"),
+            actor: actor(),
+            run_id,
+            gate_resolution_ref: gate_ref,
+            source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
+            idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        notifier.wakes(),
+        vec![TurnRunWake {
+            scope: scope("thread-a"),
+            run_id,
+            status: TurnStatus::Queued,
+            event_cursor: resumed.event_cursor,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -1946,6 +2046,27 @@ fn scope(thread: &str) -> TurnScope {
 
 fn actor() -> TurnActor {
     TurnActor::new(UserId::new("user1").unwrap())
+}
+
+#[derive(Default)]
+struct RecordingWakeNotifier {
+    wakes: Mutex<Vec<TurnRunWake>>,
+}
+
+impl RecordingWakeNotifier {
+    fn wakes(&self) -> Vec<TurnRunWake> {
+        self.wakes.lock().unwrap().clone()
+    }
+
+    fn clear(&self) {
+        self.wakes.lock().unwrap().clear();
+    }
+}
+
+impl TurnRunWakeNotifier for RecordingWakeNotifier {
+    fn notify_queued_run(&self, wake: TurnRunWake) {
+        self.wakes.lock().unwrap().push(wake);
+    }
 }
 
 struct AtomicLoopExitPort {
