@@ -1,6 +1,5 @@
 //! Hosted/enterprise security properties + sandboxed-per-deployment +
-//! `LocalShell` affordance gap + defense-in-depth between visibility filter
-//! and planner.
+//! `LocalShell` affordance gap.
 //!
 //! Restates the resolver's `hosted_family_never_resolves_to_provider_host_filesystem_or_shell`
 //! security property at the integration tier (sync `#[test]`) plus extends
@@ -9,10 +8,11 @@
 //! per-family profile set, and closes the `LocalShell` affordance dead-code
 //! gap with a synthetic in-test tool.
 //!
-//! Defense-in-depth: a planner test (`plan_capability(spawn_process,
-//! hosted_dev_policy)`) restates the planner's process-fail-closed for the
-//! hosted branch — proving the substrate fails closed even if the visibility
-//! filter were bypassed.
+//! Planner defense-in-depth (refusing `SpawnProcess`/`Network`/`UseSecret`
+//! against disabling policies) is covered by the substrate's
+//! `crates/ironclaw_host_runtime/src/planner.rs` unit tests and the
+//! `crates/ironclaw_host_runtime/tests/runtime_policy_planner_contract.rs`
+//! integration tests — not duplicated here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,13 +30,8 @@ use ironclaw::tools::{
 };
 use ironclaw_host_api::runtime_policy::{
     DeploymentMode, EffectiveRuntimePolicy, FilesystemBackendKind, NetworkMode, ProcessBackendKind,
-    RuntimeProfile, SecretMode,
+    RuntimeProfile,
 };
-use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityId, EffectKind, ExtensionId, PermissionMode, RuntimeKind,
-    TrustClass,
-};
-use ironclaw_host_runtime::{PlannerError, plan_capability};
 use ironclaw_runtime_policy::{OrgPolicyConstraints, ResolveRequest, resolve};
 
 // ---------------------------------------------------------------------------
@@ -65,20 +60,6 @@ fn resolve_yolo(
     .unwrap_or_else(|err| {
         panic!("resolve_yolo({deployment:?}, {profile:?}, admin={admin_approves}) failed: {err:?}")
     })
-}
-
-fn descriptor(id: &str, effects: Vec<EffectKind>) -> CapabilityDescriptor {
-    CapabilityDescriptor {
-        id: CapabilityId::new(id.to_string()).unwrap(),
-        provider: ExtensionId::new("test_extension".to_string()).unwrap(),
-        runtime: RuntimeKind::Script,
-        trust_ceiling: TrustClass::UserTrusted,
-        description: format!("test capability {id}"),
-        parameters_schema: serde_json::Value::Null,
-        effects,
-        default_permission: PermissionMode::Allow,
-        resource_profile: None,
-    }
 }
 
 async fn registry_with_host_fs_tools() -> ToolRegistry {
@@ -428,69 +409,4 @@ async fn local_shell_synthetic_tool_visible_only_under_local_host_process_backen
             assert_eq!(policy.process_backend, ProcessBackendKind::LocalHost);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Test 10: defense-in-depth — planner refuses spawn under hosted policy
-// ---------------------------------------------------------------------------
-
-#[test]
-fn planner_rejects_spawn_process_under_secure_default_when_visibility_filter_bypassed() {
-    // SecureDefault under LocalSingleUser resolves to ProcessBackendKind::None.
-    // A capability declaring SpawnProcess is filtered out of the model-facing
-    // tool list by the visibility filter — but if a stale plan or hallucinated
-    // call reached the planner, the planner must still fail closed.
-    let policy = resolve_simple(
-        DeploymentMode::LocalSingleUser,
-        RuntimeProfile::SecureDefault,
-    );
-    assert_eq!(policy.process_backend, ProcessBackendKind::None);
-
-    let cap = descriptor("test.spawn_process", vec![EffectKind::SpawnProcess]);
-    let err =
-        plan_capability(&cap, &policy).expect_err("planner must refuse SpawnProcess under None");
-    match err {
-        PlannerError::ProcessEffectsRequiredButProcessBackendIsNone { capability } => {
-            assert_eq!(capability.as_str(), "test.spawn_process");
-        }
-        other => panic!("expected ProcessEffectsRequiredButProcessBackendIsNone, got {other:?}"),
-    }
-}
-
-#[test]
-fn planner_rejects_network_capability_under_brokered_deny_combo() {
-    // Defense-in-depth for the network branch. Build a policy with NetworkMode::Deny
-    // by going through SecureDefault — the resolver's floor includes Brokered, not
-    // Deny, so we explicitly assert that and document the planner's parallel guard
-    // covers a deny-network policy if one is ever produced (tenant override path).
-    let policy = resolve_simple(
-        DeploymentMode::LocalSingleUser,
-        RuntimeProfile::SecureDefault,
-    );
-    // SecureDefault uses Brokered, not Deny — the planner's Deny guard is
-    // covered by its own unit tests and remains protected by this regression.
-    assert_eq!(policy.network_mode, NetworkMode::Brokered);
-
-    // Construct a synthetic policy with NetworkMode::Deny + SecretMode::Deny
-    // by mutating a resolver-produced policy in-place. This is testing-only;
-    // production code never mutates EffectiveRuntimePolicy after resolution.
-    let mut deny_policy = policy.clone();
-    deny_policy.network_mode = NetworkMode::Deny;
-    deny_policy.secret_mode = SecretMode::Deny;
-
-    let net_cap = descriptor("test.network", vec![EffectKind::Network]);
-    let err = plan_capability(&net_cap, &deny_policy)
-        .expect_err("planner must refuse Network effect under NetworkMode::Deny");
-    assert!(matches!(
-        err,
-        PlannerError::NetworkRequiredButNetworkModeIsDeny { .. }
-    ));
-
-    let secret_cap = descriptor("test.secret", vec![EffectKind::UseSecret]);
-    let err = plan_capability(&secret_cap, &deny_policy)
-        .expect_err("planner must refuse UseSecret under SecretMode::Deny");
-    assert!(matches!(
-        err,
-        PlannerError::SecretAccessRequiredButSecretModeIsDeny { .. }
-    ));
 }
