@@ -18,9 +18,10 @@ use crate::{
     TurnRunState, TurnScope, TurnStateStore, TurnStatus,
     events::EventCursor,
     runner::{
-        BlockRunRequest, CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun,
-        CompleteRunRequest, FailRunRequest, HeartbeatRequest, RecordRecoveryRequiredRequest,
-        RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse, TurnRunTransitionPort,
+        ApplyCancelledLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
+        ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
+        RecordRecoveryRequiredRequest, RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse,
+        TurnRunTransitionPort,
     },
 };
 
@@ -493,6 +494,19 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
             request.runner_id,
             request.lease_token,
             request.failure,
+        )
+    }
+
+    async fn apply_cancelled_loop_exit(
+        &self,
+        request: ApplyCancelledLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut inner = self.lock_inner()?;
+        inner.cancelled_loop_exit_transition(
+            request.run_id,
+            request.runner_id,
+            request.lease_token,
+            request.recovery_failure,
         )
     }
 }
@@ -1044,6 +1058,63 @@ impl Inner {
         })();
         self.records.insert(record.run_id, record);
         self.prune_terminal_records();
+        result
+    }
+
+    fn cancelled_loop_exit_transition(
+        &mut self,
+        run_id: TurnRunId,
+        runner_id: crate::TurnRunnerId,
+        lease_token: crate::TurnLeaseToken,
+        recovery_failure: SanitizedFailure,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut record = self.take_record(run_id)?;
+        let result = (|| {
+            ensure_active_lease(&record, runner_id, lease_token, Utc::now())?;
+            match record.status {
+                TurnStatus::CancelRequested => {
+                    record.status = TurnStatus::Cancelled;
+                    record.failure = None;
+                    record.runner_id = None;
+                    record.lease_token = None;
+                    record.lease_expires_at = None;
+                    record.event_cursor = self.next_cursor();
+                    self.release_active_lock(&record);
+                    self.remove_queued_run(record.run_id);
+                    let state = record.state();
+                    self.push_event(&record, TurnEventKind::Cancelled, None);
+                    self.mark_terminal(record.run_id);
+                    Ok(state)
+                }
+                TurnStatus::Running => {
+                    record.status = TurnStatus::RecoveryRequired;
+                    record.failure = Some(recovery_failure.clone());
+                    record.runner_id = None;
+                    record.lease_token = None;
+                    record.lease_expires_at = None;
+                    record.event_cursor = self.next_cursor();
+                    self.update_active_lock(&record, Utc::now());
+                    let state = record.state();
+                    self.push_event(
+                        &record,
+                        TurnEventKind::RecoveryRequired,
+                        Some(recovery_failure.into_category()),
+                    );
+                    Ok(state)
+                }
+                status => Err(TurnError::InvalidTransition {
+                    from: status,
+                    to: TurnStatus::Cancelled,
+                }),
+            }
+        })();
+        self.records.insert(record.run_id, record);
+        if result
+            .as_ref()
+            .is_ok_and(|state| state.status == TurnStatus::Cancelled)
+        {
+            self.prune_terminal_records();
+        }
         result
     }
 

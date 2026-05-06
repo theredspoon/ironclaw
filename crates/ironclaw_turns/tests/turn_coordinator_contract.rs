@@ -14,17 +14,18 @@ use ironclaw_turns::{
     CancelRunRequest, DefaultTurnCoordinator, GateRef, GetRunStateRequest, IdempotencyKey,
     InMemoryTurnEventSink, InMemoryTurnStateStore, InMemoryTurnStateStoreLimits, LoopCompleted,
     LoopCompletionKind, LoopExit, LoopExitInvalidHandling, LoopExitValidationPolicy, LoopGateRef,
-    LoopMessageRef, ReplyTargetBindingRef, ResumeTurnRequest, RunProfileRequest, RunProfileVersion,
-    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, SubmitTurnRequest,
-    SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnCheckpointId,
-    TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventSink,
+    LoopMessageRef, ReplyTargetBindingRef, ResumeTurnRequest, RunProfileId, RunProfileRequest,
+    RunProfileVersion, SanitizedCancelReason, SanitizedFailure, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy,
+    TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventSink,
     TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnLeaseToken, TurnLifecycleEvent,
-    TurnLockVersion, TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
+    TurnLockVersion, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     events::EventCursor,
     runner::{
-        ApplyLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest, ClaimRunRequest,
-        CompleteRunRequest, FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
-        TurnRunTransitionPort, apply_loop_exit,
+        ApplyCancelledLoopExitRequest, ApplyLoopExitRequest, BlockRunRequest,
+        CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest,
+        FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
+        RecoverExpiredLeasesResponse, TurnRunTransitionPort, apply_loop_exit,
     },
 };
 
@@ -1947,6 +1948,80 @@ fn actor() -> TurnActor {
     TurnActor::new(UserId::new("user1").unwrap())
 }
 
+struct AtomicCancelledExitPort {
+    state: Mutex<TurnStatus>,
+}
+
+#[async_trait::async_trait]
+impl TurnRunTransitionPort for AtomicCancelledExitPort {
+    async fn claim_next_run(
+        &self,
+        _request: ClaimRunRequest,
+    ) -> Result<Option<ClaimedTurnRun>, TurnError> {
+        panic!("cancelled loop-exit application must not claim runs")
+    }
+
+    async fn heartbeat(&self, _request: HeartbeatRequest) -> Result<EventCursor, TurnError> {
+        panic!("cancelled loop-exit application must not heartbeat")
+    }
+
+    async fn recover_expired_leases(
+        &self,
+        _request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
+        panic!("cancelled loop-exit application must not recover leases")
+    }
+
+    async fn block_run(&self, _request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not block runs")
+    }
+
+    async fn complete_run(&self, _request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not complete runs")
+    }
+
+    async fn cancel_run(
+        &self,
+        _request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must use atomic cancelled-exit transition")
+    }
+
+    async fn fail_run(&self, _request: FailRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not fail runs")
+    }
+
+    async fn record_recovery_required(
+        &self,
+        _request: ironclaw_turns::runner::RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("cancelled loop-exit application must not use a separate recovery transition")
+    }
+
+    async fn apply_cancelled_loop_exit(
+        &self,
+        request: ApplyCancelledLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let status = *self.state.lock().unwrap();
+        Ok(TurnRunState {
+            scope: scope("thread-a"),
+            turn_id: ironclaw_turns::TurnId::new(),
+            run_id: request.run_id,
+            status,
+            accepted_message_ref: AcceptedMessageRef::new("message-thread-a").unwrap(),
+            source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
+            resolved_run_profile_id: RunProfileId::new("default").unwrap(),
+            resolved_run_profile_version: RunProfileVersion::new(1),
+            received_at: received_at(),
+            checkpoint_id: None,
+            gate_ref: None,
+            failure: None,
+            event_cursor: EventCursor(1),
+        })
+    }
+}
+
 struct BlockingAdmissionPolicy {
     calls: AtomicUsize,
     entered: mpsc::Sender<()>,
@@ -2243,6 +2318,37 @@ async fn loop_exit_application_fails_after_validation_and_releases_lock() {
         .await
         .unwrap();
     assert_ne!(accepted_run_id(&next), run_id);
+}
+
+#[tokio::test]
+async fn cancelled_loop_exit_application_uses_single_atomic_transition_port_call() {
+    let port = AtomicCancelledExitPort {
+        state: Mutex::new(TurnStatus::Cancelled),
+    };
+
+    let state = apply_loop_exit(
+        &port,
+        ApplyLoopExitRequest {
+            run_id: TurnRunId::new(),
+            runner_id: TurnRunnerId::new(),
+            lease_token: TurnLeaseToken::new(),
+            exit: LoopExit::cancelled_for_observed_interrupt(
+                ironclaw_turns::LoopExitId::new("exit:cancelled-atomic").unwrap(),
+            ),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: true,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state.status, TurnStatus::Cancelled);
 }
 
 #[tokio::test]

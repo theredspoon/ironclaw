@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BlockedReason, LoopExit, LoopExitMapping, LoopExitValidationPolicy, SanitizedFailure,
     TurnCheckpointId, TurnError, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope,
-    TurnStatus, TurnTimestamp, events::EventCursor,
+    TurnTimestamp, events::EventCursor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +79,14 @@ pub struct RecordRecoveryRequiredRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyCancelledLoopExitRequest {
+    pub run_id: TurnRunId,
+    pub runner_id: TurnRunnerId,
+    pub lease_token: TurnLeaseToken,
+    pub recovery_failure: SanitizedFailure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyLoopExitRequest {
     pub run_id: TurnRunId,
     pub runner_id: TurnRunnerId,
@@ -129,6 +137,11 @@ pub trait TurnRunTransitionPort: Send + Sync {
         &self,
         request: RecordRecoveryRequiredRequest,
     ) -> Result<TurnRunState, TurnError>;
+
+    async fn apply_cancelled_loop_exit(
+        &self,
+        request: ApplyCancelledLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError>;
 }
 
 pub async fn apply_loop_exit<P>(
@@ -149,29 +162,13 @@ where
             .await
         }
         LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled) => {
-            match port
-                .cancel_run(CancelRunCompletionRequest {
-                    run_id: request.run_id,
-                    runner_id: request.runner_id,
-                    lease_token: request.lease_token,
-                })
-                .await
-            {
-                Ok(state) => Ok(state),
-                Err(TurnError::InvalidTransition {
-                    from: TurnStatus::Running,
-                    to: TurnStatus::Cancelled,
-                }) => {
-                    port.record_recovery_required(RecordRecoveryRequiredRequest {
-                        run_id: request.run_id,
-                        runner_id: request.runner_id,
-                        lease_token: request.lease_token,
-                        failure: SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
-                    })
-                    .await
-                }
-                Err(error) => Err(error),
-            }
+            port.apply_cancelled_loop_exit(ApplyCancelledLoopExitRequest {
+                run_id: request.run_id,
+                runner_id: request.runner_id,
+                lease_token: request.lease_token,
+                recovery_failure: SanitizedFailure::from_trusted_static("interrupted_unexpectedly"),
+            })
+            .await
         }
         LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
             checkpoint_id,

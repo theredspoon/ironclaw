@@ -9,9 +9,10 @@ use crate::{
     TurnIdempotencyRecord, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord, TurnRunState,
     TurnStateStore,
     runner::{
-        BlockRunRequest, CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun,
-        CompleteRunRequest, FailRunRequest, HeartbeatRequest, RecordRecoveryRequiredRequest,
-        RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse, TurnRunTransitionPort,
+        ApplyCancelledLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
+        ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
+        RecordRecoveryRequiredRequest, RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse,
+        TurnRunTransitionPort,
     },
 };
 
@@ -350,6 +351,21 @@ impl TurnRunTransitionPort for LibSqlTurnStateStore {
         .await;
         finish_libsql_transaction(&conn, result).await?
     }
+
+    async fn apply_cancelled_loop_exit(
+        &self,
+        request: ApplyCancelledLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let conn = self.begin_immediate().await?;
+        let result = async {
+            let store = self.load_store_from_conn(&conn).await?;
+            let result = store.apply_cancelled_loop_exit(request).await;
+            libsql_replace_snapshot(&conn, &store.persistence_snapshot()).await?;
+            Ok(result)
+        }
+        .await;
+        finish_libsql_transaction(&conn, result).await?
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -567,6 +583,20 @@ impl TurnRunTransitionPort for PostgresTurnStateStore {
         lock_postgres_turn_tables(&txn, "SHARE ROW EXCLUSIVE MODE").await?;
         let store = self.load_store_from_txn(&txn).await?;
         let result = store.record_recovery_required(request).await;
+        postgres_replace_snapshot(&txn, &store.persistence_snapshot()).await?;
+        txn.commit().await.map_err(db_error)?;
+        result
+    }
+
+    async fn apply_cancelled_loop_exit(
+        &self,
+        request: ApplyCancelledLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        let mut client = self.client().await?;
+        let txn = client.transaction().await.map_err(db_error)?;
+        lock_postgres_turn_tables(&txn, "SHARE ROW EXCLUSIVE MODE").await?;
+        let store = self.load_store_from_txn(&txn).await?;
+        let result = store.apply_cancelled_loop_exit(request).await;
         postgres_replace_snapshot(&txn, &store.persistence_snapshot()).await?;
         txn.commit().await.map_err(db_error)?;
         result
