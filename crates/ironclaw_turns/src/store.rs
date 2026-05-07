@@ -6,8 +6,8 @@ use crate::{
     GetRunStateRequest, IdempotencyKey, ReplyTargetBindingRef, ResumeTurnRequest,
     ResumeTurnResponse, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy,
     TurnActor, TurnAdmissionPolicy, TurnCheckpointId, TurnError, TurnErrorCategory, TurnId,
-    TurnLeaseToken, TurnRunId, TurnRunProfile, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
-    TurnTimestamp, events::EventCursor,
+    TurnLeaseToken, TurnLifecycleEvent, TurnRunId, TurnRunProfile, TurnRunState, TurnRunnerId,
+    TurnScope, TurnStatus, TurnTimestamp, events::EventCursor,
 };
 
 #[async_trait]
@@ -274,4 +274,6 @@ pub struct TurnPersistenceSnapshot {
     pub active_locks: Vec<TurnActiveLockRecord>,
     pub checkpoints: Vec<TurnCheckpointRecord>,
     pub idempotency_records: Vec<TurnIdempotencyRecord>,
+    #[serde(default)]
+    pub events: Vec<TurnLifecycleEvent>,
 }

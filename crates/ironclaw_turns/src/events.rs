@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::{sync::Arc, sync::Mutex};
+use thiserror::Error;
 
 use crate::{TurnError, TurnRunId, TurnScope, TurnStatus};
 
 const MAX_IN_MEMORY_EVENTS: usize = 10_000;
+pub const MAX_TURN_EVENT_PROJECTION_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(transparent)]
@@ -65,5 +67,163 @@ impl TurnEventSink for InMemoryTurnEventSink {
             events.drain(0..excess);
         }
         Ok(())
+    }
+}
+
+/// Scope-bound cursor for transport-agnostic turn lifecycle projections.
+///
+/// The cursor carries the exact [`TurnScope`] under which it was minted so a
+/// product adapter cannot use a cursor from one thread/project as bearer
+/// authority to skip or infer events from another scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct TurnEventProjectionCursor {
+    pub event: EventCursor,
+    pub scope: TurnScope,
+}
+
+impl TurnEventProjectionCursor {
+    pub fn for_scope(scope: TurnScope, event: EventCursor) -> Self {
+        Self { event, scope }
+    }
+
+    pub fn origin_for_scope(scope: TurnScope) -> Self {
+        Self {
+            event: EventCursor::default(),
+            scope,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEventProjectionRequest {
+    pub scope: TurnScope,
+    pub after: Option<TurnEventProjectionCursor>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnEventProjectionSnapshot {
+    pub entries: Vec<TurnLifecycleEvent>,
+    pub next_cursor: TurnEventProjectionCursor,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEventPage {
+    pub entries: Vec<TurnLifecycleEvent>,
+    pub next_cursor: EventCursor,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum TurnEventProjectionError {
+    #[error("turn event projection request rejected: {reason}")]
+    InvalidRequest { reason: &'static str },
+    #[error("turn event projection rebase required")]
+    RebaseRequired {
+        requested: Box<TurnEventProjectionCursor>,
+        earliest: Box<TurnEventProjectionCursor>,
+    },
+    #[error("turn event projection source failed during {operation}")]
+    Source { operation: &'static str },
+}
+
+#[async_trait]
+pub trait TurnEventProjectionSource: Send + Sync {
+    async fn read_turn_events_after(
+        &self,
+        scope: &TurnScope,
+        after: Option<EventCursor>,
+        limit: usize,
+    ) -> Result<TurnEventPage, TurnError>;
+}
+
+pub struct TurnEventProjectionService<S>
+where
+    S: TurnEventProjectionSource,
+{
+    source: Arc<S>,
+}
+
+impl<S> TurnEventProjectionService<S>
+where
+    S: TurnEventProjectionSource,
+{
+    pub fn new(source: Arc<S>) -> Self {
+        Self { source }
+    }
+
+    pub async fn snapshot(
+        &self,
+        request: TurnEventProjectionRequest,
+    ) -> Result<TurnEventProjectionSnapshot, TurnEventProjectionError> {
+        self.read(request).await
+    }
+
+    pub async fn updates(
+        &self,
+        request: TurnEventProjectionRequest,
+    ) -> Result<TurnEventProjectionSnapshot, TurnEventProjectionError> {
+        self.read(request).await
+    }
+
+    async fn read(
+        &self,
+        request: TurnEventProjectionRequest,
+    ) -> Result<TurnEventProjectionSnapshot, TurnEventProjectionError> {
+        if request.limit == 0 || request.limit > MAX_TURN_EVENT_PROJECTION_LIMIT {
+            return Err(TurnEventProjectionError::InvalidRequest {
+                reason: "limit must be between 1 and MAX_TURN_EVENT_PROJECTION_LIMIT",
+            });
+        }
+        if let Some(cursor) = request.after.as_ref()
+            && cursor.scope != request.scope
+        {
+            return Err(TurnEventProjectionError::RebaseRequired {
+                requested: Box::new(cursor.clone()),
+                earliest: Box::new(TurnEventProjectionCursor::origin_for_scope(
+                    request.scope.clone(),
+                )),
+            });
+        }
+        let after = request.after.as_ref().map(|cursor| cursor.event);
+        let page = self
+            .source
+            .read_turn_events_after(&request.scope, after, request.limit)
+            .await
+            .map_err(|_| TurnEventProjectionError::Source {
+                operation: "read_turn_events_after",
+            })?;
+        Ok(TurnEventProjectionSnapshot {
+            entries: page.entries,
+            next_cursor: TurnEventProjectionCursor::for_scope(request.scope, page.next_cursor),
+            truncated: page.truncated,
+        })
+    }
+}
+
+pub(crate) fn project_turn_events(
+    events: &[TurnLifecycleEvent],
+    scope: &TurnScope,
+    after: Option<EventCursor>,
+    limit: usize,
+) -> TurnEventPage {
+    let after = after.unwrap_or_default();
+    let mut matching = events
+        .iter()
+        .filter(|event| &event.scope == scope && event.cursor > after)
+        .cloned()
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|event| event.cursor);
+    let truncated = matching.len() > limit;
+    if truncated {
+        matching.truncate(limit);
+    }
+    let next_cursor = matching.last().map(|event| event.cursor).unwrap_or(after);
+    TurnEventPage {
+        entries: matching,
+        next_cursor,
+        truncated,
     }
 }
