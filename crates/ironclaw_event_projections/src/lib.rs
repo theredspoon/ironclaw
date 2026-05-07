@@ -15,7 +15,8 @@ use ironclaw_events::{
 };
 use ironclaw_host_api::{
     ApprovalRequestId, AuditEnvelope, AuditEventId, AuditStage, CapabilityId, ExtensionId,
-    InvocationId, ProcessId, ResourceScope, RuntimeKind, ThreadId, Timestamp,
+    InvocationId, OBLIGATION_EVALUATION_ORDER, ObligationKind, ProcessId, ResourceScope,
+    RuntimeKind, ThreadId, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -798,35 +799,53 @@ fn project_audit_entry(entry: &EventLogEntry<AuditEnvelope>) -> AuditProjectionE
     }
 }
 
-const SAFE_AUDIT_STATUS_LABELS: &[&str] = &[
-    "audit_before",
-    "audit_after",
-    "redact_output",
-    "apply_network_policy",
-    "inject_secret_once",
-    "enforce_output_limit",
-    "reserve_resources",
-    "use_scoped_mounts",
-    "enforce_resource_ceiling",
-];
-const MAX_AUDIT_STATUS_LABELS: usize = SAFE_AUDIT_STATUS_LABELS.len();
-const MAX_AUDIT_STATUS_BYTES: usize = 192;
-
 fn sanitize_audit_status(status: &str) -> String {
-    if status.len() > MAX_AUDIT_STATUS_BYTES {
-        return UNCLASSIFIED_ERROR_KIND.to_string();
+    let mut seen = HashSet::new();
+    let mut sanitized = String::new();
+
+    for (index, label) in status.split(',').enumerate() {
+        if index >= OBLIGATION_EVALUATION_ORDER.len() {
+            return UNCLASSIFIED_ERROR_KIND.to_string();
+        }
+
+        let Some(kind) = obligation_kind_from_status_label(label) else {
+            return UNCLASSIFIED_ERROR_KIND.to_string();
+        };
+        if !seen.insert(kind) {
+            return UNCLASSIFIED_ERROR_KIND.to_string();
+        }
+
+        if index > 0 {
+            sanitized.push(',');
+        }
+        sanitized.push_str(label);
     }
 
-    let labels = status.split(',').collect::<Vec<_>>();
-    if labels.is_empty()
-        || labels.len() > MAX_AUDIT_STATUS_LABELS
-        || labels
-            .iter()
-            .any(|label| !SAFE_AUDIT_STATUS_LABELS.contains(label))
-    {
+    if seen.is_empty() {
         UNCLASSIFIED_ERROR_KIND.to_string()
     } else {
-        labels.join(",")
+        sanitized
+    }
+}
+
+fn obligation_kind_from_status_label(label: &str) -> Option<ObligationKind> {
+    OBLIGATION_EVALUATION_ORDER
+        .iter()
+        .copied()
+        .find(|kind| obligation_status_label(*kind) == label)
+}
+
+fn obligation_status_label(kind: ObligationKind) -> &'static str {
+    match kind {
+        ObligationKind::ReserveResources => "reserve_resources",
+        ObligationKind::UseScopedMounts => "use_scoped_mounts",
+        ObligationKind::ApplyNetworkPolicy => "apply_network_policy",
+        ObligationKind::InjectSecretOnce => "inject_secret_once",
+        ObligationKind::AuditBefore => "audit_before",
+        ObligationKind::RedactOutput => "redact_output",
+        ObligationKind::EnforceResourceCeiling => "enforce_resource_ceiling",
+        ObligationKind::EnforceOutputLimit => "enforce_output_limit",
+        ObligationKind::AuditAfter => "audit_after",
     }
 }
 

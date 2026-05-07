@@ -125,6 +125,19 @@ async fn replay_audit_projection_preserves_only_safe_obligation_status_labels() 
     });
     log.append(unsafe_audit).await.unwrap();
 
+    let mut duplicate_audit = AuditEnvelope::denied(
+        &ctx,
+        AuditStage::After,
+        ActionSummary::from_action(&action),
+        DenyReason::PolicyDenied,
+    );
+    duplicate_audit.result = Some(ActionResultSummary {
+        success: false,
+        status: Some("audit_before,audit_before".to_string()),
+        output_bytes: None,
+    });
+    log.append(duplicate_audit).await.unwrap();
+
     let snapshot = service
         .snapshot(AuditProjectionRequest {
             scope: ProjectionScope::from_resource_scope(&ctx.resource_scope),
@@ -134,13 +147,17 @@ async fn replay_audit_projection_preserves_only_safe_obligation_status_labels() 
         .await
         .unwrap();
 
-    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.entries.len(), 3);
     assert_eq!(
         snapshot.entries[0].result_status.as_deref(),
         Some("audit_before,apply_network_policy,inject_secret_once")
     );
     assert_eq!(
         snapshot.entries[1].result_status.as_deref(),
+        Some(UNCLASSIFIED_ERROR_KIND)
+    );
+    assert_eq!(
+        snapshot.entries[2].result_status.as_deref(),
         Some(UNCLASSIFIED_ERROR_KIND)
     );
     let serialized = serde_json::to_string(&snapshot).unwrap();
