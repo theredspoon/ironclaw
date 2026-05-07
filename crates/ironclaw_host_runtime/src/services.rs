@@ -43,7 +43,7 @@ use ironclaw_reborn_event_store::{
     build_reborn_event_stores,
 };
 use ironclaw_resources::ResourceGovernor;
-use ironclaw_run_state::{ApprovalRequestStore, RunStateStore};
+use ironclaw_run_state::{ApprovalRequestStore, RunStateApprovalStore, RunStateStore};
 use ironclaw_scripts::{ScriptError, ScriptExecutionRequest, ScriptExecutor, ScriptInvocation};
 use ironclaw_secrets::SecretStore;
 use ironclaw_trust::{HostTrustPolicy, TrustPolicy};
@@ -271,6 +271,7 @@ where
     surface_version: CapabilitySurfaceVersion,
     run_state: Option<Arc<dyn RunStateStore>>,
     approval_requests: Option<Arc<dyn ApprovalRequestStore>>,
+    run_state_approval_store: Option<Arc<dyn RunStateApprovalStore>>,
     capability_leases: Option<Arc<dyn CapabilityLeaseStore>>,
     event_sink: Option<Arc<dyn EventSink>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
@@ -321,6 +322,7 @@ where
             surface_version,
             run_state: None,
             approval_requests: None,
+            run_state_approval_store: None,
             capability_leases: None,
             event_sink: None,
             audit_sink: None,
@@ -461,6 +463,7 @@ where
     {
         self.component_types.run_state = Some(type_name::<T>());
         self.run_state = Some(run_state);
+        self.run_state_approval_store = None;
         self
     }
 
@@ -470,6 +473,19 @@ where
     {
         self.component_types.approval_requests = Some(type_name::<T>());
         self.approval_requests = Some(approval_requests);
+        self.run_state_approval_store = None;
+        self
+    }
+
+    pub fn with_run_state_approval_store<T>(mut self, store: Arc<T>) -> Self
+    where
+        T: RunStateApprovalStore + 'static,
+    {
+        self.component_types.run_state = Some(type_name::<T>());
+        self.component_types.approval_requests = Some(type_name::<T>());
+        self.run_state = Some(store.clone());
+        self.approval_requests = Some(store.clone());
+        self.run_state_approval_store = Some(store);
         self
     }
 
@@ -1077,11 +1093,15 @@ where
         .with_process_cancellation_registry(self.process_services.cancellation_registry())
         .with_runtime_health(runtime_health);
 
-        if let Some(run_state) = &self.run_state {
-            runtime = runtime.with_run_state(Arc::clone(run_state));
-        }
-        if let Some(approval_requests) = &self.approval_requests {
-            runtime = runtime.with_approval_requests(Arc::clone(approval_requests));
+        if let Some(run_state_approval_store) = &self.run_state_approval_store {
+            runtime = runtime.with_run_state_approval_store(Arc::clone(run_state_approval_store));
+        } else {
+            if let Some(run_state) = &self.run_state {
+                runtime = runtime.with_run_state(Arc::clone(run_state));
+            }
+            if let Some(approval_requests) = &self.approval_requests {
+                runtime = runtime.with_approval_requests(Arc::clone(approval_requests));
+            }
         }
         if let Some(capability_leases) = &self.capability_leases {
             runtime = runtime.with_capability_leases(Arc::clone(capability_leases));
