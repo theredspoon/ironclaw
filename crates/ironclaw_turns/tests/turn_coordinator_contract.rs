@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -15,7 +16,8 @@ use ironclaw_turns::{
     IdempotencyKey, InMemoryRunProfileResolver, InMemoryTurnEventSink, InMemoryTurnStateStore,
     InMemoryTurnStateStoreLimits, LoopCompleted, LoopCompletionKind, LoopExit,
     LoopExitInvalidHandling, LoopExitValidationPolicy, LoopGateRef, LoopMessageRef,
-    ReplyTargetBindingRef, ResumeTurnRequest, RunProfileId, RunProfileRequest, RunProfileVersion,
+    ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest, RunProfileId, RunProfileRequest,
+    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
     SanitizedCancelReason, SanitizedFailure, SourceBindingRef, SubmitTurnRequest,
     SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnCheckpointId,
     TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventProjectionError,
@@ -31,6 +33,27 @@ use ironclaw_turns::{
         RecoverExpiredLeasesResponse, TurnRunTransitionPort, apply_loop_exit,
     },
 };
+
+struct BlockingRunProfileResolver {
+    started: mpsc::Sender<()>,
+}
+
+impl BlockingRunProfileResolver {
+    fn new(started: mpsc::Sender<()>) -> Self {
+        Self { started }
+    }
+}
+
+#[async_trait::async_trait]
+impl RunProfileResolver for BlockingRunProfileResolver {
+    async fn resolve_run_profile(
+        &self,
+        _request: RunProfileResolutionRequest,
+    ) -> Result<ResolvedRunProfile, RunProfileResolutionError> {
+        let _ = self.started.send(());
+        std::future::pending::<Result<ResolvedRunProfile, RunProfileResolutionError>>().await
+    }
+}
 
 #[test]
 fn turn_scope_agent_id_is_optional() {
@@ -945,6 +968,47 @@ fn concurrent_duplicate_submit_waits_for_in_flight_admission_result() {
     let second = second.join().unwrap().unwrap();
     assert_eq!(second, first);
     assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancelled_submit_during_profile_resolution_clears_in_flight_idempotency() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let (started_tx, started_rx) = mpsc::channel();
+    let resolver = Arc::new(BlockingRunProfileResolver::new(started_tx));
+    let request = submit_request("thread-a", "idem-submit-cancelled-profile-resolution");
+    let mut pending = store.submit_turn(
+        request.clone(),
+        &AllowAllTurnAdmissionPolicy,
+        resolver.as_ref(),
+    );
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
+    assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first submit should start profile resolution");
+    drop(pending);
+
+    let retry_store = store.clone();
+    let (retry_tx, retry_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let retry = runtime.block_on(retry_store.submit_turn(
+            request,
+            &AllowAllTurnAdmissionPolicy,
+            &InMemoryRunProfileResolver::default(),
+        ));
+        retry_tx.send(retry).unwrap();
+    });
+    let retry = retry_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("retry should not wait on a stale in-flight idempotency key")
+        .unwrap();
+
+    assert!(matches!(retry, SubmitTurnResponse::Accepted { .. }));
 }
 
 #[tokio::test]

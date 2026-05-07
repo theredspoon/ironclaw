@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use crate::{
     CancelRunRequest, CancelRunResponse, GetRunStateRequest, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, ResumeTurnRequest, ResumeTurnResponse, RunProfileResolver,
-    SubmitTurnRequest, SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionPolicy,
-    TurnCheckpointRecord, TurnError, TurnIdempotencyRecord, TurnLifecycleEvent,
-    TurnPersistenceSnapshot, TurnRecord, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
+    InMemoryTurnStateStoreLimits, ResolvedRunProfile, ResumeTurnRequest, ResumeTurnResponse,
+    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, SubmitTurnRequest,
+    SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionPolicy, TurnCheckpointRecord, TurnError,
+    TurnIdempotencyRecord, TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord,
+    TurnRunState, TurnScope, TurnStateStore,
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -16,6 +17,38 @@ use crate::{
         TurnRunTransitionPort,
     },
 };
+
+struct PreResolvedRunProfileResolver {
+    result: Result<ResolvedRunProfile, RunProfileResolutionError>,
+}
+
+impl PreResolvedRunProfileResolver {
+    fn new(result: Result<ResolvedRunProfile, RunProfileResolutionError>) -> Self {
+        Self { result }
+    }
+}
+
+#[async_trait]
+impl RunProfileResolver for PreResolvedRunProfileResolver {
+    async fn resolve_run_profile(
+        &self,
+        _request: RunProfileResolutionRequest,
+    ) -> Result<ResolvedRunProfile, RunProfileResolutionError> {
+        self.result.clone()
+    }
+}
+
+async fn resolve_run_profile_for_submit(
+    request: &SubmitTurnRequest,
+    resolver: &dyn RunProfileResolver,
+) -> Result<ResolvedRunProfile, RunProfileResolutionError> {
+    resolver
+        .resolve_run_profile(RunProfileResolutionRequest {
+            requested_run_profile: request.requested_run_profile.clone(),
+            ..RunProfileResolutionRequest::interactive_default()
+        })
+        .await
+}
 
 #[cfg(feature = "libsql")]
 const LIBSQL_TURN_STATE_SCHEMA: &str = r#"
@@ -208,11 +241,14 @@ impl TurnStateStore for LibSqlTurnStateStore {
         admission_policy: &dyn TurnAdmissionPolicy,
         run_profile_resolver: &dyn RunProfileResolver,
     ) -> Result<SubmitTurnResponse, TurnError> {
+        let profile_resolution =
+            resolve_run_profile_for_submit(&request, run_profile_resolver).await;
+        let pre_resolved = PreResolvedRunProfileResolver::new(profile_resolution);
         let conn = self.begin_immediate().await?;
         let result = async {
             let store = self.load_store_from_conn(&conn).await?;
             let result = store
-                .submit_turn(request, admission_policy, run_profile_resolver)
+                .submit_turn(request, admission_policy, &pre_resolved)
                 .await;
             libsql_replace_snapshot(&conn, &store.persistence_snapshot()).await?;
             Ok(result)
@@ -476,12 +512,15 @@ impl TurnStateStore for PostgresTurnStateStore {
         admission_policy: &dyn TurnAdmissionPolicy,
         run_profile_resolver: &dyn RunProfileResolver,
     ) -> Result<SubmitTurnResponse, TurnError> {
+        let profile_resolution =
+            resolve_run_profile_for_submit(&request, run_profile_resolver).await;
+        let pre_resolved = PreResolvedRunProfileResolver::new(profile_resolution);
         let mut client = self.client().await?;
         let txn = client.transaction().await.map_err(db_error)?;
         lock_postgres_turn_tables(&txn, "SHARE ROW EXCLUSIVE MODE").await?;
         let store = self.load_store_from_txn(&txn).await?;
         let result = store
-            .submit_turn(request, admission_policy, run_profile_resolver)
+            .submit_turn(request, admission_policy, &pre_resolved)
             .await;
         postgres_replace_snapshot(&txn, &store.persistence_snapshot()).await?;
         txn.commit().await.map_err(db_error)?;

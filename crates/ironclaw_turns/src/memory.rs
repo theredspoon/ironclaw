@@ -151,6 +151,33 @@ fn profile_resolution_error_to_turn_error(error: RunProfileResolutionError) -> T
     TurnError::AdmissionRejected(AdmissionRejection::new(reason))
 }
 
+struct SubmitInFlightGuard<'a> {
+    inner: &'a Mutex<Inner>,
+    ready: &'a Condvar,
+    key: SubmitIdempotencyKey,
+}
+
+impl<'a> SubmitInFlightGuard<'a> {
+    fn new(inner: &'a Mutex<Inner>, ready: &'a Condvar, key: SubmitIdempotencyKey) -> Self {
+        Self { inner, ready, key }
+    }
+}
+
+impl Drop for SubmitInFlightGuard<'_> {
+    fn drop(&mut self) {
+        let removed = match self.inner.lock() {
+            Ok(mut inner) => inner.submit_idempotency_in_flight.remove(&self.key),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .submit_idempotency_in_flight
+                .remove(&self.key),
+        };
+        if removed {
+            self.ready.notify_all();
+        }
+    }
+}
+
 impl InMemoryTurnStateStore {
     pub fn with_limits(limits: InMemoryTurnStateStoreLimits) -> Self {
         Self {
@@ -243,6 +270,11 @@ impl TurnStateStore for InMemoryTurnStateStore {
                 inner = self.wait_for_submit_idempotency(inner)?;
             }
         }
+        let _in_flight_guard = SubmitInFlightGuard::new(
+            &self.inner,
+            &self.submit_idempotency_ready,
+            idempotency_key.clone(),
+        );
 
         let admission_result = admission_policy.check_submit(&request);
 
