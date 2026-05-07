@@ -1,12 +1,27 @@
 mod driver;
+mod host;
 mod policy;
 mod refs;
 mod resolver;
 mod snapshot;
 
 pub use driver::{
-    AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverHost,
-    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest,
+    AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverResumeRequest,
+    AgentLoopDriverRunRequest,
+};
+pub use host::{
+    AgentLoopDriverHost, AgentLoopHost, AgentLoopHostError, AgentLoopHostErrorKind,
+    AppendCapabilityResultRef, AssistantReply, BeginAssistantDraft, CapabilityBatchInvocation,
+    CapabilityBatchOutcome, CapabilityCallCandidate, CapabilityDenied, CapabilityDescriptorView,
+    CapabilityFailure, CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage,
+    CapabilitySurfaceVersion, FinalizeAssistantMessage, LoopCancelReasonKind, LoopCapabilityPort,
+    LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
+    LoopContextMessage, LoopContextPort, LoopContextRequest, LoopContextSnippet,
+    LoopDriverNoteKind, LoopInput, LoopInputBatch, LoopInputCursor, LoopInputPort,
+    LoopInterruptKind, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
+    LoopProgressEvent, LoopProgressPort, LoopRunContext, LoopRunInfoPort, LoopTranscriptPort,
+    ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, UpdateAssistantDraft,
+    VisibleCapabilityRequest, VisibleCapabilitySurface,
 };
 pub use policy::{
     CancellationPolicy, CheckpointPolicy, PrivilegedRunProfileDimension,
