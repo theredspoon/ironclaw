@@ -29,6 +29,7 @@ use ironclaw_host_api::{
     RuntimeHttpEgress, RuntimeKind,
 };
 use ironclaw_mcp::{McpError, McpExecutionRequest, McpExecutor, McpInvocation};
+use ironclaw_network::NetworkHttpEgress;
 use ironclaw_processes::{
     BackgroundFailureStage, ProcessExecutionError, ProcessExecutionRequest, ProcessExecutionResult,
     ProcessExecutor, ProcessManager, ProcessResultStore, ProcessServices, ProcessStore,
@@ -40,8 +41,8 @@ use ironclaw_secrets::SecretStore;
 use ironclaw_trust::{HostTrustPolicy, TrustPolicy};
 use ironclaw_wasm::{
     DenyWasmHostHttp, PreparedWitTool, WasmError, WasmRuntimeCredentialProvider,
-    WasmRuntimeHttpAdapter, WasmRuntimePolicyDiscarder, WitToolHost, WitToolRequest,
-    WitToolRuntime, WitToolRuntimeConfig,
+    WasmRuntimeHttpAdapter, WasmRuntimePolicyDiscarder, WasmStagedRuntimeCredentials, WitToolHost,
+    WitToolRequest, WitToolRuntime, WitToolRuntimeConfig,
 };
 
 use crate::{
@@ -91,6 +92,7 @@ impl ProductionWiringConfig {
 /// Production component tracked by the host-runtime production wiring guardrail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProductionWiringComponent {
+    RuntimeBackend,
     TrustPolicy,
     Filesystem,
     ResourceGovernor,
@@ -112,6 +114,7 @@ pub enum ProductionWiringComponent {
 impl ProductionWiringComponent {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::RuntimeBackend => "runtime_backend",
             Self::TrustPolicy => "trust_policy",
             Self::Filesystem => "filesystem",
             Self::ResourceGovernor => "resource_governor",
@@ -136,6 +139,7 @@ impl ProductionWiringComponent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProductionWiringIssueKind {
     Missing,
+    UnsupportedRequirement,
     LocalOnlyImplementation,
     UnverifiedProductionImplementation,
 }
@@ -186,6 +190,8 @@ impl ProductionWiringReport {
 
 #[derive(Debug, Clone)]
 struct ProductionComponentTypes {
+    trust_policy: Option<&'static str>,
+    trust_policy_verified: bool,
     filesystem: &'static str,
     resource_governor: &'static str,
     process_store: &'static str,
@@ -199,6 +205,7 @@ struct ProductionComponentTypes {
     runtime_http_egress: Option<&'static str>,
     runtime_http_egress_verified: bool,
     wasm_credential_provider: Option<&'static str>,
+    wasm_credential_provider_verified: bool,
     wasm_runtime_credential_provider_captured: bool,
     script_runtime: Option<&'static str>,
     mcp_runtime: Option<&'static str>,
@@ -304,6 +311,8 @@ where
             mcp_runtime: None,
             wasm_runtime: None,
             component_types: ProductionComponentTypes {
+                trust_policy: None,
+                trust_policy_verified: false,
                 filesystem: type_name::<F>(),
                 resource_governor: type_name::<G>(),
                 process_store: type_name::<S>(),
@@ -317,6 +326,7 @@ where
                 runtime_http_egress: None,
                 runtime_http_egress_verified: false,
                 wasm_credential_provider: None,
+                wasm_credential_provider_verified: false,
                 wasm_runtime_credential_provider_captured: false,
                 script_runtime: None,
                 mcp_runtime: None,
@@ -331,12 +341,16 @@ where
     where
         T: TrustPolicy + 'static,
     {
+        self.component_types.trust_policy = Some(type_name::<T>());
+        self.component_types.trust_policy_verified = true;
         self.trust_policy = trust_policy;
         self.trust_policy_configured = true;
         self
     }
 
     pub fn with_trust_policy_dyn(mut self, trust_policy: Arc<dyn TrustPolicy>) -> Self {
+        self.component_types.trust_policy = Some("dyn TrustPolicy");
+        self.component_types.trust_policy_verified = false;
         self.trust_policy = trust_policy;
         self.trust_policy_configured = true;
         self
@@ -427,15 +441,21 @@ where
         self
     }
 
-    /// Attaches a runtime HTTP egress that the composition root has already
-    /// verified as production-wired (for example, host-mediated policy and
-    /// secret stores are attached rather than test/request-local policy).
-    pub fn with_verified_runtime_http_egress<T>(mut self, runtime_http_egress: Arc<T>) -> Self
+    /// Attaches the host HTTP egress shape required for production runtime
+    /// adapters. The service must use staged network-policy handoffs and secret
+    /// injection handoffs, not request-local/test policy fallback.
+    pub fn with_host_http_egress_service<N, SecretBackend>(
+        mut self,
+        runtime_http_egress: Arc<crate::HostHttpEgressService<N, SecretBackend>>,
+    ) -> Self
     where
-        T: RuntimeHttpEgress + 'static,
+        N: NetworkHttpEgress + 'static,
+        SecretBackend: SecretStore + 'static,
     {
-        self.component_types.runtime_http_egress = Some(type_name::<T>());
-        self.component_types.runtime_http_egress_verified = true;
+        self.component_types.runtime_http_egress =
+            Some(type_name::<crate::HostHttpEgressService<N, SecretBackend>>());
+        self.component_types.runtime_http_egress_verified = runtime_http_egress
+            .is_production_wired_with(&self.network_policy_store, &self.secret_injection_store);
         let runtime_http_egress: Arc<dyn RuntimeHttpEgress> = runtime_http_egress;
         set_runtime_http_egress(&self.runtime_http_egress, runtime_http_egress);
         self
@@ -454,6 +474,21 @@ where
         T: WasmRuntimeCredentialProvider + 'static,
     {
         self.component_types.wasm_credential_provider = Some(type_name::<T>());
+        self.component_types.wasm_credential_provider_verified = false;
+        let provider: Arc<dyn WasmRuntimeCredentialProvider> = provider;
+        self.wasm_credential_provider = Some(provider);
+        self.component_types
+            .wasm_runtime_credential_provider_captured = self.wasm_runtime.is_none();
+        self
+    }
+
+    pub fn with_verified_wasm_runtime_credentials(
+        mut self,
+        provider: Arc<WasmStagedRuntimeCredentials>,
+    ) -> Self {
+        self.component_types.wasm_credential_provider =
+            Some(type_name::<WasmStagedRuntimeCredentials>());
+        self.component_types.wasm_credential_provider_verified = !provider.credentials().is_empty();
         let provider: Arc<dyn WasmRuntimeCredentialProvider> = provider;
         self.wasm_credential_provider = Some(provider);
         self.component_types
@@ -463,6 +498,10 @@ where
 
     pub fn secret_injection_store(&self) -> Arc<RuntimeSecretInjectionStore> {
         Arc::clone(&self.secret_injection_store)
+    }
+
+    pub fn network_policy_store(&self) -> Arc<NetworkObligationPolicyStore> {
+        Arc::clone(&self.network_policy_store)
     }
 
     pub fn with_script_runtime<T>(mut self, runtime: Arc<T>) -> Self
@@ -573,6 +612,16 @@ where
                 ProductionWiringComponent::WasmCredentialProvider,
                 self.wasm_credential_provider.is_some(),
             );
+            if self.wasm_credential_provider.is_some()
+                && !self.component_types.wasm_credential_provider_verified
+            {
+                self.push_issue(
+                    &mut issues,
+                    ProductionWiringComponent::WasmCredentialProvider,
+                    ProductionWiringIssueKind::UnverifiedProductionImplementation,
+                    self.component_types.wasm_credential_provider,
+                );
+            }
             if self.wasm_runtime.is_some()
                 && self.wasm_credential_provider.is_some()
                 && !self
@@ -585,6 +634,17 @@ where
                     ProductionWiringIssueKind::UnverifiedProductionImplementation,
                     self.component_types.wasm_credential_provider,
                 );
+            }
+        }
+        for runtime in &config.required_runtime_backends {
+            match runtime {
+                RuntimeKind::Script | RuntimeKind::Mcp | RuntimeKind::Wasm => {}
+                RuntimeKind::FirstParty | RuntimeKind::System => self.push_issue(
+                    &mut issues,
+                    ProductionWiringComponent::RuntimeBackend,
+                    ProductionWiringIssueKind::UnsupportedRequirement,
+                    None,
+                ),
             }
         }
         if config.requires_runtime(RuntimeKind::Script) {
@@ -609,6 +669,19 @@ where
             );
         }
 
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TrustPolicy,
+            self.component_types.trust_policy,
+        );
+        if self.trust_policy_configured && !self.component_types.trust_policy_verified {
+            self.push_issue(
+                &mut issues,
+                ProductionWiringComponent::TrustPolicy,
+                ProductionWiringIssueKind::UnverifiedProductionImplementation,
+                self.component_types.trust_policy,
+            );
+        }
         self.push_local_only(
             &mut issues,
             ProductionWiringComponent::Filesystem,
@@ -738,14 +811,14 @@ where
     }
 
     /// Validates this graph and then builds the upper facade for production
-    /// callers. Composition roots should use this instead of [`Self::host_runtime`]
-    /// once they claim a graph is production-ready.
+    /// callers. This consumes the service graph so callers cannot mutate shared
+    /// runtime-adapter handoff slots after validation.
     pub fn host_runtime_for_production(
-        &self,
+        self,
         config: &ProductionWiringConfig,
     ) -> Result<DefaultHostRuntime, ProductionWiringReport> {
         self.validate_production_wiring(config)?;
-        Ok(self.host_runtime())
+        Ok(self.build_host_runtime())
     }
 
     /// Builds a runtime dispatcher with every configured runtime adapter.
@@ -779,9 +852,15 @@ where
         dispatcher
     }
 
+    /// Builds the upper facade without production validation.
+    #[doc(hidden)]
+    pub fn host_runtime_for_local_testing(&self) -> DefaultHostRuntime {
+        self.build_host_runtime()
+    }
+
     /// Builds the upper facade with the same dispatcher, process services,
     /// stores, cancellation registry, result store, and runtime health graph.
-    pub fn host_runtime(&self) -> DefaultHostRuntime {
+    fn build_host_runtime(&self) -> DefaultHostRuntime {
         let dispatcher: Arc<dyn CapabilityDispatcher> = Arc::new(self.runtime_dispatcher());
         let process_executor =
             Arc::new(RuntimeDispatchProcessExecutor::new(Arc::clone(&dispatcher)));
