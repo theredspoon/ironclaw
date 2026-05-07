@@ -467,6 +467,147 @@ async fn summaries_are_range_artifacts_and_policy_filtered_context_replacements(
 }
 
 #[tokio::test]
+async fn summary_covering_redacted_message_is_not_loaded_into_model_context() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let sensitive = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: user_message("secret token"),
+        })
+        .await
+        .unwrap();
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: user_message("safe follow-up"),
+        })
+        .await
+        .unwrap();
+    service
+        .create_summary_artifact(CreateSummaryArtifactRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            start_sequence: 1,
+            end_sequence: 2,
+            summary_kind: "model_context".into(),
+            content: MessageContent::text("summary mentions secret token"),
+            model_context_policy: Some("replace_range_when_selected".into()),
+        })
+        .await
+        .unwrap();
+    service
+        .redact_message(RedactMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            message_id: sensitive.message_id,
+            redaction_ref: "redaction/audit/3".into(),
+        })
+        .await
+        .unwrap();
+
+    let context = service
+        .load_context_window(LoadContextWindowRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+            max_messages: 16,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(context.messages.len(), 1);
+    assert_eq!(context.messages[0].kind, MessageKind::User);
+    assert_eq!(context.messages[0].content, "safe follow-up");
+}
+
+#[tokio::test]
+async fn duplicate_assistant_draft_for_same_turn_run_is_idempotent() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let first = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            content: MessageContent::text("partial"),
+        })
+        .await
+        .unwrap();
+    let duplicate = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            content: MessageContent::text("retry partial ignored"),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(first.message_id, duplicate.message_id);
+    assert_eq!(duplicate.content.as_deref(), Some("partial"));
+
+    service
+        .finalize_assistant_message(
+            &scope("a"),
+            &thread.thread_id,
+            first.message_id,
+            MessageContent::text("final answer"),
+        )
+        .await
+        .unwrap();
+    let after_final = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            content: MessageContent::text("retry after final ignored"),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(first.message_id, after_final.message_id);
+
+    let history = service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0].status, MessageStatus::Finalized);
+}
+
+#[tokio::test]
 async fn overlapping_replacement_summaries_are_rejected() {
     let service = InMemorySessionThreadService::default();
     let thread = service
@@ -590,8 +731,11 @@ async fn summary_replacement_still_applies_when_range_starts_with_redacted_messa
         .unwrap();
 
     assert_eq!(context.messages.len(), 1);
-    assert_eq!(context.messages[0].kind, MessageKind::Summary);
-    assert_eq!(context.messages[0].content, "redacted range summary");
+    assert_eq!(context.messages[0].kind, MessageKind::User);
+    assert_eq!(
+        context.messages[0].content,
+        "context that should be summarized"
+    );
 }
 
 #[tokio::test]

@@ -557,6 +557,16 @@ impl SessionThreadService for InMemorySessionThreadService {
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         let mut state = self.state.lock().await;
         let thread = get_thread_mut(&mut state, &request.scope, &request.thread_id)?;
+        if let Some(existing) = thread.messages.iter().find(|message| {
+            message.kind == MessageKind::Assistant
+                && matches!(
+                    message.status,
+                    MessageStatus::Draft | MessageStatus::Finalized
+                )
+                && message.turn_run_id.as_deref() == Some(request.turn_run_id.as_str())
+        }) {
+            return Ok(existing.clone());
+        }
         let message_id = ThreadMessageId::new();
         let message = ThreadMessageRecord {
             message_id,
@@ -819,6 +829,7 @@ fn context_messages_with_summary_replacements(thread: &StoredThread) -> Vec<Cont
             summary.start_sequence <= message.sequence
                 && message.sequence <= summary.end_sequence
                 && !emitted_summaries.contains(&summary.summary_id)
+                && !summary_covers_hidden_content(thread, summary)
         }) {
             context.push(ContextMessage {
                 message_id: None,
@@ -842,6 +853,17 @@ fn context_messages_with_summary_replacements(thread: &StoredThread) -> Vec<Cont
         }
     }
     context
+}
+
+fn summary_covers_hidden_content(thread: &StoredThread, summary: &SummaryArtifact) -> bool {
+    thread.messages.iter().any(|message| {
+        summary.start_sequence <= message.sequence
+            && message.sequence <= summary.end_sequence
+            && matches!(
+                message.status,
+                MessageStatus::Redacted | MessageStatus::Deleted
+            )
+    })
 }
 
 fn is_model_visible(status: MessageStatus) -> bool {
