@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ironclaw_events::{
     DurableAuditLog, DurableEventLog, EventCursor, EventError, EventLogEntry, EventStreamKey,
-    ReadScope, RuntimeEvent, RuntimeEventKind, sanitize_error_kind,
+    ReadScope, RuntimeEvent, RuntimeEventKind, UNCLASSIFIED_ERROR_KIND, sanitize_error_kind,
 };
 use ironclaw_host_api::{
     ApprovalRequestId, AuditEnvelope, AuditEventId, AuditStage, CapabilityId, ExtensionId,
@@ -792,9 +792,41 @@ fn project_audit_entry(entry: &EventLogEntry<AuditEnvelope>) -> AuditProjectionE
         result_status: audit
             .result
             .as_ref()
-            .and_then(|result| result.status.clone())
-            .map(sanitize_error_kind),
+            .and_then(|result| result.status.as_deref())
+            .map(sanitize_audit_status),
         output_bytes: audit.result.as_ref().and_then(|result| result.output_bytes),
+    }
+}
+
+const SAFE_AUDIT_STATUS_LABELS: &[&str] = &[
+    "audit_before",
+    "audit_after",
+    "redact_output",
+    "apply_network_policy",
+    "inject_secret_once",
+    "enforce_output_limit",
+    "reserve_resources",
+    "use_scoped_mounts",
+    "enforce_resource_ceiling",
+];
+const MAX_AUDIT_STATUS_LABELS: usize = SAFE_AUDIT_STATUS_LABELS.len();
+const MAX_AUDIT_STATUS_BYTES: usize = 192;
+
+fn sanitize_audit_status(status: &str) -> String {
+    if status.len() > MAX_AUDIT_STATUS_BYTES {
+        return UNCLASSIFIED_ERROR_KIND.to_string();
+    }
+
+    let labels = status.split(',').collect::<Vec<_>>();
+    if labels.is_empty()
+        || labels.len() > MAX_AUDIT_STATUS_LABELS
+        || labels
+            .iter()
+            .any(|label| !SAFE_AUDIT_STATUS_LABELS.contains(label))
+    {
+        UNCLASSIFIED_ERROR_KIND.to_string()
+    } else {
+        labels.join(",")
     }
 }
 
