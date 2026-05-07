@@ -9,9 +9,9 @@ use ironclaw_authorization::{
 };
 use ironclaw_capabilities::{CapabilityHost, CapabilitySpawnRequest};
 use ironclaw_events::{
-    DurableAuditLog, DurableEventLog, DurableEventSink, EventCursor, EventError, EventReplay,
-    EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog, InMemoryDurableEventLog,
-    InMemoryEventSink, ReadScope, RuntimeEventKind,
+    DurableAuditLog, DurableAuditSink, DurableEventLog, DurableEventSink, EventCursor, EventError,
+    EventReplay, EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog,
+    InMemoryDurableEventLog, InMemoryEventSink, ReadScope, RuntimeEventKind,
 };
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry};
 use ironclaw_filesystem::{LocalFilesystem, RootFilesystem};
@@ -19,7 +19,8 @@ use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     BuiltinObligationHandler, CancelReason, CancelRuntimeWorkRequest, CapabilitySurfaceVersion,
     DefaultHostRuntime, HostHttpEgressService, HostRuntime, HostRuntimeServices,
-    NetworkObligationPolicyStore, ProcessObligationLifecycleStore, RuntimeCapabilityOutcome,
+    NetworkObligationPolicyStore, ProcessObligationLifecycleStore, ProductionWiringComponent,
+    ProductionWiringConfig, ProductionWiringIssueKind, RuntimeCapabilityOutcome,
     RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest, RuntimeFailureKind,
     RuntimeSecretInjectionStore, RuntimeStatusRequest, RuntimeWorkId,
 };
@@ -58,6 +59,312 @@ use ironclaw_wasm::{
 use serde_json::json;
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::Resolve;
+
+#[test]
+fn production_wiring_validation_rejects_missing_components_and_local_only_defaults() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+
+    let report = match services.host_runtime_for_production(&ProductionWiringConfig::new([])) {
+        Ok(_) => panic!("bare local/test service graph must not pass production validation"),
+        Err(report) => report,
+    };
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::TrustPolicy,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing explicit trust policy should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RunState,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing run-state store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ApprovalRequests,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing approval store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::CapabilityLeases,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing capability lease store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::EventSink,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing event sink should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::AuditSink,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing audit sink should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::SecretStore,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing secret store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::Filesystem,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "local filesystem should be reported as local-only: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ResourceGovernor,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory resource governor should be reported as local-only: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ProcessStore,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory process store should be reported as local-only: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ProcessResultStore,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory process result store should be reported as local-only: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_uses_configured_runtime_requirements() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+    let config = ProductionWiringConfig::new([RuntimeKind::Script, RuntimeKind::Wasm])
+        .require_runtime_http_egress()
+        .require_wasm_credentials();
+
+    let report = services
+        .validate_production_wiring(&config)
+        .expect_err("required runtime backends and egress must be reported when absent");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ScriptRuntime,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing script runtime should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmRuntime,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing wasm runtime should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimeHttpEgress,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing runtime HTTP egress should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing WASM credential provider should be reported: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_sees_underlying_in_memory_durable_logs() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_durable_event_log(Arc::new(InMemoryDurableEventLog::new()))
+    .with_durable_audit_log(Arc::new(InMemoryDurableAuditLog::new()));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("in-memory durable logs must not be hidden behind durable sink wrappers");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::EventSink,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory durable event log should be reported through with_durable_event_log: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::AuditSink,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory durable audit log should be reported through with_durable_audit_log: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_direct_durable_sink_wrappers_as_unverified() {
+    let event_log: Arc<dyn DurableEventLog> = Arc::new(InMemoryDurableEventLog::new());
+    let audit_log: Arc<dyn DurableAuditLog> = Arc::new(InMemoryDurableAuditLog::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_event_sink(Arc::new(DurableEventSink::new(event_log)))
+    .with_audit_sink(Arc::new(DurableAuditSink::new(audit_log)));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("direct durable sink wrappers must not hide erased underlying log types");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::EventSink,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "direct durable event sink wrapper should require typed with_durable_event_log path: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::AuditSink,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "direct durable audit sink wrapper should require typed with_durable_audit_log path: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_unverified_runtime_http_egress() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_runtime_http_egress(Arc::new(
+        HostHttpEgressService::new_with_request_policy_for_tests(
+            RecordingNetworkHttpEgress::new(),
+            InMemorySecretStore::new(),
+        ),
+    ));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]).require_runtime_http_egress())
+        .expect_err(
+            "generic/test runtime HTTP egress must not satisfy production egress guardrail",
+        );
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimeHttpEgress,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "runtime HTTP egress should require production verification: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_wasm_credentials_added_after_adapter() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(WASM_HTTP_SUCCESS_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
+    .unwrap()
+    .with_wasm_runtime_credential_provider(Arc::new(WasmStagedRuntimeCredentials::new(vec![])));
+
+    let report = services
+        .validate_production_wiring(
+            &ProductionWiringConfig::new([RuntimeKind::Wasm]).require_wasm_credentials(),
+        )
+        .expect_err(
+            "credentials added after WASM adapter construction are not captured by the adapter",
+        );
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "WASM credentials must be configured before adapter construction: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_wasm_credentials_replaced_after_adapter() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(WASM_HTTP_SUCCESS_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_wasm_runtime_credential_provider(Arc::new(WasmStagedRuntimeCredentials::new(vec![])))
+    .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
+    .unwrap()
+    .with_wasm_runtime_credential_provider(Arc::new(WasmStagedRuntimeCredentials::new(vec![])));
+
+    let report = services
+        .validate_production_wiring(
+            &ProductionWiringConfig::new([RuntimeKind::Wasm]).require_wasm_credentials(),
+        )
+        .expect_err(
+            "replacing credentials after WASM adapter construction is not captured by the adapter",
+        );
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "WASM credentials must not be replaced after adapter construction: {report:?}"
+    );
+}
 
 #[tokio::test]
 async fn host_runtime_services_builds_dispatcher_runtime_and_health_from_registered_adapters() {
