@@ -4271,9 +4271,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "ironclaw_event_projections",
  "ironclaw_events",
  "ironclaw_filesystem",
  "ironclaw_host_api",
+ "ironclaw_reborn_event_store",
  "ironclaw_resources",
  "serde",
  "serde_json",
