@@ -4528,6 +4528,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_wasm_product_adapters"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hmac",
+ "http 1.4.0",
+ "ironclaw_host_api",
+ "ironclaw_product_adapters",
+ "ironclaw_turns",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "is-docker"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
