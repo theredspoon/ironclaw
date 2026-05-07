@@ -4184,6 +4184,7 @@ dependencies = [
  "ironclaw_authorization",
  "ironclaw_capabilities",
  "ironclaw_dispatcher",
+ "ironclaw_event_projections",
  "ironclaw_events",
  "ironclaw_extensions",
  "ironclaw_filesystem",

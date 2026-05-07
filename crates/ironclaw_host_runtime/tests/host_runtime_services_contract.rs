@@ -8,6 +8,10 @@ use ironclaw_authorization::{
     TrustAwareCapabilityDispatchAuthorizer,
 };
 use ironclaw_capabilities::{CapabilityHost, CapabilitySpawnRequest};
+use ironclaw_event_projections::{
+    EventProjectionService, ProjectionCursor, ProjectionError, ProjectionRequest, ProjectionScope,
+    ReplayEventProjectionService, RunProjectionStatus, TimelineEntryKind,
+};
 use ironclaw_events::{
     DurableAuditLog, DurableEventLog, DurableEventSink, EventCursor, EventError, EventReplay,
     EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog, InMemoryDurableEventLog,
@@ -395,6 +399,290 @@ async fn host_runtime_services_durable_event_replay_cursor_and_gap_behavior() {
         .await
         .expect_err("origin cursor should be stale after retention truncation");
     assert!(matches!(gap, EventError::ReplayGap { .. }));
+}
+
+#[tokio::test]
+async fn host_runtime_services_runtime_events_project_through_replay_projection_metadata_only() {
+    let registry = Arc::new(registry_with_manifest(SCRIPT_MANIFEST));
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let services = HostRuntimeServices::new(
+        registry,
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_durable_event_log(Arc::clone(&event_log))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope = sample_scope(InvocationId::new());
+    let payload = json!({
+        "message": "RAW_PROJECTION_INPUT_SENTINEL_3022 /tmp/private-projection-path",
+        "secret": "SECRET_PROJECTION_SENTINEL_3022_sk_live_secret",
+        "output": "RUNTIME_PROJECTION_OUTPUT_SENTINEL_3022",
+    });
+
+    let outcome = services
+        .host_runtime()
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
+            script_capability_id(),
+            ResourceEstimate::default(),
+            payload.clone(),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, RuntimeCapabilityOutcome::Completed(completed) if completed.output == payload)
+    );
+
+    let projection = ReplayEventProjectionService::new(Arc::clone(&event_log));
+    let snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .timeline
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TimelineEntryKind::DispatchRequested,
+            TimelineEntryKind::RuntimeSelected,
+            TimelineEntryKind::DispatchSucceeded,
+        ]
+    );
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(snapshot.runs[0].status, RunProjectionStatus::Completed);
+    assert_eq!(snapshot.runs[0].capability_id, script_capability_id());
+    assert_eq!(
+        snapshot.timeline.entries[2].output_bytes,
+        Some(serde_json::to_vec(&payload).unwrap().len() as u64)
+    );
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for forbidden in [
+        "RAW_PROJECTION_INPUT_SENTINEL_3022",
+        "/tmp/private-projection-path",
+        "SECRET_PROJECTION_SENTINEL_3022",
+        "RUNTIME_PROJECTION_OUTPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "runtime projection leaked {forbidden}: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_runtime_services_projection_rejects_foreign_cursor_and_surfaces_rebase_after_gap() {
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_durable_event_log(Arc::clone(&event_log))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope_a = sample_scope(InvocationId::new());
+    let scope_b = ResourceScope {
+        thread_id: Some(ThreadId::new("thread-b").unwrap()),
+        invocation_id: InvocationId::new(),
+        ..scope_a.clone()
+    };
+
+    let outcome = services
+        .host_runtime()
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(
+                script_capability_id(),
+                scope_a.clone(),
+            ),
+            script_capability_id(),
+            ResourceEstimate::default(),
+            json!({"message": "scope a"}),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RuntimeCapabilityOutcome::Completed(_)));
+
+    let projection = ReplayEventProjectionService::new(Arc::clone(&event_log));
+    let scope_a_projection = ProjectionScope::from_resource_scope(&scope_a);
+    let scope_b_projection = ProjectionScope::from_resource_scope(&scope_b);
+    let snapshot_a = projection
+        .snapshot(ProjectionRequest {
+            scope: scope_a_projection.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let snapshot_b = projection
+        .snapshot(ProjectionRequest {
+            scope: scope_b_projection.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(snapshot_b.timeline.entries.is_empty());
+
+    let foreign_cursor = projection
+        .updates(ProjectionRequest {
+            scope: scope_b_projection,
+            after: Some(snapshot_a.next_cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .expect_err("foreign projection cursor must force rebase");
+    assert!(matches!(
+        foreign_cursor,
+        ProjectionError::RebaseRequired { .. }
+    ));
+
+    event_log
+        .truncate_before_or_at(
+            &EventStreamKey::from_scope(&scope_a),
+            snapshot_a.timeline.entries[0].cursor,
+        )
+        .unwrap();
+    let stale_cursor = projection
+        .updates(ProjectionRequest {
+            scope: scope_a_projection.clone(),
+            after: Some(ProjectionCursor::origin_for_scope(scope_a_projection)),
+            limit: 10,
+        })
+        .await
+        .expect_err("retained-history gap must force projection rebase");
+    assert!(matches!(
+        stale_cursor,
+        ProjectionError::RebaseRequired { .. }
+    ));
+}
+
+#[tokio::test]
+async fn host_runtime_services_jsonl_event_store_projects_same_runtime_sequence_without_sentinels()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let store_root = temp.path().join("reborn-event-store");
+    let stores = build_reborn_event_stores(
+        RebornProfile::LocalDev,
+        RebornEventStoreConfig::Jsonl {
+            root: store_root.clone(),
+            accept_single_node_durable: false,
+        },
+    )
+    .await
+    .unwrap();
+    let event_log = Arc::clone(&stores.events);
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_event_sink(Arc::new(DurableEventSink::new(Arc::clone(&event_log))))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope = sample_scope(InvocationId::new());
+    let payload = json!({
+        "message": "JSONL_RAW_INPUT_SENTINEL_3022 /tmp/jsonl-private-path",
+        "secret": "JSONL_SECRET_SENTINEL_3022_sk_live_secret",
+        "output": "JSONL_OUTPUT_SENTINEL_3022",
+    });
+
+    let outcome = services
+        .host_runtime()
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
+            script_capability_id(),
+            ResourceEstimate::default(),
+            payload.clone(),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, RuntimeCapabilityOutcome::Completed(completed) if completed.output == payload)
+    );
+
+    let projection = ReplayEventProjectionService::from_runtime_log(Arc::clone(&event_log));
+    let snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .timeline
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TimelineEntryKind::DispatchRequested,
+            TimelineEntryKind::RuntimeSelected,
+            TimelineEntryKind::DispatchSucceeded,
+        ]
+    );
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(snapshot.runs[0].status, RunProjectionStatus::Completed);
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    let jsonl_bytes = read_directory_text(&store_root);
+    for forbidden in [
+        "JSONL_RAW_INPUT_SENTINEL_3022",
+        "/tmp/jsonl-private-path",
+        "JSONL_SECRET_SENTINEL_3022",
+        "JSONL_OUTPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !projection_json.contains(forbidden),
+            "JSONL-backed projection leaked {forbidden}: {projection_json}"
+        );
+        assert!(
+            !jsonl_bytes.contains(forbidden),
+            "JSONL durable event bytes leaked {forbidden}: {jsonl_bytes}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3548,6 +3836,27 @@ fn trust_decision_with_dispatch_authority() -> TrustDecision {
         provenance: TrustProvenance::Default,
         evaluated_at: Utc::now(),
     }
+}
+
+fn read_directory_text(root: &std::path::Path) -> String {
+    let mut output = String::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let entries = std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|err| panic!("failed to read dir entry: {err}"));
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                output.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                    panic!("failed to read {} as utf-8 text: {err}", path.display())
+                }));
+            }
+        }
+    }
+    output
 }
 
 fn sample_scope(invocation_id: InvocationId) -> ResourceScope {
