@@ -388,6 +388,9 @@ where
         T: EventSink + 'static,
     {
         self.component_types.event_sink = Some(type_name::<T>());
+        let event_sink: Arc<dyn EventSink> = event_sink;
+        self.process_lifecycle_store
+            .set_event_sink(Arc::clone(&event_sink));
         self.event_sink = Some(event_sink);
         self
     }
@@ -398,7 +401,10 @@ where
     {
         self.component_types.event_sink = Some(type_name::<T>());
         let event_log: Arc<dyn DurableEventLog> = event_log;
-        self.event_sink = Some(Arc::new(DurableEventSink::new(event_log)));
+        let event_sink: Arc<dyn EventSink> = Arc::new(DurableEventSink::new(event_log));
+        self.process_lifecycle_store
+            .set_event_sink(Arc::clone(&event_sink));
+        self.event_sink = Some(event_sink);
         self
     }
 

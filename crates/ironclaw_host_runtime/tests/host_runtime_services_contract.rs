@@ -37,8 +37,8 @@ use ironclaw_network::{
 use ironclaw_processes::{
     BackgroundFailureStage, BackgroundProcessManager, InMemoryProcessResultStore,
     InMemoryProcessStore, ProcessError, ProcessExecutionRequest, ProcessExecutionResult,
-    ProcessExecutor, ProcessHost, ProcessResultRecord, ProcessResultStore, ProcessServices,
-    ProcessStart, ProcessStatus, ProcessStore,
+    ProcessExecutor, ProcessHost, ProcessManager, ProcessResultRecord, ProcessResultStore,
+    ProcessServices, ProcessStart, ProcessStatus, ProcessStore,
 };
 use ironclaw_reborn_event_store::{
     RebornEventStoreConfig, RebornProfile, build_reborn_event_stores,
@@ -1315,6 +1315,215 @@ async fn host_runtime_services_jsonl_approval_audit_projection_rejects_foreign_c
         assert!(
             !jsonl_bytes.contains(forbidden),
             "JSONL durable audit bytes leaked {forbidden}: {jsonl_bytes}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn process_lifecycle_projects_through_durable_replay_without_output_leaks() {
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let inner_process_store = Arc::new(InMemoryProcessStore::new());
+    let process_store = Arc::new(ProcessObligationLifecycleStore::new(
+        inner_process_store,
+        Arc::new(NetworkObligationPolicyStore::new()),
+        Arc::new(RuntimeSecretInjectionStore::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+    ));
+    let durable_event_log: Arc<dyn DurableEventLog> = event_log.clone();
+    process_store.set_event_sink(Arc::new(DurableEventSink::new(durable_event_log)));
+    let result_store = Arc::new(InMemoryProcessResultStore::new());
+    let manager = BackgroundProcessManager::new(
+        Arc::clone(&process_store),
+        Arc::new(BackgroundExecutor::success_with_output(json!({
+            "result": "PROCESS_OUTPUT_SENTINEL_3022 /tmp/process-output-private"
+        }))),
+    )
+    .with_result_store(Arc::clone(&result_store));
+    let process_id = ProcessId::new();
+    let invocation_id = InvocationId::new();
+    let scope = sample_scope(invocation_id);
+
+    let process = manager
+        .spawn(process_start(process_id, invocation_id, scope.clone()))
+        .await
+        .unwrap();
+    wait_for_status(
+        process_store.as_ref(),
+        &scope,
+        process.process_id,
+        ProcessStatus::Completed,
+    )
+    .await;
+
+    let host =
+        ProcessHost::new(process_store.as_ref()).with_result_store(Arc::clone(&result_store));
+    let output = host
+        .output(&scope, process.process_id)
+        .await
+        .unwrap()
+        .expect("process output should be available through ProcessHost");
+    assert_eq!(
+        output,
+        json!({"result": "PROCESS_OUTPUT_SENTINEL_3022 /tmp/process-output-private"})
+    );
+
+    let projection = ReplayEventProjectionService::new(Arc::clone(&event_log));
+    let snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::for_process(&scope, process.process_id),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .timeline
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TimelineEntryKind::ProcessStarted,
+            TimelineEntryKind::ProcessCompleted,
+        ]
+    );
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(snapshot.runs[0].status, RunProjectionStatus::Completed);
+    assert_eq!(snapshot.runs[0].process_id, Some(process.process_id));
+
+    let foreign_scope = ResourceScope {
+        project_id: Some(ProjectId::new("foreign-project").unwrap()),
+        ..scope.clone()
+    };
+    let foreign_snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::for_process(&foreign_scope, process.process_id),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(foreign_snapshot.timeline.entries.is_empty());
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    let replay_json = serde_json::to_string(
+        &event_log
+            .read_after_cursor(
+                &EventStreamKey::from_scope(&scope),
+                &ReadScope::any(),
+                None,
+                10,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    for forbidden in [
+        "PROCESS_OUTPUT_SENTINEL_3022",
+        "/tmp/process-output-private",
+    ] {
+        assert!(
+            !projection_json.contains(forbidden),
+            "process projection leaked {forbidden}: {projection_json}"
+        );
+        assert!(
+            !replay_json.contains(forbidden),
+            "process durable replay leaked {forbidden}: {replay_json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_runtime_services_cancel_projects_kill_event_from_configured_event_sink() {
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let process_services = ProcessServices::new(
+        Arc::new(InMemoryProcessStore::new()),
+        Arc::new(InMemoryProcessResultStore::new()),
+    );
+    let process_store = process_services.process_store();
+    let result_store = process_services.result_store();
+    let runtime = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        process_services,
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_durable_event_log(Arc::clone(&event_log))
+    .host_runtime_for_local_testing();
+    let process_id = ProcessId::new();
+    let invocation_id = InvocationId::new();
+    let scope = sample_scope(invocation_id);
+    let mut start = process_start(process_id, invocation_id, scope.clone());
+    start.input = json!({
+        "message": "KILL_PROCESS_INPUT_SENTINEL_3022 /tmp/process-kill-private"
+    });
+    process_store.start(start).await.unwrap();
+
+    let outcome = runtime
+        .cancel_work(CancelRuntimeWorkRequest::new(
+            scope.clone(),
+            CorrelationId::new(),
+            CancelReason::UserRequested,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(outcome.cancelled, vec![RuntimeWorkId::Process(process_id)]);
+    assert_eq!(
+        result_store
+            .get(&scope, process_id)
+            .await
+            .unwrap()
+            .expect("cancel should persist killed process result")
+            .status,
+        ProcessStatus::Killed
+    );
+
+    let projection = ReplayEventProjectionService::new(Arc::clone(&event_log));
+    let snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::for_process(&scope, process_id),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.timeline.entries.len(), 1);
+    assert_eq!(
+        snapshot.timeline.entries[0].kind,
+        TimelineEntryKind::ProcessKilled
+    );
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(snapshot.runs[0].status, RunProjectionStatus::Killed);
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    let replay_json = serde_json::to_string(
+        &event_log
+            .read_after_cursor(
+                &EventStreamKey::from_scope(&scope),
+                &ReadScope::any(),
+                None,
+                10,
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    for forbidden in [
+        "KILL_PROCESS_INPUT_SENTINEL_3022",
+        "/tmp/process-kill-private",
+    ] {
+        assert!(
+            !projection_json.contains(forbidden),
+            "kill projection leaked {forbidden}: {projection_json}"
+        );
+        assert!(
+            !replay_json.contains(forbidden),
+            "kill durable replay leaked {forbidden}: {replay_json}"
         );
     }
 }
@@ -4183,7 +4392,13 @@ struct BackgroundExecutor {
 impl BackgroundExecutor {
     fn success() -> Self {
         Self {
-            outcome: BackgroundExecutorOutcome::Success,
+            outcome: BackgroundExecutorOutcome::Success(json!({"ok": true})),
+        }
+    }
+
+    fn success_with_output(output: serde_json::Value) -> Self {
+        Self {
+            outcome: BackgroundExecutorOutcome::Success(output),
         }
     }
 
@@ -4201,7 +4416,7 @@ impl BackgroundExecutor {
 }
 
 enum BackgroundExecutorOutcome {
-    Success,
+    Success(serde_json::Value),
     Failure(String),
     DelayedSuccess(Duration),
 }
@@ -4213,8 +4428,8 @@ impl ProcessExecutor for BackgroundExecutor {
         _request: ProcessExecutionRequest,
     ) -> Result<ProcessExecutionResult, ironclaw_processes::ProcessExecutionError> {
         match &self.outcome {
-            BackgroundExecutorOutcome::Success => Ok(ProcessExecutionResult {
-                output: json!({"ok": true}),
+            BackgroundExecutorOutcome::Success(output) => Ok(ProcessExecutionResult {
+                output: output.clone(),
             }),
             BackgroundExecutorOutcome::Failure(kind) => {
                 Err(ironclaw_processes::ProcessExecutionError::new(kind.clone()))
