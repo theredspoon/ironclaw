@@ -370,6 +370,7 @@ fn boundary_rules() -> Vec<BoundaryRule> {
         BoundaryRule {
             crate_name: "ironclaw_event_projections",
             forbidden: vec![
+                "ironclaw",
                 "ironclaw_authorization",
                 "ironclaw_approvals",
                 "ironclaw_capabilities",
@@ -605,7 +606,7 @@ fn package_dependencies(package: &Value) -> Option<(String, Vec<String>)> {
         .flatten()
         .filter(|dependency| is_normal_dependency(dependency))
         .filter_map(|dependency| dependency["name"].as_str())
-        .filter(|name| name.starts_with("ironclaw_"))
+        .filter(|name| *name == "ironclaw" || name.starts_with("ironclaw_"))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     Some((name, dependencies))
@@ -621,7 +622,9 @@ fn is_normal_dependency(dependency: &Value) -> bool {
 fn workspace_ironclaw_crates(dependencies: &HashMap<String, Vec<String>>) -> Vec<&str> {
     dependencies
         .keys()
-        .filter_map(|name| name.starts_with("ironclaw_").then_some(name.as_str()))
+        .filter_map(|name| {
+            (name == "ironclaw" || name.starts_with("ironclaw_")).then_some(name.as_str())
+        })
         .collect()
 }
 
