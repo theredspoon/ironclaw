@@ -857,7 +857,7 @@ async fn host_runtime_services_runtime_events_project_through_replay_projection_
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -945,7 +945,7 @@ async fn host_runtime_services_projection_rejects_foreign_cursor_and_surfaces_re
     };
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(
                 script_capability_id(),
@@ -1054,7 +1054,7 @@ async fn host_runtime_services_jsonl_event_store_projects_same_runtime_sequence_
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -1138,7 +1138,7 @@ async fn host_runtime_services_approval_resolution_projects_durable_audit_metada
         ScriptRuntimeConfig::for_testing(),
         EchoScriptBackend,
     )));
-    let runtime = services.host_runtime();
+    let runtime = services.host_runtime_for_local_testing();
     let scope = sample_scope(InvocationId::new());
     let context = execution_context_without_grants_for_scope(scope.clone());
     let input = json!({
@@ -1248,7 +1248,7 @@ async fn host_runtime_services_jsonl_approval_audit_projection_rejects_foreign_c
         ScriptRuntimeConfig::for_testing(),
         EchoScriptBackend,
     )));
-    let runtime = services.host_runtime();
+    let runtime = services.host_runtime_for_local_testing();
     let scope_a = sample_scope(InvocationId::new());
     let scope_b = ResourceScope {
         thread_id: Some(ThreadId::new("approval-thread-b").unwrap()),
