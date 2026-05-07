@@ -45,7 +45,7 @@ async fn approval_resume_survives_filesystem_service_restart_and_consumes_lease_
     let engine_root = temp.path().join("engine");
     let event_root = temp.path().join("events");
     let first = durable_services(&engine_root, &event_root).await;
-    let first_runtime = first.services.host_runtime();
+    let first_runtime = first.services.host_runtime_for_local_testing();
     let context = execution_context_without_grants_for_scope(sample_scope(InvocationId::new()));
     let scope = context.resource_scope.clone();
     let estimate = ResourceEstimate::default();
@@ -88,7 +88,7 @@ async fn approval_resume_survives_filesystem_service_restart_and_consumes_lease_
 
     let resumed = second
         .services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .resume_capability(RuntimeCapabilityResumeRequest::new(
             context.clone(),
             gate.approval_request_id,
@@ -163,7 +163,7 @@ async fn approval_resume_survives_filesystem_service_restart_and_consumes_lease_
 
     let second_resume = third
         .services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .resume_capability(RuntimeCapabilityResumeRequest::new(
             context,
             gate.approval_request_id,
@@ -265,7 +265,7 @@ async fn jsonl_event_and_audit_replay_survive_reopen_without_raw_sentinels() {
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
