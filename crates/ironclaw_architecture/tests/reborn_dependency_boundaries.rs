@@ -142,6 +142,87 @@ fn reborn_turns_public_surface_uses_turn_ids_not_runtime_or_process_ids() {
 }
 
 #[test]
+fn wasm_product_adapter_crate_has_local_guardrails() {
+    let guardrails = workspace_root().join("crates/ironclaw_wasm_product_adapters/CLAUDE.md");
+    assert!(
+        guardrails.exists(),
+        "ironclaw_wasm_product_adapters needs local CLAUDE.md guardrails before becoming a Reborn boundary crate"
+    );
+}
+
+#[test]
+fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+    let package = packages
+        .iter()
+        .find(|package| package["name"] == "ironclaw_wasm_product_adapters")
+        .expect("ironclaw_wasm_product_adapters must be a workspace package");
+    let mut deps = package["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .filter(|dependency| is_normal_dependency(dependency))
+        .filter_map(|dependency| dependency["name"].as_str())
+        .collect::<Vec<_>>();
+    deps.sort_unstable();
+
+    let expected = vec![
+        "hmac",
+        "http",
+        "ironclaw_product_adapters",
+        "sha2",
+        "subtle",
+        "thiserror",
+    ];
+    assert_eq!(
+        deps, expected,
+        "ironclaw_wasm_product_adapters should stay thin host glue; add runtime/workflow dependencies only when a call-site proves they are required"
+    );
+}
+
+#[test]
+fn wasm_product_adapter_wit_preserves_product_adapter_trust_boundary() {
+    let wit = std::fs::read_to_string(
+        workspace_root().join("crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit"),
+    )
+    .expect("product adapter WIT must be readable");
+
+    assert!(
+        wit.contains("record parsed-inbound"),
+        "WIT should name adapter output as ParsedProductInbound, not a trusted envelope"
+    );
+    assert!(
+        wit.contains("result<parsed-inbound, string>"),
+        "parse-inbound should return a parsed inbound payload; host glue stamps TrustedInboundContext and builds ProductInboundEnvelope"
+    );
+    for forbidden in [
+        "result<option<parsed-envelope>",
+        "record parsed-envelope",
+        "envelope-json",
+        "Returns `none`",
+        "ProductInboundEnvelope",
+    ] {
+        assert!(
+            !wit.contains(forbidden),
+            "WIT must not use `{forbidden}`; no-op events are ProductInboundPayload::NoOp and envelopes are host-stamped"
+        );
+    }
+
+    let response_record = wit
+        .split("record egress-response {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("egress-response record must exist");
+    assert!(
+        !response_record.contains("headers"),
+        "WASM egress responses must not expose raw response headers to adapters"
+    );
+}
+
+#[test]
 fn reborn_runtime_http_egress_has_single_network_boundary() {
     let forbidden = [
         ForbiddenRuntimeNetworkUse {
@@ -414,6 +495,40 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_secrets",
                 "ironclaw_skills",
                 "ironclaw_tui",
+                "ironclaw_wasm",
+            ],
+        },
+        BoundaryRule {
+            crate_name: "ironclaw_wasm_product_adapters",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_authorization",
+                "ironclaw_approvals",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_runtime",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_threads",
+                "ironclaw_tui",
+                "ironclaw_turns",
                 "ironclaw_wasm",
             ],
         },
