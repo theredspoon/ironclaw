@@ -20,6 +20,8 @@ use ironclaw_events::{
     InMemoryDurableEventLog, InMemoryEventSink, ReadScope, RuntimeEventKind,
 };
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry};
+#[cfg(feature = "libsql")]
+use ironclaw_filesystem::LibSqlRootFilesystem;
 use ironclaw_filesystem::{LocalFilesystem, RootFilesystem};
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
@@ -182,6 +184,41 @@ fn production_wiring_validation_rejects_unsupported_runtime_requirements() {
             ProductionWiringIssueKind::UnsupportedRequirement
         ),
         "unsupported runtime backend requirement should be reported: {report:?}"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn production_root_filesystem_selection_accepts_libsql_root_filesystem() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("root-filesystem.db");
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let filesystem = Arc::new(LibSqlRootFilesystem::new(db));
+    filesystem.run_migrations().await.unwrap();
+
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_libsql_root_filesystem(Arc::clone(&filesystem));
+
+    let path = VirtualPath::new("/engine/tenants/t1/users/u1/root-selection.txt").unwrap();
+    filesystem.write_file(&path, b"selected").await.unwrap();
+    assert_eq!(filesystem.read_file(&path).await.unwrap(), b"selected");
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("other local services remain intentionally unready");
+    assert!(
+        !report.contains(
+            ProductionWiringComponent::Filesystem,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "LibSqlRootFilesystem must satisfy production filesystem selection: {report:?}"
     );
 }
 

@@ -22,6 +22,10 @@ use ironclaw_events::{
     AuditSink, DurableAuditLog, DurableAuditSink, DurableEventLog, DurableEventSink, EventSink,
 };
 use ironclaw_extensions::{ExtensionRegistry, ExtensionRuntime};
+#[cfg(feature = "libsql")]
+use ironclaw_filesystem::LibSqlRootFilesystem;
+#[cfg(feature = "postgres")]
+use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
     CapabilityDispatchRequest, CapabilityDispatcher, CapabilityId, DispatchError,
@@ -352,6 +356,81 @@ where
                 mcp_runtime: None,
             },
         }
+    }
+
+    fn with_root_filesystem<T>(self, filesystem: Arc<T>) -> HostRuntimeServices<T, G, S, R>
+    where
+        T: RootFilesystem + 'static,
+    {
+        let Self {
+            registry,
+            trust_policy,
+            trust_policy_configured,
+            filesystem: _,
+            governor,
+            authorizer,
+            process_services,
+            surface_version,
+            run_state,
+            approval_requests,
+            capability_leases,
+            event_sink,
+            audit_sink,
+            secret_store,
+            network_policy_store,
+            secret_injection_store,
+            process_lifecycle_store,
+            runtime_http_egress,
+            wasm_credential_provider,
+            runtime_health,
+            script_runtime,
+            mcp_runtime,
+            wasm_runtime,
+            mut component_types,
+        } = self;
+        component_types.filesystem = type_name::<T>();
+        HostRuntimeServices {
+            registry,
+            trust_policy,
+            trust_policy_configured,
+            filesystem,
+            governor,
+            authorizer,
+            process_services,
+            surface_version,
+            run_state,
+            approval_requests,
+            capability_leases,
+            event_sink,
+            audit_sink,
+            secret_store,
+            network_policy_store,
+            secret_injection_store,
+            process_lifecycle_store,
+            runtime_http_egress,
+            wasm_credential_provider,
+            runtime_health,
+            script_runtime,
+            mcp_runtime,
+            wasm_runtime,
+            component_types,
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    pub fn with_postgres_root_filesystem(
+        self,
+        filesystem: Arc<PostgresRootFilesystem>,
+    ) -> HostRuntimeServices<PostgresRootFilesystem, G, S, R> {
+        self.with_root_filesystem(filesystem)
+    }
+
+    #[cfg(feature = "libsql")]
+    pub fn with_libsql_root_filesystem(
+        self,
+        filesystem: Arc<LibSqlRootFilesystem>,
+    ) -> HostRuntimeServices<LibSqlRootFilesystem, G, S, R> {
+        self.with_root_filesystem(filesystem)
     }
 
     /// Attaches the host-owned trust policy used by the produced
