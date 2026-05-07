@@ -1,18 +1,109 @@
 use async_trait::async_trait;
-use ironclaw_host_api::{CapabilityId, ExtensionId, ProcessId, RuntimeKind, ThreadId};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use ironclaw_host_api::{CapabilityId, ExtensionId, RuntimeKind, ThreadId};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{
     LoopDiagnosticRef, LoopGateRef, LoopMessageRef, LoopResultRef, RunProfileVersion,
-    TurnCheckpointId, TurnId, TurnRunId, TurnScope, events::EventCursor,
+    TurnCheckpointId, TurnId, TurnRunId, TurnScope,
 };
 
 use super::{
     refs::{CheckpointSchemaId, LoopDriverId, ModelProfileId},
     snapshot::ResolvedRunProfile,
 };
+
+fn validate_bounded_loop_string(
+    value: String,
+    label: &'static str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{label} must be at most {max_bytes} bytes"));
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(format!("{label} must not contain NUL/control characters"));
+    }
+    Ok(value)
+}
+
+fn validate_prefixed_loop_ref(
+    label: &'static str,
+    prefix: &'static str,
+    max_bytes: usize,
+    value: String,
+) -> Result<String, String> {
+    let value = validate_bounded_loop_string(value, label, max_bytes)?;
+    if !value.starts_with(prefix) {
+        return Err(format!("{label} must start with `{prefix}`"));
+    }
+    Ok(value)
+}
+
+macro_rules! bounded_loop_ref {
+    ($name:ident, $label:literal, $prefix:literal, $max:expr) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, String> {
+                validate_prefixed_loop_ref($label, $prefix, $max, value.into()).map(Self)
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+bounded_loop_ref!(CapabilityInputRef, "capability input ref", "input:", 256);
+bounded_loop_ref!(
+    LoopCheckpointStateRef,
+    "loop checkpoint state ref",
+    "checkpoint:",
+    256
+);
+bounded_loop_ref!(
+    LoopInputCursorToken,
+    "loop input cursor token",
+    "input-cursor:",
+    256
+);
+bounded_loop_ref!(LoopProcessRef, "loop process ref", "process:", 256);
+
+fn origin_input_cursor_token() -> LoopInputCursorToken {
+    LoopInputCursorToken("input-cursor:origin".to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopRunContext {
@@ -144,17 +235,44 @@ pub trait LoopContextPort: Send + Sync {
     ) -> Result<LoopContextBundle, AgentLoopHostError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
-#[serde(transparent)]
-pub struct LoopInputCursor(EventCursor);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopInputCursor {
+    scope: TurnScope,
+    run_id: TurnRunId,
+    token: LoopInputCursorToken,
+}
 
 impl LoopInputCursor {
-    pub fn from_event_cursor(cursor: EventCursor) -> Self {
-        Self(cursor)
+    pub fn origin_for_run(context: &LoopRunContext) -> Self {
+        Self {
+            scope: context.scope.clone(),
+            run_id: context.run_id,
+            token: origin_input_cursor_token(),
+        }
     }
 
-    pub fn as_event_cursor(self) -> EventCursor {
-        self.0
+    pub fn from_host_token(context: &LoopRunContext, token: LoopInputCursorToken) -> Self {
+        Self {
+            scope: context.scope.clone(),
+            run_id: context.run_id,
+            token,
+        }
+    }
+
+    pub fn scope(&self) -> &TurnScope {
+        &self.scope
+    }
+
+    pub fn run_id(&self) -> TurnRunId {
+        self.run_id
+    }
+
+    pub fn token(&self) -> &LoopInputCursorToken {
+        &self.token
+    }
+
+    pub fn is_for_run(&self, context: &LoopRunContext) -> bool {
+        self.scope == context.scope && self.run_id == context.run_id
     }
 }
 
@@ -202,17 +320,39 @@ pub trait LoopInputPort: Send + Sync {
     async fn ack_inputs(&self, cursor: LoopInputCursor) -> Result<(), AgentLoopHostError>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct CapabilitySurfaceVersion(u64);
+pub struct CapabilitySurfaceVersion(String);
 
 impl CapabilitySurfaceVersion {
-    pub fn new(value: u64) -> Self {
-        Self(value)
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        validate_bounded_loop_string(value.into(), "capability surface version", 128).map(Self)
     }
 
-    pub fn as_u64(self) -> u64 {
-        self.0
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for CapabilitySurfaceVersion {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for CapabilitySurfaceVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilitySurfaceVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -257,7 +397,7 @@ pub struct AssistantReply {
 pub struct CapabilityCallCandidate {
     pub surface_version: CapabilitySurfaceVersion,
     pub capability_id: CapabilityId,
-    pub arguments: Value,
+    pub input_ref: CapabilityInputRef,
 }
 
 #[async_trait]
@@ -290,7 +430,7 @@ pub struct CapabilityDescriptorView {
 pub struct CapabilityInvocation {
     pub surface_version: CapabilitySurfaceVersion,
     pub capability_id: CapabilityId,
-    pub arguments: Value,
+    pub input_ref: CapabilityInputRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,7 +486,7 @@ pub struct CapabilityResultMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessHandleSummary {
-    pub process_id: ProcessId,
+    pub process_ref: LoopProcessRef,
     pub safe_summary: String,
 }
 
@@ -434,7 +574,7 @@ pub trait LoopTranscriptPort: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopCheckpointRequest {
     pub kind: LoopCheckpointKind,
-    pub state_ref: String,
+    pub state_ref: LoopCheckpointStateRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,25 +608,6 @@ pub trait LoopCheckpointPort: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopProgressEvent {
-    ModelStarted,
-    ModelCompleted,
-    CapabilityInvoked {
-        capability_id: CapabilityId,
-    },
-    CheckpointCreated {
-        checkpoint_id: TurnCheckpointId,
-    },
-    TranscriptFinalized {
-        message_ref: LoopMessageRef,
-    },
-    Blocked {
-        gate_ref: LoopGateRef,
-        checkpoint_id: TurnCheckpointId,
-    },
-    Completed,
-    Failed {
-        reason_kind: String,
-    },
     DriverNote {
         kind: LoopDriverNoteKind,
         safe_summary: String,
@@ -494,16 +615,15 @@ pub enum LoopProgressEvent {
 }
 
 impl LoopProgressEvent {
+    pub fn driver_note(kind: LoopDriverNoteKind, safe_summary: impl Into<String>) -> Self {
+        Self::DriverNote {
+            kind,
+            safe_summary: safe_summary.into(),
+        }
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
-            Self::ModelStarted => "model_started",
-            Self::ModelCompleted => "model_completed",
-            Self::CapabilityInvoked { .. } => "capability_invoked",
-            Self::CheckpointCreated { .. } => "checkpoint_created",
-            Self::TranscriptFinalized { .. } => "transcript_finalized",
-            Self::Blocked { .. } => "blocked",
-            Self::Completed => "completed",
-            Self::Failed { .. } => "failed",
             Self::DriverNote { .. } => "driver_note",
         }
     }
