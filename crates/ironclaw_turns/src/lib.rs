@@ -28,7 +28,11 @@ pub use coordinator::{
 pub use db::LibSqlTurnStateStore;
 #[cfg(feature = "postgres")]
 pub use db::PostgresTurnStateStore;
-pub use events::{InMemoryTurnEventSink, TurnEventKind, TurnEventSink, TurnLifecycleEvent};
+pub use events::{
+    InMemoryTurnEventSink, TurnEventKind, TurnEventPage, TurnEventProjectionCursor,
+    TurnEventProjectionError, TurnEventProjectionRequest, TurnEventProjectionService,
+    TurnEventProjectionSnapshot, TurnEventProjectionSource, TurnEventSink, TurnLifecycleEvent,
+};
 pub use ids::{
     AcceptedMessageRef, GateRef, IdempotencyKey, LoopDiagnosticRef, LoopExitId, LoopGateRef,
     LoopMessageRef, LoopResultRef, LoopUsageSummaryRef, ReplyTargetBindingRef, RunProfileId,

@@ -17,7 +17,7 @@ use crate::{
     TurnIdempotencyReplay, TurnLifecycleEvent, TurnLockVersion, TurnPersistenceSnapshot,
     TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
     TurnStatus,
-    events::EventCursor,
+    events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
@@ -189,6 +189,18 @@ impl InMemoryTurnStateStore {
             .map_err(|_| TurnError::Unavailable {
                 reason: "turn state store mutex poisoned".to_string(),
             })
+    }
+}
+
+#[async_trait]
+impl TurnEventProjectionSource for InMemoryTurnStateStore {
+    async fn read_turn_events_after(
+        &self,
+        scope: &TurnScope,
+        after: Option<EventCursor>,
+        limit: usize,
+    ) -> Result<TurnEventPage, TurnError> {
+        Ok(project_turn_events(&self.events(), scope, after, limit))
     }
 }
 
@@ -633,6 +645,9 @@ impl Inner {
             }
         }
 
+        let events = snapshot.events;
+        cursor = cursor.max(events.iter().map(|event| event.cursor.0).max().unwrap_or(0));
+
         Ok(Self {
             cursor,
             turns,
@@ -650,7 +665,7 @@ impl Inner {
             resume_idempotency_order,
             cancel_idempotency_order,
             idempotency_record_order,
-            events: Vec::new(),
+            events,
             limits,
         })
     }
@@ -714,6 +729,7 @@ impl Inner {
             active_locks,
             checkpoints,
             idempotency_records,
+            events: self.events.clone(),
         }
     }
 

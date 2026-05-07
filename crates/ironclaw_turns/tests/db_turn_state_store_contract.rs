@@ -13,7 +13,8 @@ use ironclaw_turns::{
     LoopCompletionKind, LoopExit, LoopExitInvalidHandling, LoopExitValidationPolicy,
     LoopMessageRef, ReplyTargetBindingRef, RunProfileRequest, SanitizedCancelReason,
     SanitizedFailure, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy,
-    TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnStatus,
+    TurnActor, TurnCoordinator, TurnError, TurnEventKind, TurnEventProjectionRequest,
+    TurnEventProjectionService, TurnRunId, TurnScope, TurnStatus,
     runner::{
         ApplyLoopExitRequest, ClaimRunRequest, RecoverExpiredLeasesRequest, TurnRunTransitionPort,
         apply_loop_exit,
@@ -24,6 +25,54 @@ use ironclaw_turns::{
 use ironclaw_turns::LibSqlTurnStateStore;
 #[cfg(feature = "postgres")]
 use ironclaw_turns::PostgresTurnStateStore;
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_turn_event_projection_replays_submit_after_reopen_without_raw_refs() {
+    let (db, _dir) = libsql_db().await;
+    let store = Arc::new(LibSqlTurnStateStore::new(db.clone()));
+    store.run_migrations().await.unwrap();
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let mut request = submit_request("thread-turn-event-db", "idem-turn-event-db");
+    request.accepted_message_ref =
+        AcceptedMessageRef::new("message-DB_TURN_RAW_SENTINEL_3022 /tmp/db-turn-private").unwrap();
+    request.source_binding_ref =
+        SourceBindingRef::new("source-DB_TURN_SOURCE_SENTINEL_3022").unwrap();
+    request.reply_target_binding_ref =
+        ReplyTargetBindingRef::new("reply-DB_TURN_REPLY_SENTINEL_3022").unwrap();
+
+    let accepted = coordinator.submit_turn(request.clone()).await.unwrap();
+    let run_id = accepted_run_id(&accepted);
+
+    let reopened = Arc::new(LibSqlTurnStateStore::new(db));
+    let projection = TurnEventProjectionService::new(reopened);
+    let snapshot = projection
+        .snapshot(TurnEventProjectionRequest {
+            scope: request.scope,
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].kind, TurnEventKind::Submitted);
+    assert_eq!(snapshot.entries[0].run_id, run_id);
+    assert_eq!(snapshot.entries[0].status, TurnStatus::Queued);
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for forbidden in [
+        "DB_TURN_RAW_SENTINEL_3022",
+        "/tmp/db-turn-private",
+        "DB_TURN_SOURCE_SENTINEL_3022",
+        "DB_TURN_REPLY_SENTINEL_3022",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "libSQL turn lifecycle projection leaked {forbidden}: {serialized}"
+        );
+    }
+}
 
 #[cfg(feature = "libsql")]
 #[tokio::test]

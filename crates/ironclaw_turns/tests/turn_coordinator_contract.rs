@@ -18,10 +18,11 @@ use ironclaw_turns::{
     RunProfileRequest, RunProfileVersion, SanitizedCancelReason, SanitizedFailure,
     SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor,
     TurnAdmissionPolicy, TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory,
-    TurnEventKind, TurnEventSink, TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind,
-    TurnLeaseToken, TurnLifecycleEvent, TurnLockVersion, TurnRunId, TurnRunState, TurnRunWake,
-    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnStateStore,
-    TurnStatus,
+    TurnEventKind, TurnEventProjectionError, TurnEventProjectionRequest,
+    TurnEventProjectionService, TurnEventSink, TurnIdempotencyOperationKind,
+    TurnIdempotencyOutcomeKind, TurnLeaseToken, TurnLifecycleEvent, TurnLockVersion, TurnRunId,
+    TurnRunState, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId,
+    TurnScope, TurnStateStore, TurnStatus,
     events::EventCursor,
     runner::{
         ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
@@ -41,6 +42,144 @@ fn turn_scope_agent_id_is_optional() {
     );
 
     assert_eq!(scope.agent_id, None);
+}
+
+#[tokio::test]
+async fn turn_lifecycle_projection_replays_submit_block_resume_complete_without_raw_refs() {
+    let (coordinator, store) = coordinator();
+    let mut request = submit_request("thread-turn-events", "idem-turn-events-submit");
+    request.accepted_message_ref =
+        AcceptedMessageRef::new("message-TURN_RAW_INPUT_SENTINEL_3022 /tmp/turn-private-path")
+            .unwrap();
+    request.source_binding_ref = SourceBindingRef::new("source-TURN_SOURCE_SENTINEL_3022").unwrap();
+    request.reply_target_binding_ref =
+        ReplyTargetBindingRef::new("reply-TURN_REPLY_SENTINEL_3022").unwrap();
+
+    let run_id = accepted_run_id(&coordinator.submit_turn(request.clone()).await.unwrap());
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(request.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let gate_ref = GateRef::new("gate-TURN_GATE_SENTINEL_3022").unwrap();
+    store
+        .block_run(BlockRunRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            checkpoint_id: TurnCheckpointId::new(),
+            reason: BlockedReason::Approval {
+                gate_ref: gate_ref.clone(),
+            },
+        })
+        .await
+        .unwrap();
+    coordinator
+        .resume_turn(ResumeTurnRequest {
+            scope: request.scope.clone(),
+            actor: actor(),
+            run_id,
+            gate_resolution_ref: gate_ref,
+            source_binding_ref: SourceBindingRef::new("source-TURN_RESUME_SOURCE_SENTINEL_3022")
+                .unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new(
+                "reply-TURN_RESUME_REPLY_SENTINEL_3022",
+            )
+            .unwrap(),
+            idempotency_key: IdempotencyKey::new("idem-turn-events-resume").unwrap(),
+        })
+        .await
+        .unwrap();
+    let next_lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token: next_lease_token,
+            scope_filter: Some(request.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .complete_run(CompleteRunRequest {
+            run_id,
+            runner_id,
+            lease_token: next_lease_token,
+        })
+        .await
+        .unwrap();
+
+    let projection = TurnEventProjectionService::new(store.clone());
+    let snapshot = projection
+        .snapshot(TurnEventProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TurnEventKind::Submitted,
+            TurnEventKind::RunnerClaimed,
+            TurnEventKind::Blocked,
+            TurnEventKind::Resumed,
+            TurnEventKind::RunnerClaimed,
+            TurnEventKind::Completed,
+        ]
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.scope == request.scope)
+    );
+    assert!(snapshot.entries.iter().all(|entry| entry.run_id == run_id));
+    assert_eq!(
+        snapshot.entries.last().unwrap().status,
+        TurnStatus::Completed
+    );
+
+    let foreign = projection
+        .updates(TurnEventProjectionRequest {
+            scope: scope("thread-foreign-turn-events"),
+            after: Some(snapshot.next_cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .expect_err("foreign turn projection cursor must force rebase");
+    assert!(matches!(
+        foreign,
+        TurnEventProjectionError::RebaseRequired { .. }
+    ));
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for forbidden in [
+        "TURN_RAW_INPUT_SENTINEL_3022",
+        "/tmp/turn-private-path",
+        "TURN_SOURCE_SENTINEL_3022",
+        "TURN_REPLY_SENTINEL_3022",
+        "TURN_GATE_SENTINEL_3022",
+        "TURN_RESUME_SOURCE_SENTINEL_3022",
+        "TURN_RESUME_REPLY_SENTINEL_3022",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "turn lifecycle projection leaked {forbidden}: {serialized}"
+        );
+    }
 }
 
 #[tokio::test]

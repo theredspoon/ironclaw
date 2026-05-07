@@ -6,8 +6,9 @@ use crate::{
     CancelRunRequest, CancelRunResponse, GetRunStateRequest, InMemoryTurnStateStore,
     InMemoryTurnStateStoreLimits, ResumeTurnRequest, ResumeTurnResponse, SubmitTurnRequest,
     SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionPolicy, TurnCheckpointRecord, TurnError,
-    TurnIdempotencyRecord, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord, TurnRunState,
-    TurnStateStore,
+    TurnIdempotencyRecord, TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord,
+    TurnRunState, TurnScope, TurnStateStore,
+    events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
@@ -62,6 +63,16 @@ CREATE TABLE IF NOT EXISTS turn_idempotency_records (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turn_idempotency_scope ON turn_idempotency_records(scope_key, operation);
+
+CREATE TABLE IF NOT EXISTS turn_lifecycle_events (
+    event_key TEXT PRIMARY KEY,
+    scope_key TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    event_cursor INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_events_scope_cursor ON turn_lifecycle_events(scope_key, event_cursor);
 "#;
 
 #[cfg(feature = "postgres")]
@@ -110,6 +121,16 @@ CREATE TABLE IF NOT EXISTS turn_idempotency_records (
     payload JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turn_idempotency_scope ON turn_idempotency_records(scope_key, operation);
+
+CREATE TABLE IF NOT EXISTS turn_lifecycle_events (
+    event_key TEXT PRIMARY KEY,
+    scope_key TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    event_cursor BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    payload JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_events_scope_cursor ON turn_lifecycle_events(scope_key, event_cursor);
 "#;
 
 #[cfg(feature = "libsql")]
@@ -235,6 +256,24 @@ impl TurnStateStore for LibSqlTurnStateStore {
             })?
             .get_run_state(request)
             .await
+    }
+}
+
+#[cfg(feature = "libsql")]
+#[async_trait]
+impl TurnEventProjectionSource for LibSqlTurnStateStore {
+    async fn read_turn_events_after(
+        &self,
+        scope: &TurnScope,
+        after: Option<EventCursor>,
+        limit: usize,
+    ) -> Result<TurnEventPage, TurnError> {
+        Ok(project_turn_events(
+            &self.load_snapshot().await?.events,
+            scope,
+            after,
+            limit,
+        ))
     }
 }
 
@@ -484,6 +523,24 @@ impl TurnStateStore for PostgresTurnStateStore {
 
 #[cfg(feature = "postgres")]
 #[async_trait]
+impl TurnEventProjectionSource for PostgresTurnStateStore {
+    async fn read_turn_events_after(
+        &self,
+        scope: &TurnScope,
+        after: Option<EventCursor>,
+        limit: usize,
+    ) -> Result<TurnEventPage, TurnError> {
+        Ok(project_turn_events(
+            &self.load_snapshot().await?.events,
+            scope,
+            after,
+            limit,
+        ))
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
 impl TurnRunTransitionPort for PostgresTurnStateStore {
     async fn claim_next_run(
         &self,
@@ -646,12 +703,18 @@ async fn libsql_load_snapshot(
         "SELECT payload FROM turn_idempotency_records ORDER BY created_at, record_key",
     )
     .await?;
+    let events = libsql_load_payloads::<TurnLifecycleEvent>(
+        conn,
+        "SELECT payload FROM turn_lifecycle_events ORDER BY event_cursor, event_key",
+    )
+    .await?;
     Ok(TurnPersistenceSnapshot {
         turns,
         runs,
         active_locks,
         checkpoints,
         idempotency_records,
+        events,
     })
 }
 
@@ -678,6 +741,7 @@ async fn libsql_replace_snapshot(
     snapshot: &TurnPersistenceSnapshot,
 ) -> Result<(), TurnError> {
     for table in [
+        "turn_lifecycle_events",
         "turn_idempotency_records",
         "turn_checkpoints",
         "turn_active_locks",
@@ -758,6 +822,21 @@ async fn libsql_replace_snapshot(
         .await
         .map_err(db_error)?;
     }
+    for event in &snapshot.events {
+        conn.execute(
+            "INSERT INTO turn_lifecycle_events (event_key, scope_key, run_id, event_cursor, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params![
+                turn_event_key(event)?,
+                scope_key(&event.scope)?,
+                event.run_id.to_string(),
+                event.cursor.0 as i64,
+                turn_event_kind_key(event)?,
+                to_json(event)?,
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -767,7 +846,7 @@ async fn lock_postgres_turn_tables(
     mode: &str,
 ) -> Result<(), TurnError> {
     let statement = format!(
-        "LOCK TABLE turn_records, turn_run_records, turn_active_locks, turn_checkpoints, turn_idempotency_records IN {mode}"
+        "LOCK TABLE turn_records, turn_run_records, turn_active_locks, turn_checkpoints, turn_idempotency_records, turn_lifecycle_events IN {mode}"
     );
     client.batch_execute(&statement).await.map_err(db_error)
 }
@@ -818,12 +897,18 @@ async fn postgres_load_snapshot(
         "SELECT payload::text FROM turn_idempotency_records ORDER BY created_at, record_key",
     )
     .await?;
+    let events = postgres_load_payloads::<TurnLifecycleEvent>(
+        client,
+        "SELECT payload::text FROM turn_lifecycle_events ORDER BY event_cursor, event_key",
+    )
+    .await?;
     Ok(TurnPersistenceSnapshot {
         turns,
         runs,
         active_locks,
         checkpoints,
         idempotency_records,
+        events,
     })
 }
 
@@ -833,6 +918,7 @@ async fn postgres_replace_snapshot(
     snapshot: &TurnPersistenceSnapshot,
 ) -> Result<(), TurnError> {
     for table in [
+        "turn_lifecycle_events",
         "turn_idempotency_records",
         "turn_checkpoints",
         "turn_active_locks",
@@ -918,6 +1004,22 @@ async fn postgres_replace_snapshot(
         .await
         .map_err(db_error)?;
     }
+    for event in &snapshot.events {
+        let payload = to_json(event)?;
+        txn.execute(
+            "INSERT INTO turn_lifecycle_events (event_key, scope_key, run_id, event_cursor, kind, payload) VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+            &[
+                &turn_event_key(event)?,
+                &scope_key(&event.scope)?,
+                &event.run_id.to_string(),
+                &(event.cursor.0 as i64),
+                &turn_event_kind_key(event)?,
+                &payload,
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    }
     Ok(())
 }
 
@@ -955,6 +1057,27 @@ fn idempotency_record_key(record: &TurnIdempotencyRecord) -> Result<String, Turn
         run_id: record.run_id.map(|run_id| run_id.to_string()),
         key: record.key.as_str(),
     })
+}
+
+fn turn_event_key(event: &TurnLifecycleEvent) -> Result<String, TurnError> {
+    #[derive(serde::Serialize)]
+    struct TurnEventKey<'a> {
+        scope: &'a crate::TurnScope,
+        cursor: EventCursor,
+        run_id: String,
+        kind: &'a crate::TurnEventKind,
+    }
+
+    to_json(&TurnEventKey {
+        scope: &event.scope,
+        cursor: event.cursor,
+        run_id: event.run_id.to_string(),
+        kind: &event.kind,
+    })
+}
+
+fn turn_event_kind_key(event: &TurnLifecycleEvent) -> Result<String, TurnError> {
+    to_json(&event.kind)
 }
 
 fn db_error(error: impl std::fmt::Display) -> TurnError {
