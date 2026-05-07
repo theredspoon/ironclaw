@@ -4450,11 +4450,18 @@ name = "ironclaw_threads"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "deadpool-postgres",
  "futures",
  "ironclaw_host_api",
+ "libsql",
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
+ "tracing",
  "uuid",
 ]
 
