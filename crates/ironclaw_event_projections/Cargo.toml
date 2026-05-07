@@ -13,6 +13,7 @@ thiserror = "2"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+ironclaw_extensions = { path = "../ironclaw_extensions" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem" }
 ironclaw_memory = { path = "../ironclaw_memory" }
 ironclaw_reborn_event_store = { path = "../ironclaw_reborn_event_store" }
