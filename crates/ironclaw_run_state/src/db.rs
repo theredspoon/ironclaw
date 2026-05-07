@@ -11,53 +11,73 @@ use std::sync::Arc;
 #[cfg(feature = "libsql")]
 const LIBSQL_RUN_STATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS reborn_run_state_records (
-    owner_key TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
     invocation_id TEXT NOT NULL,
     capability_id TEXT NOT NULL,
     status TEXT NOT NULL,
     approval_request_id TEXT,
     error_kind TEXT,
     payload TEXT NOT NULL,
-    PRIMARY KEY (owner_key, invocation_id)
+    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id)
 );
-CREATE INDEX IF NOT EXISTS idx_reborn_run_state_records_owner_status
-    ON reborn_run_state_records(owner_key, status);
+CREATE INDEX IF NOT EXISTS idx_reborn_run_state_records_scope_status
+    ON reborn_run_state_records(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, status);
 
 CREATE TABLE IF NOT EXISTS reborn_approval_request_records (
-    owner_key TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
     status TEXT NOT NULL,
     payload TEXT NOT NULL,
-    PRIMARY KEY (owner_key, request_id)
+    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS idx_reborn_approval_request_records_owner_status
-    ON reborn_approval_request_records(owner_key, status);
+CREATE INDEX IF NOT EXISTS idx_reborn_approval_request_records_scope_status
+    ON reborn_approval_request_records(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, status);
 "#;
 
 #[cfg(feature = "postgres")]
 const POSTGRES_RUN_STATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS reborn_run_state_records (
-    owner_key TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
     invocation_id TEXT NOT NULL,
     capability_id TEXT NOT NULL,
     status TEXT NOT NULL,
     approval_request_id TEXT,
     error_kind TEXT,
     payload JSONB NOT NULL,
-    PRIMARY KEY (owner_key, invocation_id)
+    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id)
 );
-CREATE INDEX IF NOT EXISTS idx_reborn_run_state_records_owner_status
-    ON reborn_run_state_records(owner_key, status);
+CREATE INDEX IF NOT EXISTS idx_reborn_run_state_records_scope_status
+    ON reborn_run_state_records(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, status);
 
 CREATE TABLE IF NOT EXISTS reborn_approval_request_records (
-    owner_key TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    mission_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
     request_id TEXT NOT NULL,
     status TEXT NOT NULL,
     payload JSONB NOT NULL,
-    PRIMARY KEY (owner_key, request_id)
+    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, request_id)
 );
-CREATE INDEX IF NOT EXISTS idx_reborn_approval_request_records_owner_status
-    ON reborn_approval_request_records(owner_key, status);
+CREATE INDEX IF NOT EXISTS idx_reborn_approval_request_records_scope_status
+    ON reborn_approval_request_records(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, status);
 "#;
 
 /// libSQL-backed invocation lifecycle store.
@@ -179,11 +199,18 @@ impl RunStateStore for LibSqlRunStateStore {
         scope: &ResourceScope,
     ) -> Result<Vec<RunRecord>, RunStateError> {
         let conn = self.connect().await?;
-        let owner_key = owner_key(scope)?;
+        let key = ScopeKey::new(scope);
         let mut rows = conn
             .query(
-                "SELECT invocation_id, capability_id, status, approval_request_id, error_kind, payload FROM reborn_run_state_records WHERE owner_key = ?1 ORDER BY invocation_id",
-                libsql::params![owner_key],
+                "SELECT invocation_id, capability_id, status, approval_request_id, error_kind, payload FROM reborn_run_state_records WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 ORDER BY invocation_id",
+                libsql::params![
+                    key.tenant_id,
+                    key.user_id,
+                    key.agent_id,
+                    key.project_id,
+                    key.mission_id,
+                    key.thread_id,
+                ],
             )
             .await
             .map_err(db_error)?;
@@ -207,7 +234,6 @@ impl RunStateStore for LibSqlRunStateStore {
             )?;
             records.push(record);
         }
-        records.sort_by_key(|record| record.invocation_id.as_uuid());
         Ok(records)
     }
 }
@@ -519,10 +545,19 @@ impl ApprovalRequestStore for LibSqlApprovalRequestStore {
                     status: record.status,
                 });
             }
+            let key = ScopeKey::new(scope);
             let affected = conn
                 .execute(
-                    "DELETE FROM reborn_approval_request_records WHERE owner_key = ?1 AND request_id = ?2",
-                    libsql::params![owner_key(scope)?, request_id.to_string()],
+                    "DELETE FROM reborn_approval_request_records WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 AND request_id = ?7",
+                    libsql::params![
+                        key.tenant_id,
+                        key.user_id,
+                        key.agent_id,
+                        key.project_id,
+                        key.mission_id,
+                        key.thread_id,
+                        request_id.to_string(),
+                    ],
                 )
                 .await
                 .map_err(db_error)?;
@@ -538,11 +573,18 @@ impl ApprovalRequestStore for LibSqlApprovalRequestStore {
         scope: &ResourceScope,
     ) -> Result<Vec<ApprovalRecord>, RunStateError> {
         let conn = self.connect().await?;
-        let owner_key = owner_key(scope)?;
+        let key = ScopeKey::new(scope);
         let mut rows = conn
             .query(
-                "SELECT request_id, status, payload FROM reborn_approval_request_records WHERE owner_key = ?1 ORDER BY request_id",
-                libsql::params![owner_key],
+                "SELECT request_id, status, payload FROM reborn_approval_request_records WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 ORDER BY request_id",
+                libsql::params![
+                    key.tenant_id,
+                    key.user_id,
+                    key.agent_id,
+                    key.project_id,
+                    key.mission_id,
+                    key.thread_id,
+                ],
             )
             .await
             .map_err(db_error)?;
@@ -560,7 +602,6 @@ impl ApprovalRequestStore for LibSqlApprovalRequestStore {
             )?;
             records.push(record);
         }
-        records.sort_by_key(|record| record.request.id.as_uuid());
         Ok(records)
     }
 }
@@ -704,14 +745,22 @@ impl RunStateStore for PostgresRunStateStore {
         scope: &ResourceScope,
     ) -> Result<Vec<RunRecord>, RunStateError> {
         let client = self.client().await?;
+        let key = ScopeKey::new(scope);
         let rows = client
             .query(
-                "SELECT invocation_id, capability_id, status, approval_request_id, error_kind, payload::text FROM reborn_run_state_records WHERE owner_key = $1 ORDER BY invocation_id",
-                &[&owner_key(scope)?],
+                "SELECT invocation_id, capability_id, status, approval_request_id, error_kind, payload::text FROM reborn_run_state_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 ORDER BY invocation_id",
+                &[
+                    &key.tenant_id,
+                    &key.user_id,
+                    &key.agent_id,
+                    &key.project_id,
+                    &key.mission_id,
+                    &key.thread_id,
+                ],
             )
             .await
             .map_err(db_error)?;
-        let mut records = rows
+        let records = rows
             .into_iter()
             .map(|row| {
                 let row_invocation_id: String = row.get(0);
@@ -732,7 +781,6 @@ impl RunStateStore for PostgresRunStateStore {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        records.sort_by_key(|record| record.invocation_id.as_uuid());
         Ok(records)
     }
 }
@@ -1042,10 +1090,19 @@ impl ApprovalRequestStore for PostgresApprovalRequestStore {
                 status: record.status,
             });
         }
+        let key = ScopeKey::new(scope);
         let affected = txn
             .execute(
-                "DELETE FROM reborn_approval_request_records WHERE owner_key = $1 AND request_id = $2",
-                &[&owner_key(scope)?, &request_id.to_string()],
+                "DELETE FROM reborn_approval_request_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND request_id = $7",
+                &[
+                    &key.tenant_id,
+                    &key.user_id,
+                    &key.agent_id,
+                    &key.project_id,
+                    &key.mission_id,
+                    &key.thread_id,
+                    &request_id.to_string(),
+                ],
             )
             .await
             .map_err(db_error)?;
@@ -1059,14 +1116,22 @@ impl ApprovalRequestStore for PostgresApprovalRequestStore {
         scope: &ResourceScope,
     ) -> Result<Vec<ApprovalRecord>, RunStateError> {
         let client = self.client().await?;
+        let key = ScopeKey::new(scope);
         let rows = client
             .query(
-                "SELECT request_id, status, payload::text FROM reborn_approval_request_records WHERE owner_key = $1 ORDER BY request_id",
-                &[&owner_key(scope)?],
+                "SELECT request_id, status, payload::text FROM reborn_approval_request_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 ORDER BY request_id",
+                &[
+                    &key.tenant_id,
+                    &key.user_id,
+                    &key.agent_id,
+                    &key.project_id,
+                    &key.mission_id,
+                    &key.thread_id,
+                ],
             )
             .await
             .map_err(db_error)?;
-        let mut records = rows
+        let records = rows
             .into_iter()
             .map(|row| {
                 let request_id: String = row.get(0);
@@ -1081,7 +1146,6 @@ impl ApprovalRequestStore for PostgresApprovalRequestStore {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        records.sort_by_key(|record| record.request.id.as_uuid());
         Ok(records)
     }
 }
@@ -1169,10 +1233,19 @@ async fn libsql_get_run(
     scope: &ResourceScope,
     invocation_id: InvocationId,
 ) -> Result<Option<RunRecord>, RunStateError> {
+    let key = ScopeKey::new(scope);
     let mut rows = conn
         .query(
-            "SELECT capability_id, status, approval_request_id, error_kind, payload FROM reborn_run_state_records WHERE owner_key = ?1 AND invocation_id = ?2",
-            libsql::params![owner_key(scope)?, invocation_id.to_string()],
+            "SELECT capability_id, status, approval_request_id, error_kind, payload FROM reborn_run_state_records WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 AND invocation_id = ?7",
+            libsql::params![
+                key.tenant_id,
+                key.user_id,
+                key.agent_id,
+                key.project_id,
+                key.mission_id,
+                key.thread_id,
+                invocation_id.to_string(),
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -1201,10 +1274,16 @@ async fn libsql_insert_run(
     conn: &libsql::Connection,
     record: &RunRecord,
 ) -> Result<(), RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     conn.execute(
-        "INSERT INTO reborn_run_state_records (owner_key, invocation_id, capability_id, status, approval_request_id, error_kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO reborn_run_state_records (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, capability_id, status, approval_request_id, error_kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         libsql::params![
-            owner_key(&record.scope)?,
+            key.tenant_id,
+            key.user_id,
+            key.agent_id,
+            key.project_id,
+            key.mission_id,
+            key.thread_id,
             record.invocation_id.to_string(),
             record.capability_id.as_str(),
             run_status_key(record.status),
@@ -1223,11 +1302,17 @@ async fn libsql_update_run(
     conn: &libsql::Connection,
     record: &RunRecord,
 ) -> Result<(), RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     let affected = conn
         .execute(
-            "UPDATE reborn_run_state_records SET capability_id = ?3, status = ?4, approval_request_id = ?5, error_kind = ?6, payload = ?7 WHERE owner_key = ?1 AND invocation_id = ?2",
+            "UPDATE reborn_run_state_records SET capability_id = ?8, status = ?9, approval_request_id = ?10, error_kind = ?11, payload = ?12 WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 AND invocation_id = ?7",
             libsql::params![
-                owner_key(&record.scope)?,
+                key.tenant_id,
+                key.user_id,
+                key.agent_id,
+                key.project_id,
+                key.mission_id,
+                key.thread_id,
                 record.invocation_id.to_string(),
                 record.capability_id.as_str(),
                 run_status_key(record.status),
@@ -1247,10 +1332,19 @@ async fn libsql_get_approval(
     scope: &ResourceScope,
     request_id: ApprovalRequestId,
 ) -> Result<Option<ApprovalRecord>, RunStateError> {
+    let key = ScopeKey::new(scope);
     let mut rows = conn
         .query(
-            "SELECT status, payload FROM reborn_approval_request_records WHERE owner_key = ?1 AND request_id = ?2",
-            libsql::params![owner_key(scope)?, request_id.to_string()],
+            "SELECT status, payload FROM reborn_approval_request_records WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 AND request_id = ?7",
+            libsql::params![
+                key.tenant_id,
+                key.user_id,
+                key.agent_id,
+                key.project_id,
+                key.mission_id,
+                key.thread_id,
+                request_id.to_string(),
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -1273,10 +1367,16 @@ async fn libsql_insert_approval(
     conn: &libsql::Connection,
     record: &ApprovalRecord,
 ) -> Result<(), RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     conn.execute(
-        "INSERT INTO reborn_approval_request_records (owner_key, request_id, status, payload) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO reborn_approval_request_records (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, request_id, status, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         libsql::params![
-            owner_key(&record.scope)?,
+            key.tenant_id,
+            key.user_id,
+            key.agent_id,
+            key.project_id,
+            key.mission_id,
+            key.thread_id,
             record.request.id.to_string(),
             approval_status_key(record.status),
             to_json(record)?,
@@ -1292,11 +1392,17 @@ async fn libsql_update_approval(
     conn: &libsql::Connection,
     record: &ApprovalRecord,
 ) -> Result<(), RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     let affected = conn
         .execute(
-            "UPDATE reborn_approval_request_records SET status = ?3, payload = ?4 WHERE owner_key = ?1 AND request_id = ?2",
+            "UPDATE reborn_approval_request_records SET status = ?8, payload = ?9 WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 AND request_id = ?7",
             libsql::params![
-                owner_key(&record.scope)?,
+                key.tenant_id,
+                key.user_id,
+                key.agent_id,
+                key.project_id,
+                key.mission_id,
+                key.thread_id,
                 record.request.id.to_string(),
                 approval_status_key(record.status),
                 to_json(record)?,
@@ -1316,12 +1422,113 @@ async fn run_postgres_migrations(pool: &deadpool_postgres::Pool) -> Result<(), R
     txn.query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])
         .await
         .map_err(db_error)?;
+    if postgres_table_has_column(&txn, "reborn_run_state_records", "owner_key").await? {
+        postgres_migrate_run_owner_key_schema(&txn).await?;
+    }
+    if postgres_table_has_column(&txn, "reborn_approval_request_records", "owner_key").await? {
+        postgres_migrate_approval_owner_key_schema(&txn).await?;
+    }
     if !postgres_schema_present(&txn).await? {
         txn.batch_execute(POSTGRES_RUN_STATE_SCHEMA)
             .await
             .map_err(db_error)?;
     }
     txn.commit().await.map_err(db_error)
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_table_has_column(
+    client: &impl deadpool_postgres::GenericClient,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, RunStateError> {
+    let row = client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND column_name = $2
+            )",
+            &[&table_name, &column_name],
+        )
+        .await
+        .map_err(db_error)?;
+    Ok(row.get(0))
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_migrate_run_owner_key_schema(
+    client: &impl deadpool_postgres::GenericClient,
+) -> Result<(), RunStateError> {
+    client
+        .batch_execute(
+            "ALTER TABLE reborn_run_state_records DROP CONSTRAINT IF EXISTS reborn_run_state_records_pkey;
+             ALTER TABLE reborn_run_state_records ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+             ALTER TABLE reborn_run_state_records ADD COLUMN IF NOT EXISTS user_id TEXT;
+             ALTER TABLE reborn_run_state_records ADD COLUMN IF NOT EXISTS agent_id TEXT;
+             ALTER TABLE reborn_run_state_records ADD COLUMN IF NOT EXISTS project_id TEXT;
+             ALTER TABLE reborn_run_state_records ADD COLUMN IF NOT EXISTS mission_id TEXT;
+             ALTER TABLE reborn_run_state_records ADD COLUMN IF NOT EXISTS thread_id TEXT;
+             UPDATE reborn_run_state_records
+                SET tenant_id = owner_key::jsonb->>'tenant_id',
+                    user_id = owner_key::jsonb->>'user_id',
+                    agent_id = COALESCE(owner_key::jsonb->>'agent_id', ''),
+                    project_id = COALESCE(owner_key::jsonb->>'project_id', ''),
+                    mission_id = COALESCE(owner_key::jsonb->>'mission_id', ''),
+                    thread_id = COALESCE(owner_key::jsonb->>'thread_id', '')
+              WHERE owner_key IS NOT NULL;
+             ALTER TABLE reborn_run_state_records ALTER COLUMN tenant_id SET NOT NULL;
+             ALTER TABLE reborn_run_state_records ALTER COLUMN user_id SET NOT NULL;
+             ALTER TABLE reborn_run_state_records ALTER COLUMN agent_id SET NOT NULL;
+             ALTER TABLE reborn_run_state_records ALTER COLUMN project_id SET NOT NULL;
+             ALTER TABLE reborn_run_state_records ALTER COLUMN mission_id SET NOT NULL;
+             ALTER TABLE reborn_run_state_records ALTER COLUMN thread_id SET NOT NULL;
+             ALTER TABLE reborn_run_state_records DROP COLUMN IF EXISTS owner_key;
+             ALTER TABLE reborn_run_state_records ADD PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id);
+             DROP INDEX IF EXISTS idx_reborn_run_state_records_owner_status;
+             CREATE INDEX IF NOT EXISTS idx_reborn_run_state_records_scope_status
+                ON reborn_run_state_records(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, status);",
+        )
+        .await
+        .map_err(db_error)
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_migrate_approval_owner_key_schema(
+    client: &impl deadpool_postgres::GenericClient,
+) -> Result<(), RunStateError> {
+    client
+        .batch_execute(
+            "ALTER TABLE reborn_approval_request_records DROP CONSTRAINT IF EXISTS reborn_approval_request_records_pkey;
+             ALTER TABLE reborn_approval_request_records ADD COLUMN IF NOT EXISTS tenant_id TEXT;
+             ALTER TABLE reborn_approval_request_records ADD COLUMN IF NOT EXISTS user_id TEXT;
+             ALTER TABLE reborn_approval_request_records ADD COLUMN IF NOT EXISTS agent_id TEXT;
+             ALTER TABLE reborn_approval_request_records ADD COLUMN IF NOT EXISTS project_id TEXT;
+             ALTER TABLE reborn_approval_request_records ADD COLUMN IF NOT EXISTS mission_id TEXT;
+             ALTER TABLE reborn_approval_request_records ADD COLUMN IF NOT EXISTS thread_id TEXT;
+             UPDATE reborn_approval_request_records
+                SET tenant_id = owner_key::jsonb->>'tenant_id',
+                    user_id = owner_key::jsonb->>'user_id',
+                    agent_id = COALESCE(owner_key::jsonb->>'agent_id', ''),
+                    project_id = COALESCE(owner_key::jsonb->>'project_id', ''),
+                    mission_id = COALESCE(owner_key::jsonb->>'mission_id', ''),
+                    thread_id = COALESCE(owner_key::jsonb->>'thread_id', '')
+              WHERE owner_key IS NOT NULL;
+             ALTER TABLE reborn_approval_request_records ALTER COLUMN tenant_id SET NOT NULL;
+             ALTER TABLE reborn_approval_request_records ALTER COLUMN user_id SET NOT NULL;
+             ALTER TABLE reborn_approval_request_records ALTER COLUMN agent_id SET NOT NULL;
+             ALTER TABLE reborn_approval_request_records ALTER COLUMN project_id SET NOT NULL;
+             ALTER TABLE reborn_approval_request_records ALTER COLUMN mission_id SET NOT NULL;
+             ALTER TABLE reborn_approval_request_records ALTER COLUMN thread_id SET NOT NULL;
+             ALTER TABLE reborn_approval_request_records DROP COLUMN IF EXISTS owner_key;
+             ALTER TABLE reborn_approval_request_records ADD PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, request_id);
+             DROP INDEX IF EXISTS idx_reborn_approval_request_records_owner_status;
+             CREATE INDEX IF NOT EXISTS idx_reborn_approval_request_records_scope_status
+                ON reborn_approval_request_records(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, status);",
+        )
+        .await
+        .map_err(db_error)
 }
 
 #[cfg(feature = "postgres")]
@@ -1332,9 +1539,21 @@ async fn postgres_schema_present(
         .query_one(
             "SELECT
                 to_regclass('public.reborn_run_state_records') IS NOT NULL,
-                to_regclass('public.idx_reborn_run_state_records_owner_status') IS NOT NULL,
+                to_regclass('public.idx_reborn_run_state_records_scope_status') IS NOT NULL,
                 to_regclass('public.reborn_approval_request_records') IS NOT NULL,
-                to_regclass('public.idx_reborn_approval_request_records_owner_status') IS NOT NULL",
+                to_regclass('public.idx_reborn_approval_request_records_scope_status') IS NOT NULL,
+                NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name IN ('reborn_run_state_records', 'reborn_approval_request_records')
+                      AND column_name = 'owner_key'
+                ),
+                (
+                    SELECT count(*) FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name IN ('reborn_run_state_records', 'reborn_approval_request_records')
+                      AND column_name IN ('tenant_id', 'user_id', 'agent_id', 'project_id', 'mission_id', 'thread_id')
+                ) = 12",
             &[],
         )
         .await
@@ -1342,7 +1561,9 @@ async fn postgres_schema_present(
     Ok(row.get::<_, bool>(0)
         && row.get::<_, bool>(1)
         && row.get::<_, bool>(2)
-        && row.get::<_, bool>(3))
+        && row.get::<_, bool>(3)
+        && row.get::<_, bool>(4)
+        && row.get::<_, bool>(5))
 }
 
 #[cfg(feature = "postgres")]
@@ -1351,10 +1572,19 @@ async fn postgres_get_run(
     scope: &ResourceScope,
     invocation_id: InvocationId,
 ) -> Result<Option<RunRecord>, RunStateError> {
+    let key = ScopeKey::new(scope);
     let row = client
         .query_opt(
-            "SELECT capability_id, status, approval_request_id, error_kind, payload::text FROM reborn_run_state_records WHERE owner_key = $1 AND invocation_id = $2",
-            &[&owner_key(scope)?, &invocation_id.to_string()],
+            "SELECT capability_id, status, approval_request_id, error_kind, payload::text FROM reborn_run_state_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND invocation_id = $7",
+            &[
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
+                &invocation_id.to_string(),
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -1384,10 +1614,19 @@ async fn postgres_get_run_for_update(
     scope: &ResourceScope,
     invocation_id: InvocationId,
 ) -> Result<Option<RunRecord>, RunStateError> {
+    let key = ScopeKey::new(scope);
     let row = client
         .query_opt(
-            "SELECT capability_id, status, approval_request_id, error_kind, payload::text FROM reborn_run_state_records WHERE owner_key = $1 AND invocation_id = $2 FOR UPDATE",
-            &[&owner_key(scope)?, &invocation_id.to_string()],
+            "SELECT capability_id, status, approval_request_id, error_kind, payload::text FROM reborn_run_state_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND invocation_id = $7 FOR UPDATE",
+            &[
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
+                &invocation_id.to_string(),
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -1416,12 +1655,18 @@ async fn postgres_insert_run(
     client: &impl deadpool_postgres::GenericClient,
     record: &RunRecord,
 ) -> Result<bool, RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     let payload = to_json(record)?;
     let affected = client
         .execute(
-            "INSERT INTO reborn_run_state_records (owner_key, invocation_id, capability_id, status, approval_request_id, error_kind, payload) VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb) ON CONFLICT DO NOTHING",
+            "INSERT INTO reborn_run_state_records (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, capability_id, status, approval_request_id, error_kind, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::text::jsonb) ON CONFLICT DO NOTHING",
             &[
-                &owner_key(&record.scope)?,
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
                 &record.invocation_id.to_string(),
                 &record.capability_id.as_str(),
                 &run_status_key(record.status),
@@ -1440,12 +1685,18 @@ async fn postgres_update_run(
     client: &impl deadpool_postgres::GenericClient,
     record: &RunRecord,
 ) -> Result<(), RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     let payload = to_json(record)?;
     let affected = client
         .execute(
-            "UPDATE reborn_run_state_records SET capability_id = $3, status = $4, approval_request_id = $5, error_kind = $6, payload = $7::text::jsonb WHERE owner_key = $1 AND invocation_id = $2",
+            "UPDATE reborn_run_state_records SET capability_id = $8, status = $9, approval_request_id = $10, error_kind = $11, payload = $12::text::jsonb WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND invocation_id = $7",
             &[
-                &owner_key(&record.scope)?,
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
                 &record.invocation_id.to_string(),
                 &record.capability_id.as_str(),
                 &run_status_key(record.status),
@@ -1465,10 +1716,19 @@ async fn postgres_get_approval(
     scope: &ResourceScope,
     request_id: ApprovalRequestId,
 ) -> Result<Option<ApprovalRecord>, RunStateError> {
+    let key = ScopeKey::new(scope);
     let row = client
         .query_opt(
-            "SELECT status, payload::text FROM reborn_approval_request_records WHERE owner_key = $1 AND request_id = $2",
-            &[&owner_key(scope)?, &request_id.to_string()],
+            "SELECT status, payload::text FROM reborn_approval_request_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND request_id = $7",
+            &[
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
+                &request_id.to_string(),
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -1492,10 +1752,19 @@ async fn postgres_get_approval_for_update(
     scope: &ResourceScope,
     request_id: ApprovalRequestId,
 ) -> Result<Option<ApprovalRecord>, RunStateError> {
+    let key = ScopeKey::new(scope);
     let row = client
         .query_opt(
-            "SELECT status, payload::text FROM reborn_approval_request_records WHERE owner_key = $1 AND request_id = $2 FOR UPDATE",
-            &[&owner_key(scope)?, &request_id.to_string()],
+            "SELECT status, payload::text FROM reborn_approval_request_records WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND request_id = $7 FOR UPDATE",
+            &[
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
+                &request_id.to_string(),
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -1518,12 +1787,18 @@ async fn postgres_insert_approval(
     client: &impl deadpool_postgres::GenericClient,
     record: &ApprovalRecord,
 ) -> Result<bool, RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     let payload = to_json(record)?;
     let affected = client
         .execute(
-            "INSERT INTO reborn_approval_request_records (owner_key, request_id, status, payload) VALUES ($1, $2, $3, $4::text::jsonb) ON CONFLICT DO NOTHING",
+            "INSERT INTO reborn_approval_request_records (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, request_id, status, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::jsonb) ON CONFLICT DO NOTHING",
             &[
-                &owner_key(&record.scope)?,
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
                 &record.request.id.to_string(),
                 &approval_status_key(record.status),
                 &payload,
@@ -1539,12 +1814,18 @@ async fn postgres_update_approval(
     client: &impl deadpool_postgres::GenericClient,
     record: &ApprovalRecord,
 ) -> Result<(), RunStateError> {
+    let key = ScopeKey::new(&record.scope);
     let payload = to_json(record)?;
     let affected = client
         .execute(
-            "UPDATE reborn_approval_request_records SET status = $3, payload = $4::text::jsonb WHERE owner_key = $1 AND request_id = $2",
+            "UPDATE reborn_approval_request_records SET status = $8, payload = $9::text::jsonb WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND request_id = $7",
             &[
-                &owner_key(&record.scope)?,
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
                 &record.request.id.to_string(),
                 &approval_status_key(record.status),
                 &payload,
@@ -1577,7 +1858,7 @@ fn validate_run_row(
     row_error_kind: Option<&str>,
 ) -> Result<RunRecord, RunStateError> {
     if !crate::same_scope_owner(&record.scope, expected_scope) {
-        return Err(row_integrity_error("run-state", "owner_key"));
+        return Err(row_integrity_error("run-state", "scope columns"));
     }
     if record.invocation_id != row_invocation_id {
         return Err(row_integrity_error("run-state", "invocation_id"));
@@ -1605,7 +1886,7 @@ fn validate_approval_row(
     row_status: &str,
 ) -> Result<ApprovalRecord, RunStateError> {
     if !crate::same_scope_owner(&record.scope, expected_scope) {
-        return Err(row_integrity_error("approval-request", "owner_key"));
+        return Err(row_integrity_error("approval-request", "scope columns"));
     }
     if record.request.id != row_request_id {
         return Err(row_integrity_error("approval-request", "request_id"));
@@ -1635,25 +1916,26 @@ fn require_single_affected_row(
     }
 }
 
-fn owner_key(scope: &ResourceScope) -> Result<String, RunStateError> {
-    #[derive(serde::Serialize)]
-    struct OwnerKey<'a> {
-        tenant_id: &'a str,
-        user_id: &'a str,
-        agent_id: Option<&'a str>,
-        project_id: Option<&'a str>,
-        mission_id: Option<&'a str>,
-        thread_id: Option<&'a str>,
-    }
+struct ScopeKey<'a> {
+    tenant_id: &'a str,
+    user_id: &'a str,
+    agent_id: &'a str,
+    project_id: &'a str,
+    mission_id: &'a str,
+    thread_id: &'a str,
+}
 
-    to_json(&OwnerKey {
-        tenant_id: scope.tenant_id.as_str(),
-        user_id: scope.user_id.as_str(),
-        agent_id: scope.agent_id.as_ref().map(|id| id.as_str()),
-        project_id: scope.project_id.as_ref().map(|id| id.as_str()),
-        mission_id: scope.mission_id.as_ref().map(|id| id.as_str()),
-        thread_id: scope.thread_id.as_ref().map(|id| id.as_str()),
-    })
+impl<'a> ScopeKey<'a> {
+    fn new(scope: &'a ResourceScope) -> Self {
+        Self {
+            tenant_id: scope.tenant_id.as_str(),
+            user_id: scope.user_id.as_str(),
+            agent_id: scope.agent_id.as_ref().map_or("", |id| id.as_str()),
+            project_id: scope.project_id.as_ref().map_or("", |id| id.as_str()),
+            mission_id: scope.mission_id.as_ref().map_or("", |id| id.as_str()),
+            thread_id: scope.thread_id.as_ref().map_or("", |id| id.as_str()),
+        }
+    }
 }
 
 fn run_status_key(status: RunStatus) -> &'static str {

@@ -360,6 +360,7 @@ where
         }
     }
 
+    #[cfg(any(feature = "postgres", feature = "libsql"))]
     fn with_root_filesystem<T>(self, filesystem: Arc<T>) -> HostRuntimeServices<T, G, S, R>
     where
         T: RootFilesystem + 'static,
@@ -375,6 +376,7 @@ where
             surface_version,
             run_state,
             approval_requests,
+            run_state_approval_store,
             capability_leases,
             event_sink,
             audit_sink,
@@ -402,6 +404,7 @@ where
             surface_version,
             run_state,
             approval_requests,
+            run_state_approval_store,
             capability_leases,
             event_sink,
             audit_sink,

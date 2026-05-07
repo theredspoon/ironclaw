@@ -784,7 +784,32 @@ async fn host_runtime_services_builds_dispatcher_runtime_and_health_from_registe
 
 #[tokio::test]
 async fn host_runtime_services_wires_combined_store_for_atomic_approval_block() {
-    let combined_store = Arc::new(InMemoryRecordingCombinedRunStateApprovalStore::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(ApprovalThenGrantAuthorizer),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+
+    assert_services_use_combined_store_for_atomic_approval_block(
+        services,
+        "approval from services",
+    )
+    .await;
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn host_runtime_services_preserves_combined_store_after_root_filesystem_selection() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir
+        .path()
+        .join("root-filesystem-preserves-combined-store.db");
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let filesystem = Arc::new(LibSqlRootFilesystem::new(db));
+    filesystem.run_migrations().await.unwrap();
     let services = HostRuntimeServices::new(
         Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
         Arc::new(LocalFilesystem::new()),
@@ -793,15 +818,35 @@ async fn host_runtime_services_wires_combined_store_for_atomic_approval_block() 
         ProcessServices::in_memory(),
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
     )
-    .with_trust_policy(Arc::new(local_manifest_trust_policy(
-        "script",
-        vec![EffectKind::DispatchCapability],
-    )))
-    .with_run_state_approval_store(Arc::clone(&combined_store))
-    .with_script_runtime(Arc::new(ScriptRuntime::new(
-        ScriptRuntimeConfig::for_testing(),
-        EchoScriptBackend,
-    )));
+    .with_libsql_root_filesystem(filesystem);
+
+    assert_services_use_combined_store_for_atomic_approval_block(
+        services,
+        "approval after root filesystem selection",
+    )
+    .await;
+}
+
+async fn assert_services_use_combined_store_for_atomic_approval_block<
+    F: RootFilesystem + 'static,
+    G: ResourceGovernor + 'static,
+    S: ProcessStore + 'static,
+    R: ProcessResultStore + 'static,
+>(
+    services: HostRuntimeServices<F, G, S, R>,
+    message: &str,
+) {
+    let combined_store = Arc::new(InMemoryRecordingCombinedRunStateApprovalStore::new());
+    let services = services
+        .with_trust_policy(Arc::new(local_manifest_trust_policy(
+            "script",
+            vec![EffectKind::DispatchCapability],
+        )))
+        .with_run_state_approval_store(Arc::clone(&combined_store))
+        .with_script_runtime(Arc::new(ScriptRuntime::new(
+            ScriptRuntimeConfig::for_testing(),
+            EchoScriptBackend,
+        )));
 
     let runtime = services.host_runtime_for_local_testing();
     let context = execution_context_without_grants();
@@ -810,7 +855,7 @@ async fn host_runtime_services_wires_combined_store_for_atomic_approval_block() 
             context.clone(),
             script_capability_id(),
             ResourceEstimate::default(),
-            json!({"message": "approval from services"}),
+            json!({"message": message}),
             trust_decision_with_dispatch_authority(),
         ))
         .await

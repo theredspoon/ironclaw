@@ -20,6 +20,29 @@ use ironclaw_run_state::{
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn libsql_schema_uses_structured_scope_columns_instead_of_serialized_owner_key() {
+    let (db_path, _dir) = libsql_db_path();
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let runs = LibSqlRunStateStore::new(Arc::clone(&db));
+    runs.run_migrations().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    let run_columns = libsql_table_columns(&conn, "reborn_run_state_records").await;
+    let approval_columns = libsql_table_columns(&conn, "reborn_approval_request_records").await;
+
+    for columns in [&run_columns, &approval_columns] {
+        assert!(columns.contains(&"tenant_id".to_string()));
+        assert!(columns.contains(&"user_id".to_string()));
+        assert!(columns.contains(&"agent_id".to_string()));
+        assert!(columns.contains(&"project_id".to_string()));
+        assert!(columns.contains(&"mission_id".to_string()));
+        assert!(columns.contains(&"thread_id".to_string()));
+        assert!(!columns.contains(&"owner_key".to_string()));
+    }
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn libsql_run_state_and_approval_stores_persist_across_database_reopen() {
     let (db_path, _dir) = libsql_db_path();
     let db = Arc::new(
@@ -320,6 +343,30 @@ async fn libsql_rejects_approval_rows_when_payload_request_id_does_not_match_row
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
+async fn postgres_schema_uses_structured_scope_columns_instead_of_serialized_owner_key() {
+    let Some(pool) = postgres_pool().await else {
+        return;
+    };
+    let store = PostgresRunStateStore::new(pool.clone());
+    store.run_migrations().await.unwrap();
+    let client = pool.get().await.unwrap();
+
+    let run_columns = postgres_table_columns(&client, "reborn_run_state_records").await;
+    let approval_columns = postgres_table_columns(&client, "reborn_approval_request_records").await;
+
+    for columns in [&run_columns, &approval_columns] {
+        assert!(columns.contains(&"tenant_id".to_string()));
+        assert!(columns.contains(&"user_id".to_string()));
+        assert!(columns.contains(&"agent_id".to_string()));
+        assert!(columns.contains(&"project_id".to_string()));
+        assert!(columns.contains(&"mission_id".to_string()));
+        assert!(columns.contains(&"thread_id".to_string()));
+        assert!(!columns.contains(&"owner_key".to_string()));
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
 async fn postgres_migrations_are_serialized_when_called_concurrently() {
     let Some(pool) = postgres_pool().await else {
         return;
@@ -615,6 +662,34 @@ fn libsql_stores_implement_run_state_contract_traits() {
     assert_run_state::<LibSqlRunStateStore>();
     assert_approval::<LibSqlApprovalRequestStore>();
     assert_combined::<LibSqlRunStateApprovalStore>();
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_table_columns(conn: &libsql::Connection, table_name: &str) -> Vec<String> {
+    let sql = format!("PRAGMA table_info({table_name})");
+    let mut rows = conn.query(&sql, ()).await.unwrap();
+    let mut columns = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        columns.push(row.get::<String>(1).unwrap());
+    }
+    columns
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_table_columns(
+    client: &deadpool_postgres::Object,
+    table_name: &str,
+) -> Vec<String> {
+    client
+        .query(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+            &[&table_name],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
 }
 
 #[cfg(feature = "libsql")]
