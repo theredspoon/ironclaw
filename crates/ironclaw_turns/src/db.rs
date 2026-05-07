@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use crate::{
     CancelRunRequest, CancelRunResponse, GetRunStateRequest, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, ResumeTurnRequest, ResumeTurnResponse, SubmitTurnRequest,
-    SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionPolicy, TurnCheckpointRecord, TurnError,
-    TurnIdempotencyRecord, TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord,
-    TurnRunState, TurnScope, TurnStateStore,
+    InMemoryTurnStateStoreLimits, ResumeTurnRequest, ResumeTurnResponse, RunProfileResolver,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionPolicy,
+    TurnCheckpointRecord, TurnError, TurnIdempotencyRecord, TurnLifecycleEvent,
+    TurnPersistenceSnapshot, TurnRecord, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -206,11 +206,14 @@ impl TurnStateStore for LibSqlTurnStateStore {
         &self,
         request: SubmitTurnRequest,
         admission_policy: &dyn TurnAdmissionPolicy,
+        run_profile_resolver: &dyn RunProfileResolver,
     ) -> Result<SubmitTurnResponse, TurnError> {
         let conn = self.begin_immediate().await?;
         let result = async {
             let store = self.load_store_from_conn(&conn).await?;
-            let result = store.submit_turn(request, admission_policy).await;
+            let result = store
+                .submit_turn(request, admission_policy, run_profile_resolver)
+                .await;
             libsql_replace_snapshot(&conn, &store.persistence_snapshot()).await?;
             Ok(result)
         }
@@ -471,12 +474,15 @@ impl TurnStateStore for PostgresTurnStateStore {
         &self,
         request: SubmitTurnRequest,
         admission_policy: &dyn TurnAdmissionPolicy,
+        run_profile_resolver: &dyn RunProfileResolver,
     ) -> Result<SubmitTurnResponse, TurnError> {
         let mut client = self.client().await?;
         let txn = client.transaction().await.map_err(db_error)?;
         lock_postgres_turn_tables(&txn, "SHARE ROW EXCLUSIVE MODE").await?;
         let store = self.load_store_from_txn(&txn).await?;
-        let result = store.submit_turn(request, admission_policy).await;
+        let result = store
+            .submit_turn(request, admission_policy, run_profile_resolver)
+            .await;
         postgres_replace_snapshot(&txn, &store.persistence_snapshot()).await?;
         txn.commit().await.map_err(db_error)?;
         result

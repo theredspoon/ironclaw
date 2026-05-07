@@ -8,15 +8,16 @@ use std::{
 use chrono::{Duration as ChronoDuration, Utc};
 
 use crate::{
-    AcceptedMessageRef, BlockedReason, CancelRunRequest, CancelRunResponse, GetRunStateRequest,
-    IdempotencyKey, LoopExitMapping, ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse,
-    SanitizedFailure, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy,
-    TurnActiveLockKey, TurnActiveLockRecord, TurnActor, TurnAdmissionPolicy, TurnCheckpointId,
-    TurnCheckpointRecord, TurnError, TurnEventKind, TurnIdempotencyErrorReplay,
-    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
-    TurnIdempotencyReplay, TurnLifecycleEvent, TurnLockVersion, TurnPersistenceSnapshot,
-    TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
-    TurnStatus,
+    AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, BlockedReason,
+    CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey, LoopExitMapping,
+    ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse, RunProfileResolutionError,
+    RunProfileResolutionRequest, RunProfileResolver, SanitizedFailure, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActiveLockKey, TurnActiveLockRecord,
+    TurnActor, TurnAdmissionPolicy, TurnCheckpointId, TurnCheckpointRecord, TurnError,
+    TurnEventKind, TurnIdempotencyErrorReplay, TurnIdempotencyOperationKind,
+    TurnIdempotencyOutcomeKind, TurnIdempotencyRecord, TurnIdempotencyReplay, TurnLifecycleEvent,
+    TurnLockVersion, TurnPersistenceSnapshot, TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord,
+    TurnRunState, TurnScope, TurnStateStore, TurnStatus,
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -139,6 +140,17 @@ struct PersistedIdempotencyKey {
     key: IdempotencyKey,
 }
 
+fn profile_resolution_error_to_turn_error(error: RunProfileResolutionError) -> TurnError {
+    let reason = match error {
+        RunProfileResolutionError::Unauthorized { .. } => AdmissionRejectionReason::Unauthorized,
+        RunProfileResolutionError::ProfileUnavailable { .. }
+        | RunProfileResolutionError::InvalidRequest { .. } => {
+            AdmissionRejectionReason::ProfileRejected
+        }
+    };
+    TurnError::AdmissionRejected(AdmissionRejection::new(reason))
+}
+
 impl InMemoryTurnStateStore {
     pub fn with_limits(limits: InMemoryTurnStateStoreLimits) -> Self {
         Self {
@@ -210,27 +222,57 @@ impl TurnStateStore for InMemoryTurnStateStore {
         &self,
         request: SubmitTurnRequest,
         admission_policy: &dyn TurnAdmissionPolicy,
+        run_profile_resolver: &dyn RunProfileResolver,
     ) -> Result<SubmitTurnResponse, TurnError> {
         let idempotency_key = SubmitIdempotencyKey {
             scope: request.scope.clone(),
             key: request.idempotency_key.clone(),
         };
-        let mut inner = self.lock_inner()?;
-        loop {
-            if let Some(result) = inner.submit_idempotency.get(&idempotency_key) {
-                return result.clone();
+        {
+            let mut inner = self.lock_inner()?;
+            loop {
+                if let Some(result) = inner.submit_idempotency.get(&idempotency_key) {
+                    return result.clone();
+                }
+                if inner
+                    .submit_idempotency_in_flight
+                    .insert(idempotency_key.clone())
+                {
+                    break;
+                }
+                inner = self.wait_for_submit_idempotency(inner)?;
             }
-            if inner
-                .submit_idempotency_in_flight
-                .insert(idempotency_key.clone())
-            {
-                break;
-            }
-            inner = self.wait_for_submit_idempotency(inner)?;
         }
-        drop(inner);
 
         let admission_result = admission_policy.check_submit(&request);
+
+        {
+            let mut inner = self.lock_inner()?;
+            if let Some(result) = inner.submit_idempotency.get(&idempotency_key).cloned() {
+                inner.submit_idempotency_in_flight.remove(&idempotency_key);
+                self.submit_idempotency_ready.notify_all();
+                return result;
+            }
+
+            if let Err(rejection) = admission_result {
+                let response = Err(TurnError::AdmissionRejected(rejection));
+                inner.remember_submit_idempotency(
+                    idempotency_key.clone(),
+                    response.clone(),
+                    request.received_at,
+                );
+                inner.submit_idempotency_in_flight.remove(&idempotency_key);
+                self.submit_idempotency_ready.notify_all();
+                return response;
+            }
+        }
+
+        let profile_resolution = run_profile_resolver
+            .resolve_run_profile(RunProfileResolutionRequest {
+                requested_run_profile: request.requested_run_profile.clone(),
+                ..RunProfileResolutionRequest::interactive_default()
+            })
+            .await;
 
         let mut inner = self.lock_inner()?;
         if let Some(result) = inner.submit_idempotency.get(&idempotency_key).cloned() {
@@ -238,18 +280,20 @@ impl TurnStateStore for InMemoryTurnStateStore {
             self.submit_idempotency_ready.notify_all();
             return result;
         }
-
-        if let Err(rejection) = admission_result {
-            let response = Err(TurnError::AdmissionRejected(rejection));
-            inner.remember_submit_idempotency(
-                idempotency_key.clone(),
-                response.clone(),
-                request.received_at,
-            );
-            inner.submit_idempotency_in_flight.remove(&idempotency_key);
-            self.submit_idempotency_ready.notify_all();
-            return response;
-        }
+        let profile = match profile_resolution {
+            Ok(resolved) => TurnRunProfile::from_resolved(resolved),
+            Err(error) => {
+                let response = Err(profile_resolution_error_to_turn_error(error));
+                inner.remember_submit_idempotency(
+                    idempotency_key.clone(),
+                    response.clone(),
+                    request.received_at,
+                );
+                inner.submit_idempotency_in_flight.remove(&idempotency_key);
+                self.submit_idempotency_ready.notify_all();
+                return response;
+            }
+        };
 
         let lock_key = TurnActiveLockKey::from(&request.scope);
         if let Some(active_lock) = inner.active_locks.get(&lock_key)
@@ -274,7 +318,6 @@ impl TurnStateStore for InMemoryTurnStateStore {
         let turn_id = crate::TurnId::new();
         let run_id = TurnRunId::new();
         let cursor = inner.next_cursor();
-        let profile = TurnRunProfile::resolve(request.requested_run_profile.as_ref());
         let turn_record = TurnRecord {
             turn_id,
             scope: request.scope.clone(),
@@ -410,6 +453,7 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
         inner.update_active_lock(&record, now);
         let claimed = ClaimedTurnRun {
             state: record.state(),
+            resolved_run_profile: record.profile.resolved.clone(),
             runner_id: request.runner_id,
             lease_token: request.lease_token,
         };
