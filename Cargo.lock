@@ -4111,9 +4111,13 @@ dependencies = [
  "async-trait",
  "chrono",
  "ironclaw_events",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
+ "ironclaw_memory",
+ "ironclaw_reborn_event_store",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
