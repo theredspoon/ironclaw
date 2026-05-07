@@ -21,6 +21,16 @@ fn user_message(text: &str) -> MessageContent {
     MessageContent::text(text)
 }
 
+fn same_tenant_scope(agent_label: &str) -> ThreadScope {
+    ThreadScope {
+        tenant_id: TenantId::new("tenant-shared").unwrap(),
+        agent_id: AgentId::new(format!("agent-{agent_label}")).unwrap(),
+        project_id: Some(ProjectId::new(format!("project-{agent_label}")).unwrap()),
+        owner_user_id: Some(UserId::new(format!("user-{agent_label}")).unwrap()),
+        mission_id: None,
+    }
+}
+
 #[tokio::test]
 async fn creates_thread_without_channel_binding_and_assigns_monotonic_sequences_concurrently() {
     let service = InMemorySessionThreadService::default();
@@ -181,6 +191,73 @@ async fn duplicate_external_event_with_wrong_thread_does_not_replay_cross_thread
         .await;
 
     assert!(replay.is_err());
+}
+
+#[tokio::test]
+async fn duplicate_external_event_is_scoped_to_full_thread_scope() {
+    let service = InMemorySessionThreadService::default();
+    let first_scope = same_tenant_scope("a");
+    let second_scope = same_tenant_scope("b");
+    let first_thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: first_scope.clone(),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let second_thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: second_scope.clone(),
+            thread_id: None,
+            created_by_actor_id: "actor-b".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let first = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: first_scope,
+            thread_id: first_thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: Some("telegram-thread-1".into()),
+            reply_target_binding_id: Some("telegram-thread-1".into()),
+            external_event_id: Some("telegram-event-9".into()),
+            content: user_message("first scope only"),
+        })
+        .await
+        .unwrap();
+    let second = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: second_scope.clone(),
+            thread_id: second_thread.thread_id.clone(),
+            actor_id: "actor-b".into(),
+            source_binding_id: Some("telegram-thread-1".into()),
+            reply_target_binding_id: Some("telegram-thread-1".into()),
+            external_event_id: Some("telegram-event-9".into()),
+            content: user_message("second scope is independent"),
+        })
+        .await
+        .unwrap();
+
+    assert_ne!(first.message_id, second.message_id);
+    assert!(!second.idempotent_replay);
+    let second_history = service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: second_scope,
+            thread_id: second_thread.thread_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(second_history.messages.len(), 1);
+    assert_eq!(
+        second_history.messages[0].content.as_deref(),
+        Some("second scope is independent")
+    );
 }
 
 #[tokio::test]
@@ -525,6 +602,20 @@ async fn summary_covering_redacted_message_is_not_loaded_into_model_context() {
         .await
         .unwrap();
 
+    let history = service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.summary_artifacts.len(), 1);
+    assert_eq!(history.summary_artifacts[0].content, "[redacted]");
+    assert_ne!(
+        history.summary_artifacts[0].content,
+        "summary mentions secret token"
+    );
+
     let context = service
         .load_context_window(LoadContextWindowRequest {
             scope: scope("a"),
@@ -537,6 +628,67 @@ async fn summary_covering_redacted_message_is_not_loaded_into_model_context() {
     assert_eq!(context.messages.len(), 1);
     assert_eq!(context.messages[0].kind, MessageKind::User);
     assert_eq!(context.messages[0].content, "safe follow-up");
+}
+
+#[tokio::test]
+async fn summary_covering_draft_message_is_not_loaded_into_model_context() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            content: MessageContent::text("draft secret"),
+        })
+        .await
+        .unwrap();
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: user_message("visible user message"),
+        })
+        .await
+        .unwrap();
+    service
+        .create_summary_artifact(CreateSummaryArtifactRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            start_sequence: 1,
+            end_sequence: 2,
+            summary_kind: "model_context".into(),
+            content: MessageContent::text("summary leaks draft secret"),
+            model_context_policy: Some("replace_range_when_selected".into()),
+        })
+        .await
+        .unwrap();
+
+    let context = service
+        .load_context_window(LoadContextWindowRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+            max_messages: 16,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(context.messages.len(), 1);
+    assert_eq!(context.messages[0].kind, MessageKind::User);
+    assert_eq!(context.messages[0].content, "visible user message");
 }
 
 #[tokio::test]
@@ -596,6 +748,28 @@ async fn duplicate_assistant_draft_for_same_turn_run_is_idempotent() {
 
     assert_eq!(first.message_id, after_final.message_id);
 
+    service
+        .redact_message(RedactMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            message_id: first.message_id,
+            redaction_ref: "redaction/audit/assistant".into(),
+        })
+        .await
+        .unwrap();
+    let after_redaction = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            content: MessageContent::text("retry after redaction must not create a new row"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.message_id, after_redaction.message_id);
+    assert_eq!(after_redaction.status, MessageStatus::Redacted);
+    assert!(after_redaction.content.is_none());
+
     let history = service
         .list_thread_history(ThreadHistoryRequest {
             scope: scope("a"),
@@ -604,7 +778,7 @@ async fn duplicate_assistant_draft_for_same_turn_run_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(history.messages.len(), 1);
-    assert_eq!(history.messages[0].status, MessageStatus::Finalized);
+    assert_eq!(history.messages[0].status, MessageStatus::Redacted);
 }
 
 #[tokio::test]

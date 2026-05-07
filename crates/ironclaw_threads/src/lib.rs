@@ -393,7 +393,7 @@ struct StoredThread {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct InboundIdempotencyKey {
-    tenant_id: TenantId,
+    scope: ThreadScope,
     source_binding_id: String,
     external_event_id: String,
 }
@@ -407,7 +407,7 @@ struct InboundIdempotencyRecord {
 impl InboundIdempotencyKey {
     fn from_request(request: &AcceptInboundMessageRequest) -> Option<Self> {
         Some(Self {
-            tenant_id: request.scope.tenant_id.clone(),
+            scope: request.scope.clone(),
             source_binding_id: request.source_binding_id.clone()?,
             external_event_id: request.external_event_id.clone()?,
         })
@@ -559,10 +559,6 @@ impl SessionThreadService for InMemorySessionThreadService {
         let thread = get_thread_mut(&mut state, &request.scope, &request.thread_id)?;
         if let Some(existing) = thread.messages.iter().find(|message| {
             message.kind == MessageKind::Assistant
-                && matches!(
-                    message.status,
-                    MessageStatus::Draft | MessageStatus::Finalized
-                )
                 && message.turn_run_id.as_deref() == Some(request.turn_run_id.as_str())
         }) {
             return Ok(existing.clone());
@@ -661,7 +657,7 @@ impl SessionThreadService for InMemorySessionThreadService {
         Ok(ThreadHistory {
             thread: thread.record.clone(),
             messages: thread.messages.clone(),
-            summary_artifacts: thread.summary_artifacts.clone(),
+            summary_artifacts: history_summary_artifacts(thread),
         })
     }
 
@@ -855,7 +851,37 @@ fn context_messages_with_summary_replacements(thread: &StoredThread) -> Vec<Cont
     context
 }
 
+const REDACTED_SUMMARY_CONTENT: &str = "[redacted]";
+
+fn history_summary_artifacts(thread: &StoredThread) -> Vec<SummaryArtifact> {
+    thread
+        .summary_artifacts
+        .iter()
+        .map(|summary| {
+            if summary_covers_redacted_or_deleted_content(thread, summary) {
+                let mut redacted = summary.clone();
+                redacted.content = REDACTED_SUMMARY_CONTENT.to_string();
+                redacted.model_context_policy = None;
+                redacted
+            } else {
+                summary.clone()
+            }
+        })
+        .collect()
+}
+
 fn summary_covers_hidden_content(thread: &StoredThread, summary: &SummaryArtifact) -> bool {
+    thread.messages.iter().any(|message| {
+        summary.start_sequence <= message.sequence
+            && message.sequence <= summary.end_sequence
+            && !is_model_visible(message.status)
+    })
+}
+
+fn summary_covers_redacted_or_deleted_content(
+    thread: &StoredThread,
+    summary: &SummaryArtifact,
+) -> bool {
     thread.messages.iter().any(|message| {
         summary.start_sequence <= message.sequence
             && message.sequence <= summary.end_sequence
