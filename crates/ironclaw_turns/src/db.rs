@@ -1,12 +1,13 @@
 use async_trait::async_trait;
-#[cfg(feature = "libsql")]
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
 
 use crate::{
-    CancelRunRequest, CancelRunResponse, GetRunStateRequest, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, ResolvedRunProfile, ResumeTurnRequest, ResumeTurnResponse,
-    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, SubmitTurnRequest,
-    SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionPolicy, TurnCheckpointRecord, TurnError,
+    AllowAllTurnAdmissionLimitProvider, CancelRunRequest, CancelRunResponse, GetRunStateRequest,
+    InMemoryTurnStateStore, InMemoryTurnStateStoreLimits, ResolvedRunProfile, ResumeTurnRequest,
+    ResumeTurnResponse, RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionLimitProvider,
+    TurnAdmissionPolicy, TurnAdmissionReservationRecord, TurnCheckpointRecord, TurnError,
     TurnIdempotencyRecord, TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord,
     TurnRunState, TurnScope, TurnStateStore,
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
@@ -111,6 +112,13 @@ CREATE TABLE IF NOT EXISTS turn_store_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS turn_admission_reservations (
+    run_id TEXT PRIMARY KEY,
+    released INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_admission_reservations_released ON turn_admission_reservations(released);
 "#;
 
 #[cfg(feature = "postgres")]
@@ -174,12 +182,20 @@ CREATE TABLE IF NOT EXISTS turn_store_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS turn_admission_reservations (
+    run_id TEXT PRIMARY KEY,
+    released BOOLEAN NOT NULL,
+    payload JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_admission_reservations_released ON turn_admission_reservations(released);
 "#;
 
 #[cfg(feature = "libsql")]
 pub struct LibSqlTurnStateStore {
     db: Arc<libsql::Database>,
     limits: InMemoryTurnStateStoreLimits,
+    admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
 }
 
 #[cfg(feature = "libsql")]
@@ -188,11 +204,20 @@ impl LibSqlTurnStateStore {
         Self {
             db,
             limits: InMemoryTurnStateStoreLimits::default(),
+            admission_limit_provider: Arc::new(AllowAllTurnAdmissionLimitProvider),
         }
     }
 
     pub fn with_limits(mut self, limits: InMemoryTurnStateStoreLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub fn with_admission_limit_provider(
+        mut self,
+        admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
+    ) -> Self {
+        self.admission_limit_provider = admission_limit_provider;
         self
     }
 
@@ -228,9 +253,10 @@ impl LibSqlTurnStateStore {
         &self,
         conn: &libsql::Connection,
     ) -> Result<InMemoryTurnStateStore, TurnError> {
-        InMemoryTurnStateStore::from_persistence_snapshot(
+        InMemoryTurnStateStore::from_persistence_snapshot_with_admission_limit_provider(
             libsql_load_snapshot(conn).await?,
             self.limits,
+            self.admission_limit_provider.clone(),
         )
     }
 
@@ -462,6 +488,7 @@ impl TurnRunTransitionPort for LibSqlTurnStateStore {
 pub struct PostgresTurnStateStore {
     pool: deadpool_postgres::Pool,
     limits: InMemoryTurnStateStoreLimits,
+    admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
 }
 
 #[cfg(feature = "postgres")]
@@ -470,11 +497,20 @@ impl PostgresTurnStateStore {
         Self {
             pool,
             limits: InMemoryTurnStateStoreLimits::default(),
+            admission_limit_provider: Arc::new(AllowAllTurnAdmissionLimitProvider),
         }
     }
 
     pub fn with_limits(mut self, limits: InMemoryTurnStateStoreLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub fn with_admission_limit_provider(
+        mut self,
+        admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
+    ) -> Self {
+        self.admission_limit_provider = admission_limit_provider;
         self
     }
 
@@ -499,9 +535,10 @@ impl PostgresTurnStateStore {
         &self,
         txn: &impl deadpool_postgres::GenericClient,
     ) -> Result<InMemoryTurnStateStore, TurnError> {
-        InMemoryTurnStateStore::from_persistence_snapshot(
+        InMemoryTurnStateStore::from_persistence_snapshot_with_admission_limit_provider(
             postgres_load_snapshot(txn).await?,
             self.limits,
+            self.admission_limit_provider.clone(),
         )
     }
 
@@ -786,6 +823,11 @@ async fn libsql_load_snapshot(
     )
     .await?;
     let event_retention_floor = libsql_load_event_retention_floor(conn).await?;
+    let admission_reservations = libsql_load_payloads::<TurnAdmissionReservationRecord>(
+        conn,
+        "SELECT payload FROM turn_admission_reservations ORDER BY run_id",
+    )
+    .await?;
     Ok(TurnPersistenceSnapshot {
         turns,
         runs,
@@ -794,6 +836,7 @@ async fn libsql_load_snapshot(
         idempotency_records,
         events,
         event_retention_floor,
+        admission_reservations,
     })
 }
 
@@ -822,6 +865,7 @@ async fn libsql_replace_snapshot(
     for table in [
         "turn_store_metadata",
         "turn_lifecycle_events",
+        "turn_admission_reservations",
         "turn_idempotency_records",
         "turn_checkpoints",
         "turn_active_locks",
@@ -917,6 +961,18 @@ async fn libsql_replace_snapshot(
         .await
         .map_err(db_error)?;
     }
+    for record in &snapshot.admission_reservations {
+        conn.execute(
+            "INSERT INTO turn_admission_reservations (run_id, released, payload) VALUES (?1, ?2, ?3)",
+            libsql::params![
+                record.run_id.to_string(),
+                if record.released { 1_i64 } else { 0_i64 },
+                to_json(record)?,
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    }
     conn.execute(
         "INSERT INTO turn_store_metadata (key, value) VALUES ('event_retention_floor', ?1)",
         libsql::params![snapshot.event_retention_floor.0.to_string()],
@@ -932,7 +988,7 @@ async fn lock_postgres_turn_tables(
     mode: &str,
 ) -> Result<(), TurnError> {
     let statement = format!(
-        "LOCK TABLE turn_records, turn_run_records, turn_active_locks, turn_checkpoints, turn_idempotency_records, turn_lifecycle_events, turn_store_metadata IN {mode}"
+        "LOCK TABLE turn_records, turn_run_records, turn_active_locks, turn_checkpoints, turn_idempotency_records, turn_lifecycle_events, turn_store_metadata, turn_admission_reservations IN {mode}"
     );
     client.batch_execute(&statement).await.map_err(db_error)
 }
@@ -1007,6 +1063,11 @@ async fn postgres_load_snapshot(
     )
     .await?;
     let event_retention_floor = postgres_load_event_retention_floor(client).await?;
+    let admission_reservations = postgres_load_payloads::<TurnAdmissionReservationRecord>(
+        client,
+        "SELECT payload::text FROM turn_admission_reservations ORDER BY run_id",
+    )
+    .await?;
     Ok(TurnPersistenceSnapshot {
         turns,
         runs,
@@ -1015,6 +1076,7 @@ async fn postgres_load_snapshot(
         idempotency_records,
         events,
         event_retention_floor,
+        admission_reservations,
     })
 }
 
@@ -1026,6 +1088,7 @@ async fn postgres_replace_snapshot(
     for table in [
         "turn_store_metadata",
         "turn_lifecycle_events",
+        "turn_admission_reservations",
         "turn_idempotency_records",
         "turn_checkpoints",
         "turn_active_locks",
@@ -1123,6 +1186,15 @@ async fn postgres_replace_snapshot(
                 &turn_event_kind_key(event)?,
                 &payload,
             ],
+        )
+        .await
+        .map_err(db_error)?;
+    }
+    for record in &snapshot.admission_reservations {
+        let payload = to_json(record)?;
+        txn.execute(
+            "INSERT INTO turn_admission_reservations (run_id, released, payload) VALUES ($1, $2, $3::jsonb)",
+            &[&record.run_id.to_string(), &record.released, &payload],
         )
         .await
         .map_err(db_error)?;

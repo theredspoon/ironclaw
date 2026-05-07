@@ -17,14 +17,15 @@ use ironclaw_turns::{
     LoopExit, LoopExitInvalidHandling, LoopExitValidationPolicy, LoopMessageRef,
     ReplyTargetBindingRef, ResolvedRunProfile, RunProfileRequest, RunProfileResolutionError,
     RunProfileResolutionRequest, RunProfileResolver, SanitizedCancelReason, SanitizedFailure,
-    SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor,
-    TurnCoordinator, TurnError, TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError,
+    SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitTurnRequest, SubmitTurnResponse,
+    ThreadBusy, TurnActor, TurnAdmissionAxisKind, TurnAdmissionCapacityDenial, TurnCoordinator,
+    TurnError, TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError,
     TurnEventProjectionRequest, TurnEventProjectionService, TurnLeaseToken, TurnRunId,
     TurnRunnerId, TurnScope, TurnStatus,
     events::EventCursor,
     runner::{
-        ApplyLoopExitRequest, ClaimRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
-        TurnRunTransitionPort, apply_loop_exit,
+        ApplyLoopExitRequest, ClaimRunRequest, CompleteRunRequest, HeartbeatRequest,
+        RecoverExpiredLeasesRequest, TurnRunTransitionPort, apply_loop_exit,
     },
 };
 
@@ -210,6 +211,98 @@ async fn libsql_turn_state_store_persists_submit_and_busy_across_instances() {
         .await
         .unwrap();
     assert_eq!(duplicate, accepted);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_turn_state_store_persists_admission_reservations_across_instances() {
+    let (db, _dir) = libsql_db().await;
+    let limits = Arc::new(
+        StaticTurnAdmissionLimitProvider::default()
+            .with_total_limit(TurnAdmissionAxisKind::Tenant, 1),
+    );
+    let store = Arc::new(
+        LibSqlTurnStateStore::new(db.clone()).with_admission_limit_provider(limits.clone()),
+    );
+    store.run_migrations().await.unwrap();
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let first_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+
+    let reopened = Arc::new(
+        LibSqlTurnStateStore::new(db.clone()).with_admission_limit_provider(limits.clone()),
+    );
+    let reopened_coordinator = DefaultTurnCoordinator::new(reopened.clone());
+    let denied = reopened_coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(ironclaw_turns::AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Tenant,
+                limit: 1,
+                active_count: 1,
+                ..
+            }),
+            ..
+        })
+    ));
+    assert_eq!(
+        reopened
+            .persistence_snapshot()
+            .await
+            .unwrap()
+            .admission_reservations
+            .iter()
+            .filter(|reservation| !reservation.released)
+            .count(),
+        1
+    );
+
+    let runner_id = ironclaw_turns::TurnRunnerId::new();
+    let lease_token = ironclaw_turns::TurnLeaseToken::new();
+    reopened
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    reopened
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+
+    let after_release =
+        Arc::new(LibSqlTurnStateStore::new(db).with_admission_limit_provider(limits));
+    let after_release_coordinator = DefaultTurnCoordinator::new(after_release.clone());
+    after_release_coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b-after-release"))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_release
+            .persistence_snapshot()
+            .await
+            .unwrap()
+            .admission_reservations
+            .iter()
+            .filter(|reservation| !reservation.released)
+            .count(),
+        1
+    );
 }
 
 #[cfg(feature = "libsql")]
@@ -582,6 +675,98 @@ async fn postgres_turn_state_store_persists_submit_and_busy_across_instances_whe
             ..
         }) if active_run_id == run_id
     ));
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_turn_state_store_persists_admission_reservations_when_configured() {
+    let Some(pool) = postgres_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let limits = Arc::new(
+        StaticTurnAdmissionLimitProvider::default()
+            .with_total_limit(TurnAdmissionAxisKind::Tenant, 1),
+    );
+    let store = Arc::new(
+        PostgresTurnStateStore::new(pool.clone()).with_admission_limit_provider(limits.clone()),
+    );
+    store.run_migrations().await.unwrap();
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let tenant_id = TenantId::new(format!("tenant-admission-{suffix}")).unwrap();
+    let tenant_submit_request = |thread: &str, idempotency_key: &str| {
+        let mut request = submit_request(thread, idempotency_key);
+        request.scope.tenant_id = tenant_id.clone();
+        request
+    };
+    let first_thread = format!("pg-admission-a-{suffix}");
+    let second_thread = format!("pg-admission-b-{suffix}");
+    let first_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(tenant_submit_request(
+                &first_thread,
+                &format!("idem-submit-a-{suffix}"),
+            ))
+            .await
+            .unwrap(),
+    );
+
+    let reopened = Arc::new(
+        PostgresTurnStateStore::new(pool.clone()).with_admission_limit_provider(limits.clone()),
+    );
+    let reopened_coordinator = DefaultTurnCoordinator::new(reopened.clone());
+    let denied = reopened_coordinator
+        .submit_turn(tenant_submit_request(
+            &second_thread,
+            &format!("idem-submit-b-{suffix}"),
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(ironclaw_turns::AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Tenant,
+                limit: 1,
+                active_count: 1,
+                ..
+            }),
+            ..
+        })
+    ));
+
+    let runner_id = ironclaw_turns::TurnRunnerId::new();
+    let lease_token = ironclaw_turns::TurnLeaseToken::new();
+    let mut first_scope = scope(&first_thread);
+    first_scope.tenant_id = tenant_id.clone();
+    reopened
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(first_scope),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    reopened
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+
+    let after_release =
+        Arc::new(PostgresTurnStateStore::new(pool).with_admission_limit_provider(limits));
+    let after_release_coordinator = DefaultTurnCoordinator::new(after_release);
+    after_release_coordinator
+        .submit_turn(tenant_submit_request(
+            &second_thread,
+            &format!("idem-submit-b-after-release-{suffix}"),
+        ))
+        .await
+        .unwrap();
 }
 
 #[cfg(feature = "postgres")]

@@ -2,22 +2,25 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
-    sync::{Condvar, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
 use chrono::{Duration as ChronoDuration, Utc};
 
 use crate::{
-    AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, BlockedReason,
-    CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey, LoopExitMapping,
-    ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse, RunProfileResolutionError,
-    RunProfileResolutionRequest, RunProfileResolver, SanitizedFailure, SourceBindingRef,
-    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActiveLockKey, TurnActiveLockRecord,
-    TurnActor, TurnAdmissionPolicy, TurnCheckpointId, TurnCheckpointRecord, TurnError,
-    TurnEventKind, TurnIdempotencyErrorReplay, TurnIdempotencyOperationKind,
-    TurnIdempotencyOutcomeKind, TurnIdempotencyRecord, TurnIdempotencyReplay, TurnLifecycleEvent,
-    TurnLockVersion, TurnPersistenceSnapshot, TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord,
-    TurnRunState, TurnScope, TurnStateStore, TurnStatus,
+    AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason,
+    AllowAllTurnAdmissionLimitProvider, BlockedReason, CancelRunRequest, CancelRunResponse,
+    GetRunStateRequest, IdempotencyKey, LoopExitMapping, ReplyTargetBindingRef, ResumeTurnRequest,
+    ResumeTurnResponse, RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver,
+    SanitizedFailure, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy,
+    TurnActiveLockKey, TurnActiveLockRecord, TurnActor, TurnAdmissionClass,
+    TurnAdmissionLimitProvider, TurnAdmissionPolicy, TurnAdmissionReservationRecord,
+    TurnCheckpointId, TurnCheckpointRecord, TurnError, TurnEventKind, TurnIdempotencyErrorReplay,
+    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
+    TurnIdempotencyReplay, TurnLifecycleEvent, TurnLockVersion, TurnPersistenceSnapshot,
+    TurnRecord, TurnRunId, TurnRunProfile, TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
+    TurnStatus,
+    admission::{TurnAdmissionBucket, admission_buckets},
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -54,6 +57,7 @@ impl Default for InMemoryTurnStateStoreLimits {
 pub struct InMemoryTurnStateStore {
     inner: Mutex<Inner>,
     submit_idempotency_ready: Condvar,
+    admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
 }
 
 impl Default for InMemoryTurnStateStore {
@@ -82,6 +86,7 @@ struct Inner {
     idempotency_record_order: VecDeque<PersistedIdempotencyKey>,
     events: Vec<TurnLifecycleEvent>,
     event_retention_floor: EventCursor,
+    admission_reservations: HashMap<TurnRunId, TurnAdmissionReservationRecord>,
     limits: InMemoryTurnStateStoreLimits,
 }
 
@@ -187,6 +192,37 @@ impl InMemoryTurnStateStore {
                 ..Inner::default()
             }),
             submit_idempotency_ready: Condvar::new(),
+            admission_limit_provider: Arc::new(AllowAllTurnAdmissionLimitProvider),
+        }
+    }
+
+    pub fn with_admission_limit_provider(
+        admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
+    ) -> Self {
+        Self::with_limits_and_admission_limit_provider(
+            InMemoryTurnStateStoreLimits::default(),
+            admission_limit_provider,
+        )
+    }
+
+    pub fn with_limits_and_admission_limit_provider(
+        limits: InMemoryTurnStateStoreLimits,
+        admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(Inner {
+                limits,
+                ..Inner::default()
+            }),
+            submit_idempotency_ready: Condvar::new(),
+            admission_limit_provider,
+        }
+    }
+
+    pub fn active_admission_reservations(&self) -> Vec<TurnAdmissionReservationRecord> {
+        match self.inner.lock() {
+            Ok(inner) => inner.active_admission_reservations(),
+            Err(poisoned) => poisoned.into_inner().active_admission_reservations(),
         }
     }
 
@@ -201,9 +237,22 @@ impl InMemoryTurnStateStore {
         snapshot: TurnPersistenceSnapshot,
         limits: InMemoryTurnStateStoreLimits,
     ) -> Result<Self, TurnError> {
+        Self::from_persistence_snapshot_with_admission_limit_provider(
+            snapshot,
+            limits,
+            Arc::new(AllowAllTurnAdmissionLimitProvider),
+        )
+    }
+
+    pub fn from_persistence_snapshot_with_admission_limit_provider(
+        snapshot: TurnPersistenceSnapshot,
+        limits: InMemoryTurnStateStoreLimits,
+        admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
+    ) -> Result<Self, TurnError> {
         Ok(Self {
             inner: Mutex::new(Inner::from_persistence_snapshot(snapshot, limits)?),
             submit_idempotency_ready: Condvar::new(),
+            admission_limit_provider,
         })
     }
 
@@ -336,15 +385,23 @@ impl TurnStateStore for InMemoryTurnStateStore {
         };
 
         let lock_key = TurnActiveLockKey::from(&request.scope);
-        if let Some(active_lock) = inner.active_locks.get(&lock_key)
-            && let Some(record) = inner.records.get(&active_lock.run_id)
-            && record.status.keeps_active_lock()
-        {
-            let response = Err(TurnError::ThreadBusy(ThreadBusy {
-                active_run_id: active_lock.run_id,
-                status: record.status,
-                event_cursor: record.event_cursor,
-            }));
+        if let Some(response) = inner.thread_busy(&lock_key) {
+            inner.submit_idempotency_in_flight.remove(&idempotency_key);
+            self.submit_idempotency_ready.notify_all();
+            return Err(TurnError::ThreadBusy(response));
+        }
+
+        let turn_id = crate::TurnId::new();
+        let run_id = TurnRunId::new();
+        let admission_class = profile.admission_class.clone();
+        if let Err(rejection) = inner.reserve_admission(
+            run_id,
+            admission_class.clone(),
+            &request.scope,
+            &request.actor,
+            self.admission_limit_provider.as_ref(),
+        ) {
+            let response = Err(TurnError::AdmissionRejected(rejection));
             inner.remember_submit_idempotency(
                 idempotency_key.clone(),
                 response.clone(),
@@ -354,9 +411,6 @@ impl TurnStateStore for InMemoryTurnStateStore {
             self.submit_idempotency_ready.notify_all();
             return response;
         }
-
-        let turn_id = crate::TurnId::new();
-        let run_id = TurnRunId::new();
         let cursor = inner.next_cursor();
         let turn_record = TurnRecord {
             turn_id,
@@ -732,6 +786,26 @@ impl Inner {
         let events = snapshot.events;
         cursor = cursor.max(events.iter().map(|event| event.cursor.0).max().unwrap_or(0));
         cursor = cursor.max(snapshot.event_retention_floor.0);
+        let mut admission_reservations = HashMap::new();
+        for reservation in snapshot.admission_reservations {
+            admission_reservations.insert(reservation.run_id, reservation);
+        }
+        for record in records.values() {
+            if record.status.keeps_active_lock()
+                && !admission_reservations.contains_key(&record.run_id)
+            {
+                let admission_class = record.profile.admission_class.clone();
+                admission_reservations.insert(
+                    record.run_id,
+                    TurnAdmissionReservationRecord {
+                        run_id: record.run_id,
+                        admission_class: admission_class.clone(),
+                        buckets: admission_buckets(&record.scope, &record.actor, &admission_class),
+                        released: false,
+                    },
+                );
+            }
+        }
 
         Ok(Self {
             cursor,
@@ -752,6 +826,7 @@ impl Inner {
             idempotency_record_order,
             events,
             event_retention_floor: snapshot.event_retention_floor,
+            admission_reservations,
             limits,
         })
     }
@@ -812,6 +887,12 @@ impl Inner {
             .cloned()
             .collect::<Vec<_>>();
         idempotency_records.sort_by_key(|record| record.created_at);
+        let mut admission_reservations = self
+            .admission_reservations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        admission_reservations.sort_by_key(|reservation| reservation.run_id.to_string());
         TurnPersistenceSnapshot {
             turns,
             runs,
@@ -820,6 +901,7 @@ impl Inner {
             idempotency_records,
             events: self.events.clone(),
             event_retention_floor: self.event_retention_floor,
+            admission_reservations,
         }
     }
 
@@ -1466,6 +1548,85 @@ impl Inner {
         }
     }
 
+    fn thread_busy(&self, lock_key: &TurnActiveLockKey) -> Option<ThreadBusy> {
+        let active_lock = self.active_locks.get(lock_key)?;
+        let record = self.records.get(&active_lock.run_id)?;
+        record.status.keeps_active_lock().then_some(ThreadBusy {
+            active_run_id: active_lock.run_id,
+            status: record.status,
+            event_cursor: record.event_cursor,
+        })
+    }
+
+    fn reserve_admission(
+        &mut self,
+        run_id: TurnRunId,
+        admission_class: TurnAdmissionClass,
+        scope: &TurnScope,
+        actor: &TurnActor,
+        limit_provider: &dyn TurnAdmissionLimitProvider,
+    ) -> Result<(), AdmissionRejection> {
+        let buckets = admission_buckets(scope, actor, &admission_class);
+        for bucket in &buckets {
+            let limit = limit_provider
+                .limit_for(bucket)
+                .map_err(|_| AdmissionRejection::new(AdmissionRejectionReason::Unavailable))?;
+            if let Some(max_active) = limit.max_active {
+                let active_count = self.active_admission_count(bucket);
+                if active_count >= max_active {
+                    return Err(
+                        AdmissionRejection::new(AdmissionRejectionReason::TenantLimit)
+                            .with_capacity_denial(crate::TurnAdmissionCapacityDenial {
+                                axis_kind: bucket.axis_kind,
+                                bucket_kind: bucket.bucket_kind,
+                                admission_class: bucket.admission_class.clone(),
+                                limit: max_active,
+                                active_count,
+                                retry_after_ms: limit.retry_after_ms,
+                            }),
+                    );
+                }
+            }
+        }
+        self.admission_reservations.insert(
+            run_id,
+            TurnAdmissionReservationRecord {
+                run_id,
+                admission_class,
+                buckets,
+                released: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn active_admission_count(&self, bucket: &TurnAdmissionBucket) -> u64 {
+        self.admission_reservations
+            .values()
+            .filter(|reservation| {
+                !reservation.released
+                    && reservation
+                        .buckets
+                        .iter()
+                        .any(|reserved| reserved == bucket)
+            })
+            .count() as u64
+    }
+
+    fn active_admission_reservations(&self) -> Vec<TurnAdmissionReservationRecord> {
+        self.admission_reservations
+            .values()
+            .filter(|reservation| !reservation.released)
+            .cloned()
+            .collect()
+    }
+
+    fn release_admission(&mut self, run_id: TurnRunId) {
+        if let Some(reservation) = self.admission_reservations.get_mut(&run_id) {
+            reservation.released = true;
+        }
+    }
+
     fn record_checkpoint(
         &mut self,
         record: &RunRecord,
@@ -1501,6 +1662,7 @@ impl Inner {
     }
 
     fn mark_terminal(&mut self, run_id: TurnRunId) {
+        self.release_admission(run_id);
         self.terminal_runs.push_back(run_id);
     }
 

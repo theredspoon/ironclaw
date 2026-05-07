@@ -5,6 +5,7 @@
 //! binding/session layer. Trusted workers use [`runner`] explicitly; runner
 //! transition APIs are intentionally not re-exported from this crate prelude.
 
+pub mod admission;
 pub mod coordinator;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 pub mod db;
@@ -20,6 +21,12 @@ pub mod scope;
 pub mod status;
 pub mod store;
 
+pub use admission::{
+    AllowAllTurnAdmissionLimitProvider, StaticTurnAdmissionLimitProvider, TurnAdmissionAxisKind,
+    TurnAdmissionBucket, TurnAdmissionBucketKind, TurnAdmissionBucketScope,
+    TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionLimit,
+    TurnAdmissionLimitProvider, TurnAdmissionLimitUnavailable, TurnAdmissionReservationRecord,
+};
 pub use coordinator::{
     AllowAllTurnAdmissionPolicy, DefaultTurnCoordinator, NoopTurnRunWakeNotifier,
     TurnAdmissionPolicy, TurnCoordinator, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
