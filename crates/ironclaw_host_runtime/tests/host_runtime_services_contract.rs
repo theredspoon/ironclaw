@@ -8,6 +8,12 @@ use ironclaw_authorization::{
     TrustAwareCapabilityDispatchAuthorizer,
 };
 use ironclaw_capabilities::{CapabilityHost, CapabilitySpawnRequest};
+use ironclaw_event_projections::{
+    AuditProjectionError, AuditProjectionRequest, AuditProjectionService, AuditProjectionStage,
+    EventProjectionService, ProjectionCursor, ProjectionError, ProjectionRequest, ProjectionScope,
+    ReplayAuditProjectionService, ReplayEventProjectionService, RunProjectionStatus,
+    TimelineEntryKind,
+};
 use ironclaw_events::{
     DurableAuditLog, DurableAuditSink, DurableEventLog, DurableEventSink, EventCursor, EventError,
     EventReplay, EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog,
@@ -820,6 +826,497 @@ async fn host_runtime_services_durable_event_replay_cursor_and_gap_behavior() {
         .await
         .expect_err("origin cursor should be stale after retention truncation");
     assert!(matches!(gap, EventError::ReplayGap { .. }));
+}
+
+#[tokio::test]
+async fn host_runtime_services_runtime_events_project_through_replay_projection_metadata_only() {
+    let registry = Arc::new(registry_with_manifest(SCRIPT_MANIFEST));
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let services = HostRuntimeServices::new(
+        registry,
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_durable_event_log(Arc::clone(&event_log))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope = sample_scope(InvocationId::new());
+    let payload = json!({
+        "message": "RAW_PROJECTION_INPUT_SENTINEL_3022 /tmp/private-projection-path",
+        "secret": "SECRET_PROJECTION_SENTINEL_3022_sk_live_secret",
+        "output": "RUNTIME_PROJECTION_OUTPUT_SENTINEL_3022",
+    });
+
+    let outcome = services
+        .host_runtime()
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
+            script_capability_id(),
+            ResourceEstimate::default(),
+            payload.clone(),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome, RuntimeCapabilityOutcome::Completed(completed) if completed.output == payload)
+    );
+
+    let projection = ReplayEventProjectionService::new(Arc::clone(&event_log));
+    let snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .timeline
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TimelineEntryKind::DispatchRequested,
+            TimelineEntryKind::RuntimeSelected,
+            TimelineEntryKind::DispatchSucceeded,
+        ]
+    );
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(snapshot.runs[0].status, RunProjectionStatus::Completed);
+    assert_eq!(snapshot.runs[0].capability_id, script_capability_id());
+    assert_eq!(
+        snapshot.timeline.entries[2].output_bytes,
+        Some(serde_json::to_vec(&payload).unwrap().len() as u64)
+    );
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for forbidden in [
+        "RAW_PROJECTION_INPUT_SENTINEL_3022",
+        "/tmp/private-projection-path",
+        "SECRET_PROJECTION_SENTINEL_3022",
+        "RUNTIME_PROJECTION_OUTPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "runtime projection leaked {forbidden}: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_runtime_services_projection_rejects_foreign_cursor_and_surfaces_rebase_after_gap() {
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_durable_event_log(Arc::clone(&event_log))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope_a = sample_scope(InvocationId::new());
+    let scope_b = ResourceScope {
+        thread_id: Some(ThreadId::new("thread-b").unwrap()),
+        invocation_id: InvocationId::new(),
+        ..scope_a.clone()
+    };
+
+    let outcome = services
+        .host_runtime()
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(
+                script_capability_id(),
+                scope_a.clone(),
+            ),
+            script_capability_id(),
+            ResourceEstimate::default(),
+            json!({"message": "scope a"}),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RuntimeCapabilityOutcome::Completed(_)));
+
+    let projection = ReplayEventProjectionService::new(Arc::clone(&event_log));
+    let scope_a_projection = ProjectionScope::from_resource_scope(&scope_a);
+    let scope_b_projection = ProjectionScope::from_resource_scope(&scope_b);
+    let snapshot_a = projection
+        .snapshot(ProjectionRequest {
+            scope: scope_a_projection.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let snapshot_b = projection
+        .snapshot(ProjectionRequest {
+            scope: scope_b_projection.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(snapshot_b.timeline.entries.is_empty());
+
+    let foreign_cursor = projection
+        .updates(ProjectionRequest {
+            scope: scope_b_projection,
+            after: Some(snapshot_a.next_cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .expect_err("foreign projection cursor must force rebase");
+    assert!(matches!(
+        foreign_cursor,
+        ProjectionError::RebaseRequired { .. }
+    ));
+
+    event_log
+        .truncate_before_or_at(
+            &EventStreamKey::from_scope(&scope_a),
+            snapshot_a.timeline.entries[0].cursor,
+        )
+        .unwrap();
+    let stale_cursor = projection
+        .updates(ProjectionRequest {
+            scope: scope_a_projection.clone(),
+            after: Some(ProjectionCursor::origin_for_scope(scope_a_projection)),
+            limit: 10,
+        })
+        .await
+        .expect_err("retained-history gap must force projection rebase");
+    assert!(matches!(
+        stale_cursor,
+        ProjectionError::RebaseRequired { .. }
+    ));
+}
+
+#[tokio::test]
+async fn host_runtime_services_jsonl_event_store_projects_same_runtime_sequence_without_sentinels()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let store_root = temp.path().join("reborn-event-store");
+    let stores = build_reborn_event_stores(
+        RebornProfile::LocalDev,
+        RebornEventStoreConfig::Jsonl {
+            root: store_root.clone(),
+            accept_single_node_durable: false,
+        },
+    )
+    .await
+    .unwrap();
+    let event_log = Arc::clone(&stores.events);
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_event_sink(Arc::new(DurableEventSink::new(Arc::clone(&event_log))))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope = sample_scope(InvocationId::new());
+    let payload = json!({
+        "message": "JSONL_RAW_INPUT_SENTINEL_3022 /tmp/jsonl-private-path",
+        "secret": "JSONL_SECRET_SENTINEL_3022_sk_live_secret",
+        "output": "JSONL_OUTPUT_SENTINEL_3022",
+    });
+
+    let outcome = services
+        .host_runtime()
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
+            script_capability_id(),
+            ResourceEstimate::default(),
+            payload.clone(),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, RuntimeCapabilityOutcome::Completed(completed) if completed.output == payload)
+    );
+
+    let projection = ReplayEventProjectionService::from_runtime_log(Arc::clone(&event_log));
+    let snapshot = projection
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .timeline
+            .entries
+            .iter()
+            .map(|entry| entry.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            TimelineEntryKind::DispatchRequested,
+            TimelineEntryKind::RuntimeSelected,
+            TimelineEntryKind::DispatchSucceeded,
+        ]
+    );
+    assert_eq!(snapshot.runs.len(), 1);
+    assert_eq!(snapshot.runs[0].status, RunProjectionStatus::Completed);
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    let jsonl_bytes = read_directory_text(&store_root);
+    for forbidden in [
+        "JSONL_RAW_INPUT_SENTINEL_3022",
+        "/tmp/jsonl-private-path",
+        "JSONL_SECRET_SENTINEL_3022",
+        "JSONL_OUTPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !projection_json.contains(forbidden),
+            "JSONL-backed projection leaked {forbidden}: {projection_json}"
+        );
+        assert!(
+            !jsonl_bytes.contains(forbidden),
+            "JSONL durable event bytes leaked {forbidden}: {jsonl_bytes}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_runtime_services_approval_resolution_projects_durable_audit_metadata_only() {
+    let run_state = Arc::new(InMemoryRunStateStore::new());
+    let approval_requests = Arc::new(InMemoryApprovalRequestStore::new());
+    let capability_leases = Arc::new(InMemoryCapabilityLeaseStore::new());
+    let audit_log = Arc::new(InMemoryDurableAuditLog::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(SentinelApprovalAuthorizer),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_run_state(Arc::clone(&run_state))
+    .with_approval_requests(Arc::clone(&approval_requests))
+    .with_capability_leases(Arc::clone(&capability_leases))
+    .with_durable_audit_log(Arc::clone(&audit_log))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let runtime = services.host_runtime();
+    let scope = sample_scope(InvocationId::new());
+    let context = execution_context_without_grants_for_scope(scope.clone());
+    let input = json!({
+        "message": "APPROVAL_RAW_INPUT_SENTINEL_3022 /tmp/private-approval-path",
+        "secret": "APPROVAL_SECRET_SENTINEL_3022_sk_live_secret",
+        "output": "APPROVAL_OUTPUT_SENTINEL_3022",
+    });
+
+    let gate = block_for_approval(
+        &runtime,
+        context.clone(),
+        ResourceEstimate::default(),
+        input.clone(),
+    )
+    .await;
+    approve_dispatch_for_services(&services, &scope, gate.approval_request_id, None).await;
+    let resumed = runtime
+        .resume_capability(RuntimeCapabilityResumeRequest::new(
+            context,
+            gate.approval_request_id,
+            script_capability_id(),
+            ResourceEstimate::default(),
+            input.clone(),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(resumed, RuntimeCapabilityOutcome::Completed(completed) if completed.output == input)
+    );
+
+    let projection = ReplayAuditProjectionService::new(Arc::clone(&audit_log));
+    let snapshot = projection
+        .snapshot(AuditProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.entries.len(), 1);
+    let entry = &snapshot.entries[0];
+    assert_eq!(entry.stage, AuditProjectionStage::ApprovalResolved);
+    assert_eq!(entry.invocation_id, scope.invocation_id);
+    assert_eq!(entry.thread_id, scope.thread_id);
+    assert_eq!(entry.approval_request_id, Some(gate.approval_request_id));
+    assert_eq!(entry.action_kind, "dispatch");
+    assert_eq!(
+        entry.action_target.as_deref(),
+        Some(script_capability_id().as_str())
+    );
+    assert_eq!(entry.decision_kind, "approved");
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    for forbidden in [
+        "APPROVAL_REASON_SENTINEL_3022",
+        "APPROVAL_RAW_INPUT_SENTINEL_3022",
+        "/tmp/private-approval-path",
+        "APPROVAL_SECRET_SENTINEL_3022",
+        "APPROVAL_OUTPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "approval audit projection leaked {forbidden}: {serialized}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_runtime_services_jsonl_approval_audit_projection_rejects_foreign_cursor_without_leaks()
+ {
+    let temp = tempfile::tempdir().unwrap();
+    let store_root = temp.path().join("reborn-event-store");
+    let stores = build_reborn_event_stores(
+        RebornProfile::LocalDev,
+        RebornEventStoreConfig::Jsonl {
+            root: store_root.clone(),
+            accept_single_node_durable: false,
+        },
+    )
+    .await
+    .unwrap();
+    let audit_log = Arc::clone(&stores.audit);
+    let run_state = Arc::new(InMemoryRunStateStore::new());
+    let approval_requests = Arc::new(InMemoryApprovalRequestStore::new());
+    let capability_leases = Arc::new(InMemoryCapabilityLeaseStore::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(SentinelApprovalAuthorizer),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability],
+    )))
+    .with_run_state(Arc::clone(&run_state))
+    .with_approval_requests(Arc::clone(&approval_requests))
+    .with_capability_leases(Arc::clone(&capability_leases))
+    .with_audit_sink(Arc::new(ironclaw_events::DurableAuditSink::new(
+        Arc::clone(&audit_log),
+    )))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let runtime = services.host_runtime();
+    let scope_a = sample_scope(InvocationId::new());
+    let scope_b = ResourceScope {
+        thread_id: Some(ThreadId::new("approval-thread-b").unwrap()),
+        invocation_id: InvocationId::new(),
+        ..scope_a.clone()
+    };
+    let context = execution_context_without_grants_for_scope(scope_a.clone());
+    let input = json!({"message": "JSONL_APPROVAL_INPUT_SENTINEL_3022"});
+
+    let gate = block_for_approval(
+        &runtime,
+        context.clone(),
+        ResourceEstimate::default(),
+        input.clone(),
+    )
+    .await;
+    approve_dispatch_for_services(&services, &scope_a, gate.approval_request_id, None).await;
+
+    let projection = ReplayAuditProjectionService::from_audit_log(Arc::clone(&audit_log));
+    let scope_a_projection = ProjectionScope::from_resource_scope(&scope_a);
+    let scope_b_projection = ProjectionScope::from_resource_scope(&scope_b);
+    let snapshot_a = projection
+        .snapshot(AuditProjectionRequest {
+            scope: scope_a_projection,
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(snapshot_a.entries.len(), 1);
+    let snapshot_b = projection
+        .snapshot(AuditProjectionRequest {
+            scope: scope_b_projection.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(snapshot_b.entries.is_empty());
+
+    let foreign_cursor = projection
+        .updates(AuditProjectionRequest {
+            scope: scope_b_projection,
+            after: Some(snapshot_a.next_cursor.clone()),
+            limit: 10,
+        })
+        .await
+        .expect_err("foreign audit projection cursor must force rebase");
+    assert!(matches!(
+        foreign_cursor,
+        AuditProjectionError::RebaseRequired { .. }
+    ));
+
+    let projection_json = serde_json::to_string(&snapshot_a).unwrap();
+    let jsonl_bytes = read_directory_text(&store_root);
+    for forbidden in [
+        "APPROVAL_REASON_SENTINEL_3022",
+        "JSONL_APPROVAL_INPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !projection_json.contains(forbidden),
+            "JSONL approval audit projection leaked {forbidden}: {projection_json}"
+        );
+        assert!(
+            !jsonl_bytes.contains(forbidden),
+            "JSONL durable audit bytes leaked {forbidden}: {jsonl_bytes}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1774,7 +2271,7 @@ async fn host_runtime_services_routes_cached_wasm_http_through_per_invocation_po
 }
 
 #[tokio::test]
-async fn host_runtime_services_routes_wasm_http_with_staged_network_and_secret_handoffs() {
+async fn host_runtime_services_wasm_http_uses_production_staged_network_and_secret_handoffs() {
     let parsed_manifest = ExtensionManifest::parse(WASM_HTTP_SUCCESS_MANIFEST).unwrap();
     let component = tool_component(HTTP_TOOL_WAT);
     let filesystem = Arc::new(
@@ -1820,11 +2317,9 @@ async fn host_runtime_services_routes_wasm_http_with_staged_network_and_secret_h
         ),
     ])));
     let runtime_http = Arc::new(
-        HostHttpEgressService::new_with_request_policy_for_tests(
-            network.clone(),
-            InMemorySecretStore::new(),
-        )
-        .with_secret_injection_store(services.secret_injection_store()),
+        HostHttpEgressService::new(network.clone(), InMemorySecretStore::new())
+            .with_network_policy_store(services.network_policy_store())
+            .with_secret_injection_store(services.secret_injection_store()),
     );
     let services = services
         .with_runtime_http_egress(runtime_http)
@@ -1835,7 +2330,7 @@ async fn host_runtime_services_routes_wasm_http_with_staged_network_and_secret_h
     secret_store
         .put(
             scope.clone(),
-            secret_handle,
+            secret_handle.clone(),
             SecretMaterial::from("sk-vertical-secret"),
         )
         .await
@@ -1865,6 +2360,21 @@ async fn host_runtime_services_routes_wasm_http_with_staged_network_and_secret_h
             "authorization".to_string(),
             "Bearer sk-vertical-secret".to_string(),
         ))
+    );
+    assert!(
+        services
+            .network_policy_store()
+            .take(&scope, &capability_id)
+            .is_none(),
+        "completed invoke must discard staged network policy after shared egress uses it"
+    );
+    assert!(
+        services
+            .secret_injection_store()
+            .take(&scope, &capability_id, &secret_handle)
+            .unwrap()
+            .is_none(),
+        "completed invoke must consume staged secret material once"
     );
 }
 
@@ -3089,6 +3599,41 @@ async fn approve_dispatch_for_services(
         .unwrap()
 }
 
+struct SentinelApprovalAuthorizer;
+
+#[async_trait]
+impl TrustAwareCapabilityDispatchAuthorizer for SentinelApprovalAuthorizer {
+    async fn authorize_dispatch_with_trust(
+        &self,
+        context: &ExecutionContext,
+        descriptor: &CapabilityDescriptor,
+        estimate: &ResourceEstimate,
+        trust_decision: &TrustDecision,
+    ) -> Decision {
+        if context.grants.grants.is_empty() {
+            Decision::RequireApproval {
+                request: ApprovalRequest {
+                    id: ApprovalRequestId::new(),
+                    correlation_id: context.correlation_id,
+                    requested_by: Principal::Extension(context.extension_id.clone()),
+                    action: Box::new(Action::Dispatch {
+                        capability: descriptor.id.clone(),
+                        estimated_resources: estimate.clone(),
+                    }),
+                    invocation_fingerprint: None,
+                    reason: "APPROVAL_REASON_SENTINEL_3022 /tmp/private-approval-reason"
+                        .to_string(),
+                    reusable_scope: None,
+                },
+            }
+        } else {
+            GrantAuthorizer::new()
+                .authorize_dispatch_with_trust(context, descriptor, estimate, trust_decision)
+                .await
+        }
+    }
+}
+
 struct ApprovalThenGrantAuthorizer;
 
 #[async_trait]
@@ -3973,6 +4518,27 @@ fn trust_decision_with_dispatch_authority() -> TrustDecision {
         provenance: TrustProvenance::Default,
         evaluated_at: Utc::now(),
     }
+}
+
+fn read_directory_text(root: &std::path::Path) -> String {
+    let mut output = String::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let entries = std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        for entry in entries {
+            let entry = entry.unwrap_or_else(|err| panic!("failed to read dir entry: {err}"));
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                output.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|err| {
+                    panic!("failed to read {} as utf-8 text: {err}", path.display())
+                }));
+            }
+        }
+    }
+    output
 }
 
 fn sample_scope(invocation_id: InvocationId) -> ResourceScope {
