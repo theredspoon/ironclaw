@@ -15,9 +15,9 @@ use ironclaw_event_projections::{
     TimelineEntryKind,
 };
 use ironclaw_events::{
-    DurableAuditLog, DurableEventLog, DurableEventSink, EventCursor, EventError, EventReplay,
-    EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog, InMemoryDurableEventLog,
-    InMemoryEventSink, ReadScope, RuntimeEventKind,
+    DurableAuditLog, DurableAuditSink, DurableEventLog, DurableEventSink, EventCursor, EventError,
+    EventReplay, EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog,
+    InMemoryDurableEventLog, InMemoryEventSink, ReadScope, RuntimeEventKind,
 };
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry};
 use ironclaw_filesystem::{LocalFilesystem, RootFilesystem};
@@ -25,7 +25,8 @@ use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     BuiltinObligationHandler, CancelReason, CancelRuntimeWorkRequest, CapabilitySurfaceVersion,
     DefaultHostRuntime, HostHttpEgressService, HostRuntime, HostRuntimeServices,
-    NetworkObligationPolicyStore, ProcessObligationLifecycleStore, RuntimeCapabilityOutcome,
+    NetworkObligationPolicyStore, ProcessObligationLifecycleStore, ProductionWiringComponent,
+    ProductionWiringConfig, ProductionWiringIssueKind, RuntimeCapabilityOutcome,
     RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest, RuntimeFailureKind,
     RuntimeSecretInjectionStore, RuntimeStatusRequest, RuntimeWorkId,
 };
@@ -65,6 +66,430 @@ use serde_json::json;
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::Resolve;
 
+#[test]
+fn production_wiring_validation_rejects_missing_components_and_local_only_defaults() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+
+    let report = match services.host_runtime_for_production(&ProductionWiringConfig::new([])) {
+        Ok(_) => panic!("bare local/test service graph must not pass production validation"),
+        Err(report) => report,
+    };
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::TrustPolicy,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing explicit trust policy should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RunState,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing run-state store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ApprovalRequests,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing approval store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::CapabilityLeases,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing capability lease store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::EventSink,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing event sink should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::AuditSink,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing audit sink should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::SecretStore,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing secret store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::Filesystem,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "local filesystem should be reported as local-only: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ResourceGovernor,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory resource governor should be reported as local-only: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ProcessStore,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory process store should be reported as local-only: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ProcessResultStore,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory process result store should be reported as local-only: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_unsupported_runtime_requirements() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([RuntimeKind::FirstParty]))
+        .expect_err("first-party runtime requirements are not dispatcher backend requirements");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimeBackend,
+            ProductionWiringIssueKind::UnsupportedRequirement
+        ),
+        "unsupported runtime backend requirement should be reported: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_uses_configured_runtime_requirements() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+    let config = ProductionWiringConfig::new([RuntimeKind::Script, RuntimeKind::Wasm])
+        .require_runtime_http_egress()
+        .require_wasm_credentials();
+
+    let report = services
+        .validate_production_wiring(&config)
+        .expect_err("required runtime backends and egress must be reported when absent");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::ScriptRuntime,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing script runtime should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmRuntime,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing wasm runtime should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimeHttpEgress,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing runtime HTTP egress should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing WASM credential provider should be reported: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_sees_underlying_in_memory_durable_logs() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_durable_event_log(Arc::new(InMemoryDurableEventLog::new()))
+    .with_durable_audit_log(Arc::new(InMemoryDurableAuditLog::new()));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("in-memory durable logs must not be hidden behind durable sink wrappers");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::EventSink,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory durable event log should be reported through with_durable_event_log: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::AuditSink,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "in-memory durable audit log should be reported through with_durable_audit_log: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_direct_durable_sink_wrappers_as_unverified() {
+    let event_log: Arc<dyn DurableEventLog> = Arc::new(InMemoryDurableEventLog::new());
+    let audit_log: Arc<dyn DurableAuditLog> = Arc::new(InMemoryDurableAuditLog::new());
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_event_sink(Arc::new(DurableEventSink::new(event_log)))
+    .with_audit_sink(Arc::new(DurableAuditSink::new(audit_log)));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("direct durable sink wrappers must not hide erased underlying log types");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::EventSink,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "direct durable event sink wrapper should require typed with_durable_event_log path: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::AuditSink,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "direct durable audit sink wrapper should require typed with_durable_audit_log path: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_accepts_verified_host_http_egress_shape() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+    let runtime_http = Arc::new(
+        HostHttpEgressService::new(
+            RecordingNetworkHttpEgress::new(),
+            InMemorySecretStore::new(),
+        )
+        .with_secret_injection_store(services.secret_injection_store())
+        .with_network_policy_store(services.network_policy_store()),
+    );
+    let services = services.with_host_http_egress_service(runtime_http);
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]).require_runtime_http_egress());
+
+    assert!(
+        report.as_ref().err().is_none_or(|report| !report.contains(
+            ProductionWiringComponent::RuntimeHttpEgress,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        )),
+        "verified host HTTP egress should satisfy the runtime egress guardrail: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_host_http_egress_with_unrelated_handoff_store() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+    let runtime_http = Arc::new(
+        HostHttpEgressService::new(
+            RecordingNetworkHttpEgress::new(),
+            InMemorySecretStore::new(),
+        )
+        .with_secret_injection_store(services.secret_injection_store())
+        .with_network_policy_store(Arc::new(NetworkObligationPolicyStore::new())),
+    );
+    let services = services.with_host_http_egress_service(runtime_http);
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]).require_runtime_http_egress())
+        .expect_err("runtime HTTP egress must share the graph-owned network policy handoff store");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimeHttpEgress,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "runtime HTTP egress with unrelated handoff stores should be unverified: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_unverified_runtime_http_egress() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_runtime_http_egress(Arc::new(
+        HostHttpEgressService::new_with_request_policy_for_tests(
+            RecordingNetworkHttpEgress::new(),
+            InMemorySecretStore::new(),
+        ),
+    ));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]).require_runtime_http_egress())
+        .expect_err(
+            "generic/test runtime HTTP egress must not satisfy production egress guardrail",
+        );
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::RuntimeHttpEgress,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "runtime HTTP egress should require production verification: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_empty_verified_wasm_credentials() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(WASM_HTTP_SUCCESS_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_verified_wasm_runtime_credentials(Arc::new(WasmStagedRuntimeCredentials::new(vec![])))
+    .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
+    .unwrap();
+
+    let report = services
+        .validate_production_wiring(
+            &ProductionWiringConfig::new([RuntimeKind::Wasm]).require_wasm_credentials(),
+        )
+        .expect_err("empty verified credential provider must not satisfy credential requirement");
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "empty WASM credentials should be reported as unverified: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_wasm_credentials_added_after_adapter() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(WASM_HTTP_SUCCESS_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
+    .unwrap()
+    .with_wasm_runtime_credential_provider(Arc::new(WasmStagedRuntimeCredentials::new(vec![])));
+
+    let report = services
+        .validate_production_wiring(
+            &ProductionWiringConfig::new([RuntimeKind::Wasm]).require_wasm_credentials(),
+        )
+        .expect_err(
+            "credentials added after WASM adapter construction are not captured by the adapter",
+        );
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "WASM credentials must be configured before adapter construction: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_rejects_wasm_credentials_replaced_after_adapter() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(WASM_HTTP_SUCCESS_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_wasm_runtime_credential_provider(Arc::new(WasmStagedRuntimeCredentials::new(vec![])))
+    .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
+    .unwrap()
+    .with_wasm_runtime_credential_provider(Arc::new(WasmStagedRuntimeCredentials::new(vec![])));
+
+    let report = services
+        .validate_production_wiring(
+            &ProductionWiringConfig::new([RuntimeKind::Wasm]).require_wasm_credentials(),
+        )
+        .expect_err(
+            "replacing credentials after WASM adapter construction is not captured by the adapter",
+        );
+
+    assert!(
+        report.contains(
+            ProductionWiringComponent::WasmCredentialProvider,
+            ProductionWiringIssueKind::UnverifiedProductionImplementation
+        ),
+        "WASM credentials must not be replaced after adapter construction: {report:?}"
+    );
+}
+
 #[tokio::test]
 async fn host_runtime_services_builds_dispatcher_runtime_and_health_from_registered_adapters() {
     let registry = Arc::new(registry_with_manifest(SCRIPT_MANIFEST));
@@ -100,7 +525,7 @@ async fn host_runtime_services_builds_dispatcher_runtime_and_health_from_registe
     .with_script_runtime(script_runtime)
     .with_event_sink(Arc::new(events.clone()));
 
-    let runtime = services.host_runtime();
+    let runtime = services.host_runtime_for_local_testing();
     let context = execution_context_with_dispatch_grant(script_capability_id());
     let request = RuntimeCapabilityRequest::new(
         context,
@@ -174,7 +599,7 @@ async fn host_runtime_services_writes_runtime_events_to_durable_event_log_metada
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -271,7 +696,7 @@ async fn host_runtime_services_consumes_reborn_jsonl_event_store_without_v1_comp
 
     let scope = sample_scope(InvocationId::new());
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -338,7 +763,7 @@ async fn host_runtime_services_durable_event_replay_cursor_and_gap_behavior() {
     let stream = EventStreamKey::from_scope(&scope);
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -432,7 +857,7 @@ async fn host_runtime_services_runtime_events_project_through_replay_projection_
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -520,7 +945,7 @@ async fn host_runtime_services_projection_rejects_foreign_cursor_and_surfaces_re
     };
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(
                 script_capability_id(),
@@ -629,7 +1054,7 @@ async fn host_runtime_services_jsonl_event_store_projects_same_runtime_sequence_
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -713,7 +1138,7 @@ async fn host_runtime_services_approval_resolution_projects_durable_audit_metada
         ScriptRuntimeConfig::for_testing(),
         EchoScriptBackend,
     )));
-    let runtime = services.host_runtime();
+    let runtime = services.host_runtime_for_local_testing();
     let scope = sample_scope(InvocationId::new());
     let context = execution_context_without_grants_for_scope(scope.clone());
     let input = json!({
@@ -823,7 +1248,7 @@ async fn host_runtime_services_jsonl_approval_audit_projection_rejects_foreign_c
         ScriptRuntimeConfig::for_testing(),
         EchoScriptBackend,
     )));
-    let runtime = services.host_runtime();
+    let runtime = services.host_runtime_for_local_testing();
     let scope_a = sample_scope(InvocationId::new());
     let scope_b = ResourceScope {
         thread_id: Some(ThreadId::new("approval-thread-b").unwrap()),
@@ -897,7 +1322,7 @@ async fn host_runtime_services_jsonl_approval_audit_projection_rejects_foreign_c
 #[tokio::test]
 async fn host_runtime_services_resumes_approved_capability_and_consumes_lease_once() {
     let fixture = approval_resume_fixture();
-    let runtime = fixture.services.host_runtime();
+    let runtime = fixture.services.host_runtime_for_local_testing();
     let context = execution_context_without_grants();
     let scope = context.resource_scope.clone();
     let estimate = ResourceEstimate::default();
@@ -974,7 +1399,7 @@ async fn host_runtime_services_resumes_approved_capability_and_consumes_lease_on
 #[tokio::test]
 async fn host_runtime_services_resume_changed_input_fails_before_lease_claim_or_dispatch() {
     let fixture = approval_resume_fixture();
-    let runtime = fixture.services.host_runtime();
+    let runtime = fixture.services.host_runtime_for_local_testing();
     let context = execution_context_without_grants();
     let scope = context.resource_scope.clone();
     let estimate = ResourceEstimate::default();
@@ -1017,7 +1442,7 @@ async fn host_runtime_services_resume_changed_input_fails_before_lease_claim_or_
 #[tokio::test]
 async fn host_runtime_services_resume_wrong_user_scope_is_hidden_before_dispatch() {
     let fixture = approval_resume_fixture();
-    let runtime = fixture.services.host_runtime();
+    let runtime = fixture.services.host_runtime_for_local_testing();
     let context = execution_context_without_grants();
     let scope = context.resource_scope.clone();
     let estimate = ResourceEstimate::default();
@@ -1073,7 +1498,7 @@ async fn host_runtime_services_resume_wrong_user_scope_is_hidden_before_dispatch
 #[tokio::test]
 async fn host_runtime_services_resume_expired_lease_fails_before_dispatch() {
     let fixture = approval_resume_fixture();
-    let runtime = fixture.services.host_runtime();
+    let runtime = fixture.services.host_runtime_for_local_testing();
     let context = execution_context_without_grants();
     let scope = context.resource_scope.clone();
     let estimate = ResourceEstimate::default();
@@ -1116,7 +1541,7 @@ async fn host_runtime_services_resume_expired_lease_fails_before_dispatch() {
 #[tokio::test]
 async fn host_runtime_services_resume_trust_preflight_failure_fails_only_matching_blocked_run() {
     let fixture = approval_resume_fixture();
-    let runtime = fixture.services.host_runtime();
+    let runtime = fixture.services.host_runtime_for_local_testing();
     let context = execution_context_without_grants();
     let scope = context.resource_scope.clone();
     let estimate = ResourceEstimate::default();
@@ -1228,7 +1653,7 @@ async fn host_runtime_services_resume_without_backing_stores_fails_closed() {
         ScriptRuntimeConfig::for_testing(),
         EchoScriptBackend,
     )))
-    .host_runtime();
+    .host_runtime_for_local_testing();
 
     let outcome = runtime
         .resume_capability(RuntimeCapabilityResumeRequest::new(
@@ -1267,7 +1692,7 @@ async fn host_runtime_services_registered_runtime_health_tracks_script_mcp_and_w
     .with_mcp_runtime(Arc::new(PanicMcpExecutor))
     .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
     .unwrap()
-    .host_runtime();
+    .host_runtime_for_local_testing();
 
     let health = runtime.health().await.unwrap();
 
@@ -1285,7 +1710,7 @@ async fn host_runtime_services_health_fails_closed_for_unregistered_required_run
         ProcessServices::in_memory(),
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
     )
-    .host_runtime();
+    .host_runtime_for_local_testing();
 
     let health = runtime.health().await.unwrap();
 
@@ -1317,7 +1742,7 @@ async fn host_runtime_services_installs_builtin_obligation_handler_with_audit_si
     .with_script_runtime(script_runtime);
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant(script_capability_id()),
             script_capability_id(),
@@ -1376,7 +1801,7 @@ async fn host_runtime_services_applies_scoped_mount_obligation_to_script_runtime
     .with_script_runtime(Arc::clone(&script_runtime));
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             context,
             script_capability_id(),
@@ -1429,7 +1854,7 @@ async fn host_runtime_services_rejects_broader_scoped_mount_before_dispatch() {
     .with_script_runtime(Arc::clone(&script_runtime));
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             context,
             script_capability_id(),
@@ -1480,7 +1905,7 @@ async fn host_runtime_services_writes_obligation_audit_records_to_durable_log_me
     });
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -1577,7 +2002,7 @@ async fn host_runtime_services_enforces_output_limit_and_reconciles_resource_usa
     let input = json!({"message": "this output is deliberately too large"});
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -1639,7 +2064,7 @@ async fn host_runtime_services_releases_reservation_when_dispatch_preflight_fail
     )));
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
             script_capability_id(),
@@ -1694,7 +2119,7 @@ async fn host_runtime_services_fails_closed_when_durable_obligation_audit_append
     .with_script_runtime(script_runtime);
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(RuntimeCapabilityRequest::new(
             execution_context_with_dispatch_grant(script_capability_id()),
             script_capability_id(),
@@ -1755,7 +2180,7 @@ async fn host_runtime_services_routes_wasm_http_through_per_invocation_policy_ha
     let scope = sample_scope(InvocationId::new());
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(wasm_runtime_request_for_scope(
             capability_id.clone(),
             scope.clone(),
@@ -1813,7 +2238,7 @@ async fn host_runtime_services_routes_cached_wasm_http_through_per_invocation_po
     .with_runtime_http_egress(Arc::clone(&egress))
     .try_with_wasm_runtime(WitToolRuntimeConfig::for_testing(), WitToolHost::deny_all())
     .unwrap();
-    let runtime = services.host_runtime();
+    let runtime = services.host_runtime_for_local_testing();
     let capability_id = CapabilityId::new("wasm-http.success").unwrap();
     let first_scope = sample_scope(InvocationId::new());
     let second_scope = sample_scope(InvocationId::new());
@@ -1912,7 +2337,7 @@ async fn host_runtime_services_wasm_http_uses_production_staged_network_and_secr
         .unwrap();
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(wasm_runtime_request_for_scope(
             capability_id.clone(),
             scope.clone(),
@@ -2006,7 +2431,7 @@ async fn host_runtime_services_wasm_http_missing_staged_secret_stays_before_tran
     let capability_id = CapabilityId::new("wasm-http.success").unwrap();
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(wasm_runtime_request(
             capability_id.clone(),
             json!({"call": "http-missing-staged-secret"}),
@@ -2063,7 +2488,7 @@ async fn host_runtime_services_denies_wasm_http_when_shared_egress_has_no_policy
     let capability_id = CapabilityId::new("wasm-http.success").unwrap();
 
     let outcome = services
-        .host_runtime()
+        .host_runtime_for_local_testing()
         .invoke_capability(wasm_runtime_request(
             capability_id,
             json!({"call": "http-without-policy"}),
@@ -2125,7 +2550,7 @@ async fn host_runtime_services_cancel_and_status_share_process_result_and_cancel
         process_services,
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
     )
-    .host_runtime();
+    .host_runtime_for_local_testing();
     let invocation_id = InvocationId::new();
     let process_id = ProcessId::new();
     let scope = sample_scope(invocation_id);
@@ -2178,7 +2603,7 @@ async fn host_runtime_services_cancel_writes_killed_result_when_reservation_is_s
         process_services,
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
     )
-    .host_runtime();
+    .host_runtime_for_local_testing();
     let invocation_id = InvocationId::new();
     let process_id = ProcessId::new();
     let stale_reservation_id = ResourceReservationId::new();
@@ -2227,7 +2652,7 @@ async fn host_runtime_services_cancel_records_kill_side_effects_when_cleanup_fai
         process_services,
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
     )
-    .host_runtime();
+    .host_runtime_for_local_testing();
     let invocation_id = InvocationId::new();
     let process_id = ProcessId::new();
     let scope = sample_scope(invocation_id);
@@ -3104,7 +3529,7 @@ fn resume_runtime_with_empty_registry(fixture: &ApprovalResumeFixture) -> Defaul
         ScriptRuntimeConfig::for_testing(),
         EchoScriptBackend,
     )))
-    .host_runtime()
+    .host_runtime_for_local_testing()
 }
 
 async fn assert_blocked_approval_run(
@@ -4242,7 +4667,7 @@ async fn wasm_runtime_for_component(
     .unwrap();
 
     WasmRuntimeFixture {
-        runtime: services.host_runtime(),
+        runtime: services.host_runtime_for_local_testing(),
         governor,
         http,
         capability_id: CapabilityId::new(capability).unwrap(),
@@ -4279,7 +4704,7 @@ async fn wasm_runtime_for_component_with_slow_zero_body_http(
     .unwrap();
 
     WasmWallClockRuntimeFixture {
-        runtime: services.host_runtime(),
+        runtime: services.host_runtime_for_local_testing(),
         governor,
         http,
         capability_id: CapabilityId::new(capability).unwrap(),
