@@ -2170,6 +2170,150 @@ async fn host_runtime_services_writes_obligation_audit_records_to_durable_log_me
 }
 
 #[tokio::test]
+async fn host_runtime_services_projects_resource_network_secret_obligation_audit_metadata_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let store_root = temp.path().join("reborn-event-store");
+    let stores = build_reborn_event_stores(
+        RebornProfile::LocalDev,
+        RebornEventStoreConfig::Jsonl {
+            root: store_root.clone(),
+            accept_single_node_durable: false,
+        },
+    )
+    .await
+    .unwrap();
+    let audit_log = Arc::clone(&stores.audit);
+    let governor = Arc::new(governor_with_default_limit(sample_account()));
+    let secret_store = Arc::new(InMemorySecretStore::new());
+    let secret_handle = SecretHandle::new("obligation-api-token").unwrap();
+    let reservation_id = ResourceReservationId::new();
+    let policy = NetworkPolicy {
+        allowed_targets: vec![NetworkTargetPattern {
+            scheme: Some(NetworkScheme::Https),
+            host_pattern: "NETWORK_POLICY_SENTINEL_3022.example.test".to_string(),
+            port: Some(443),
+        }],
+        deny_private_ip_ranges: true,
+        max_egress_bytes: Some(10_000),
+    };
+    let authorizer: Arc<dyn TrustAwareCapabilityDispatchAuthorizer> =
+        Arc::new(ObligatingAuthorizer::new(vec![
+            Obligation::AuditBefore,
+            Obligation::ApplyNetworkPolicy { policy },
+            Obligation::InjectSecretOnce {
+                handle: secret_handle.clone(),
+            },
+            Obligation::ReserveResources { reservation_id },
+            Obligation::AuditAfter,
+        ]));
+    let services: InMemoryHostRuntimeServices = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::clone(&governor),
+        authorizer,
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy(
+        "script",
+        vec![EffectKind::DispatchCapability, EffectKind::Network],
+    )))
+    .with_secret_store(Arc::clone(&secret_store))
+    .with_audit_sink(Arc::new(DurableAuditSink::new(Arc::clone(&audit_log))))
+    .with_script_runtime(Arc::new(ScriptRuntime::new(
+        ScriptRuntimeConfig::for_testing(),
+        EchoScriptBackend,
+    )));
+    let scope = sample_scope(InvocationId::new());
+    secret_store
+        .put(
+            scope.clone(),
+            secret_handle,
+            SecretMaterial::from("SECRET_MATERIAL_SENTINEL_3022_sk_live_secret"),
+        )
+        .await
+        .unwrap();
+    let payload = json!({
+        "message": "OBLIGATION_INPUT_SENTINEL_3022 /tmp/private-obligation-path",
+        "output": "OBLIGATION_OUTPUT_SENTINEL_3022",
+    });
+
+    let runtime = services.host_runtime_for_local_testing();
+    let outcome = runtime
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            execution_context_with_dispatch_grant_for_scope(script_capability_id(), scope.clone()),
+            script_capability_id(),
+            ResourceEstimate {
+                concurrency_slots: Some(1),
+                network_egress_bytes: Some(10),
+                output_bytes: Some(100),
+                ..ResourceEstimate::default()
+            },
+            payload.clone(),
+            trust_decision_with_dispatch_authority(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, RuntimeCapabilityOutcome::Completed(completed) if completed.output == payload)
+    );
+
+    let projection = ReplayAuditProjectionService::from_audit_log(Arc::clone(&audit_log));
+    let snapshot = projection
+        .snapshot(AuditProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(snapshot.entries[0].stage, AuditProjectionStage::Before);
+    assert_eq!(snapshot.entries[1].stage, AuditProjectionStage::After);
+    let mut status_labels = snapshot.entries[0]
+        .result_status
+        .as_deref()
+        .unwrap()
+        .split(',')
+        .collect::<Vec<_>>();
+    status_labels.sort_unstable();
+    assert_eq!(
+        status_labels,
+        vec![
+            "apply_network_policy",
+            "audit_after",
+            "audit_before",
+            "inject_secret_once",
+            "reserve_resources",
+        ]
+    );
+    assert_eq!(
+        snapshot.entries[1].output_bytes,
+        Some(serde_json::to_vec(&payload).unwrap().len() as u64)
+    );
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    let jsonl_bytes = read_directory_text(&store_root);
+    for forbidden in [
+        "NETWORK_POLICY_SENTINEL_3022",
+        "SECRET_MATERIAL_SENTINEL_3022",
+        "OBLIGATION_INPUT_SENTINEL_3022",
+        "/tmp/private-obligation-path",
+        "OBLIGATION_OUTPUT_SENTINEL_3022",
+    ] {
+        assert!(
+            !projection_json.contains(forbidden),
+            "obligation audit projection leaked {forbidden}: {projection_json}"
+        );
+        assert!(
+            !jsonl_bytes.contains(forbidden),
+            "durable obligation audit bytes leaked {forbidden}: {jsonl_bytes}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn host_runtime_services_enforces_output_limit_and_reconciles_resource_usage() {
     let registry = Arc::new(registry_with_manifest(SCRIPT_MANIFEST));
     let governor = Arc::new(InMemoryResourceGovernor::new());

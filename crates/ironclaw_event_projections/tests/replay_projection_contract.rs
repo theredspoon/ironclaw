@@ -14,9 +14,9 @@ use ironclaw_events::{
     RuntimeEventId, RuntimeEventKind, UNCLASSIFIED_ERROR_KIND,
 };
 use ironclaw_host_api::{
-    Action, ActionSummary, AgentId, AuditEnvelope, AuditStage, CapabilityId, CapabilitySet,
-    CorrelationId, DenyReason, ExtensionId, InvocationId, MountView, ProcessId, ProjectId,
-    ResourceScope, RuntimeKind, ScopedPath, TenantId, ThreadId, TrustClass, UserId,
+    Action, ActionResultSummary, ActionSummary, AgentId, AuditEnvelope, AuditStage, CapabilityId,
+    CapabilitySet, CorrelationId, DenyReason, ExtensionId, InvocationId, MountView, ProcessId,
+    ProjectId, ResourceScope, RuntimeKind, ScopedPath, TenantId, ThreadId, TrustClass, UserId,
 };
 
 #[tokio::test]
@@ -88,6 +88,64 @@ async fn replay_audit_projection_does_not_expose_unsafe_action_targets() {
     assert_eq!(snapshot.entries[0].action_target, None);
     let serialized = serde_json::to_string(&snapshot).unwrap();
     assert!(!serialized.contains("AUDIT_TARGET_SENTINEL_3022"));
+}
+
+#[tokio::test]
+async fn replay_audit_projection_preserves_only_safe_obligation_status_labels() {
+    let log = Arc::new(InMemoryDurableAuditLog::new());
+    let service = ReplayAuditProjectionService::new(Arc::clone(&log));
+    let ctx = execution_context_for_scope(scope_for_thread(ThreadId::new("thread-a").unwrap()));
+    let action = Action::Dispatch {
+        capability: capability_id(),
+        estimated_resources: Default::default(),
+    };
+    let mut safe_audit = AuditEnvelope::denied(
+        &ctx,
+        AuditStage::After,
+        ActionSummary::from_action(&action),
+        DenyReason::PolicyDenied,
+    );
+    safe_audit.result = Some(ActionResultSummary {
+        success: true,
+        status: Some("audit_before,apply_network_policy,inject_secret_once".to_string()),
+        output_bytes: Some(10),
+    });
+    log.append(safe_audit).await.unwrap();
+
+    let mut unsafe_audit = AuditEnvelope::denied(
+        &ctx,
+        AuditStage::After,
+        ActionSummary::from_action(&action),
+        DenyReason::PolicyDenied,
+    );
+    unsafe_audit.result = Some(ActionResultSummary {
+        success: false,
+        status: Some("api.internal,secret_token".to_string()),
+        output_bytes: None,
+    });
+    log.append(unsafe_audit).await.unwrap();
+
+    let snapshot = service
+        .snapshot(AuditProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&ctx.resource_scope),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.entries.len(), 2);
+    assert_eq!(
+        snapshot.entries[0].result_status.as_deref(),
+        Some("audit_before,apply_network_policy,inject_secret_once")
+    );
+    assert_eq!(
+        snapshot.entries[1].result_status.as_deref(),
+        Some(UNCLASSIFIED_ERROR_KIND)
+    );
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    assert!(!serialized.contains("api.internal"));
+    assert!(!serialized.contains("secret_token"));
 }
 
 #[tokio::test]
