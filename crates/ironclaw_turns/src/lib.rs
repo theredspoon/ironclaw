@@ -51,27 +51,15 @@ pub use request::{
 };
 pub use response::{CancelRunResponse, ResumeTurnResponse, SubmitTurnResponse, ThreadBusy};
 pub use run_profile::{
-    AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverHost,
-    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, AgentLoopHost, AgentLoopHostError,
-    AgentLoopHostErrorKind, AppendCapabilityResultRef, AssistantReply, BeginAssistantDraft,
-    CancellationPolicy, CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityCallCandidate,
-    CapabilityDenied, CapabilityDescriptorView, CapabilityFailure, CapabilityInvocation,
-    CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceProfileId,
-    CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass,
-    ContextProfileId, FinalizeAssistantMessage, InMemoryRunProfileRegistry,
-    InMemoryRunProfileResolver, LoopCancelReasonKind, LoopCapabilityPort, LoopCheckpointKind,
-    LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextMessage,
-    LoopContextPort, LoopContextRequest, LoopContextSnippet, LoopDriverId, LoopDriverNoteKind,
-    LoopInput, LoopInputBatch, LoopInputCursor, LoopInputPort, LoopInterruptKind, LoopModelMessage,
-    LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProgressEvent, LoopProgressPort,
-    LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, ModelProfileId, ModelStreamChunk,
-    ParentLoopOutput, PrivilegedRunProfileDimension, ProcessHandleSummary,
+    AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverResumeRequest,
+    AgentLoopDriverRunRequest, CancellationPolicy, CapabilitySurfaceProfileId, CheckpointPolicy,
+    CheckpointSchemaId, ConcurrencyClass, ContextProfileId, InMemoryRunProfileRegistry,
+    InMemoryRunProfileResolver, LoopDriverId, ModelProfileId, PrivilegedRunProfileDimension,
     RedactedRunProfileProvenance, RedactedRunProfileSource, ResolvedRunProfile,
     ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
     RunProfileRequestAuthority, RunProfileResolutionError, RunProfileResolutionRequest,
     RunProfileResolver, RunProfileSourceLayer, RunProfileSourceRef, RunnerPoolId,
-    RuntimeProfileConstraints, SchedulingClass, SteeringPolicy, UpdateAssistantDraft,
-    VisibleCapabilityRequest, VisibleCapabilitySurface,
+    RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
 };
 pub use scope::{TurnActor, TurnScope};
 pub use status::{

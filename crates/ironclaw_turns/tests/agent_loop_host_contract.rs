@@ -7,20 +7,22 @@ use ironclaw_host_api::{
 };
 use ironclaw_turns::{
     AcceptedMessageRef, AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError,
-    AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply,
-    CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDescriptorView,
-    CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion, DefaultTurnCoordinator,
-    FinalizeAssistantMessage, IdempotencyKey, InMemoryTurnStateStore, LoopBlocked, LoopBlockedKind,
-    LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
-    LoopCompleted, LoopCompletionKind, LoopContextBundle, LoopContextMessage, LoopContextPort,
-    LoopContextRequest, LoopExit, LoopExitId, LoopGateRef, LoopInputBatch, LoopInputCursor,
-    LoopInputPort, LoopMessageRef, LoopModelMessage, LoopModelPort, LoopModelRequest,
-    LoopModelResponse, LoopProgressEvent, LoopProgressPort, LoopRunContext, LoopRunInfoPort,
-    LoopTranscriptPort, ParentLoopOutput, ReplyTargetBindingRef, RunProfileRequest,
-    RunProfileVersion, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor,
-    TurnCheckpointId, TurnCoordinator, TurnLeaseToken, TurnRunnerId, VisibleCapabilityRequest,
-    VisibleCapabilitySurface,
-    events::EventCursor,
+    DefaultTurnCoordinator, IdempotencyKey, InMemoryTurnStateStore, LoopBlocked, LoopBlockedKind,
+    LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopGateRef, LoopMessageRef,
+    ReplyTargetBindingRef, RunProfileRequest, RunProfileVersion, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCheckpointId, TurnCoordinator,
+    TurnLeaseToken, TurnRunId, TurnRunnerId,
+    run_profile::{
+        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply,
+        CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDescriptorView,
+        CapabilityInputRef, CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
+        FinalizeAssistantMessage, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
+        LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextBundle, LoopContextMessage,
+        LoopContextPort, LoopContextRequest, LoopDriverNoteKind, LoopInputBatch, LoopInputCursor,
+        LoopInputCursorToken, LoopInputPort, LoopModelMessage, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopProgressEvent, LoopProgressPort, LoopRunContext, LoopRunInfoPort,
+        LoopTranscriptPort, ParentLoopOutput, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    },
     runner::{ClaimRunRequest, TurnRunTransitionPort},
 };
 
@@ -57,11 +59,11 @@ async fn two_fake_drivers_use_the_same_per_run_agent_loop_host_contract() {
             "visible_capabilities",
             "model",
             "finalize_assistant",
-            "progress:transcript_finalized",
+            "progress:driver_note",
             "visible_capabilities",
             "invoke:demo.echo",
             "checkpoint:before_block",
-            "progress:blocked",
+            "progress:driver_note",
         ]
     );
     assert_eq!(host.run_context().run_id, host.context.run_id);
@@ -78,9 +80,9 @@ async fn capability_invocations_must_cite_visible_surface_before_host_dispatch()
 
     let error = host
         .invoke_capability(CapabilityInvocation {
-            surface_version: CapabilitySurfaceVersion::new(1),
+            surface_version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
             capability_id: foreign,
-            arguments: serde_json::json!({"raw": "RAW_AGENT_LOOP_HOST_SENTINEL"}),
+            input_ref: CapabilityInputRef::new("input:opaque-agent-loop-host-sentinel").unwrap(),
         })
         .await
         .unwrap_err();
@@ -89,6 +91,54 @@ async fn capability_invocations_must_cite_visible_surface_before_host_dispatch()
     assert_eq!(host.effects(), Vec::<String>::new());
     let serialized = serde_json::to_string(&error).unwrap();
     assert!(!serialized.contains("RAW_AGENT_LOOP_HOST_SENTINEL"));
+}
+
+#[test]
+fn loop_host_refs_are_bounded_opaque_tokens() {
+    assert!(CapabilityInputRef::new("input:opaque-tool-arguments").is_ok());
+    assert!(CapabilityInputRef::new("{\"raw\":\"payload\"}").is_err());
+    assert!(CapabilityInputRef::new(format!("input:{}", "x".repeat(256))).is_err());
+    assert!(LoopCheckpointStateRef::new("checkpoint:state-ref").is_ok());
+    assert!(LoopCheckpointStateRef::new("/host/path/checkpoint.json").is_err());
+    assert!(LoopInputCursorToken::new("input-cursor:seen-1").is_ok());
+    assert!(LoopInputCursorToken::new("999").is_err());
+}
+
+#[test]
+fn loop_host_refs_validate_when_deserialized() {
+    let invalid_invocation = serde_json::json!({
+        "surface_version": "surface-v1",
+        "capability_id": "demo.echo",
+        "input_ref": {"raw": "RAW_AGENT_LOOP_HOST_SENTINEL"}
+    });
+    assert!(serde_json::from_value::<CapabilityInvocation>(invalid_invocation).is_err());
+
+    let invalid_checkpoint = serde_json::json!({
+        "kind": "before_block",
+        "state_ref": "raw-checkpoint-json"
+    });
+    assert!(serde_json::from_value::<LoopCheckpointRequest>(invalid_checkpoint).is_err());
+
+    let invalid_surface = serde_json::json!("surface\n1");
+    assert!(serde_json::from_value::<CapabilitySurfaceVersion>(invalid_surface).is_err());
+}
+
+#[tokio::test]
+async fn input_cursors_are_bound_to_the_claimed_run_context() {
+    let context = claimed_run_context().await;
+    let cursor = LoopInputCursor::from_host_token(
+        &context,
+        LoopInputCursorToken::new("input-cursor:seen-1").unwrap(),
+    );
+    assert!(cursor.is_for_run(&context));
+
+    let other_context = LoopRunContext::new(
+        context.scope.clone(),
+        context.turn_id,
+        TurnRunId::new(),
+        context.resolved_run_profile.clone(),
+    );
+    assert!(!cursor.is_for_run(&other_context));
 }
 
 struct ReplyDriver;
@@ -123,7 +173,7 @@ impl AgentLoopDriver for ReplyDriver {
                     role: "user".to_string(),
                     content_ref: context.messages[0].message_ref.clone(),
                 }],
-                surface_version: Some(CapabilitySurfaceVersion::new(1)),
+                surface_version: Some(CapabilitySurfaceVersion::new("surface-v1").unwrap()),
                 model_preference: Some(
                     host.run_context()
                         .resolved_run_profile
@@ -142,9 +192,10 @@ impl AgentLoopDriver for ReplyDriver {
             .finalize_assistant_message(FinalizeAssistantMessage { reply })
             .await
             .map_err(driver_error)?;
-        host.emit_loop_progress(LoopProgressEvent::TranscriptFinalized {
-            message_ref: message_ref.clone(),
-        })
+        host.emit_loop_progress(LoopProgressEvent::driver_note(
+            LoopDriverNoteKind::Planning,
+            "assistant transcript finalized",
+        ))
         .await
         .map_err(driver_error)?;
         Ok(LoopExit::Completed(LoopCompleted {
@@ -195,7 +246,7 @@ impl AgentLoopDriver for CapabilityDriver {
             .invoke_capability(CapabilityInvocation {
                 surface_version: surface.version,
                 capability_id: surface.descriptors[0].capability_id.clone(),
-                arguments: serde_json::json!({"arg_ref": "result:opaque-input-ref"}),
+                input_ref: CapabilityInputRef::new("input:opaque-tool-arguments").unwrap(),
             })
             .await
             .map_err(driver_error)?;
@@ -207,14 +258,14 @@ impl AgentLoopDriver for CapabilityDriver {
         let checkpoint_id = host
             .checkpoint(LoopCheckpointRequest {
                 kind: LoopCheckpointKind::BeforeBlock,
-                state_ref: "checkpoint:approval-state".to_string(),
+                state_ref: LoopCheckpointStateRef::new("checkpoint:approval-state").unwrap(),
             })
             .await
             .map_err(driver_error)?;
-        host.emit_loop_progress(LoopProgressEvent::Blocked {
-            gate_ref: gate_ref.clone(),
-            checkpoint_id,
-        })
+        host.emit_loop_progress(LoopProgressEvent::driver_note(
+            LoopDriverNoteKind::Waiting,
+            "blocked on approval gate",
+        ))
         .await
         .map_err(driver_error)?;
         Ok(LoopExit::Blocked(LoopBlocked {
@@ -258,7 +309,7 @@ impl RecordingAgentLoopHost {
             model_responses: Mutex::new(Vec::new()),
             capability_outcomes: Mutex::new(Vec::new()),
             visible_surface: VisibleCapabilitySurface {
-                version: CapabilitySurfaceVersion::new(1),
+                version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
                 descriptors: vec![CapabilityDescriptorView {
                     capability_id: CapabilityId::new("demo.echo").unwrap(),
                     provider: None,
@@ -321,7 +372,10 @@ impl LoopInputPort for RecordingAgentLoopHost {
     ) -> Result<LoopInputBatch, AgentLoopHostError> {
         Ok(LoopInputBatch {
             inputs: Vec::new(),
-            next_cursor: LoopInputCursor::from_event_cursor(EventCursor(0)),
+            next_cursor: LoopInputCursor::from_host_token(
+                &self.context,
+                LoopInputCursorToken::new("input-cursor:0").unwrap(),
+            ),
         })
     }
 
