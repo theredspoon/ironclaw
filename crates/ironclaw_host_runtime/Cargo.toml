@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+postgres = ["ironclaw_filesystem/postgres"]
+libsql = ["ironclaw_filesystem/libsql"]
+
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -37,6 +42,7 @@ url = "2"
 
 [dev-dependencies]
 ironclaw_event_projections = { path = "../ironclaw_event_projections" }
+libsql = { version = "0.6", default-features = false, features = ["core", "replication", "remote", "tls"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 wat = "1.245.1"
