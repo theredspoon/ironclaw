@@ -90,7 +90,7 @@ fn non_cli_channels_enabled(cli_only: bool) -> bool {
     !cli_only
 }
 
-fn normalize_persisted_wasm_channel_names<I, S>(names: I) -> std::collections::HashSet<String>
+fn normalize_startup_wasm_channel_names<I, S>(names: I) -> std::collections::HashSet<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -105,7 +105,7 @@ where
                 tracing::warn!(
                     channel = name.as_ref(),
                     error = %e,
-                    "Ignoring invalid persisted WASM channel name"
+                    "Ignoring invalid startup WASM channel name"
                 );
             }
         }
@@ -113,28 +113,28 @@ where
     normalized
 }
 
-async fn persisted_active_wasm_channel_names(
+async fn startup_active_wasm_channel_names(
     ext_mgr: &ironclaw::extensions::ExtensionManager,
     user_id: &str,
-    persisted_active_channels: &[String],
+    startup_active_channels: &[String],
 ) -> std::collections::HashSet<String> {
     let mut relay_channels = std::collections::HashSet::new();
-    for name in persisted_active_channels {
+    for name in startup_active_channels {
         if ext_mgr.is_relay_channel(name, user_id).await {
             relay_channels.insert(name.clone());
         }
     }
-    persisted_non_relay_wasm_channel_names(persisted_active_channels, &relay_channels)
+    startup_non_relay_wasm_channel_names(startup_active_channels, &relay_channels)
 }
 
-fn persisted_non_relay_wasm_channel_names(
-    persisted_active_channels: &[String],
-    persisted_active_relay_channels: &std::collections::HashSet<String>,
+fn startup_non_relay_wasm_channel_names(
+    startup_active_channels: &[String],
+    startup_active_relay_channels: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<String> {
-    normalize_persisted_wasm_channel_names(
-        persisted_active_channels
+    normalize_startup_wasm_channel_names(
+        startup_active_channels
             .iter()
-            .filter(|name| !persisted_active_relay_channels.contains(*name)),
+            .filter(|name| !startup_active_relay_channels.contains(*name)),
     )
 }
 
@@ -483,20 +483,14 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Default user ID for extension operations (single-user mode).
     let ext_user_id = config.owner_id.clone();
-    let settings_persistence_available = components.db.is_some();
-    let persisted_active_channels: Vec<String> =
-        if settings_persistence_available && let Some(ref ext_mgr) = components.extension_manager {
-            ext_mgr.load_persisted_active_channels(&ext_user_id).await
-        } else {
-            Vec::new()
-        };
-    let persisted_active_wasm_channels: std::collections::HashSet<String> =
-        if settings_persistence_available && let Some(ref ext_mgr) = components.extension_manager {
-            persisted_active_wasm_channel_names(ext_mgr, &ext_user_id, &persisted_active_channels)
-                .await
-        } else {
-            std::collections::HashSet::new()
-        };
+    // Startup-active WASM channels are resolved lazily inside the
+    // `enable_non_cli && wasm_channels_enabled` gate below. Defaulting to
+    // an empty set here keeps the later auto-activation block (gated on
+    // `wasm_channel_runtime_state`) compiling without computing — and
+    // potentially failing on — settings-store reads in `--cli-only` /
+    // `WASM_CHANNELS_ENABLED=false` runs.
+    let mut startup_active_wasm_channels: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     let channels = ChannelManager::new();
     let mut channel_names: Vec<String> = Vec::new();
@@ -680,13 +674,40 @@ async fn async_main() -> anyhow::Result<()> {
         && config.channels.wasm_channels_enabled
         && config.channels.wasm_channels_dir.exists()
     {
+        // Resolve startup-active channels: persisted state is authoritative
+        // when present; otherwise fall back to the setup wizard's
+        // `channels.wasm_channels` so headless installs (no DB, no web UI)
+        // still auto-activate channels listed in the config. Settings-store
+        // errors propagate — masking them would silently re-activate channels
+        // the user had deactivated. Resolved here (not at outer scope) so a
+        // corrupt `activated_channels` row only fails startup when channels
+        // are actually about to be restored.
+        let startup_active_channels: Vec<String> =
+            if let Some(ref ext_mgr) = components.extension_manager {
+                ext_mgr
+                    .load_startup_active_channels(
+                        &ext_user_id,
+                        config.channels.configured_wasm_channels.clone(),
+                    )
+                    .await?
+            } else {
+                ironclaw::extensions::naming::normalize_extension_names(
+                    config.channels.configured_wasm_channels.clone(),
+                )
+            };
+        startup_active_wasm_channels = if let Some(ref ext_mgr) = components.extension_manager {
+            startup_active_wasm_channel_names(ext_mgr, &ext_user_id, &startup_active_channels).await
+        } else {
+            startup_active_channels.iter().cloned().collect()
+        };
+
         let wasm_result = ironclaw::channels::wasm::setup_wasm_channels(
             &config,
             &components.secrets_store,
             components.extension_manager.as_ref(),
             components.db.as_ref(),
             &channel_names,
-            settings_persistence_available.then_some(&persisted_active_wasm_channels),
+            &startup_active_wasm_channels,
             Arc::clone(&components.ownership_cache),
         )
         .await;
@@ -1116,9 +1137,11 @@ async fn async_main() -> anyhow::Result<()> {
             .await;
         tracing::debug!("Channel runtime wired into extension manager for hot-activation");
 
-        // Auto-activate WASM channels that were active in a previous session.
+        // Auto-activate WASM channels resolved at startup — either persisted
+        // from a prior session or supplied by the setup wizard's
+        // `channels.wasm_channels` config when no settings store is available.
         // Relay channels are handled separately below via restore_relay_channels().
-        for name in &persisted_active_wasm_channels {
+        for name in &startup_active_wasm_channels {
             if active_at_startup.contains(name)
                 || ext_mgr.is_relay_channel(name, &ext_user_id).await
             {
@@ -1139,14 +1162,14 @@ async fn async_main() -> anyhow::Result<()> {
                     tracing::debug!(
                         channel = %name,
                         message = %message,
-                        "Auto-activated persisted WASM channel"
+                        "Auto-activated startup WASM channel"
                     );
                 }
                 Ok(ironclaw::extensions::EnsureReadyOutcome::NeedsAuth { auth, .. }) => {
                     tracing::warn!(
                         channel = %name,
                         instructions = ?auth.instructions(),
-                        "Persisted WASM channel still needs authentication"
+                        "Startup WASM channel still needs authentication"
                     );
                 }
                 Ok(ironclaw::extensions::EnsureReadyOutcome::NeedsSetup {
@@ -1155,14 +1178,14 @@ async fn async_main() -> anyhow::Result<()> {
                     tracing::warn!(
                         channel = %name,
                         instructions = %instructions,
-                        "Persisted WASM channel still needs setup"
+                        "Startup WASM channel still needs setup"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         channel = %name,
                         error = %e,
-                        "Failed to auto-activate persisted WASM channel"
+                        "Failed to auto-activate startup WASM channel"
                     );
                 }
             }
@@ -1750,9 +1773,9 @@ mod tests {
     }
 
     #[test]
-    fn normalize_persisted_wasm_channel_names_canonicalizes_and_dedupes() {
+    fn normalize_startup_wasm_channel_names_canonicalizes_and_dedupes() {
         let normalized =
-            normalize_persisted_wasm_channel_names(["slack-relay", "slack_relay", "telegram"]);
+            normalize_startup_wasm_channel_names(["slack-relay", "slack_relay", "telegram"]);
 
         assert_eq!(normalized.len(), 2);
         assert!(normalized.contains("slack_relay"));
@@ -1760,8 +1783,8 @@ mod tests {
     }
 
     #[test]
-    fn normalize_persisted_wasm_channel_names_skips_invalid_entries() {
-        let normalized = normalize_persisted_wasm_channel_names(["../bad", "telegram"]);
+    fn normalize_startup_wasm_channel_names_skips_invalid_entries() {
+        let normalized = normalize_startup_wasm_channel_names(["../bad", "telegram"]);
 
         assert_eq!(
             normalized,
@@ -1770,9 +1793,9 @@ mod tests {
     }
 
     #[test]
-    fn persisted_non_relay_wasm_channel_names_preserves_legacy_relay_entries() {
+    fn startup_non_relay_wasm_channel_names_preserves_legacy_relay_entries() {
         let relay_names = std::collections::HashSet::from(["slack-relay".to_string()]);
-        let names = persisted_non_relay_wasm_channel_names(
+        let names = startup_non_relay_wasm_channel_names(
             &["slack-relay".to_string(), "telegram".to_string()],
             &relay_names,
         );
@@ -1784,10 +1807,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_persisted_wasm_channel_names_rejects_invalid_extension_names() {
+    fn normalize_startup_wasm_channel_names_rejects_invalid_extension_names() {
         // ExtensionName rejects uppercase, dots, consecutive underscores
         let normalized =
-            normalize_persisted_wasm_channel_names(["My.Channel", "bad__name", "already_ok"]);
+            normalize_startup_wasm_channel_names(["My.Channel", "bad__name", "already_ok"]);
 
         assert_eq!(
             normalized,
