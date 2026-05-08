@@ -8,6 +8,8 @@ pub mod driver_registry;
 
 #[cfg(feature = "root-llm-provider")]
 pub mod model_gateway;
+#[cfg(feature = "libsql-secrets")]
+pub mod secrets;
 
 #[cfg(feature = "root-llm-provider")]
 pub use model_gateway::{
