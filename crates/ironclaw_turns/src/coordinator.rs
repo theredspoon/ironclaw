@@ -80,7 +80,7 @@ pub trait TurnCoordinator: Send + Sync {
     async fn get_run_state(&self, request: GetRunStateRequest) -> Result<TurnRunState, TurnError>;
 }
 
-pub struct DefaultTurnCoordinator<S> {
+pub struct DefaultTurnCoordinator<S: ?Sized> {
     store: Arc<S>,
     admission_policy: Arc<dyn TurnAdmissionPolicy>,
     run_profile_resolver: Arc<dyn RunProfileResolver>,
@@ -89,7 +89,7 @@ pub struct DefaultTurnCoordinator<S> {
 
 impl<S> DefaultTurnCoordinator<S>
 where
-    S: TurnStateStore,
+    S: TurnStateStore + ?Sized,
 {
     pub fn new(store: Arc<S>) -> Self {
         Self {
@@ -151,7 +151,7 @@ fn notify_queued_run_best_effort(notifier: &dyn TurnRunWakeNotifier, wake: TurnR
 #[async_trait]
 impl<S> TurnCoordinator for DefaultTurnCoordinator<S>
 where
-    S: TurnStateStore + 'static,
+    S: TurnStateStore + ?Sized + 'static,
 {
     async fn submit_turn(
         &self,

@@ -53,6 +53,11 @@ use ironclaw_run_state::{ApprovalRequestStore, RunStateApprovalStore, RunStateSt
 use ironclaw_scripts::{ScriptError, ScriptExecutionRequest, ScriptExecutor, ScriptInvocation};
 use ironclaw_secrets::SecretStore;
 use ironclaw_trust::{HostTrustPolicy, TrustPolicy};
+#[cfg(feature = "libsql")]
+use ironclaw_turns::LibSqlTurnStateStore;
+#[cfg(feature = "postgres")]
+use ironclaw_turns::PostgresTurnStateStore;
+use ironclaw_turns::{DefaultTurnCoordinator, TurnRunWakeNotifier, TurnStateStore};
 use ironclaw_wasm::{
     DenyWasmHostHttp, PreparedWitTool, WasmError, WasmRuntimeCredentialProvider,
     WasmRuntimeHttpAdapter, WasmRuntimePolicyDiscarder, WasmStagedRuntimeCredentials, WitToolHost,
@@ -139,6 +144,8 @@ pub enum ProductionWiringComponent {
     ScriptRuntime,
     McpRuntime,
     WasmRuntime,
+    TurnState,
+    TurnRunWakeNotifier,
 }
 
 impl ProductionWiringComponent {
@@ -161,6 +168,8 @@ impl ProductionWiringComponent {
             Self::ScriptRuntime => "script_runtime",
             Self::McpRuntime => "mcp_runtime",
             Self::WasmRuntime => "wasm_runtime",
+            Self::TurnState => "turn_state",
+            Self::TurnRunWakeNotifier => "turn_run_wake_notifier",
         }
     }
 }
@@ -239,6 +248,8 @@ struct ProductionComponentTypes {
     wasm_runtime_credential_provider_captured: bool,
     script_runtime: Option<&'static str>,
     mcp_runtime: Option<&'static str>,
+    turn_state: Option<&'static str>,
+    turn_run_wake_notifier: Option<&'static str>,
 }
 
 fn is_local_only_component(type_name: &str) -> bool {
@@ -291,6 +302,8 @@ where
     script_runtime: Option<Arc<dyn ScriptExecutor>>,
     mcp_runtime: Option<Arc<dyn McpExecutor>>,
     wasm_runtime: Option<Arc<WasmRuntimeAdapter>>,
+    turn_state: Option<Arc<dyn TurnStateStore>>,
+    turn_run_wake_notifier: Option<Arc<dyn TurnRunWakeNotifier>>,
     component_types: ProductionComponentTypes,
 }
 
@@ -342,6 +355,8 @@ where
             script_runtime: None,
             mcp_runtime: None,
             wasm_runtime: None,
+            turn_state: None,
+            turn_run_wake_notifier: None,
             component_types: ProductionComponentTypes {
                 trust_policy: None,
                 trust_policy_verified: false,
@@ -362,6 +377,8 @@ where
                 wasm_runtime_credential_provider_captured: false,
                 script_runtime: None,
                 mcp_runtime: None,
+                turn_state: None,
+                turn_run_wake_notifier: None,
             },
         }
     }
@@ -396,6 +413,8 @@ where
             script_runtime,
             mcp_runtime,
             wasm_runtime,
+            turn_state,
+            turn_run_wake_notifier,
             mut component_types,
         } = self;
         component_types.filesystem = type_name::<T>();
@@ -424,6 +443,8 @@ where
             script_runtime,
             mcp_runtime,
             wasm_runtime,
+            turn_state,
+            turn_run_wake_notifier,
             component_types,
         }
     }
@@ -528,6 +549,44 @@ where
     {
         self.component_types.capability_leases = Some(type_name::<T>());
         self.capability_leases = Some(capability_leases);
+        self
+    }
+
+    pub fn with_turn_state<T>(mut self, turn_state: Arc<T>) -> Self
+    where
+        T: TurnStateStore + 'static,
+    {
+        self.component_types.turn_state = Some(type_name::<T>());
+        self.turn_state = Some(turn_state);
+        self
+    }
+
+    #[cfg(feature = "libsql")]
+    pub async fn with_libsql_turn_state_store(
+        self,
+        db: Arc<libsql::Database>,
+    ) -> Result<Self, ironclaw_turns::TurnError> {
+        let store = Arc::new(LibSqlTurnStateStore::new(db));
+        store.run_migrations().await?;
+        Ok(self.with_turn_state(store))
+    }
+
+    #[cfg(feature = "postgres")]
+    pub async fn with_postgres_turn_state_store(
+        self,
+        pool: deadpool_postgres::Pool,
+    ) -> Result<Self, ironclaw_turns::TurnError> {
+        let store = Arc::new(PostgresTurnStateStore::new(pool));
+        store.run_migrations().await?;
+        Ok(self.with_turn_state(store))
+    }
+
+    pub fn with_turn_run_wake_notifier<T>(mut self, notifier: Arc<T>) -> Self
+    where
+        T: TurnRunWakeNotifier + 'static,
+    {
+        self.component_types.turn_run_wake_notifier = Some(type_name::<T>());
+        self.turn_run_wake_notifier = Some(notifier);
         self
     }
 
@@ -769,6 +828,16 @@ where
         );
         self.push_missing(
             &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.turn_state.is_some(),
+        );
+        self.push_missing(
+            &mut issues,
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            self.turn_run_wake_notifier.is_some(),
+        );
+        self.push_missing(
+            &mut issues,
             ProductionWiringComponent::EventSink,
             self.event_sink.is_some(),
         );
@@ -913,6 +982,16 @@ where
         );
         self.push_local_only(
             &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.component_types.turn_state,
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            self.component_types.turn_run_wake_notifier,
+        );
+        self.push_local_only(
+            &mut issues,
             ProductionWiringComponent::EventSink,
             self.component_types.event_sink,
         );
@@ -1013,6 +1092,62 @@ where
     ) -> Result<DefaultHostRuntime, ProductionWiringReport> {
         self.validate_production_wiring(config)?;
         Ok(self.build_host_runtime())
+    }
+
+    /// Validates this graph and builds the production turn coordinator from
+    /// the configured durable turn-state store and wake notifier. This keeps
+    /// turn orchestration as an upper-layer artifact while still ensuring the
+    /// same production guardrail validates the actual handles returned to
+    /// callers.
+    pub fn turn_coordinator_for_production(
+        &self,
+    ) -> Result<DefaultTurnCoordinator<dyn TurnStateStore>, ProductionWiringReport> {
+        self.validate_production_turn_wiring()?;
+        let Some(turn_state) = self.turn_state.as_ref() else {
+            return Err(production_wiring_report(
+                ProductionWiringComponent::TurnState,
+                ProductionWiringIssueKind::Missing,
+                None,
+            ));
+        };
+        let Some(notifier) = self.turn_run_wake_notifier.as_ref() else {
+            return Err(production_wiring_report(
+                ProductionWiringComponent::TurnRunWakeNotifier,
+                ProductionWiringIssueKind::Missing,
+                None,
+            ));
+        };
+        Ok(DefaultTurnCoordinator::new(Arc::clone(turn_state))
+            .with_wake_notifier(Arc::clone(notifier)))
+    }
+
+    fn validate_production_turn_wiring(&self) -> Result<(), ProductionWiringReport> {
+        let mut issues = Vec::new();
+        self.push_missing(
+            &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.turn_state.is_some(),
+        );
+        self.push_missing(
+            &mut issues,
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            self.turn_run_wake_notifier.is_some(),
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.component_types.turn_state,
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            self.component_types.turn_run_wake_notifier,
+        );
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(ProductionWiringReport { issues })
+        }
     }
 
     /// Builds and attaches the configured Reborn durable event/audit stores,
@@ -1201,6 +1336,20 @@ fn set_runtime_http_egress(
         Err(poisoned) => {
             *poisoned.into_inner() = Some(runtime_http_egress);
         }
+    }
+}
+
+fn production_wiring_report(
+    component: ProductionWiringComponent,
+    kind: ProductionWiringIssueKind,
+    implementation: Option<&'static str>,
+) -> ProductionWiringReport {
+    ProductionWiringReport {
+        issues: vec![ProductionWiringIssue {
+            component,
+            kind,
+            implementation,
+        }],
     }
 }
 
