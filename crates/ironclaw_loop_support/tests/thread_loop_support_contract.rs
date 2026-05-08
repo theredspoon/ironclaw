@@ -25,10 +25,10 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft, CapabilityInputRef,
         CapabilityInvocation, CapabilitySurfaceVersion, FinalizeAssistantMessage,
-        InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextPort, LoopContextRequest,
-        LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest,
-        LoopRunContext, LoopTranscriptPort, ParentLoopOutput, UpdateAssistantDraft,
-        VisibleCapabilityRequest,
+        InMemoryLoopHostMilestoneSink, InMemoryRunProfileResolver, LoopCapabilityPort,
+        LoopContextPort, LoopContextRequest, LoopHostMilestoneKind, LoopInputCursor,
+        LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopRunContext,
+        LoopTranscriptPort, ParentLoopOutput, UpdateAssistantDraft, VisibleCapabilityRequest,
     },
 };
 
@@ -226,16 +226,53 @@ async fn transcript_port_finalizes_assistant_reply_into_durable_thread_history()
 }
 
 #[tokio::test]
-async fn transcript_port_finalize_is_idempotent_for_matching_reply() {
+async fn transcript_port_emits_assistant_reply_finalized_milestone_without_reply_content() {
     let fixture = ThreadFixture::new().await;
-    let adapter = ThreadBackedLoopTranscriptPort::new(
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let adapter = ThreadBackedLoopTranscriptPort::with_milestone_sink(
         Arc::clone(&fixture.thread_service),
         fixture.thread_scope.clone(),
         fixture.run_context.clone(),
+        milestone_sink.clone(),
+    );
+
+    let message_ref = adapter
+        .finalize_assistant_message(FinalizeAssistantMessage {
+            reply: AssistantReply {
+                content: "RAW_ASSISTANT_CONTENT_SENTINEL sk-reply-secret /host/path tool_input"
+                    .to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let milestones = milestone_sink.milestones();
+    assert_eq!(milestones.len(), 1);
+    assert!(matches!(
+        &milestones[0].kind,
+        LoopHostMilestoneKind::AssistantReplyFinalized { message_ref: finalized_ref }
+            if finalized_ref == &message_ref
+    ));
+    let wire = serde_json::to_string(&milestones).unwrap();
+    assert!(!wire.contains("RAW_ASSISTANT_CONTENT_SENTINEL"));
+    assert!(!wire.contains("sk-reply-secret"));
+    assert!(!wire.contains("/host/path"));
+    assert!(!wire.contains("tool_input"));
+}
+
+#[tokio::test]
+async fn transcript_port_finalize_is_idempotent_for_matching_reply() {
+    let fixture = ThreadFixture::new().await;
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let adapter = ThreadBackedLoopTranscriptPort::with_milestone_sink(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        milestone_sink.clone(),
     );
     let request = FinalizeAssistantMessage {
         reply: AssistantReply {
-            content: "idempotent reply".to_string(),
+            content: "idempotent reply RAW_IDEMPOTENT_REPLY_SENTINEL".to_string(),
         },
     };
 
@@ -246,6 +283,18 @@ async fn transcript_port_finalize_is_idempotent_for_matching_reply() {
     let second_ref = adapter.finalize_assistant_message(request).await.unwrap();
 
     assert_eq!(first_ref, second_ref);
+    let milestones = milestone_sink.milestones();
+    assert_eq!(milestones.len(), 2);
+    assert!(milestones.iter().all(|milestone| matches!(
+        &milestone.kind,
+        LoopHostMilestoneKind::AssistantReplyFinalized { message_ref }
+            if message_ref == &first_ref
+    )));
+    assert!(
+        !serde_json::to_string(&milestones)
+            .unwrap()
+            .contains("RAW_IDEMPOTENT_REPLY_SENTINEL")
+    );
     let history = fixture
         .thread_service
         .list_thread_history(ThreadHistoryRequest {
@@ -261,16 +310,21 @@ async fn transcript_port_finalize_is_idempotent_for_matching_reply() {
         .collect::<Vec<_>>();
     assert_eq!(finalized.len(), 1);
     assert_eq!(finalized[0].status, MessageStatus::Finalized);
-    assert_eq!(finalized[0].content.as_deref(), Some("idempotent reply"));
+    assert_eq!(
+        finalized[0].content.as_deref(),
+        Some("idempotent reply RAW_IDEMPOTENT_REPLY_SENTINEL")
+    );
 }
 
 #[tokio::test]
 async fn transcript_port_finalize_is_idempotent_under_concurrent_duplicate_calls() {
     let fixture = GatedThreadFixture::new().await;
-    let adapter = ThreadBackedLoopTranscriptPort::new(
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let adapter = ThreadBackedLoopTranscriptPort::with_milestone_sink(
         Arc::clone(&fixture.thread_service),
         fixture.thread_scope.clone(),
         fixture.run_context.clone(),
+        milestone_sink.clone(),
     );
     let request = FinalizeAssistantMessage {
         reply: AssistantReply {
@@ -286,6 +340,13 @@ async fn transcript_port_finalize_is_idempotent_under_concurrent_duplicate_calls
     let second_ref = second.unwrap();
 
     assert_eq!(first_ref, second_ref);
+    let milestones = milestone_sink.milestones();
+    assert_eq!(milestones.len(), 2);
+    assert!(milestones.iter().all(|milestone| matches!(
+        &milestone.kind,
+        LoopHostMilestoneKind::AssistantReplyFinalized { message_ref }
+            if message_ref == &first_ref
+    )));
     let history = fixture
         .thread_service
         .list_thread_history(ThreadHistoryRequest {
@@ -542,6 +603,124 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
 }
 
 #[tokio::test]
+async fn model_port_emits_model_milestones_without_prompt_or_output_payloads() {
+    let fixture = ThreadFixture::new_with_user_content(
+        "RAW_PROMPT_TEXT_SENTINEL sk-prompt-secret /host/path tool_input",
+    )
+    .await;
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let gateway = Arc::new(RecordingGateway::reply(
+        "RAW_ASSISTANT_CONTENT_SENTINEL sk-output-secret",
+    ));
+    let port = ThreadBackedLoopModelPort::with_milestone_sink(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway,
+        16,
+        milestone_sink.clone(),
+    );
+
+    let response = port
+        .stream_model(LoopModelRequest {
+            messages: vec![LoopModelMessage {
+                role: "user".to_string(),
+                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
+                    .unwrap(),
+            }],
+            surface_version: None,
+            model_preference: Some(
+                fixture
+                    .run_context
+                    .resolved_run_profile
+                    .model_profile_id
+                    .clone(),
+            ),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.effective_model_profile_id,
+        fixture.run_context.resolved_run_profile.model_profile_id
+    );
+    let milestones = milestone_sink.milestones();
+    assert_eq!(milestones.len(), 2);
+    assert!(matches!(
+        &milestones[0].kind,
+        LoopHostMilestoneKind::ModelStarted { requested_model_profile_id: Some(model_profile_id) }
+            if model_profile_id == &fixture.run_context.resolved_run_profile.model_profile_id
+    ));
+    assert!(matches!(
+        &milestones[1].kind,
+        LoopHostMilestoneKind::ModelCompleted { effective_model_profile_id }
+            if effective_model_profile_id == &fixture.run_context.resolved_run_profile.model_profile_id
+    ));
+    let wire = serde_json::to_string(&milestones).unwrap();
+    for forbidden in [
+        "RAW_PROMPT_TEXT_SENTINEL",
+        "RAW_ASSISTANT_CONTENT_SENTINEL",
+        "sk-prompt-secret",
+        "sk-output-secret",
+        "/host/path",
+        "tool_input",
+    ] {
+        assert!(!wire.contains(forbidden), "milestone leaked {forbidden}");
+    }
+}
+
+#[tokio::test]
+async fn model_port_emits_only_started_milestone_when_gateway_fails() {
+    let fixture = ThreadFixture::new_with_user_content("RAW_PROMPT_TEXT_SENTINEL").await;
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let gateway = Arc::new(RecordingGateway::deny(
+        "RAW_PROVIDER_ERROR invalid api key sk-provider-secret /host/path tool_input",
+    ));
+    let port = ThreadBackedLoopModelPort::with_milestone_sink(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway,
+        16,
+        milestone_sink.clone(),
+    );
+
+    let error = port
+        .stream_model(LoopModelRequest {
+            messages: vec![LoopModelMessage {
+                role: "user".to_string(),
+                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
+                    .unwrap(),
+            }],
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+    let milestones = milestone_sink.milestones();
+    assert_eq!(milestones.len(), 1);
+    assert!(matches!(
+        &milestones[0].kind,
+        LoopHostMilestoneKind::ModelStarted {
+            requested_model_profile_id: None
+        }
+    ));
+    let wire = serde_json::to_string(&milestones).unwrap();
+    for forbidden in [
+        "RAW_PROMPT_TEXT_SENTINEL",
+        "RAW_PROVIDER_ERROR",
+        "invalid api key",
+        "sk-provider-secret",
+        "/host/path",
+        "tool_input",
+    ] {
+        assert!(!wire.contains(forbidden), "milestone leaked {forbidden}");
+    }
+}
+
+#[tokio::test]
 async fn model_port_rejects_message_role_that_disagrees_with_thread_record() {
     let fixture = ThreadFixture::new().await;
     let gateway = Arc::new(RecordingGateway::reply("should not be called"));
@@ -610,6 +789,10 @@ struct ThreadFixture {
 
 impl ThreadFixture {
     async fn new() -> Self {
+        Self::new_with_user_content("hello reborn").await
+    }
+
+    async fn new_with_user_content(user_content: &str) -> Self {
         let thread_service = Arc::new(InMemorySessionThreadService::default());
         let tenant_id = TenantId::new("tenant-loop-support").unwrap();
         let agent_id = AgentId::new("agent-loop-support").unwrap();
@@ -641,7 +824,7 @@ impl ThreadFixture {
                 source_binding_id: Some("source-web".to_string()),
                 reply_target_binding_id: Some("reply-web".to_string()),
                 external_event_id: Some("event-1".to_string()),
-                content: MessageContent::text("hello reborn"),
+                content: MessageContent::text(user_content),
             })
             .await
             .unwrap();

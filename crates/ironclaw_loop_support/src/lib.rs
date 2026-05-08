@@ -20,10 +20,10 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied, CapabilityInvocation,
         CapabilityOutcome, CapabilitySurfaceVersion, FinalizeAssistantMessage, LoopContextBundle,
-        LoopContextMessage, LoopContextPort, LoopContextRequest, LoopInputCursor, LoopModelMessage,
-        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopRunContext, LoopRunInfoPort,
-        LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, UpdateAssistantDraft,
-        VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopContextMessage, LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter,
+        LoopHostMilestoneSink, LoopInputCursor, LoopModelMessage, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, ModelStreamChunk,
+        ParentLoopOutput, UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -113,6 +113,7 @@ where
     thread_service: Arc<S>,
     thread_scope: ThreadScope,
     run_context: LoopRunContext,
+    milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
 }
 
 impl<S> ThreadBackedLoopTranscriptPort<S>
@@ -128,6 +129,21 @@ where
             thread_service,
             thread_scope,
             run_context,
+            milestone_sink: None,
+        }
+    }
+
+    pub fn with_milestone_sink(
+        thread_service: Arc<S>,
+        thread_scope: ThreadScope,
+        run_context: LoopRunContext,
+        milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+    ) -> Self {
+        Self {
+            thread_service,
+            thread_scope,
+            run_context,
+            milestone_sink: Some(milestone_sink),
         }
     }
 }
@@ -201,7 +217,10 @@ where
             .map_err(transcript_write_error)?;
         if draft.status == MessageStatus::Finalized {
             if draft.content.as_deref() == Some(reply_content.as_str()) {
-                return message_ref(draft.message_id);
+                let message_ref = message_ref(draft.message_id)?;
+                self.emit_assistant_reply_finalized(message_ref.clone())
+                    .await;
+                return Ok(message_ref);
             }
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::TranscriptWriteFailed,
@@ -218,13 +237,21 @@ where
             )
             .await;
         match finalized {
-            Ok(message) => message_ref(message.message_id),
+            Ok(message) => {
+                let message_ref = message_ref(message.message_id)?;
+                self.emit_assistant_reply_finalized(message_ref.clone())
+                    .await;
+                Ok(message_ref)
+            }
             Err(error) => {
                 if let Some(message_id) = self
                     .already_finalized_matching_reply(draft.message_id, &reply_content)
                     .await?
                 {
-                    return message_ref(message_id);
+                    let message_ref = message_ref(message_id)?;
+                    self.emit_assistant_reply_finalized(message_ref.clone())
+                        .await;
+                    return Ok(message_ref);
                 }
                 Err(transcript_write_error(error))
             }
@@ -236,6 +263,14 @@ impl<S> ThreadBackedLoopTranscriptPort<S>
 where
     S: SessionThreadService + ?Sized + Send + Sync,
 {
+    async fn emit_assistant_reply_finalized(&self, message_ref: LoopMessageRef) {
+        if let Some(milestone_sink) = &self.milestone_sink {
+            let milestones =
+                LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
+            let _ = milestones.assistant_reply_finalized(message_ref).await;
+        }
+    }
+
     async fn load_current_run_message(
         &self,
         message_id: ThreadMessageId,
@@ -365,6 +400,7 @@ where
     run_context: LoopRunContext,
     gateway: Arc<G>,
     max_messages: usize,
+    milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
 }
 
 impl<S, G> ThreadBackedLoopModelPort<S, G>
@@ -385,6 +421,25 @@ where
             run_context,
             gateway,
             max_messages,
+            milestone_sink: None,
+        }
+    }
+
+    pub fn with_milestone_sink(
+        thread_service: Arc<S>,
+        thread_scope: ThreadScope,
+        run_context: LoopRunContext,
+        gateway: Arc<G>,
+        max_messages: usize,
+        milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+    ) -> Self {
+        Self {
+            thread_service,
+            thread_scope,
+            run_context,
+            gateway,
+            max_messages,
+            milestone_sink: Some(milestone_sink),
         }
     }
 }
@@ -410,13 +465,15 @@ where
         request: LoopModelRequest,
     ) -> Result<LoopModelResponse, AgentLoopHostError> {
         validate_thread_scope_for_run(&self.thread_scope, &self.run_context)?;
-        let model_profile_id = request.model_preference.clone().unwrap_or_else(|| {
+        let requested_model_profile_id = request.model_preference.clone();
+        let model_profile_id = requested_model_profile_id.clone().unwrap_or_else(|| {
             self.run_context
                 .resolved_run_profile
                 .model_profile_id
                 .clone()
         });
         let resolved_messages = self.resolve_model_messages(request.messages).await?;
+        self.emit_model_started(requested_model_profile_id).await?;
         let gateway_response = self
             .gateway
             .stream_model(HostManagedModelRequest {
@@ -428,6 +485,8 @@ where
             })
             .await
             .map_err(model_gateway_error)?;
+
+        self.emit_model_completed(model_profile_id.clone()).await;
 
         Ok(LoopModelResponse {
             chunks: gateway_response
@@ -446,6 +505,26 @@ where
     S: SessionThreadService + ?Sized + Send + Sync,
     G: HostManagedModelGateway + ?Sized + Send + Sync,
 {
+    async fn emit_model_started(
+        &self,
+        requested_model_profile_id: Option<ModelProfileId>,
+    ) -> Result<(), AgentLoopHostError> {
+        if let Some(milestone_sink) = &self.milestone_sink {
+            let milestones =
+                LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
+            milestones.model_started(requested_model_profile_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn emit_model_completed(&self, effective_model_profile_id: ModelProfileId) {
+        if let Some(milestone_sink) = &self.milestone_sink {
+            let milestones =
+                LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
+            let _ = milestones.model_completed(effective_model_profile_id).await;
+        }
+    }
+
     async fn resolve_model_messages(
         &self,
         requested_messages: Vec<LoopModelMessage>,
