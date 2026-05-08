@@ -159,6 +159,10 @@ impl LoopSafeSummary {
         validate_loop_safe_summary(value.into()).map(Self)
     }
 
+    pub fn model_gateway_failed() -> Self {
+        Self("model gateway failed".to_string())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

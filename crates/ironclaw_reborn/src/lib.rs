@@ -8,4 +8,6 @@
 pub mod model_gateway;
 
 #[cfg(feature = "root-llm-provider")]
-pub use model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
+pub use model_gateway::{
+    LlmModelProfilePolicy, LlmProviderModelGateway, ThreadBackedLoopModelGateway,
+};
