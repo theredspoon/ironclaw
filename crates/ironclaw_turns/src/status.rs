@@ -3,8 +3,8 @@ use thiserror::Error;
 
 use crate::{
     AcceptedMessageRef, GateRef, ReplyTargetBindingRef, ResolvedRunProfile, RunProfileId,
-    RunProfileVersion, SourceBindingRef, TurnCheckpointId, TurnId, TurnRunId, TurnScope,
-    events::EventCursor, request::TurnTimestamp,
+    RunProfileVersion, SourceBindingRef, TurnAdmissionClass, TurnCheckpointId, TurnId, TurnRunId,
+    TurnScope, events::EventCursor, request::TurnTimestamp,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +35,8 @@ impl TurnStatus {
 pub struct TurnRunProfile {
     pub id: RunProfileId,
     pub version: RunProfileVersion,
+    #[serde(default = "TurnAdmissionClass::interactive")]
+    pub admission_class: TurnAdmissionClass,
     pub allow_steering: bool,
     pub auto_queue_followups: bool,
     pub resolved: ResolvedRunProfile,
@@ -46,6 +48,7 @@ impl TurnRunProfile {
         Self {
             id,
             version: resolved.profile_version,
+            admission_class: TurnAdmissionClass::interactive(),
             allow_steering: resolved.steering_policy.allow_steering,
             auto_queue_followups: false,
             resolved,
@@ -62,6 +65,8 @@ impl<'de> Deserialize<'de> for TurnRunProfile {
         struct WireProfile {
             id: RunProfileId,
             version: RunProfileVersion,
+            #[serde(default = "TurnAdmissionClass::interactive")]
+            admission_class: TurnAdmissionClass,
             allow_steering: bool,
             auto_queue_followups: bool,
             resolved: Option<ResolvedRunProfile>,
@@ -78,6 +83,7 @@ impl<'de> Deserialize<'de> for TurnRunProfile {
         Ok(Self {
             id: wire.id,
             version: wire.version,
+            admission_class: wire.admission_class,
             allow_steering: wire.allow_steering,
             auto_queue_followups: wire.auto_queue_followups,
             resolved,
@@ -229,6 +235,8 @@ impl AdmissionRejectionReason {
 pub struct AdmissionRejection {
     pub reason: AdmissionRejectionReason,
     pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_denial: Option<crate::TurnAdmissionCapacityDenial>,
 }
 
 impl AdmissionRejection {
@@ -236,11 +244,18 @@ impl AdmissionRejection {
         Self {
             reason,
             retry_after_ms: None,
+            capacity_denial: None,
         }
     }
 
     pub fn with_retry_after_ms(mut self, retry_after_ms: u64) -> Self {
         self.retry_after_ms = Some(retry_after_ms);
+        self
+    }
+
+    pub fn with_capacity_denial(mut self, denial: crate::TurnAdmissionCapacityDenial) -> Self {
+        self.retry_after_ms = denial.retry_after_ms;
+        self.capacity_denial = Some(denial);
         self
     }
 }

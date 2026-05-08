@@ -18,14 +18,16 @@ use ironclaw_turns::{
     LoopExitInvalidHandling, LoopExitValidationPolicy, LoopGateRef, LoopMessageRef,
     ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest, RunProfileId, RunProfileRequest,
     RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
-    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, SubmitTurnRequest,
-    SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnCheckpointId,
-    TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind, TurnEventProjectionCursor,
-    TurnEventProjectionError, TurnEventProjectionRequest, TurnEventProjectionService,
-    TurnEventSink, TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnLeaseToken,
-    TurnLifecycleEvent, TurnLockVersion, TurnRunId, TurnRunProfile, TurnRunState, TurnRunWake,
-    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnStateStore,
-    TurnStatus,
+    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionAxisKind,
+    TurnAdmissionBucketKind, TurnAdmissionBucketScope, TurnAdmissionCapacityDenial,
+    TurnAdmissionClass, TurnAdmissionPolicy, TurnCheckpointId, TurnCoordinator, TurnError,
+    TurnErrorCategory, TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError,
+    TurnEventProjectionRequest, TurnEventProjectionService, TurnEventSink,
+    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
+    TurnIdempotencyReplay, TurnLeaseToken, TurnLifecycleEvent, TurnLockVersion, TurnRunId,
+    TurnRunProfile, TurnRunState, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
+    TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
     events::EventCursor,
     runner::{
         ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
@@ -700,8 +702,13 @@ async fn same_thread_lock_excludes_actor_identity() {
 }
 
 #[tokio::test]
-async fn submit_turn_busy_path_records_idempotent_thread_busy_without_new_run() {
-    let (coordinator, store) = coordinator();
+async fn same_thread_busy_is_transient_and_checked_before_admission_capacity() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
     let first_run_id = accepted_run_id(
         &coordinator
             .submit_turn(submit_request("thread-a", "idem-submit-a"))
@@ -714,26 +721,9 @@ async fn submit_turn_busy_path_records_idempotent_thread_busy_without_new_run() 
         .submit_turn(busy_request.clone())
         .await
         .unwrap_err();
-
-    let snapshot = store.persistence_snapshot();
-    assert_eq!(snapshot.turns.len(), 1);
-    assert_eq!(snapshot.runs.len(), 1);
-    let busy_idempotency = snapshot
-        .idempotency_records
-        .iter()
-        .find(|record| record.key == busy_request.idempotency_key)
-        .expect("busy submit idempotency result must be recorded");
-    assert_eq!(
-        busy_idempotency.operation,
-        TurnIdempotencyOperationKind::Submit
-    );
-    assert_eq!(busy_idempotency.turn_id, None);
-    assert_eq!(busy_idempotency.run_id, Some(first_run_id));
-    assert_eq!(
-        busy_idempotency.outcome,
-        TurnIdempotencyOutcomeKind::ThreadBusy
-    );
-    assert_eq!(busy_idempotency.created_at, busy_request.received_at);
+    assert!(matches!(busy, TurnError::ThreadBusy(_)));
+    assert_eq!(store.active_admission_reservations().len(), 1);
+    assert_eq!(store.persistence_snapshot().idempotency_records.len(), 1);
 
     let runner_id = TurnRunnerId::new();
     let lease_token = TurnLeaseToken::new();
@@ -755,9 +745,775 @@ async fn submit_turn_busy_path_records_idempotent_thread_busy_without_new_run() 
         .await
         .unwrap();
 
-    let duplicate = coordinator.submit_turn(busy_request).await.unwrap_err();
-    assert_eq!(duplicate, busy);
+    let duplicate_after_unlock = coordinator.submit_turn(busy_request).await.unwrap();
+    assert_ne!(accepted_run_id(&duplicate_after_unlock), first_run_id);
+    assert_eq!(store.persistence_snapshot().turns.len(), 2);
+}
+
+#[tokio::test]
+async fn tenant_capacity_denial_is_structured_idempotent_and_all_or_nothing() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+    let denied_request = submit_request("thread-b", "idem-submit-b");
+
+    let denied = coordinator
+        .submit_turn(denied_request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(AdmissionRejection {
+            reason: AdmissionRejectionReason::TenantLimit,
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Tenant,
+                bucket_kind: TurnAdmissionBucketKind::Total,
+                limit: 1,
+                active_count: 1,
+                ..
+            }),
+            ..
+        })
+    ));
     assert_eq!(store.persistence_snapshot().turns.len(), 1);
+    assert_eq!(store.active_admission_reservations().len(), 1);
+
+    let duplicate_denied = coordinator.submit_turn(denied_request).await.unwrap_err();
+    assert_eq!(duplicate_denied, denied);
+    assert_eq!(store.persistence_snapshot().turns.len(), 1);
+    assert_eq!(store.active_admission_reservations().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_submits_cannot_oversubscribe_admission_limit() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+
+    let (first, second) = tokio::join!(
+        coordinator.submit_turn(submit_request("thread-a", "idem-submit-a")),
+        coordinator.submit_turn(submit_request("thread-b", "idem-submit-b")),
+    );
+
+    let accepted = [first.as_ref(), second.as_ref()]
+        .into_iter()
+        .filter(|result| matches!(result, Ok(SubmitTurnResponse::Accepted { .. })))
+        .count();
+    let rejected = [first.as_ref(), second.as_ref()]
+        .into_iter()
+        .filter(|result| matches!(result, Err(TurnError::AdmissionRejected(_))))
+        .count();
+    assert_eq!(accepted, 1);
+    assert_eq!(rejected, 1);
+    assert_eq!(store.persistence_snapshot().turns.len(), 1);
+    assert_eq!(store.active_admission_reservations().len(), 1);
+}
+
+#[tokio::test]
+async fn capacity_denial_does_not_advance_event_cursor() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let first_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+
+    let denied = coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(denied, TurnError::AdmissionRejected(_)));
+
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+
+    let SubmitTurnResponse::Accepted { event_cursor, .. } = coordinator
+        .submit_turn(submit_request("thread-c", "idem-submit-c"))
+        .await
+        .unwrap();
+    assert_eq!(event_cursor, EventCursor(4));
+}
+
+#[tokio::test]
+async fn snapshot_load_ignores_legacy_submit_thread_busy_replays() {
+    let source_store = Arc::new(InMemoryTurnStateStore::default());
+    let source_coordinator = DefaultTurnCoordinator::new(source_store.clone());
+    let first_run_id = accepted_run_id(
+        &source_coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let mut snapshot = source_store.persistence_snapshot();
+    let legacy_busy_key = IdempotencyKey::new("idem-legacy-busy").unwrap();
+    snapshot.idempotency_records.push(TurnIdempotencyRecord {
+        scope: scope("thread-a"),
+        operation: TurnIdempotencyOperationKind::Submit,
+        key: legacy_busy_key.clone(),
+        turn_id: None,
+        run_id: Some(first_run_id),
+        outcome: TurnIdempotencyOutcomeKind::ThreadBusy,
+        replay: TurnIdempotencyReplay::SubmitThreadBusy(ThreadBusy {
+            active_run_id: first_run_id,
+            status: TurnStatus::Queued,
+            event_cursor: EventCursor(1),
+        }),
+        created_at: received_at(),
+        expires_at: None,
+    });
+    let restored = Arc::new(
+        InMemoryTurnStateStore::from_persistence_snapshot(
+            snapshot,
+            InMemoryTurnStateStoreLimits::default(),
+        )
+        .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    restored
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    restored
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+
+    let restored_coordinator = DefaultTurnCoordinator::new(restored.clone());
+    let accepted_after_unlock = restored_coordinator
+        .submit_turn(submit_request("thread-a", legacy_busy_key.as_str()))
+        .await
+        .unwrap();
+    assert_ne!(accepted_run_id(&accepted_after_unlock), first_run_id);
+}
+
+#[tokio::test]
+async fn snapshot_load_synthesizes_reservations_for_legacy_active_runs() {
+    let source_store = Arc::new(InMemoryTurnStateStore::default());
+    let source_coordinator = DefaultTurnCoordinator::new(source_store.clone());
+    source_coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+    let mut snapshot = source_store.persistence_snapshot();
+    assert_eq!(snapshot.admission_reservations.len(), 1);
+    snapshot.admission_reservations.clear();
+
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let restored = Arc::new(
+        InMemoryTurnStateStore::from_persistence_snapshot_with_admission_limit_provider(
+            snapshot,
+            InMemoryTurnStateStoreLimits::default(),
+            Arc::new(limits),
+        )
+        .unwrap(),
+    );
+    assert_eq!(restored.active_admission_reservations().len(), 1);
+
+    let restored_coordinator = DefaultTurnCoordinator::new(restored.clone());
+    let denied = restored_coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Tenant,
+                limit: 1,
+                active_count: 1,
+                ..
+            }),
+            ..
+        })
+    ));
+    assert_eq!(restored.persistence_snapshot().turns.len(), 1);
+}
+
+#[tokio::test]
+async fn snapshot_load_recovers_released_or_mismatched_reservations_for_active_runs() {
+    let source_store = Arc::new(InMemoryTurnStateStore::default());
+    let source_coordinator = DefaultTurnCoordinator::new(source_store.clone());
+    source_coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+    let source_snapshot = source_store.persistence_snapshot();
+    assert_eq!(source_snapshot.admission_reservations.len(), 1);
+
+    for corrupt_reservation in ["released", "empty_buckets"] {
+        let mut snapshot = source_snapshot.clone();
+        match corrupt_reservation {
+            "released" => snapshot.admission_reservations[0].released = true,
+            "empty_buckets" => snapshot.admission_reservations[0].buckets.clear(),
+            _ => unreachable!(),
+        }
+        let limits = StaticTurnAdmissionLimitProvider::default()
+            .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+        let restored = Arc::new(
+            InMemoryTurnStateStore::from_persistence_snapshot_with_admission_limit_provider(
+                snapshot,
+                InMemoryTurnStateStoreLimits::default(),
+                Arc::new(limits),
+            )
+            .unwrap(),
+        );
+        let reservations = restored.active_admission_reservations();
+        assert_eq!(reservations.len(), 1, "case {corrupt_reservation}");
+        assert!(!reservations[0].released, "case {corrupt_reservation}");
+        assert_eq!(
+            reservations[0].buckets.len(),
+            8,
+            "case {corrupt_reservation}"
+        );
+
+        let restored_coordinator = DefaultTurnCoordinator::new(restored.clone());
+        let denied = restored_coordinator
+            .submit_turn(submit_request(
+                &format!("thread-b-{corrupt_reservation}"),
+                &format!("idem-submit-b-{corrupt_reservation}"),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                denied,
+                TurnError::AdmissionRejected(AdmissionRejection {
+                    capacity_denial: Some(TurnAdmissionCapacityDenial {
+                        axis_kind: TurnAdmissionAxisKind::Tenant,
+                        limit: 1,
+                        active_count: 1,
+                        ..
+                    }),
+                    ..
+                })
+            ),
+            "case {corrupt_reservation}: {denied:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_run_releases_admission_reservation_for_new_thread() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let first_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+
+    assert!(store.active_admission_reservations().is_empty());
+    let second = coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap();
+    assert_ne!(accepted_run_id(&second), first_run_id);
+    assert_eq!(store.active_admission_reservations().len(), 1);
+}
+
+#[tokio::test]
+async fn snapshot_load_drops_released_reservations_without_retained_run_records() {
+    let source_store = Arc::new(InMemoryTurnStateStore::default());
+    let source_coordinator = DefaultTurnCoordinator::new(source_store.clone());
+    let run_id = accepted_run_id(
+        &source_coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    source_store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    source_store
+        .complete_run(CompleteRunRequest {
+            run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+    let mut snapshot = source_store.persistence_snapshot();
+    assert_eq!(snapshot.admission_reservations.len(), 1);
+    assert!(snapshot.admission_reservations[0].released);
+    snapshot.runs.clear();
+
+    let restored = InMemoryTurnStateStore::from_persistence_snapshot(
+        snapshot,
+        InMemoryTurnStateStoreLimits::default(),
+    )
+    .unwrap();
+
+    assert!(
+        restored
+            .persistence_snapshot()
+            .admission_reservations
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn terminal_record_pruning_bounds_released_admission_reservations() {
+    let store = Arc::new(InMemoryTurnStateStore::with_limits(
+        InMemoryTurnStateStoreLimits {
+            max_terminal_records: 1,
+            ..InMemoryTurnStateStoreLimits::default()
+        },
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let first_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let first_runner_id = TurnRunnerId::new();
+    let first_lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id: first_runner_id,
+            lease_token: first_lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id: first_runner_id,
+            lease_token: first_lease_token,
+        })
+        .await
+        .unwrap();
+
+    let second_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-b", "idem-submit-b"))
+            .await
+            .unwrap(),
+    );
+    let second_runner_id = TurnRunnerId::new();
+    let second_lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id: second_runner_id,
+            lease_token: second_lease_token,
+            scope_filter: Some(scope("thread-b")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .complete_run(CompleteRunRequest {
+            run_id: second_run_id,
+            runner_id: second_runner_id,
+            lease_token: second_lease_token,
+        })
+        .await
+        .unwrap();
+
+    let snapshot = store.persistence_snapshot();
+    assert!(snapshot.runs.iter().all(|run| run.run_id != first_run_id));
+    assert!(
+        snapshot
+            .admission_reservations
+            .iter()
+            .all(|reservation| reservation.run_id != first_run_id)
+    );
+    assert_eq!(snapshot.admission_reservations.len(), 1);
+}
+
+#[tokio::test]
+async fn actor_user_capacity_uses_submitting_actor_not_thread_scope() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::ActorUser, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+
+    let same_actor_denied = coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        same_actor_denied,
+        TurnError::AdmissionRejected(AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::ActorUser,
+                ..
+            }),
+            ..
+        })
+    ));
+
+    let mut different_actor = submit_request("thread-c", "idem-submit-c");
+    different_actor.actor = TurnActor::new(UserId::new("user2").unwrap());
+    coordinator.submit_turn(different_actor).await.unwrap();
+    assert_eq!(store.active_admission_reservations().len(), 2);
+}
+
+#[tokio::test]
+async fn class_capacity_denial_reports_admission_class() {
+    let limits = StaticTurnAdmissionLimitProvider::default().with_class_limit(
+        TurnAdmissionAxisKind::Tenant,
+        TurnAdmissionClass::interactive(),
+        1,
+    );
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store);
+    coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+
+    let denied = coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Tenant,
+                bucket_kind: TurnAdmissionBucketKind::Class,
+                admission_class: Some(ref class),
+                limit: 1,
+                active_count: 1,
+                ..
+            }),
+            ..
+        }) if class == &TurnAdmissionClass::interactive()
+    ));
+}
+
+#[tokio::test]
+async fn accepted_submit_reserves_unlimited_buckets_and_replay_does_not_reacquire() {
+    let (coordinator, store) = coordinator();
+    let first = coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+    let duplicate = coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+
+    assert_eq!(duplicate, first);
+    let reservations = store.active_admission_reservations();
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0].buckets.len(), 8);
+    assert_eq!(
+        reservations[0].admission_class,
+        TurnAdmissionClass::interactive()
+    );
+}
+
+#[tokio::test]
+async fn project_none_consumes_unscoped_project_bucket() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Project, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let mut first = submit_request("thread-a", "idem-submit-a");
+    first.scope.project_id = None;
+    coordinator.submit_turn(first).await.unwrap();
+    let mut second = submit_request("thread-b", "idem-submit-b");
+    second.scope.project_id = None;
+
+    let denied = coordinator.submit_turn(second).await.unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Project,
+                bucket_kind: TurnAdmissionBucketKind::Total,
+                ..
+            }),
+            ..
+        })
+    ));
+    assert!(
+        store.active_admission_reservations()[0]
+            .buckets
+            .iter()
+            .any(|bucket| matches!(
+                bucket.scope,
+                TurnAdmissionBucketScope::Project {
+                    project_id: None,
+                    ..
+                }
+            ))
+    );
+}
+
+#[tokio::test]
+async fn agent_capacity_is_keyed_by_tenant_and_optional_agent() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Agent, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let first = submit_request("thread-a", "idem-submit-a");
+    coordinator.submit_turn(first).await.unwrap();
+    let denied = coordinator
+        .submit_turn(submit_request("thread-b", "idem-submit-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        denied,
+        TurnError::AdmissionRejected(AdmissionRejection {
+            capacity_denial: Some(TurnAdmissionCapacityDenial {
+                axis_kind: TurnAdmissionAxisKind::Agent,
+                ..
+            }),
+            ..
+        })
+    ));
+
+    let mut no_agent = submit_request("thread-c", "idem-submit-c");
+    no_agent.scope.agent_id = None;
+    coordinator.submit_turn(no_agent).await.unwrap();
+    assert_eq!(store.active_admission_reservations().len(), 2);
+}
+
+#[tokio::test]
+async fn admission_limit_provider_unavailable_fails_closed_without_run_or_reservation() {
+    let limits = StaticTurnAdmissionLimitProvider::default().unavailable();
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+
+    let denied = coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        denied,
+        TurnError::AdmissionRejected(AdmissionRejection::new(
+            AdmissionRejectionReason::Unavailable
+        ))
+    );
+    let snapshot = store.persistence_snapshot();
+    assert!(snapshot.turns.is_empty());
+    assert!(snapshot.runs.is_empty());
+    assert!(snapshot.admission_reservations.is_empty());
+}
+
+#[tokio::test]
+async fn blocked_resume_and_recovery_required_keep_existing_admission_reservation() {
+    let limits = StaticTurnAdmissionLimitProvider::default()
+        .with_total_limit(TurnAdmissionAxisKind::Tenant, 1);
+    let store = Arc::new(InMemoryTurnStateStore::with_admission_limit_provider(
+        Arc::new(limits),
+    ));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let gate_ref = GateRef::new("gate:approval").unwrap();
+    store
+        .block_run(BlockRunRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            reason: BlockedReason::Approval {
+                gate_ref: gate_ref.clone(),
+            },
+            checkpoint_id: TurnCheckpointId::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.active_admission_reservations().len(), 1);
+
+    let resumed = coordinator
+        .resume_turn(ResumeTurnRequest {
+            scope: scope("thread-a"),
+            actor: actor(),
+            run_id,
+            gate_resolution_ref: gate_ref,
+            source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
+            idempotency_key: IdempotencyKey::new("idem-resume-a").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, TurnStatus::Queued);
+    assert_eq!(store.active_admission_reservations().len(), 1);
+
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-a")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .record_recovery_required(ironclaw_turns::runner::RecordRecoveryRequiredRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            failure: SanitizedFailure::new("driver_protocol_violation").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.active_admission_reservations().len(), 1);
+}
+
+#[tokio::test]
+async fn submit_turn_busy_path_is_transient_without_new_run_or_idempotency_record() {
+    let (coordinator, store) = coordinator();
+    let first_run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-a", "idem-submit-a"))
+            .await
+            .unwrap(),
+    );
+    let busy_request = submit_request("thread-a", "idem-submit-b");
+
+    let busy = coordinator
+        .submit_turn(busy_request.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(busy, TurnError::ThreadBusy(_)));
+
+    let snapshot = store.persistence_snapshot();
+    assert_eq!(snapshot.turns.len(), 1);
+    assert_eq!(snapshot.runs.len(), 1);
+    assert!(
+        snapshot
+            .idempotency_records
+            .iter()
+            .all(|record| record.key != busy_request.idempotency_key),
+        "busy submit is transient and must not pin admission/idempotency capacity"
+    );
+
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: None,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .complete_run(CompleteRunRequest {
+            run_id: first_run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap();
+
+    let accepted_after_unlock = coordinator.submit_turn(busy_request).await.unwrap();
+    assert_ne!(accepted_run_id(&accepted_after_unlock), first_run_id);
+    assert_eq!(store.persistence_snapshot().turns.len(), 2);
 }
 
 #[tokio::test]
@@ -909,20 +1665,24 @@ async fn resume_updates_persisted_run_binding_refs_and_replay_envelope() {
 }
 
 #[tokio::test]
-async fn persisted_submit_busy_and_cancel_replay_envelopes_are_reconstructable() {
-    let (coordinator, store) = coordinator();
+async fn persisted_admission_rejection_and_cancel_replay_envelopes_are_reconstructable() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_admission_policy(Arc::new(DenyAll));
+    let rejected_request = submit_request("thread-a", "idem-submit-rejected");
+    let rejected = coordinator
+        .submit_turn(rejected_request.clone())
+        .await
+        .unwrap_err();
+
+    let allowed_coordinator = DefaultTurnCoordinator::new(store.clone());
     let first_run_id = accepted_run_id(
-        &coordinator
+        &allowed_coordinator
             .submit_turn(submit_request("thread-a", "idem-submit-a"))
             .await
             .unwrap(),
     );
-    let busy_request = submit_request("thread-a", "idem-submit-b");
-    let busy = coordinator
-        .submit_turn(busy_request.clone())
-        .await
-        .unwrap_err();
-    let cancel = coordinator
+    let cancel = allowed_coordinator
         .cancel_run(cancel_request(
             "thread-a",
             first_run_id,
@@ -932,12 +1692,12 @@ async fn persisted_submit_busy_and_cancel_replay_envelopes_are_reconstructable()
         .unwrap();
 
     let snapshot = store.persistence_snapshot();
-    let busy_record = snapshot
+    let rejection_record = snapshot
         .idempotency_records
         .iter()
-        .find(|record| record.key == busy_request.idempotency_key)
-        .expect("busy submit idempotency record must be persisted");
-    assert_eq!(busy_record.replay_submit().unwrap(), Err(busy));
+        .find(|record| record.key == rejected_request.idempotency_key)
+        .expect("admission rejection idempotency record must be persisted");
+    assert_eq!(rejection_record.replay_submit().unwrap(), Err(rejected));
     let cancel_record = snapshot
         .idempotency_records
         .iter()
@@ -961,7 +1721,7 @@ async fn submit_turn_idempotency_replays_same_success_result() {
 }
 
 #[tokio::test]
-async fn submit_turn_busy_idempotency_replays_after_thread_unlocks() {
+async fn submit_turn_busy_idempotency_does_not_replay_after_thread_unlocks() {
     let (coordinator, store) = coordinator();
     let first_run_id = accepted_run_id(
         &coordinator
@@ -996,8 +1756,8 @@ async fn submit_turn_busy_idempotency_replays_after_thread_unlocks() {
         .await
         .unwrap();
 
-    let duplicate_after_unlock = coordinator.submit_turn(busy_request).await.unwrap_err();
-    assert_eq!(duplicate_after_unlock, busy);
+    let accepted_after_unlock = coordinator.submit_turn(busy_request).await.unwrap();
+    assert_ne!(accepted_run_id(&accepted_after_unlock), first_run_id);
 }
 
 #[test]
@@ -1500,6 +2260,30 @@ async fn admission_policy_rejection_is_typed_and_does_not_create_run() {
             .unwrap_err(),
         TurnError::ScopeNotFound
     );
+}
+
+#[tokio::test]
+async fn admission_policy_rejection_wins_over_busy_thread_metadata() {
+    let (coordinator, store) = coordinator();
+    coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-a"))
+        .await
+        .unwrap();
+    let unauthorized_coordinator = DefaultTurnCoordinator::new(store.clone())
+        .with_admission_policy(Arc::new(DenyUnauthorized));
+
+    let err = unauthorized_coordinator
+        .submit_turn(submit_request("thread-a", "idem-submit-unauthorized-busy"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        TurnError::AdmissionRejected(AdmissionRejection::new(
+            AdmissionRejectionReason::Unauthorized
+        ))
+    );
+    assert_eq!(store.persistence_snapshot().turns.len(), 1);
 }
 
 #[tokio::test]
@@ -2321,6 +3105,11 @@ async fn sanitized_failure_rejects_empty_controlled_oversized_or_unsanitized_cat
 
 #[test]
 fn bounded_refs_validate_during_deserialization() {
+    assert!(serde_json::from_str::<TurnAdmissionClass>("\"interactive\"").is_ok());
+    assert!(serde_json::from_str::<TurnAdmissionClass>("\"\"").is_err());
+    assert!(serde_json::from_str::<TurnAdmissionClass>("\"Interactive\"").is_err());
+    assert!(serde_json::from_str::<TurnAdmissionClass>("\"admin-system\"").is_err());
+    assert!(serde_json::from_str::<TurnAdmissionClass>("\"class\\nsecret\"").is_err());
     assert!(serde_json::from_str::<AcceptedMessageRef>("\"message-ok\"").is_ok());
     assert!(serde_json::from_str::<AcceptedMessageRef>("\"\"").is_err());
     assert!(serde_json::from_str::<SourceBindingRef>("\"source\\nsecret\"").is_err());
@@ -2641,6 +3430,16 @@ impl TurnAdmissionPolicy for DenyFirstThenAllow {
         } else {
             Ok(())
         }
+    }
+}
+
+struct DenyUnauthorized;
+
+impl TurnAdmissionPolicy for DenyUnauthorized {
+    fn check_submit(&self, _request: &SubmitTurnRequest) -> Result<(), AdmissionRejection> {
+        Err(AdmissionRejection::new(
+            AdmissionRejectionReason::Unauthorized,
+        ))
     }
 }
 

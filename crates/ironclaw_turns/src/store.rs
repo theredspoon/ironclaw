@@ -5,9 +5,10 @@ use crate::{
     AcceptedMessageRef, AdmissionRejection, CancelRunRequest, CancelRunResponse, GateRef,
     GetRunStateRequest, IdempotencyKey, ReplyTargetBindingRef, ResumeTurnRequest,
     ResumeTurnResponse, RunProfileResolver, SourceBindingRef, SubmitTurnRequest,
-    SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnCheckpointId, TurnError,
-    TurnErrorCategory, TurnId, TurnLeaseToken, TurnLifecycleEvent, TurnRunId, TurnRunProfile,
-    TurnRunState, TurnRunnerId, TurnScope, TurnStatus, TurnTimestamp, events::EventCursor,
+    SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnAdmissionReservationRecord,
+    TurnCheckpointId, TurnError, TurnErrorCategory, TurnId, TurnLeaseToken, TurnLifecycleEvent,
+    TurnRunId, TurnRunProfile, TurnRunState, TurnRunnerId, TurnScope, TurnStatus, TurnTimestamp,
+    events::EventCursor,
 };
 
 #[async_trait]
@@ -222,9 +223,9 @@ impl TurnIdempotencyRecord {
         }
         match &self.replay {
             TurnIdempotencyReplay::SubmitAccepted(response) => Some(Ok(response.clone())),
-            TurnIdempotencyReplay::SubmitThreadBusy(busy) => {
-                Some(Err(TurnError::ThreadBusy(busy.clone())))
-            }
+            // Legacy persisted busy submit records are intentionally not replayable.
+            // Same-thread busy is a transient lock state, not an idempotent submit outcome.
+            TurnIdempotencyReplay::SubmitThreadBusy(_) => None,
             TurnIdempotencyReplay::SubmitAdmissionRejected(rejection) => {
                 Some(Err(TurnError::AdmissionRejected(rejection.clone())))
             }
@@ -279,4 +280,6 @@ pub struct TurnPersistenceSnapshot {
     pub events: Vec<TurnLifecycleEvent>,
     #[serde(default)]
     pub event_retention_floor: EventCursor,
+    #[serde(default)]
+    pub admission_reservations: Vec<TurnAdmissionReservationRecord>,
 }
