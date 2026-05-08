@@ -7,7 +7,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use ironclaw::llm::{ChatMessage, CompletionRequest, LlmError, LlmProvider};
+use ironclaw::llm::{
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmError, LlmProvider,
+};
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessage, HostManagedModelMessageRole, HostManagedModelRequest,
@@ -84,8 +86,9 @@ where
                     "model profile is not permitted",
                 )
             })?;
+        let model_override = pinned_model_override(route)?;
         let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
-        completion.model.clone_from(&route.model_override);
+        completion.model = Some(model_override.to_string());
         completion.metadata.insert(
             "model_profile_id".to_string(),
             request.model_profile_id.as_str().to_string(),
@@ -102,7 +105,48 @@ where
             .complete(completion)
             .await
             .map_err(map_provider_error)?;
-        Ok(HostManagedModelResponse::assistant_reply(response.content))
+        response_to_host_reply(response)
+    }
+}
+
+fn pinned_model_override(route: &LlmModelProfileRoute) -> Result<&str, HostManagedModelError> {
+    let Some(model_override) = route.model_override.as_deref() else {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model profile route must pin a concrete provider model",
+        ));
+    };
+    let trimmed = model_override.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model profile route must pin a concrete provider model",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn response_to_host_reply(
+    response: CompletionResponse,
+) -> Result<HostManagedModelResponse, HostManagedModelError> {
+    match response.finish_reason {
+        FinishReason::Stop => Ok(HostManagedModelResponse::assistant_reply(response.content)),
+        FinishReason::Length => Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::BudgetExceeded,
+            "model response was truncated before completion",
+        )),
+        FinishReason::ContentFilter => Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model response was blocked by provider policy",
+        )),
+        FinishReason::ToolUse => Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::InvalidRequest,
+            "model returned unsupported tool calls for a text-only loop",
+        )),
+        FinishReason::Unknown => Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::Unavailable,
+            "model response did not complete cleanly",
+        )),
     }
 }
 

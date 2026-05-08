@@ -9,8 +9,9 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use ironclaw_threads::{
     AppendAssistantDraftRequest, ContextMessage, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, SessionThreadError, SessionThreadService, ThreadHistoryRequest,
-    ThreadMessageId, ThreadMessageRecord, ThreadScope, UpdateAssistantDraftRequest,
+    MessageKind, MessageStatus, SessionThreadError, SessionThreadService, SummaryArtifact,
+    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
+    UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef,
@@ -213,11 +214,21 @@ where
                 &self.thread_scope,
                 &self.run_context.thread_id,
                 draft.message_id,
-                MessageContent::text(reply_content),
+                MessageContent::text(reply_content.clone()),
             )
-            .await
-            .map_err(transcript_write_error)?;
-        message_ref(finalized.message_id)
+            .await;
+        match finalized {
+            Ok(message) => message_ref(message.message_id),
+            Err(error) => {
+                if let Some(message_id) = self
+                    .already_finalized_matching_reply(draft.message_id, &reply_content)
+                    .await?
+                {
+                    return message_ref(message_id);
+                }
+                Err(transcript_write_error(error))
+            }
+        }
     }
 }
 
@@ -250,6 +261,32 @@ where
             ));
         }
         Ok(message)
+    }
+
+    async fn already_finalized_matching_reply(
+        &self,
+        message_id: ThreadMessageId,
+        reply_content: &str,
+    ) -> Result<Option<ThreadMessageId>, AgentLoopHostError> {
+        let history = self
+            .thread_service
+            .list_thread_history(ThreadHistoryRequest {
+                scope: self.thread_scope.clone(),
+                thread_id: self.run_context.thread_id.clone(),
+            })
+            .await
+            .map_err(transcript_write_error)?;
+        let expected_run_id = self.run_context.run_id.to_string();
+        Ok(history.messages.into_iter().find_map(|message| {
+            let belongs_to_run = message.turn_run_id.as_deref() == Some(expected_run_id.as_str());
+            let matches_reply = message.status == MessageStatus::Finalized
+                && message.content.as_deref() == Some(reply_content);
+            if message.message_id == message_id && belongs_to_run && matches_reply {
+                Some(message.message_id)
+            } else {
+                None
+            }
+        }))
     }
 }
 
@@ -439,7 +476,22 @@ where
             return Ok(messages);
         }
 
-        let messages_by_ref = context_messages_by_ref(context.messages);
+        let mut messages_by_ref = context_messages_by_ref(context.messages);
+        let needs_history_lookup = requested_messages
+            .iter()
+            .any(|message| !messages_by_ref.contains_key(message.content_ref.as_str()));
+        if needs_history_lookup {
+            let history = self
+                .thread_service
+                .list_thread_history(ThreadHistoryRequest {
+                    scope: self.thread_scope.clone(),
+                    thread_id: self.run_context.thread_id.clone(),
+                })
+                .await
+                .map_err(context_read_error)?;
+            messages_by_ref.extend(history_messages_by_ref(history.messages));
+            messages_by_ref.extend(history_summaries_by_ref(history.summary_artifacts));
+        }
         let mut resolved = Vec::with_capacity(requested_messages.len());
         for message in requested_messages {
             let context_message = messages_by_ref
@@ -505,7 +557,7 @@ pub enum HostManagedModelMessageRole {
 impl HostManagedModelMessageRole {
     fn from_loop_role(role: &str) -> Result<Self, AgentLoopHostError> {
         match role {
-            "system" => Ok(Self::System),
+            "system" | "tool_result_reference" => Ok(Self::System),
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
             _ => Err(AgentLoopHostError::new(
@@ -594,13 +646,19 @@ fn validate_context_cursor(
     cursor: Option<&LoopInputCursor>,
     run_context: &LoopRunContext,
 ) -> Result<(), AgentLoopHostError> {
-    if let Some(cursor) = cursor
-        && !cursor.is_for_run(run_context)
-    {
-        return Err(AgentLoopHostError::new(
-            AgentLoopHostErrorKind::ScopeMismatch,
-            "context cursor does not belong to this loop run",
-        ));
+    if let Some(cursor) = cursor {
+        if !cursor.is_for_run(run_context) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "context cursor does not belong to this loop run",
+            ));
+        }
+        if cursor != &LoopInputCursor::origin_for_run(run_context) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "context cursor snapshots are not supported by this host",
+            ));
+        }
     }
     Ok(())
 }
@@ -613,6 +671,49 @@ fn context_messages_by_ref(messages: Vec<ContextMessage>) -> HashMap<String, Con
                 .map(|message_ref| (message_ref.as_str().to_string(), message))
         })
         .collect()
+}
+
+fn history_messages_by_ref(messages: Vec<ThreadMessageRecord>) -> HashMap<String, ContextMessage> {
+    messages
+        .into_iter()
+        .filter(|message| model_visible_status(message.status))
+        .filter_map(|message| {
+            let content = message.content?;
+            let context_message = ContextMessage {
+                message_id: Some(message.message_id),
+                summary_id: None,
+                sequence: message.sequence,
+                kind: message.kind,
+                content,
+            };
+            message_ref_from_context(&context_message)
+                .map(|message_ref| (message_ref.as_str().to_string(), context_message))
+        })
+        .collect()
+}
+
+fn history_summaries_by_ref(summaries: Vec<SummaryArtifact>) -> HashMap<String, ContextMessage> {
+    summaries
+        .into_iter()
+        .filter_map(|summary| {
+            let context_message = ContextMessage {
+                message_id: None,
+                summary_id: Some(summary.summary_id),
+                sequence: summary.end_sequence,
+                kind: MessageKind::Summary,
+                content: summary.content,
+            };
+            message_ref_from_context(&context_message)
+                .map(|message_ref| (message_ref.as_str().to_string(), context_message))
+        })
+        .collect()
+}
+
+fn model_visible_status(status: MessageStatus) -> bool {
+    matches!(
+        status,
+        MessageStatus::Accepted | MessageStatus::Submitted | MessageStatus::Finalized
+    )
 }
 
 fn context_message_to_loop_message(message: ContextMessage) -> Option<LoopContextMessage> {

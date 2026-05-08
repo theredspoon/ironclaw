@@ -49,7 +49,8 @@ async fn gateway_rejects_unknown_model_profile_without_calling_provider() {
     let provider = Arc::new(RecordingLlmProvider::reply("unused"));
     let gateway = LlmProviderModelGateway::new(
         provider.clone(),
-        LlmModelProfilePolicy::new().allow_model_profile(interactive_model(), None),
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
     );
 
     let error = gateway
@@ -62,6 +63,103 @@ async fn gateway_rejects_unknown_model_profile_without_calling_provider() {
 }
 
 #[tokio::test]
+async fn gateway_rejects_unpinned_model_profile_without_calling_provider() {
+    let provider = Arc::new(RecordingLlmProvider::reply("unused"));
+    let gateway = LlmProviderModelGateway::new(
+        provider.clone(),
+        LlmModelProfilePolicy::new().allow_model_profile(interactive_model(), None),
+    );
+
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn gateway_rejects_truncated_provider_responses() {
+    let provider = Arc::new(RecordingLlmProvider::reply_with_finish_reason(
+        "partial response",
+        FinishReason::Length,
+    ));
+    let gateway = LlmProviderModelGateway::new(
+        provider,
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
+    );
+
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::BudgetExceeded);
+}
+
+#[tokio::test]
+async fn gateway_rejects_content_filtered_provider_responses() {
+    let provider = Arc::new(RecordingLlmProvider::reply_with_finish_reason(
+        "filtered response",
+        FinishReason::ContentFilter,
+    ));
+    let gateway = LlmProviderModelGateway::new(
+        provider,
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
+    );
+
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+}
+
+#[tokio::test]
+async fn gateway_rejects_tool_use_provider_responses() {
+    let provider = Arc::new(RecordingLlmProvider::reply_with_finish_reason(
+        "tool call requested",
+        FinishReason::ToolUse,
+    ));
+    let gateway = LlmProviderModelGateway::new(
+        provider,
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
+    );
+
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
+async fn gateway_rejects_unknown_finish_reason_provider_responses() {
+    let provider = Arc::new(RecordingLlmProvider::reply_with_finish_reason(
+        "unknown completion",
+        FinishReason::Unknown,
+    ));
+    let gateway = LlmProviderModelGateway::new(
+        provider,
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
+    );
+
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::Unavailable);
+}
+
+#[tokio::test]
 async fn gateway_sanitizes_provider_errors() {
     let provider = Arc::new(RecordingLlmProvider::fail(LlmError::RequestFailed {
         provider: "raw-provider".to_string(),
@@ -69,7 +167,8 @@ async fn gateway_sanitizes_provider_errors() {
     }));
     let gateway = LlmProviderModelGateway::new(
         provider,
-        LlmModelProfilePolicy::new().allow_model_profile(interactive_model(), None),
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
     );
 
     let error = gateway
@@ -116,13 +215,17 @@ struct RecordingLlmProvider {
 
 impl RecordingLlmProvider {
     fn reply(content: &str) -> Self {
+        Self::reply_with_finish_reason(content, FinishReason::Stop)
+    }
+
+    fn reply_with_finish_reason(content: &str, finish_reason: FinishReason) -> Self {
         Self {
             requests: Mutex::new(Vec::new()),
             response: Mutex::new(Some(Ok(CompletionResponse {
                 content: content.to_string(),
                 input_tokens: 1,
                 output_tokens: 1,
-                finish_reason: FinishReason::Stop,
+                finish_reason,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }))),

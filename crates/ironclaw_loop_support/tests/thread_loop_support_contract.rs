@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
@@ -9,9 +12,12 @@ use ironclaw_loop_support::{
     ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{
-    AcceptInboundMessageRequest, CreateSummaryArtifactRequest, EnsureThreadRequest,
-    InMemorySessionThreadService, MessageContent, MessageKind, MessageStatus, SessionThreadService,
-    ThreadHistoryRequest, ThreadScope,
+    AcceptInboundMessageRequest, AcceptedInboundMessage, AppendAssistantDraftRequest,
+    ContextMessage, ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest,
+    InMemorySessionThreadService, MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
+    SessionThreadError, SessionThreadRecord, SessionThreadService, SummaryArtifact, ThreadHistory,
+    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
+    UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef, RunProfileResolutionRequest, RunProfileResolver, TurnActor, TurnId, TurnRunId,
@@ -100,6 +106,30 @@ async fn thread_context_port_preserves_summary_replacements_as_system_messages()
             .starts_with("msg:summary-")
     );
     assert!(bundle.instruction_snippets.is_empty());
+}
+
+#[tokio::test]
+async fn thread_context_port_rejects_non_origin_context_cursor() {
+    let fixture = ThreadFixture::new().await;
+    let adapter = ThreadBackedLoopContextPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        16,
+    );
+
+    let error = adapter
+        .load_loop_context(LoopContextRequest {
+            after: Some(LoopInputCursor::from_host_token(
+                &fixture.run_context,
+                LoopInputCursorToken::new("input-cursor:after-first-input").unwrap(),
+            )),
+            limit: 16,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
 }
 
 #[tokio::test]
@@ -232,6 +262,46 @@ async fn transcript_port_finalize_is_idempotent_for_matching_reply() {
     assert_eq!(finalized.len(), 1);
     assert_eq!(finalized[0].status, MessageStatus::Finalized);
     assert_eq!(finalized[0].content.as_deref(), Some("idempotent reply"));
+}
+
+#[tokio::test]
+async fn transcript_port_finalize_is_idempotent_under_concurrent_duplicate_calls() {
+    let fixture = GatedThreadFixture::new().await;
+    let adapter = ThreadBackedLoopTranscriptPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+    );
+    let request = FinalizeAssistantMessage {
+        reply: AssistantReply {
+            content: "concurrent reply".to_string(),
+        },
+    };
+
+    let (first, second) = tokio::join!(
+        adapter.finalize_assistant_message(request.clone()),
+        adapter.finalize_assistant_message(request),
+    );
+    let first_ref = first.unwrap();
+    let second_ref = second.unwrap();
+
+    assert_eq!(first_ref, second_ref);
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    let finalized = history
+        .messages
+        .iter()
+        .filter(|message| message.kind == MessageKind::Assistant)
+        .collect::<Vec<_>>();
+    assert_eq!(finalized.len(), 1);
+    assert_eq!(finalized[0].status, MessageStatus::Finalized);
+    assert_eq!(finalized[0].content.as_deref(), Some("concurrent reply"));
 }
 
 #[tokio::test]
@@ -370,6 +440,108 @@ async fn model_port_resolves_thread_message_refs_and_delegates_to_gateway() {
 }
 
 #[tokio::test]
+async fn model_port_resolves_explicit_refs_that_fall_outside_context_window() {
+    let fixture = ThreadFixture::new().await;
+    for index in 0..3 {
+        fixture
+            .thread_service
+            .accept_inbound_message(AcceptInboundMessageRequest {
+                scope: fixture.thread_scope.clone(),
+                thread_id: fixture.thread_id.clone(),
+                actor_id: "user-loop-support".to_string(),
+                source_binding_id: Some("source-web".to_string()),
+                reply_target_binding_id: Some("reply-web".to_string()),
+                external_event_id: Some(format!("event-extra-{index}")),
+                content: MessageContent::text(format!("newer message {index}")),
+            })
+            .await
+            .unwrap();
+    }
+    let gateway = Arc::new(RecordingGateway::reply("model says hi"));
+    let port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway.clone(),
+        1,
+    );
+
+    port.stream_model(LoopModelRequest {
+        messages: vec![LoopModelMessage {
+            role: "user".to_string(),
+            content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+        }],
+        surface_version: None,
+        model_preference: None,
+    })
+    .await
+    .unwrap();
+
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(calls[0].messages[0].content, "hello reborn");
+}
+
+#[tokio::test]
+async fn model_port_round_trips_tool_result_reference_context_as_system_model_input() {
+    let fixture = ThreadFixture::new().await;
+    let tool_result_ref = LoopMessageRef::new("msg:11111111-1111-1111-1111-111111111111").unwrap();
+    let thread_service = Arc::new(StaticContextThreadService::new(ContextMessage {
+        message_id: Some(ThreadMessageId::parse("11111111-1111-1111-1111-111111111111").unwrap()),
+        summary_id: None,
+        sequence: 1,
+        kind: MessageKind::ToolResultReference,
+        content: "tool result content".to_string(),
+    }));
+    let context_port = ThreadBackedLoopContextPort::new(
+        thread_service.clone(),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        16,
+    );
+    let context = context_port
+        .load_loop_context(LoopContextRequest {
+            after: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(context.messages[0].role, "tool_result_reference");
+    assert_eq!(context.messages[0].message_ref, tool_result_ref);
+
+    let gateway = Arc::new(RecordingGateway::reply("model says hi"));
+    let model_port = ThreadBackedLoopModelPort::new(
+        thread_service,
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway.clone(),
+        16,
+    );
+
+    model_port
+        .stream_model(LoopModelRequest {
+            messages: context
+                .messages
+                .into_iter()
+                .map(|message| LoopModelMessage {
+                    role: message.role,
+                    content_ref: message.message_ref,
+                })
+                .collect(),
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(
+        calls[0].messages[0].role,
+        HostManagedModelMessageRole::System
+    );
+    assert_eq!(calls[0].messages[0].content, "tool result content");
+}
+
+#[tokio::test]
 async fn model_port_rejects_message_role_that_disagrees_with_thread_record() {
     let fixture = ThreadFixture::new().await;
     let gateway = Arc::new(RecordingGateway::reply("should not be called"));
@@ -493,6 +665,235 @@ impl ThreadFixture {
             user_message_id: accepted.message_id,
             run_context,
         }
+    }
+}
+
+struct GatedThreadFixture {
+    thread_service: Arc<GatedFinalizeThreadService>,
+    thread_scope: ThreadScope,
+    thread_id: ThreadId,
+    run_context: LoopRunContext,
+}
+
+impl GatedThreadFixture {
+    async fn new() -> Self {
+        let base = ThreadFixture::new().await;
+        let gated = Arc::new(GatedFinalizeThreadService {
+            inner: Arc::clone(&base.thread_service),
+            finalize_entries: AtomicUsize::new(0),
+        });
+        Self {
+            thread_service: gated,
+            thread_scope: base.thread_scope,
+            thread_id: base.thread_id,
+            run_context: base.run_context,
+        }
+    }
+}
+
+struct GatedFinalizeThreadService {
+    inner: Arc<InMemorySessionThreadService>,
+    finalize_entries: AtomicUsize,
+}
+
+#[async_trait]
+impl SessionThreadService for GatedFinalizeThreadService {
+    async fn ensure_thread(
+        &self,
+        request: EnsureThreadRequest,
+    ) -> Result<SessionThreadRecord, SessionThreadError> {
+        self.inner.ensure_thread(request).await
+    }
+
+    async fn accept_inbound_message(
+        &self,
+        request: AcceptInboundMessageRequest,
+    ) -> Result<AcceptedInboundMessage, SessionThreadError> {
+        self.inner.accept_inbound_message(request).await
+    }
+
+    async fn mark_message_submitted(
+        &self,
+        scope: &ThreadScope,
+        thread_id: &ThreadId,
+        message_id: ThreadMessageId,
+        turn_id: String,
+        turn_run_id: String,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.inner
+            .mark_message_submitted(scope, thread_id, message_id, turn_id, turn_run_id)
+            .await
+    }
+
+    async fn mark_message_deferred_busy(
+        &self,
+        scope: &ThreadScope,
+        thread_id: &ThreadId,
+        message_id: ThreadMessageId,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.inner
+            .mark_message_deferred_busy(scope, thread_id, message_id)
+            .await
+    }
+
+    async fn append_assistant_draft(
+        &self,
+        request: AppendAssistantDraftRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.inner.append_assistant_draft(request).await
+    }
+
+    async fn update_assistant_draft(
+        &self,
+        request: UpdateAssistantDraftRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.inner.update_assistant_draft(request).await
+    }
+
+    async fn finalize_assistant_message(
+        &self,
+        scope: &ThreadScope,
+        thread_id: &ThreadId,
+        message_id: ThreadMessageId,
+        content: MessageContent,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.finalize_entries.fetch_add(1, Ordering::SeqCst);
+        while self.finalize_entries.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        self.inner
+            .finalize_assistant_message(scope, thread_id, message_id, content)
+            .await
+    }
+
+    async fn redact_message(
+        &self,
+        request: RedactMessageRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.inner.redact_message(request).await
+    }
+
+    async fn load_context_window(
+        &self,
+        request: ironclaw_threads::LoadContextWindowRequest,
+    ) -> Result<ContextWindow, SessionThreadError> {
+        self.inner.load_context_window(request).await
+    }
+
+    async fn list_thread_history(
+        &self,
+        request: ThreadHistoryRequest,
+    ) -> Result<ThreadHistory, SessionThreadError> {
+        self.inner.list_thread_history(request).await
+    }
+
+    async fn create_summary_artifact(
+        &self,
+        request: CreateSummaryArtifactRequest,
+    ) -> Result<SummaryArtifact, SessionThreadError> {
+        self.inner.create_summary_artifact(request).await
+    }
+}
+
+struct StaticContextThreadService {
+    context_message: ContextMessage,
+}
+
+impl StaticContextThreadService {
+    fn new(context_message: ContextMessage) -> Self {
+        Self { context_message }
+    }
+}
+
+#[async_trait]
+impl SessionThreadService for StaticContextThreadService {
+    async fn ensure_thread(
+        &self,
+        _request: EnsureThreadRequest,
+    ) -> Result<SessionThreadRecord, SessionThreadError> {
+        panic!("static context service does not create threads")
+    }
+
+    async fn accept_inbound_message(
+        &self,
+        _request: AcceptInboundMessageRequest,
+    ) -> Result<AcceptedInboundMessage, SessionThreadError> {
+        panic!("static context service does not accept inbound messages")
+    }
+
+    async fn mark_message_submitted(
+        &self,
+        _scope: &ThreadScope,
+        _thread_id: &ThreadId,
+        _message_id: ThreadMessageId,
+        _turn_id: String,
+        _turn_run_id: String,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("static context service does not mark submitted")
+    }
+
+    async fn mark_message_deferred_busy(
+        &self,
+        _scope: &ThreadScope,
+        _thread_id: &ThreadId,
+        _message_id: ThreadMessageId,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("static context service does not defer messages")
+    }
+
+    async fn append_assistant_draft(
+        &self,
+        _request: AppendAssistantDraftRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("static context service does not append assistant drafts")
+    }
+
+    async fn update_assistant_draft(
+        &self,
+        _request: UpdateAssistantDraftRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("static context service does not update assistant drafts")
+    }
+
+    async fn finalize_assistant_message(
+        &self,
+        _scope: &ThreadScope,
+        _thread_id: &ThreadId,
+        _message_id: ThreadMessageId,
+        _content: MessageContent,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("static context service does not finalize assistant messages")
+    }
+
+    async fn redact_message(
+        &self,
+        _request: RedactMessageRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        panic!("static context service does not redact messages")
+    }
+
+    async fn load_context_window(
+        &self,
+        request: ironclaw_threads::LoadContextWindowRequest,
+    ) -> Result<ContextWindow, SessionThreadError> {
+        Ok(ContextWindow {
+            thread_id: request.thread_id,
+            messages: vec![self.context_message.clone()],
+        })
+    }
+
+    async fn list_thread_history(
+        &self,
+        _request: ThreadHistoryRequest,
+    ) -> Result<ThreadHistory, SessionThreadError> {
+        panic!("static context service does not list history")
+    }
+
+    async fn create_summary_artifact(
+        &self,
+        _request: CreateSummaryArtifactRequest,
+    ) -> Result<SummaryArtifact, SessionThreadError> {
+        panic!("static context service does not create summaries")
     }
 }
 
