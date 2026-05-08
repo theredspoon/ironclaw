@@ -3912,12 +3912,10 @@ dependencies = [
  "ironclaw_engine",
  "ironclaw_gateway",
  "ironclaw_host_api",
- "ironclaw_loop_support",
  "ironclaw_runtime_policy",
  "ironclaw_safety",
  "ironclaw_skills",
  "ironclaw_tui",
- "ironclaw_turns",
  "json5",
  "jsonschema",
  "jsonwebtoken",
@@ -4368,6 +4366,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ironclaw_reborn"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ironclaw",
+ "ironclaw_loop_support",
+ "ironclaw_turns",
+ "rust_decimal",
+ "tokio",
 ]
 
 [[package]]

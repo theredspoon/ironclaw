@@ -20,8 +20,9 @@ use ironclaw_turns::{
         AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft, CapabilityInputRef,
         CapabilityInvocation, CapabilitySurfaceVersion, FinalizeAssistantMessage,
         InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextPort, LoopContextRequest,
-        LoopModelMessage, LoopModelPort, LoopModelRequest, LoopRunContext, LoopTranscriptPort,
-        ParentLoopOutput, UpdateAssistantDraft, VisibleCapabilityRequest,
+        LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest,
+        LoopRunContext, LoopTranscriptPort, ParentLoopOutput, UpdateAssistantDraft,
+        VisibleCapabilityRequest,
     },
 };
 
@@ -45,7 +46,8 @@ async fn thread_context_port_loads_policy_filtered_transcript_messages() {
 
     assert_eq!(bundle.messages.len(), 1);
     assert_eq!(bundle.messages[0].role, "user");
-    assert_eq!(bundle.messages[0].safe_summary, "hello reborn");
+    assert_eq!(bundle.messages[0].safe_summary, "user message available");
+    assert!(!bundle.messages[0].safe_summary.contains("hello reborn"));
     assert_eq!(
         bundle.messages[0].message_ref.as_str(),
         format!("msg:{}", fixture.user_message_id).as_str()
@@ -86,7 +88,8 @@ async fn thread_context_port_preserves_summary_replacements_as_system_messages()
 
     assert_eq!(bundle.messages.len(), 1);
     assert_eq!(bundle.messages[0].role, "system");
-    assert_eq!(bundle.messages[0].safe_summary, "summarized hello");
+    assert_eq!(bundle.messages[0].safe_summary, "summary artifact available");
+    assert!(!bundle.messages[0].safe_summary.contains("summarized hello"));
     assert!(
         bundle.messages[0]
             .message_ref
@@ -111,6 +114,36 @@ async fn thread_ports_reject_thread_scope_mismatch_before_thread_access() {
     let error = adapter
         .load_loop_context(LoopContextRequest {
             after: None,
+            limit: 16,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::ScopeMismatch);
+}
+
+#[tokio::test]
+async fn context_port_rejects_cursor_from_another_run() {
+    let fixture = ThreadFixture::new().await;
+    let other_context = LoopRunContext::new(
+        fixture.run_context.scope.clone(),
+        fixture.run_context.turn_id,
+        TurnRunId::new(),
+        fixture.run_context.resolved_run_profile.clone(),
+    );
+    let adapter = ThreadBackedLoopContextPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        16,
+    );
+
+    let error = adapter
+        .load_loop_context(LoopContextRequest {
+            after: Some(LoopInputCursor::from_host_token(
+                &other_context,
+                LoopInputCursorToken::new("input-cursor:foreign-run").unwrap(),
+            )),
             limit: 16,
         })
         .await

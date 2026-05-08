@@ -128,6 +128,41 @@ fn reborn_turns_public_surface_keeps_runner_api_explicit() {
 }
 
 #[test]
+fn reborn_loop_support_llm_wiring_stays_out_of_root_src() {
+    let root = workspace_root();
+    let root_lib =
+        std::fs::read_to_string(root.join("src/lib.rs")).expect("root src/lib.rs must be readable");
+    assert!(
+        !root_lib.contains("pub mod reborn_loop_support;"),
+        "Reborn loop LLM wiring must live under crates/ironclaw_reborn, not root src/lib.rs"
+    );
+    assert!(
+        !root.join("src/reborn_loop_support.rs").exists(),
+        "Reborn loop LLM wiring must not live under root src/"
+    );
+
+    let reborn_gateway = root.join("crates/ironclaw_reborn/src/model_gateway.rs");
+    assert!(
+        reborn_gateway.exists(),
+        "expected Reborn LLM gateway wiring at {}",
+        reborn_gateway.display()
+    );
+    let reborn_gateway_source = std::fs::read_to_string(&reborn_gateway)
+        .expect("Reborn model gateway source must be readable");
+    assert!(
+        reborn_gateway_source.contains("LlmProviderModelGateway"),
+        "Reborn LLM gateway wiring should expose LlmProviderModelGateway from crates/ironclaw_reborn"
+    );
+
+    let reborn_manifest = std::fs::read_to_string(root.join("crates/ironclaw_reborn/Cargo.toml"))
+        .expect("Reborn manifest must be readable");
+    assert!(
+        reborn_manifest.contains("default-features = false"),
+        "ironclaw_reborn may reuse root LLM code, but it must not enable the root app's default postgres/libsql/tui feature set"
+    );
+}
+
+#[test]
 fn reborn_turns_public_surface_uses_turn_ids_not_runtime_or_process_ids() {
     let root = workspace_root();
     let turns_src = root.join("crates/ironclaw_turns/src");

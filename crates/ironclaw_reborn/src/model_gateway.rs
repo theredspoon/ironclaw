@@ -1,20 +1,19 @@
-//! Root-level adapters for Reborn loop support services.
+//! LLM provider-backed Reborn model gateway wiring.
 //!
-//! Reborn crates define contracts and support adapters without owning raw root
-//! runtime/provider handles. This module is the root composition boundary that
-//! wraps the existing `src/llm` provider trait behind those contracts.
+//! The loop-support crate owns the host-facing model gateway contract. This
+//! adapter lives in the standalone Reborn composition crate because it bridges
+//! that contract to the existing root `src/llm` provider abstraction.
 
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use ironclaw::llm::{ChatMessage, CompletionRequest, LlmError, LlmProvider};
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessage, HostManagedModelMessageRole, HostManagedModelRequest,
     HostManagedModelResponse,
 };
 use ironclaw_turns::run_profile::ModelProfileId;
-
-use crate::llm::{ChatMessage, CompletionRequest, LlmError, LlmProvider};
 
 /// Fail-closed routing policy from resolved Reborn model profile ids to the
 /// host-selected provider/model envelope.

@@ -19,10 +19,10 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied, CapabilityInvocation,
         CapabilityOutcome, CapabilitySurfaceVersion, FinalizeAssistantMessage, LoopContextBundle,
-        LoopContextMessage, LoopContextPort, LoopContextRequest, LoopModelMessage, LoopModelPort,
-        LoopModelRequest, LoopModelResponse, LoopRunContext, LoopRunInfoPort, LoopTranscriptPort,
-        ModelStreamChunk, ParentLoopOutput, UpdateAssistantDraft, VisibleCapabilityRequest,
-        VisibleCapabilitySurface,
+        LoopContextMessage, LoopContextPort, LoopContextRequest, LoopInputCursor,
+        LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse, LoopRunContext,
+        LoopRunInfoPort, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
+        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,7 @@ where
         request: LoopContextRequest,
     ) -> Result<LoopContextBundle, AgentLoopHostError> {
         validate_thread_scope_for_run(&self.thread_scope, &self.run_context)?;
+        validate_context_cursor(request.after.as_ref(), &self.run_context)?;
         let max_messages = bounded_limit(request.limit, self.max_messages);
         let context = self
             .thread_service
@@ -589,6 +590,21 @@ fn bounded_limit(requested: usize, configured: usize) -> usize {
     }
 }
 
+fn validate_context_cursor(
+    cursor: Option<&LoopInputCursor>,
+    run_context: &LoopRunContext,
+) -> Result<(), AgentLoopHostError> {
+    if let Some(cursor) = cursor
+        && !cursor.is_for_run(run_context)
+    {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::ScopeMismatch,
+            "context cursor does not belong to this loop run",
+        ));
+    }
+    Ok(())
+}
+
 fn context_messages_by_ref(messages: Vec<ContextMessage>) -> HashMap<String, ContextMessage> {
     messages
         .into_iter()
@@ -604,7 +620,7 @@ fn context_message_to_loop_message(message: ContextMessage) -> Option<LoopContex
     Some(LoopContextMessage {
         message_ref,
         role: role_for_kind(message.kind).to_string(),
-        safe_summary: message.content,
+        safe_summary: safe_context_summary(message.kind).to_string(),
     })
 }
 
@@ -662,6 +678,17 @@ fn model_role_for_kind(kind: MessageKind) -> HostManagedModelMessageRole {
         | MessageKind::Summary
         | MessageKind::CheckpointReference
         | MessageKind::ToolResultReference => HostManagedModelMessageRole::System,
+    }
+}
+
+fn safe_context_summary(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::User => "user message available",
+        MessageKind::Assistant => "assistant message available",
+        MessageKind::System => "system message available",
+        MessageKind::Summary => "summary artifact available",
+        MessageKind::CheckpointReference => "checkpoint reference available",
+        MessageKind::ToolResultReference => "tool result reference available",
     }
 }
 
