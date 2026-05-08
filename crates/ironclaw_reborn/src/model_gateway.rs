@@ -13,9 +13,13 @@ use ironclaw::llm::{
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessage, HostManagedModelMessageRole, HostManagedModelRequest,
-    HostManagedModelResponse,
+    HostManagedModelResponse, ThreadBackedLoopModelPort,
 };
-use ironclaw_turns::run_profile::ModelProfileId;
+use ironclaw_threads::{SessionThreadService, ThreadScope};
+use ironclaw_turns::run_profile::{
+    AgentLoopHostError, LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest,
+    LoopModelPort, LoopModelResponse, LoopSafeSummary, ModelProfileId,
+};
 
 /// Fail-closed routing policy from resolved Reborn model profile ids to the
 /// host-selected provider/model envelope.
@@ -47,6 +51,67 @@ impl LlmModelProfilePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LlmModelProfileRoute {
     model_override: Option<String>,
+}
+
+/// Production Reborn model gateway backed by durable session-thread context.
+///
+/// This is the concrete adapter intended to sit behind
+/// [`HostManagedLoopModelPort`](ironclaw_turns::run_profile::HostManagedLoopModelPort):
+/// it resolves loop message refs from the durable thread service, then delegates
+/// provider routing and sanitization to the host-managed model gateway.
+#[derive(Clone)]
+pub struct ThreadBackedLoopModelGateway<S, G>
+where
+    S: SessionThreadService + ?Sized,
+    G: HostManagedModelGateway + ?Sized,
+{
+    thread_service: Arc<S>,
+    thread_scope: ThreadScope,
+    host_gateway: Arc<G>,
+    max_messages: usize,
+}
+
+impl<S, G> ThreadBackedLoopModelGateway<S, G>
+where
+    S: SessionThreadService + ?Sized,
+    G: HostManagedModelGateway + ?Sized,
+{
+    pub fn new(
+        thread_service: Arc<S>,
+        thread_scope: ThreadScope,
+        host_gateway: Arc<G>,
+        max_messages: usize,
+    ) -> Self {
+        Self {
+            thread_service,
+            thread_scope,
+            host_gateway,
+            max_messages,
+        }
+    }
+}
+
+#[async_trait]
+impl<S, G> LoopModelGateway for ThreadBackedLoopModelGateway<S, G>
+where
+    S: SessionThreadService + ?Sized + Send + Sync,
+    G: HostManagedModelGateway + ?Sized + Send + Sync,
+{
+    async fn stream_model(
+        &self,
+        request: LoopModelGatewayRequest,
+    ) -> Result<LoopModelResponse, LoopModelGatewayError> {
+        ThreadBackedLoopModelPort::new(
+            Arc::clone(&self.thread_service),
+            self.thread_scope.clone(),
+            request.context,
+            Arc::clone(&self.host_gateway),
+            self.max_messages,
+        )
+        .stream_model(request.request)
+        .await
+        .map_err(host_error_to_model_gateway_error)
+    }
 }
 
 /// Host-managed model gateway backed by the root `LlmProvider` abstraction.
@@ -107,6 +172,22 @@ where
             .map_err(map_provider_error)?;
         response_to_host_reply(response)
     }
+}
+
+fn host_error_to_model_gateway_error(error: AgentLoopHostError) -> LoopModelGatewayError {
+    let diagnostic_ref = error.diagnostic_ref;
+    let mut converted = match LoopModelGatewayError::new(error.kind, error.safe_summary) {
+        Ok(error) => error,
+        Err(_) => LoopModelGatewayError {
+            kind: error.kind,
+            safe_summary: LoopSafeSummary::model_gateway_failed(),
+            diagnostic_ref: None,
+        },
+    };
+    if let Some(diagnostic_ref) = diagnostic_ref {
+        converted = converted.with_diagnostic_ref(diagnostic_ref);
+    }
+    converted
 }
 
 fn pinned_model_override(route: &LlmModelProfileRoute) -> Result<&str, HostManagedModelError> {
