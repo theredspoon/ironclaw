@@ -9,8 +9,8 @@ use std::{collections::HashMap, sync::Arc};
 use async_trait::async_trait;
 use ironclaw_threads::{
     AppendAssistantDraftRequest, ContextMessage, LoadContextWindowRequest, MessageContent,
-    MessageKind, SessionThreadError, SessionThreadService, ThreadMessageId, ThreadScope,
-    UpdateAssistantDraftRequest,
+    MessageKind, MessageStatus, SessionThreadError, SessionThreadService, ThreadHistoryRequest,
+    ThreadMessageId, ThreadMessageRecord, ThreadScope, UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef,
@@ -168,6 +168,7 @@ where
     ) -> Result<(), AgentLoopHostError> {
         validate_thread_scope_for_run(&self.thread_scope, &self.run_context)?;
         let message_id = message_id_from_ref(&request.message_ref)?;
+        self.load_current_run_message(message_id).await?;
         self.thread_service
             .update_assistant_draft(UpdateAssistantDraftRequest {
                 scope: self.thread_scope.clone(),
@@ -185,27 +186,69 @@ where
         request: FinalizeAssistantMessage,
     ) -> Result<LoopMessageRef, AgentLoopHostError> {
         validate_thread_scope_for_run(&self.thread_scope, &self.run_context)?;
+        let reply_content = request.reply.content;
         let draft = self
             .thread_service
             .append_assistant_draft(AppendAssistantDraftRequest {
                 scope: self.thread_scope.clone(),
                 thread_id: self.run_context.thread_id.clone(),
                 turn_run_id: self.run_context.run_id.to_string(),
-                content: MessageContent::text(request.reply.content.clone()),
+                content: MessageContent::text(reply_content.clone()),
             })
             .await
             .map_err(transcript_write_error)?;
+        if draft.status == MessageStatus::Finalized {
+            if draft.content.as_deref() == Some(reply_content.as_str()) {
+                return message_ref(draft.message_id);
+            }
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::TranscriptWriteFailed,
+                "assistant transcript write failed",
+            ));
+        }
         let finalized = self
             .thread_service
             .finalize_assistant_message(
                 &self.thread_scope,
                 &self.run_context.thread_id,
                 draft.message_id,
-                MessageContent::text(request.reply.content),
+                MessageContent::text(reply_content),
             )
             .await
             .map_err(transcript_write_error)?;
         message_ref(finalized.message_id)
+    }
+}
+
+impl<S> ThreadBackedLoopTranscriptPort<S>
+where
+    S: SessionThreadService + ?Sized + Send + Sync,
+{
+    async fn load_current_run_message(
+        &self,
+        message_id: ThreadMessageId,
+    ) -> Result<ThreadMessageRecord, AgentLoopHostError> {
+        let history = self
+            .thread_service
+            .list_thread_history(ThreadHistoryRequest {
+                scope: self.thread_scope.clone(),
+                thread_id: self.run_context.thread_id.clone(),
+            })
+            .await
+            .map_err(transcript_write_error)?;
+        let message = history
+            .messages
+            .into_iter()
+            .find(|message| message.message_id == message_id)
+            .ok_or_else(invalid_transcript_ref_error)?;
+        let expected_run_id = self.run_context.run_id.to_string();
+        if message.turn_run_id.as_deref() != Some(expected_run_id.as_str()) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "transcript message does not belong to this loop run",
+            ));
+        }
+        Ok(message)
     }
 }
 
@@ -406,8 +449,16 @@ where
                         "model message reference is unavailable",
                     )
                 })?;
+            let requested_role = HostManagedModelMessageRole::from_loop_role(&message.role)?;
+            let durable_role = model_role_for_kind(context_message.kind);
+            if requested_role != durable_role {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "model message role does not match transcript message",
+                ));
+            }
             resolved.push(HostManagedModelMessage {
-                role: HostManagedModelMessageRole::from_loop_role(&message.role)?,
+                role: durable_role,
                 content: context_message.content.clone(),
                 content_ref: message.content_ref,
             });
@@ -580,18 +631,18 @@ fn message_ref(message_id: ThreadMessageId) -> Result<LoopMessageRef, AgentLoopH
 fn message_id_from_ref(
     message_ref: &LoopMessageRef,
 ) -> Result<ThreadMessageId, AgentLoopHostError> {
-    let raw = message_ref.as_str().strip_prefix("msg:").ok_or_else(|| {
-        AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            "transcript message reference is invalid",
-        )
-    })?;
-    ThreadMessageId::parse(raw).map_err(|_| {
-        AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            "transcript message reference is invalid",
-        )
-    })
+    let raw = message_ref
+        .as_str()
+        .strip_prefix("msg:")
+        .ok_or_else(invalid_transcript_ref_error)?;
+    ThreadMessageId::parse(raw).map_err(|_| invalid_transcript_ref_error())
+}
+
+fn invalid_transcript_ref_error() -> AgentLoopHostError {
+    AgentLoopHostError::new(
+        AgentLoopHostErrorKind::InvalidInvocation,
+        "transcript message reference is invalid",
+    )
 }
 
 fn role_for_kind(kind: MessageKind) -> &'static str {

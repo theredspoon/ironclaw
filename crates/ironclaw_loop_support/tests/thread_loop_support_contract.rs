@@ -17,11 +17,11 @@ use ironclaw_turns::{
     LoopMessageRef, RunProfileResolutionRequest, RunProfileResolver, TurnActor, TurnId, TurnRunId,
     TurnScope,
     run_profile::{
-        AgentLoopHostErrorKind, AssistantReply, CapabilityInputRef, CapabilityInvocation,
-        CapabilitySurfaceVersion, FinalizeAssistantMessage, InMemoryRunProfileResolver,
-        LoopCapabilityPort, LoopContextPort, LoopContextRequest, LoopModelMessage, LoopModelPort,
-        LoopModelRequest, LoopRunContext, LoopTranscriptPort, ParentLoopOutput,
-        VisibleCapabilityRequest,
+        AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft, CapabilityInputRef,
+        CapabilityInvocation, CapabilitySurfaceVersion, FinalizeAssistantMessage,
+        InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextPort, LoopContextRequest,
+        LoopModelMessage, LoopModelPort, LoopModelRequest, LoopRunContext, LoopTranscriptPort,
+        ParentLoopOutput, UpdateAssistantDraft, VisibleCapabilityRequest,
     },
 };
 
@@ -160,6 +160,96 @@ async fn transcript_port_finalizes_assistant_reply_into_durable_thread_history()
 }
 
 #[tokio::test]
+async fn transcript_port_finalize_is_idempotent_for_matching_reply() {
+    let fixture = ThreadFixture::new().await;
+    let adapter = ThreadBackedLoopTranscriptPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+    );
+    let request = FinalizeAssistantMessage {
+        reply: AssistantReply {
+            content: "idempotent reply".to_string(),
+        },
+    };
+
+    let first_ref = adapter
+        .finalize_assistant_message(request.clone())
+        .await
+        .unwrap();
+    let second_ref = adapter.finalize_assistant_message(request).await.unwrap();
+
+    assert_eq!(first_ref, second_ref);
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    let finalized = history
+        .messages
+        .iter()
+        .filter(|message| message.kind == MessageKind::Assistant)
+        .collect::<Vec<_>>();
+    assert_eq!(finalized.len(), 1);
+    assert_eq!(finalized[0].status, MessageStatus::Finalized);
+    assert_eq!(finalized[0].content.as_deref(), Some("idempotent reply"));
+}
+
+#[tokio::test]
+async fn transcript_port_rejects_draft_updates_from_other_runs() {
+    let fixture = ThreadFixture::new().await;
+    let run_a = ThreadBackedLoopTranscriptPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+    );
+    let draft_ref = run_a
+        .begin_assistant_draft(BeginAssistantDraft {
+            reply: AssistantReply {
+                content: "run A draft".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+    let mut run_b_context = fixture.run_context.clone();
+    run_b_context.run_id = TurnRunId::new();
+    let run_b = ThreadBackedLoopTranscriptPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        run_b_context,
+    );
+
+    let error = run_b
+        .update_assistant_draft(UpdateAssistantDraft {
+            message_ref: draft_ref,
+            reply: AssistantReply {
+                content: "run B overwrite".to_string(),
+            },
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    let assistant = history
+        .messages
+        .iter()
+        .find(|message| message.kind == MessageKind::Assistant)
+        .expect("assistant draft must exist");
+    assert_eq!(assistant.content.as_deref(), Some("run A draft"));
+}
+
+#[tokio::test]
 async fn empty_capability_port_exposes_empty_surface_and_rejects_invocations() {
     let port = EmptyLoopCapabilityPort;
 
@@ -241,6 +331,35 @@ async fn model_port_resolves_thread_message_refs_and_delegates_to_gateway() {
     assert_eq!(calls[0].model_profile_id.as_str(), "interactive_model");
     assert_eq!(calls[0].messages[0].role, HostManagedModelMessageRole::User);
     assert_eq!(calls[0].messages[0].content, "hello reborn");
+}
+
+#[tokio::test]
+async fn model_port_rejects_message_role_that_disagrees_with_thread_record() {
+    let fixture = ThreadFixture::new().await;
+    let gateway = Arc::new(RecordingGateway::reply("should not be called"));
+    let port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway.clone(),
+        16,
+    );
+
+    let error = port
+        .stream_model(LoopModelRequest {
+            messages: vec![LoopModelMessage {
+                role: "system".to_string(),
+                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
+                    .unwrap(),
+            }],
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    assert!(gateway.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
