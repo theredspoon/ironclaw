@@ -68,6 +68,7 @@ pub enum SecretLeaseStatus {
     Active,
     Consumed,
     Revoked,
+    Expired,
 }
 
 /// Metadata for a scoped one-shot secret lease.
@@ -134,6 +135,10 @@ impl SecretStoreError {
 
     pub fn is_revoked(&self) -> bool {
         matches!(self, Self::LeaseRevoked { .. })
+    }
+
+    pub fn is_expired(&self) -> bool {
+        matches!(self, Self::SecretExpired | Self::LeaseExpired { .. })
     }
 }
 
@@ -646,7 +651,9 @@ fn raw_url_path(url: &str) -> Option<&str> {
 fn path_has_encoded_traversal(path: &str) -> bool {
     path.split('/').any(|segment| {
         let decoded = percent_decode_bytes(segment.as_bytes());
-        matches!(decoded.as_slice(), b"." | b"..") || decoded.contains(&b'/')
+        matches!(decoded.as_slice(), b"." | b"..")
+            || decoded.contains(&b'/')
+            || decoded.contains(&b'%')
     })
 }
 
@@ -793,9 +800,9 @@ impl SecretLeaseKey {
 #[derive(Debug, Clone)]
 struct LeaseRecord {
     lease: SecretLease,
-    material: Option<SecretMaterial>,
     secret_id: Uuid,
-    expires_at: Timestamp,
+    lease_expires_at: Timestamp,
+    secret_expires_at: Option<Timestamp>,
 }
 
 /// Adapter that exposes the battle-tested encrypted [`SecretsStore`] contract
@@ -804,6 +811,7 @@ struct LeaseRecord {
 pub struct ScopedSecretsStoreAdapter<S> {
     inner: Arc<S>,
     leases: Mutex<HashMap<SecretLeaseKey, LeaseRecord>>,
+    lease_ttl: Duration,
 }
 
 impl<S> ScopedSecretsStoreAdapter<S>
@@ -811,9 +819,14 @@ where
     S: SecretsStore + 'static,
 {
     pub fn new(inner: Arc<S>) -> Self {
+        Self::with_lease_ttl(inner, Duration::seconds(DEFAULT_SECRET_LEASE_TTL_SECONDS))
+    }
+
+    pub fn with_lease_ttl(inner: Arc<S>, lease_ttl: Duration) -> Self {
         Self {
             inner,
             leases: Mutex::new(HashMap::new()),
+            lease_ttl,
         }
     }
 
@@ -825,6 +838,26 @@ where
             .map_err(|error| SecretStoreError::StoreUnavailable {
                 reason: error.to_string(),
             })
+    }
+
+    fn mark_consumed_lease(
+        &self,
+        scope: &ResourceScope,
+        lease_id: SecretLeaseId,
+        status: SecretLeaseStatus,
+    ) -> Result<(), SecretStoreError> {
+        let mut leases = self.lock_leases()?;
+        let key = SecretLeaseKey::new(scope, lease_id);
+        let record = leases
+            .get_mut(&key)
+            .ok_or_else(|| SecretStoreError::UnknownLease {
+                scope: Box::new(scope.clone()),
+                lease_id,
+            })?;
+        if record.lease.status == SecretLeaseStatus::Consumed {
+            record.lease.status = status;
+        }
+        Ok(())
     }
 }
 
@@ -895,11 +928,6 @@ where
                 },
                 other => map_legacy_secret_error(other),
             })?;
-        let material = self
-            .inner
-            .get_decrypted(&legacy_user_id, handle.as_str())
-            .await
-            .map_err(map_legacy_secret_error)?;
         let lease = SecretLease {
             id: SecretLeaseId::new(),
             scope: scope.clone(),
@@ -910,9 +938,9 @@ where
             SecretLeaseKey::new(scope, lease.id),
             LeaseRecord {
                 lease: lease.clone(),
-                material: Some(SecretMaterial::from(material.expose().to_string())),
                 secret_id: secret.id,
-                expires_at: Utc::now() + Duration::seconds(DEFAULT_SECRET_LEASE_TTL_SECONDS),
+                lease_expires_at: Utc::now() + self.lease_ttl,
+                secret_expires_at: secret.expires_at,
             },
         );
         Ok(lease)
@@ -923,8 +951,9 @@ where
         scope: &ResourceScope,
         lease_id: SecretLeaseId,
     ) -> Result<SecretMaterial, SecretStoreError> {
-        let (material, secret_id) = {
+        let (handle, secret_id) = {
             let mut leases = self.lock_leases()?;
+            expire_stale_active_leases(&mut leases, Utc::now());
             let key = SecretLeaseKey::new(scope, lease_id);
             let record = leases
                 .get_mut(&key)
@@ -934,19 +963,8 @@ where
                 })?;
             match record.lease.status {
                 SecretLeaseStatus::Active => {
-                    if record.expires_at <= Utc::now() {
-                        record.material = None;
-                        record.lease.status = SecretLeaseStatus::Revoked;
-                        return Err(SecretStoreError::LeaseExpired { lease_id });
-                    }
-                    let Some(material) = record.material.take() else {
-                        record.lease.status = SecretLeaseStatus::Consumed;
-                        return Err(SecretStoreError::StoreUnavailable {
-                            reason: "active lease material unavailable".to_string(),
-                        });
-                    };
                     record.lease.status = SecretLeaseStatus::Consumed;
-                    (material, record.secret_id)
+                    (record.lease.handle.clone(), record.secret_id)
                 }
                 SecretLeaseStatus::Consumed => {
                     return Err(SecretStoreError::LeaseConsumed { lease_id });
@@ -954,13 +972,31 @@ where
                 SecretLeaseStatus::Revoked => {
                     return Err(SecretStoreError::LeaseRevoked { lease_id });
                 }
+                SecretLeaseStatus::Expired => {
+                    return Err(SecretStoreError::LeaseExpired { lease_id });
+                }
             }
         };
-        self.inner
-            .record_usage(secret_id)
+        let material = match self
+            .inner
+            .get_decrypted(&scoped_legacy_user_id(scope), handle.as_str())
             .await
-            .map_err(map_legacy_secret_error)?;
-        Ok(material)
+        {
+            Ok(material) => material,
+            Err(SecretError::Expired) => {
+                self.mark_consumed_lease(scope, lease_id, SecretLeaseStatus::Expired)?;
+                return Err(SecretStoreError::LeaseExpired { lease_id });
+            }
+            Err(error) => {
+                self.mark_consumed_lease(scope, lease_id, SecretLeaseStatus::Active)?;
+                return Err(map_legacy_secret_error(error));
+            }
+        };
+        if let Err(error) = self.inner.record_usage(secret_id).await {
+            self.mark_consumed_lease(scope, lease_id, SecretLeaseStatus::Active)?;
+            return Err(map_legacy_secret_error(error));
+        }
+        Ok(SecretMaterial::from(material.expose().to_string()))
     }
 
     async fn revoke(
@@ -969,7 +1005,7 @@ where
         lease_id: SecretLeaseId,
     ) -> Result<SecretLease, SecretStoreError> {
         let mut leases = self.lock_leases()?;
-        prune_inactive_or_expired_leases(&mut leases);
+        expire_stale_active_leases(&mut leases, Utc::now());
         let key = SecretLeaseKey::new(scope, lease_id);
         let record = leases
             .get_mut(&key)
@@ -978,7 +1014,6 @@ where
                 lease_id,
             })?;
         if record.lease.status == SecretLeaseStatus::Active {
-            record.material = None;
             record.lease.status = SecretLeaseStatus::Revoked;
         }
         Ok(record.lease.clone())
@@ -989,7 +1024,7 @@ where
         scope: &ResourceScope,
     ) -> Result<Vec<SecretLease>, SecretStoreError> {
         let mut leases = self.lock_leases()?;
-        prune_inactive_or_expired_leases(&mut leases);
+        expire_stale_active_leases(&mut leases, Utc::now());
         Ok(leases
             .iter()
             .filter(|(key, _)| key.matches_scope(scope))
@@ -998,11 +1033,16 @@ where
     }
 }
 
-fn prune_inactive_or_expired_leases(leases: &mut HashMap<SecretLeaseKey, LeaseRecord>) {
-    let now = Utc::now();
-    leases.retain(|_, record| {
-        record.lease.status != SecretLeaseStatus::Active || record.expires_at > now
-    });
+fn expire_stale_active_leases(leases: &mut HashMap<SecretLeaseKey, LeaseRecord>, now: Timestamp) {
+    for record in leases.values_mut() {
+        let lease_expired = record.lease_expires_at <= now;
+        let secret_expired = record
+            .secret_expires_at
+            .is_some_and(|secret_expires_at| secret_expires_at <= now);
+        if record.lease.status == SecretLeaseStatus::Active && (lease_expired || secret_expired) {
+            record.lease.status = SecretLeaseStatus::Expired;
+        }
+    }
 }
 
 fn map_legacy_secret_error(error: SecretError) -> SecretStoreError {
@@ -1199,6 +1239,10 @@ mod tests {
         assert!(!policy.matches(
             &NetworkMethod::Get,
             "https://api.example.com/v1/%2e%2e%2fadmin"
+        ));
+        assert!(!policy.matches(
+            &NetworkMethod::Get,
+            "https://api.example.com/v1/%252e%252e%252fadmin"
         ));
         assert!(!policy.matches(&NetworkMethod::Get, "https://api.example.com/v1/%2e/admin"));
 
@@ -1572,7 +1616,7 @@ mod tests {
             let record = leases
                 .get_mut(&SecretLeaseKey::new(&scope, lease.id))
                 .unwrap();
-            record.expires_at = Utc::now() - chrono::Duration::seconds(1);
+            record.lease_expires_at = Utc::now() - chrono::Duration::seconds(1);
         }
 
         assert!(matches!(
