@@ -3912,10 +3912,12 @@ dependencies = [
  "ironclaw_engine",
  "ironclaw_gateway",
  "ironclaw_host_api",
+ "ironclaw_loop_support",
  "ironclaw_runtime_policy",
  "ironclaw_safety",
  "ironclaw_skills",
  "ironclaw_tui",
+ "ironclaw_turns",
  "json5",
  "jsonschema",
  "jsonwebtoken",
@@ -4244,6 +4246,20 @@ dependencies = [
  "wat",
  "wit-component 0.245.1",
  "wit-parser 0.245.1",
+]
+
+[[package]]
+name = "ironclaw_loop_support"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ironclaw_host_api",
+ "ironclaw_threads",
+ "ironclaw_turns",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

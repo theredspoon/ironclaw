@@ -68,6 +68,7 @@ pub mod orchestrator;
 pub mod ownership;
 pub mod pairing;
 pub mod profile;
+pub mod reborn_loop_support;
 pub mod registry;
 pub mod safety;
 pub mod sandbox;
