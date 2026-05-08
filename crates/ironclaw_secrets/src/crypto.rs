@@ -31,12 +31,12 @@ impl SecretsCrypto {
         Ok(Self { master_key })
     }
 
-    pub(crate) fn from_valid_master_key_literal(master_key: &'static str) -> Self {
-        // The caller is limited to crate-owned literals whose length is reviewed
-        // at compile time. This keeps infallible test/demo store construction out
-        // of production panic paths while preserving `new` validation for dynamic keys.
+    pub(crate) fn from_valid_master_key(master_key: String) -> Self {
+        // The caller is limited to crate-owned key generation whose byte length is reviewed.
+        // This keeps infallible test/demo store construction out of production panic paths
+        // while preserving `new` validation for externally supplied dynamic keys.
         Self {
-            master_key: SecretString::from(master_key.to_string()),
+            master_key: SecretString::from(master_key),
         }
     }
 

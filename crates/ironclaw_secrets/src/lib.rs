@@ -14,6 +14,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use chrono::{Duration, Utc};
 pub use crypto::SecretsCrypto;
 use ironclaw_host_api::{
     AgentId, CapabilityId, ExtensionId, InvocationId, MissionId, NetworkMethod, ProjectId,
@@ -24,9 +25,13 @@ pub use legacy_store::{
     SecretError, SecretRef, SecretsStore,
 };
 pub use secrecy::SecretString as SecretMaterial;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
+
+const CREDENTIAL_ID_MAX_LEN: usize = 128;
+const DEFAULT_SECRET_LEASE_TTL_SECONDS: i64 = 300;
 
 /// Opaque identifier for a one-shot secret lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,6 +96,12 @@ pub enum SecretStoreError {
     LeaseConsumed { lease_id: SecretLeaseId },
     #[error("secret lease {lease_id} was revoked")]
     LeaseRevoked { lease_id: SecretLeaseId },
+    #[error("secret lease {lease_id} expired")]
+    LeaseExpired { lease_id: SecretLeaseId },
+    #[error("secret expired")]
+    SecretExpired,
+    #[error("secret backend is misconfigured: {reason}")]
+    BackendMisconfigured { reason: String },
     #[error("secret store state is unavailable: {reason}")]
     StoreUnavailable { reason: String },
 }
@@ -102,6 +113,9 @@ impl SecretStoreError {
             Self::UnknownLease { .. } => "MissingCredential",
             Self::LeaseConsumed { .. } => "CredentialExpired",
             Self::LeaseRevoked { .. } => "CredentialRevoked",
+            Self::LeaseExpired { .. } => "CredentialExpired",
+            Self::SecretExpired => "CredentialExpired",
+            Self::BackendMisconfigured { .. } => "BackendMisconfigured",
             Self::StoreUnavailable { .. } => "BackendUnavailable",
         }
     }
@@ -123,7 +137,31 @@ impl SecretStoreError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedJson(Value);
+
+impl RedactedJson {
+    pub fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl fmt::Debug for RedactedJson {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED_JSON]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct CredentialAccountId(String);
 
 impl CredentialAccountId {
@@ -135,6 +173,40 @@ impl CredentialAccountId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for CredentialAccountId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<String> for CredentialAccountId {
+    type Error = CredentialBrokerError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<CredentialAccountId> for String {
+    fn from(value: CredentialAccountId) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CredentialAccountId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -156,6 +228,12 @@ impl CredentialSessionId {
 impl Default for CredentialSessionId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Display for CredentialSessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -186,6 +264,12 @@ impl CredentialTargetPolicy {
         let Ok(parsed) = url::Url::parse(url) else {
             return false;
         };
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return false;
+        }
+        if raw_url_path(url).is_some_and(path_has_encoded_traversal) {
+            return false;
+        }
         if self.scheme != parsed.scheme() {
             return false;
         }
@@ -220,22 +304,55 @@ pub struct CredentialAccount {
     pub status: CredentialAccountStatus,
     pub secret_handles: Vec<SecretHandle>,
     pub allowed_targets: Vec<CredentialTargetPolicy>,
-    pub redacted_metadata: Value,
+    pub redacted_metadata: RedactedJson,
     pub updated_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialSession {
-    pub scope: ResourceScope,
-    pub invocation_id: InvocationId,
-    pub capability_id: CapabilityId,
-    pub extension_id: ExtensionId,
-    pub account_id: CredentialAccountId,
-    pub secret_handles: Vec<SecretHandle>,
-    pub allowed_targets: Vec<CredentialTargetPolicy>,
-    pub expires_at: Option<Timestamp>,
-    pub max_uses: Option<u64>,
-    pub correlation_id: CredentialSessionId,
+    scope: ResourceScope,
+    invocation_id: InvocationId,
+    capability_id: CapabilityId,
+    extension_id: ExtensionId,
+    account_id: CredentialAccountId,
+    secret_handles: Vec<SecretHandle>,
+    allowed_targets: Vec<CredentialTargetPolicy>,
+    expires_at: Option<Timestamp>,
+    max_uses: Option<u64>,
+    correlation_id: CredentialSessionId,
+}
+
+impl CredentialSession {
+    pub fn scope(&self) -> &ResourceScope {
+        &self.scope
+    }
+    pub fn invocation_id(&self) -> InvocationId {
+        self.invocation_id
+    }
+    pub fn capability_id(&self) -> &CapabilityId {
+        &self.capability_id
+    }
+    pub fn extension_id(&self) -> &ExtensionId {
+        &self.extension_id
+    }
+    pub fn account_id(&self) -> &CredentialAccountId {
+        &self.account_id
+    }
+    pub fn secret_handles(&self) -> &[SecretHandle] {
+        &self.secret_handles
+    }
+    pub fn allowed_targets(&self) -> &[CredentialTargetPolicy] {
+        &self.allowed_targets
+    }
+    pub fn expires_at(&self) -> Option<Timestamp> {
+        self.expires_at
+    }
+    pub fn max_uses(&self) -> Option<u64> {
+        self.max_uses
+    }
+    pub fn correlation_id(&self) -> CredentialSessionId {
+        self.correlation_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -246,6 +363,16 @@ pub enum CredentialBrokerError {
     MissingCredential { account_id: CredentialAccountId },
     #[error("credential account {account_id} does not match caller scope")]
     CredentialScopeMismatch { account_id: CredentialAccountId },
+    #[error("credential session request invocation does not match caller scope for {account_id}")]
+    CredentialInvocationMismatch { account_id: CredentialAccountId },
+    #[error("credential broker state is unavailable: {reason}")]
+    BrokerUnavailable { reason: String },
+    #[error("credential session {session_id} is unknown")]
+    UnknownSession { session_id: CredentialSessionId },
+    #[error("credential session {session_id} is expired")]
+    SessionExpired { session_id: CredentialSessionId },
+    #[error("credential session {session_id} has no uses remaining")]
+    SessionUseLimitExceeded { session_id: CredentialSessionId },
     #[error("credential account {account_id} is expired")]
     CredentialExpired { account_id: CredentialAccountId },
     #[error("credential account {account_id} is revoked")]
@@ -262,6 +389,11 @@ impl CredentialBrokerError {
             Self::InvalidAccountId { .. } => "MissingCredential",
             Self::MissingCredential { .. } => "MissingCredential",
             Self::CredentialScopeMismatch { .. } => "CredentialScopeMismatch",
+            Self::CredentialInvocationMismatch { .. } => "CredentialScopeMismatch",
+            Self::BrokerUnavailable { .. } => "BackendUnavailable",
+            Self::UnknownSession { .. } => "MissingCredential",
+            Self::SessionExpired { .. } => "CredentialExpired",
+            Self::SessionUseLimitExceeded { .. } => "CredentialExpired",
             Self::CredentialExpired { .. } => "CredentialExpired",
             Self::CredentialRevoked { .. } => "CredentialRevoked",
             Self::CredentialExtensionMismatch { .. } => "CredentialPolicyMismatch",
@@ -286,6 +418,13 @@ pub struct CredentialSessionRequest {
 #[derive(Debug, Default)]
 pub struct InMemoryCredentialBroker {
     accounts: Mutex<HashMap<CredentialAccountKey, CredentialAccount>>,
+    sessions: Mutex<HashMap<CredentialSessionId, CredentialSessionRecord>>,
+}
+
+#[derive(Debug, Clone)]
+struct CredentialSessionRecord {
+    session: CredentialSession,
+    uses: u64,
 }
 
 impl InMemoryCredentialBroker {
@@ -296,8 +435,8 @@ impl InMemoryCredentialBroker {
     pub fn put_account(&self, account: CredentialAccount) -> Result<(), CredentialBrokerError> {
         self.accounts
             .lock()
-            .map_err(|_| CredentialBrokerError::MissingCredential {
-                account_id: account.id.clone(),
+            .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                reason: error.to_string(),
             })?
             .insert(
                 CredentialAccountKey::new(&account.scope, &account.id),
@@ -310,11 +449,16 @@ impl InMemoryCredentialBroker {
         &self,
         request: CredentialSessionRequest,
     ) -> Result<CredentialSession, CredentialBrokerError> {
+        if request.invocation_id != request.scope.invocation_id {
+            return Err(CredentialBrokerError::CredentialInvocationMismatch {
+                account_id: request.account_id,
+            });
+        }
         let accounts =
             self.accounts
                 .lock()
-                .map_err(|_| CredentialBrokerError::MissingCredential {
-                    account_id: request.account_id.clone(),
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
                 })?;
         let account = accounts
             .get(&CredentialAccountKey::new(
@@ -358,7 +502,7 @@ impl InMemoryCredentialBroker {
                 account_id: request.account_id,
             });
         }
-        Ok(CredentialSession {
+        let session = CredentialSession {
             scope: request.scope,
             invocation_id: request.invocation_id,
             capability_id: request.capability_id,
@@ -369,7 +513,84 @@ impl InMemoryCredentialBroker {
             expires_at: request.expires_at,
             max_uses: request.max_uses,
             correlation_id: CredentialSessionId::new(),
-        })
+        };
+        drop(accounts);
+        self.sessions
+            .lock()
+            .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                reason: error.to_string(),
+            })?
+            .insert(
+                session.correlation_id,
+                CredentialSessionRecord {
+                    session: session.clone(),
+                    uses: 0,
+                },
+            );
+        Ok(session)
+    }
+
+    pub fn validate_session(
+        &self,
+        session_id: CredentialSessionId,
+        now: Timestamp,
+    ) -> Result<CredentialSession, CredentialBrokerError> {
+        let mut sessions =
+            self.sessions
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        let record = sessions
+            .get_mut(&session_id)
+            .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
+        if record
+            .session
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return Err(CredentialBrokerError::SessionExpired { session_id });
+        }
+        if record
+            .session
+            .max_uses
+            .is_some_and(|max_uses| record.uses >= max_uses)
+        {
+            return Err(CredentialBrokerError::SessionUseLimitExceeded { session_id });
+        }
+        Ok(record.session.clone())
+    }
+
+    pub fn consume_session_use(
+        &self,
+        session_id: CredentialSessionId,
+        now: Timestamp,
+    ) -> Result<CredentialSession, CredentialBrokerError> {
+        let mut sessions =
+            self.sessions
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        let record = sessions
+            .get_mut(&session_id)
+            .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
+        if record
+            .session
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            return Err(CredentialBrokerError::SessionExpired { session_id });
+        }
+        if record
+            .session
+            .max_uses
+            .is_some_and(|max_uses| record.uses >= max_uses)
+        {
+            return Err(CredentialBrokerError::SessionUseLimitExceeded { session_id });
+        }
+        record.uses += 1;
+        Ok(record.session.clone())
     }
 }
 
@@ -395,6 +616,9 @@ impl CredentialAccountKey {
 }
 
 fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if path_has_encoded_traversal(path) {
+        return false;
+    }
     let path = path.strip_suffix('/').unwrap_or(path);
     let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
     if path == prefix {
@@ -407,15 +631,73 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     false
 }
 
+fn raw_url_path(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://")?.1;
+    let path_start = after_scheme.find('/')?;
+    let path_and_suffix = &after_scheme[path_start..];
+    Some(
+        path_and_suffix
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(path_and_suffix),
+    )
+}
+
+fn path_has_encoded_traversal(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        let decoded = percent_decode_bytes(segment.as_bytes());
+        matches!(decoded.as_slice(), b"." | b"..") || decoded.contains(&b'/')
+    })
+}
+
+fn percent_decode_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) =
+                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+        {
+            out.push((hi << 4) | lo);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    out
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn validate_credential_id(kind: &'static str, value: &str) -> Result<(), CredentialBrokerError> {
-    if value.is_empty()
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    if value.is_empty() {
+        return Err(CredentialBrokerError::InvalidAccountId {
+            value: value.to_string(),
+            reason: format!("{kind} must not be empty"),
+        });
+    }
+    if value.len() > CREDENTIAL_ID_MAX_LEN {
+        return Err(CredentialBrokerError::InvalidAccountId {
+            value: value.to_string(),
+            reason: format!("{kind} must be at most {CREDENTIAL_ID_MAX_LEN} bytes"),
+        });
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
     {
         return Err(CredentialBrokerError::InvalidAccountId {
             value: value.to_string(),
-            reason: format!("{kind} must contain only ASCII letters, digits, '-' or '_"),
+            reason: format!("{kind} must contain only ASCII letters, digits, '-' or '_'"),
         });
     }
     Ok(())
@@ -512,6 +794,8 @@ impl SecretLeaseKey {
 struct LeaseRecord {
     lease: SecretLease,
     material: Option<SecretMaterial>,
+    secret_id: Uuid,
+    expires_at: Timestamp,
 }
 
 /// Adapter that exposes the battle-tested encrypted [`SecretsStore`] contract
@@ -599,9 +883,10 @@ where
         scope: &ResourceScope,
         handle: &SecretHandle,
     ) -> Result<SecretLease, SecretStoreError> {
-        let material = self
+        let legacy_user_id = scoped_legacy_user_id(scope);
+        let secret = self
             .inner
-            .get_decrypted(&scoped_legacy_user_id(scope), handle.as_str())
+            .get(&legacy_user_id, handle.as_str())
             .await
             .map_err(|error| match error {
                 SecretError::NotFound(_) => SecretStoreError::UnknownSecret {
@@ -610,6 +895,11 @@ where
                 },
                 other => map_legacy_secret_error(other),
             })?;
+        let material = self
+            .inner
+            .get_decrypted(&legacy_user_id, handle.as_str())
+            .await
+            .map_err(map_legacy_secret_error)?;
         let lease = SecretLease {
             id: SecretLeaseId::new(),
             scope: scope.clone(),
@@ -621,6 +911,8 @@ where
             LeaseRecord {
                 lease: lease.clone(),
                 material: Some(SecretMaterial::from(material.expose().to_string())),
+                secret_id: secret.id,
+                expires_at: Utc::now() + Duration::seconds(DEFAULT_SECRET_LEASE_TTL_SECONDS),
             },
         );
         Ok(lease)
@@ -631,28 +923,44 @@ where
         scope: &ResourceScope,
         lease_id: SecretLeaseId,
     ) -> Result<SecretMaterial, SecretStoreError> {
-        let mut leases = self.lock_leases()?;
-        let key = SecretLeaseKey::new(scope, lease_id);
-        let record = leases
-            .get_mut(&key)
-            .ok_or_else(|| SecretStoreError::UnknownLease {
-                scope: Box::new(scope.clone()),
-                lease_id,
-            })?;
-        match record.lease.status {
-            SecretLeaseStatus::Active => {
-                let Some(material) = record.material.take() else {
+        let (material, secret_id) = {
+            let mut leases = self.lock_leases()?;
+            let key = SecretLeaseKey::new(scope, lease_id);
+            let record = leases
+                .get_mut(&key)
+                .ok_or_else(|| SecretStoreError::UnknownLease {
+                    scope: Box::new(scope.clone()),
+                    lease_id,
+                })?;
+            match record.lease.status {
+                SecretLeaseStatus::Active => {
+                    if record.expires_at <= Utc::now() {
+                        record.material = None;
+                        record.lease.status = SecretLeaseStatus::Revoked;
+                        return Err(SecretStoreError::LeaseExpired { lease_id });
+                    }
+                    let Some(material) = record.material.take() else {
+                        record.lease.status = SecretLeaseStatus::Consumed;
+                        return Err(SecretStoreError::StoreUnavailable {
+                            reason: "active lease material unavailable".to_string(),
+                        });
+                    };
                     record.lease.status = SecretLeaseStatus::Consumed;
-                    return Err(SecretStoreError::StoreUnavailable {
-                        reason: "active lease material unavailable".to_string(),
-                    });
-                };
-                record.lease.status = SecretLeaseStatus::Consumed;
-                Ok(material)
+                    (material, record.secret_id)
+                }
+                SecretLeaseStatus::Consumed => {
+                    return Err(SecretStoreError::LeaseConsumed { lease_id });
+                }
+                SecretLeaseStatus::Revoked => {
+                    return Err(SecretStoreError::LeaseRevoked { lease_id });
+                }
             }
-            SecretLeaseStatus::Consumed => Err(SecretStoreError::LeaseConsumed { lease_id }),
-            SecretLeaseStatus::Revoked => Err(SecretStoreError::LeaseRevoked { lease_id }),
-        }
+        };
+        self.inner
+            .record_usage(secret_id)
+            .await
+            .map_err(map_legacy_secret_error)?;
+        Ok(material)
     }
 
     async fn revoke(
@@ -661,6 +969,7 @@ where
         lease_id: SecretLeaseId,
     ) -> Result<SecretLease, SecretStoreError> {
         let mut leases = self.lock_leases()?;
+        prune_inactive_or_expired_leases(&mut leases);
         let key = SecretLeaseKey::new(scope, lease_id);
         let record = leases
             .get_mut(&key)
@@ -679,8 +988,9 @@ where
         &self,
         scope: &ResourceScope,
     ) -> Result<Vec<SecretLease>, SecretStoreError> {
-        Ok(self
-            .lock_leases()?
+        let mut leases = self.lock_leases()?;
+        prune_inactive_or_expired_leases(&mut leases);
+        Ok(leases
             .iter()
             .filter(|(key, _)| key.matches_scope(scope))
             .map(|(_, record)| record.lease.clone())
@@ -688,15 +998,20 @@ where
     }
 }
 
+fn prune_inactive_or_expired_leases(leases: &mut HashMap<SecretLeaseKey, LeaseRecord>) {
+    let now = Utc::now();
+    leases.retain(|_, record| {
+        record.lease.status != SecretLeaseStatus::Active || record.expires_at > now
+    });
+}
+
 fn map_legacy_secret_error(error: SecretError) -> SecretStoreError {
     match error {
         SecretError::NotFound(name) => SecretStoreError::StoreUnavailable {
             reason: format!("legacy secret missing: {name}"),
         },
-        SecretError::Expired => SecretStoreError::StoreUnavailable {
-            reason: "legacy secret expired".to_string(),
-        },
-        SecretError::InvalidMasterKey => SecretStoreError::StoreUnavailable {
+        SecretError::Expired => SecretStoreError::SecretExpired,
+        SecretError::InvalidMasterKey => SecretStoreError::BackendMisconfigured {
             reason: "legacy secrets master key unavailable".to_string(),
         },
         SecretError::AccessDenied => SecretStoreError::StoreUnavailable {
@@ -723,9 +1038,15 @@ pub struct InMemorySecretStore {
 
 impl InMemorySecretStore {
     pub fn new() -> Self {
-        let crypto = Arc::new(SecretsCrypto::from_valid_master_key_literal(
-            "0123456789abcdef0123456789abcdef",
+        let crypto = Arc::new(SecretsCrypto::from_valid_master_key(
+            Uuid::new_v4().simple().to_string(),
         ));
+        Self {
+            inner: ScopedSecretsStoreAdapter::new(Arc::new(InMemorySecretsStore::new(crypto))),
+        }
+    }
+
+    pub fn with_crypto(crypto: Arc<SecretsCrypto>) -> Self {
         Self {
             inner: ScopedSecretsStoreAdapter::new(Arc::new(InMemorySecretsStore::new(crypto))),
         }
@@ -802,11 +1123,12 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        CredentialAccount, CredentialAccountId, CredentialAccountStatus, CredentialBrokerError,
-        CredentialPathPolicy, CredentialSessionRequest, CredentialTargetPolicy,
-        InMemoryCredentialBroker, InMemorySecretStore, InMemorySecretsStore,
-        ScopedSecretsStoreAdapter, SecretMaterial, SecretStore, SecretStoreError, SecretsCrypto,
-        SecretsStore, scoped_legacy_user_id,
+        CREDENTIAL_ID_MAX_LEN, CredentialAccount, CredentialAccountId, CredentialAccountStatus,
+        CredentialBrokerError, CredentialPathPolicy, CredentialSessionRequest,
+        CredentialTargetPolicy, InMemoryCredentialBroker, InMemorySecretStore,
+        InMemorySecretsStore, RedactedJson, ScopedSecretsStoreAdapter, SecretLeaseKey,
+        SecretMaterial, SecretStore, SecretStoreError, SecretsCrypto, SecretsStore,
+        scoped_legacy_user_id,
     };
 
     #[test]
@@ -827,6 +1149,23 @@ mod tests {
             scoped_legacy_user_id(&delimiter_scope)
         );
         assert!(scoped_legacy_user_id(&none_agent).contains("\"agent_id\":null"));
+    }
+
+    #[test]
+    fn credential_account_id_validates_and_round_trips() {
+        let id = CredentialAccountId::new("openai_prod-1").unwrap();
+        assert_eq!(id.as_ref(), "openai_prod-1");
+        assert_eq!(String::from(id.clone()), "openai_prod-1");
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"openai_prod-1\"");
+        assert_eq!(
+            serde_json::from_str::<CredentialAccountId>("\"openai_prod-1\"").unwrap(),
+            id
+        );
+
+        for invalid in ["", "a/b", "a b", "a.b"] {
+            assert!(CredentialAccountId::new(invalid).is_err());
+        }
+        assert!(CredentialAccountId::new("a".repeat(CREDENTIAL_ID_MAX_LEN + 1)).is_err());
     }
 
     #[test]
@@ -853,6 +1192,15 @@ mod tests {
         ));
         assert!(!policy.matches(&NetworkMethod::Get, "http://api.example.com/v1/models"));
         assert!(!policy.matches(&NetworkMethod::Get, "https://evil.example.com/v1/models"));
+        assert!(!policy.matches(
+            &NetworkMethod::Get,
+            "https://user:pass@api.example.com/v1/models"
+        ));
+        assert!(!policy.matches(
+            &NetworkMethod::Get,
+            "https://api.example.com/v1/%2e%2e%2fadmin"
+        ));
+        assert!(!policy.matches(&NetworkMethod::Get, "https://api.example.com/v1/%2e/admin"));
 
         let policy_without_port_constraint = CredentialTargetPolicy {
             port: None,
@@ -866,6 +1214,46 @@ mod tests {
             &NetworkMethod::Get,
             "https://api.example.com:8443/v1/models"
         ));
+    }
+
+    #[test]
+    fn credential_account_debug_redacts_metadata() {
+        let account = sample_account(
+            sample_scope("tenant-a", "user-a"),
+            CredentialAccountId::new("openai_prod").unwrap(),
+            SecretHandle::new("openai_key").unwrap(),
+        );
+        let debug = format!("{account:?}");
+        assert!(!debug.contains("refresh_token"));
+        assert!(!debug.contains("sk-live-sentinel"));
+        assert!(debug.contains("[REDACTED_JSON]"));
+    }
+
+    #[test]
+    fn stable_reason_tokens_are_locked() {
+        let account_id = CredentialAccountId::new("openai_prod").unwrap();
+        assert_eq!(
+            CredentialBrokerError::BrokerUnavailable {
+                reason: "poisoned".to_string()
+            }
+            .stable_reason(),
+            "BackendUnavailable"
+        );
+        assert_eq!(
+            CredentialBrokerError::CredentialExpired { account_id }.stable_reason(),
+            "CredentialExpired"
+        );
+        assert_eq!(
+            SecretStoreError::SecretExpired.stable_reason(),
+            "CredentialExpired"
+        );
+        assert_eq!(
+            SecretStoreError::BackendMisconfigured {
+                reason: "missing key".to_string()
+            }
+            .stable_reason(),
+            "BackendMisconfigured"
+        );
     }
 
     #[test]
@@ -896,11 +1284,89 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(session.scope, scope);
-        assert_eq!(session.secret_handles, vec![secret_handle]);
+        assert_eq!(session.scope(), &scope);
+        assert_eq!(session.secret_handles(), &[secret_handle]);
         let debug = format!("{session:?}");
         assert!(!debug.contains("sk-live-sentinel"));
         assert!(!debug.contains("token"));
+    }
+
+    #[test]
+    fn credential_session_validation_enforces_expiry_and_use_limits() {
+        let broker = InMemoryCredentialBroker::new();
+        let scope = sample_scope("tenant-a", "user-a");
+        let account_id = CredentialAccountId::new("openai_prod").unwrap();
+        broker
+            .put_account(sample_account(
+                scope.clone(),
+                account_id.clone(),
+                SecretHandle::new("openai_key").unwrap(),
+            ))
+            .unwrap();
+        let session = broker
+            .create_session(CredentialSessionRequest {
+                expires_at: Some(Utc::now() + chrono::Duration::seconds(60)),
+                max_uses: Some(1),
+                ..session_request(
+                    scope.clone(),
+                    account_id,
+                    "https://api.example.com/v1/models",
+                )
+            })
+            .unwrap();
+
+        broker
+            .validate_session(session.correlation_id(), Utc::now())
+            .unwrap();
+        broker
+            .consume_session_use(session.correlation_id(), Utc::now())
+            .unwrap();
+        assert!(matches!(
+            broker.consume_session_use(session.correlation_id(), Utc::now()),
+            Err(CredentialBrokerError::SessionUseLimitExceeded { .. })
+        ));
+
+        let expired_id = CredentialAccountId::new("openai_expiring").unwrap();
+        broker
+            .put_account(sample_account(
+                scope.clone(),
+                expired_id.clone(),
+                SecretHandle::new("openai_expiring_key").unwrap(),
+            ))
+            .unwrap();
+        let expired = broker
+            .create_session(CredentialSessionRequest {
+                expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+                ..session_request(scope, expired_id, "https://api.example.com/v1/models")
+            })
+            .unwrap();
+        assert!(matches!(
+            broker.validate_session(expired.correlation_id(), Utc::now()),
+            Err(CredentialBrokerError::SessionExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn credential_session_creation_rejects_invocation_mismatch() {
+        let broker = InMemoryCredentialBroker::new();
+        let scope = sample_scope("tenant-a", "user-a");
+        let account_id = CredentialAccountId::new("openai_prod").unwrap();
+        broker
+            .put_account(sample_account(
+                scope.clone(),
+                account_id.clone(),
+                SecretHandle::new("openai_key").unwrap(),
+            ))
+            .unwrap();
+
+        let result = broker.create_session(CredentialSessionRequest {
+            invocation_id: InvocationId::new(),
+            ..session_request(scope, account_id, "https://api.example.com/v1/models")
+        });
+        assert!(matches!(
+            result,
+            Err(CredentialBrokerError::CredentialInvocationMismatch { .. })
+        ));
     }
 
     #[test]
@@ -931,8 +1397,8 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(session.scope, request_scope);
-        assert_eq!(session.secret_handles, vec![secret_handle]);
+        assert_eq!(session.scope(), &request_scope);
+        assert_eq!(session.secret_handles(), &[secret_handle]);
     }
 
     #[test]
@@ -991,6 +1457,24 @@ mod tests {
         assert!(matches!(
             extension_mismatch,
             Err(CredentialBrokerError::CredentialExtensionMismatch { .. })
+        ));
+
+        let expired_id = CredentialAccountId::new("github_expired").unwrap();
+        let mut expired = sample_account(
+            scope.clone(),
+            expired_id.clone(),
+            SecretHandle::new("github_expired_key").unwrap(),
+        );
+        expired.status = CredentialAccountStatus::Expired;
+        broker.put_account(expired).unwrap();
+        let expired_result = broker.create_session(session_request(
+            scope.clone(),
+            expired_id,
+            "https://api.example.com/v1/models",
+        ));
+        assert!(matches!(
+            expired_result,
+            Err(CredentialBrokerError::CredentialExpired { .. })
         ));
 
         let revoked_id = CredentialAccountId::new("github_revoked").unwrap();
@@ -1055,11 +1539,48 @@ mod tests {
         let lease = adapter.lease_once(&scope, &handle).await.unwrap();
         let material = adapter.consume(&scope, lease.id).await.unwrap();
         assert_eq!(material.expose_secret(), "sk-live-sentinel");
+        let used_secret = legacy
+            .get(&scoped_legacy_user_id(&scope), handle.as_str())
+            .await
+            .unwrap();
+        assert_eq!(used_secret.usage_count, 1);
+        assert!(used_secret.last_used_at.is_some());
         let second_consume = adapter.consume(&scope, lease.id).await;
         assert!(matches!(
             second_consume,
             Err(SecretStoreError::LeaseConsumed { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn expired_lease_drops_material_and_cannot_be_consumed() {
+        let store = InMemorySecretStore::new();
+        let scope = sample_scope("tenant-a", "user-a");
+        let handle = SecretHandle::new("api_key").unwrap();
+        store
+            .put(
+                scope.clone(),
+                handle.clone(),
+                SecretMaterial::from("super-secret"),
+            )
+            .await
+            .unwrap();
+
+        let lease = store.lease_once(&scope, &handle).await.unwrap();
+        {
+            let mut leases = store.inner.leases.lock().unwrap();
+            let record = leases
+                .get_mut(&SecretLeaseKey::new(&scope, lease.id))
+                .unwrap();
+            record.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        }
+
+        assert!(matches!(
+            store.consume(&scope, lease.id).await,
+            Err(SecretStoreError::LeaseExpired { .. })
+        ));
+        let leases_debug = format!("{store:?}");
+        assert!(!leases_debug.contains("SecretBox"));
     }
 
     #[tokio::test]
@@ -1129,7 +1650,10 @@ mod tests {
                 path: CredentialPathPolicy::Prefix("/v1/".to_string()),
                 methods: vec![NetworkMethod::Get],
             }],
-            redacted_metadata: json!({ "last_four": "1234" }),
+            redacted_metadata: RedactedJson::new(json!({
+                "last_four": "1234",
+                "refresh_token": "sk-live-sentinel"
+            })),
             updated_at: Utc::now(),
         }
     }

@@ -345,7 +345,13 @@ impl SecretsStore for InMemorySecretsStore {
             .is_some())
     }
 
-    async fn record_usage(&self, _secret_id: Uuid) -> Result<(), SecretError> {
+    async fn record_usage(&self, secret_id: Uuid) -> Result<(), SecretError> {
+        let mut secrets = self.secrets.write().await;
+        let Some(secret) = secrets.values_mut().find(|secret| secret.id == secret_id) else {
+            return Err(SecretError::NotFound(secret_id.to_string()));
+        };
+        secret.last_used_at = Some(Utc::now());
+        secret.usage_count += 1;
         Ok(())
     }
 
