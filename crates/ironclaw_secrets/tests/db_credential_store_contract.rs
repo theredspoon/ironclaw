@@ -1,6 +1,5 @@
 #![cfg(any(feature = "libsql", feature = "postgres"))]
 
-#[cfg(feature = "libsql")]
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -15,7 +14,7 @@ use ironclaw_secrets::PostgresCredentialStore;
 use ironclaw_secrets::{
     CredentialAccount, CredentialAccountId, CredentialAccountStatus, CredentialAccountStore,
     CredentialPathPolicy, CredentialSessionRequest, CredentialSessionStore, CredentialTargetPolicy,
-    InMemoryCredentialBroker, RedactedJson,
+    InMemoryCredentialBroker, RedactedJson, SecretMaterial, SecretsCrypto,
 };
 use serde_json::json;
 
@@ -76,6 +75,119 @@ async fn libsql_credential_store_persists_sessions_and_enforces_use_limits_acros
     assert_eq!(
         reopened.get_session(&scope, session_id).await.unwrap(),
         Some(session)
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_does_not_persist_sensitive_payload_plaintext() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let mut account = sample_account(scope.clone(), account_id.clone());
+    account.redacted_metadata = RedactedJson::new(json!({
+        "last_four": "1234",
+        "refresh_token": "sk-live-sentinel-refresh-token"
+    }));
+    account.allowed_targets = vec![CredentialTargetPolicy {
+        scheme: "https".to_string(),
+        host: "sentinel-api.example.com".to_string(),
+        port: Some(443),
+        path: CredentialPathPolicy::Prefix("/v1/".to_string()),
+        methods: vec![NetworkMethod::Get],
+    }];
+    let session = broker_session(scope.clone(), account_id.clone(), Some(1), None);
+
+    store.put_account(account).await.unwrap();
+    store.issue_session(session).await.unwrap();
+    drop(store);
+
+    let raw_database = std::fs::read(&db_path).unwrap();
+    let raw_database = String::from_utf8_lossy(&raw_database);
+    assert!(
+        !raw_database.contains("sk-live-sentinel-refresh-token"),
+        "credential account metadata must be encrypted at rest"
+    );
+    assert!(
+        !raw_database.contains("sentinel-api.example.com"),
+        "credential target policy payload must be encrypted at rest"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_rejects_existing_plaintext_payload_rows() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let db = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE reborn_credential_accounts (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider_or_extension_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, project_id, account_id)
+        );
+        CREATE TABLE reborn_credential_sessions (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            expires_at TEXT,
+            max_uses INTEGER,
+            uses INTEGER NOT NULL DEFAULT 0,
+            payload TEXT NOT NULL,
+            PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id)
+        );
+        "#,
+    )
+    .await
+    .unwrap();
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let mut account = sample_account(scope.clone(), account_id.clone());
+    account.redacted_metadata = RedactedJson::new(json!({
+        "refresh_token": "legacy-sk-live-sentinel-refresh-token"
+    }));
+    let key = db_scope_key(&scope);
+    conn.execute(
+        "INSERT INTO reborn_credential_accounts (tenant_id, user_id, agent_id, project_id, account_id, status, provider_or_extension_id, updated_at, payload) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8)",
+        libsql::params![
+            key.tenant_id,
+            key.user_id,
+            key.agent_id,
+            key.project_id,
+            account_id.as_str(),
+            account.provider_or_extension_id.as_str(),
+            account.updated_at.to_rfc3339(),
+            serde_json::to_string(&account).unwrap(),
+        ],
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let store = LibSqlCredentialStore::new(db, test_crypto());
+    let error = store.run_migrations().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unencrypted legacy payload rows"),
+        "durable Reborn credential stores must fail closed instead of pretending to securely scrub prior plaintext rows: {error}"
     );
 }
 
@@ -153,7 +265,7 @@ async fn postgres_credential_store_persists_accounts_and_sessions_when_database_
 #[cfg(feature = "libsql")]
 async fn libsql_store(path: &std::path::Path) -> LibSqlCredentialStore {
     let db = Arc::new(libsql::Builder::new_local(path).build().await.unwrap());
-    let store = LibSqlCredentialStore::new(db);
+    let store = LibSqlCredentialStore::new(db, test_crypto());
     store.run_migrations().await.unwrap();
     store
 }
@@ -172,12 +284,21 @@ async fn postgres_store() -> Option<PostgresCredentialStore> {
         .max_size(4)
         .build()
         .expect("Postgres pool must build");
-    let store = PostgresCredentialStore::new(pool);
+    let store = PostgresCredentialStore::new(pool, test_crypto());
     store
         .run_migrations()
         .await
         .expect("DATABASE_URL must point at a reachable Postgres test database");
     Some(store)
+}
+
+fn test_crypto() -> Arc<SecretsCrypto> {
+    Arc::new(
+        SecretsCrypto::new(SecretMaterial::from(
+            "0123456789abcdef0123456789abcdef".to_string(),
+        ))
+        .unwrap(),
+    )
 }
 
 fn broker_session(
@@ -203,6 +324,32 @@ fn broker_session(
             max_uses,
         })
         .unwrap()
+}
+
+#[cfg(feature = "libsql")]
+struct TestDbScopeKey {
+    tenant_id: String,
+    user_id: String,
+    agent_id: String,
+    project_id: String,
+}
+
+#[cfg(feature = "libsql")]
+fn db_scope_key(scope: &ResourceScope) -> TestDbScopeKey {
+    TestDbScopeKey {
+        tenant_id: scope.tenant_id.to_string(),
+        user_id: scope.user_id.to_string(),
+        agent_id: scope
+            .agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        project_id: scope
+            .project_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+    }
 }
 
 fn sample_account(scope: ResourceScope, id: CredentialAccountId) -> CredentialAccount {
