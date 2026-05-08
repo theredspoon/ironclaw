@@ -1,0 +1,238 @@
+#![cfg(any(feature = "libsql", feature = "postgres"))]
+
+#[cfg(feature = "libsql")]
+use std::sync::Arc;
+
+use chrono::Utc;
+use ironclaw_host_api::{
+    AgentId, CapabilityId, ExtensionId, InvocationId, MissionId, NetworkMethod, ProjectId,
+    ResourceScope, SecretHandle, TenantId, ThreadId, UserId,
+};
+#[cfg(feature = "libsql")]
+use ironclaw_secrets::LibSqlCredentialStore;
+#[cfg(feature = "postgres")]
+use ironclaw_secrets::PostgresCredentialStore;
+use ironclaw_secrets::{
+    CredentialAccount, CredentialAccountId, CredentialAccountStatus, CredentialAccountStore,
+    CredentialPathPolicy, CredentialSessionRequest, CredentialSessionStore, CredentialTargetPolicy,
+    InMemoryCredentialBroker, RedactedJson,
+};
+use serde_json::json;
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_persists_accounts_across_reopen_and_isolates_scope() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+    let other_scope = sample_scope("tenant-b", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let account = sample_account(scope.clone(), account_id.clone());
+
+    store.put_account(account.clone()).await.unwrap();
+    drop(store);
+
+    let reopened = libsql_store(&db_path).await;
+    assert_eq!(
+        reopened.get_account(&scope, &account_id).await.unwrap(),
+        Some(account)
+    );
+    assert_eq!(
+        reopened
+            .get_account(&other_scope, &account_id)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_persists_sessions_and_enforces_use_limits_across_reopen() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let session = broker_session(scope.clone(), account_id, Some(1), None);
+    let session_id = session.correlation_id();
+
+    store.issue_session(session.clone()).await.unwrap();
+    store
+        .consume_session_use(&scope, session_id, Utc::now())
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = libsql_store(&db_path).await;
+    assert!(
+        reopened
+            .validate_session(&scope, session_id, Utc::now())
+            .await
+            .unwrap_err()
+            .is_use_limit_exceeded()
+    );
+    assert_eq!(
+        reopened.get_session(&scope, session_id).await.unwrap(),
+        Some(session)
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_persists_session_expiry_across_reopen() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let session = broker_session(
+        scope.clone(),
+        account_id,
+        None,
+        Some(Utc::now() - chrono::Duration::seconds(1)),
+    );
+    let session_id = session.correlation_id();
+
+    store.issue_session(session).await.unwrap();
+    drop(store);
+
+    let reopened = libsql_store(&db_path).await;
+    assert!(
+        reopened
+            .validate_session(&scope, session_id, Utc::now())
+            .await
+            .unwrap_err()
+            .is_expired()
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_credential_store_persists_accounts_and_sessions_when_database_url_is_set() {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let scope = sample_scope(&format!("tenant-{suffix}"), "user-a");
+    let other_scope = sample_scope(&format!("tenant-other-{suffix}"), "user-a");
+    let account_id = CredentialAccountId::new(format!("openai_{suffix}")).unwrap();
+    let account = sample_account(scope.clone(), account_id.clone());
+    let session = broker_session(scope.clone(), account_id.clone(), Some(1), None);
+    let session_id = session.correlation_id();
+
+    store.put_account(account.clone()).await.unwrap();
+    store.issue_session(session.clone()).await.unwrap();
+    store
+        .consume_session_use(&scope, session_id, Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get_account(&scope, &account_id).await.unwrap(),
+        Some(account)
+    );
+    assert_eq!(
+        store.get_account(&other_scope, &account_id).await.unwrap(),
+        None
+    );
+    assert!(
+        store
+            .validate_session(&scope, session_id, Utc::now())
+            .await
+            .unwrap_err()
+            .is_use_limit_exceeded()
+    );
+    assert_eq!(
+        store.get_session(&scope, session_id).await.unwrap(),
+        Some(session)
+    );
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_store(path: &std::path::Path) -> LibSqlCredentialStore {
+    let db = Arc::new(libsql::Builder::new_local(path).build().await.unwrap());
+    let store = LibSqlCredentialStore::new(db);
+    store.run_migrations().await.unwrap();
+    store
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_store() -> Option<PostgresCredentialStore> {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping Postgres credential store contract: DATABASE_URL is not set");
+        return None;
+    };
+    let config: tokio_postgres::Config = database_url
+        .parse()
+        .expect("DATABASE_URL must parse as a Postgres connection string");
+    let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
+    let pool = deadpool_postgres::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("Postgres pool must build");
+    let store = PostgresCredentialStore::new(pool);
+    store
+        .run_migrations()
+        .await
+        .expect("DATABASE_URL must point at a reachable Postgres test database");
+    Some(store)
+}
+
+fn broker_session(
+    scope: ResourceScope,
+    account_id: CredentialAccountId,
+    max_uses: Option<u64>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) -> ironclaw_secrets::CredentialSession {
+    let broker = InMemoryCredentialBroker::new();
+    broker
+        .put_account(sample_account(scope.clone(), account_id.clone()))
+        .unwrap();
+    broker
+        .create_session(CredentialSessionRequest {
+            invocation_id: scope.invocation_id,
+            scope,
+            capability_id: CapabilityId::new("openai.chat").unwrap(),
+            extension_id: ExtensionId::new("openai").unwrap(),
+            account_id,
+            method: NetworkMethod::Get,
+            url: "https://api.example.com/v1/models".to_string(),
+            expires_at,
+            max_uses,
+        })
+        .unwrap()
+}
+
+fn sample_account(scope: ResourceScope, id: CredentialAccountId) -> CredentialAccount {
+    CredentialAccount {
+        scope,
+        id,
+        provider_or_extension_id: ExtensionId::new("openai").unwrap(),
+        label: "Production".to_string(),
+        status: CredentialAccountStatus::Active,
+        secret_handles: vec![SecretHandle::new("openai_key").unwrap()],
+        allowed_targets: vec![CredentialTargetPolicy {
+            scheme: "https".to_string(),
+            host: "api.example.com".to_string(),
+            port: Some(443),
+            path: CredentialPathPolicy::Prefix("/v1/".to_string()),
+            methods: vec![NetworkMethod::Get],
+        }],
+        redacted_metadata: RedactedJson::new(json!({ "last_four": "1234" })),
+        updated_at: Utc::now(),
+    }
+}
+
+fn sample_scope(tenant: &str, user: &str) -> ResourceScope {
+    ResourceScope {
+        tenant_id: TenantId::new(tenant).unwrap(),
+        user_id: UserId::new(user).unwrap(),
+        agent_id: Some(AgentId::new("agent-a").unwrap()),
+        project_id: Some(ProjectId::new("project-a").unwrap()),
+        mission_id: Some(MissionId::new("mission-a").unwrap()),
+        thread_id: Some(ThreadId::new("thread-a").unwrap()),
+        invocation_id: InvocationId::new(),
+    }
+}

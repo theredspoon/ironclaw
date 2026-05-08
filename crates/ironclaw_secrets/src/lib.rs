@@ -7,7 +7,14 @@
 //! composition slice consumes these primitives.
 
 mod crypto;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod db;
 mod legacy_store;
+
+#[cfg(feature = "libsql")]
+pub use db::LibSqlCredentialStore;
+#[cfg(feature = "postgres")]
+pub use db::PostgresCredentialStore;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -221,7 +228,8 @@ impl fmt::Display for CredentialAccountId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct CredentialSessionId(Uuid);
 
 impl CredentialSessionId {
@@ -242,20 +250,22 @@ impl fmt::Display for CredentialSessionId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CredentialAccountStatus {
     Active,
     Expired,
     Revoked,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CredentialPathPolicy {
     Exact(String),
     Prefix(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialTargetPolicy {
     pub scheme: String,
     pub host: String,
@@ -300,7 +310,7 @@ impl CredentialTargetPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialAccount {
     pub scope: ResourceScope,
     pub id: CredentialAccountId,
@@ -313,7 +323,7 @@ pub struct CredentialAccount {
     pub updated_at: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialSession {
     scope: ResourceScope,
     invocation_id: InvocationId,
@@ -405,6 +415,17 @@ impl CredentialBrokerError {
             Self::CredentialPolicyMismatch { .. } => "CredentialPolicyMismatch",
         }
     }
+
+    pub fn is_expired(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionExpired { .. } | Self::CredentialExpired { .. }
+        )
+    }
+
+    pub fn is_use_limit_exceeded(&self) -> bool {
+        matches!(self, Self::SessionUseLimitExceeded { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +441,53 @@ pub struct CredentialSessionRequest {
     pub max_uses: Option<u64>,
 }
 
+#[async_trait]
+pub trait CredentialAccountStore: Send + Sync {
+    async fn put_account(
+        &self,
+        account: CredentialAccount,
+    ) -> Result<CredentialAccount, CredentialBrokerError>;
+
+    async fn get_account(
+        &self,
+        scope: &ResourceScope,
+        account_id: &CredentialAccountId,
+    ) -> Result<Option<CredentialAccount>, CredentialBrokerError>;
+
+    async fn accounts_for_scope(
+        &self,
+        scope: &ResourceScope,
+    ) -> Result<Vec<CredentialAccount>, CredentialBrokerError>;
+}
+
+#[async_trait]
+pub trait CredentialSessionStore: Send + Sync {
+    async fn issue_session(
+        &self,
+        session: CredentialSession,
+    ) -> Result<CredentialSession, CredentialBrokerError>;
+
+    async fn get_session(
+        &self,
+        scope: &ResourceScope,
+        session_id: CredentialSessionId,
+    ) -> Result<Option<CredentialSession>, CredentialBrokerError>;
+
+    async fn validate_session(
+        &self,
+        scope: &ResourceScope,
+        session_id: CredentialSessionId,
+        now: Timestamp,
+    ) -> Result<CredentialSession, CredentialBrokerError>;
+
+    async fn consume_session_use(
+        &self,
+        scope: &ResourceScope,
+        session_id: CredentialSessionId,
+        now: Timestamp,
+    ) -> Result<CredentialSession, CredentialBrokerError>;
+}
+
 #[derive(Debug, Default)]
 pub struct InMemoryCredentialBroker {
     accounts: Mutex<HashMap<CredentialAccountKey, CredentialAccount>>,
@@ -430,6 +498,28 @@ pub struct InMemoryCredentialBroker {
 struct CredentialSessionRecord {
     session: CredentialSession,
     uses: u64,
+}
+
+fn ensure_credential_session_record_usable(
+    record: &CredentialSessionRecord,
+    session_id: CredentialSessionId,
+    now: Timestamp,
+) -> Result<(), CredentialBrokerError> {
+    if record
+        .session
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(CredentialBrokerError::SessionExpired { session_id });
+    }
+    if record
+        .session
+        .max_uses
+        .is_some_and(|max_uses| record.uses >= max_uses)
+    {
+        return Err(CredentialBrokerError::SessionUseLimitExceeded { session_id });
+    }
+    Ok(())
 }
 
 impl InMemoryCredentialBroker {
@@ -549,20 +639,7 @@ impl InMemoryCredentialBroker {
         let record = sessions
             .get_mut(&session_id)
             .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
-        if record
-            .session
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= now)
-        {
-            return Err(CredentialBrokerError::SessionExpired { session_id });
-        }
-        if record
-            .session
-            .max_uses
-            .is_some_and(|max_uses| record.uses >= max_uses)
-        {
-            return Err(CredentialBrokerError::SessionUseLimitExceeded { session_id });
-        }
+        ensure_credential_session_record_usable(record, session_id, now)?;
         Ok(record.session.clone())
     }
 
@@ -580,20 +657,131 @@ impl InMemoryCredentialBroker {
         let record = sessions
             .get_mut(&session_id)
             .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
-        if record
-            .session
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= now)
-        {
-            return Err(CredentialBrokerError::SessionExpired { session_id });
-        }
-        if record
-            .session
-            .max_uses
-            .is_some_and(|max_uses| record.uses >= max_uses)
-        {
-            return Err(CredentialBrokerError::SessionUseLimitExceeded { session_id });
-        }
+        ensure_credential_session_record_usable(record, session_id, now)?;
+        record.uses += 1;
+        Ok(record.session.clone())
+    }
+}
+
+#[async_trait]
+impl CredentialAccountStore for InMemoryCredentialBroker {
+    async fn put_account(
+        &self,
+        account: CredentialAccount,
+    ) -> Result<CredentialAccount, CredentialBrokerError> {
+        InMemoryCredentialBroker::put_account(self, account.clone())?;
+        Ok(account)
+    }
+
+    async fn get_account(
+        &self,
+        scope: &ResourceScope,
+        account_id: &CredentialAccountId,
+    ) -> Result<Option<CredentialAccount>, CredentialBrokerError> {
+        let accounts =
+            self.accounts
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        Ok(accounts
+            .get(&CredentialAccountKey::new(scope, account_id))
+            .cloned())
+    }
+
+    async fn accounts_for_scope(
+        &self,
+        scope: &ResourceScope,
+    ) -> Result<Vec<CredentialAccount>, CredentialBrokerError> {
+        let accounts =
+            self.accounts
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        Ok(accounts
+            .iter()
+            .filter(|(key, _)| key.matches_scope_owner(scope))
+            .map(|(_, account)| account.clone())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl CredentialSessionStore for InMemoryCredentialBroker {
+    async fn issue_session(
+        &self,
+        session: CredentialSession,
+    ) -> Result<CredentialSession, CredentialBrokerError> {
+        self.sessions
+            .lock()
+            .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                reason: error.to_string(),
+            })?
+            .insert(
+                session.correlation_id,
+                CredentialSessionRecord {
+                    session: session.clone(),
+                    uses: 0,
+                },
+            );
+        Ok(session)
+    }
+
+    async fn get_session(
+        &self,
+        scope: &ResourceScope,
+        session_id: CredentialSessionId,
+    ) -> Result<Option<CredentialSession>, CredentialBrokerError> {
+        let sessions =
+            self.sessions
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        Ok(sessions
+            .get(&session_id)
+            .filter(|record| record.session.scope == *scope)
+            .map(|record| record.session.clone()))
+    }
+
+    async fn validate_session(
+        &self,
+        scope: &ResourceScope,
+        session_id: CredentialSessionId,
+        now: Timestamp,
+    ) -> Result<CredentialSession, CredentialBrokerError> {
+        let sessions =
+            self.sessions
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        let record = sessions
+            .get(&session_id)
+            .filter(|record| record.session.scope == *scope)
+            .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
+        ensure_credential_session_record_usable(record, session_id, now)?;
+        Ok(record.session.clone())
+    }
+
+    async fn consume_session_use(
+        &self,
+        scope: &ResourceScope,
+        session_id: CredentialSessionId,
+        now: Timestamp,
+    ) -> Result<CredentialSession, CredentialBrokerError> {
+        let mut sessions =
+            self.sessions
+                .lock()
+                .map_err(|error| CredentialBrokerError::BrokerUnavailable {
+                    reason: error.to_string(),
+                })?;
+        let record = sessions
+            .get_mut(&session_id)
+            .filter(|record| record.session.scope == *scope)
+            .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
+        ensure_credential_session_record_usable(record, session_id, now)?;
         record.uses += 1;
         Ok(record.session.clone())
     }
@@ -617,6 +805,13 @@ impl CredentialAccountKey {
             project_id: scope.project_id.clone(),
             account_id: account_id.clone(),
         }
+    }
+
+    fn matches_scope_owner(&self, scope: &ResourceScope) -> bool {
+        self.tenant_id == scope.tenant_id
+            && self.user_id == scope.user_id
+            && self.agent_id == scope.agent_id
+            && self.project_id == scope.project_id
     }
 }
 
