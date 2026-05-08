@@ -4248,6 +4248,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_loop_support"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ironclaw_host_api",
+ "ironclaw_threads",
+ "ironclaw_turns",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "ironclaw_mcp"
 version = "0.1.0"
 dependencies = [
@@ -4353,6 +4367,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "ironclaw_reborn"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ironclaw",
+ "ironclaw_loop_support",
+ "ironclaw_turns",
+ "rust_decimal",
+ "tokio",
 ]
 
 [[package]]
