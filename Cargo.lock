@@ -4231,6 +4231,7 @@ dependencies = [
  "ironclaw_scripts",
  "ironclaw_secrets",
  "ironclaw_trust",
+ "ironclaw_turns",
  "ironclaw_wasm",
  "libsql",
  "rust_decimal",

@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -70,6 +70,14 @@ use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
     HostTrustPolicy, TrustDecision, TrustProvenance,
 };
+#[cfg(feature = "libsql")]
+use ironclaw_turns::LibSqlTurnStateStore;
+#[cfg(feature = "libsql")]
+use ironclaw_turns::{
+    AcceptedMessageRef, IdempotencyKey, ReplyTargetBindingRef, RunProfileRequest, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnScope, TurnStateStore,
+};
+use ironclaw_turns::{NoopTurnRunWakeNotifier, TurnRunWake, TurnRunWakeNotifier};
 use ironclaw_wasm::{
     RecordingWasmHostHttp, WasmHostError, WasmHostHttp, WasmHttpRequest, WasmHttpResponse,
     WasmStagedRuntimeCredential, WasmStagedRuntimeCredentials, WitToolHost, WitToolRuntimeConfig,
@@ -121,6 +129,20 @@ fn production_wiring_validation_rejects_missing_components_and_local_only_defaul
             ProductionWiringIssueKind::Missing
         ),
         "missing capability lease store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::TurnState,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing turn-state store should be reported: {report:?}"
+    );
+    assert!(
+        report.contains(
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            ProductionWiringIssueKind::Missing
+        ),
+        "missing turn wake notifier should be reported: {report:?}"
     );
     assert!(
         report.contains(
@@ -391,6 +413,164 @@ async fn production_root_filesystem_selection_accepts_libsql_root_filesystem() {
             ProductionWiringIssueKind::LocalOnlyImplementation
         ),
         "LibSqlRootFilesystem must satisfy production filesystem selection: {report:?}"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn production_turn_state_selection_accepts_libsql_turn_state_store() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("turn-state.db");
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let turn_state = Arc::new(LibSqlTurnStateStore::new(Arc::clone(&db)));
+    turn_state.run_migrations().await.unwrap();
+
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_libsql_turn_state_store(Arc::clone(&db))
+    .await
+    .unwrap();
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("other local services remain intentionally unready");
+    assert!(
+        !report.contains(
+            ProductionWiringComponent::TurnState,
+            ProductionWiringIssueKind::Missing
+        ),
+        "LibSqlTurnStateStore must satisfy production turn-state presence: {report:?}"
+    );
+    assert!(
+        !report.contains(
+            ProductionWiringComponent::TurnState,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "LibSqlTurnStateStore must not be classified local-only: {report:?}"
+    );
+}
+
+#[derive(Debug, Default)]
+struct RecordingTurnRunWakeNotifier {
+    wakes: Mutex<Vec<TurnRunWake>>,
+}
+
+impl RecordingTurnRunWakeNotifier {
+    #[cfg(feature = "libsql")]
+    fn wakes(&self) -> Vec<TurnRunWake> {
+        self.wakes.lock().unwrap().clone()
+    }
+}
+
+impl TurnRunWakeNotifier for RecordingTurnRunWakeNotifier {
+    fn notify_queued_run(
+        &self,
+        wake: TurnRunWake,
+    ) -> Result<(), ironclaw_turns::TurnRunWakeNotifyError> {
+        self.wakes.lock().unwrap().push(wake);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn production_turn_coordinator_uses_configured_store_and_notifier() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("turn-coordinator.db");
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let notifier = Arc::new(RecordingTurnRunWakeNotifier::default());
+
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_libsql_turn_state_store(Arc::clone(&db))
+    .await
+    .unwrap()
+    .with_turn_run_wake_notifier(Arc::clone(&notifier));
+
+    let coordinator = services
+        .turn_coordinator_for_production()
+        .expect("production-ready turn wiring should build coordinator");
+    let request = submit_turn_request("thread-production-turn-coordinator", "idem-production-turn");
+    let response = coordinator.submit_turn(request.clone()).await.unwrap();
+    let SubmitTurnResponse::Accepted { run_id, .. } = response;
+
+    let reopened = LibSqlTurnStateStore::new(Arc::clone(&db));
+    let state = reopened
+        .get_run_state(ironclaw_turns::GetRunStateRequest {
+            scope: request.scope,
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.run_id, run_id);
+    assert_eq!(notifier.wakes().len(), 1);
+    assert_eq!(notifier.wakes()[0].run_id, run_id);
+}
+
+#[test]
+fn production_wiring_validation_rejects_noop_turn_wake_notifier() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_turn_run_wake_notifier(Arc::new(NoopTurnRunWakeNotifier));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("other local services remain intentionally unready");
+    assert!(
+        report.contains(
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "NoopTurnRunWakeNotifier must not satisfy production turn wake wiring: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_accepts_configured_turn_wake_notifier() {
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_turn_run_wake_notifier(Arc::new(RecordingTurnRunWakeNotifier::default()));
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("other local services remain intentionally unready");
+    assert!(
+        !report.contains(
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            ProductionWiringIssueKind::Missing
+        ),
+        "configured turn wake notifier must satisfy production presence: {report:?}"
+    );
+    assert!(
+        !report.contains(
+            ProductionWiringComponent::TurnRunWakeNotifier,
+            ProductionWiringIssueKind::LocalOnlyImplementation
+        ),
+        "configured turn wake notifier must not be classified local-only: {report:?}"
     );
 }
 
@@ -5796,6 +5976,25 @@ fn http_without_body_then_guest_error_wat() -> String {
         "i32.const 1\n    i32.const 256\n    i32.const 5",
         "i32.const 0\n    i32.const 0\n    i32.const 0",
     )
+}
+
+#[cfg(feature = "libsql")]
+fn submit_turn_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {
+    SubmitTurnRequest {
+        scope: TurnScope::new(
+            TenantId::new("tenant1").unwrap(),
+            Some(AgentId::new("agent1").unwrap()),
+            Some(ProjectId::new("project1").unwrap()),
+            ThreadId::new(thread).unwrap(),
+        ),
+        actor: TurnActor::new(UserId::new("user1").unwrap()),
+        accepted_message_ref: AcceptedMessageRef::new(format!("message-{thread}")).unwrap(),
+        source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
+        reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
+        requested_run_profile: Some(RunProfileRequest::new("default").unwrap()),
+        idempotency_key: IdempotencyKey::new(idempotency_key).unwrap(),
+        received_at: Utc::now(),
+    }
 }
 
 const SCRIPT_MANIFEST: &str = r#"
