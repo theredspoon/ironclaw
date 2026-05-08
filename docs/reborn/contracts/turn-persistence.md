@@ -84,6 +84,9 @@ A duplicate idempotency key must replay prior accepted submit and admission-reje
 - Heartbeats only renew metadata for matching, unexpired runner ID/lease token; successful heartbeats refresh `last_heartbeat_at` and extend `lease_expires_at`.
 - Expired `Running` and `CancelRequested` leases transition to `RecoveryRequired`, clear current runner ownership, emit a redacted recovery event, and keep the active lock so uncertain side-effecting work is not auto-retried.
 - Blocking a running run requires a matching, unexpired lease, writes a checkpoint record, stores the latest checkpoint/gate refs on the run, clears current lease ownership, and keeps the active lock.
+- Loop-driver resume payloads are staged in a host-owned `CheckpointStateStore` before a public checkpoint record is written. The store returns an opaque `LoopCheckpointStateRef`; callers cannot choose arbitrary refs for durable records.
+- Checkpoint-state records are scoped by `TurnScope`, `TurnId`, and `TurnRunId`. Reads with a matching ref but foreign scope or run return no state, preserving tenant/thread/run isolation.
+- Checkpoint-state payload bytes are bounded and debug-redacted. Public checkpoint/run/event/idempotency records may store only metadata and refs, never raw checkpoint payload bytes.
 - Terminal runner outcomes require the matching, unexpired runner ID/lease token and release the active lock only if the run still owns it.
 
 ---
