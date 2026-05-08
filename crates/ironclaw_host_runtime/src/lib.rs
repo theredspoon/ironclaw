@@ -999,6 +999,12 @@ fn sanitized_secret_error(error: &SecretStoreError) -> String {
         SecretStoreError::UnknownLease { .. } => "credential lease is unavailable".to_string(),
         SecretStoreError::LeaseConsumed { .. } => "credential lease was already used".to_string(),
         SecretStoreError::LeaseRevoked { .. } => "credential lease was revoked".to_string(),
+        SecretStoreError::LeaseExpired { .. } | SecretStoreError::SecretExpired => {
+            "credential expired".to_string()
+        }
+        SecretStoreError::BackendMisconfigured { .. } => {
+            "credential store is misconfigured".to_string()
+        }
         SecretStoreError::StoreUnavailable { .. } => "credential store unavailable".to_string(),
     }
 }
