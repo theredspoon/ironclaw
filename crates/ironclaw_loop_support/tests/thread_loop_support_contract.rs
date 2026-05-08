@@ -88,7 +88,10 @@ async fn thread_context_port_preserves_summary_replacements_as_system_messages()
 
     assert_eq!(bundle.messages.len(), 1);
     assert_eq!(bundle.messages[0].role, "system");
-    assert_eq!(bundle.messages[0].safe_summary, "summary artifact available");
+    assert_eq!(
+        bundle.messages[0].safe_summary,
+        "summary artifact available"
+    );
     assert!(!bundle.messages[0].safe_summary.contains("summarized hello"));
     assert!(
         bundle.messages[0]
