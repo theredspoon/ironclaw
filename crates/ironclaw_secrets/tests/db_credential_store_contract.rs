@@ -54,6 +54,10 @@ async fn libsql_credential_store_persists_sessions_and_enforces_use_limits_acros
     let store = libsql_store(&db_path).await;
     let scope = sample_scope("tenant-a", "user-a");
     let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    store
+        .put_account(sample_account(scope.clone(), account_id.clone()))
+        .await
+        .unwrap();
     let session = broker_session(scope.clone(), account_id, Some(1), None);
     let session_id = session.correlation_id();
 
@@ -193,12 +197,152 @@ async fn libsql_credential_store_rejects_existing_plaintext_payload_rows() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn libsql_credential_store_rejects_sql_injected_scope_values() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+    let injected_scope = sample_scope("tenant-a' OR '1'='1", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let account = sample_account(scope.clone(), account_id.clone());
+
+    store.put_account(account).await.unwrap();
+
+    assert_eq!(
+        store
+            .get_account(&injected_scope, &account_id)
+            .await
+            .unwrap(),
+        None,
+        "scope fields must be bound parameters, not SQL string fragments"
+    );
+    assert!(
+        store
+            .accounts_for_scope(&injected_scope)
+            .await
+            .unwrap()
+            .is_empty(),
+        "injected tenant ids must not escape scope isolation"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_rejects_sessions_without_matching_account_row() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let session = broker_session(scope.clone(), account_id.clone(), Some(1), None);
+
+    let error = store.issue_session(session.clone()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("constraint"),
+        "sessions must be constrained to an existing credential account row: {error}"
+    );
+
+    store
+        .put_account(sample_account(scope, account_id))
+        .await
+        .unwrap();
+    store.issue_session(session).await.unwrap();
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_concurrent_session_consumption_respects_max_uses() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = Arc::new(libsql_store(&db_path).await);
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    store
+        .put_account(sample_account(scope.clone(), account_id.clone()))
+        .await
+        .unwrap();
+    let session = broker_session(scope.clone(), account_id, Some(1), None);
+    let session_id = session.correlation_id();
+    store.issue_session(session).await.unwrap();
+
+    let first = {
+        let store = Arc::clone(&store);
+        let scope = scope.clone();
+        tokio::spawn(async move {
+            store
+                .consume_session_use(&scope, session_id, Utc::now())
+                .await
+        })
+    };
+    let second = {
+        let store = Arc::clone(&store);
+        let scope = scope.clone();
+        tokio::spawn(async move {
+            store
+                .consume_session_use(&scope, session_id, Utc::now())
+                .await
+        })
+    };
+
+    let results = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(error) if error.is_use_limit_exceeded()))
+            .count(),
+        1
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_credential_store_accounts_for_scope_rejects_over_limit_result_sets() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let store = libsql_store(&db_path).await;
+    let scope = sample_scope("tenant-a", "user-a");
+
+    for index in 0..1000 {
+        let account_id = CredentialAccountId::new(format!("acct_{index:04}")).unwrap();
+        store
+            .put_account(sample_account(scope.clone(), account_id))
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.accounts_for_scope(&scope).await.unwrap().len(), 1000);
+
+    store
+        .put_account(sample_account(
+            scope.clone(),
+            CredentialAccountId::new("acct_overflow").unwrap(),
+        ))
+        .await
+        .unwrap();
+    let error = store.accounts_for_scope(&scope).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("more than 1000 credential accounts"),
+        "large account listings must fail closed before unbounded allocation: {error}"
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn libsql_credential_store_persists_session_expiry_across_reopen() {
     let dir = tempfile::tempdir().unwrap().keep();
     let db_path = dir.join("credentials.db");
     let store = libsql_store(&db_path).await;
     let scope = sample_scope("tenant-a", "user-a");
     let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    store
+        .put_account(sample_account(scope.clone(), account_id.clone()))
+        .await
+        .unwrap();
     let session = broker_session(
         scope.clone(),
         account_id,
@@ -259,6 +403,69 @@ async fn postgres_credential_store_persists_accounts_and_sessions_when_database_
     assert_eq!(
         store.get_session(&scope, session_id).await.unwrap(),
         Some(session)
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_credential_store_rejects_sessions_without_matching_account_row_when_database_url_is_set()
+ {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let scope = sample_scope(&format!("tenant-missing-{suffix}"), "user-a");
+    let account_id = CredentialAccountId::new(format!("openai_missing_{suffix}")).unwrap();
+    let session = broker_session(scope.clone(), account_id.clone(), Some(1), None);
+
+    let error = store.issue_session(session.clone()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("constraint"),
+        "sessions must be constrained to an existing credential account row: {error}"
+    );
+
+    store
+        .put_account(sample_account(scope, account_id))
+        .await
+        .unwrap();
+    store.issue_session(session).await.unwrap();
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_credential_store_accounts_for_scope_rejects_over_limit_result_sets_when_database_url_is_set()
+ {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let scope = sample_scope(&format!("tenant-many-{suffix}"), "user-a");
+
+    for index in 0..1000 {
+        let account_id = CredentialAccountId::new(format!("acct_{suffix}_{index:04}")).unwrap();
+        store
+            .put_account(sample_account(scope.clone(), account_id))
+            .await
+            .unwrap();
+    }
+    assert_eq!(store.accounts_for_scope(&scope).await.unwrap().len(), 1000);
+
+    store
+        .put_account(sample_account(
+            scope.clone(),
+            CredentialAccountId::new(format!("acct_{suffix}_overflow")).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let error = store.accounts_for_scope(&scope).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("more than 1000 credential accounts"),
+        "large account listings must fail closed before unbounded allocation: {error}"
     );
 }
 

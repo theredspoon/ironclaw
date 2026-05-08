@@ -1,6 +1,20 @@
+//! Durable credential-store backends for IronClaw Reborn.
+//!
+//! Account and session payloads are encrypted with [`SecretsCrypto`] before they
+//! are written to libSQL or PostgreSQL. Operators must still enable
+//! storage-layer encryption for database files, WALs, snapshots, and backups
+//! because scope keys, account ids, encrypted blobs, and indexes remain durable
+//! metadata outside the encrypted payload.
+
 use std::sync::Arc;
 
-use ironclaw_host_api::ResourceScope;
+use ironclaw_host_api::{
+    CapabilityId, ExtensionId, InvocationId, ResourceScope, SecretHandle, Timestamp,
+};
+use serde::{Deserialize, Serialize};
+
+const CREDENTIAL_ACCOUNTS_FOR_SCOPE_LIMIT: usize = 1000;
+const CREDENTIAL_ACCOUNTS_FOR_SCOPE_QUERY_LIMIT: i64 = 1001;
 
 use crate::{
     CredentialAccount, CredentialAccountId, CredentialAccountStatus, CredentialAccountStore,
@@ -43,7 +57,12 @@ CREATE TABLE IF NOT EXISTS reborn_credential_sessions (
     payload TEXT NOT NULL DEFAULT '{}',
     encrypted_payload BLOB NOT NULL DEFAULT X'',
     payload_key_salt BLOB NOT NULL DEFAULT X'',
-    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id)
+    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id),
+    CONSTRAINT reborn_credential_sessions_account_fk
+        FOREIGN KEY (tenant_id, user_id, agent_id, project_id, account_id)
+        REFERENCES reborn_credential_accounts(tenant_id, user_id, agent_id, project_id, account_id)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_reborn_credential_sessions_account
     ON reborn_credential_sessions(tenant_id, user_id, agent_id, project_id, account_id);
@@ -84,7 +103,12 @@ CREATE TABLE IF NOT EXISTS reborn_credential_sessions (
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     encrypted_payload BYTEA NOT NULL DEFAULT '\x'::bytea,
     payload_key_salt BYTEA NOT NULL DEFAULT '\x'::bytea,
-    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id)
+    PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id),
+    CONSTRAINT reborn_credential_sessions_account_fk
+        FOREIGN KEY (tenant_id, user_id, agent_id, project_id, account_id)
+        REFERENCES reborn_credential_accounts(tenant_id, user_id, agent_id, project_id, account_id)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_reborn_credential_sessions_account
     ON reborn_credential_sessions(tenant_id, user_id, agent_id, project_id, account_id);
@@ -108,6 +132,7 @@ impl LibSqlCredentialStore {
             .await
             .map_err(db_error)?;
         libsql_ensure_encrypted_payload_columns(&conn).await?;
+        libsql_ensure_session_account_foreign_key(&conn).await?;
         libsql_reject_unencrypted_payload_rows(&conn).await?;
         Ok(())
     }
@@ -124,7 +149,7 @@ impl CredentialAccountStore for LibSqlCredentialStore {
         &self,
         account: CredentialAccount,
     ) -> Result<CredentialAccount, CredentialBrokerError> {
-        let conn = libsql_begin_immediate(&self.db).await?;
+        let conn = libsql_begin_exclusive(&self.db).await?;
         let result = async {
             libsql_upsert_account(&conn, &self.crypto, &account).await?;
             Ok(account)
@@ -158,7 +183,7 @@ impl CredentialSessionStore for LibSqlCredentialStore {
         &self,
         session: CredentialSession,
     ) -> Result<CredentialSession, CredentialBrokerError> {
-        let conn = libsql_begin_immediate(&self.db).await?;
+        let conn = libsql_begin_exclusive(&self.db).await?;
         let result = async {
             libsql_upsert_session(&conn, &self.crypto, &session, 0).await?;
             Ok(session)
@@ -200,15 +225,15 @@ impl CredentialSessionStore for LibSqlCredentialStore {
         session_id: CredentialSessionId,
         now: ironclaw_host_api::Timestamp,
     ) -> Result<CredentialSession, CredentialBrokerError> {
-        let conn = libsql_begin_immediate(&self.db).await?;
+        let conn = libsql_begin_exclusive(&self.db).await?;
         let result = async {
-            let record = libsql_get_session_record(&conn, &self.crypto, scope, session_id)
-                .await?
-                .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
-            ensure_session_usable(&record, session_id, now)?;
-            let new_uses = record.uses + 1;
-            libsql_update_session_uses(&conn, scope, session_id, new_uses).await?;
-            Ok(record.session)
+            if let Some(record) =
+                libsql_consume_session_record(&conn, &self.crypto, scope, session_id, now).await?
+            {
+                return Ok(record.session);
+            }
+            let record = libsql_get_session_record(&conn, &self.crypto, scope, session_id).await?;
+            session_use_denial_result(record, session_id, now)
         }
         .await;
         finish_libsql_transaction(&conn, result).await
@@ -234,6 +259,7 @@ impl PostgresCredentialStore {
             .await
             .map_err(db_error)?;
         postgres_ensure_encrypted_payload_columns(&client).await?;
+        postgres_ensure_session_account_foreign_key(&client).await?;
         postgres_reject_unencrypted_payload_rows(&client).await
     }
 }
@@ -287,7 +313,7 @@ impl CredentialSessionStore for PostgresCredentialStore {
     ) -> Result<Option<CredentialSession>, CredentialBrokerError> {
         let client = self.pool.get().await.map_err(db_error)?;
         Ok(
-            postgres_get_session_record(&client, &self.crypto, scope, session_id, false)
+            postgres_get_session_record(&client, &self.crypto, scope, session_id)
                 .await?
                 .map(|record| record.session),
         )
@@ -300,7 +326,7 @@ impl CredentialSessionStore for PostgresCredentialStore {
         now: ironclaw_host_api::Timestamp,
     ) -> Result<CredentialSession, CredentialBrokerError> {
         let client = self.pool.get().await.map_err(db_error)?;
-        let record = postgres_get_session_record(&client, &self.crypto, scope, session_id, false)
+        let record = postgres_get_session_record(&client, &self.crypto, scope, session_id)
             .await?
             .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
         ensure_session_usable(&record, session_id, now)?;
@@ -314,16 +340,22 @@ impl CredentialSessionStore for PostgresCredentialStore {
         now: ironclaw_host_api::Timestamp,
     ) -> Result<CredentialSession, CredentialBrokerError> {
         let mut client = self.pool.get().await.map_err(db_error)?;
-        let transaction = client.transaction().await.map_err(db_error)?;
+        let transaction = client
+            .build_transaction()
+            .isolation_level(tokio_postgres::IsolationLevel::Serializable)
+            .start()
+            .await
+            .map_err(db_error)?;
         let result = async {
-            let record =
-                postgres_get_session_record(&transaction, &self.crypto, scope, session_id, true)
+            if let Some(record) =
+                postgres_consume_session_record(&transaction, &self.crypto, scope, session_id, now)
                     .await?
-                    .ok_or(CredentialBrokerError::UnknownSession { session_id })?;
-            ensure_session_usable(&record, session_id, now)?;
-            let new_uses = record.uses + 1;
-            postgres_update_session_uses(&transaction, scope, session_id, new_uses).await?;
-            Ok(record.session)
+            {
+                return Ok(record.session);
+            }
+            let record =
+                postgres_get_session_record(&transaction, &self.crypto, scope, session_id).await?;
+            session_use_denial_result(record, session_id, now)
         }
         .await;
         match result {
@@ -367,11 +399,35 @@ fn ensure_session_usable(
     Ok(())
 }
 
+fn session_use_denial_result(
+    record: Option<SessionRecord>,
+    session_id: CredentialSessionId,
+    now: ironclaw_host_api::Timestamp,
+) -> Result<CredentialSession, CredentialBrokerError> {
+    let record = record.ok_or(CredentialBrokerError::UnknownSession { session_id })?;
+    ensure_session_usable(&record, session_id, now)?;
+    Err(persistence_error(
+        "credential session use was not consumed atomically",
+    ))
+}
+
+fn ensure_account_result_within_limit(count: usize) -> Result<(), CredentialBrokerError> {
+    if count > CREDENTIAL_ACCOUNTS_FOR_SCOPE_LIMIT {
+        return Err(persistence_error(
+            "scope contains more than 1000 credential accounts; add pagination before listing",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "libsql")]
 async fn libsql_connect(
     db: &libsql::Database,
 ) -> Result<libsql::Connection, CredentialBrokerError> {
     let conn = db.connect().map_err(db_error)?;
+    conn.execute("PRAGMA foreign_keys = ON", ())
+        .await
+        .map_err(db_error)?;
     conn.query("PRAGMA busy_timeout = 5000", ())
         .await
         .map_err(db_error)?;
@@ -379,11 +435,11 @@ async fn libsql_connect(
 }
 
 #[cfg(feature = "libsql")]
-async fn libsql_begin_immediate(
+async fn libsql_begin_exclusive(
     db: &libsql::Database,
 ) -> Result<libsql::Connection, CredentialBrokerError> {
     let conn = libsql_connect(db).await?;
-    conn.execute("BEGIN IMMEDIATE", ())
+    conn.execute("BEGIN EXCLUSIVE", ())
         .await
         .map_err(db_error)?;
     Ok(conn)
@@ -477,8 +533,14 @@ async fn libsql_accounts_for_scope(
     let key = DbScopeKey::from_account_scope(scope);
     let mut rows = conn
         .query(
-            "SELECT account_id, status, provider_or_extension_id, updated_at, encrypted_payload, payload_key_salt FROM reborn_credential_accounts WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 ORDER BY account_id",
-            libsql::params![key.tenant_id, key.user_id, key.agent_id, key.project_id],
+            "SELECT account_id, status, provider_or_extension_id, updated_at, encrypted_payload, payload_key_salt FROM reborn_credential_accounts WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 ORDER BY account_id LIMIT ?5",
+            libsql::params![
+                key.tenant_id,
+                key.user_id,
+                key.agent_id,
+                key.project_id,
+                CREDENTIAL_ACCOUNTS_FOR_SCOPE_QUERY_LIMIT,
+            ],
         )
         .await
         .map_err(db_error)?;
@@ -500,6 +562,7 @@ async fn libsql_accounts_for_scope(
             &updated_at,
         )?);
     }
+    ensure_account_result_within_limit(accounts.len())?;
     Ok(accounts)
 }
 
@@ -511,7 +574,7 @@ async fn libsql_upsert_session(
     uses: u64,
 ) -> Result<(), CredentialBrokerError> {
     let key = DbScopeKey::from_full_scope(session.scope());
-    let payload = encrypt_json_payload(crypto, session)?;
+    let payload = encrypt_session_payload(crypto, session)?;
     conn.execute(
         "INSERT INTO reborn_credential_sessions (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id, account_id, expires_at, max_uses, uses, payload, encrypted_payload, payload_key_salt) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, '{}', ?13, ?14) ON CONFLICT(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id) DO UPDATE SET account_id = EXCLUDED.account_id, expires_at = EXCLUDED.expires_at, max_uses = EXCLUDED.max_uses, uses = EXCLUDED.uses, payload = '{}', encrypted_payload = EXCLUDED.encrypted_payload, payload_key_salt = EXCLUDED.payload_key_salt",
         libsql::params![
@@ -561,7 +624,7 @@ async fn libsql_get_session_record(
     let encrypted_payload: Vec<u8> = row.get(4).map_err(db_error)?;
     let payload_key_salt: Vec<u8> = row.get(5).map_err(db_error)?;
     validate_session_row(
-        decrypt_json_payload(crypto, &encrypted_payload, &payload_key_salt)?,
+        decrypt_session_payload(crypto, &encrypted_payload, &payload_key_salt)?,
         scope,
         session_id,
         &account_id,
@@ -573,20 +636,50 @@ async fn libsql_get_session_record(
 }
 
 #[cfg(feature = "libsql")]
-async fn libsql_update_session_uses(
+async fn libsql_consume_session_record(
     conn: &libsql::Connection,
+    crypto: &SecretsCrypto,
     scope: &ResourceScope,
     session_id: CredentialSessionId,
-    uses: u64,
-) -> Result<(), CredentialBrokerError> {
+    now: ironclaw_host_api::Timestamp,
+) -> Result<Option<SessionRecord>, CredentialBrokerError> {
     let key = DbScopeKey::from_full_scope(scope);
-    conn.execute(
-        "UPDATE reborn_credential_sessions SET uses = ?1 WHERE tenant_id = ?2 AND user_id = ?3 AND agent_id = ?4 AND project_id = ?5 AND mission_id = ?6 AND thread_id = ?7 AND invocation_id = ?8 AND session_id = ?9",
-        libsql::params![uses as i64, key.tenant_id, key.user_id, key.agent_id, key.project_id, key.mission_id, key.thread_id, key.invocation_id, session_id.to_string()],
+    let mut rows = conn
+        .query(
+            "UPDATE reborn_credential_sessions SET uses = uses + 1 WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 AND mission_id = ?5 AND thread_id = ?6 AND invocation_id = ?7 AND session_id = ?8 AND (expires_at IS NULL OR expires_at > ?9) AND (max_uses IS NULL OR uses < max_uses) RETURNING account_id, expires_at, max_uses, uses, encrypted_payload, payload_key_salt",
+            libsql::params![
+                key.tenant_id,
+                key.user_id,
+                key.agent_id,
+                key.project_id,
+                key.mission_id,
+                key.thread_id,
+                key.invocation_id,
+                session_id.to_string(),
+                now.to_rfc3339(),
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    let Some(row) = rows.next().await.map_err(db_error)? else {
+        return Ok(None);
+    };
+    let account_id: String = row.get(0).map_err(db_error)?;
+    let expires_at: Option<String> = row.get(1).map_err(db_error)?;
+    let max_uses: Option<i64> = row.get(2).map_err(db_error)?;
+    let uses: i64 = row.get(3).map_err(db_error)?;
+    let encrypted_payload: Vec<u8> = row.get(4).map_err(db_error)?;
+    let payload_key_salt: Vec<u8> = row.get(5).map_err(db_error)?;
+    validate_session_row(
+        decrypt_session_payload(crypto, &encrypted_payload, &payload_key_salt)?,
+        scope,
+        session_id,
+        &account_id,
+        expires_at.as_deref(),
+        max_uses,
+        uses,
     )
-    .await
-    .map_err(db_error)?;
-    Ok(())
+    .map(Some)
 }
 
 #[cfg(feature = "postgres")]
@@ -636,7 +729,7 @@ async fn postgres_accounts_for_scope(
     scope: &ResourceScope,
 ) -> Result<Vec<CredentialAccount>, CredentialBrokerError> {
     let key = DbScopeKey::from_account_scope(scope);
-    let rows = client.query("SELECT account_id, status, provider_or_extension_id, updated_at, encrypted_payload, payload_key_salt FROM reborn_credential_accounts WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 ORDER BY account_id", &[&key.tenant_id, &key.user_id, &key.agent_id, &key.project_id]).await.map_err(db_error)?;
+    let rows = client.query("SELECT account_id, status, provider_or_extension_id, updated_at, encrypted_payload, payload_key_salt FROM reborn_credential_accounts WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 ORDER BY account_id LIMIT $5", &[&key.tenant_id, &key.user_id, &key.agent_id, &key.project_id, &CREDENTIAL_ACCOUNTS_FOR_SCOPE_QUERY_LIMIT]).await.map_err(db_error)?;
     let mut accounts = Vec::new();
     for row in rows {
         let account_id: String = row.get(0);
@@ -655,6 +748,7 @@ async fn postgres_accounts_for_scope(
             &updated_at,
         )?);
     }
+    ensure_account_result_within_limit(accounts.len())?;
     Ok(accounts)
 }
 
@@ -667,7 +761,7 @@ async fn postgres_upsert_session(
 ) -> Result<(), CredentialBrokerError> {
     let key = DbScopeKey::from_full_scope(session.scope());
     let max_uses = session.max_uses().map(|value| value as i64);
-    let payload = encrypt_json_payload(crypto, session)?;
+    let payload = encrypt_session_payload(crypto, session)?;
     client.execute("INSERT INTO reborn_credential_sessions (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id, account_id, expires_at, max_uses, uses, payload, encrypted_payload, payload_key_salt) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '{}'::jsonb, $13, $14) ON CONFLICT(tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id) DO UPDATE SET account_id = EXCLUDED.account_id, expires_at = EXCLUDED.expires_at, max_uses = EXCLUDED.max_uses, uses = EXCLUDED.uses, payload = '{}'::jsonb, encrypted_payload = EXCLUDED.encrypted_payload, payload_key_salt = EXCLUDED.payload_key_salt", &[&key.tenant_id, &key.user_id, &key.agent_id, &key.project_id, &key.mission_id, &key.thread_id, &key.invocation_id, &session.correlation_id().to_string(), &session.account_id().as_str(), &session.expires_at().map(|value| value.to_rfc3339()), &max_uses, &(uses as i64), &payload.encrypted_value, &payload.key_salt]).await.map_err(db_error)?;
     Ok(())
 }
@@ -678,16 +772,11 @@ async fn postgres_get_session_record(
     crypto: &SecretsCrypto,
     scope: &ResourceScope,
     session_id: CredentialSessionId,
-    for_update: bool,
 ) -> Result<Option<SessionRecord>, CredentialBrokerError> {
     let key = DbScopeKey::from_full_scope(scope);
-    let suffix = if for_update { " FOR UPDATE" } else { "" };
-    let query = format!(
-        "SELECT account_id, expires_at, max_uses, uses, encrypted_payload, payload_key_salt FROM reborn_credential_sessions WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND invocation_id = $7 AND session_id = $8{suffix}"
-    );
     let row = client
         .query_opt(
-            &query,
+            "SELECT account_id, expires_at, max_uses, uses, encrypted_payload, payload_key_salt FROM reborn_credential_sessions WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND invocation_id = $7 AND session_id = $8",
             &[
                 &key.tenant_id,
                 &key.user_id,
@@ -711,7 +800,7 @@ async fn postgres_get_session_record(
     let encrypted_payload: Vec<u8> = row.get(4);
     let payload_key_salt: Vec<u8> = row.get(5);
     validate_session_row(
-        decrypt_json_payload(crypto, &encrypted_payload, &payload_key_salt)?,
+        decrypt_session_payload(crypto, &encrypted_payload, &payload_key_salt)?,
         scope,
         session_id,
         &account_id,
@@ -723,15 +812,50 @@ async fn postgres_get_session_record(
 }
 
 #[cfg(feature = "postgres")]
-async fn postgres_update_session_uses(
+async fn postgres_consume_session_record(
     client: &impl deadpool_postgres::GenericClient,
+    crypto: &SecretsCrypto,
     scope: &ResourceScope,
     session_id: CredentialSessionId,
-    uses: u64,
-) -> Result<(), CredentialBrokerError> {
+    now: ironclaw_host_api::Timestamp,
+) -> Result<Option<SessionRecord>, CredentialBrokerError> {
     let key = DbScopeKey::from_full_scope(scope);
-    client.execute("UPDATE reborn_credential_sessions SET uses = $1 WHERE tenant_id = $2 AND user_id = $3 AND agent_id = $4 AND project_id = $5 AND mission_id = $6 AND thread_id = $7 AND invocation_id = $8 AND session_id = $9", &[&(uses as i64), &key.tenant_id, &key.user_id, &key.agent_id, &key.project_id, &key.mission_id, &key.thread_id, &key.invocation_id, &session_id.to_string()]).await.map_err(db_error)?;
-    Ok(())
+    let row = client
+        .query_opt(
+            "UPDATE reborn_credential_sessions SET uses = uses + 1 WHERE tenant_id = $1 AND user_id = $2 AND agent_id = $3 AND project_id = $4 AND mission_id = $5 AND thread_id = $6 AND invocation_id = $7 AND session_id = $8 AND (expires_at IS NULL OR expires_at > $9) AND (max_uses IS NULL OR uses < max_uses) RETURNING account_id, expires_at, max_uses, uses, encrypted_payload, payload_key_salt",
+            &[
+                &key.tenant_id,
+                &key.user_id,
+                &key.agent_id,
+                &key.project_id,
+                &key.mission_id,
+                &key.thread_id,
+                &key.invocation_id,
+                &session_id.to_string(),
+                &now.to_rfc3339(),
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let account_id: String = row.get(0);
+    let expires_at: Option<String> = row.get(1);
+    let max_uses: Option<i64> = row.get(2);
+    let uses: i64 = row.get(3);
+    let encrypted_payload: Vec<u8> = row.get(4);
+    let payload_key_salt: Vec<u8> = row.get(5);
+    validate_session_row(
+        decrypt_session_payload(crypto, &encrypted_payload, &payload_key_salt)?,
+        scope,
+        session_id,
+        &account_id,
+        expires_at.as_deref(),
+        max_uses,
+        uses,
+    )
+    .map(Some)
 }
 
 #[cfg(feature = "libsql")]
@@ -760,6 +884,77 @@ fn ignore_duplicate_column_error(error: libsql::Error) -> Result<(), CredentialB
     } else {
         Err(db_error(error))
     }
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_ensure_session_account_foreign_key(
+    conn: &libsql::Connection,
+) -> Result<(), CredentialBrokerError> {
+    if libsql_session_account_foreign_key_exists(conn).await? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS reborn_credential_sessions_with_account_fk;
+        CREATE TABLE reborn_credential_sessions_with_account_fk (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            expires_at TEXT,
+            max_uses INTEGER,
+            uses INTEGER NOT NULL DEFAULT 0,
+            payload TEXT NOT NULL DEFAULT '{}',
+            encrypted_payload BLOB NOT NULL DEFAULT X'',
+            payload_key_salt BLOB NOT NULL DEFAULT X'',
+            PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id),
+            CONSTRAINT reborn_credential_sessions_account_fk
+                FOREIGN KEY (tenant_id, user_id, agent_id, project_id, account_id)
+                REFERENCES reborn_credential_accounts(tenant_id, user_id, agent_id, project_id, account_id)
+                ON UPDATE CASCADE
+                ON DELETE RESTRICT
+        );
+        INSERT INTO reborn_credential_sessions_with_account_fk (
+            tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id,
+            session_id, account_id, expires_at, max_uses, uses, payload, encrypted_payload,
+            payload_key_salt
+        )
+        SELECT
+            tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id,
+            session_id, account_id, expires_at, max_uses, uses, payload, encrypted_payload,
+            payload_key_salt
+        FROM reborn_credential_sessions;
+        DROP TABLE reborn_credential_sessions;
+        ALTER TABLE reborn_credential_sessions_with_account_fk RENAME TO reborn_credential_sessions;
+        CREATE INDEX IF NOT EXISTS idx_reborn_credential_sessions_account
+            ON reborn_credential_sessions(tenant_id, user_id, agent_id, project_id, account_id);
+        "#,
+    )
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_session_account_foreign_key_exists(
+    conn: &libsql::Connection,
+) -> Result<bool, CredentialBrokerError> {
+    let mut rows = conn
+        .query("PRAGMA foreign_key_list(reborn_credential_sessions)", ())
+        .await
+        .map_err(db_error)?;
+    while let Some(row) = rows.next().await.map_err(db_error)? {
+        let table: String = row.get(2).map_err(db_error)?;
+        if table == "reborn_credential_accounts" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(feature = "libsql")]
@@ -811,6 +1006,30 @@ async fn postgres_ensure_encrypted_payload_columns(
 }
 
 #[cfg(feature = "postgres")]
+async fn postgres_ensure_session_account_foreign_key(
+    client: &impl deadpool_postgres::GenericClient,
+) -> Result<(), CredentialBrokerError> {
+    client
+        .batch_execute(
+            r#"
+            DO $$
+            BEGIN
+                ALTER TABLE reborn_credential_sessions
+                    ADD CONSTRAINT reborn_credential_sessions_account_fk
+                    FOREIGN KEY (tenant_id, user_id, agent_id, project_id, account_id)
+                    REFERENCES reborn_credential_accounts(tenant_id, user_id, agent_id, project_id, account_id)
+                    ON UPDATE CASCADE
+                    ON DELETE RESTRICT;
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+            "#,
+        )
+        .await
+        .map_err(db_error)
+}
+
+#[cfg(feature = "postgres")]
 async fn postgres_reject_unencrypted_payload_rows(
     client: &impl deadpool_postgres::GenericClient,
 ) -> Result<(), CredentialBrokerError> {
@@ -847,6 +1066,74 @@ async fn postgres_has_unencrypted_rows(
 struct EncryptedPayload {
     encrypted_value: Vec<u8>,
     key_salt: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedCredentialSession {
+    scope: ResourceScope,
+    invocation_id: InvocationId,
+    capability_id: CapabilityId,
+    extension_id: ExtensionId,
+    account_id: CredentialAccountId,
+    secret_handles: Vec<SecretHandle>,
+    allowed_targets: Vec<crate::CredentialTargetPolicy>,
+    expires_at: Option<Timestamp>,
+    max_uses: Option<u64>,
+    correlation_id: String,
+}
+
+impl From<&CredentialSession> for PersistedCredentialSession {
+    fn from(session: &CredentialSession) -> Self {
+        Self {
+            scope: session.scope.clone(),
+            invocation_id: session.invocation_id,
+            capability_id: session.capability_id.clone(),
+            extension_id: session.extension_id.clone(),
+            account_id: session.account_id.clone(),
+            secret_handles: session.secret_handles.clone(),
+            allowed_targets: session.allowed_targets.clone(),
+            expires_at: session.expires_at,
+            max_uses: session.max_uses,
+            correlation_id: session.correlation_id.to_string(),
+        }
+    }
+}
+
+impl TryFrom<PersistedCredentialSession> for CredentialSession {
+    type Error = CredentialBrokerError;
+
+    fn try_from(value: PersistedCredentialSession) -> Result<Self, Self::Error> {
+        Ok(Self {
+            scope: value.scope,
+            invocation_id: value.invocation_id,
+            capability_id: value.capability_id,
+            extension_id: value.extension_id,
+            account_id: value.account_id,
+            secret_handles: value.secret_handles,
+            allowed_targets: value.allowed_targets,
+            expires_at: value.expires_at,
+            max_uses: value.max_uses,
+            correlation_id: CredentialSessionId::parse(&value.correlation_id)
+                .map_err(|error| persistence_error(error.to_string()))?,
+        })
+    }
+}
+
+fn encrypt_session_payload(
+    crypto: &SecretsCrypto,
+    session: &CredentialSession,
+) -> Result<EncryptedPayload, CredentialBrokerError> {
+    encrypt_json_payload(crypto, &PersistedCredentialSession::from(session))
+}
+
+fn decrypt_session_payload(
+    crypto: &SecretsCrypto,
+    encrypted_value: &[u8],
+    key_salt: &[u8],
+) -> Result<CredentialSession, CredentialBrokerError> {
+    let persisted: PersistedCredentialSession =
+        decrypt_json_payload(crypto, encrypted_value, key_salt)?;
+    persisted.try_into()
 }
 
 fn encrypt_json_payload<T: serde::Serialize>(
