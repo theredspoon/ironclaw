@@ -324,7 +324,9 @@ impl InMemoryCredentialBroker {
             .ok_or_else(|| CredentialBrokerError::MissingCredential {
                 account_id: request.account_id.clone(),
             })?;
-        if account.scope != request.scope {
+        if CredentialAccountKey::new(&account.scope, &account.id)
+            != CredentialAccountKey::new(&request.scope, &request.account_id)
+        {
             return Err(CredentialBrokerError::CredentialScopeMismatch {
                 account_id: request.account_id,
             });
@@ -721,12 +723,9 @@ pub struct InMemorySecretStore {
 
 impl InMemorySecretStore {
     pub fn new() -> Self {
-        let crypto = Arc::new(
-            SecretsCrypto::new(SecretMaterial::from(
-                "0123456789abcdef0123456789abcdef".to_string(),
-            ))
-            .expect("test crypto key is a valid 32-byte literal"),
-        );
+        let crypto = Arc::new(SecretsCrypto::from_valid_master_key_literal(
+            "0123456789abcdef0123456789abcdef",
+        ));
         Self {
             inner: ScopedSecretsStoreAdapter::new(Arc::new(InMemorySecretsStore::new(crypto))),
         }
@@ -902,6 +901,38 @@ mod tests {
         let debug = format!("{session:?}");
         assert!(!debug.contains("sk-live-sentinel"));
         assert!(!debug.contains("token"));
+    }
+
+    #[test]
+    fn credential_session_creation_accepts_project_scoped_account_across_invocations() {
+        let broker = InMemoryCredentialBroker::new();
+        let account_scope = sample_scope("tenant-a", "user-a");
+        let request_scope = ResourceScope {
+            mission_id: Some(MissionId::new("mission-b").unwrap()),
+            thread_id: Some(ThreadId::new("thread-b").unwrap()),
+            invocation_id: InvocationId::new(),
+            ..account_scope.clone()
+        };
+        let account_id = CredentialAccountId::new("openai_prod").unwrap();
+        let secret_handle = SecretHandle::new("openai_key").unwrap();
+        broker
+            .put_account(sample_account(
+                account_scope,
+                account_id.clone(),
+                secret_handle.clone(),
+            ))
+            .unwrap();
+
+        let session = broker
+            .create_session(session_request(
+                request_scope.clone(),
+                account_id,
+                "https://api.example.com/v1/models",
+            ))
+            .unwrap();
+
+        assert_eq!(session.scope, request_scope);
+        assert_eq!(session.secret_handles, vec![secret_handle]);
     }
 
     #[test]

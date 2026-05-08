@@ -31,6 +31,15 @@ impl SecretsCrypto {
         Ok(Self { master_key })
     }
 
+    pub(crate) fn from_valid_master_key_literal(master_key: &'static str) -> Self {
+        // The caller is limited to crate-owned literals whose length is reviewed
+        // at compile time. This keeps infallible test/demo store construction out
+        // of production panic paths while preserving `new` validation for dynamic keys.
+        Self {
+            master_key: SecretString::from(master_key.to_string()),
+        }
+    }
+
     pub fn generate_salt() -> Vec<u8> {
         let mut salt = vec![0u8; SALT_SIZE];
         rand::RngCore::fill_bytes(&mut OsRng, &mut salt);
