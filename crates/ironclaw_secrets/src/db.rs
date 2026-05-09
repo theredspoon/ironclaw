@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 const CREDENTIAL_ACCOUNTS_FOR_SCOPE_LIMIT: usize = 1000;
 const CREDENTIAL_ACCOUNTS_FOR_SCOPE_QUERY_LIMIT: i64 = 1001;
+const SECRET_STORE_KEY_CHECK_ID: &str = "active";
+const SECRET_STORE_KEY_CHECK_PLAINTEXT: &str = "reborn-secret-store-key-check-v1";
 
 use crate::{
     CreateSecretParams, CredentialAccount, CredentialAccountId, CredentialAccountStatus,
@@ -1091,6 +1093,13 @@ CREATE TABLE IF NOT EXISTS reborn_secret_records (
 );
 CREATE INDEX IF NOT EXISTS idx_reborn_secret_records_id
     ON reborn_secret_records(id);
+CREATE TABLE IF NOT EXISTS reborn_secret_store_key_check (
+    id TEXT PRIMARY KEY,
+    encrypted_value BLOB NOT NULL,
+    key_salt BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 #[cfg(feature = "postgres")]
@@ -1111,6 +1120,13 @@ CREATE TABLE IF NOT EXISTS reborn_secret_records (
 );
 CREATE INDEX IF NOT EXISTS idx_reborn_secret_records_id
     ON reborn_secret_records(id);
+CREATE TABLE IF NOT EXISTS reborn_secret_store_key_check (
+    id TEXT PRIMARY KEY,
+    encrypted_value BYTEA NOT NULL,
+    key_salt BYTEA NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 "#;
 
 #[cfg(feature = "libsql")]
@@ -1137,23 +1153,13 @@ impl LibSqlSecretsStore {
         libsql_secret_connect(&self.db).await
     }
 
+    /// Verifies the durable store key-check sentinel.
+    ///
+    /// Stores that predate the sentinel are bootstrapped by decrypting one
+    /// deterministic existing secret row before installing the key-check record.
     pub async fn verify_can_decrypt_existing_secrets(&self) -> Result<(), SecretError> {
         let conn = self.connect().await?;
-        // Sample one existing row to validate the configured master key without
-        // turning readiness checks into an O(N) table scan/decryption pass.
-        let mut rows = conn
-            .query(
-                "SELECT encrypted_value, key_salt FROM reborn_secret_records LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(secret_db_error)?;
-        while let Some(row) = rows.next().await.map_err(secret_db_error)? {
-            let encrypted_value: Vec<u8> = row.get(0).map_err(secret_db_error)?;
-            let key_salt: Vec<u8> = row.get(1).map_err(secret_db_error)?;
-            self.crypto.decrypt(&encrypted_value, &key_salt)?;
-        }
-        Ok(())
+        libsql_verify_or_bootstrap_secret_store_key_check(&conn, &self.crypto).await
     }
 }
 
@@ -1306,23 +1312,13 @@ impl PostgresSecretsStore {
             .map_err(secret_db_error)
     }
 
+    /// Verifies the durable store key-check sentinel.
+    ///
+    /// Stores that predate the sentinel are bootstrapped by decrypting one
+    /// deterministic existing secret row before installing the key-check record.
     pub async fn verify_can_decrypt_existing_secrets(&self) -> Result<(), SecretError> {
         let client = self.pool.get().await.map_err(secret_db_error)?;
-        // Sample one existing row to validate the configured master key without
-        // turning readiness checks into an O(N) table scan/decryption pass.
-        let rows = client
-            .query(
-                "SELECT encrypted_value, key_salt FROM reborn_secret_records LIMIT 1",
-                &[],
-            )
-            .await
-            .map_err(secret_db_error)?;
-        for row in rows {
-            let encrypted_value: Vec<u8> = row.get(0);
-            let key_salt: Vec<u8> = row.get(1);
-            self.crypto.decrypt(&encrypted_value, &key_salt)?;
-        }
-        Ok(())
+        postgres_verify_or_bootstrap_secret_store_key_check(&client, &self.crypto).await
     }
 }
 
@@ -1501,6 +1497,79 @@ async fn finish_libsql_secret_transaction<T>(
 }
 
 #[cfg(feature = "libsql")]
+async fn libsql_verify_or_bootstrap_secret_store_key_check(
+    conn: &libsql::Connection,
+    crypto: &SecretsCrypto,
+) -> Result<(), SecretError> {
+    if let Some((encrypted_value, key_salt)) = libsql_secret_store_key_check(conn).await? {
+        return verify_secret_store_key_check(crypto, &encrypted_value, &key_salt);
+    }
+    // Legacy/bootstrap path for stores created before the key-check row existed:
+    // validate one deterministic existing row before installing the sentinel.
+    if let Some((encrypted_value, key_salt)) = libsql_first_secret_payload(conn).await? {
+        crypto.decrypt(&encrypted_value, &key_salt)?;
+    }
+    libsql_insert_secret_store_key_check(conn, crypto).await
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_secret_store_key_check(
+    conn: &libsql::Connection,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, SecretError> {
+    let mut rows = conn
+        .query(
+            "SELECT encrypted_value, key_salt FROM reborn_secret_store_key_check WHERE id = ?1",
+            libsql::params![SECRET_STORE_KEY_CHECK_ID],
+        )
+        .await
+        .map_err(secret_db_error)?;
+    let Some(row) = rows.next().await.map_err(secret_db_error)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get(0).map_err(secret_db_error)?,
+        row.get(1).map_err(secret_db_error)?,
+    )))
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_first_secret_payload(
+    conn: &libsql::Connection,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, SecretError> {
+    let mut rows = conn
+        .query(
+            "SELECT encrypted_value, key_salt FROM reborn_secret_records ORDER BY user_id, name LIMIT 1",
+            (),
+        )
+        .await
+        .map_err(secret_db_error)?;
+    let Some(row) = rows.next().await.map_err(secret_db_error)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get(0).map_err(secret_db_error)?,
+        row.get(1).map_err(secret_db_error)?,
+    )))
+}
+
+#[cfg(feature = "libsql")]
+async fn libsql_insert_secret_store_key_check(
+    conn: &libsql::Connection,
+    crypto: &SecretsCrypto,
+) -> Result<(), SecretError> {
+    let (encrypted_value, key_salt) =
+        crypto.encrypt(SECRET_STORE_KEY_CHECK_PLAINTEXT.as_bytes())?;
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO reborn_secret_store_key_check (id, encrypted_value, key_salt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+        libsql::params![SECRET_STORE_KEY_CHECK_ID, encrypted_value, key_salt, now],
+    )
+    .await
+    .map_err(secret_db_error)?;
+    Ok(())
+}
+
+#[cfg(feature = "libsql")]
 async fn libsql_upsert_secret(
     conn: &libsql::Connection,
     secret: &Secret,
@@ -1582,6 +1651,68 @@ async fn libsql_delete_secret(
 }
 
 #[cfg(feature = "postgres")]
+async fn postgres_verify_or_bootstrap_secret_store_key_check(
+    client: &impl deadpool_postgres::GenericClient,
+    crypto: &SecretsCrypto,
+) -> Result<(), SecretError> {
+    if let Some((encrypted_value, key_salt)) = postgres_secret_store_key_check(client).await? {
+        return verify_secret_store_key_check(crypto, &encrypted_value, &key_salt);
+    }
+    // Legacy/bootstrap path for stores created before the key-check row existed:
+    // validate one deterministic existing row before installing the sentinel.
+    if let Some((encrypted_value, key_salt)) = postgres_first_secret_payload(client).await? {
+        crypto.decrypt(&encrypted_value, &key_salt)?;
+    }
+    postgres_insert_secret_store_key_check(client, crypto).await
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_secret_store_key_check(
+    client: &impl deadpool_postgres::GenericClient,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, SecretError> {
+    let row = client
+        .query_opt(
+            "SELECT encrypted_value, key_salt FROM reborn_secret_store_key_check WHERE id = $1",
+            &[&SECRET_STORE_KEY_CHECK_ID],
+        )
+        .await
+        .map_err(secret_db_error)?;
+    Ok(row.map(|row| (row.get(0), row.get(1))))
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_first_secret_payload(
+    client: &impl deadpool_postgres::GenericClient,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>, SecretError> {
+    let row = client
+        .query_opt(
+            "SELECT encrypted_value, key_salt FROM reborn_secret_records ORDER BY user_id, name LIMIT 1",
+            &[],
+        )
+        .await
+        .map_err(secret_db_error)?;
+    Ok(row.map(|row| (row.get(0), row.get(1))))
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_insert_secret_store_key_check(
+    client: &impl deadpool_postgres::GenericClient,
+    crypto: &SecretsCrypto,
+) -> Result<(), SecretError> {
+    let (encrypted_value, key_salt) =
+        crypto.encrypt(SECRET_STORE_KEY_CHECK_PLAINTEXT.as_bytes())?;
+    let now = Utc::now().to_rfc3339();
+    client
+        .execute(
+            "INSERT INTO reborn_secret_store_key_check (id, encrypted_value, key_salt, created_at, updated_at) VALUES ($1, $2, $3, $4, $4) ON CONFLICT(id) DO NOTHING",
+            &[&SECRET_STORE_KEY_CHECK_ID, &encrypted_value, &key_salt, &now],
+        )
+        .await
+        .map_err(secret_db_error)?;
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
 async fn postgres_upsert_secret(
     client: &impl deadpool_postgres::GenericClient,
     secret: &Secret,
@@ -1660,6 +1791,20 @@ async fn postgres_delete_secret(
         .await
         .map_err(secret_db_error)?;
     Ok(changed > 0)
+}
+
+fn verify_secret_store_key_check(
+    crypto: &SecretsCrypto,
+    encrypted_value: &[u8],
+    key_salt: &[u8],
+) -> Result<(), SecretError> {
+    let decrypted = crypto.decrypt(encrypted_value, key_salt)?;
+    if decrypted.expose() != SECRET_STORE_KEY_CHECK_PLAINTEXT {
+        return Err(SecretError::DecryptionFailed(
+            "secret store key check mismatch".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_encrypted_secret(

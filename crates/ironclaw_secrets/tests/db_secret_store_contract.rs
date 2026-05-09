@@ -57,13 +57,7 @@ async fn libsql_secret_store_verify_can_decrypt_existing_secrets_rejects_wrong_k
         .unwrap();
     drop(store);
 
-    let wrong_crypto = Arc::new(
-        SecretsCrypto::new(SecretMaterial::from(
-            "abcdef0123456789abcdef0123456789".to_string(),
-        ))
-        .unwrap(),
-    );
-    let reopened = libsql_store(&db_path, wrong_crypto).await;
+    let reopened = libsql_store(&db_path, wrong_crypto()).await;
     let error = reopened
         .verify_can_decrypt_existing_secrets()
         .await
@@ -113,7 +107,7 @@ async fn postgres_secret_store_persists_encrypted_secret_material_when_database_
     let Some(store) = postgres_store().await else {
         return;
     };
-    let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let suffix = unique_suffix();
     let user_id = format!("reborn-user-{suffix}");
     let secret_name = format!("openai_key_{suffix}");
 
@@ -131,6 +125,70 @@ async fn postgres_secret_store_persists_encrypted_secret_material_when_database_
     );
 }
 
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_secret_store_verify_can_decrypt_existing_secrets_rejects_wrong_key() {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let user_id = format!("reborn-user-wrong-key-{suffix}");
+    let secret_name = format!("openai_key_{suffix}");
+
+    store
+        .create(
+            &user_id,
+            CreateSecretParams::new(&secret_name, "sk-live-postgres-wrong-key-sentinel"),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let Some(reopened) = postgres_store_with_crypto(wrong_crypto()).await else {
+        return;
+    };
+    let error = reopened
+        .verify_can_decrypt_existing_secrets()
+        .await
+        .expect_err("wrong key must fail existing row decryptability check");
+    assert!(matches!(error, SecretError::DecryptionFailed(_)));
+    assert!(!format!("{error:?}").contains("sk-live-postgres-wrong-key-sentinel"));
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_secret_store_consume_if_matches_is_one_shot_and_durable() {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let user_id = format!("reborn-user-oauth-{suffix}");
+    let secret_name = format!("oauth_state_{suffix}");
+
+    store
+        .create(
+            &user_id,
+            CreateSecretParams::new(&secret_name, "state-postgres-secret-sentinel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .consume_if_matches(&user_id, &secret_name, "wrong")
+            .await
+            .unwrap(),
+        ironclaw_secrets::SecretConsumeResult::Mismatched
+    );
+    assert_eq!(
+        store
+            .consume_if_matches(&user_id, &secret_name, "state-postgres-secret-sentinel")
+            .await
+            .unwrap(),
+        ironclaw_secrets::SecretConsumeResult::Matched
+    );
+    assert!(!store.exists(&user_id, &secret_name).await.unwrap());
+}
+
 #[cfg(feature = "libsql")]
 async fn libsql_store(path: &std::path::Path, crypto: Arc<SecretsCrypto>) -> LibSqlSecretsStore {
     let db = Arc::new(libsql::Builder::new_local(path).build().await.unwrap());
@@ -141,6 +199,11 @@ async fn libsql_store(path: &std::path::Path, crypto: Arc<SecretsCrypto>) -> Lib
 
 #[cfg(feature = "postgres")]
 async fn postgres_store() -> Option<PostgresSecretsStore> {
+    postgres_store_with_crypto(test_crypto()).await
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_store_with_crypto(crypto: Arc<SecretsCrypto>) -> Option<PostgresSecretsStore> {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping Postgres secret store contract: DATABASE_URL is not set");
         return None;
@@ -153,7 +216,7 @@ async fn postgres_store() -> Option<PostgresSecretsStore> {
         .max_size(4)
         .build()
         .expect("Postgres pool must build");
-    let store = PostgresSecretsStore::new(pool, test_crypto());
+    let store = PostgresSecretsStore::new(pool, crypto);
     store
         .run_migrations()
         .await
@@ -168,4 +231,18 @@ fn test_crypto() -> Arc<SecretsCrypto> {
         ))
         .unwrap(),
     )
+}
+
+fn wrong_crypto() -> Arc<SecretsCrypto> {
+    Arc::new(
+        SecretsCrypto::new(SecretMaterial::from(
+            "abcdef0123456789abcdef0123456789".to_string(),
+        ))
+        .unwrap(),
+    )
+}
+
+#[cfg(feature = "postgres")]
+fn unique_suffix() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
 }

@@ -64,7 +64,7 @@ impl std::error::Error for RebornSecretStoreError {}
 /// Probe the libSQL Reborn secret-store wiring.
 ///
 /// This uses the same fail-closed construction path as the builder, including
-/// migration and decryptability verification. `config.master_key = None` is
+/// migration and secret-store key-check verification. `config.master_key = None` is
 /// reported as [`RebornSecretStoreHealthStatus::MissingMasterKey`], not treated
 /// as a healthy local/default configuration.
 pub async fn check_libsql_reborn_secret_store_health(
@@ -85,9 +85,9 @@ pub async fn check_libsql_reborn_secret_store_health(
                 "operator master key is invalid or cannot decrypt existing secret rows".to_string(),
             ),
         },
-        Err(error) => RebornSecretStoreHealth {
+        Err(_) => RebornSecretStoreHealth {
             status: RebornSecretStoreHealthStatus::Unavailable,
-            reason: Some(error.to_string()),
+            reason: Some("secret store backend unavailable".to_string()),
         },
     }
 }
@@ -95,8 +95,7 @@ pub async fn check_libsql_reborn_secret_store_health(
 /// Build the libSQL Reborn secret store.
 ///
 /// Requires explicit operator-provided master key material. The returned store
-/// has completed schema migration and sampled decryptability verification for
-/// existing encrypted rows.
+/// has completed schema migration and secret-store key-check verification.
 pub async fn build_libsql_reborn_secret_store(
     config: RebornLibSqlSecretStoreConfig,
 ) -> Result<Arc<dyn SecretStore>, RebornSecretStoreError> {
