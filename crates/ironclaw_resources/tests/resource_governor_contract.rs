@@ -47,6 +47,18 @@ fn persistent_trait_set_limit_surfaces_storage_errors() {
 }
 
 #[test]
+fn storage_errors_display_sanitized_message_without_backend_details() {
+    let error = ResourceError::Storage {
+        reason: "postgres://user:secret@localhost/db failed under /tmp/private".to_string(),
+    };
+    let rendered = error.to_string();
+
+    assert_eq!(rendered, "resource governor storage error");
+    assert!(!rendered.contains("secret"));
+    assert!(!rendered.contains("/tmp/private"));
+}
+
+#[test]
 fn reserve_succeeds_when_budget_is_available() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
