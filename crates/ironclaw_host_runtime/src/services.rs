@@ -257,6 +257,8 @@ struct ProductionComponentTypes {
     script_runtime: Option<&'static str>,
     mcp_runtime: Option<&'static str>,
     turn_state: Option<&'static str>,
+    turn_run_transition_port: Option<&'static str>,
+    turn_run_transition_port_verified: bool,
     turn_run_wake_notifier: Option<&'static str>,
 }
 
@@ -388,6 +390,8 @@ where
                 script_runtime: None,
                 mcp_runtime: None,
                 turn_state: None,
+                turn_run_transition_port: None,
+                turn_run_transition_port_verified: false,
                 turn_run_wake_notifier: None,
             },
         }
@@ -675,6 +679,8 @@ where
         T: TurnStateStore + 'static,
     {
         self.component_types.turn_state = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port = None;
+        self.component_types.turn_run_transition_port_verified = false;
         self.turn_state = Some(turn_state);
         self.turn_run_transition_port = None;
         self
@@ -685,6 +691,8 @@ where
         T: TurnStateStore + TurnRunTransitionPort + 'static,
     {
         self.component_types.turn_state = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port_verified = true;
         let state: Arc<dyn TurnStateStore> = turn_state.clone();
         let transition_port: Arc<dyn TurnRunTransitionPort> = turn_state;
         self.turn_state = Some(state);
@@ -696,6 +704,8 @@ where
     where
         T: TurnRunTransitionPort + 'static,
     {
+        self.component_types.turn_run_transition_port = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port_verified = false;
         self.turn_run_transition_port = Some(transition_port);
         self
     }
@@ -1279,6 +1289,21 @@ where
             ProductionWiringComponent::TurnState,
             self.component_types.turn_state,
         );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.component_types.turn_run_transition_port,
+        );
+        if self.turn_run_transition_port.is_some()
+            && !self.component_types.turn_run_transition_port_verified
+        {
+            self.push_issue(
+                &mut issues,
+                ProductionWiringComponent::TurnState,
+                ProductionWiringIssueKind::UnverifiedProductionImplementation,
+                self.component_types.turn_run_transition_port,
+            );
+        }
         if self.turn_run_transition_port.is_none() {
             self.push_issue(
                 &mut issues,

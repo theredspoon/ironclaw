@@ -13,8 +13,9 @@ use ironclaw_extensions::ExtensionRegistry;
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_host_runtime::{
-    CapabilitySurfaceVersion, HostRuntimeServices, TurnRunExecutor, TurnRunExecutorError,
-    TurnRunScheduler, TurnRunSchedulerConfig,
+    CapabilitySurfaceVersion, HostRuntimeServices, ProductionWiringComponent,
+    ProductionWiringIssueKind, TurnRunExecutor, TurnRunExecutorError, TurnRunScheduler,
+    TurnRunSchedulerConfig,
 };
 use ironclaw_processes::ProcessServices;
 use ironclaw_resources::InMemoryResourceGovernor;
@@ -247,6 +248,94 @@ impl HangingExecutor {
     }
 }
 
+struct HeartbeatTrackingTransitions {
+    store: Arc<InMemoryTurnStateStore>,
+    heartbeats: AtomicUsize,
+    notify_heartbeat: Notify,
+}
+
+impl HeartbeatTrackingTransitions {
+    fn new(store: Arc<InMemoryTurnStateStore>) -> Self {
+        Self {
+            store,
+            heartbeats: AtomicUsize::new(0),
+            notify_heartbeat: Notify::new(),
+        }
+    }
+
+    async fn wait_for_heartbeats(&self, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while self.heartbeats.load(Ordering::SeqCst) < expected {
+                self.notify_heartbeat.notified().await;
+            }
+        })
+        .await
+        .expect("scheduler did not heartbeat claimed run");
+    }
+}
+
+#[async_trait]
+impl TurnRunTransitionPort for HeartbeatTrackingTransitions {
+    async fn claim_next_run(
+        &self,
+        request: ClaimRunRequest,
+    ) -> Result<Option<ClaimedTurnRun>, TurnError> {
+        self.store.claim_next_run(request).await
+    }
+
+    async fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Result<ironclaw_turns::EventCursor, TurnError> {
+        let result = self.store.heartbeat(request).await;
+        if result.is_ok() {
+            self.heartbeats.fetch_add(1, Ordering::SeqCst);
+            self.notify_heartbeat.notify_waiters();
+        }
+        result
+    }
+
+    async fn recover_expired_leases(
+        &self,
+        request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
+        self.store.recover_expired_leases(request).await
+    }
+
+    async fn block_run(&self, request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
+        self.store.block_run(request).await
+    }
+
+    async fn complete_run(&self, request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
+        self.store.complete_run(request).await
+    }
+
+    async fn cancel_run(
+        &self,
+        request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.store.cancel_run(request).await
+    }
+
+    async fn fail_run(&self, request: FailRunRequest) -> Result<TurnRunState, TurnError> {
+        self.store.fail_run(request).await
+    }
+
+    async fn record_recovery_required(
+        &self,
+        request: RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.store.record_recovery_required(request).await
+    }
+
+    async fn apply_validated_loop_exit(
+        &self,
+        request: ApplyValidatedLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.store.apply_validated_loop_exit(request).await
+    }
+}
+
 #[test]
 fn production_services_build_scheduler_from_configured_transition_port_without_notifier() {
     let store = Arc::new(DurableTurnStoreStub);
@@ -264,6 +353,32 @@ fn production_services_build_scheduler_from_configured_transition_port_without_n
     let _scheduler = services
         .turn_scheduler_for_production(executor, fast_config())
         .expect("production turn scheduler should build from configured transition port");
+}
+
+#[test]
+fn production_services_reject_unverified_scheduler_transition_port() {
+    let turn_state = Arc::new(DurableTurnStoreStub);
+    let transition_port = Arc::new(DurableTurnStoreStub);
+    let services = HostRuntimeServices::new(
+        Arc::new(ExtensionRegistry::new()),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_turn_state(turn_state)
+    .with_turn_run_transition_port(transition_port);
+    let executor: Arc<dyn TurnRunExecutor> = Arc::new(CompletingExecutor::default());
+
+    let result = services.turn_scheduler_for_production(executor, fast_config());
+    let Err(report) = result else {
+        panic!("production scheduler should reject unverified transition port");
+    };
+    assert!(report.contains(
+        ProductionWiringComponent::TurnState,
+        ProductionWiringIssueKind::UnverifiedProductionImplementation
+    ));
 }
 
 #[tokio::test]
@@ -446,6 +561,40 @@ async fn executor_error_records_recovery_required_instead_of_retrying() {
 }
 
 #[tokio::test]
+async fn scheduler_heartbeats_long_running_executor_until_completion() {
+    let store = Arc::new(InMemoryTurnStateStore::with_limits(
+        InMemoryTurnStateStoreLimits {
+            runner_lease_ttl: ChronoDuration::milliseconds(40),
+            ..InMemoryTurnStateStoreLimits::default()
+        },
+    ));
+    let transitions = Arc::new(HeartbeatTrackingTransitions::new(Arc::clone(&store)));
+    let transition_port: Arc<dyn TurnRunTransitionPort> = transitions.clone();
+    let gate = Arc::new(Notify::new());
+    let executor = Arc::new(CompletingExecutor::with_gate(Arc::clone(&gate)));
+    let scheduler = TurnRunScheduler::new(
+        transition_port,
+        executor.clone(),
+        fast_config()
+            .with_poll_interval(Duration::from_secs(60))
+            .with_runner_heartbeat_interval(Duration::from_millis(5)),
+    );
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let request = submit_turn_request("thread-heartbeat", "idem-heartbeat");
+    let scope = request.scope.clone();
+    let run_id = accepted_run_id(coordinator.submit_turn(request).await.unwrap());
+
+    executor.wait_for_started(1).await;
+    transitions.wait_for_heartbeats(2).await;
+    gate.notify_waiters();
+    wait_for_status(&store, scope, run_id, TurnStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn expired_lease_reconciler_marks_running_run_recovery_required() {
     let store = Arc::new(InMemoryTurnStateStore::with_limits(
         InMemoryTurnStateStoreLimits {
@@ -503,6 +652,31 @@ fn fast_config() -> TurnRunSchedulerConfig {
         .with_lease_recovery_interval(Duration::from_millis(10))
         .with_claim_error_backoff(Duration::from_millis(10))
         .with_wake_channel_capacity(16)
+}
+
+async fn wait_for_status(
+    store: &InMemoryTurnStateStore,
+    scope: TurnScope,
+    run_id: ironclaw_turns::TurnRunId,
+    expected: TurnStatus,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let state = store
+                .get_run_state(ironclaw_turns::GetRunStateRequest {
+                    scope: scope.clone(),
+                    run_id,
+                })
+                .await
+                .unwrap();
+            if state.status == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("run did not reach expected status");
 }
 
 fn submit_turn_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {

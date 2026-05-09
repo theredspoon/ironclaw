@@ -7,7 +7,7 @@ use ironclaw_turns::{
     SanitizedFailure, TurnError, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
     TurnScope,
     runner::{
-        ClaimRunRequest, ClaimedTurnRun, RecordRecoveryRequiredRequest,
+        ClaimRunRequest, ClaimedTurnRun, HeartbeatRequest, RecordRecoveryRequiredRequest,
         RecoverExpiredLeasesRequest, TurnRunTransitionPort,
     },
 };
@@ -23,6 +23,7 @@ pub struct TurnRunSchedulerConfig {
     max_concurrent_runs: usize,
     poll_interval: Duration,
     lease_recovery_interval: Duration,
+    runner_heartbeat_interval: Duration,
     claim_error_backoff: Duration,
     wake_channel_capacity: usize,
 }
@@ -33,6 +34,7 @@ impl Default for TurnRunSchedulerConfig {
             max_concurrent_runs: 4,
             poll_interval: Duration::from_secs(5),
             lease_recovery_interval: Duration::from_secs(10),
+            runner_heartbeat_interval: Duration::from_secs(30),
             claim_error_backoff: Duration::from_secs(1),
             wake_channel_capacity: 128,
         }
@@ -60,6 +62,10 @@ impl TurnRunSchedulerConfig {
         self.lease_recovery_interval
     }
 
+    pub fn runner_heartbeat_interval(&self) -> Duration {
+        self.runner_heartbeat_interval
+    }
+
     pub fn claim_error_backoff(&self) -> Duration {
         self.claim_error_backoff
     }
@@ -80,6 +86,11 @@ impl TurnRunSchedulerConfig {
 
     pub fn with_lease_recovery_interval(mut self, lease_recovery_interval: Duration) -> Self {
         self.lease_recovery_interval = non_zero_duration(lease_recovery_interval);
+        self
+    }
+
+    pub fn with_runner_heartbeat_interval(mut self, runner_heartbeat_interval: Duration) -> Self {
+        self.runner_heartbeat_interval = non_zero_duration(runner_heartbeat_interval);
         self
     }
 
@@ -238,7 +249,7 @@ async fn run_scheduler_loop(
                             Arc::clone(&executor),
                             Arc::clone(&semaphore),
                             command_tx.clone(),
-                            config.claim_error_backoff(),
+                            &config,
                             Some(wake.scope),
                             &mut executor_tasks,
                         ).await;
@@ -247,7 +258,7 @@ async fn run_scheduler_loop(
                             Arc::clone(&executor),
                             Arc::clone(&semaphore),
                             command_tx.clone(),
-                            config.claim_error_backoff(),
+                            &config,
                             None,
                             &mut executor_tasks,
                         ).await;
@@ -258,7 +269,7 @@ async fn run_scheduler_loop(
                             Arc::clone(&executor),
                             Arc::clone(&semaphore),
                             command_tx.clone(),
-                            config.claim_error_backoff(),
+                            &config,
                             None,
                             &mut executor_tasks,
                         ).await;
@@ -275,7 +286,7 @@ async fn run_scheduler_loop(
                     Arc::clone(&executor),
                     Arc::clone(&semaphore),
                     command_tx.clone(),
-                    config.claim_error_backoff(),
+                    &config,
                     None,
                     &mut executor_tasks,
                 ).await;
@@ -297,7 +308,7 @@ async fn drain_queued_runs(
     executor: Arc<dyn TurnRunExecutor>,
     semaphore: Arc<Semaphore>,
     command_tx: mpsc::Sender<SchedulerCommand>,
-    claim_error_backoff: Duration,
+    config: &TurnRunSchedulerConfig,
     scope_filter: Option<TurnScope>,
     executor_tasks: &mut JoinSet<()>,
 ) {
@@ -320,13 +331,14 @@ async fn drain_queued_runs(
                     Arc::clone(&executor),
                     command_tx.clone(),
                     permit,
+                    config.runner_heartbeat_interval(),
                     executor_tasks,
                 );
             }
             Ok(None) => break,
             Err(error) => {
                 debug!(error = %error, "turn run scheduler claim failed");
-                schedule_drain_after(command_tx.clone(), claim_error_backoff);
+                schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
                 break;
             }
         }
@@ -339,16 +351,32 @@ fn spawn_executor_task(
     executor: Arc<dyn TurnRunExecutor>,
     command_tx: mpsc::Sender<SchedulerCommand>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    runner_heartbeat_interval: Duration,
     executor_tasks: &mut JoinSet<()>,
 ) {
     executor_tasks.spawn(async move {
         let recovery_run_id = claimed.state.run_id;
         let recovery_runner_id = claimed.runner_id;
         let recovery_lease_token = claimed.lease_token;
+        let mut heartbeat_tick = interval(runner_heartbeat_interval);
+        heartbeat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let executor_result =
             AssertUnwindSafe(executor.execute_claimed_run(claimed, Arc::clone(&transitions)))
-                .catch_unwind()
-                .await;
+                .catch_unwind();
+        tokio::pin!(executor_result);
+        let executor_result = loop {
+            tokio::select! {
+                result = &mut executor_result => break result,
+                _ = heartbeat_tick.tick() => {
+                    heartbeat_claimed_run(
+                        Arc::clone(&transitions),
+                        recovery_run_id,
+                        recovery_runner_id,
+                        recovery_lease_token,
+                    ).await;
+                }
+            }
+        };
 
         match executor_result {
             Ok(Ok(())) => {}
@@ -379,6 +407,24 @@ fn spawn_executor_task(
     });
 }
 
+async fn heartbeat_claimed_run(
+    transitions: Arc<dyn TurnRunTransitionPort>,
+    run_id: ironclaw_turns::TurnRunId,
+    runner_id: ironclaw_turns::TurnRunnerId,
+    lease_token: ironclaw_turns::TurnLeaseToken,
+) {
+    let result = transitions
+        .heartbeat(HeartbeatRequest {
+            run_id,
+            runner_id,
+            lease_token,
+        })
+        .await;
+    if let Err(error) = result {
+        debug!(error = %error, "turn run scheduler heartbeat failed");
+    }
+}
+
 async fn record_recovery_required(
     transitions: Arc<dyn TurnRunTransitionPort>,
     run_id: ironclaw_turns::TurnRunId,
@@ -386,7 +432,13 @@ async fn record_recovery_required(
     lease_token: ironclaw_turns::TurnLeaseToken,
     category: &str,
 ) {
-    let failure = sanitized_failure(category);
+    let Some(failure) = sanitized_failure(category) else {
+        debug!(
+            category,
+            "turn run scheduler could not sanitize recovery category"
+        );
+        return;
+    };
     let result = transitions
         .record_recovery_required(RecordRecoveryRequiredRequest {
             run_id,
@@ -400,15 +452,10 @@ async fn record_recovery_required(
     }
 }
 
-fn sanitized_failure(category: &str) -> SanitizedFailure {
-    match SanitizedFailure::new(category.to_string()) {
-        Ok(failure) => failure,
-        Err(_) => match SanitizedFailure::new("scheduler_executor_error") {
-            Ok(failure) => failure,
-            Err(_) => SanitizedFailure::new("scheduler_error")
-                .expect("SAFETY: hard-coded scheduler failure category is valid"),
-        },
-    }
+fn sanitized_failure(category: &str) -> Option<SanitizedFailure> {
+    SanitizedFailure::new(category.to_string())
+        .or_else(|_| SanitizedFailure::new("scheduler_executor_error"))
+        .ok()
 }
 
 async fn recover_expired_leases(transitions: Arc<dyn TurnRunTransitionPort>) {
