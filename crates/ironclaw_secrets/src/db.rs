@@ -1155,8 +1155,8 @@ impl LibSqlSecretsStore {
 
     /// Verifies the durable store key-check sentinel.
     ///
-    /// Stores that predate the sentinel are bootstrapped by decrypting one
-    /// deterministic existing secret row before installing the key-check record.
+    /// Stores that predate the sentinel are bootstrapped by decrypting all
+    /// existing secret rows before installing the key-check record.
     pub async fn verify_can_decrypt_existing_secrets(&self) -> Result<(), SecretError> {
         let conn = self.connect().await?;
         libsql_verify_or_bootstrap_secret_store_key_check(&conn, &self.crypto).await
@@ -1174,8 +1174,7 @@ impl SecretsStore for LibSqlSecretsStore {
         let conn = libsql_secret_begin_immediate(&self.db).await?;
         let result = async {
             let secret = build_encrypted_secret(user_id, params, &self.crypto)?;
-            libsql_upsert_secret(&conn, &secret).await?;
-            Ok(secret)
+            libsql_upsert_secret(&conn, &secret).await
         }
         .await;
         finish_libsql_secret_transaction(&conn, result).await
@@ -1314,8 +1313,8 @@ impl PostgresSecretsStore {
 
     /// Verifies the durable store key-check sentinel.
     ///
-    /// Stores that predate the sentinel are bootstrapped by decrypting one
-    /// deterministic existing secret row before installing the key-check record.
+    /// Stores that predate the sentinel are bootstrapped by decrypting all
+    /// existing secret rows before installing the key-check record.
     pub async fn verify_can_decrypt_existing_secrets(&self) -> Result<(), SecretError> {
         let client = self.pool.get().await.map_err(secret_db_error)?;
         postgres_verify_or_bootstrap_secret_store_key_check(&client, &self.crypto).await
@@ -1332,8 +1331,7 @@ impl SecretsStore for PostgresSecretsStore {
     ) -> Result<Secret, SecretError> {
         let client = self.pool.get().await.map_err(secret_db_error)?;
         let secret = build_encrypted_secret(user_id, params, &self.crypto)?;
-        postgres_upsert_secret(&client, &secret).await?;
-        Ok(secret)
+        postgres_upsert_secret(&client, &secret).await
     }
 
     async fn get(&self, user_id: &str, name: &str) -> Result<Secret, SecretError> {
@@ -1505,10 +1503,9 @@ async fn libsql_verify_or_bootstrap_secret_store_key_check(
         return verify_secret_store_key_check(crypto, &encrypted_value, &key_salt);
     }
     // Legacy/bootstrap path for stores created before the key-check row existed:
-    // validate one deterministic existing row before installing the sentinel.
-    if let Some((encrypted_value, key_salt)) = libsql_first_secret_payload(conn).await? {
-        crypto.decrypt(&encrypted_value, &key_salt)?;
-    }
+    // validate every existing row before installing the sentinel. This is a
+    // one-time migration/readiness cost; steady-state checks use the sentinel.
+    libsql_verify_all_secret_payloads(conn, crypto).await?;
     libsql_insert_secret_store_key_check(conn, crypto).await?;
     let Some((encrypted_value, key_salt)) = libsql_secret_store_key_check(conn).await? else {
         return Err(SecretError::Database(
@@ -1539,23 +1536,23 @@ async fn libsql_secret_store_key_check(
 }
 
 #[cfg(feature = "libsql")]
-async fn libsql_first_secret_payload(
+async fn libsql_verify_all_secret_payloads(
     conn: &libsql::Connection,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>, SecretError> {
+    crypto: &SecretsCrypto,
+) -> Result<(), SecretError> {
     let mut rows = conn
         .query(
-            "SELECT encrypted_value, key_salt FROM reborn_secret_records ORDER BY user_id, name LIMIT 1",
+            "SELECT encrypted_value, key_salt FROM reborn_secret_records ORDER BY user_id, name",
             (),
         )
         .await
         .map_err(secret_db_error)?;
-    let Some(row) = rows.next().await.map_err(secret_db_error)? else {
-        return Ok(None);
-    };
-    Ok(Some((
-        row.get(0).map_err(secret_db_error)?,
-        row.get(1).map_err(secret_db_error)?,
-    )))
+    while let Some(row) = rows.next().await.map_err(secret_db_error)? {
+        let encrypted_value: Vec<u8> = row.get(0).map_err(secret_db_error)?;
+        let key_salt: Vec<u8> = row.get(1).map_err(secret_db_error)?;
+        crypto.decrypt(&encrypted_value, &key_salt)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "libsql")]
@@ -1579,9 +1576,9 @@ async fn libsql_insert_secret_store_key_check(
 async fn libsql_upsert_secret(
     conn: &libsql::Connection,
     secret: &Secret,
-) -> Result<(), SecretError> {
+) -> Result<Secret, SecretError> {
     conn.execute(
-        "INSERT INTO reborn_secret_records (user_id, name, id, encrypted_value, key_salt, provider, expires_at, last_used_at, usage_count, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(user_id, name) DO UPDATE SET id = EXCLUDED.id, encrypted_value = EXCLUDED.encrypted_value, key_salt = EXCLUDED.key_salt, provider = EXCLUDED.provider, expires_at = EXCLUDED.expires_at, last_used_at = NULL, usage_count = 0, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at",
+        "INSERT INTO reborn_secret_records (user_id, name, id, encrypted_value, key_salt, provider, expires_at, last_used_at, usage_count, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(user_id, name) DO UPDATE SET encrypted_value = EXCLUDED.encrypted_value, key_salt = EXCLUDED.key_salt, provider = EXCLUDED.provider, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at",
         libsql::params![
             secret.user_id.clone(),
             secret.name.clone(),
@@ -1598,7 +1595,11 @@ async fn libsql_upsert_secret(
     )
     .await
     .map_err(secret_db_error)?;
-    Ok(())
+    libsql_get_secret(conn, &secret.user_id, &secret.name)
+        .await?
+        .ok_or_else(|| {
+            SecretError::Database("secret upsert succeeded but row was not found".to_string())
+        })
 }
 
 #[cfg(feature = "libsql")]
@@ -1665,10 +1666,9 @@ async fn postgres_verify_or_bootstrap_secret_store_key_check(
         return verify_secret_store_key_check(crypto, &encrypted_value, &key_salt);
     }
     // Legacy/bootstrap path for stores created before the key-check row existed:
-    // validate one deterministic existing row before installing the sentinel.
-    if let Some((encrypted_value, key_salt)) = postgres_first_secret_payload(client).await? {
-        crypto.decrypt(&encrypted_value, &key_salt)?;
-    }
+    // validate every existing row before installing the sentinel. This is a
+    // one-time migration/readiness cost; steady-state checks use the sentinel.
+    postgres_verify_all_secret_payloads(client, crypto).await?;
     postgres_insert_secret_store_key_check(client, crypto).await?;
     let Some((encrypted_value, key_salt)) = postgres_secret_store_key_check(client).await? else {
         return Err(SecretError::Database(
@@ -1693,17 +1693,23 @@ async fn postgres_secret_store_key_check(
 }
 
 #[cfg(feature = "postgres")]
-async fn postgres_first_secret_payload(
+async fn postgres_verify_all_secret_payloads(
     client: &impl deadpool_postgres::GenericClient,
-) -> Result<Option<(Vec<u8>, Vec<u8>)>, SecretError> {
-    let row = client
-        .query_opt(
-            "SELECT encrypted_value, key_salt FROM reborn_secret_records ORDER BY user_id, name LIMIT 1",
+    crypto: &SecretsCrypto,
+) -> Result<(), SecretError> {
+    let rows = client
+        .query(
+            "SELECT encrypted_value, key_salt FROM reborn_secret_records ORDER BY user_id, name",
             &[],
         )
         .await
         .map_err(secret_db_error)?;
-    Ok(row.map(|row| (row.get(0), row.get(1))))
+    for row in rows {
+        let encrypted_value: Vec<u8> = row.get(0);
+        let key_salt: Vec<u8> = row.get(1);
+        crypto.decrypt(&encrypted_value, &key_salt)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "postgres")]
@@ -1728,9 +1734,9 @@ async fn postgres_insert_secret_store_key_check(
 async fn postgres_upsert_secret(
     client: &impl deadpool_postgres::GenericClient,
     secret: &Secret,
-) -> Result<(), SecretError> {
-    client.execute("INSERT INTO reborn_secret_records (user_id, name, id, encrypted_value, key_salt, provider, expires_at, last_used_at, usage_count, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT(user_id, name) DO UPDATE SET id = EXCLUDED.id, encrypted_value = EXCLUDED.encrypted_value, key_salt = EXCLUDED.key_salt, provider = EXCLUDED.provider, expires_at = EXCLUDED.expires_at, last_used_at = NULL, usage_count = 0, created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at", &[&secret.user_id, &secret.name, &secret.id.to_string(), &secret.encrypted_value, &secret.key_salt, &secret.provider, &secret.expires_at.map(|value| value.to_rfc3339()), &secret.last_used_at.map(|value| value.to_rfc3339()), &secret.usage_count, &secret.created_at.to_rfc3339(), &secret.updated_at.to_rfc3339()]).await.map_err(secret_db_error)?;
-    Ok(())
+) -> Result<Secret, SecretError> {
+    let row = client.query_one("INSERT INTO reborn_secret_records (user_id, name, id, encrypted_value, key_salt, provider, expires_at, last_used_at, usage_count, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT(user_id, name) DO UPDATE SET encrypted_value = EXCLUDED.encrypted_value, key_salt = EXCLUDED.key_salt, provider = EXCLUDED.provider, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at RETURNING id, user_id, name, encrypted_value, key_salt, provider, expires_at, last_used_at, usage_count, created_at, updated_at", &[&secret.user_id, &secret.name, &secret.id.to_string(), &secret.encrypted_value, &secret.key_salt, &secret.provider, &secret.expires_at.map(|value| value.to_rfc3339()), &secret.last_used_at.map(|value| value.to_rfc3339()), &secret.usage_count, &secret.created_at.to_rfc3339(), &secret.updated_at.to_rfc3339()]).await.map_err(secret_db_error)?;
+    postgres_secret_from_row(&row)
 }
 
 #[cfg(feature = "postgres")]
