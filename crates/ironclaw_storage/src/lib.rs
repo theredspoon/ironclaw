@@ -98,7 +98,7 @@ pub struct StorageKey(String);
 impl StorageKey {
     pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
         let value = value.into();
-        validate_storage_token(&value, "storage key", 512)?;
+        validate_storage_key(&value)?;
         Ok(Self(value))
     }
 
@@ -195,11 +195,44 @@ pub struct StoredBlob {
     pub version: StorageVersion,
 }
 
+/// Validated structured JSON payload for [`RecordStore`] values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordPayloadJson(String);
+
+impl RecordPayloadJson {
+    pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
+        let value = value.into();
+        let _: serde_json::Value =
+            serde_json::from_str(&value).map_err(|_| StorageError::Serialization)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for RecordPayloadJson {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for RecordPayloadJson {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Structured JSON record returned by [`RecordStore`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRecord {
     pub key: StorageKey,
-    pub payload_json: String,
+    pub payload_json: RecordPayloadJson,
     pub version: StorageVersion,
 }
 
@@ -213,7 +246,7 @@ pub struct PutBlobRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutRecordRequest {
     pub key: StorageKey,
-    pub payload_json: String,
+    pub payload_json: RecordPayloadJson,
     pub condition: PutCondition,
 }
 
@@ -237,6 +270,19 @@ pub trait RecordStore: Send + Sync {
     async fn delete_record(&self, key: &StorageKey) -> Result<(), StorageError>;
 }
 
+fn validate_storage_key(value: &str) -> Result<(), StorageError> {
+    validate_storage_token(value, "storage key", 512)?;
+    if value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains('\\')
+        || value.split('/').any(|segment| segment == "..")
+        || looks_like_windows_absolute_path(value)
+    {
+        return Err(StorageError::Validation);
+    }
+    Ok(())
+}
+
 fn validate_storage_token(
     value: &str,
     _label: &'static str,
@@ -252,6 +298,14 @@ fn validate_storage_token(
         return Err(StorageError::Validation);
     }
     Ok(())
+}
+
+fn looks_like_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+        && bytes[0].is_ascii_alphabetic()
 }
 
 /// Bounded pagination helper for storage reads.
@@ -358,6 +412,29 @@ mod tests {
         assert!(serde_json::from_str::<StorageVersion>("\"\"").is_err());
         assert!(
             serde_json::from_str::<StorageVersion>(&format!("\"{}\"", "v".repeat(129))).is_err()
+        );
+    }
+
+    #[test]
+    fn storage_key_rejects_path_traversal_and_platform_absolute_forms() {
+        for invalid in ["../x", "/x", "a/../../b", "a\\..\\b", "C:\\secrets"] {
+            assert_eq!(
+                StorageKey::new(invalid).unwrap_err(),
+                StorageError::Validation
+            );
+        }
+        assert_eq!(
+            StorageKey::new("version..2").unwrap().as_str(),
+            "version..2"
+        );
+    }
+
+    #[test]
+    fn record_payload_json_rejects_malformed_payloads() {
+        assert!(RecordPayloadJson::new("{\"ok\":true}").is_ok());
+        assert_eq!(
+            RecordPayloadJson::new("not json").unwrap_err(),
+            StorageError::Serialization
         );
     }
 

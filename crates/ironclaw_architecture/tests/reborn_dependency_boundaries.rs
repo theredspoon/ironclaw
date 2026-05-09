@@ -315,6 +315,7 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_reborn_event_store",
                 "ironclaw_resources",
                 "ironclaw_run_state",
+                "ironclaw_runtime_policy",
                 "ironclaw_safety",
                 "ironclaw_scripts",
                 "ironclaw_secrets",
