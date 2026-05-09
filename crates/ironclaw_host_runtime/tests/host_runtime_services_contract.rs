@@ -54,7 +54,7 @@ use ironclaw_reborn_event_store::{
 };
 use ironclaw_resources::{
     InMemoryResourceGovernor, JsonFileResourceGovernorStore, PersistentResourceGovernor,
-    ResourceAccount, ResourceError, ResourceGovernor, ResourceLimits,
+    ResourceAccount, ResourceError, ResourceGovernor, ResourceLimits, ResourceTally,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_run_state::LibSqlRunStateApprovalStore;
@@ -269,6 +269,83 @@ async fn with_libsql_resource_governor_runs_migrations_before_first_reserve() {
         )
         .unwrap();
     governor.release(reservation.id).unwrap();
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn with_libsql_resource_governor_closes_process_reservations_on_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        libsql::Builder::new_local(dir.path().join("resources.db"))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let process_services = ProcessServices::new(
+        Arc::new(InMemoryProcessStore::new()),
+        Arc::new(InMemoryProcessResultStore::new()),
+    );
+    let process_store = process_services.process_store();
+
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        process_services,
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_libsql_resource_governor(Arc::clone(&db))
+    .await
+    .unwrap();
+    let governor = services.resource_governor();
+    let scope = sample_scope(InvocationId::new());
+    let account = ResourceAccount::tenant(scope.tenant_id.clone());
+    let reservation_id = ResourceReservationId::new();
+    let estimate = ResourceEstimate {
+        concurrency_slots: Some(1),
+        ..ResourceEstimate::default()
+    };
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    governor
+        .reserve_with_id(scope.clone(), estimate.clone(), reservation_id)
+        .unwrap();
+    let process_id = ProcessId::new();
+    let mut start = process_start(process_id, scope.invocation_id, scope.clone());
+    start.estimated_resources = estimate;
+    start.resource_reservation_id = Some(reservation_id);
+    process_store.start(start).await.unwrap();
+
+    let runtime = services.host_runtime_for_local_testing();
+    let outcome = runtime
+        .cancel_work(CancelRuntimeWorkRequest::new(
+            scope.clone(),
+            CorrelationId::new(),
+            CancelReason::UserRequested,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.cancelled, vec![RuntimeWorkId::Process(process_id)]);
+    assert_eq!(
+        governor.reserved_for(&account).unwrap(),
+        ResourceTally::default()
+    );
+    assert!(matches!(
+        governor.release(reservation_id).unwrap_err(),
+        ResourceError::ReservationClosed {
+            status: ReservationStatus::Released,
+            ..
+        }
+    ));
 }
 
 #[cfg(feature = "postgres")]

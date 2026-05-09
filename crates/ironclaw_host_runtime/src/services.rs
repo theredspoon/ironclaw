@@ -494,7 +494,7 @@ where
             secret_store,
             network_policy_store,
             secret_injection_store,
-            process_lifecycle_store,
+            process_lifecycle_store: _,
             runtime_http_egress,
             wasm_credential_provider,
             runtime_health,
@@ -505,6 +505,16 @@ where
             turn_run_wake_notifier,
             mut component_types,
         } = self;
+        let lifecycle_governor: Arc<dyn ResourceGovernor> = governor.clone();
+        let process_lifecycle_store = Arc::new(ProcessObligationLifecycleStore::new(
+            process_services.process_store(),
+            Arc::clone(&network_policy_store),
+            Arc::clone(&secret_injection_store),
+            lifecycle_governor,
+        ));
+        if let Some(event_sink) = &event_sink {
+            process_lifecycle_store.set_event_sink(Arc::clone(event_sink));
+        }
         component_types.resource_governor = type_name::<T>();
         HostRuntimeServices {
             registry,

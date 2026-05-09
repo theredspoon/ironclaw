@@ -265,7 +265,7 @@ pub enum ResourceError {
     },
     /// Durable storage or snapshot schema validation failed. Governors must
     /// fail closed when this is returned.
-    #[error("resource governor storage error: {reason}")]
+    #[error("resource governor storage error")]
     Storage { reason: String },
 }
 
