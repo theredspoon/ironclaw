@@ -9,10 +9,10 @@ Use this page as a human map before opening individual crate docs or source file
 IronClaw Reborn keeps authority narrow and explicit:
 
 1. **Contracts describe authority**: `ironclaw_host_api` and adjacent contract crates define scoped identities, policies, requests, decisions, and DTOs.
-2. **Policy gates decide**: authorization, trust, runtime policy, resources, approvals, secrets, filesystem, and network crates each own one kind of decision or side effect.
-3. **Capability hosts coordinate**: capability, dispatcher, process, script, MCP, WASM, and host-runtime crates compose validated requests into sandboxed execution.
-4. **State is durable and replayable**: events, run state, threads, conversations, memory, outbound policy, and projections keep the host observable without leaking secrets.
-5. **Product surfaces adapt**: engine, loop support, gateway, TUI, skills, safety, and product adapters turn those lower-level boundaries into agent and user experiences.
+2. Policy gates decide: authorization, trust, runtime policy, resources, approvals, secrets, safety, filesystem, and network crates each own one kind of decision or side effect.
+3. Capability hosts coordinate: capabilities, dispatcher, processes, scripts, MCP, WASM, and host-runtime crates compose validated requests into sandboxed execution.
+4. State is durable and replayable: events, run state, threads, conversations, memory, outbound, and event projections keep the host observable without leaking secrets.
+5. Product surfaces adapt: engine, loop support, gateway, TUI, skills, and product adapters turn those lower-level boundaries into agent and user experiences.
 
 A good rule of thumb: if a change adds new authority or persistence, put it in the crate that owns that boundary instead of threading it through a UI or runtime crate.
 
