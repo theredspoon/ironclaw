@@ -65,13 +65,13 @@ async fn reborn_e2e_gate_invokes_script_through_host_runtime_with_status_events_
 
     let surface = runtime
         .visible_capabilities(ironclaw_host_runtime::VisibleCapabilityRequest::new(
-            scope.clone(),
-            context.correlation_id,
+            context.clone(),
             SurfaceKind::new("gateway-smoke").unwrap(),
         ))
         .await
         .unwrap();
-    assert_eq!(surface.version.as_str(), "surface-v1");
+    assert_ne!(surface.version.as_str(), "surface-v1");
+    assert_eq!(surface.capabilities.len(), 1);
     assert_eq!(surface.descriptors.len(), 1);
     assert_eq!(surface.descriptors[0].id, script_capability_id());
 

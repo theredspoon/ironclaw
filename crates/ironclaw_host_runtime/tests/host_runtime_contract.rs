@@ -510,8 +510,8 @@ async fn default_runtime_status_filters_to_running_records_only() {
 
 #[tokio::test]
 async fn default_runtime_visible_capabilities_returns_empty_descriptors_for_empty_registry() {
-    // Pins the empty-registry path: the surface still carries the
-    // configured version so callers can cache against it.
+    // Pins the empty-registry path: the surface still carries a deterministic
+    // version derived from the configured base version and request policy.
     let registry = Arc::new(ExtensionRegistry::new());
     let dispatcher = Arc::new(RecordingDispatcher::default());
     let authorizer: Arc<dyn TrustAwareCapabilityDispatchAuthorizer> = Arc::new(GrantAuthorizer);
@@ -525,14 +525,14 @@ async fn default_runtime_visible_capabilities_returns_empty_descriptors_for_empt
     let context = execution_context_with_dispatch_grant();
     let surface = runtime
         .visible_capabilities(VisibleCapabilityRequest::new(
-            context.resource_scope,
-            context.correlation_id,
+            context,
             SurfaceKind::new("agent_loop").unwrap(),
         ))
         .await
         .unwrap();
 
-    assert_eq!(surface.version.as_str(), "surface-v1");
+    assert_ne!(surface.version.as_str(), "surface-v1");
+    assert!(surface.capabilities.is_empty());
     assert!(surface.descriptors.is_empty());
 }
 
@@ -546,19 +546,20 @@ async fn default_runtime_returns_versioned_visible_surface_with_registry_descrip
         dispatcher,
         authorizer,
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
-    );
+    )
+    .with_trust_policy(Arc::new(local_manifest_trust_policy()));
 
     let context = execution_context_with_dispatch_grant();
     let surface = runtime
         .visible_capabilities(VisibleCapabilityRequest::new(
-            context.resource_scope.clone(),
-            context.correlation_id,
+            context,
             SurfaceKind::new("agent_loop").unwrap(),
         ))
         .await
         .unwrap();
 
-    assert_eq!(surface.version.as_str(), "surface-v1");
+    assert_ne!(surface.version.as_str(), "surface-v1");
+    assert_eq!(surface.capabilities.len(), 1);
     assert_eq!(surface.descriptors.len(), 1);
     assert_eq!(surface.descriptors[0].id, capability_id());
 }
