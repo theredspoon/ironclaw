@@ -225,6 +225,11 @@ impl LoopCheckpointStateRef {
     }
 }
 
+/// Opaque reference to a host-built prompt bundle for one loop run.
+///
+/// Serialized refs use `prompt:{run_id}:{opaque_token}`. Consumers must treat
+/// the token as opaque metadata and must not infer or persist raw prompt text
+/// from this value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct LoopPromptBundleRef(String);
@@ -597,6 +602,12 @@ pub struct LoopModelMessage {
     pub content_ref: LoopMessageRef,
 }
 
+/// Prompt construction mode requested by an agent-loop driver.
+///
+/// `TextOnly` builds a prompt from transcript/context message refs and is the
+/// only mode supported by [`crate::run_profile::HostManagedLoopPromptPort`]
+/// today. `CodeAct` is reserved for a future checkpoint/tool-aware prompt
+/// bundle flow and is rejected by the text-only host port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
@@ -614,6 +625,11 @@ impl PromptMode {
     }
 }
 
+/// Request for a host-managed prompt bundle.
+///
+/// The optional cursor and checkpoint refs are run-scoped and are validated by
+/// host ports before context is loaded. `max_messages` is a host budget hint;
+/// zero is rejected and oversized values may be clamped by the implementation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopPromptBundleRequest {
     pub mode: PromptMode,
@@ -623,6 +639,11 @@ pub struct LoopPromptBundleRequest {
     pub max_messages: Option<u32>,
 }
 
+/// Prompt bundle returned to a driver.
+///
+/// The bundle carries model-message references rather than raw prompt text.
+/// Drivers pass these refs to [`LoopModelPort`], allowing the host to resolve
+/// content under the same run scope and policy checks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopPromptBundle {
     pub bundle_ref: LoopPromptBundleRef,
@@ -630,6 +651,11 @@ pub struct LoopPromptBundle {
     pub surface_version: Option<CapabilitySurfaceVersion>,
 }
 
+/// Host boundary for building prompt bundles before model invocation.
+///
+/// Implementations own context loading, scoping, prompt-shape policy, and
+/// milestone emission. Drivers should not assemble raw prompt strings when a
+/// prompt port is available.
 #[async_trait]
 pub trait LoopPromptPort: Send + Sync {
     async fn build_prompt_bundle(

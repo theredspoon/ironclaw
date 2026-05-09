@@ -1,3 +1,13 @@
+//! Agent-loop driver, host-port, prompt-bundle, and run-profile contracts.
+//!
+//! Prompt bundle APIs are host-managed: drivers request a bounded bundle of
+//! context message references from [`LoopPromptPort`] and then pass those refs to
+//! the model port. Prompt APIs intentionally move prompt construction out of
+//! driver-owned string assembly without exposing raw prompt text in milestones.
+//! The initial host-managed implementation supports only [`PromptMode::TextOnly`]
+//! and rejects checkpoint-backed prompt state until a durable checkpoint prompt
+//! store is introduced.
+
 mod driver;
 mod host;
 mod milestones;

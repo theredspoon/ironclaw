@@ -36,6 +36,15 @@ impl LoopHostMilestone {
     }
 }
 
+/// Public wire shape for host-loop milestones.
+///
+/// Milestones may be serialized into traces or delivered across process
+/// boundaries. Consumers must treat this enum as extensible and prefer
+/// [`LoopHostMilestoneKind::kind_name`] plus a catch-all branch rather than
+/// assuming the historical closed set. `PromptBundleBuilt` was added as an
+/// additive wire-format variant for prompt-bundle construction; it carries only
+/// refs, mode, optional surface version, and counts, never raw prompt/model
+/// content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopHostMilestoneKind {

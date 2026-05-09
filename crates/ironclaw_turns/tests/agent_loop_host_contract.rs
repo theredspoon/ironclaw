@@ -353,6 +353,38 @@ async fn loop_prompt_port_rejects_cross_run_checkpoint_ref() {
 }
 
 #[tokio::test]
+async fn loop_prompt_port_rejects_cross_run_context_cursor() {
+    let host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
+    let other_context = LoopRunContext::new(
+        host.context.scope.clone(),
+        host.context.turn_id,
+        TurnRunId::new(),
+        host.context.resolved_run_profile.clone(),
+    );
+    let port = HostManagedLoopPromptPort::new(
+        host.context.clone(),
+        host.clone(),
+        host.milestone_sink.clone(),
+    );
+
+    let error = port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: Some(LoopInputCursor::origin_for_run(&other_context)),
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::ScopeMismatch);
+    assert_eq!(host.effects(), Vec::<String>::new());
+    assert!(host.context_requests().is_empty());
+    assert!(host.milestones().is_empty());
+}
+
+#[tokio::test]
 async fn loop_prompt_port_rejects_checkpoint_state_ref_until_supported() {
     let host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
     let port = HostManagedLoopPromptPort::new(
@@ -481,6 +513,68 @@ async fn loop_prompt_port_rejects_zero_message_limit() {
 
     assert_eq!(error.kind, AgentLoopHostErrorKind::BudgetExceeded);
     assert_eq!(host.effects(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn loop_prompt_port_clamps_default_and_requested_message_limits() {
+    let zero_default_host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
+    let zero_default_port = HostManagedLoopPromptPort::new(
+        zero_default_host.context.clone(),
+        zero_default_host.clone(),
+        zero_default_host.milestone_sink.clone(),
+    )
+    .with_default_message_limit(0);
+
+    zero_default_port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(zero_default_host.context_request_limits(), vec![1]);
+
+    let high_default_host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
+    let high_default_port = HostManagedLoopPromptPort::new(
+        high_default_host.context.clone(),
+        high_default_host.clone(),
+        high_default_host.milestone_sink.clone(),
+    )
+    .with_default_message_limit(usize::MAX);
+
+    high_default_port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(high_default_host.context_request_limits(), vec![128]);
+
+    let high_request_host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
+    let high_request_port = HostManagedLoopPromptPort::new(
+        high_request_host.context.clone(),
+        high_request_host.clone(),
+        high_request_host.milestone_sink.clone(),
+    );
+
+    high_request_port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(u32::MAX),
+        })
+        .await
+        .unwrap();
+    assert_eq!(high_request_host.context_request_limits(), vec![128]);
 }
 
 #[test]
@@ -903,6 +997,7 @@ impl LoopModelGateway for RecordingLoopModelGateway {
 struct RecordingAgentLoopHost {
     context: LoopRunContext,
     effects: Mutex<Vec<String>>,
+    context_requests: Mutex<Vec<LoopContextRequest>>,
     model_responses: Mutex<Vec<LoopModelResponse>>,
     capability_outcomes: Mutex<Vec<CapabilityOutcome>>,
     visible_surface: VisibleCapabilitySurface,
@@ -917,6 +1012,7 @@ impl RecordingAgentLoopHost {
         Self {
             context,
             effects: Mutex::new(Vec::new()),
+            context_requests: Mutex::new(Vec::new()),
             model_responses: Mutex::new(Vec::new()),
             capability_outcomes: Mutex::new(Vec::new()),
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
@@ -977,6 +1073,17 @@ impl RecordingAgentLoopHost {
         self.effects.lock().unwrap().clone()
     }
 
+    fn context_requests(&self) -> Vec<LoopContextRequest> {
+        self.context_requests.lock().unwrap().clone()
+    }
+
+    fn context_request_limits(&self) -> Vec<usize> {
+        self.context_requests()
+            .into_iter()
+            .map(|request| request.limit)
+            .collect()
+    }
+
     fn milestones(&self) -> Vec<ironclaw_turns::run_profile::LoopHostMilestone> {
         self.milestone_sink.milestones()
     }
@@ -1007,8 +1114,9 @@ impl LoopRunInfoPort for RecordingAgentLoopHost {
 impl LoopContextPort for RecordingAgentLoopHost {
     async fn load_loop_context(
         &self,
-        _request: LoopContextRequest,
+        request: LoopContextRequest,
     ) -> Result<LoopContextBundle, AgentLoopHostError> {
+        self.context_requests.lock().unwrap().push(request);
         self.record("context");
         Ok(LoopContextBundle {
             messages: vec![LoopContextMessage {

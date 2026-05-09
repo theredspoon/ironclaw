@@ -307,7 +307,7 @@ fn production_readiness_rejects_missing_required_host_component() {
 }
 
 #[test]
-fn production_readiness_rejects_missing_required_prompt_port() {
+fn production_readiness_enforces_required_prompt_port_availability() {
     let mut registry = DriverRegistry::new();
     let driver_key = registry
         .register_driver(
@@ -336,7 +336,7 @@ fn production_readiness_rejects_missing_required_prompt_port() {
             host_graph: HostGraphReadiness::all_available().without_prompt(),
             configured_profiles: vec![ConfiguredRunProfile::enabled(
                 "interactive_default",
-                driver_key,
+                driver_key.clone(),
             )],
             persisted_runs: Vec::new(),
         },
@@ -347,6 +347,21 @@ fn production_readiness_rejects_missing_required_prompt_port() {
         diagnostic.code == "missing_required_driver_requirement"
             && diagnostic.message.contains("prompt bundle")
     }));
+
+    let ready_report = registry.validate_readiness(
+        DriverReadinessMode::Production,
+        DriverReadinessInputs {
+            host_graph: HostGraphReadiness::all_available(),
+            configured_profiles: vec![ConfiguredRunProfile::enabled(
+                "interactive_default",
+                driver_key,
+            )],
+            persisted_runs: Vec::new(),
+        },
+    );
+
+    assert_eq!(ready_report.status, DriverReadinessStatus::ProductionReady);
+    assert!(ready_report.diagnostics.is_empty());
 }
 
 #[test]

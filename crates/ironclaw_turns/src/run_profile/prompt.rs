@@ -12,6 +12,15 @@ use super::milestones::{LoopHostMilestoneEmitter, LoopHostMilestoneSink};
 const DEFAULT_TEXT_ONLY_MESSAGE_LIMIT: usize = 32;
 const MAX_TEXT_ONLY_MESSAGE_LIMIT: usize = 128;
 
+/// Text-only host-managed prompt bundle port.
+///
+/// This adapter validates that prompt requests are scoped to the current
+/// [`LoopRunContext`], loads bounded transcript context through a
+/// [`LoopContextPort`], returns model-message references, and emits a
+/// `prompt_bundle_built` milestone containing only metadata. It currently
+/// supports [`PromptMode::TextOnly`] only; checkpoint-backed prompt state and
+/// instruction/memory snippet materialization fail closed until dedicated host
+/// stores are wired.
 #[derive(Clone)]
 pub struct HostManagedLoopPromptPort<C, S>
 where
