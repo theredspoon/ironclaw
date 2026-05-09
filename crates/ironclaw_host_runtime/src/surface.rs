@@ -182,12 +182,8 @@ fn surface_version(
         .iter()
         .map(|capability| {
             json!({
-                "id": capability.descriptor.id.as_str(),
-                "provider": capability.descriptor.provider.as_str(),
-                "runtime": capability.descriptor.runtime,
-                "effects": capability.descriptor.effects,
-                "parameters_schema": capability.descriptor.parameters_schema,
-                "estimated_resources": capability.estimated_resources,
+                "descriptor": &capability.descriptor,
+                "estimated_resources": &capability.estimated_resources,
                 "access": match capability.access {
                     VisibleCapabilityAccess::Available => "available",
                     VisibleCapabilityAccess::RequiresApproval => "requires_approval",

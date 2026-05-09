@@ -328,6 +328,56 @@ async fn visible_surface_version_changes_with_schema_and_policy_changes() {
 }
 
 #[tokio::test]
+async fn visible_surface_version_changes_with_returned_descriptor_metadata() {
+    let context = context_with_grants([(
+        capability_id("echo.say"),
+        vec![EffectKind::DispatchCapability],
+    )]);
+    let runtime_a = runtime_with(
+        registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(Arc::new(trust_policy_for([(
+        "echo",
+        "/system/extensions/echo/manifest.toml",
+        vec![EffectKind::DispatchCapability],
+    )])));
+    let runtime_b = runtime_with(
+        registry_from_manifests([(ECHO_MANIFEST_WITH_DESCRIPTION, "/system/extensions/echo")]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(Arc::new(trust_policy_for([(
+        "echo",
+        "/system/extensions/echo/manifest.toml",
+        vec![EffectKind::DispatchCapability],
+    )])));
+
+    let surface_a = runtime_a
+        .visible_capabilities(VisibleCapabilityRequest::new(
+            context.clone(),
+            SurfaceKind::new("agent_loop").unwrap(),
+        ))
+        .await
+        .unwrap();
+    let surface_b = runtime_b
+        .visible_capabilities(VisibleCapabilityRequest::new(
+            context,
+            SurfaceKind::new("agent_loop").unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        surface_a.descriptors[0].description,
+        surface_b.descriptors[0].description
+    );
+    assert_ne!(
+        surface_a.version, surface_b.version,
+        "surface version must change when returned descriptor metadata changes"
+    );
+}
+
+#[tokio::test]
 async fn visible_surface_rejects_invalid_execution_context() {
     let runtime = runtime_with(
         registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]),
@@ -620,6 +670,25 @@ description = "Echoes input"
 effects = ["dispatch_capability"]
 default_permission = "allow"
 parameters_schema = { type = "object", properties = { message = { type = "string" } } }
+"#;
+
+const ECHO_MANIFEST_WITH_DESCRIPTION: &str = r#"
+id = "echo"
+name = "Echo"
+version = "0.1.0"
+description = "Echo test extension"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "echo.wasm"
+
+[[capabilities]]
+id = "echo.say"
+description = "Echoes transformed input"
+effects = ["dispatch_capability"]
+default_permission = "allow"
+parameters_schema = {}
 "#;
 
 const FILES_MANIFEST: &str = r#"
