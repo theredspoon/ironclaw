@@ -228,19 +228,33 @@ impl fmt::Display for CredentialAccountId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+/// Opaque bearer-like identifier for a credential session.
+///
+/// This id is intentionally not `Serialize`: durable stores persist it through
+/// private encrypted DTOs only, and public API/log surfaces must not emit it as
+/// a reusable session credential.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CredentialSessionId(Uuid);
 
 impl CredentialSessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn parse(value: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(value).map(Self)
+    }
 }
 
 impl Default for CredentialSessionId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Debug for CredentialSessionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialSessionId([REDACTED])")
     }
 }
 
@@ -253,8 +267,12 @@ impl fmt::Display for CredentialSessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialAccountStatus {
+    /// Account can issue new sessions and satisfy matching credential requests.
     Active,
+    /// Account can no longer issue sessions because its upstream credential or
+    /// configured lifetime has expired.
     Expired,
+    /// Account was explicitly disabled and must not issue new sessions.
     Revoked,
 }
 
@@ -323,7 +341,7 @@ pub struct CredentialAccount {
     pub updated_at: Timestamp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialSession {
     scope: ResourceScope,
     invocation_id: InvocationId,
@@ -1528,6 +1546,7 @@ mod tests {
         let debug = format!("{session:?}");
         assert!(!debug.contains("sk-live-sentinel"));
         assert!(!debug.contains("token"));
+        assert!(!debug.contains(&session.correlation_id().to_string()));
     }
 
     #[test]
