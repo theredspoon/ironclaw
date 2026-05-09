@@ -149,7 +149,7 @@ impl CredentialAccountStore for LibSqlCredentialStore {
         &self,
         account: CredentialAccount,
     ) -> Result<CredentialAccount, CredentialBrokerError> {
-        let conn = libsql_begin_exclusive(&self.db).await?;
+        let conn = libsql_begin_immediate(&self.db).await?;
         let result = async {
             libsql_upsert_account(&conn, &self.crypto, &account).await?;
             Ok(account)
@@ -183,7 +183,7 @@ impl CredentialSessionStore for LibSqlCredentialStore {
         &self,
         session: CredentialSession,
     ) -> Result<CredentialSession, CredentialBrokerError> {
-        let conn = libsql_begin_exclusive(&self.db).await?;
+        let conn = libsql_begin_immediate(&self.db).await?;
         let result = async {
             libsql_upsert_session(&conn, &self.crypto, &session, 0).await?;
             Ok(session)
@@ -225,7 +225,7 @@ impl CredentialSessionStore for LibSqlCredentialStore {
         session_id: CredentialSessionId,
         now: ironclaw_host_api::Timestamp,
     ) -> Result<CredentialSession, CredentialBrokerError> {
-        let conn = libsql_begin_exclusive(&self.db).await?;
+        let conn = libsql_begin_immediate(&self.db).await?;
         let result = async {
             if let Some(record) =
                 libsql_consume_session_record(&conn, &self.crypto, scope, session_id, now).await?
@@ -435,11 +435,11 @@ async fn libsql_connect(
 }
 
 #[cfg(feature = "libsql")]
-async fn libsql_begin_exclusive(
+async fn libsql_begin_immediate(
     db: &libsql::Database,
 ) -> Result<libsql::Connection, CredentialBrokerError> {
     let conn = libsql_connect(db).await?;
-    conn.execute("BEGIN EXCLUSIVE", ())
+    conn.execute("BEGIN IMMEDIATE", ())
         .await
         .map_err(db_error)?;
     Ok(conn)
@@ -893,8 +893,10 @@ async fn libsql_ensure_session_account_foreign_key(
     if libsql_session_account_foreign_key_exists(conn).await? {
         return Ok(());
     }
-    conn.execute_batch(
-        r#"
+    let migration_result = conn
+        .execute_batch(
+            r#"
+        BEGIN IMMEDIATE;
         DROP TABLE IF EXISTS reborn_credential_sessions_with_account_fk;
         CREATE TABLE reborn_credential_sessions_with_account_fk (
             tenant_id TEXT NOT NULL,
@@ -933,10 +935,14 @@ async fn libsql_ensure_session_account_foreign_key(
         ALTER TABLE reborn_credential_sessions_with_account_fk RENAME TO reborn_credential_sessions;
         CREATE INDEX IF NOT EXISTS idx_reborn_credential_sessions_account
             ON reborn_credential_sessions(tenant_id, user_id, agent_id, project_id, account_id);
+        COMMIT;
         "#,
-    )
-    .await
-    .map_err(db_error)?;
+        )
+        .await;
+    if let Err(error) = migration_result {
+        let _ = conn.execute("ROLLBACK", ()).await;
+        return Err(db_error(error));
+    }
     Ok(())
 }
 

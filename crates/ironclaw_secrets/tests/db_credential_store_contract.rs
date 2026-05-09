@@ -228,6 +228,88 @@ async fn libsql_credential_store_rejects_sql_injected_scope_values() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn libsql_credential_store_keeps_legacy_session_table_when_fk_migration_fails() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let db = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let conn = db.connect().unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE reborn_credential_accounts (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider_or_extension_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            encrypted_payload BLOB NOT NULL DEFAULT X'',
+            payload_key_salt BLOB NOT NULL DEFAULT X'',
+            PRIMARY KEY (tenant_id, user_id, agent_id, project_id, account_id)
+        );
+        CREATE TABLE reborn_credential_sessions (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            mission_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            expires_at TEXT,
+            max_uses INTEGER,
+            uses INTEGER NOT NULL DEFAULT 0,
+            payload TEXT NOT NULL DEFAULT '{}',
+            encrypted_payload BLOB NOT NULL DEFAULT X'00',
+            payload_key_salt BLOB NOT NULL DEFAULT X'00',
+            PRIMARY KEY (tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id, session_id)
+        );
+        INSERT INTO reborn_credential_sessions (
+            tenant_id, user_id, agent_id, project_id, mission_id, thread_id, invocation_id,
+            session_id, account_id, encrypted_payload, payload_key_salt
+        ) VALUES (
+            'tenant-a', 'user-a', 'agent-a', 'project-a', 'mission-a', 'thread-a', 'invocation-a',
+            'session-orphan', 'missing-account', X'01', X'02'
+        );
+        "#,
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let store = LibSqlCredentialStore::new(db.clone(), test_crypto());
+    let error = store.run_migrations().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("constraint"),
+        "orphan legacy sessions should fail FK backfill: {error}"
+    );
+
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query("SELECT account_id FROM reborn_credential_sessions", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let account_id: String = row.get(0).unwrap();
+    assert_eq!(account_id, "missing-account");
+    let mut temp_rows = conn
+        .query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'reborn_credential_sessions_with_account_fk'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(temp_rows.next().await.unwrap().is_none());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn libsql_credential_store_rejects_sessions_without_matching_account_row() {
     let dir = tempfile::tempdir().unwrap().keep();
     let db_path = dir.join("credentials.db");
