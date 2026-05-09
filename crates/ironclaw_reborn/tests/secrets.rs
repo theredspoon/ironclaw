@@ -290,6 +290,44 @@ async fn reborn_secret_store_missing_secret_does_not_create_lease() {
 }
 
 #[tokio::test]
+async fn reborn_secret_store_active_lease_survives_secret_rotation() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("reborn-secrets.db");
+    let database = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let store = build_libsql_reborn_secret_store(RebornLibSqlSecretStoreConfig {
+        database,
+        master_key: Some(SecretMaterial::from(
+            "0123456789abcdef0123456789abcdef".to_string(),
+        )),
+    })
+    .await
+    .unwrap();
+    let scope = sample_scope();
+    let handle = ironclaw_host_api::SecretHandle::new("openai_key").unwrap();
+
+    store
+        .put(
+            scope.clone(),
+            handle.clone(),
+            SecretMaterial::from("sk-live-before-rotation"),
+        )
+        .await
+        .unwrap();
+    let lease = store.lease_once(&scope, &handle).await.unwrap();
+    store
+        .put(
+            scope.clone(),
+            handle,
+            SecretMaterial::from("sk-live-after-rotation"),
+        )
+        .await
+        .unwrap();
+
+    let material = store.consume(&scope, lease.id).await.unwrap();
+    assert_eq!(material.expose_secret(), "sk-live-after-rotation");
+}
+
+#[tokio::test]
 async fn reborn_secret_store_persists_material_encrypted_and_exposes_only_through_secret_store() {
     let dir = tempfile::tempdir().unwrap().keep();
     let db_path = dir.join("reborn-secrets.db");

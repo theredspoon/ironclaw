@@ -110,6 +110,44 @@ async fn libsql_secret_store_verify_can_decrypt_existing_secrets_rejects_wrong_k
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn libsql_secret_store_key_check_bootstrap_scans_all_existing_rows() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("secrets.db");
+    let database = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let store = LibSqlSecretsStore::new(Arc::clone(&database), test_crypto());
+    store.run_migrations().await.unwrap();
+    store
+        .create(
+            "a-reborn-user",
+            CreateSecretParams::new("a_key", "sk-live-good-row"),
+        )
+        .await
+        .unwrap();
+    let conn = database.connect().unwrap();
+    insert_libsql_secret_record(
+        &conn,
+        "z-reborn-user",
+        "z_key",
+        wrong_crypto(),
+        "sk-live-wrong-row",
+    )
+    .await;
+
+    let error = store
+        .verify_can_decrypt_existing_secrets()
+        .await
+        .expect_err("pre-sentinel bootstrap must validate every existing row before installing the key check");
+    assert!(matches!(error, SecretError::DecryptionFailed(_)));
+    assert!(!format!("{error:?}").contains("sk-live-wrong-row"));
+    let mut rows = conn
+        .query("SELECT 1 FROM reborn_secret_store_key_check", ())
+        .await
+        .unwrap();
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn libsql_secret_store_key_check_rejects_concurrent_conflict_winner_with_wrong_key() {
     let dir = tempfile::tempdir().unwrap().keep();
     let db_path = dir.join("secrets.db");
@@ -275,6 +313,68 @@ async fn postgres_secret_store_verify_can_decrypt_existing_secrets_rejects_wrong
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
+async fn postgres_secret_store_key_check_bootstrap_scans_all_existing_rows() {
+    let Some(pool) = postgres_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let store = PostgresSecretsStore::new(pool.clone(), test_crypto());
+    store.run_migrations().await.unwrap();
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "DELETE FROM reborn_secret_store_key_check WHERE id = $1",
+            &[&"active"],
+        )
+        .await
+        .unwrap();
+    let good_user_id = format!("a-reborn-user-bootstrap-{suffix}");
+    let bad_user_id = format!("z-reborn-user-bootstrap-{suffix}");
+    let good_name = format!("a_key_{suffix}");
+    let bad_name = format!("z_key_{suffix}");
+    store
+        .create(
+            &good_user_id,
+            CreateSecretParams::new(&good_name, "sk-live-postgres-good-row"),
+        )
+        .await
+        .unwrap();
+    insert_postgres_secret_record(
+        &client,
+        &bad_user_id,
+        &bad_name,
+        wrong_crypto(),
+        "sk-live-postgres-wrong-row",
+    )
+    .await;
+
+    let error = store
+        .verify_can_decrypt_existing_secrets()
+        .await
+        .expect_err("pre-sentinel bootstrap must validate every existing row before installing the key check");
+    assert!(matches!(error, SecretError::DecryptionFailed(_)));
+    assert!(!format!("{error:?}").contains("sk-live-postgres-wrong-row"));
+    assert!(
+        client
+            .query_opt(
+                "SELECT 1 FROM reborn_secret_store_key_check WHERE id = $1",
+                &[&"active"],
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    client
+        .execute(
+            "DELETE FROM reborn_secret_records WHERE user_id = ANY($1)",
+            &[&vec![good_user_id, bad_user_id]],
+        )
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
 async fn postgres_secret_store_key_check_rejects_concurrent_conflict_winner_with_wrong_key() {
     let Some(pool) = postgres_pool().await else {
         return;
@@ -393,13 +493,17 @@ where
         )
         .await
         .unwrap();
-    assert_ne!(overwritten.id, created.id);
+    assert_eq!(overwritten.id, created.id);
     assert_eq!(overwritten.name, "beta_key");
+    assert_eq!(overwritten.created_at, created.created_at);
+    assert_eq!(overwritten.usage_count, 1);
+    assert!(overwritten.last_used_at.is_some());
 
     let after_overwrite = store.get(user_id, "beta_key").await.unwrap();
-    assert_eq!(after_overwrite.id, overwritten.id);
-    assert_eq!(after_overwrite.usage_count, 0);
-    assert!(after_overwrite.last_used_at.is_none());
+    assert_eq!(after_overwrite.id, created.id);
+    assert_eq!(after_overwrite.created_at, created.created_at);
+    assert_eq!(after_overwrite.usage_count, 1);
+    assert!(after_overwrite.last_used_at.is_some());
     assert_eq!(after_overwrite.provider.as_deref(), Some("anthropic"));
     let decrypted = store.get_decrypted(user_id, "beta_key").await.unwrap();
     assert_eq!(decrypted.expose(), "sk-live-second-value");
@@ -528,6 +632,24 @@ async fn insert_libsql_secret_store_key_check(
     .unwrap();
 }
 
+#[cfg(feature = "libsql")]
+async fn insert_libsql_secret_record(
+    conn: &libsql::Connection,
+    user_id: &str,
+    name: &str,
+    crypto: Arc<SecretsCrypto>,
+    plaintext: &str,
+) {
+    let (encrypted_value, key_salt) = crypto.encrypt(plaintext.as_bytes()).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO reborn_secret_records (user_id, name, id, encrypted_value, key_salt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        libsql::params![user_id, name, uuid::Uuid::new_v4().to_string(), encrypted_value, key_salt, now],
+    )
+    .await
+    .unwrap();
+}
+
 #[cfg(feature = "postgres")]
 async fn postgres_store() -> Option<PostgresSecretsStore> {
     postgres_store_with_crypto(test_crypto()).await
@@ -573,6 +695,25 @@ async fn insert_postgres_secret_store_key_check(
         .execute(
             "INSERT INTO reborn_secret_store_key_check (id, encrypted_value, key_salt, created_at, updated_at) VALUES ($1, $2, $3, $4, $4)",
             &[&"active", &encrypted_value, &key_salt, &now],
+        )
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "postgres")]
+async fn insert_postgres_secret_record(
+    client: &impl deadpool_postgres::GenericClient,
+    user_id: &str,
+    name: &str,
+    crypto: Arc<SecretsCrypto>,
+    plaintext: &str,
+) {
+    let (encrypted_value, key_salt) = crypto.encrypt(plaintext.as_bytes()).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    client
+        .execute(
+            "INSERT INTO reborn_secret_records (user_id, name, id, encrypted_value, key_salt, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6)",
+            &[&user_id, &name, &uuid::Uuid::new_v4().to_string(), &encrypted_value, &key_salt, &now],
         )
         .await
         .unwrap();
