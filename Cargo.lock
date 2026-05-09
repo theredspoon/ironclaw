@@ -4336,6 +4336,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "url",
  "wat",
@@ -4565,6 +4566,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

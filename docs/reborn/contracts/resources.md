@@ -242,7 +242,7 @@ pub enum ResourceAccount {
 }
 
 pub trait ResourceGovernor {
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits);
+    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits) -> Result<(), ResourceError>;
     fn reserve(
         &self,
         scope: ResourceScope,

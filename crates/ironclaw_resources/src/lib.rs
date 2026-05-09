@@ -341,7 +341,11 @@ pub trait ResourceGovernor: Send + Sync {
     ///
     /// Persistent governors also expose `try_set_limit` so callers that need
     /// durable write confirmation can observe storage errors.
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits);
+    fn set_limit(
+        &self,
+        account: ResourceAccount,
+        limits: ResourceLimits,
+    ) -> Result<(), ResourceError>;
 
     /// Reserves estimated resources before costed/quota-limited work starts.
     ///
@@ -486,7 +490,7 @@ fn write_file_snapshot_atomically(
     let temp_path = temp_path_for(path);
     let encoded = serde_json::to_vec_pretty(snapshot).map_err(storage_error)?;
     let write_result = write_temp_snapshot(&temp_path, &encoded)
-        .and_then(|()| std::fs::rename(&temp_path, path).map_err(storage_error))
+        .and_then(|()| replace_file_atomically(&temp_path, path))
         .and_then(|()| sync_parent_dir(path));
     if write_result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
@@ -505,11 +509,133 @@ fn write_temp_snapshot(temp_path: &Path, encoded: &[u8]) -> Result<(), ResourceE
     temp_file.sync_all().map_err(storage_error)
 }
 
+#[cfg(not(windows))]
+fn replace_file_atomically(temp_path: &Path, path: &Path) -> Result<(), ResourceError> {
+    std::fs::rename(temp_path, path).map_err(storage_error)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(temp_path: &Path, path: &Path) -> Result<(), ResourceError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_path = path_to_nul_terminated_wide(temp_path)?;
+    let target_path = path_to_nul_terminated_wide(path)?;
+    // SAFETY: Both arguments are valid NUL-terminated UTF-16 buffers that live
+    // for the duration of the call. The temp file lives beside the target, so
+    // MoveFileExW performs an atomic same-volume replacement when the target
+    // already exists instead of failing like std::fs::rename on Windows.
+    let moved = unsafe {
+        MoveFileExW(
+            temp_path.as_ptr(),
+            target_path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(storage_error(std::io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn path_to_nul_terminated_wide(path: &Path) -> Result<Vec<u16>, ResourceError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let absolute = std::path::absolute(path).map_err(storage_error)?;
+    let mut wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(ResourceError::Storage {
+            reason: "path contains an interior NUL byte".to_string(),
+        });
+    }
+
+    normalize_windows_path_separators(&mut wide);
+    if !has_windows_namespace_prefix(&wide) {
+        wide = verbatim_windows_path(wide);
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn has_windows_namespace_prefix(wide: &[u16]) -> bool {
+    wide.len() >= 4
+        && is_windows_path_separator(wide[0])
+        && is_windows_path_separator(wide[1])
+        && (wide[2] == b'?' as u16 || wide[2] == b'.' as u16)
+        && is_windows_path_separator(wide[3])
+}
+
+#[cfg(windows)]
+fn normalize_windows_path_separators(wide: &mut [u16]) {
+    for code_unit in wide {
+        if *code_unit == b'/' as u16 {
+            *code_unit = b'\\' as u16;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn verbatim_windows_path(wide: Vec<u16>) -> Vec<u16> {
+    if wide.len() >= 2 && is_windows_path_separator(wide[0]) && is_windows_path_separator(wide[1]) {
+        let mut prefixed = wide_literal(r"\\?\UNC\");
+        prefixed.extend_from_slice(&wide[2..]);
+        prefixed
+    } else if wide.len() >= 3 && wide[1] == b':' as u16 && is_windows_path_separator(wide[2]) {
+        let mut prefixed = wide_literal(r"\\?\");
+        prefixed.extend_from_slice(&wide);
+        prefixed
+    } else {
+        wide
+    }
+}
+
+#[cfg(windows)]
+fn wide_literal(value: &str) -> Vec<u16> {
+    value.encode_utf16().collect()
+}
+
+#[cfg(windows)]
+fn is_windows_path_separator(code_unit: u16) -> bool {
+    code_unit == b'\\' as u16 || code_unit == b'/' as u16
+}
+
 fn sync_parent_dir(path: &Path) -> Result<(), ResourceError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(storage_error)
+    normalize_parent_dir_sync_result(File::open(parent).and_then(|dir| dir.sync_all()))
+}
+
+fn normalize_parent_dir_sync_result(result: std::io::Result<()>) -> Result<(), ResourceError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_unsupported_parent_dir_sync_error(&error) => Ok(()),
+        Err(error) => Err(storage_error(error)),
+    }
+}
+
+fn is_unsupported_parent_dir_sync_error(error: &std::io::Error) -> bool {
+    if matches!(error.kind(), ErrorKind::Unsupported) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        const ERROR_INVALID_FUNCTION: i32 = 1;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        if matches!(error.kind(), ErrorKind::PermissionDenied)
+            || matches!(
+                error.raw_os_error(),
+                Some(ERROR_INVALID_FUNCTION) | Some(ERROR_ACCESS_DENIED)
+            )
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn storage_error(error: impl std::fmt::Display) -> ResourceError {
@@ -587,14 +713,24 @@ impl AsyncStorageWorker {
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-fn run_async_on_shared_storage_worker<T, Fut, F>(build: F) -> Result<T, ResourceError>
+type AsyncStorageWorkerCell = std::sync::Arc<OnceLock<Result<AsyncStorageWorker, String>>>;
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn new_storage_worker_cell() -> AsyncStorageWorkerCell {
+    std::sync::Arc::new(OnceLock::new())
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn run_async_on_storage_worker<T, Fut, F>(
+    worker_cell: &AsyncStorageWorkerCell,
+    build: F,
+) -> Result<T, ResourceError>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T, ResourceError>> + Send + 'static,
     F: FnOnce() -> Fut + Send + 'static,
 {
-    static WORKER: OnceLock<Result<AsyncStorageWorker, String>> = OnceLock::new();
-    let worker = WORKER.get_or_init(|| {
+    let worker = worker_cell.get_or_init(|| {
         AsyncStorageWorker::spawn("resource-governor-storage").map_err(|error| error.to_string())
     });
     match worker {
@@ -607,12 +743,16 @@ where
 #[derive(Debug, Clone)]
 pub struct LibSqlResourceGovernorStore {
     db: std::sync::Arc<libsql::Database>,
+    worker: AsyncStorageWorkerCell,
 }
 
 #[cfg(feature = "libsql")]
 impl LibSqlResourceGovernorStore {
     pub fn new(db: std::sync::Arc<libsql::Database>) -> Self {
-        Self { db }
+        Self {
+            db,
+            worker: new_storage_worker_cell(),
+        }
     }
 
     pub async fn run_migrations(&self) -> Result<(), ResourceError> {
@@ -651,7 +791,7 @@ impl ResourceGovernorStore for LibSqlResourceGovernorStore {
         F: FnOnce(&mut ResourceGovernorSnapshot) -> Result<T, ResourceError> + Send + 'static,
     {
         let store = self.clone();
-        run_async_on_shared_storage_worker(move || async move {
+        run_async_on_storage_worker(&self.worker, move || async move {
             let conn = store.connect().await?;
             conn.execute_batch("BEGIN IMMEDIATE")
                 .await
@@ -711,12 +851,16 @@ where
 #[derive(Debug, Clone)]
 pub struct PostgresResourceGovernorStore {
     pool: deadpool_postgres::Pool,
+    worker: AsyncStorageWorkerCell,
 }
 
 #[cfg(feature = "postgres")]
 impl PostgresResourceGovernorStore {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            worker: new_storage_worker_cell(),
+        }
     }
 
     pub async fn run_migrations(&self) -> Result<(), ResourceError> {
@@ -741,7 +885,7 @@ impl ResourceGovernorStore for PostgresResourceGovernorStore {
         F: FnOnce(&mut ResourceGovernorSnapshot) -> Result<T, ResourceError> + Send + 'static,
     {
         let store = self.clone();
-        run_async_on_shared_storage_worker(move || async move {
+        run_async_on_storage_worker(&self.worker, move || async move {
             let mut client = store.pool.get().await.map_err(storage_error)?;
             let transaction = client.transaction().await.map_err(storage_error)?;
             transaction
@@ -857,8 +1001,12 @@ impl<S> ResourceGovernor for PersistentResourceGovernor<S>
 where
     S: ResourceGovernorStore,
 {
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits) {
-        let _ = self.try_set_limit(account, limits);
+    fn set_limit(
+        &self,
+        account: ResourceAccount,
+        limits: ResourceLimits,
+    ) -> Result<(), ResourceError> {
+        self.try_set_limit(account, limits)
     }
 
     fn reserve(
@@ -1004,8 +1152,13 @@ impl InMemoryResourceGovernor {
 }
 
 impl ResourceGovernor for InMemoryResourceGovernor {
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits) {
+    fn set_limit(
+        &self,
+        account: ResourceAccount,
+        limits: ResourceLimits,
+    ) -> Result<(), ResourceError> {
         set_limit_in_state(&mut self.lock_state(), account, limits);
+        Ok(())
     }
 
     fn reserve(
@@ -1358,5 +1511,73 @@ fn check_integer(
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_snapshot_replace_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("resources.json");
+        let temp_path = temp_path_for(&path);
+        std::fs::write(&path, b"old").unwrap();
+        write_temp_snapshot(&temp_path, b"new").unwrap();
+
+        replace_file_atomically(&temp_path, &path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn unsupported_parent_directory_sync_is_best_effort() {
+        let error = std::io::Error::new(ErrorKind::Unsupported, "directory sync unsupported");
+
+        assert!(normalize_parent_dir_sync_result(Err(error)).is_ok());
+    }
+
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    #[test]
+    fn independent_storage_worker_cells_do_not_head_of_line_block() {
+        let first_worker = new_storage_worker_cell();
+        let second_worker = new_storage_worker_cell();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let blocked = std::thread::spawn({
+            let first_worker = first_worker.clone();
+            move || {
+                run_async_on_storage_worker(&first_worker, move || async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<(), ResourceError>(())
+                })
+            }
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("first worker job should start");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_async_on_storage_worker(&second_worker, || async {
+                Ok::<u8, ResourceError>(7)
+            });
+            done_tx.send(result).unwrap();
+        });
+
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("independent worker should not wait behind blocked worker")
+                .unwrap(),
+            7
+        );
+
+        release_tx.send(()).unwrap();
+        blocked.join().unwrap().unwrap();
     }
 }

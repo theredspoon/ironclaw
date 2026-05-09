@@ -7,20 +7,58 @@ use ironclaw_host_api::*;
 use ironclaw_resources::*;
 use rust_decimal_macros::dec;
 
+#[derive(Clone)]
+struct AlwaysFailingStore;
+
+impl ResourceGovernorStore for AlwaysFailingStore {
+    fn update<T, F>(&self, _update: F) -> Result<T, ResourceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut ResourceGovernorSnapshot) -> Result<T, ResourceError> + Send + 'static,
+    {
+        Err(ResourceError::Storage {
+            reason: "forced durable write failure".to_string(),
+        })
+    }
+}
+
+#[test]
+fn persistent_trait_set_limit_surfaces_storage_errors() {
+    let governor: Arc<dyn ResourceGovernor> =
+        Arc::new(PersistentResourceGovernor::new(AlwaysFailingStore));
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+
+    let error = governor
+        .set_limit(
+            ResourceAccount::tenant(scope.tenant_id),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ResourceError::Storage { reason } if reason == "forced durable write failure")
+    );
+}
+
 #[test]
 fn reserve_succeeds_when_budget_is_available() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
 
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            max_concurrency_slots: Some(2),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                max_concurrency_slots: Some(2),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let reservation = governor
         .reserve(
@@ -162,13 +200,15 @@ fn usd_limit_check_denies_instead_of_panicking_on_decimal_overflow() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(rust_decimal::Decimal::MAX),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(rust_decimal::Decimal::MAX),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     governor
         .reserve(
@@ -202,13 +242,15 @@ fn reserve_denies_when_usd_limit_would_be_exceeded() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(0.50)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(0.50)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let err = governor
         .reserve(
@@ -236,14 +278,16 @@ fn reserve_denies_runtime_quota_even_without_usd() {
         scope.user_id.clone(),
         scope.project_id.clone().unwrap(),
     );
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_wall_clock_ms: Some(1_000),
-            max_process_count: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_wall_clock_ms: Some(1_000),
+                max_process_count: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let err = governor
         .reserve(
@@ -272,13 +316,15 @@ fn active_reservations_consume_concurrency_until_released() {
         scope.user_id.clone(),
         scope.project_id.clone().unwrap(),
     );
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_concurrency_slots: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let first = governor
         .reserve(
@@ -327,13 +373,15 @@ fn concurrent_reservations_cannot_oversubscribe_scope() {
         scope.user_id.clone(),
         scope.project_id.clone().unwrap(),
     );
-    governor.set_limit(
-        account,
-        ResourceLimits {
-            max_concurrency_slots: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account,
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let barrier = Arc::new(Barrier::new(8));
     let mut handles = Vec::new();
@@ -369,14 +417,16 @@ fn reconcile_records_actual_usage_and_closes_reservation() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            max_concurrency_slots: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let reservation = governor
         .reserve(
@@ -428,14 +478,16 @@ fn release_frees_reserved_capacity_without_recording_spend() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            max_concurrency_slots: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let reservation = governor
         .reserve(
@@ -479,13 +531,15 @@ fn tenant_limit_applies_across_projects() {
     let project_a = sample_scope("tenant1", "user1", Some("project_a"));
     let project_b = sample_scope("tenant1", "user1", Some("project_b"));
     let tenant_account = ResourceAccount::tenant(project_a.tenant_id.clone());
-    governor.set_limit(
-        tenant_account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            tenant_account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     governor
         .reserve(
@@ -521,13 +575,15 @@ fn resource_governor_enforces_agent_scoped_limits_independently() {
     let user = UserId::new("user1").unwrap();
     let agent_a = AgentId::new("agent-a").unwrap();
     let agent_b = AgentId::new("agent-b").unwrap();
-    governor.set_limit(
-        ResourceAccount::agent(tenant.clone(), user.clone(), None, agent_a.clone()),
-        ResourceLimits {
-            max_output_bytes: Some(10),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            ResourceAccount::agent(tenant.clone(), user.clone(), None, agent_a.clone()),
+            ResourceLimits {
+                max_output_bytes: Some(10),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let estimate = ResourceEstimate {
         output_bytes: Some(8),
@@ -779,6 +835,133 @@ async fn libsql_persistent_governor_reloads_active_holds_and_usage_from_store() 
     ));
 }
 
+#[cfg(feature = "postgres")]
+const POSTGRES_SKIP_ENV: &str = "IRONCLAW_SKIP_POSTGRES_TESTS";
+
+#[cfg(feature = "postgres")]
+fn postgres_skip_requested() -> bool {
+    std::env::var(POSTGRES_SKIP_ENV).is_ok_and(|value| value == "1" || value == "true")
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_pool_or_skip() -> Option<deadpool_postgres::Pool> {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://localhost/ironclaw_test".to_string());
+    let config: tokio_postgres::Config = database_url
+        .parse()
+        .expect("DATABASE_URL must be a valid Postgres URL");
+    let mgr = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
+    let pool = deadpool_postgres::Pool::builder(mgr)
+        .max_size(2)
+        .build()
+        .expect("build deadpool");
+    match pool.get().await {
+        Ok(_) => Some(pool),
+        Err(error) => {
+            if postgres_skip_requested() {
+                eprintln!(
+                    "skipping Postgres resource governor contract ({POSTGRES_SKIP_ENV}=1): {error}"
+                );
+                None
+            } else {
+                panic!(
+                    "Postgres resource governor contract could not reach Postgres ({error}); \
+                     set DATABASE_URL to a reachable Postgres test database, or set \
+                     {POSTGRES_SKIP_ENV}=1 to explicitly skip."
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+async fn clear_postgres_resource_snapshots(pool: &deadpool_postgres::Pool) {
+    let client = pool.get().await.expect("cleanup client");
+    client
+        .batch_execute("DELETE FROM ironclaw_resource_governor_snapshots")
+        .await
+        .expect("cleanup resource governor snapshots");
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_persistent_governor_reloads_active_holds_and_usage_from_store() {
+    let Some(pool) = postgres_pool_or_skip().await else {
+        return;
+    };
+    let store = PostgresResourceGovernorStore::new(pool.clone());
+    store.run_migrations().await.unwrap();
+    clear_postgres_resource_snapshots(&pool).await;
+
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+    let account = ResourceAccount::tenant(scope.tenant_id.clone());
+    let governor = PersistentResourceGovernor::new(store);
+    governor
+        .try_set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    let active = governor
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                concurrency_slots: Some(1),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap();
+
+    let reloaded =
+        PersistentResourceGovernor::new(PostgresResourceGovernorStore::new(pool.clone()));
+    let concurrency_denial = reloaded
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                concurrency_slots: Some(1),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        concurrency_denial,
+        ResourceError::LimitExceeded(denial)
+            if denial.account == account && denial.dimension == ResourceDimension::ConcurrencySlots
+    ));
+
+    reloaded
+        .reconcile(
+            active.id,
+            ResourceUsage {
+                usd: dec!(0.95),
+                ..ResourceUsage::default()
+            },
+        )
+        .unwrap();
+    let usd_denial = reloaded
+        .reserve(
+            scope,
+            ResourceEstimate {
+                usd: Some(dec!(0.10)),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        usd_denial,
+        ResourceError::LimitExceeded(denial)
+            if denial.account == account
+                && denial.dimension == ResourceDimension::Usd
+                && denial.current_usage == ResourceValue::Decimal(dec!(0.95))
+    ));
+
+    clear_postgres_resource_snapshots(&pool).await;
+}
+
 fn sample_scope(tenant: &str, user: &str, project: Option<&str>) -> ResourceScope {
     ResourceScope {
         tenant_id: TenantId::new(tenant).unwrap(),
@@ -818,20 +1001,24 @@ fn project_and_agent_limits_both_apply_without_override() {
         scope.agent_id.clone().unwrap(),
     );
 
-    governor.set_limit(
-        project_account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(0.50)),
-            ..ResourceLimits::default()
-        },
-    );
-    governor.set_limit(
-        agent_account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            project_account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(0.50)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    governor
+        .set_limit(
+            agent_account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let err = governor
         .reserve(
@@ -849,20 +1036,24 @@ fn project_and_agent_limits_both_apply_without_override() {
             if denial.account == project_account && denial.dimension == ResourceDimension::Usd
     ));
 
-    governor.set_limit(
-        project_account,
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
-    governor.set_limit(
-        agent_account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(0.50)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            project_account,
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    governor
+        .set_limit(
+            agent_account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(0.50)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let err = governor
         .reserve(
@@ -949,20 +1140,24 @@ fn project_limit_denies_leaf_even_when_tenant_allows() {
         scope.user_id.clone(),
         scope.project_id.clone().unwrap(),
     );
-    governor.set_limit(
-        tenant,
-        ResourceLimits {
-            max_usd: Some(dec!(10.00)),
-            ..ResourceLimits::default()
-        },
-    );
-    governor.set_limit(
-        project.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            tenant,
+            ResourceLimits {
+                max_usd: Some(dec!(10.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    governor
+        .set_limit(
+            project.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let err = governor
         .reserve(
@@ -986,13 +1181,15 @@ fn reconciled_usage_counts_against_future_reservations() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let reservation = governor
         .reserve(
@@ -1039,13 +1236,15 @@ fn active_reserved_and_usage_appear_in_denial_details() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let completed = governor
         .reserve(
@@ -1103,13 +1302,15 @@ fn actual_usage_above_estimate_is_recorded_and_blocks_future_work() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_usd: Some(dec!(1.00)),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
 
     let reservation = governor
         .reserve(
@@ -1243,7 +1444,7 @@ fn assert_denied_dimension(
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope("tenant1", "user1", Some("project1"));
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(account.clone(), limits);
+    governor.set_limit(account.clone(), limits).unwrap();
 
     let err = governor.reserve(scope, estimate).unwrap_err();
     assert!(matches!(
