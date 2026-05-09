@@ -1,6 +1,8 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use tempfile::tempdir;
+
 use ironclaw_host_api::*;
 use ironclaw_resources::*;
 use rust_decimal_macros::dec;
@@ -571,6 +573,210 @@ fn resource_governor_enforces_agent_scoped_limits_independently() {
             ..ResourceTally::default()
         }
     );
+}
+
+#[test]
+fn persistent_governor_reloads_active_holds_and_usage_from_store() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+    let account = ResourceAccount::tenant(scope.tenant_id.clone());
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    governor
+        .try_set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    let active = governor
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                usd: Some(dec!(0.20)),
+                concurrency_slots: Some(1),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap();
+
+    let reloaded = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let concurrency_denial = reloaded
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                concurrency_slots: Some(1),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        concurrency_denial,
+        ResourceError::LimitExceeded(denial)
+            if denial.account == account
+                && denial.dimension == ResourceDimension::ConcurrencySlots
+                && denial.active_reserved == ResourceValue::Integer(1)
+    ));
+
+    reloaded
+        .reconcile(
+            active.id,
+            ResourceUsage {
+                usd: dec!(0.95),
+                ..ResourceUsage::default()
+            },
+        )
+        .unwrap();
+
+    let reloaded_again = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let usd_denial = reloaded_again
+        .reserve(
+            scope,
+            ResourceEstimate {
+                usd: Some(dec!(0.10)),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        usd_denial,
+        ResourceError::LimitExceeded(denial)
+            if denial.account == account
+                && denial.dimension == ResourceDimension::Usd
+                && denial.current_usage == ResourceValue::Decimal(dec!(0.95))
+    ));
+}
+
+#[test]
+fn persistent_governor_serializes_concurrent_reservations_across_handles() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+    let account = ResourceAccount::tenant(scope.tenant_id.clone());
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    governor
+        .try_set_limit(
+            account,
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let path = path.clone();
+        let barrier = Arc::clone(&barrier);
+        let mut scope = scope.clone();
+        scope.invocation_id = InvocationId::new();
+        handles.push(thread::spawn(move || {
+            let governor =
+                PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(path));
+            barrier.wait();
+            governor
+                .reserve(
+                    scope,
+                    ResourceEstimate {
+                        concurrency_slots: Some(1),
+                        ..ResourceEstimate::default()
+                    },
+                )
+                .is_ok()
+        }));
+    }
+
+    let successes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(|success| *success)
+        .count();
+    assert_eq!(successes, 1);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_persistent_governor_reloads_active_holds_and_usage_from_store() {
+    let dir = tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        libsql::Builder::new_local(dir.path().join("resources.db"))
+            .build()
+            .await
+            .unwrap(),
+    );
+    let store = LibSqlResourceGovernorStore::new(std::sync::Arc::clone(&db));
+    store.run_migrations().await.unwrap();
+
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+    let account = ResourceAccount::tenant(scope.tenant_id.clone());
+    let governor = PersistentResourceGovernor::new(store);
+    governor
+        .try_set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+    let active = governor
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                concurrency_slots: Some(1),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap();
+
+    let reloaded = PersistentResourceGovernor::new(LibSqlResourceGovernorStore::new(db));
+    let concurrency_denial = reloaded
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                concurrency_slots: Some(1),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        concurrency_denial,
+        ResourceError::LimitExceeded(denial)
+            if denial.account == account && denial.dimension == ResourceDimension::ConcurrencySlots
+    ));
+
+    reloaded
+        .reconcile(
+            active.id,
+            ResourceUsage {
+                usd: dec!(0.95),
+                ..ResourceUsage::default()
+            },
+        )
+        .unwrap();
+    let usd_denial = reloaded
+        .reserve(
+            scope,
+            ResourceEstimate {
+                usd: Some(dec!(0.10)),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        usd_denial,
+        ResourceError::LimitExceeded(denial)
+            if denial.account == account
+                && denial.dimension == ResourceDimension::Usd
+                && denial.current_usage == ResourceValue::Decimal(dec!(0.95))
+    ));
 }
 
 fn sample_scope(tenant: &str, user: &str, project: Option<&str>) -> ResourceScope {

@@ -53,7 +53,8 @@ use ironclaw_reborn_event_store::{
     RebornEventStoreConfig, RebornEventStoreError, RebornProfile, build_reborn_event_stores,
 };
 use ironclaw_resources::{
-    InMemoryResourceGovernor, ResourceAccount, ResourceError, ResourceGovernor, ResourceLimits,
+    InMemoryResourceGovernor, JsonFileResourceGovernorStore, PersistentResourceGovernor,
+    ResourceAccount, ResourceError, ResourceGovernor, ResourceLimits,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_run_state::LibSqlRunStateApprovalStore;
@@ -192,6 +193,34 @@ fn production_wiring_validation_rejects_missing_components_and_local_only_defaul
             ProductionWiringIssueKind::LocalOnlyImplementation
         ),
         "in-memory process result store should be reported as local-only: {report:?}"
+    );
+}
+
+#[test]
+fn production_wiring_validation_accepts_persistent_resource_governor_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let governor = Arc::new(PersistentResourceGovernor::new(
+        JsonFileResourceGovernorStore::new(dir.path().join("resource-governor.json")),
+    ));
+    let services = HostRuntimeServices::new(
+        Arc::new(registry_with_manifest(SCRIPT_MANIFEST)),
+        Arc::new(LocalFilesystem::new()),
+        governor,
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    );
+
+    let report = services
+        .validate_production_wiring(&ProductionWiringConfig::new([]))
+        .expect_err("other local/test defaults still prevent production validation");
+
+    assert!(
+        !report.contains(
+            ProductionWiringComponent::ResourceGovernor,
+            ProductionWiringIssueKind::LocalOnlyImplementation,
+        ),
+        "persistent resource governor should satisfy resource guardrail: {report:?}"
     );
 }
 
