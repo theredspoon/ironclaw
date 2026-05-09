@@ -1,5 +1,8 @@
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::{
+    fs,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use tempfile::tempdir;
 
@@ -754,6 +757,313 @@ fn persistent_governor_serializes_concurrent_reservations_across_handles() {
         .filter(|success| *success)
         .count();
     assert_eq!(successes, 1);
+}
+
+#[test]
+fn persistent_governor_writes_versioned_snapshot_schema() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+    let account = ResourceAccount::tenant(scope.tenant_id);
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    governor
+        .try_set_limit(
+            account,
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["schema_version"], serde_json::json!(1));
+}
+
+#[test]
+fn persistent_governor_upgrades_legacy_unversioned_snapshot() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    fs::write(
+        &path,
+        r#"{
+            "state": {
+                "limits": [],
+                "reserved_by_account": [],
+                "usage_by_account": [],
+                "reservations": []
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    governor
+        .try_set_limit(
+            ResourceAccount::tenant(TenantId::new("tenant1").unwrap()),
+            ResourceLimits {
+                max_usd: Some(dec!(1.00)),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(snapshot["schema_version"], serde_json::json!(1));
+}
+
+#[test]
+fn persistent_governor_rejects_malformed_snapshot_with_storage_error() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    fs::write(&path, "{not valid json").unwrap();
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = governor
+        .try_set_limit(
+            ResourceAccount::tenant(TenantId::new("tenant1").unwrap()),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("malformed resource governor snapshot")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_unknown_snapshot_fields() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    fs::write(
+        &path,
+        r#"{
+            "schema_version": 1,
+            "state": {
+                "limits": [],
+                "reserved_by_account": [],
+                "usage_by_account": [],
+                "reservations": []
+            },
+            "unexpected": true
+        }"#,
+    )
+    .unwrap();
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = governor
+        .try_set_limit(
+            ResourceAccount::tenant(TenantId::new("tenant1").unwrap()),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("unknown field")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_unknown_persisted_resource_fields() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    fs::write(
+        &path,
+        r#"{
+            "schema_version": 1,
+            "state": {
+                "limits": [
+                    [
+                        { "Tenant": { "tenant_id": "tenant1" } },
+                        { "max_usd": "1.00", "unexpected_limit": true }
+                    ]
+                ],
+                "reserved_by_account": [],
+                "usage_by_account": [],
+                "reservations": []
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = governor
+        .try_set_limit(
+            ResourceAccount::tenant(TenantId::new("tenant1").unwrap()),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("unknown field")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_unknown_reservation_scope_fields() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    governor
+        .reserve(scope.clone(), ResourceEstimate::default())
+        .unwrap();
+
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    snapshot["state"]["reservations"].as_array_mut().unwrap()[0][1]["reservation"]["scope"]["unexpected_scope"] =
+        serde_json::json!(true);
+    fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+
+    let reloaded = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = reloaded
+        .try_set_limit(
+            ResourceAccount::tenant(scope.tenant_id),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("unknown field")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_unknown_reservation_estimate_fields() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    governor
+        .reserve(
+            scope.clone(),
+            ResourceEstimate {
+                usd: Some(dec!(0.20)),
+                ..ResourceEstimate::default()
+            },
+        )
+        .unwrap();
+
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    snapshot["state"]["reservations"].as_array_mut().unwrap()[0][1]["reservation"]["estimate"]["unexpected_estimate"] =
+        serde_json::json!(true);
+    fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+
+    let reloaded = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = reloaded
+        .try_set_limit(
+            ResourceAccount::tenant(scope.tenant_id),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("unknown field")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_unknown_reservation_actual_fields() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    let scope = sample_scope("tenant1", "user1", Some("project1"));
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let reservation = governor
+        .reserve(scope.clone(), ResourceEstimate::default())
+        .unwrap();
+    governor
+        .reconcile(
+            reservation.id,
+            ResourceUsage {
+                usd: dec!(0.20),
+                ..ResourceUsage::default()
+            },
+        )
+        .unwrap();
+
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    snapshot["state"]["reservations"].as_array_mut().unwrap()[0][1]["actual"]["unexpected_actual"] =
+        serde_json::json!(true);
+    fs::write(&path, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+
+    let reloaded = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = reloaded
+        .try_set_limit(
+            ResourceAccount::tenant(scope.tenant_id),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("unknown field")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_partial_snapshot_fields() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    fs::write(&path, r#"{"schema_version": 1}"#).unwrap();
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = governor
+        .try_set_limit(
+            ResourceAccount::tenant(TenantId::new("tenant1").unwrap()),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason } if reason.contains("missing field")
+    ));
+}
+
+#[test]
+fn persistent_governor_rejects_unsupported_snapshot_schema_version() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("resource-governor.json");
+    fs::write(
+        &path,
+        r#"{
+            "schema_version": 999,
+            "state": {
+                "limits": [],
+                "reserved_by_account": [],
+                "usage_by_account": [],
+                "reservations": []
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let governor = PersistentResourceGovernor::new(JsonFileResourceGovernorStore::new(&path));
+    let error = governor
+        .try_set_limit(
+            ResourceAccount::tenant(TenantId::new("tenant1").unwrap()),
+            ResourceLimits::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ResourceError::Storage { reason }
+            if reason.contains("unsupported resource governor snapshot schema version 999")
+    ));
 }
 
 #[cfg(feature = "libsql")]

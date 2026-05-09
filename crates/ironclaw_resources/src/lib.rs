@@ -4,6 +4,11 @@
 //! runtime lanes before they spend money or consume scarce sandbox capacity:
 //! reserve estimated resources, execute work, then reconcile actual usage or
 //! release the unused hold.
+//!
+//! Persistent governors fail closed when snapshot reads, writes, locks, or
+//! schema validation fail. Callers must handle [`ResourceError::Storage`] the
+//! same way as quota denials: do not start costed or quota-limited work until a
+//! reservation operation succeeds.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -28,6 +33,7 @@ use thiserror::Error;
 
 /// Durable account level that can carry resource limits and ledgers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ResourceAccount {
     Tenant {
         tenant_id: TenantId,
@@ -178,6 +184,7 @@ impl ResourceAccount {
 
 /// Optional maximums for each resource dimension.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     pub max_usd: Option<Decimal>,
     pub max_input_tokens: Option<u64>,
@@ -256,12 +263,15 @@ pub enum ResourceError {
         id: ResourceReservationId,
         status: ReservationStatus,
     },
+    /// Durable storage or snapshot schema validation failed. Governors must
+    /// fail closed when this is returned.
     #[error("resource governor storage error: {reason}")]
     Storage { reason: String },
 }
 
 /// Aggregated resource usage/reservation tally.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceTally {
     pub usd: Decimal,
     pub input_tokens: u64,
@@ -336,11 +346,13 @@ impl ResourceTally {
 }
 
 /// Synchronous resource governor contract.
+///
+/// Persistent implementations may return [`ResourceError::Storage`] from any
+/// method when durable reads, writes, locking, serialization, or schema
+/// validation fail. Callers must treat storage failures as fail-closed and avoid
+/// starting quota-limited work without a successful reservation.
 pub trait ResourceGovernor: Send + Sync {
     /// Sets or replaces limits for a scoped resource account without mutating existing reservations.
-    ///
-    /// Persistent governors also expose `try_set_limit` so callers that need
-    /// durable write confirmation can observe storage errors.
     fn set_limit(
         &self,
         account: ResourceAccount,
@@ -381,10 +393,54 @@ pub trait ResourceGovernor: Send + Sync {
     ) -> Result<ResourceReceipt, ResourceError>;
 }
 
+const RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
 /// Serializable governor snapshot stored by durable stores.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResourceGovernorSnapshot {
+    schema_version: u32,
     state: ResourceState,
+}
+
+impl Default for ResourceGovernorSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION,
+            state: ResourceState::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceGovernorSnapshotSerde {
+    #[serde(default = "current_resource_governor_snapshot_schema_version")]
+    schema_version: u32,
+    state: ResourceState,
+}
+
+impl<'de> Deserialize<'de> for ResourceGovernorSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let snapshot = ResourceGovernorSnapshotSerde::deserialize(deserializer)?;
+        if snapshot.schema_version != RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported resource governor snapshot schema version {}; expected {}",
+                snapshot.schema_version, RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION
+            )));
+        }
+
+        Ok(Self {
+            schema_version: snapshot.schema_version,
+            state: snapshot.state,
+        })
+    }
+}
+
+fn current_resource_governor_snapshot_schema_version() -> u32 {
+    RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION
 }
 
 /// Transactional storage primitive for [`PersistentResourceGovernor`].
@@ -479,7 +535,7 @@ fn read_file_snapshot(path: &Path) -> Result<ResourceGovernorSnapshot, ResourceE
     if contents.trim().is_empty() {
         Ok(ResourceGovernorSnapshot::default())
     } else {
-        serde_json::from_str(&contents).map_err(storage_error)
+        serde_json::from_str(&contents).map_err(snapshot_decode_error)
     }
 }
 
@@ -641,6 +697,12 @@ fn is_unsupported_parent_dir_sync_error(error: &std::io::Error) -> bool {
 fn storage_error(error: impl std::fmt::Display) -> ResourceError {
     ResourceError::Storage {
         reason: error.to_string(),
+    }
+}
+
+fn snapshot_decode_error(error: impl std::fmt::Display) -> ResourceError {
+    ResourceError::Storage {
+        reason: format!("malformed resource governor snapshot: {error}"),
     }
 }
 
@@ -828,7 +890,7 @@ where
         .map_err(storage_error)?;
     let mut snapshot = if let Some(row) = rows.next().await.map_err(storage_error)? {
         let state_json: String = row.get(0).map_err(storage_error)?;
-        serde_json::from_str(&state_json).map_err(storage_error)?
+        serde_json::from_str(&state_json).map_err(snapshot_decode_error)?
     } else {
         ResourceGovernorSnapshot::default()
     };
@@ -924,7 +986,7 @@ where
         .map_err(storage_error)?;
     let mut snapshot = if let Some(row) = row {
         let state_json: String = row.get(0);
-        serde_json::from_str(&state_json).map_err(storage_error)?
+        serde_json::from_str(&state_json).map_err(snapshot_decode_error)?
     } else {
         ResourceGovernorSnapshot::default()
     };
@@ -1060,7 +1122,7 @@ struct ResourceState {
     reservations: HashMap<ResourceReservationId, ReservationRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ReservationRecord {
     reservation: ResourceReservation,
     accounts: Vec<ResourceAccount>,
@@ -1069,7 +1131,111 @@ struct ReservationRecord {
     actual: Option<ResourceUsage>,
 }
 
+#[derive(Deserialize)]
+#[serde(remote = "ResourceScope", deny_unknown_fields)]
+struct StrictResourceScope {
+    tenant_id: TenantId,
+    user_id: UserId,
+    #[serde(default)]
+    agent_id: Option<AgentId>,
+    #[serde(default)]
+    project_id: Option<ProjectId>,
+    #[serde(default)]
+    mission_id: Option<MissionId>,
+    #[serde(default)]
+    thread_id: Option<ThreadId>,
+    invocation_id: ironclaw_host_api::InvocationId,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "ResourceEstimate", deny_unknown_fields)]
+struct StrictResourceEstimate {
+    #[serde(default)]
+    usd: Option<Decimal>,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    wall_clock_ms: Option<u64>,
+    #[serde(default)]
+    output_bytes: Option<u64>,
+    #[serde(default)]
+    network_egress_bytes: Option<u64>,
+    #[serde(default)]
+    process_count: Option<u32>,
+    #[serde(default)]
+    concurrency_slots: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "ResourceUsage", deny_unknown_fields)]
+struct StrictResourceUsage {
+    usd: Decimal,
+    input_tokens: u64,
+    output_tokens: u64,
+    wall_clock_ms: u64,
+    output_bytes: u64,
+    network_egress_bytes: u64,
+    process_count: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "ResourceReservation", deny_unknown_fields)]
+struct StrictResourceReservation {
+    id: ResourceReservationId,
+    #[serde(with = "StrictResourceScope")]
+    scope: ResourceScope,
+    #[serde(with = "StrictResourceEstimate")]
+    estimate: ResourceEstimate,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReservationRecordSerde {
+    #[serde(with = "StrictResourceReservation")]
+    reservation: ResourceReservation,
+    accounts: Vec<ResourceAccount>,
+    tally: ResourceTally,
+    status: ReservationStatus,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_strict_resource_usage"
+    )]
+    actual: Option<ResourceUsage>,
+}
+
+impl<'de> Deserialize<'de> for ReservationRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = ReservationRecordSerde::deserialize(deserializer)?;
+        Ok(Self {
+            reservation: value.reservation,
+            accounts: value.accounts,
+            tally: value.tally,
+            status: value.status,
+            actual: value.actual,
+        })
+    }
+}
+
+fn deserialize_optional_strict_resource_usage<'de, D>(
+    deserializer: D,
+) -> Result<Option<ResourceUsage>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct StrictResourceUsageOption(#[serde(with = "StrictResourceUsage")] ResourceUsage);
+
+    Option::<StrictResourceUsageOption>::deserialize(deserializer)
+        .map(|value| value.map(|wrapper| wrapper.0))
+}
+
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResourceStateSerde {
     limits: Vec<(ResourceAccount, ResourceLimits)>,
     reserved_by_account: Vec<(ResourceAccount, ResourceTally)>,
