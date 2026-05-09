@@ -345,6 +345,11 @@ async fn drain_queued_runs(
     }
 }
 
+enum ExecutorTaskOutcome {
+    Completed,
+    RecoveryRequired(String),
+}
+
 fn spawn_executor_task(
     claimed: ClaimedTurnRun,
     transitions: Arc<dyn TurnRunTransitionPort>,
@@ -364,39 +369,43 @@ fn spawn_executor_task(
             AssertUnwindSafe(executor.execute_claimed_run(claimed, Arc::clone(&transitions)))
                 .catch_unwind();
         tokio::pin!(executor_result);
-        let executor_result = loop {
+        let outcome = loop {
             tokio::select! {
-                result = &mut executor_result => break result,
+                result = &mut executor_result => {
+                    break match result {
+                        Ok(Ok(())) => ExecutorTaskOutcome::Completed,
+                        Ok(Err(error)) => ExecutorTaskOutcome::RecoveryRequired(
+                            error.failure_category().to_string(),
+                        ),
+                        Err(_) => ExecutorTaskOutcome::RecoveryRequired(
+                            "scheduler_executor_panic".to_string(),
+                        ),
+                    };
+                }
                 _ = heartbeat_tick.tick() => {
-                    heartbeat_claimed_run(
+                    if !heartbeat_claimed_run(
                         Arc::clone(&transitions),
                         recovery_run_id,
                         recovery_runner_id,
                         recovery_lease_token,
-                    ).await;
+                    ).await {
+                        break ExecutorTaskOutcome::RecoveryRequired(
+                            "scheduler_heartbeat_failed".to_string(),
+                        );
+                    }
                 }
             }
         };
 
-        match executor_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        match outcome {
+            ExecutorTaskOutcome::Completed => {}
+            ExecutorTaskOutcome::RecoveryRequired(category) => {
                 record_recovery_required(
                     Arc::clone(&transitions),
                     recovery_run_id,
                     recovery_runner_id,
                     recovery_lease_token,
-                    error.failure_category(),
-                )
-                .await;
-            }
-            Err(_) => {
-                record_recovery_required(
-                    Arc::clone(&transitions),
-                    recovery_run_id,
-                    recovery_runner_id,
-                    recovery_lease_token,
-                    "scheduler_executor_panic",
+                    &category,
                 )
                 .await;
             }
@@ -412,7 +421,7 @@ async fn heartbeat_claimed_run(
     run_id: ironclaw_turns::TurnRunId,
     runner_id: ironclaw_turns::TurnRunnerId,
     lease_token: ironclaw_turns::TurnLeaseToken,
-) {
+) -> bool {
     let result = transitions
         .heartbeat(HeartbeatRequest {
             run_id,
@@ -422,7 +431,9 @@ async fn heartbeat_claimed_run(
         .await;
     if let Err(error) = result {
         debug!(error = %error, "turn run scheduler heartbeat failed");
+        return false;
     }
+    true
 }
 
 async fn record_recovery_required(

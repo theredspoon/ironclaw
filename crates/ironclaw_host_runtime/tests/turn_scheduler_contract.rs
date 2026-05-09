@@ -23,9 +23,9 @@ use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, DefaultTurnCoordinator,
     GetRunStateRequest, IdempotencyKey, InMemoryTurnStateStore, InMemoryTurnStateStoreLimits,
     NoopTurnRunWakeNotifier, ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse,
-    RunProfileRequest, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor,
-    TurnCoordinator, TurnError, TurnRunState, TurnRunWake, TurnRunWakeNotifier, TurnScope,
-    TurnStateStore, TurnStatus,
+    RunProfileRequest, SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest,
+    SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunState, TurnRunWake,
+    TurnRunWakeNotifier, TurnScope, TurnStateStore, TurnStatus,
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
@@ -591,6 +591,46 @@ async fn scheduler_heartbeats_long_running_executor_until_completion() {
     transitions.wait_for_heartbeats(2).await;
     gate.notify_waiters();
     wait_for_status(&store, scope, run_id, TurnStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn canceled_hanging_executor_lease_expires_to_recovery_required() {
+    let store = Arc::new(InMemoryTurnStateStore::with_limits(
+        InMemoryTurnStateStoreLimits {
+            runner_lease_ttl: ChronoDuration::milliseconds(40),
+            ..InMemoryTurnStateStoreLimits::default()
+        },
+    ));
+    let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
+    let executor = Arc::new(HangingExecutor::default());
+    let scheduler = TurnRunScheduler::new(
+        Arc::clone(&transitions),
+        executor.clone(),
+        fast_config()
+            .with_poll_interval(Duration::from_secs(60))
+            .with_runner_heartbeat_interval(Duration::from_millis(5)),
+    );
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let request = submit_turn_request("thread-cancel-recovery", "idem-cancel-recovery");
+    let scope = request.scope.clone();
+    let run_id = accepted_run_id(coordinator.submit_turn(request).await.unwrap());
+    executor.wait_for_started().await;
+    coordinator
+        .cancel_run(CancelRunRequest {
+            scope: scope.clone(),
+            actor: TurnActor::new(UserId::new("user1").unwrap()),
+            run_id,
+            reason: SanitizedCancelReason::UserRequested,
+            idempotency_key: IdempotencyKey::new("idem-cancel-request").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    wait_for_status(&store, scope, run_id, TurnStatus::RecoveryRequired).await;
     handle.shutdown().await;
 }
 
