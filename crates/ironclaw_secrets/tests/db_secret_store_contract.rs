@@ -6,7 +6,9 @@ use std::sync::Arc;
 use ironclaw_secrets::LibSqlSecretsStore;
 #[cfg(feature = "postgres")]
 use ironclaw_secrets::PostgresSecretsStore;
-use ironclaw_secrets::{CreateSecretParams, SecretMaterial, SecretsCrypto, SecretsStore};
+use ironclaw_secrets::{
+    CreateSecretParams, SecretError, SecretMaterial, SecretsCrypto, SecretsStore,
+};
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
@@ -37,6 +39,37 @@ async fn libsql_secret_store_persists_encrypted_secret_material_across_reopen() 
         .await
         .unwrap();
     assert_eq!(decrypted.expose(), "sk-live-reborn-secret-sentinel");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_secret_store_verify_can_decrypt_existing_secrets_rejects_wrong_key() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("secrets.db");
+    let store = libsql_store(&db_path, test_crypto()).await;
+
+    store
+        .create(
+            "reborn-user",
+            CreateSecretParams::new("openai_key", "sk-live-wrong-key-sentinel"),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let wrong_crypto = Arc::new(
+        SecretsCrypto::new(SecretMaterial::from(
+            "abcdef0123456789abcdef0123456789".to_string(),
+        ))
+        .unwrap(),
+    );
+    let reopened = libsql_store(&db_path, wrong_crypto).await;
+    let error = reopened
+        .verify_can_decrypt_existing_secrets()
+        .await
+        .expect_err("wrong key must fail existing row decryptability check");
+    assert!(matches!(error, SecretError::DecryptionFailed(_)));
+    assert!(!format!("{error:?}").contains("sk-live-wrong-key-sentinel"));
 }
 
 #[cfg(feature = "libsql")]

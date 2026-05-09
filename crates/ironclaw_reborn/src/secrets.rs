@@ -12,6 +12,11 @@ use ironclaw_secrets::{
 /// decryptable across restarts, matching v1's encrypted-at-rest invariant.
 pub struct RebornLibSqlSecretStoreConfig {
     pub database: Arc<libsql::Database>,
+    /// Operator-provided durable master key material.
+    ///
+    /// `None` is accepted only so builders and health checks can fail closed
+    /// with [`RebornSecretStoreError::MissingMasterKey`]. Production
+    /// composition must pass `Some`.
     pub master_key: Option<SecretMaterial>,
 }
 
@@ -25,6 +30,7 @@ pub struct RebornSecretStoreHealth {
 pub enum RebornSecretStoreHealthStatus {
     Ready,
     MissingMasterKey,
+    InvalidMasterKey,
     Unavailable,
 }
 
@@ -55,6 +61,12 @@ impl fmt::Display for RebornSecretStoreError {
 
 impl std::error::Error for RebornSecretStoreError {}
 
+/// Probe the libSQL Reborn secret-store wiring.
+///
+/// This uses the same fail-closed construction path as the builder, including
+/// migration and decryptability verification. `config.master_key = None` is
+/// reported as [`RebornSecretStoreHealthStatus::MissingMasterKey`], not treated
+/// as a healthy local/default configuration.
 pub async fn check_libsql_reborn_secret_store_health(
     config: RebornLibSqlSecretStoreConfig,
 ) -> RebornSecretStoreHealth {
@@ -67,6 +79,12 @@ pub async fn check_libsql_reborn_secret_store_health(
             status: RebornSecretStoreHealthStatus::MissingMasterKey,
             reason: Some("explicit operator master key is required".to_string()),
         },
+        Err(RebornSecretStoreError::InvalidMasterKey) => RebornSecretStoreHealth {
+            status: RebornSecretStoreHealthStatus::InvalidMasterKey,
+            reason: Some(
+                "operator master key is invalid or cannot decrypt existing secret rows".to_string(),
+            ),
+        },
         Err(error) => RebornSecretStoreHealth {
             status: RebornSecretStoreHealthStatus::Unavailable,
             reason: Some(error.to_string()),
@@ -74,6 +92,11 @@ pub async fn check_libsql_reborn_secret_store_health(
     }
 }
 
+/// Build the libSQL Reborn secret store.
+///
+/// Requires explicit operator-provided master key material. The returned store
+/// has completed schema migration and sampled decryptability verification for
+/// existing encrypted rows.
 pub async fn build_libsql_reborn_secret_store(
     config: RebornLibSqlSecretStoreConfig,
 ) -> Result<Arc<dyn SecretStore>, RebornSecretStoreError> {
@@ -94,7 +117,7 @@ pub async fn build_libsql_reborn_secret_store(
     backend
         .verify_can_decrypt_existing_secrets()
         .await
-        .map_err(map_secret_store_error)?;
+        .map_err(map_existing_secret_decryptability_error)?;
     Ok(Arc::new(ScopedSecretsStoreAdapter::new(backend)))
 }
 
@@ -104,5 +127,14 @@ fn map_secret_store_error(error: SecretError) -> RebornSecretStoreError {
         other => RebornSecretStoreError::BackendUnavailable {
             reason: other.to_string(),
         },
+    }
+}
+
+fn map_existing_secret_decryptability_error(error: SecretError) -> RebornSecretStoreError {
+    match error {
+        SecretError::InvalidMasterKey
+        | SecretError::DecryptionFailed(_)
+        | SecretError::InvalidUtf8 => RebornSecretStoreError::InvalidMasterKey,
+        other => map_secret_store_error(other),
     }
 }

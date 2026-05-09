@@ -76,22 +76,61 @@ async fn reborn_secret_store_fails_closed_when_existing_rows_use_another_master_
         .unwrap();
     drop(store);
 
+    let wrong_key = Some(SecretMaterial::from(
+        "abcdef0123456789abcdef0123456789".to_string(),
+    ));
     let error = match build_libsql_reborn_secret_store(RebornLibSqlSecretStoreConfig {
-        database,
-        master_key: Some(SecretMaterial::from(
-            "abcdef0123456789abcdef0123456789".to_string(),
-        )),
+        database: Arc::clone(&database),
+        master_key: wrong_key.clone(),
     })
     .await
     {
         Ok(_) => panic!("secret store must fail closed when existing rows cannot decrypt"),
         Err(error) => error,
     };
-    assert!(matches!(
-        error,
-        RebornSecretStoreError::BackendUnavailable { .. }
-    ));
+    assert!(matches!(error, RebornSecretStoreError::InvalidMasterKey));
     assert!(!format!("{error:?}").contains("sk-live-existing-secret"));
+
+    let health = check_libsql_reborn_secret_store_health(RebornLibSqlSecretStoreConfig {
+        database,
+        master_key: wrong_key,
+    })
+    .await;
+    assert_eq!(
+        health.status,
+        RebornSecretStoreHealthStatus::InvalidMasterKey
+    );
+    assert!(!format!("{health:?}").contains("sk-live-existing-secret"));
+}
+
+#[tokio::test]
+async fn reborn_secret_store_reports_malformed_master_key_as_invalid_master_key() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("reborn-secrets.db");
+    let database = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let short_key = Some(SecretMaterial::from("short".to_string()));
+
+    let error = match build_libsql_reborn_secret_store(RebornLibSqlSecretStoreConfig {
+        database: Arc::clone(&database),
+        master_key: short_key.clone(),
+    })
+    .await
+    {
+        Ok(_) => panic!("secret store must reject malformed operator master key"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, RebornSecretStoreError::InvalidMasterKey));
+
+    let health = check_libsql_reborn_secret_store_health(RebornLibSqlSecretStoreConfig {
+        database,
+        master_key: short_key,
+    })
+    .await;
+    assert_eq!(
+        health.status,
+        RebornSecretStoreHealthStatus::InvalidMasterKey
+    );
+    assert!(!format!("{health:?}").contains("short"));
 }
 
 #[tokio::test]
