@@ -56,4 +56,4 @@ Agent-loop drivers return `LoopExit` claims. `TurnRunner` validates those claims
 
 ## 6. Deferred work
 
-The current `ironclaw_turns` slices define the core lease/recovery state machine, initial PostgreSQL/libSQL persistence adapters, pure `LoopExit` validation/mapping types, and runner-side `apply_loop_exit` transition application. AgentLoopHost/AgentLoopDriver integration, durable exit-id replay storage, transcript draft validation, side-effect boundary checkpoint cadence inside the loop, production service-graph wiring, and safe explicit retry/fork UX remain follow-up slices.
+The current slices define the core lease/recovery state machine, initial PostgreSQL/libSQL persistence adapters, pure `LoopExit` validation/mapping types, runner-side `apply_loop_exit` transition application, and host-runtime production scheduler wiring. AgentLoopHost/AgentLoopDriver integration, durable exit-id replay storage, transcript draft validation, side-effect boundary checkpoint cadence inside the loop, concrete runner-worker startup, and safe explicit retry/fork UX remain follow-up slices.

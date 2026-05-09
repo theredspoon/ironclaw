@@ -222,6 +222,7 @@ impl TurnRunSchedulerHandle {
 enum SchedulerCommand {
     Wake(TurnRunWake),
     Drain,
+    RetryDrain,
     Shutdown,
 }
 
@@ -238,33 +239,61 @@ async fn run_scheduler_loop(
     poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut recovery_tick = interval(config.lease_recovery_interval());
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut claim_retry_pending = false;
 
     loop {
         tokio::select! {
             Some(command) = command_rx.recv() => {
                 match command {
                     SchedulerCommand::Wake(wake) => {
-                        drain_queued_runs(
-                            Arc::clone(&transitions),
-                            Arc::clone(&executor),
-                            Arc::clone(&semaphore),
-                            command_tx.clone(),
-                            &config,
-                            Some(wake.scope),
-                            &mut executor_tasks,
-                        ).await;
-                        drain_queued_runs(
-                            Arc::clone(&transitions),
-                            Arc::clone(&executor),
-                            Arc::clone(&semaphore),
-                            command_tx.clone(),
-                            &config,
-                            None,
-                            &mut executor_tasks,
-                        ).await;
+                        if !claim_retry_pending {
+                            if drain_queued_runs(
+                                Arc::clone(&transitions),
+                                Arc::clone(&executor),
+                                Arc::clone(&semaphore),
+                                command_tx.clone(),
+                                &config,
+                                Some(wake.scope),
+                                &mut executor_tasks,
+                            ).await {
+                                claim_retry_pending = true;
+                                schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                            }
+                        }
+                        if !claim_retry_pending
+                            && drain_queued_runs(
+                                Arc::clone(&transitions),
+                                Arc::clone(&executor),
+                                Arc::clone(&semaphore),
+                                command_tx.clone(),
+                                &config,
+                                None,
+                                &mut executor_tasks,
+                            ).await
+                        {
+                            claim_retry_pending = true;
+                            schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                        }
                     }
                     SchedulerCommand::Drain => {
-                        drain_queued_runs(
+                        if !claim_retry_pending
+                            && drain_queued_runs(
+                                Arc::clone(&transitions),
+                                Arc::clone(&executor),
+                                Arc::clone(&semaphore),
+                                command_tx.clone(),
+                                &config,
+                                None,
+                                &mut executor_tasks,
+                            ).await
+                        {
+                            claim_retry_pending = true;
+                            schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                        }
+                    }
+                    SchedulerCommand::RetryDrain => {
+                        claim_retry_pending = false;
+                        if drain_queued_runs(
                             Arc::clone(&transitions),
                             Arc::clone(&executor),
                             Arc::clone(&semaphore),
@@ -272,7 +301,10 @@ async fn run_scheduler_loop(
                             &config,
                             None,
                             &mut executor_tasks,
-                        ).await;
+                        ).await {
+                            claim_retry_pending = true;
+                            schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                        }
                     }
                     SchedulerCommand::Shutdown => {
                         executor_tasks.shutdown().await;
@@ -281,15 +313,20 @@ async fn run_scheduler_loop(
                 }
             }
             _ = poll_tick.tick() => {
-                drain_queued_runs(
-                    Arc::clone(&transitions),
-                    Arc::clone(&executor),
-                    Arc::clone(&semaphore),
-                    command_tx.clone(),
-                    &config,
-                    None,
-                    &mut executor_tasks,
-                ).await;
+                if !claim_retry_pending
+                    && drain_queued_runs(
+                        Arc::clone(&transitions),
+                        Arc::clone(&executor),
+                        Arc::clone(&semaphore),
+                        command_tx.clone(),
+                        &config,
+                        None,
+                        &mut executor_tasks,
+                    ).await
+                {
+                    claim_retry_pending = true;
+                    schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                }
             }
             Some(result) = executor_tasks.join_next(), if !executor_tasks.is_empty() => {
                 if let Err(error) = result {
@@ -311,10 +348,10 @@ async fn drain_queued_runs(
     config: &TurnRunSchedulerConfig,
     scope_filter: Option<TurnScope>,
     executor_tasks: &mut JoinSet<()>,
-) {
+) -> bool {
     loop {
         let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
-            break;
+            return false;
         };
         let claim = transitions
             .claim_next_run(ClaimRunRequest {
@@ -335,11 +372,10 @@ async fn drain_queued_runs(
                     executor_tasks,
                 );
             }
-            Ok(None) => break,
+            Ok(None) => return false,
             Err(error) => {
                 debug!(error = %error, "turn run scheduler claim failed");
-                schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
-                break;
+                return true;
             }
         }
     }
@@ -484,6 +520,6 @@ async fn recover_expired_leases(transitions: Arc<dyn TurnRunTransitionPort>) {
 fn schedule_drain_after(command_tx: mpsc::Sender<SchedulerCommand>, delay: Duration) {
     tokio::spawn(async move {
         sleep(delay).await;
-        let _ = command_tx.send(SchedulerCommand::Drain).await;
+        let _ = command_tx.send(SchedulerCommand::RetryDrain).await;
     });
 }

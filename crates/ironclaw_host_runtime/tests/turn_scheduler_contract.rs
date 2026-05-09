@@ -101,6 +101,18 @@ struct FailingExecutor {
     notify_started: Notify,
 }
 
+#[derive(Default)]
+struct PanickingExecutor {
+    started: AtomicUsize,
+    notify_started: Notify,
+}
+
+#[derive(Default)]
+struct FailingClaimTransitions {
+    claim_attempts: AtomicUsize,
+    notify_claim: Notify,
+}
+
 #[derive(Debug)]
 struct DurableTurnStoreStub;
 
@@ -132,6 +144,116 @@ impl TurnRunExecutor for FailingExecutor {
         self.started.fetch_add(1, Ordering::SeqCst);
         self.notify_started.notify_waiters();
         Err(TurnRunExecutorError::new("scheduler_test_error").unwrap())
+    }
+}
+
+impl PanickingExecutor {
+    async fn wait_for_started(&self) {
+        timeout(Duration::from_secs(2), async {
+            while self.started.load(Ordering::SeqCst) == 0 {
+                self.notify_started.notified().await;
+            }
+        })
+        .await
+        .expect("executor did not start");
+    }
+}
+
+#[async_trait]
+impl TurnRunExecutor for PanickingExecutor {
+    async fn execute_claimed_run(
+        &self,
+        _claimed: ClaimedTurnRun,
+        _transitions: Arc<dyn TurnRunTransitionPort>,
+    ) -> Result<(), TurnRunExecutorError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        self.notify_started.notify_waiters();
+        panic!("scheduler test panic");
+    }
+}
+
+impl FailingClaimTransitions {
+    async fn wait_for_claim_attempts(&self, expected: usize) {
+        assert!(
+            self.wait_for_claim_attempts_for(expected, Duration::from_secs(2))
+                .await,
+            "scheduler did not reach expected claim attempts"
+        );
+    }
+
+    async fn wait_for_claim_attempts_for(&self, expected: usize, duration: Duration) -> bool {
+        timeout(duration, async {
+            while self.claim_attempts.load(Ordering::SeqCst) < expected {
+                self.notify_claim.notified().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    fn claim_attempts(&self) -> usize {
+        self.claim_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TurnRunTransitionPort for FailingClaimTransitions {
+    async fn claim_next_run(
+        &self,
+        _request: ClaimRunRequest,
+    ) -> Result<Option<ClaimedTurnRun>, TurnError> {
+        self.claim_attempts.fetch_add(1, Ordering::SeqCst);
+        self.notify_claim.notify_waiters();
+        Err(TurnError::Unavailable {
+            reason: "claim store unavailable".to_string(),
+        })
+    }
+
+    async fn heartbeat(
+        &self,
+        _request: HeartbeatRequest,
+    ) -> Result<ironclaw_turns::EventCursor, TurnError> {
+        panic!("failing claim transitions should not heartbeat")
+    }
+
+    async fn recover_expired_leases(
+        &self,
+        _request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
+        Ok(RecoverExpiredLeasesResponse { recovered: vec![] })
+    }
+
+    async fn block_run(&self, _request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("failing claim transitions should not block runs")
+    }
+
+    async fn complete_run(&self, _request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("failing claim transitions should not complete runs")
+    }
+
+    async fn cancel_run(
+        &self,
+        _request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("failing claim transitions should not cancel runs")
+    }
+
+    async fn fail_run(&self, _request: FailRunRequest) -> Result<TurnRunState, TurnError> {
+        panic!("failing claim transitions should not fail runs")
+    }
+
+    async fn record_recovery_required(
+        &self,
+        _request: RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("failing claim transitions should not record recovery")
+    }
+
+    async fn apply_validated_loop_exit(
+        &self,
+        _request: ApplyValidatedLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        panic!("failing claim transitions should not apply loop exits")
     }
 }
 
@@ -382,6 +504,50 @@ fn production_services_reject_unverified_scheduler_transition_port() {
 }
 
 #[tokio::test]
+async fn claim_errors_coalesce_wakes_during_backoff() {
+    let transitions = Arc::new(FailingClaimTransitions::default());
+    let transition_port: Arc<dyn TurnRunTransitionPort> = transitions.clone();
+    let executor = Arc::new(CompletingExecutor::default());
+    let scheduler = TurnRunScheduler::new(
+        transition_port,
+        executor,
+        fast_config()
+            .with_poll_interval(Duration::from_secs(60))
+            .with_lease_recovery_interval(Duration::from_secs(60))
+            .with_claim_error_backoff(Duration::from_millis(200)),
+    );
+    let handle = scheduler.start();
+
+    transitions.wait_for_claim_attempts(1).await;
+    for _ in 0..8 {
+        handle
+            .wake_notifier()
+            .notify_queued_run(TurnRunWake {
+                scope: scope("thread-claim-backoff"),
+                run_id: ironclaw_turns::TurnRunId::new(),
+                status: TurnStatus::Queued,
+                event_cursor: ironclaw_turns::EventCursor::default(),
+            })
+            .unwrap();
+    }
+
+    assert!(
+        !transitions
+            .wait_for_claim_attempts_for(2, Duration::from_millis(50))
+            .await,
+        "wake storm retried claims before claim_error_backoff elapsed"
+    );
+    transitions.wait_for_claim_attempts(2).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        transitions.claim_attempts(),
+        2,
+        "claim retries should be coalesced while one backoff retry is pending"
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn wake_notifier_drains_submitted_run() {
     let store = Arc::new(InMemoryTurnStateStore::default());
     let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
@@ -557,6 +723,46 @@ async fn executor_error_records_recovery_required_instead_of_retrying() {
     })
     .await
     .expect("run did not move to recovery_required");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn executor_panic_records_recovery_required() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
+    let executor = Arc::new(PanickingExecutor::default());
+    let scheduler =
+        TurnRunScheduler::new(Arc::clone(&transitions), executor.clone(), fast_config());
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let request = submit_turn_request("thread-panic", "idem-panic");
+    let scope = request.scope.clone();
+    let run_id = accepted_run_id(coordinator.submit_turn(request).await.unwrap());
+
+    executor.wait_for_started().await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let state = store
+                .get_run_state(ironclaw_turns::GetRunStateRequest {
+                    scope: scope.clone(),
+                    run_id,
+                })
+                .await
+                .unwrap();
+            if state.status == TurnStatus::RecoveryRequired {
+                assert_eq!(
+                    state.failure.as_ref().map(|failure| failure.category()),
+                    Some("scheduler_executor_panic")
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("run did not move to recovery_required after executor panic");
     handle.shutdown().await;
 }
 
