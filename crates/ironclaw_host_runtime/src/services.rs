@@ -42,7 +42,13 @@ use ironclaw_reborn_event_store::{
     RebornEventStoreConfig, RebornEventStoreError, RebornEventStores, RebornProfile,
     build_reborn_event_stores,
 };
+#[cfg(feature = "libsql")]
+use ironclaw_resources::LibSqlResourceGovernorStore;
+#[cfg(feature = "postgres")]
+use ironclaw_resources::PostgresResourceGovernorStore;
 use ironclaw_resources::ResourceGovernor;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_resources::{PersistentResourceGovernor, ResourceError};
 #[cfg(feature = "libsql")]
 use ironclaw_run_state::LibSqlRunStateApprovalStore;
 #[cfg(feature = "postgres")]
@@ -463,6 +469,102 @@ where
         filesystem: Arc<LibSqlRootFilesystem>,
     ) -> HostRuntimeServices<LibSqlRootFilesystem, G, S, R> {
         self.with_root_filesystem(filesystem)
+    }
+
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    fn with_resource_governor<T>(self, governor: Arc<T>) -> HostRuntimeServices<F, T, S, R>
+    where
+        T: ResourceGovernor + 'static,
+    {
+        let Self {
+            registry,
+            trust_policy,
+            trust_policy_configured,
+            filesystem,
+            governor: _,
+            authorizer,
+            process_services,
+            surface_version,
+            run_state,
+            approval_requests,
+            run_state_approval_store,
+            capability_leases,
+            event_sink,
+            audit_sink,
+            secret_store,
+            network_policy_store,
+            secret_injection_store,
+            process_lifecycle_store,
+            runtime_http_egress,
+            wasm_credential_provider,
+            runtime_health,
+            script_runtime,
+            mcp_runtime,
+            wasm_runtime,
+            turn_state,
+            turn_run_wake_notifier,
+            mut component_types,
+        } = self;
+        component_types.resource_governor = type_name::<T>();
+        HostRuntimeServices {
+            registry,
+            trust_policy,
+            trust_policy_configured,
+            filesystem,
+            governor,
+            authorizer,
+            process_services,
+            surface_version,
+            run_state,
+            approval_requests,
+            run_state_approval_store,
+            capability_leases,
+            event_sink,
+            audit_sink,
+            secret_store,
+            network_policy_store,
+            secret_injection_store,
+            process_lifecycle_store,
+            runtime_http_egress,
+            wasm_credential_provider,
+            runtime_health,
+            script_runtime,
+            mcp_runtime,
+            wasm_runtime,
+            turn_state,
+            turn_run_wake_notifier,
+            component_types,
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    pub async fn with_libsql_resource_governor(
+        self,
+        db: Arc<libsql::Database>,
+    ) -> Result<
+        HostRuntimeServices<F, PersistentResourceGovernor<LibSqlResourceGovernorStore>, S, R>,
+        ResourceError,
+    > {
+        let store = LibSqlResourceGovernorStore::new(db);
+        store.run_migrations().await?;
+        Ok(self.with_resource_governor(Arc::new(PersistentResourceGovernor::new(store))))
+    }
+
+    #[cfg(feature = "postgres")]
+    pub async fn with_postgres_resource_governor(
+        self,
+        pool: deadpool_postgres::Pool,
+    ) -> Result<
+        HostRuntimeServices<F, PersistentResourceGovernor<PostgresResourceGovernorStore>, S, R>,
+        ResourceError,
+    > {
+        let store = PostgresResourceGovernorStore::new(pool);
+        store.run_migrations().await?;
+        Ok(self.with_resource_governor(Arc::new(PersistentResourceGovernor::new(store))))
+    }
+
+    pub fn resource_governor(&self) -> Arc<G> {
+        Arc::clone(&self.governor)
     }
 
     /// Attaches the host-owned trust policy used by the produced
