@@ -1139,9 +1139,11 @@ impl LibSqlSecretsStore {
 
     pub async fn verify_can_decrypt_existing_secrets(&self) -> Result<(), SecretError> {
         let conn = self.connect().await?;
+        // Sample one existing row to validate the configured master key without
+        // turning readiness checks into an O(N) table scan/decryption pass.
         let mut rows = conn
             .query(
-                "SELECT encrypted_value, key_salt FROM reborn_secret_records",
+                "SELECT encrypted_value, key_salt FROM reborn_secret_records LIMIT 1",
                 (),
             )
             .await
@@ -1306,9 +1308,11 @@ impl PostgresSecretsStore {
 
     pub async fn verify_can_decrypt_existing_secrets(&self) -> Result<(), SecretError> {
         let client = self.pool.get().await.map_err(secret_db_error)?;
+        // Sample one existing row to validate the configured master key without
+        // turning readiness checks into an O(N) table scan/decryption pass.
         let rows = client
             .query(
-                "SELECT encrypted_value, key_salt FROM reborn_secret_records",
+                "SELECT encrypted_value, key_salt FROM reborn_secret_records LIMIT 1",
                 &[],
             )
             .await
