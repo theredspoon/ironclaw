@@ -6,7 +6,7 @@
 //! schemas, validation, and query semantics.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 /// Sentinel value for optional scope components stored in composite SQL keys.
@@ -91,7 +91,7 @@ pub fn optional_scope_component(value: Option<&str>) -> &str {
 ///
 /// Keys may be path-like, but they are not authority-bearing filesystem paths.
 /// Domain stores own key grammar and scope semantics before constructing one.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct StorageKey(String);
 
@@ -104,6 +104,16 @@ impl StorageKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|_| serde::de::Error::custom("invalid storage key"))
     }
 }
 
@@ -120,7 +130,7 @@ impl std::fmt::Display for StorageKey {
 }
 
 /// Opaque backend version/fencing value for primitive compare-and-swap writes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct StorageVersion(String);
 
@@ -133,6 +143,16 @@ impl StorageVersion {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(|_| serde::de::Error::custom("invalid storage version"))
     }
 }
 
@@ -327,6 +347,17 @@ mod tests {
         assert_eq!(
             StorageVersion::new("v".repeat(129)).unwrap_err(),
             StorageError::Validation
+        );
+    }
+
+    #[test]
+    fn storage_key_and_version_reject_invalid_deserialized_values() {
+        assert!(serde_json::from_str::<StorageKey>("\"\"").is_err());
+        assert!(serde_json::from_str::<StorageKey>(&format!("\"{}\"", "x".repeat(513))).is_err());
+        assert!(serde_json::from_str::<StorageKey>("\"bad\\nkey\"").is_err());
+        assert!(serde_json::from_str::<StorageVersion>("\"\"").is_err());
+        assert!(
+            serde_json::from_str::<StorageVersion>(&format!("\"{}\"", "v".repeat(129))).is_err()
         );
     }
 
