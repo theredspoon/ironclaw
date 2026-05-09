@@ -25,7 +25,7 @@ use ironclaw_turns::{
     NoopTurnRunWakeNotifier, ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse,
     RunProfileRequest, SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest,
     SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunState, TurnRunWake,
-    TurnRunWakeNotifier, TurnScope, TurnStateStore, TurnStatus,
+    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnScope, TurnStateStore, TurnStatus,
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
@@ -111,6 +111,10 @@ struct PanickingExecutor {
 struct FailingClaimTransitions {
     claim_attempts: AtomicUsize,
     notify_claim: Notify,
+}
+
+struct DurableLikeTurnStore {
+    inner: InMemoryTurnStateStore,
 }
 
 #[derive(Debug)]
@@ -254,6 +258,103 @@ impl TurnRunTransitionPort for FailingClaimTransitions {
         _request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
         panic!("failing claim transitions should not apply loop exits")
+    }
+}
+
+impl Default for DurableLikeTurnStore {
+    fn default() -> Self {
+        Self {
+            inner: InMemoryTurnStateStore::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl TurnStateStore for DurableLikeTurnStore {
+    async fn submit_turn(
+        &self,
+        request: SubmitTurnRequest,
+        admission_policy: &dyn ironclaw_turns::TurnAdmissionPolicy,
+        run_profile_resolver: &dyn ironclaw_turns::RunProfileResolver,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        self.inner
+            .submit_turn(request, admission_policy, run_profile_resolver)
+            .await
+    }
+
+    async fn resume_turn(
+        &self,
+        request: ResumeTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        self.inner.resume_turn(request).await
+    }
+
+    async fn request_cancel(
+        &self,
+        request: CancelRunRequest,
+    ) -> Result<CancelRunResponse, TurnError> {
+        self.inner.request_cancel(request).await
+    }
+
+    async fn get_run_state(&self, request: GetRunStateRequest) -> Result<TurnRunState, TurnError> {
+        self.inner.get_run_state(request).await
+    }
+}
+
+#[async_trait]
+impl TurnRunTransitionPort for DurableLikeTurnStore {
+    async fn claim_next_run(
+        &self,
+        request: ClaimRunRequest,
+    ) -> Result<Option<ClaimedTurnRun>, TurnError> {
+        self.inner.claim_next_run(request).await
+    }
+
+    async fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Result<ironclaw_turns::EventCursor, TurnError> {
+        self.inner.heartbeat(request).await
+    }
+
+    async fn recover_expired_leases(
+        &self,
+        request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
+        self.inner.recover_expired_leases(request).await
+    }
+
+    async fn block_run(&self, request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
+        self.inner.block_run(request).await
+    }
+
+    async fn complete_run(&self, request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
+        self.inner.complete_run(request).await
+    }
+
+    async fn cancel_run(
+        &self,
+        request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.inner.cancel_run(request).await
+    }
+
+    async fn fail_run(&self, request: FailRunRequest) -> Result<TurnRunState, TurnError> {
+        self.inner.fail_run(request).await
+    }
+
+    async fn record_recovery_required(
+        &self,
+        request: RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.inner.record_recovery_required(request).await
+    }
+
+    async fn apply_validated_loop_exit(
+        &self,
+        request: ApplyValidatedLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.inner.apply_validated_loop_exit(request).await
     }
 }
 
@@ -501,6 +602,147 @@ fn production_services_reject_unverified_scheduler_transition_port() {
         ProductionWiringComponent::TurnState,
         ProductionWiringIssueKind::UnverifiedProductionImplementation
     ));
+}
+
+#[tokio::test]
+async fn production_services_scheduler_and_coordinator_execute_turn_end_to_end() {
+    let store = Arc::new(DurableLikeTurnStore::default());
+    let services = HostRuntimeServices::new(
+        Arc::new(ExtensionRegistry::new()),
+        Arc::new(LocalFilesystem::new()),
+        Arc::new(InMemoryResourceGovernor::new()),
+        Arc::new(GrantAuthorizer::new()),
+        ProcessServices::in_memory(),
+        CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+    )
+    .with_turn_state_and_transition_port(Arc::clone(&store));
+    let executor = Arc::new(CompletingExecutor::default());
+    let executor_port: Arc<dyn TurnRunExecutor> = executor.clone();
+    let scheduler = services
+        .turn_scheduler_for_production(
+            executor_port,
+            fast_config().with_poll_interval(Duration::from_secs(60)),
+        )
+        .expect("production scheduler should build from verified turn store");
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let request = submit_turn_request("thread-production-e2e", "idem-production-e2e");
+    let scope = request.scope.clone();
+    let run_id = accepted_run_id(coordinator.submit_turn(request).await.unwrap());
+
+    executor.wait_for_started(1).await;
+    wait_for_status(store.as_ref(), scope, run_id, TurnStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduler_completes_multiple_submitted_threads_end_to_end() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
+    let executor = Arc::new(CompletingExecutor::default());
+    let scheduler = TurnRunScheduler::new(
+        Arc::clone(&transitions),
+        executor.clone(),
+        fast_config()
+            .with_max_concurrent_runs(2)
+            .with_poll_interval(Duration::from_secs(60)),
+    );
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let first = submit_turn_request("thread-multi-a", "idem-multi-a");
+    let first_scope = first.scope.clone();
+    let first_run = accepted_run_id(coordinator.submit_turn(first).await.unwrap());
+    let second = submit_turn_request("thread-multi-b", "idem-multi-b");
+    let second_scope = second.scope.clone();
+    let second_run = accepted_run_id(coordinator.submit_turn(second).await.unwrap());
+
+    executor.wait_for_started(2).await;
+    wait_for_status(&*store, first_scope, first_run, TurnStatus::Completed).await;
+    wait_for_status(&*store, second_scope, second_run, TurnStatus::Completed).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn fake_wake_without_queued_run_does_not_execute() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
+    let executor = Arc::new(CompletingExecutor::default());
+    let scheduler = TurnRunScheduler::new(
+        Arc::clone(&transitions),
+        executor.clone(),
+        fast_config().with_poll_interval(Duration::from_secs(60)),
+    );
+    let handle = scheduler.start();
+
+    handle
+        .wake_notifier()
+        .notify_queued_run(fake_wake("thread-fake-wake"))
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        executor.started_count(),
+        0,
+        "scheduler must not execute directly from wake payload without a claimed queued run"
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_wake_after_completion_does_not_reexecute_run() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
+    let executor = Arc::new(CompletingExecutor::default());
+    let scheduler = TurnRunScheduler::new(
+        Arc::clone(&transitions),
+        executor.clone(),
+        fast_config().with_poll_interval(Duration::from_secs(60)),
+    );
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let request = submit_turn_request("thread-stale-wake", "idem-stale-wake");
+    let scope = request.scope.clone();
+    let response = coordinator.submit_turn(request).await.unwrap();
+    let run_id = accepted_run_id(response.clone());
+    let stale_wake = wake_from_response(scope.clone(), &response);
+
+    executor.wait_for_started(1).await;
+    wait_for_status(&*store, scope, run_id, TurnStatus::Completed).await;
+    handle
+        .wake_notifier()
+        .notify_queued_run(stale_wake)
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        executor.started_count(),
+        1,
+        "stale wake for completed run must not re-execute work"
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn wake_notifier_reports_delivery_unavailable_after_scheduler_shutdown() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let transitions: Arc<dyn TurnRunTransitionPort> = store.clone();
+    let executor = Arc::new(CompletingExecutor::default());
+    let scheduler = TurnRunScheduler::new(Arc::clone(&transitions), executor, fast_config());
+    let handle = scheduler.start();
+    let notifier = handle.wake_notifier();
+
+    handle.shutdown().await;
+
+    assert_eq!(
+        notifier.notify_queued_run(fake_wake("thread-after-shutdown")),
+        Err(TurnRunWakeNotifyError::DeliveryUnavailable)
+    );
 }
 
 #[tokio::test]
@@ -796,7 +1038,7 @@ async fn scheduler_heartbeats_long_running_executor_until_completion() {
     executor.wait_for_started(1).await;
     transitions.wait_for_heartbeats(2).await;
     gate.notify_waiters();
-    wait_for_status(&store, scope, run_id, TurnStatus::Completed).await;
+    wait_for_status(&*store, scope, run_id, TurnStatus::Completed).await;
     handle.shutdown().await;
 }
 
@@ -836,7 +1078,7 @@ async fn canceled_hanging_executor_lease_expires_to_recovery_required() {
         .await
         .unwrap();
 
-    wait_for_status(&store, scope, run_id, TurnStatus::RecoveryRequired).await;
+    wait_for_status(&*store, scope, run_id, TurnStatus::RecoveryRequired).await;
     handle.shutdown().await;
 }
 
@@ -900,12 +1142,14 @@ fn fast_config() -> TurnRunSchedulerConfig {
         .with_wake_channel_capacity(16)
 }
 
-async fn wait_for_status(
-    store: &InMemoryTurnStateStore,
+async fn wait_for_status<S>(
+    store: &S,
     scope: TurnScope,
     run_id: ironclaw_turns::TurnRunId,
     expected: TurnStatus,
-) {
+) where
+    S: TurnStateStore + ?Sized,
+{
     timeout(Duration::from_secs(2), async {
         loop {
             let state = store
@@ -950,6 +1194,15 @@ fn scope(thread: &str) -> TurnScope {
 fn accepted_run_id(response: SubmitTurnResponse) -> ironclaw_turns::TurnRunId {
     let SubmitTurnResponse::Accepted { run_id, .. } = response;
     run_id
+}
+
+fn fake_wake(thread: &str) -> TurnRunWake {
+    TurnRunWake {
+        scope: scope(thread),
+        run_id: ironclaw_turns::TurnRunId::new(),
+        status: TurnStatus::Queued,
+        event_cursor: ironclaw_turns::EventCursor::default(),
+    }
 }
 
 fn wake_from_response(scope: TurnScope, response: &SubmitTurnResponse) -> TurnRunWake {
