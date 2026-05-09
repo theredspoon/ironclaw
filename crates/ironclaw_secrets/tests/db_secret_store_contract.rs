@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use chrono::{Duration, Utc};
+
 #[cfg(feature = "libsql")]
 use ironclaw_secrets::LibSqlSecretsStore;
 #[cfg(feature = "postgres")]
@@ -39,6 +41,46 @@ async fn libsql_secret_store_persists_encrypted_secret_material_across_reopen() 
         .await
         .unwrap();
     assert_eq!(decrypted.expose(), "sk-live-reborn-secret-sentinel");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_secret_store_tracks_metadata_usage_overwrite_and_empty_state_edges() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("secrets.db");
+    let store = libsql_store(&db_path, test_crypto()).await;
+
+    assert!(!store.any_exist().await.unwrap());
+    assert_secret_store_tracks_metadata_usage_and_overwrite_edges(&store, "reborn-user-metadata")
+        .await;
+    assert!(!store.any_exist().await.unwrap());
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_secret_store_preserves_mismatched_and_expired_one_shot_values() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("secrets.db");
+    let store = libsql_store(&db_path, test_crypto()).await;
+
+    assert_secret_store_preserves_mismatched_and_expired_one_shot_values(
+        &store,
+        "reborn-user-edge",
+        "oauth_state",
+        "expired_state",
+    )
+    .await;
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_secret_store_enforces_access_patterns_without_exposing_missing_names() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("secrets.db");
+    let store = libsql_store(&db_path, test_crypto()).await;
+
+    assert_secret_store_enforces_access_patterns(&store, "reborn-user-access", "OpenAI_Prod_Key")
+        .await;
 }
 
 #[cfg(feature = "libsql")]
@@ -158,6 +200,51 @@ async fn postgres_secret_store_persists_encrypted_secret_material_when_database_
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
+async fn postgres_secret_store_tracks_metadata_usage_and_overwrite_edges() {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let user_id = format!("reborn-user-metadata-{suffix}");
+
+    assert_secret_store_tracks_metadata_usage_and_overwrite_edges(&store, &user_id).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_secret_store_preserves_mismatched_and_expired_one_shot_values() {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let user_id = format!("reborn-user-edge-{suffix}");
+    let mismatch_name = format!("oauth_state_{suffix}");
+    let expired_name = format!("expired_state_{suffix}");
+
+    assert_secret_store_preserves_mismatched_and_expired_one_shot_values(
+        &store,
+        &user_id,
+        &mismatch_name,
+        &expired_name,
+    )
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_secret_store_enforces_access_patterns_without_exposing_missing_names() {
+    let Some(store) = postgres_store().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let user_id = format!("reborn-user-access-{suffix}");
+    let secret_name = format!("OpenAI_Prod_Key_{suffix}");
+
+    assert_secret_store_enforces_access_patterns(&store, &user_id, &secret_name).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
 async fn postgres_secret_store_verify_can_decrypt_existing_secrets_rejects_wrong_key() {
     let Some(store) = postgres_store().await else {
         return;
@@ -262,6 +349,160 @@ async fn postgres_secret_store_consume_if_matches_is_one_shot_and_durable() {
         ironclaw_secrets::SecretConsumeResult::Matched
     );
     assert!(!store.exists(&user_id, &secret_name).await.unwrap());
+}
+
+async fn assert_secret_store_tracks_metadata_usage_and_overwrite_edges<S>(store: &S, user_id: &str)
+where
+    S: SecretsStore + ?Sized,
+{
+    let expires_at = Utc::now() + Duration::hours(1);
+    let created = store
+        .create(
+            user_id,
+            CreateSecretParams::new("Beta_Key", "sk-live-first-value")
+                .with_provider("openai")
+                .with_expiry(expires_at),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.name, "beta_key");
+    assert_eq!(created.provider.as_deref(), Some("openai"));
+    assert_eq!(created.usage_count, 0);
+    assert!(created.last_used_at.is_none());
+
+    let fetched = store.get(user_id, "BETA_KEY").await.unwrap();
+    assert_eq!(fetched.id, created.id);
+    assert_eq!(fetched.name, "beta_key");
+    assert_eq!(fetched.provider.as_deref(), Some("openai"));
+    assert_eq!(fetched.expires_at, Some(expires_at));
+
+    let refs = store.list(user_id).await.unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].name, "beta_key");
+    assert_eq!(refs[0].provider.as_deref(), Some("openai"));
+
+    store.record_usage(fetched.id).await.unwrap();
+    let used = store.get(user_id, "beta_key").await.unwrap();
+    assert_eq!(used.usage_count, 1);
+    assert!(used.last_used_at.is_some());
+
+    let overwritten = store
+        .create(
+            user_id,
+            CreateSecretParams::new("BETA_KEY", "sk-live-second-value").with_provider("anthropic"),
+        )
+        .await
+        .unwrap();
+    assert_ne!(overwritten.id, created.id);
+    assert_eq!(overwritten.name, "beta_key");
+
+    let after_overwrite = store.get(user_id, "beta_key").await.unwrap();
+    assert_eq!(after_overwrite.id, overwritten.id);
+    assert_eq!(after_overwrite.usage_count, 0);
+    assert!(after_overwrite.last_used_at.is_none());
+    assert_eq!(after_overwrite.provider.as_deref(), Some("anthropic"));
+    let decrypted = store.get_decrypted(user_id, "beta_key").await.unwrap();
+    assert_eq!(decrypted.expose(), "sk-live-second-value");
+
+    assert!(store.delete(user_id, "BETA_KEY").await.unwrap());
+    assert!(!store.exists(user_id, "beta_key").await.unwrap());
+    assert!(!store.delete(user_id, "beta_key").await.unwrap());
+    assert!(matches!(
+        store.record_usage(overwritten.id).await,
+        Err(SecretError::NotFound(_))
+    ));
+}
+
+async fn assert_secret_store_preserves_mismatched_and_expired_one_shot_values<S>(
+    store: &S,
+    user_id: &str,
+    mismatch_name: &str,
+    expired_name: &str,
+) where
+    S: SecretsStore + ?Sized,
+{
+    store
+        .create(
+            user_id,
+            CreateSecretParams::new(mismatch_name, "state-secret-sentinel"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .consume_if_matches(user_id, mismatch_name, "wrong-state")
+            .await
+            .unwrap(),
+        ironclaw_secrets::SecretConsumeResult::Mismatched
+    );
+    assert!(store.exists(user_id, mismatch_name).await.unwrap());
+    let still_decrypts = store.get_decrypted(user_id, mismatch_name).await.unwrap();
+    assert_eq!(still_decrypts.expose(), "state-secret-sentinel");
+
+    store
+        .create(
+            user_id,
+            CreateSecretParams::new(expired_name, "expired-state-sentinel")
+                .with_expiry(Utc::now() - Duration::seconds(1)),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.get(user_id, expired_name).await,
+        Err(SecretError::Expired)
+    ));
+    assert!(matches!(
+        store.get_decrypted(user_id, expired_name).await,
+        Err(SecretError::Expired)
+    ));
+    assert!(matches!(
+        store
+            .consume_if_matches(user_id, expired_name, "expired-state-sentinel")
+            .await,
+        Err(SecretError::Expired)
+    ));
+    assert!(
+        store.exists(user_id, expired_name).await.unwrap(),
+        "expired rows stay durable for cleanup/rotation rather than disappearing during reads"
+    );
+}
+
+async fn assert_secret_store_enforces_access_patterns<S>(store: &S, user_id: &str, name: &str)
+where
+    S: SecretsStore + ?Sized,
+{
+    store
+        .create(
+            user_id,
+            CreateSecretParams::new(name, "sk-live-access-sentinel"),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .is_accessible(user_id, name, &[name.to_ascii_uppercase()])
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .is_accessible(user_id, name, &["openai_*".to_string()])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_accessible(user_id, name, &["github_*".to_string()])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .is_accessible(user_id, "missing_secret", &["missing_*".to_string()])
+            .await
+            .unwrap()
+    );
 }
 
 #[cfg(feature = "libsql")]
