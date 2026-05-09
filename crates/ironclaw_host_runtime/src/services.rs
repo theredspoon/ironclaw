@@ -512,6 +512,7 @@ where
             mcp_runtime,
             wasm_runtime,
             turn_state,
+            turn_run_transition_port,
             turn_run_wake_notifier,
             mut component_types,
         } = self;
@@ -552,6 +553,7 @@ where
             mcp_runtime,
             wasm_runtime,
             turn_state,
+            turn_run_transition_port,
             turn_run_wake_notifier,
             component_types,
         }
