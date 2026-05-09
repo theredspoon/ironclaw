@@ -378,9 +378,19 @@ impl VisibleCapabilityRequest {
 }
 
 /// Host-filtered visible capability surface.
+///
+/// Entries are returned in filtered registry order for deterministic rendering.
+/// The version fingerprint canonicalizes unordered inputs (policy allow-lists
+/// and visible capability set) so semantically equivalent projections do not
+/// churn when callers permute allow-list values or registry insertion order
+/// changes. Visibility remains informational only; invocation authority is
+/// re-checked by [`HostRuntime::invoke_capability`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisibleCapabilitySurface {
+    /// Stable token for the semantic visible surface under this request policy.
     pub version: CapabilitySurfaceVersion,
+    /// Typed visible capabilities, including access status and selected
+    /// resource estimate.
     pub capabilities: Vec<VisibleCapability>,
     /// Compatibility projection for existing prompt renderers. Entries are the
     /// descriptors from [`Self::capabilities`] in the same filtered order.

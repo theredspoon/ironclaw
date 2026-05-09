@@ -42,9 +42,24 @@ const ALL_EFFECT_KINDS: &[EffectKind] = &[
 /// authorizer is consulted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilitySurfacePolicy {
+    /// Runtime kinds that may appear on this projection.
+    ///
+    /// Order and duplicates do not affect filtering or surface-version
+    /// fingerprinting.
     pub allowed_runtimes: Vec<RuntimeKind>,
+    /// Effect ceiling for visible descriptors.
+    ///
+    /// This is strict subset semantics: every effect declared by a capability
+    /// must appear in this list or the capability is omitted. Order and
+    /// duplicates do not affect filtering or surface-version fingerprinting.
     pub allowed_effects: Vec<EffectKind>,
+    /// Whether capabilities that require approval may be rendered as askable.
+    ///
+    /// This is informational only. It does not issue approval leases or widen
+    /// direct invocation authority.
     pub include_requires_approval: bool,
+    /// Maximum visible capabilities returned after filtering, in registry
+    /// order. `Some(0)` returns an empty surface without authorizer calls.
     pub max_capabilities: Option<usize>,
 }
 
@@ -77,14 +92,26 @@ impl Default for CapabilitySurfacePolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VisibleCapabilityAccess {
+    /// Caller can invoke directly if the same context remains authorized at
+    /// invocation time.
     Available,
+    /// Capability may be shown as askable, but actual use must still block on
+    /// the approval/lease path.
     RequiresApproval,
 }
 
+/// Capability metadata safe to render on a model/tool surface.
+///
+/// This is a visibility affordance, not authority. Direct invocation still
+/// re-runs host-owned trust, grants, approvals, obligations, and runtime
+/// dispatch checks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisibleCapability {
+    /// Redacted declarative capability descriptor from the extension registry.
     pub descriptor: CapabilityDescriptor,
+    /// Current visibility status for this context and policy.
     pub access: VisibleCapabilityAccess,
+    /// Host-selected estimate used for the visibility authorization check.
     pub estimated_resources: ResourceEstimate,
 }
 
@@ -119,8 +146,12 @@ impl<'a> CapabilityCatalog<'a> {
             HostRuntimeError::invalid_request(format!("invalid execution context: {error}"))
         })?;
 
+        let max_capabilities = request.policy.max_capabilities.unwrap_or(usize::MAX);
         let mut capabilities = Vec::new();
         for descriptor in self.registry.capabilities() {
+            if capabilities.len() >= max_capabilities {
+                break;
+            }
             if !request.policy.allows_runtime(descriptor.runtime)
                 || !request.policy.allows_effects(&descriptor.effects)
             {
@@ -156,10 +187,6 @@ impl<'a> CapabilityCatalog<'a> {
             });
         }
 
-        if let Some(max_capabilities) = request.policy.max_capabilities {
-            capabilities.truncate(max_capabilities);
-        }
-
         let version = surface_version(self.base_version, &request, &capabilities)?;
         let descriptors = capabilities
             .iter()
@@ -178,25 +205,31 @@ fn surface_version(
     request: &VisibleCapabilityRequest,
     capabilities: &[VisibleCapability],
 ) -> Result<CapabilitySurfaceVersion, HostRuntimeError> {
-    let capability_payload = capabilities
+    let mut capability_payload = capabilities
         .iter()
         .map(|capability| {
-            json!({
-                "descriptor": &capability.descriptor,
-                "estimated_resources": &capability.estimated_resources,
-                "access": match capability.access {
-                    VisibleCapabilityAccess::Available => "available",
-                    VisibleCapabilityAccess::RequiresApproval => "requires_approval",
-                },
-            })
+            let descriptor = canonical_descriptor_for_version(&capability.descriptor);
+            (
+                capability_version_key(capability),
+                json!({
+                    "descriptor": descriptor,
+                    "estimated_resources": &capability.estimated_resources,
+                    "access": access_token(capability.access),
+                }),
+            )
         })
+        .collect::<Vec<_>>();
+    capability_payload.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let capability_payload = capability_payload
+        .into_iter()
+        .map(|(_, payload)| payload)
         .collect::<Vec<_>>();
     let payload = json!({
         "base_version": base_version.as_str(),
         "surface_kind": request.surface_kind.as_str(),
         "policy": {
-            "allowed_runtimes": request.policy.allowed_runtimes,
-            "allowed_effects": request.policy.allowed_effects,
+            "allowed_runtimes": canonical_runtime_kinds(&request.policy.allowed_runtimes),
+            "allowed_effects": canonical_effect_kinds(&request.policy.allowed_effects),
             "include_requires_approval": request.policy.include_requires_approval,
             "max_capabilities": request.policy.max_capabilities,
         },
@@ -205,6 +238,81 @@ fn surface_version(
     let canonical = serde_json::to_vec(&payload)
         .map_err(|error| HostRuntimeError::invalid_request(error.to_string()))?;
     CapabilitySurfaceVersion::new(format!("surface-fnv1a-{:016x}", fnv1a64(&canonical)))
+}
+
+fn canonical_descriptor_for_version(descriptor: &CapabilityDescriptor) -> CapabilityDescriptor {
+    let mut descriptor = descriptor.clone();
+    descriptor
+        .effects
+        .sort_by_key(|effect| effect_kind_token(*effect));
+    descriptor.effects.dedup();
+    descriptor
+}
+
+fn capability_version_key(
+    capability: &VisibleCapability,
+) -> (String, String, &'static str, &'static str) {
+    (
+        capability.descriptor.id.as_str().to_string(),
+        capability.descriptor.provider.as_str().to_string(),
+        runtime_kind_token(capability.descriptor.runtime),
+        access_token(capability.access),
+    )
+}
+
+fn canonical_runtime_kinds(runtimes: &[RuntimeKind]) -> Vec<&'static str> {
+    let mut values = runtimes
+        .iter()
+        .map(|runtime| runtime_kind_token(*runtime))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn canonical_effect_kinds(effects: &[EffectKind]) -> Vec<&'static str> {
+    let mut values = effects
+        .iter()
+        .map(|effect| effect_kind_token(*effect))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn runtime_kind_token(runtime: RuntimeKind) -> &'static str {
+    match runtime {
+        RuntimeKind::Wasm => "wasm",
+        RuntimeKind::Mcp => "mcp",
+        RuntimeKind::Script => "script",
+        RuntimeKind::FirstParty => "first_party",
+        RuntimeKind::System => "system",
+    }
+}
+
+fn effect_kind_token(effect: EffectKind) -> &'static str {
+    match effect {
+        EffectKind::ReadFilesystem => "read_filesystem",
+        EffectKind::WriteFilesystem => "write_filesystem",
+        EffectKind::DeleteFilesystem => "delete_filesystem",
+        EffectKind::Network => "network",
+        EffectKind::UseSecret => "use_secret",
+        EffectKind::ExecuteCode => "execute_code",
+        EffectKind::SpawnProcess => "spawn_process",
+        EffectKind::DispatchCapability => "dispatch_capability",
+        EffectKind::ModifyExtension => "modify_extension",
+        EffectKind::ModifyApproval => "modify_approval",
+        EffectKind::ModifyBudget => "modify_budget",
+        EffectKind::ExternalWrite => "external_write",
+        EffectKind::Financial => "financial",
+    }
+}
+
+fn access_token(access: VisibleCapabilityAccess) -> &'static str {
+    match access {
+        VisibleCapabilityAccess::Available => "available",
+        VisibleCapabilityAccess::RequiresApproval => "requires_approval",
+    }
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

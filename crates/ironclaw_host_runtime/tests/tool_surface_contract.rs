@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -378,6 +381,220 @@ async fn visible_surface_version_changes_with_returned_descriptor_metadata() {
 }
 
 #[tokio::test]
+async fn visible_surface_version_is_order_insensitive_for_equivalent_policy() {
+    let context = context_with_grants([(
+        capability_id("echo.say"),
+        vec![EffectKind::DispatchCapability],
+    )]);
+    let runtime = runtime_with(
+        registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(Arc::new(trust_policy_for([(
+        "echo",
+        "/system/extensions/echo/manifest.toml",
+        vec![EffectKind::DispatchCapability],
+    )])));
+
+    let policy_a = CapabilitySurfacePolicy {
+        allowed_runtimes: vec![RuntimeKind::Wasm, RuntimeKind::Script],
+        allowed_effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
+        include_requires_approval: true,
+        max_capabilities: None,
+    };
+    let policy_b = CapabilitySurfacePolicy {
+        allowed_runtimes: vec![RuntimeKind::Script, RuntimeKind::Wasm],
+        allowed_effects: vec![EffectKind::Network, EffectKind::DispatchCapability],
+        include_requires_approval: true,
+        max_capabilities: None,
+    };
+
+    let surface_a = runtime
+        .visible_capabilities(
+            VisibleCapabilityRequest::new(context.clone(), SurfaceKind::new("agent_loop").unwrap())
+                .with_policy(policy_a),
+        )
+        .await
+        .unwrap();
+    let surface_b = runtime
+        .visible_capabilities(
+            VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+                .with_policy(policy_b),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(surface_a.descriptors, surface_b.descriptors);
+    assert_eq!(
+        surface_a.version, surface_b.version,
+        "equivalent allow-list ordering must not churn the surface version"
+    );
+}
+
+#[tokio::test]
+async fn visible_surface_version_is_order_insensitive_for_equivalent_capability_set() {
+    let context = context_with_grants([
+        (
+            capability_id("echo.say"),
+            vec![EffectKind::DispatchCapability],
+        ),
+        (
+            capability_id("files.read"),
+            vec![EffectKind::ReadFilesystem],
+        ),
+    ]);
+    let trust_policy = Arc::new(trust_policy_for([
+        (
+            "echo",
+            "/system/extensions/echo/manifest.toml",
+            vec![EffectKind::DispatchCapability],
+        ),
+        (
+            "files",
+            "/system/extensions/files/manifest.toml",
+            vec![EffectKind::ReadFilesystem],
+        ),
+    ]));
+    let runtime_a = runtime_with(
+        registry_from_manifests([
+            (ECHO_MANIFEST, "/system/extensions/echo"),
+            (FILES_MANIFEST, "/system/extensions/files"),
+        ]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(Arc::clone(&trust_policy));
+    let runtime_b = runtime_with(
+        registry_from_manifests([
+            (FILES_MANIFEST, "/system/extensions/files"),
+            (ECHO_MANIFEST, "/system/extensions/echo"),
+        ]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(trust_policy);
+
+    let surface_a = runtime_a
+        .visible_capabilities(VisibleCapabilityRequest::new(
+            context.clone(),
+            SurfaceKind::new("agent_loop").unwrap(),
+        ))
+        .await
+        .unwrap();
+    let surface_b = runtime_b
+        .visible_capabilities(VisibleCapabilityRequest::new(
+            context,
+            SurfaceKind::new("agent_loop").unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(surface_a.descriptors, surface_b.descriptors);
+    assert_eq!(
+        surface_a.version, surface_b.version,
+        "equivalent capability sets must hash in canonical key order"
+    );
+}
+
+#[tokio::test]
+async fn visible_surface_max_capabilities_stops_authorization_after_limit() {
+    let registry = registry_from_manifests([
+        (ECHO_MANIFEST, "/system/extensions/echo"),
+        (FILES_MANIFEST, "/system/extensions/files"),
+        (NET_MANIFEST, "/system/extensions/net"),
+    ]);
+    let authorizer = Arc::new(CountingGrantAuthorizer::default());
+    let runtime =
+        runtime_with(registry, authorizer.clone()).with_trust_policy(Arc::new(trust_policy_for([
+            (
+                "echo",
+                "/system/extensions/echo/manifest.toml",
+                vec![EffectKind::DispatchCapability],
+            ),
+            (
+                "files",
+                "/system/extensions/files/manifest.toml",
+                vec![EffectKind::ReadFilesystem],
+            ),
+            (
+                "net",
+                "/system/extensions/net/manifest.toml",
+                vec![EffectKind::Network],
+            ),
+        ])));
+    let context = context_with_grants([
+        (
+            capability_id("echo.say"),
+            vec![EffectKind::DispatchCapability],
+        ),
+        (
+            capability_id("files.read"),
+            vec![EffectKind::ReadFilesystem],
+        ),
+        (capability_id("net.fetch"), vec![EffectKind::Network]),
+    ]);
+    let request = VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+        .with_policy(CapabilitySurfacePolicy {
+            max_capabilities: Some(1),
+            ..CapabilitySurfacePolicy::allow_all()
+        });
+
+    let surface = runtime.visible_capabilities(request).await.unwrap();
+
+    assert_eq!(surface.capabilities.len(), 1);
+    assert_eq!(authorizer.call_count(), 1);
+}
+
+#[tokio::test]
+async fn visible_surface_can_hide_approval_required_capabilities_by_policy() {
+    let registry = registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]);
+    let runtime = runtime_with(registry, Arc::new(ApprovalAuthorizer)).with_trust_policy(Arc::new(
+        trust_policy_for([(
+            "echo",
+            "/system/extensions/echo/manifest.toml",
+            vec![EffectKind::DispatchCapability],
+        )]),
+    ));
+    let context = context_with_grants([(
+        capability_id("echo.say"),
+        vec![EffectKind::DispatchCapability],
+    )]);
+    let request = VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+        .with_policy(CapabilitySurfacePolicy {
+            include_requires_approval: false,
+            ..CapabilitySurfacePolicy::allow_all()
+        });
+
+    let surface = runtime.visible_capabilities(request).await.unwrap();
+
+    assert!(surface.capabilities.is_empty());
+    assert!(surface.descriptors.is_empty());
+}
+
+#[tokio::test]
+async fn visible_surface_requires_every_descriptor_effect_to_be_policy_allowed() {
+    let registry = registry_from_manifests([(ECHO_NETWORK_MANIFEST, "/system/extensions/echo")]);
+    let runtime = runtime_with(registry, Arc::new(PanicAuthorizer)).with_trust_policy(Arc::new(
+        trust_policy_for([(
+            "echo",
+            "/system/extensions/echo/manifest.toml",
+            vec![EffectKind::DispatchCapability, EffectKind::Network],
+        )]),
+    ));
+    let context = context_with_grants([(
+        capability_id("echo.say"),
+        vec![EffectKind::DispatchCapability, EffectKind::Network],
+    )]);
+    let request = VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+        .with_policy(CapabilitySurfacePolicy {
+            allowed_effects: vec![EffectKind::DispatchCapability],
+            ..CapabilitySurfacePolicy::allow_all()
+        });
+
+    let surface = runtime.visible_capabilities(request).await.unwrap();
+
+    assert!(surface.capabilities.is_empty());
+}
+
+#[tokio::test]
 async fn visible_surface_rejects_invalid_execution_context() {
     let runtime = runtime_with(
         registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]),
@@ -586,6 +803,33 @@ impl CapabilityDispatcher for RecordingDispatcher {
     }
 }
 
+#[derive(Default)]
+struct CountingGrantAuthorizer {
+    calls: AtomicUsize,
+}
+
+impl CountingGrantAuthorizer {
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TrustAwareCapabilityDispatchAuthorizer for CountingGrantAuthorizer {
+    async fn authorize_dispatch_with_trust(
+        &self,
+        context: &ExecutionContext,
+        descriptor: &CapabilityDescriptor,
+        estimate: &ResourceEstimate,
+        trust_decision: &TrustDecision,
+    ) -> Decision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        GrantAuthorizer::new()
+            .authorize_dispatch_with_trust(context, descriptor, estimate, trust_decision)
+            .await
+    }
+}
+
 struct ApprovalAuthorizer;
 
 #[async_trait]
@@ -649,6 +893,25 @@ module = "echo.wasm"
 id = "echo.say"
 description = "Echoes input"
 effects = ["dispatch_capability"]
+default_permission = "allow"
+parameters_schema = {}
+"#;
+
+const ECHO_NETWORK_MANIFEST: &str = r#"
+id = "echo"
+name = "Echo"
+version = "0.1.0"
+description = "Echo test extension"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "echo.wasm"
+
+[[capabilities]]
+id = "echo.say"
+description = "Echoes input over network"
+effects = ["dispatch_capability", "network"]
 default_permission = "allow"
 parameters_schema = {}
 "#;
