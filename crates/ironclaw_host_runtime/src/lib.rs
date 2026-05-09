@@ -49,6 +49,7 @@ mod obligations;
 mod planner;
 mod production;
 mod services;
+mod surface;
 
 pub use obligations::{
     BuiltinObligationHandler, BuiltinObligationServices, NetworkObligationPolicyStore,
@@ -60,6 +61,7 @@ pub use services::{
     HostRuntimeServices, ProductionWiringComponent, ProductionWiringConfig, ProductionWiringIssue,
     ProductionWiringIssueKind, ProductionWiringReport, RegisteredRuntimeHealth,
 };
+pub use surface::{CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess};
 
 /// Stable, validated idempotency key supplied by upper turn/loop services.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -348,26 +350,30 @@ impl RuntimeCapabilityResumeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct VisibleCapabilityRequest {
-    pub scope: ResourceScope,
-    pub correlation_id: CorrelationId,
+    /// Authority envelope used for the same grant/trust checks as invocation.
+    pub context: ExecutionContext,
     /// Projection surface selection only; this is not authority and must not
     /// grant or bypass authorization. The host treats this as an opaque
     /// cache/version dimension; deciding which surface labels a given caller
     /// may request is an upper-layer concern.
     pub surface_kind: SurfaceKind,
+    /// Upper/profile-supplied visibility ceiling. This only narrows what is
+    /// shown; it never grants authority or bypasses invocation authorization.
+    pub policy: CapabilitySurfacePolicy,
 }
 
 impl VisibleCapabilityRequest {
-    pub fn new(
-        scope: ResourceScope,
-        correlation_id: CorrelationId,
-        surface_kind: SurfaceKind,
-    ) -> Self {
+    pub fn new(context: ExecutionContext, surface_kind: SurfaceKind) -> Self {
         Self {
-            scope,
-            correlation_id,
+            context,
             surface_kind,
+            policy: CapabilitySurfacePolicy::default(),
         }
+    }
+
+    pub fn with_policy(mut self, policy: CapabilitySurfacePolicy) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -375,6 +381,9 @@ impl VisibleCapabilityRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisibleCapabilitySurface {
     pub version: CapabilitySurfaceVersion,
+    pub capabilities: Vec<VisibleCapability>,
+    /// Compatibility projection for existing prompt renderers. Entries are the
+    /// descriptors from [`Self::capabilities`] in the same filtered order.
     pub descriptors: Vec<CapabilityDescriptor>,
 }
 
