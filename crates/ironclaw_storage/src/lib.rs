@@ -276,7 +276,7 @@ pub trait RecordStore: Send + Sync {
 
     async fn get_record(&self, key: &StorageKey) -> Result<Option<StoredRecord>, StorageError>;
 
-    async fn delete_record(&self, key: &StorageKey) -> Result<(), StorageError>;
+    async fn delete_record(&self, key: &StorageKey, condition: PutCondition) -> Result<(), StorageError>;
 }
 
 fn validate_storage_key(value: &str) -> Result<(), StorageError> {
