@@ -4513,6 +4513,7 @@ name = "ironclaw_reborn"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "ironclaw_host_api",
  "ironclaw_llm",
  "ironclaw_loop_support",
@@ -4522,6 +4523,7 @@ dependencies = [
  "libsql",
  "rust_decimal",
  "secrecy",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

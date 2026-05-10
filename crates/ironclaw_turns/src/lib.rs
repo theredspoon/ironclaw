@@ -30,8 +30,9 @@ pub use admission::{
 };
 pub use checkpoint_state::{
     CheckpointStateRecord, CheckpointStateStore, GetCheckpointStateRequest,
-    InMemoryCheckpointStateStore, MAX_CHECKPOINT_STATE_PAYLOAD_BYTES, PutCheckpointStateRequest,
-    RedactedCheckpointPayload,
+    GetLoopCheckpointRequest, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
+    LoopCheckpointRecord, LoopCheckpointStore, MAX_CHECKPOINT_STATE_PAYLOAD_BYTES,
+    PutCheckpointStateRequest, PutLoopCheckpointRequest, RedactedCheckpointPayload,
 };
 pub use coordinator::{
     AllowAllTurnAdmissionPolicy, DefaultTurnCoordinator, NoopTurnRunWakeNotifier,

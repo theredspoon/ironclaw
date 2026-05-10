@@ -5,12 +5,18 @@
 //! free of Reborn loop-support wiring.
 
 pub mod driver_registry;
+pub mod loop_driver_host;
 
 #[cfg(feature = "root-llm-provider")]
 pub mod model_gateway;
 #[cfg(feature = "libsql-secrets")]
 pub mod secrets;
 
+pub use loop_driver_host::{
+    HostManagedLoopCheckpointPort, HostManagedLoopProgressPort, NoExtraLoopInputPort,
+    RebornLoopDriverHost, RebornLoopDriverHostError, RebornLoopDriverHostFactory,
+    RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
+};
 #[cfg(feature = "root-llm-provider")]
 pub use model_gateway::{
     LlmModelProfilePolicy, LlmProviderModelGateway, ThreadBackedLoopModelGateway,
