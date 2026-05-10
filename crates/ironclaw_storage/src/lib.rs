@@ -349,7 +349,7 @@ pub struct StorageMigration {
     pub id: &'static str,
     pub description: &'static str,
     pub backend: StorageBackendKind,
-    pub sql: &'static str,
+    pub sql: Option<&'static str>,
 }
 
 #[cfg(test)]
