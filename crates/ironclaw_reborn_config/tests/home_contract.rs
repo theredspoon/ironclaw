@@ -65,6 +65,38 @@ fn userprofile_is_used_when_home_is_empty_or_invalid() {
 }
 
 #[test]
+fn rejects_reborn_home_equal_to_home_v1_state_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".ironclaw");
+    let err = RebornHome::resolve_from_env_parts(
+        Some(path.clone().into_os_string()),
+        Some(temp.path().into()),
+        None,
+    )
+    .expect_err("Reborn home must not target default v1 state root");
+
+    assert!(
+        matches!(err, RebornConfigError::V1StateRoot { name, path: actual } if name == REBORN_HOME_ENV && actual == path)
+    );
+}
+
+#[test]
+fn rejects_reborn_home_equal_to_userprofile_v1_state_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".ironclaw");
+    let err = RebornHome::resolve_from_env_parts(
+        Some(path.clone().into_os_string()),
+        None,
+        Some(temp.path().into()),
+    )
+    .expect_err("Reborn home must not target USERPROFILE v1 state root");
+
+    assert!(
+        matches!(err, RebornConfigError::V1StateRoot { name, path: actual } if name == REBORN_HOME_ENV && actual == path)
+    );
+}
+
+#[test]
 fn rejects_parent_components_in_reborn_home_override() {
     let path = root_path().join("tmp").join("..");
     let err = RebornHome::resolve_from_env_parts(Some(path.clone().into_os_string()), None, None)

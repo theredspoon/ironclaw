@@ -15,12 +15,9 @@ impl RebornBootConfig {
     }
 
     pub fn resolve_from_env() -> Result<Self, RebornConfigError> {
-        Self::resolve_from_env_parts(
-            env::var_os(crate::REBORN_HOME_ENV),
-            env::var_os("HOME"),
-            env::var_os("USERPROFILE"),
-            env::var_os(REBORN_PROFILE_ENV),
-        )
+        let home = RebornHome::resolve_from_env()?;
+        let profile = RebornProfile::from_env_value(env::var_os(REBORN_PROFILE_ENV))?;
+        Ok(Self { home, profile })
     }
 
     pub fn resolve_from_env_parts(

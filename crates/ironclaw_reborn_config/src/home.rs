@@ -8,6 +8,8 @@ use std::{
 /// Environment variable that selects the standalone Reborn state root.
 pub const REBORN_HOME_ENV: &str = "IRONCLAW_REBORN_HOME";
 
+const V1_BASE_DIR_ENV: &str = "IRONCLAW_BASE_DIR";
+
 /// Source used to resolve [`RebornHome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebornHomeSource {
@@ -33,10 +35,11 @@ pub struct RebornHome {
 
 impl RebornHome {
     pub fn resolve_from_env() -> Result<Self, RebornConfigError> {
-        Self::resolve_from_env_parts(
+        Self::resolve_from_env_parts_with_v1_base(
             env::var_os(REBORN_HOME_ENV),
             env::var_os("HOME"),
             env::var_os("USERPROFILE"),
+            env::var_os(V1_BASE_DIR_ENV),
         )
     }
 
@@ -45,12 +48,27 @@ impl RebornHome {
         home: Option<OsString>,
         userprofile: Option<OsString>,
     ) -> Result<Self, RebornConfigError> {
+        Self::resolve_from_env_parts_with_v1_base(reborn_home, home, userprofile, None)
+    }
+
+    fn resolve_from_env_parts_with_v1_base(
+        reborn_home: Option<OsString>,
+        home: Option<OsString>,
+        userprofile: Option<OsString>,
+        v1_base_dir: Option<OsString>,
+    ) -> Result<Self, RebornConfigError> {
         if let Some(raw_home) = reborn_home {
             validate_non_empty(&raw_home, REBORN_HOME_ENV)?;
             let path = PathBuf::from(raw_home);
             validate_absolute(&path, REBORN_HOME_ENV)?;
             validate_no_parent_components(&path, REBORN_HOME_ENV)?;
             validate_not_root(&path, REBORN_HOME_ENV)?;
+            validate_not_v1_state_root(
+                &path,
+                home.as_ref(),
+                userprofile.as_ref(),
+                v1_base_dir.as_ref(),
+            )?;
             return Ok(Self {
                 path,
                 source: RebornHomeSource::Env,
@@ -139,6 +157,58 @@ fn validate_no_parent_components(path: &Path, name: &'static str) -> Result<(), 
     Ok(())
 }
 
+fn validate_not_v1_state_root(
+    path: &Path,
+    home: Option<&OsString>,
+    userprofile: Option<&OsString>,
+    v1_base_dir: Option<&OsString>,
+) -> Result<(), RebornConfigError> {
+    let home_candidate = home.and_then(default_v1_state_root_from_home);
+    let userprofile_candidate = userprofile.and_then(default_v1_state_root_from_home);
+    let explicit_base_candidate = v1_base_dir.and_then(v1_state_root_from_base_dir);
+
+    for candidate in [
+        home_candidate.as_deref(),
+        userprofile_candidate.as_deref(),
+        explicit_base_candidate.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path == candidate {
+            return Err(RebornConfigError::V1StateRoot {
+                name: REBORN_HOME_ENV,
+                path: path.to_path_buf(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn default_v1_state_root_from_home(raw_home: &OsString) -> Option<PathBuf> {
+    validated_absolute_candidate(raw_home).map(|path| path.join(".ironclaw"))
+}
+
+fn v1_state_root_from_base_dir(raw_base_dir: &OsString) -> Option<PathBuf> {
+    validated_absolute_candidate(raw_base_dir)
+}
+
+fn validated_absolute_candidate(raw_path: &OsString) -> Option<PathBuf> {
+    if raw_path.as_os_str().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw_path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    Some(path)
+}
+
 fn validate_not_root(path: &Path, name: &'static str) -> Result<(), RebornConfigError> {
     if path.parent().is_none() {
         return Err(RebornConfigError::RootPath {
@@ -156,6 +226,7 @@ pub enum RebornConfigError {
     RelativePath { name: &'static str, path: PathBuf },
     ParentPath { name: &'static str, path: PathBuf },
     RootPath { name: &'static str, path: PathBuf },
+    V1StateRoot { name: &'static str, path: PathBuf },
     MissingHome,
     InvalidProfile { name: &'static str, value: String },
 }
@@ -172,6 +243,12 @@ impl fmt::Display for RebornConfigError {
                 )
             }
             Self::RootPath { name, .. } => write!(formatter, "{name} must not be filesystem root"),
+            Self::V1StateRoot { name, .. } => {
+                write!(
+                    formatter,
+                    "{name} must not point at the v1 IronClaw state root"
+                )
+            }
             Self::MissingHome => write!(
                 formatter,
                 "HOME or USERPROFILE must be set when {REBORN_HOME_ENV} is unset"

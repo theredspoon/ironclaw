@@ -111,6 +111,26 @@ fn doctor_reports_explicit_profile() {
 }
 
 #[test]
+fn doctor_rejects_reborn_home_equal_to_explicit_v1_base_dir() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let v1_root = temp.path().join("v1-state");
+
+    let output = Command::new(reborn_bin())
+        .arg("doctor")
+        .env("IRONCLAW_REBORN_HOME", &v1_root)
+        .env("IRONCLAW_BASE_DIR", &v1_root)
+        .output()
+        .expect("ironclaw-reborn doctor should run");
+
+    assert!(!output.status.success(), "doctor should reject v1 root");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("IRONCLAW_REBORN_HOME must not point at the v1 IronClaw state root"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn doctor_rejects_empty_reborn_home_override() {
     let output = Command::new(reborn_bin())
         .arg("doctor")
