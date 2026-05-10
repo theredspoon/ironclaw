@@ -4307,6 +4307,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "deadpool-postgres",
+ "futures-util",
  "ironclaw_approvals",
  "ironclaw_authorization",
  "ironclaw_capabilities",

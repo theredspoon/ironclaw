@@ -19,7 +19,7 @@ Product adapters must continue to use `TurnCoordinator`. Runner transition APIs 
 - `submit_turn` creates a queued `TurnRunId` and active-thread lock, but no model/tool side effects may run before a runner claim succeeds.
 - `claim_next_run` atomically moves one matching `Queued` run to `Running`.
 - A successful claim stores `runner_id`, `lease_token`, `last_heartbeat_at`, `lease_expires_at`, increments `claim_count`, updates the active lock, and emits `RunnerClaimed`.
-- `heartbeat` requires the matching `runner_id` and `lease_token` and rejects leases whose `lease_expires_at` has already passed; on success it refreshes `last_heartbeat_at`, extends `lease_expires_at`, touches the active lock, and emits `RunnerHeartbeat`.
+- `heartbeat` requires the matching `runner_id` and `lease_token`, only refreshes actively `Running` work, and rejects leases whose `lease_expires_at` has already passed. Once cancellation is requested, heartbeats no longer extend the lease; the runner must complete cancellation before the existing lease expires or the reconciler moves the run to recovery. On success, heartbeat refreshes `last_heartbeat_at`, extends `lease_expires_at`, touches the active lock, and emits `RunnerHeartbeat`.
 - Pull-based claims are authoritative. Wake notifications are optimization hints only.
 - After `TurnCoordinator` durably accepts a submitted run or requeues a resumed run, it may emit a redacted queued-run wake hint containing only the canonical scope, `TurnRunId`, queued status, and event cursor. Wake delivery is best-effort, is not a source of truth, must not fail the durable adapter call, and duplicate hints must be harmless.
 
@@ -56,4 +56,4 @@ Agent-loop drivers return `LoopExit` claims. `TurnRunner` validates those claims
 
 ## 6. Deferred work
 
-The current `ironclaw_turns` slices define the core lease/recovery state machine, initial PostgreSQL/libSQL persistence adapters, pure `LoopExit` validation/mapping types, and runner-side `apply_loop_exit` transition application. AgentLoopHost/AgentLoopDriver integration, durable exit-id replay storage, transcript draft validation, side-effect boundary checkpoint cadence inside the loop, production service-graph wiring, and safe explicit retry/fork UX remain follow-up slices.
+The current slices define the core lease/recovery state machine, initial PostgreSQL/libSQL persistence adapters, pure `LoopExit` validation/mapping types, runner-side `apply_loop_exit` transition application, and host-runtime production scheduler wiring. AgentLoopHost/AgentLoopDriver integration, durable exit-id replay storage, transcript draft validation, side-effect boundary checkpoint cadence inside the loop, concrete runner-worker startup, and safe explicit retry/fork UX remain follow-up slices.

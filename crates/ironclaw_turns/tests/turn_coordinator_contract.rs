@@ -2332,6 +2332,67 @@ async fn runner_claims_queued_run_with_lease_and_heartbeat_requires_matching_lea
 }
 
 #[tokio::test]
+async fn cancel_requested_runner_heartbeat_does_not_extend_lease() {
+    let limits = InMemoryTurnStateStoreLimits {
+        runner_lease_ttl: ChronoDuration::milliseconds(40),
+        ..InMemoryTurnStateStoreLimits::default()
+    };
+    let store = Arc::new(InMemoryTurnStateStore::with_limits(limits));
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let request = submit_request("thread-cancel-heartbeat", "idem-submit-cancel-heartbeat");
+    let scope = request.scope.clone();
+    let run_id = accepted_run_id(&coordinator.submit_turn(request).await.unwrap());
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator
+        .cancel_run(CancelRunRequest {
+            scope,
+            actor: TurnActor::new(UserId::new("user1").unwrap()),
+            run_id,
+            reason: SanitizedCancelReason::UserRequested,
+            idempotency_key: IdempotencyKey::new("idem-cancel-heartbeat").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let heartbeat = store
+        .heartbeat(HeartbeatRequest {
+            run_id,
+            runner_id,
+            lease_token,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        heartbeat,
+        TurnError::InvalidTransition {
+            from: TurnStatus::CancelRequested,
+            to: TurnStatus::Running,
+        }
+    );
+
+    std::thread::sleep(Duration::from_millis(60));
+    let recovered = store
+        .recover_expired_leases(RecoverExpiredLeasesRequest {
+            now: Utc::now(),
+            scope_filter: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered.recovered.len(), 1);
+    assert_eq!(recovered.recovered[0].status, TurnStatus::RecoveryRequired);
+}
+
+#[tokio::test]
 async fn expired_runner_lease_rejects_heartbeat_and_terminal_completion_before_recovery_sweep() {
     let limits = InMemoryTurnStateStoreLimits {
         runner_lease_ttl: ChronoDuration::milliseconds(-1),

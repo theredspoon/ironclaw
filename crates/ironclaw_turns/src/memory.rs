@@ -562,6 +562,12 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
         let result = (|| {
             let now = Utc::now();
             ensure_active_lease(&record, request.runner_id, request.lease_token, now)?;
+            if record.status != TurnStatus::Running {
+                return Err(TurnError::InvalidTransition {
+                    from: record.status,
+                    to: TurnStatus::Running,
+                });
+            }
             record.last_heartbeat_at = Some(now);
             record.lease_expires_at = Some(inner.next_lease_expiry(now));
             record.event_cursor = inner.next_cursor();
