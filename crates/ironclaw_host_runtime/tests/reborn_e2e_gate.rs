@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -15,10 +18,10 @@ use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
-    CapabilitySurfaceVersion, HostHttpEgressService, HostRuntime, HostRuntimeServices,
-    NetworkObligationPolicyStore, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
-    RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeSecretInjectionStore,
-    RuntimeStatusRequest, SurfaceKind,
+    CapabilitySurfacePolicy, CapabilitySurfaceVersion, HostHttpEgressService, HostRuntime,
+    HostRuntimeServices, NetworkObligationPolicyStore, RuntimeCapabilityOutcome,
+    RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest, RuntimeFailureKind,
+    RuntimeSecretInjectionStore, RuntimeStatusRequest, SurfaceKind,
 };
 use ironclaw_network::{
     NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse, NetworkUsage,
@@ -64,16 +67,26 @@ async fn reborn_e2e_gate_invokes_script_through_host_runtime_with_status_events_
     let invocation_id = context.invocation_id;
 
     let surface = runtime
-        .visible_capabilities(ironclaw_host_runtime::VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("gateway-smoke").unwrap(),
-        ))
+        .visible_capabilities(
+            ironclaw_host_runtime::VisibleCapabilityRequest::new(
+                context.clone(),
+                SurfaceKind::new("gateway-smoke").unwrap(),
+            )
+            .with_policy(CapabilitySurfacePolicy::allow_all())
+            .with_provider_trust(BTreeMap::from([(
+                ExtensionId::new("script").unwrap(),
+                trust_decision_with_dispatch_authority(),
+            )])),
+        )
         .await
         .unwrap();
     assert_ne!(surface.version.as_str(), "surface-v1");
+    assert!(surface.version.as_str().starts_with("sha256:"));
     assert_eq!(surface.capabilities.len(), 1);
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].id, script_capability_id());
+    assert_eq!(
+        surface.capabilities[0].descriptor.id,
+        script_capability_id()
+    );
 
     let health = runtime.health().await.unwrap();
     assert!(health.ready);

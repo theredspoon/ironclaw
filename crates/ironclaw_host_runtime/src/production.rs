@@ -385,9 +385,7 @@ impl HostRuntime for DefaultHostRuntime {
             self.authorizer.as_ref(),
             &self.surface_version,
         )
-        .visible_capabilities(request, |descriptor| {
-            self.evaluate_invocation_trust(&descriptor.id).ok()
-        })
+        .visible_capabilities(request)
         .await
     }
 

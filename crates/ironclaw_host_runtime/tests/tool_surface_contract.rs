@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -11,11 +14,11 @@ use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     CapabilitySurfacePolicy, CapabilitySurfaceVersion, DefaultHostRuntime, HostRuntime,
     RuntimeCapabilityOutcome, RuntimeCapabilityRequest, SurfaceKind, VisibleCapabilityAccess,
-    VisibleCapabilityRequest,
+    VisibleCapabilityRequest, VisibleCapabilitySurface,
 };
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
-    HostTrustPolicy, TrustDecision, TrustProvenance,
+    HostTrustPolicy, TrustDecision, TrustError, TrustPolicy, TrustPolicyInput, TrustProvenance,
 };
 use serde_json::json;
 
@@ -29,13 +32,66 @@ async fn visible_surface_empty_registry_returns_deterministic_empty_version() {
     let second = runtime.visible_capabilities(request).await.unwrap();
 
     assert!(first.capabilities.is_empty());
-    assert!(first.descriptors.is_empty());
     assert_eq!(first.version, second.version);
     assert_ne!(first.version.as_str(), "surface-v1");
+    assert!(first.version.as_str().starts_with("sha256:"));
 }
 
 #[tokio::test]
-async fn visible_surface_filters_by_grants_trust_policy_and_preserves_registry_order() {
+async fn visible_surface_default_policy_and_missing_provider_trust_fail_closed() {
+    let authorizer = Arc::new(CountingGrantAuthorizer::default());
+    let runtime = runtime_with(
+        registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]),
+        authorizer.clone(),
+    );
+    let context = context_with_grants([(
+        capability_id("echo.say"),
+        vec![EffectKind::DispatchCapability],
+    )]);
+
+    let default_policy_surface = runtime
+        .visible_capabilities(
+            VisibleCapabilityRequest::new(context.clone(), SurfaceKind::new("agent_loop").unwrap())
+                .with_provider_trust(provider_trust_for(default_provider_trust())),
+        )
+        .await
+        .unwrap();
+    assert!(default_policy_surface.capabilities.is_empty());
+    assert_eq!(authorizer.call_count(), 0);
+
+    let missing_trust_surface = runtime
+        .visible_capabilities(
+            VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+                .with_policy(CapabilitySurfacePolicy::allow_all()),
+        )
+        .await
+        .unwrap();
+    assert!(missing_trust_surface.capabilities.is_empty());
+    assert_eq!(authorizer.call_count(), 0);
+}
+
+#[tokio::test]
+async fn visible_surface_uses_caller_provider_trust_not_host_trust_policy() {
+    let runtime = runtime_with(
+        registry_from_manifests([(ECHO_MANIFEST, "/system/extensions/echo")]),
+        Arc::new(GrantAuthorizer),
+    )
+    .with_trust_policy(Arc::new(PanicTrustPolicy));
+    let context = context_with_grants([(
+        capability_id("echo.say"),
+        vec![EffectKind::DispatchCapability],
+    )]);
+
+    let surface = runtime
+        .visible_capabilities(visible_request(context))
+        .await
+        .unwrap();
+
+    assert_eq!(visible_ids(&surface), vec![capability_id("echo.say")]);
+}
+
+#[tokio::test]
+async fn visible_surface_filters_by_grants_provider_trust_and_preserves_registry_order() {
     let registry = registry_from_manifests([
         (ECHO_MANIFEST, "/system/extensions/echo"),
         (FILES_MANIFEST, "/system/extensions/files"),
@@ -72,10 +128,7 @@ async fn visible_surface_filters_by_grants_trust_policy_and_preserves_registry_o
     ]);
 
     let surface = runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context,
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context))
         .await
         .unwrap();
 
@@ -89,7 +142,7 @@ async fn visible_surface_filters_by_grants_trust_policy_and_preserves_registry_o
         vec![capability_id("echo.say"), capability_id("files.read")],
         "filtered surface must preserve registry order, not grant order"
     );
-    assert_eq!(surface.descriptors.len(), 2);
+    assert_eq!(surface.capabilities.len(), 2);
     assert!(
         surface
             .capabilities
@@ -111,22 +164,19 @@ async fn visible_surface_omits_missing_trust_and_insufficient_trust_ceiling() {
         Arc::new(GrantAuthorizer),
     );
     let missing_policy_surface = missing_policy_runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
+        .visible_capabilities(request_with_provider_trust(
             granted_context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
+            Vec::new(),
         ))
         .await
         .unwrap();
     assert!(missing_policy_surface.capabilities.is_empty());
 
-    let insufficient_policy_runtime =
-        runtime_with(registry, Arc::new(GrantAuthorizer)).with_trust_policy(Arc::new(
-            trust_policy_for([("echo", "/system/extensions/echo/manifest.toml", Vec::new())]),
-        ));
+    let insufficient_policy_runtime = runtime_with(registry, Arc::new(GrantAuthorizer));
     let insufficient_surface = insufficient_policy_runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
+        .visible_capabilities(request_with_provider_trust(
             granted_context,
-            SurfaceKind::new("agent_loop").unwrap(),
+            vec![("echo", Vec::new())],
         ))
         .await
         .unwrap();
@@ -159,17 +209,14 @@ async fn visible_surface_policy_filters_runtime_and_effects_before_authorization
                 vec![EffectKind::Network],
             ),
         ])));
-    let mut request = VisibleCapabilityRequest::new(
-        context_with_grants([
-            (
-                capability_id("echo.say"),
-                vec![EffectKind::DispatchCapability],
-            ),
-            (capability_id("scripts.run"), vec![EffectKind::ExecuteCode]),
-            (capability_id("net.fetch"), vec![EffectKind::Network]),
-        ]),
-        SurfaceKind::new("agent_loop").unwrap(),
-    );
+    let mut request = visible_request(context_with_grants([
+        (
+            capability_id("echo.say"),
+            vec![EffectKind::DispatchCapability],
+        ),
+        (capability_id("scripts.run"), vec![EffectKind::ExecuteCode]),
+        (capability_id("net.fetch"), vec![EffectKind::Network]),
+    ]));
     request.policy = CapabilitySurfacePolicy {
         allowed_runtimes: vec![RuntimeKind::Wasm],
         allowed_effects: vec![EffectKind::DispatchCapability],
@@ -202,10 +249,7 @@ async fn visible_surface_marks_askable_capabilities_without_granting_authority()
     )]);
 
     let surface = runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context.clone()))
         .await
         .unwrap();
 
@@ -251,10 +295,7 @@ async fn hidden_capability_direct_invoke_still_fails_closed_through_authorizatio
     let context = context_with_grants([]);
 
     let surface = runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context.clone()))
         .await
         .unwrap();
     assert!(surface.capabilities.is_empty());
@@ -305,23 +346,16 @@ async fn visible_surface_version_changes_with_schema_and_policy_changes() {
     )])));
 
     let surface_a = runtime_a
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context.clone()))
         .await
         .unwrap();
     let surface_b = runtime_b
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context.clone()))
         .await
         .unwrap();
     assert_ne!(surface_a.version, surface_b.version);
 
-    let mut policy_request =
-        VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap());
+    let mut policy_request = visible_request(context);
     policy_request.policy.max_capabilities = Some(0);
     let narrowed = runtime_a
         .visible_capabilities(policy_request)
@@ -356,23 +390,17 @@ async fn visible_surface_version_changes_with_returned_descriptor_metadata() {
     )])));
 
     let surface_a = runtime_a
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context.clone()))
         .await
         .unwrap();
     let surface_b = runtime_b
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context,
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context))
         .await
         .unwrap();
 
     assert_ne!(
-        surface_a.descriptors[0].description,
-        surface_b.descriptors[0].description
+        surface_a.capabilities[0].descriptor.description,
+        surface_b.capabilities[0].descriptor.description
     );
     assert_ne!(
         surface_a.version, surface_b.version,
@@ -410,21 +438,15 @@ async fn visible_surface_version_is_order_insensitive_for_equivalent_policy() {
     };
 
     let surface_a = runtime
-        .visible_capabilities(
-            VisibleCapabilityRequest::new(context.clone(), SurfaceKind::new("agent_loop").unwrap())
-                .with_policy(policy_a),
-        )
+        .visible_capabilities(visible_request(context.clone()).with_policy(policy_a))
         .await
         .unwrap();
     let surface_b = runtime
-        .visible_capabilities(
-            VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
-                .with_policy(policy_b),
-        )
+        .visible_capabilities(visible_request(context).with_policy(policy_b))
         .await
         .unwrap();
 
-    assert_eq!(surface_a.descriptors, surface_b.descriptors);
+    assert_eq!(visible_ids(&surface_a), visible_ids(&surface_b));
     assert_eq!(
         surface_a.version, surface_b.version,
         "equivalent allow-list ordering must not churn the surface version"
@@ -473,21 +495,15 @@ async fn visible_surface_version_is_order_insensitive_for_equivalent_capability_
     .with_trust_policy(trust_policy);
 
     let surface_a = runtime_a
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context.clone(),
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context.clone()))
         .await
         .unwrap();
     let surface_b = runtime_b
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context,
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context))
         .await
         .unwrap();
 
-    assert_ne!(surface_a.descriptors, surface_b.descriptors);
+    assert_ne!(visible_ids(&surface_a), visible_ids(&surface_b));
     assert_eq!(
         surface_a.version, surface_b.version,
         "equivalent capability sets must hash in canonical key order"
@@ -531,11 +547,10 @@ async fn visible_surface_max_capabilities_stops_authorization_after_limit() {
         ),
         (capability_id("net.fetch"), vec![EffectKind::Network]),
     ]);
-    let request = VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
-        .with_policy(CapabilitySurfacePolicy {
-            max_capabilities: Some(1),
-            ..CapabilitySurfacePolicy::allow_all()
-        });
+    let request = visible_request(context).with_policy(CapabilitySurfacePolicy {
+        max_capabilities: Some(1),
+        ..CapabilitySurfacePolicy::allow_all()
+    });
 
     let surface = runtime.visible_capabilities(request).await.unwrap();
 
@@ -557,16 +572,14 @@ async fn visible_surface_can_hide_approval_required_capabilities_by_policy() {
         capability_id("echo.say"),
         vec![EffectKind::DispatchCapability],
     )]);
-    let request = VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
-        .with_policy(CapabilitySurfacePolicy {
-            include_requires_approval: false,
-            ..CapabilitySurfacePolicy::allow_all()
-        });
+    let request = visible_request(context).with_policy(CapabilitySurfacePolicy {
+        include_requires_approval: false,
+        ..CapabilitySurfacePolicy::allow_all()
+    });
 
     let surface = runtime.visible_capabilities(request).await.unwrap();
 
     assert!(surface.capabilities.is_empty());
-    assert!(surface.descriptors.is_empty());
 }
 
 #[tokio::test]
@@ -583,11 +596,10 @@ async fn visible_surface_requires_every_descriptor_effect_to_be_policy_allowed()
         capability_id("echo.say"),
         vec![EffectKind::DispatchCapability, EffectKind::Network],
     )]);
-    let request = VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
-        .with_policy(CapabilitySurfacePolicy {
-            allowed_effects: vec![EffectKind::DispatchCapability],
-            ..CapabilitySurfacePolicy::allow_all()
-        });
+    let request = visible_request(context).with_policy(CapabilitySurfacePolicy {
+        allowed_effects: vec![EffectKind::DispatchCapability],
+        ..CapabilitySurfacePolicy::allow_all()
+    });
 
     let surface = runtime.visible_capabilities(request).await.unwrap();
 
@@ -607,10 +619,7 @@ async fn visible_surface_rejects_invalid_execution_context() {
     context.resource_scope.invocation_id = InvocationId::new();
 
     let error = runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context,
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context))
         .await
         .unwrap_err();
 
@@ -633,10 +642,7 @@ async fn visible_surface_debug_does_not_expose_authority_internals() {
     let context = context_with_secret_grant();
 
     let surface = runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context,
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_request(context))
         .await
         .unwrap();
     let debug = format!("{surface:?}");
@@ -646,6 +652,63 @@ async fn visible_surface_debug_does_not_expose_authority_internals() {
     assert!(!debug.contains("/private/sentinel"));
     assert!(!debug.contains("approval_store"));
     assert!(!debug.contains("lease"));
+}
+
+fn visible_request(context: ExecutionContext) -> VisibleCapabilityRequest {
+    request_with_provider_trust(context, default_provider_trust())
+}
+
+fn request_with_provider_trust(
+    context: ExecutionContext,
+    provider_trust: impl IntoIterator<Item = (&'static str, Vec<EffectKind>)>,
+) -> VisibleCapabilityRequest {
+    VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+        .with_policy(CapabilitySurfacePolicy::allow_all())
+        .with_provider_trust(provider_trust_for(provider_trust))
+}
+
+fn default_provider_trust() -> Vec<(&'static str, Vec<EffectKind>)> {
+    vec![
+        ("echo", vec![EffectKind::DispatchCapability]),
+        ("files", vec![EffectKind::ReadFilesystem]),
+        ("net", vec![EffectKind::Network]),
+        ("scripts", vec![EffectKind::ExecuteCode]),
+        ("secret-tool", vec![EffectKind::UseSecret]),
+    ]
+}
+
+fn provider_trust_for(
+    entries: impl IntoIterator<Item = (&'static str, Vec<EffectKind>)>,
+) -> BTreeMap<ExtensionId, TrustDecision> {
+    entries
+        .into_iter()
+        .map(|(provider, effects)| {
+            (
+                ExtensionId::new(provider).unwrap(),
+                trust_decision_for(effects),
+            )
+        })
+        .collect()
+}
+
+fn trust_decision_for(allowed_effects: Vec<EffectKind>) -> TrustDecision {
+    TrustDecision {
+        effective_trust: EffectiveTrustClass::user_trusted(),
+        authority_ceiling: AuthorityCeiling {
+            allowed_effects,
+            max_resource_ceiling: None,
+        },
+        provenance: TrustProvenance::Default,
+        evaluated_at: Utc::now(),
+    }
+}
+
+fn visible_ids(surface: &VisibleCapabilitySurface) -> Vec<CapabilityId> {
+    surface
+        .capabilities
+        .iter()
+        .map(|capability| capability.descriptor.id.clone())
+        .collect()
 }
 
 fn runtime_with(
@@ -751,14 +814,14 @@ fn capability_id(value: &str) -> CapabilityId {
 }
 
 fn trust_decision_with_dispatch_authority() -> TrustDecision {
-    TrustDecision {
-        effective_trust: EffectiveTrustClass::user_trusted(),
-        authority_ceiling: AuthorityCeiling {
-            allowed_effects: vec![EffectKind::DispatchCapability],
-            max_resource_ceiling: None,
-        },
-        provenance: TrustProvenance::Default,
-        evaluated_at: Utc::now(),
+    trust_decision_for(vec![EffectKind::DispatchCapability])
+}
+
+struct PanicTrustPolicy;
+
+impl TrustPolicy for PanicTrustPolicy {
+    fn evaluate(&self, _input: &TrustPolicyInput) -> Result<TrustDecision, TrustError> {
+        panic!("visible surface must use caller-supplied provider_trust, not host trust policy")
     }
 }
 
