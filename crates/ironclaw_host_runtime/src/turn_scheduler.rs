@@ -5,7 +5,7 @@ use chrono::Utc;
 use futures_util::FutureExt;
 use ironclaw_turns::{
     SanitizedFailure, TurnError, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
-    TurnScope,
+    TurnRunnerId, TurnScope,
     runner::{
         ClaimRunRequest, ClaimedTurnRun, HeartbeatRequest, RecordRecoveryRequiredRequest,
         RecoverExpiredLeasesRequest, TurnRunTransitionPort,
@@ -107,18 +107,22 @@ impl TurnRunSchedulerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnRunExecutorError {
-    failure_category: String,
+    failure: SanitizedFailure,
 }
 
 impl TurnRunExecutorError {
     pub fn new(failure_category: impl Into<String>) -> Result<Self, String> {
-        let failure_category = failure_category.into();
-        SanitizedFailure::new(failure_category.clone())?;
-        Ok(Self { failure_category })
+        Ok(Self {
+            failure: SanitizedFailure::new(failure_category)?,
+        })
+    }
+
+    pub fn failure(&self) -> &SanitizedFailure {
+        &self.failure
     }
 
     pub fn failure_category(&self) -> &str {
-        &self.failure_category
+        self.failure.category()
     }
 }
 
@@ -127,7 +131,7 @@ impl fmt::Display for TurnRunExecutorError {
         write!(
             formatter,
             "turn run executor failed: {}",
-            self.failure_category
+            self.failure.category()
         )
     }
 }
@@ -147,6 +151,7 @@ pub struct TurnRunScheduler {
     transitions: Arc<dyn TurnRunTransitionPort>,
     executor: Arc<dyn TurnRunExecutor>,
     config: TurnRunSchedulerConfig,
+    runner_id: TurnRunnerId,
 }
 
 impl TurnRunScheduler {
@@ -159,6 +164,7 @@ impl TurnRunScheduler {
             transitions,
             executor,
             config,
+            runner_id: TurnRunnerId::new(),
         }
     }
 
@@ -173,6 +179,7 @@ impl TurnRunScheduler {
             self.transitions,
             self.executor,
             self.config,
+            self.runner_id,
         ));
         TurnRunSchedulerHandle {
             notifier,
@@ -232,6 +239,7 @@ async fn run_scheduler_loop(
     transitions: Arc<dyn TurnRunTransitionPort>,
     executor: Arc<dyn TurnRunExecutor>,
     config: TurnRunSchedulerConfig,
+    runner_id: TurnRunnerId,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_runs()));
     let mut executor_tasks = JoinSet::new();
@@ -246,6 +254,8 @@ async fn run_scheduler_loop(
             Some(command) = command_rx.recv() => {
                 match command {
                     SchedulerCommand::Wake(wake) => {
+                        // Prefer the woken scope for locality; if that scope has no
+                        // claimable work, fall back to the global queue below.
                         if !claim_retry_pending {
                             if drain_queued_runs(
                                 Arc::clone(&transitions),
@@ -253,6 +263,7 @@ async fn run_scheduler_loop(
                                 Arc::clone(&semaphore),
                                 command_tx.clone(),
                                 &config,
+                                runner_id,
                                 Some(wake.scope),
                                 &mut executor_tasks,
                             ).await {
@@ -267,6 +278,7 @@ async fn run_scheduler_loop(
                                 Arc::clone(&semaphore),
                                 command_tx.clone(),
                                 &config,
+                                runner_id,
                                 None,
                                 &mut executor_tasks,
                             ).await
@@ -283,6 +295,7 @@ async fn run_scheduler_loop(
                                 Arc::clone(&semaphore),
                                 command_tx.clone(),
                                 &config,
+                                runner_id,
                                 None,
                                 &mut executor_tasks,
                             ).await
@@ -299,6 +312,7 @@ async fn run_scheduler_loop(
                             Arc::clone(&semaphore),
                             command_tx.clone(),
                             &config,
+                            runner_id,
                             None,
                             &mut executor_tasks,
                         ).await {
@@ -320,6 +334,7 @@ async fn run_scheduler_loop(
                         Arc::clone(&semaphore),
                         command_tx.clone(),
                         &config,
+                        runner_id,
                         None,
                         &mut executor_tasks,
                     ).await
@@ -346,6 +361,7 @@ async fn drain_queued_runs(
     semaphore: Arc<Semaphore>,
     command_tx: mpsc::Sender<SchedulerCommand>,
     config: &TurnRunSchedulerConfig,
+    runner_id: TurnRunnerId,
     scope_filter: Option<TurnScope>,
     executor_tasks: &mut JoinSet<()>,
 ) -> bool {
@@ -355,7 +371,7 @@ async fn drain_queued_runs(
         };
         let claim = transitions
             .claim_next_run(ClaimRunRequest {
-                runner_id: ironclaw_turns::TurnRunnerId::new(),
+                runner_id,
                 lease_token: ironclaw_turns::TurnLeaseToken::new(),
                 scope_filter: scope_filter.clone(),
             })
@@ -383,7 +399,7 @@ async fn drain_queued_runs(
 
 enum ExecutorTaskOutcome {
     Completed,
-    RecoveryRequired(String),
+    RecoveryRequired(SanitizedFailure),
 }
 
 fn spawn_executor_task(
@@ -411,11 +427,11 @@ fn spawn_executor_task(
                     break match result {
                         Ok(Ok(())) => ExecutorTaskOutcome::Completed,
                         Ok(Err(error)) => ExecutorTaskOutcome::RecoveryRequired(
-                            error.failure_category().to_string(),
+                            error.failure().clone(),
                         ),
-                        Err(_) => ExecutorTaskOutcome::RecoveryRequired(
-                            "scheduler_executor_panic".to_string(),
-                        ),
+                        Err(_) => ExecutorTaskOutcome::RecoveryRequired(scheduler_failure(
+                            "scheduler_executor_panic",
+                        )),
                     };
                 }
                 _ = heartbeat_tick.tick() => {
@@ -425,9 +441,9 @@ fn spawn_executor_task(
                         recovery_runner_id,
                         recovery_lease_token,
                     ).await {
-                        break ExecutorTaskOutcome::RecoveryRequired(
-                            "scheduler_heartbeat_failed".to_string(),
-                        );
+                        break ExecutorTaskOutcome::RecoveryRequired(scheduler_failure(
+                            "scheduler_heartbeat_failed",
+                        ));
                     }
                 }
             }
@@ -441,7 +457,7 @@ fn spawn_executor_task(
                     recovery_run_id,
                     recovery_runner_id,
                     recovery_lease_token,
-                    &category,
+                    category,
                 )
                 .await;
             }
@@ -477,15 +493,8 @@ async fn record_recovery_required(
     run_id: ironclaw_turns::TurnRunId,
     runner_id: ironclaw_turns::TurnRunnerId,
     lease_token: ironclaw_turns::TurnLeaseToken,
-    category: &str,
+    failure: SanitizedFailure,
 ) {
-    let Some(failure) = sanitized_failure(category) else {
-        debug!(
-            category,
-            "turn run scheduler could not sanitize recovery category"
-        );
-        return;
-    };
     let result = transitions
         .record_recovery_required(RecordRecoveryRequiredRequest {
             run_id,
@@ -499,16 +508,16 @@ async fn record_recovery_required(
     }
 }
 
-fn sanitized_failure(category: &str) -> Option<SanitizedFailure> {
-    SanitizedFailure::new(category.to_string())
-        .or_else(|_| SanitizedFailure::new("scheduler_executor_error"))
-        .ok()
+fn scheduler_failure(category: &'static str) -> SanitizedFailure {
+    SanitizedFailure::new(category).expect("scheduler failure category must be sanitized")
 }
 
 async fn recover_expired_leases(transitions: Arc<dyn TurnRunTransitionPort>) {
     let result: Result<_, TurnError> = transitions
         .recover_expired_leases(RecoverExpiredLeasesRequest {
             now: Utc::now(),
+            // Scheduler currently owns one global worker pool; if composition
+            // introduces per-tenant schedulers, thread that scope filter here.
             scope_filter: None,
         })
         .await;
@@ -518,6 +527,7 @@ async fn recover_expired_leases(transitions: Arc<dyn TurnRunTransitionPort>) {
 }
 
 fn schedule_drain_after(command_tx: mpsc::Sender<SchedulerCommand>, delay: Duration) {
+    // Best-effort timer: if shutdown closes the command channel first, send fails harmlessly.
     tokio::spawn(async move {
         sleep(delay).await;
         let _ = command_tx.send(SchedulerCommand::RetryDrain).await;

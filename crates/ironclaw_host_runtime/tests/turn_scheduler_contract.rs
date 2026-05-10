@@ -25,7 +25,8 @@ use ironclaw_turns::{
     NoopTurnRunWakeNotifier, ReplyTargetBindingRef, ResumeTurnRequest, ResumeTurnResponse,
     RunProfileRequest, SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest,
     SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunState, TurnRunWake,
-    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnScope, TurnStateStore, TurnStatus,
+    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnStateStore,
+    TurnStatus,
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
@@ -477,6 +478,11 @@ struct HeartbeatTrackingTransitions {
     notify_heartbeat: Notify,
 }
 
+struct ClaimRecordingTransitions {
+    store: Arc<InMemoryTurnStateStore>,
+    claim_runner_ids: Mutex<Vec<TurnRunnerId>>,
+}
+
 impl HeartbeatTrackingTransitions {
     fn new(store: Arc<InMemoryTurnStateStore>) -> Self {
         Self {
@@ -494,6 +500,19 @@ impl HeartbeatTrackingTransitions {
         })
         .await
         .expect("scheduler did not heartbeat claimed run");
+    }
+}
+
+impl ClaimRecordingTransitions {
+    fn new(store: Arc<InMemoryTurnStateStore>) -> Self {
+        Self {
+            store,
+            claim_runner_ids: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn claim_runner_ids(&self) -> Vec<TurnRunnerId> {
+        self.claim_runner_ids.lock().unwrap().clone()
     }
 }
 
@@ -559,6 +578,75 @@ impl TurnRunTransitionPort for HeartbeatTrackingTransitions {
     }
 }
 
+#[async_trait]
+impl TurnRunTransitionPort for ClaimRecordingTransitions {
+    async fn claim_next_run(
+        &self,
+        request: ClaimRunRequest,
+    ) -> Result<Option<ClaimedTurnRun>, TurnError> {
+        self.claim_runner_ids
+            .lock()
+            .unwrap()
+            .push(request.runner_id);
+        self.store.claim_next_run(request).await
+    }
+
+    async fn heartbeat(
+        &self,
+        request: HeartbeatRequest,
+    ) -> Result<ironclaw_turns::EventCursor, TurnError> {
+        self.store.heartbeat(request).await
+    }
+
+    async fn recover_expired_leases(
+        &self,
+        request: RecoverExpiredLeasesRequest,
+    ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
+        self.store.recover_expired_leases(request).await
+    }
+
+    async fn block_run(&self, request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
+        self.store.block_run(request).await
+    }
+
+    async fn complete_run(&self, request: CompleteRunRequest) -> Result<TurnRunState, TurnError> {
+        self.store.complete_run(request).await
+    }
+
+    async fn cancel_run(
+        &self,
+        request: CancelRunCompletionRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.store.cancel_run(request).await
+    }
+
+    async fn fail_run(&self, request: FailRunRequest) -> Result<TurnRunState, TurnError> {
+        self.store.fail_run(request).await
+    }
+
+    async fn record_recovery_required(
+        &self,
+        request: RecordRecoveryRequiredRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.store.record_recovery_required(request).await
+    }
+
+    async fn apply_validated_loop_exit(
+        &self,
+        request: ApplyValidatedLoopExitRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        self.store.apply_validated_loop_exit(request).await
+    }
+}
+
+#[test]
+fn executor_error_exposes_typed_sanitized_failure() {
+    let error = TurnRunExecutorError::new("scheduler_test_error").unwrap();
+
+    assert_eq!(error.failure().category(), "scheduler_test_error");
+    assert_eq!(error.failure_category(), "scheduler_test_error");
+}
+
 #[test]
 fn production_services_build_scheduler_from_configured_transition_port_without_notifier() {
     let store = Arc::new(DurableTurnStoreStub);
@@ -602,6 +690,43 @@ fn production_services_reject_unverified_scheduler_transition_port() {
         ProductionWiringComponent::TurnState,
         ProductionWiringIssueKind::UnverifiedProductionImplementation
     ));
+}
+
+#[tokio::test]
+async fn scheduler_uses_stable_runner_id_across_claims() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let transitions = Arc::new(ClaimRecordingTransitions::new(Arc::clone(&store)));
+    let transition_port: Arc<dyn TurnRunTransitionPort> = transitions.clone();
+    let executor = Arc::new(CompletingExecutor::default());
+    let scheduler = TurnRunScheduler::new(
+        transition_port,
+        executor.clone(),
+        fast_config()
+            .with_max_concurrent_runs(2)
+            .with_poll_interval(Duration::from_secs(60)),
+    );
+    let handle = scheduler.start();
+    let coordinator =
+        DefaultTurnCoordinator::new(store.clone()).with_wake_notifier(handle.wake_notifier());
+
+    let first = submit_turn_request("thread-runner-id-a", "idem-runner-id-a");
+    let second = submit_turn_request("thread-runner-id-b", "idem-runner-id-b");
+    coordinator.submit_turn(first).await.unwrap();
+    coordinator.submit_turn(second).await.unwrap();
+
+    executor.wait_for_started(2).await;
+    let runner_ids = transitions.claim_runner_ids();
+    assert!(
+        runner_ids.len() >= 2,
+        "scheduler should record at least two claim attempts"
+    );
+    assert!(
+        runner_ids
+            .iter()
+            .all(|runner_id| *runner_id == runner_ids[0]),
+        "one scheduler instance should use one stable TurnRunnerId across claims"
+    );
+    handle.shutdown().await;
 }
 
 #[tokio::test]
