@@ -22,6 +22,15 @@ pub struct CheckpointPolicy {
     pub require_before_side_effect: bool,
     pub require_before_block: bool,
     pub max_checkpoint_bytes: u64,
+    /// Terminal exits (`Completed`, `Cancelled`, `Failed`) must name a durable
+    /// final checkpoint. Production profiles set this; local/test profiles may
+    /// relax it explicitly.
+    #[serde(default)]
+    pub require_final_checkpoint: bool,
+    /// `LoopCompletionKind::NoReply` is trusted only for profiles that
+    /// explicitly permit no-reply completion.
+    #[serde(default)]
+    pub allow_no_reply_completion: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

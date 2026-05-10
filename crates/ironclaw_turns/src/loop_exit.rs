@@ -52,27 +52,8 @@ impl LoopExit {
                 LoopExitViolationKind::UnverifiedBlockedEvidence,
                 policy.invalid_handling,
             ),
-            Self::Cancelled(_exit) if policy.host_cancellation_observed => {
-                LoopExitValidationDecision::trusted(exit_id, TurnRunnerOutcome::Cancelled)
-            }
-            Self::Cancelled(_exit) => invalid_exit_decision(
-                exit_id,
-                LoopExitViolationKind::CancellationNotObserved,
-                policy.invalid_handling,
-            ),
-            Self::Failed(exit) if policy.failure_evidence_verified => {
-                LoopExitValidationDecision::trusted(
-                    exit_id,
-                    TurnRunnerOutcome::Failed {
-                        failure: exit.reason_kind.to_sanitized_failure(),
-                    },
-                )
-            }
-            Self::Failed(_exit) => invalid_exit_decision(
-                exit_id,
-                LoopExitViolationKind::UnverifiedFailureEvidence,
-                policy.invalid_handling,
-            ),
+            Self::Cancelled(exit) => validate_cancelled_exit(exit_id, exit, policy),
+            Self::Failed(exit) => validate_failed_exit(exit_id, exit, policy),
         }
     }
 
@@ -139,6 +120,8 @@ pub enum LoopBlockedKind {
     Approval,
     Auth,
     Resource,
+    /// Spawned process suspension — maps to `BlockedReason::Process`.
+    Process,
 }
 
 impl LoopBlockedKind {
@@ -148,6 +131,7 @@ impl LoopBlockedKind {
             Self::Approval => BlockedReason::Approval { gate_ref },
             Self::Auth => BlockedReason::Auth { gate_ref },
             Self::Resource => BlockedReason::Resource { gate_ref },
+            Self::Process => BlockedReason::Process { gate_ref },
         })
     }
 }
@@ -220,6 +204,8 @@ pub enum LoopExitInvalidHandling {
 #[serde(deny_unknown_fields)]
 pub struct LoopExitValidationPolicy {
     pub require_final_checkpoint: bool,
+    pub allow_no_reply_completion: bool,
+    pub final_checkpoint_verified: bool,
     pub host_cancellation_observed: bool,
     pub invalid_handling: LoopExitInvalidHandling,
     pub completion_refs_verified: bool,
@@ -231,6 +217,8 @@ impl Default for LoopExitValidationPolicy {
     fn default() -> Self {
         Self {
             require_final_checkpoint: false,
+            allow_no_reply_completion: false,
+            final_checkpoint_verified: false,
             host_cancellation_observed: false,
             invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
             completion_refs_verified: false,
@@ -296,6 +284,7 @@ pub enum LoopExitViolationKind {
     UnverifiedBlockedEvidence,
     UnverifiedFailureEvidence,
     CancellationNotObserved,
+    NoReplyNotAllowed,
 }
 
 impl LoopExitViolationKind {
@@ -307,6 +296,7 @@ impl LoopExitViolationKind {
             Self::UnverifiedBlockedEvidence => "unverified_blocked_evidence",
             Self::UnverifiedFailureEvidence => "unverified_failure_evidence",
             Self::CancellationNotObserved => "cancellation_not_observed",
+            Self::NoReplyNotAllowed => "no_reply_not_allowed",
         }
     }
 
@@ -317,7 +307,8 @@ impl LoopExitViolationKind {
             | Self::UnverifiedCompletionReference
             | Self::MissingFinalCheckpoint
             | Self::UnverifiedBlockedEvidence
-            | Self::UnverifiedFailureEvidence => "driver_protocol_violation",
+            | Self::UnverifiedFailureEvidence
+            | Self::NoReplyNotAllowed => "driver_protocol_violation",
         }
     }
 }
@@ -352,7 +343,15 @@ fn validate_completed_exit(
     exit: LoopCompleted,
     policy: LoopExitValidationPolicy,
 ) -> LoopExitValidationDecision {
-    if !exit.has_durable_completion_ref() {
+    if exit.completion_kind == LoopCompletionKind::NoReply {
+        if !policy.allow_no_reply_completion {
+            return invalid_exit_decision(
+                exit_id,
+                LoopExitViolationKind::NoReplyNotAllowed,
+                policy.invalid_handling,
+            );
+        }
+    } else if !exit.has_durable_completion_ref() {
         return invalid_exit_decision(
             exit_id,
             LoopExitViolationKind::MissingCompletionReference,
@@ -360,7 +359,7 @@ fn validate_completed_exit(
         );
     }
 
-    if !policy.completion_refs_verified {
+    if exit.has_durable_completion_ref() && !policy.completion_refs_verified {
         return invalid_exit_decision(
             exit_id,
             LoopExitViolationKind::UnverifiedCompletionReference,
@@ -368,7 +367,9 @@ fn validate_completed_exit(
         );
     }
 
-    if policy.require_final_checkpoint && exit.final_checkpoint_id.is_none() {
+    if policy.require_final_checkpoint
+        && (exit.final_checkpoint_id.is_none() || !policy.final_checkpoint_verified)
+    {
         return invalid_exit_decision(
             exit_id,
             LoopExitViolationKind::MissingFinalCheckpoint,
@@ -377,6 +378,59 @@ fn validate_completed_exit(
     }
 
     LoopExitValidationDecision::trusted(exit_id, TurnRunnerOutcome::Completed)
+}
+
+fn validate_cancelled_exit(
+    exit_id: LoopExitId,
+    exit: LoopCancelled,
+    policy: LoopExitValidationPolicy,
+) -> LoopExitValidationDecision {
+    if !policy.host_cancellation_observed {
+        return invalid_exit_decision(
+            exit_id,
+            LoopExitViolationKind::CancellationNotObserved,
+            policy.invalid_handling,
+        );
+    }
+    if policy.require_final_checkpoint
+        && (exit.checkpoint_id.is_none() || !policy.final_checkpoint_verified)
+    {
+        return invalid_exit_decision(
+            exit_id,
+            LoopExitViolationKind::MissingFinalCheckpoint,
+            policy.invalid_handling,
+        );
+    }
+    LoopExitValidationDecision::trusted(exit_id, TurnRunnerOutcome::Cancelled)
+}
+
+fn validate_failed_exit(
+    exit_id: LoopExitId,
+    exit: LoopFailed,
+    policy: LoopExitValidationPolicy,
+) -> LoopExitValidationDecision {
+    if !policy.failure_evidence_verified {
+        return invalid_exit_decision(
+            exit_id,
+            LoopExitViolationKind::UnverifiedFailureEvidence,
+            policy.invalid_handling,
+        );
+    }
+    if policy.require_final_checkpoint
+        && (exit.checkpoint_id.is_none() || !policy.final_checkpoint_verified)
+    {
+        return invalid_exit_decision(
+            exit_id,
+            LoopExitViolationKind::MissingFinalCheckpoint,
+            policy.invalid_handling,
+        );
+    }
+    LoopExitValidationDecision::trusted(
+        exit_id,
+        TurnRunnerOutcome::Failed {
+            failure: exit.reason_kind.to_sanitized_failure(),
+        },
+    )
 }
 
 fn invalid_exit_decision(

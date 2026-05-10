@@ -20,7 +20,10 @@ use ironclaw_turns::{
     },
 };
 
-use crate::driver_registry::{DriverKind, DriverRegistry, DriverRequirements};
+use crate::{
+    driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
+    loop_exit_applier::{InMemoryLoopExitEvidencePort, LoopExitApplier},
+};
 
 use super::*;
 
@@ -80,6 +83,8 @@ fn test_resolved_profile_with_driver(
             require_before_side_effect: false,
             require_before_block: true,
             max_checkpoint_bytes: 64 * 1024,
+            require_final_checkpoint: false,
+            allow_no_reply_completion: false,
         },
         resource_budget_policy: ResourceBudgetPolicy {
             tier: ResourceBudgetTier::new("test_tier").expect("valid"),
@@ -567,6 +572,13 @@ fn setup_registry(driver: Arc<dyn AgentLoopDriver>) -> DriverRegistry {
     registry
 }
 
+fn make_applier(port: Arc<MockTransitionPort>) -> Arc<LoopExitApplier> {
+    Arc::new(LoopExitApplier::new(
+        port,
+        Arc::new(InMemoryLoopExitEvidencePort::all_verified()),
+    ))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -725,6 +737,7 @@ async fn worker_claims_and_completes_run() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -864,6 +877,7 @@ async fn worker_records_recovery_on_driver_error() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -905,6 +919,7 @@ async fn worker_records_recovery_on_driver_panic() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -945,7 +960,14 @@ async fn worker_records_recovery_on_host_factory_error() {
         reason: "test host creation failure".to_string(),
     });
 
-    let worker = TurnRunnerWorker::new(config, port.clone(), registry, host_factory, wake_receiver);
+    let worker = TurnRunnerWorker::new(
+        config,
+        port.clone(),
+        make_applier(port.clone()),
+        registry,
+        host_factory,
+        wake_receiver,
+    );
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -985,6 +1007,7 @@ async fn worker_records_recovery_when_driver_not_found() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1023,6 +1046,7 @@ async fn worker_continues_when_no_runs_available() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1122,6 +1146,7 @@ async fn wake_signal_triggers_claim_attempt() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1160,6 +1185,7 @@ async fn heartbeat_runs_during_driver_execution() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1194,7 +1220,8 @@ async fn worker_generates_stable_runner_id() {
 
     let worker = TurnRunnerWorker::new(
         TurnRunnerWorkerConfig::default(),
-        port,
+        port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,

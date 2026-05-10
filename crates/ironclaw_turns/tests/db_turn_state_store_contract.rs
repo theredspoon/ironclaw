@@ -524,6 +524,8 @@ async fn libsql_turn_state_store_persists_apply_loop_exit_recovery_across_instan
             exit: completed_exit("exit:unverified-completed"),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
+                allow_no_reply_completion: false,
+                final_checkpoint_verified: false,
                 host_cancellation_observed: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
@@ -612,6 +614,8 @@ async fn libsql_turn_state_store_persists_cancelled_loop_exit_application() {
             ),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
+                allow_no_reply_completion: false,
+                final_checkpoint_verified: false,
                 host_cancellation_observed: true,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
@@ -662,6 +666,8 @@ async fn libsql_turn_state_store_persists_cancelled_loop_exit_application() {
             ),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
+                allow_no_reply_completion: false,
+                final_checkpoint_verified: false,
                 host_cancellation_observed: true,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
@@ -1048,6 +1054,8 @@ async fn postgres_turn_state_store_persists_apply_loop_exit_recovery_when_config
             exit: completed_exit(&format!("exit:unverified-{suffix}")),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
+                allow_no_reply_completion: false,
+                final_checkpoint_verified: false,
                 host_cancellation_observed: false,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
@@ -1125,6 +1133,8 @@ async fn postgres_turn_state_store_persists_cancelled_loop_exit_application_when
             ),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
+                allow_no_reply_completion: false,
+                final_checkpoint_verified: false,
                 host_cancellation_observed: true,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
@@ -1179,6 +1189,8 @@ async fn postgres_turn_state_store_persists_cancelled_loop_exit_application_when
             ),
             validation_policy: LoopExitValidationPolicy {
                 require_final_checkpoint: false,
+                allow_no_reply_completion: false,
+                final_checkpoint_verified: false,
                 host_cancellation_observed: true,
                 invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
                 completion_refs_verified: false,
