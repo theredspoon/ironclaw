@@ -30,7 +30,9 @@ pub(crate) fn from_json<T: serde::de::DeserializeOwned>(value: &str) -> Result<T
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 pub(crate) fn db_error(error: impl std::fmt::Display) -> OutboundError {
-    let _ = ironclaw_storage::redacted_backend_error(error);
+    tracing::debug!(error = %&error, "outbound storage backend error");
+    let redacted = ironclaw_storage::redacted_backend_error(error);
+    debug_assert_eq!(redacted, ironclaw_storage::StorageError::Backend);
     OutboundError::Backend
 }
 

@@ -6,7 +6,10 @@
 //! schemas, validation, and query semantics.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, IgnoredAny},
+};
 use thiserror::Error;
 
 /// Sentinel value for optional scope components stored in composite SQL keys.
@@ -21,6 +24,9 @@ pub const ABSENT_SCOPE_COMPONENT: &str = "";
 /// This is an identity/support marker, not an authority grant and not a domain
 /// repository selector. Composition code may use it for diagnostics and
 /// migration routing after the owning domain has selected a store.
+/// `Filesystem` identifies a blob/record store implementation backed by
+/// filesystem mechanics; it does not grant file-shaped path authority or turn
+/// this crate into a filesystem abstraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageBackendKind {
     Memory,
@@ -47,6 +53,7 @@ impl StorageBackendKind {
 /// Variants intentionally avoid carrying raw backend messages. Domain stores can
 /// map these into their own error types without leaking SQL details, host paths,
 /// secret material, or provider/runtime payloads.
+// Copy is intentional: variants must remain payload-free so redaction stays trivial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum StorageError {
     #[error("storage backend operation failed")]
@@ -67,6 +74,8 @@ pub enum StorageError {
 ///
 /// The input is accepted so callers can pass concrete DB/client errors at the
 /// call site, but it is deliberately discarded to prevent accidental leakage.
+/// Callers that need operational diagnostics must log the raw error before
+/// passing it here; this function is the redaction boundary.
 pub fn redacted_backend_error(error: impl std::fmt::Display) -> StorageError {
     let _ = error;
     StorageError::Backend
@@ -202,7 +211,7 @@ pub struct RecordPayloadJson(String);
 impl RecordPayloadJson {
     pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
         let value = value.into();
-        let _: serde_json::Value =
+        let _: IgnoredAny =
             serde_json::from_str(&value).map_err(|_| StorageError::Serialization)?;
         Ok(Self(value))
     }
@@ -345,11 +354,99 @@ pub struct StorageMigration {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
     use super::*;
 
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct Payload {
         value: String,
+    }
+
+    #[derive(Default)]
+    struct InMemoryPrimitiveStore {
+        blobs: Mutex<HashMap<StorageKey, StoredBlob>>,
+        records: Mutex<HashMap<StorageKey, StoredRecord>>,
+        next_version: AtomicU64,
+    }
+
+    impl InMemoryPrimitiveStore {
+        fn next_storage_version(&self) -> StorageVersion {
+            let version = self.next_version.fetch_add(1, Ordering::Relaxed) + 1;
+            StorageVersion::new(format!("memory-{version}"))
+                .expect("generated storage version is valid")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BlobStore for InMemoryPrimitiveStore {
+        async fn put_blob(&self, request: PutBlobRequest) -> Result<StoredBlob, StorageError> {
+            let mut blobs = self.blobs.lock().map_err(|_| StorageError::Backend)?;
+            let allowed = request
+                .condition
+                .allows(blobs.get(&request.key).map(|blob| &blob.version));
+            if !allowed {
+                return Err(StorageError::Conflict);
+            }
+            let stored = StoredBlob {
+                key: request.key,
+                bytes: request.bytes,
+                version: self.next_storage_version(),
+            };
+            blobs.insert(stored.key.clone(), stored.clone());
+            Ok(stored)
+        }
+
+        async fn get_blob(&self, key: &StorageKey) -> Result<Option<StoredBlob>, StorageError> {
+            let blobs = self.blobs.lock().map_err(|_| StorageError::Backend)?;
+            Ok(blobs.get(key).cloned())
+        }
+
+        async fn delete_blob(&self, key: &StorageKey) -> Result<(), StorageError> {
+            let mut blobs = self.blobs.lock().map_err(|_| StorageError::Backend)?;
+            blobs.remove(key);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RecordStore for InMemoryPrimitiveStore {
+        async fn put_record(
+            &self,
+            request: PutRecordRequest,
+        ) -> Result<StoredRecord, StorageError> {
+            let mut records = self.records.lock().map_err(|_| StorageError::Backend)?;
+            let allowed = request
+                .condition
+                .allows(records.get(&request.key).map(|record| &record.version));
+            if !allowed {
+                return Err(StorageError::Conflict);
+            }
+            let stored = StoredRecord {
+                key: request.key,
+                payload_json: request.payload_json,
+                version: self.next_storage_version(),
+            };
+            records.insert(stored.key.clone(), stored.clone());
+            Ok(stored)
+        }
+
+        async fn get_record(&self, key: &StorageKey) -> Result<Option<StoredRecord>, StorageError> {
+            let records = self.records.lock().map_err(|_| StorageError::Backend)?;
+            Ok(records.get(key).cloned())
+        }
+
+        async fn delete_record(&self, key: &StorageKey) -> Result<(), StorageError> {
+            let mut records = self.records.lock().map_err(|_| StorageError::Backend)?;
+            records.remove(key);
+            Ok(())
+        }
     }
 
     #[test]
@@ -416,6 +513,17 @@ mod tests {
     }
 
     #[test]
+    fn storage_version_serializes_and_deserializes_transparently() {
+        let version = StorageVersion::new("opaque-v1").unwrap();
+
+        let encoded = serde_json::to_string(&version).unwrap();
+        let decoded: StorageVersion = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(encoded, "\"opaque-v1\"");
+        assert_eq!(decoded, version);
+    }
+
+    #[test]
     fn storage_key_rejects_path_traversal_and_platform_absolute_forms() {
         for invalid in ["../x", "/x", "a/../../b", "a\\..\\b", "C:\\secrets"] {
             assert_eq!(
@@ -450,6 +558,68 @@ mod tests {
         assert!(PutCondition::IfVersion(current.clone()).allows(Some(&current)));
         assert!(!PutCondition::IfVersion(other).allows(Some(&current)));
         assert!(!PutCondition::IfVersion(current).allows(None));
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_exercises_blob_and_record_traits() {
+        let store = InMemoryPrimitiveStore::default();
+        let blob_key = StorageKey::new("blobs/example").unwrap();
+
+        assert!(store.get_blob(&blob_key).await.unwrap().is_none());
+        let first_blob = store
+            .put_blob(PutBlobRequest {
+                key: blob_key.clone(),
+                bytes: b"first".to_vec(),
+                condition: PutCondition::IfAbsent,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_blob.bytes, b"first");
+        assert_eq!(
+            store
+                .put_blob(PutBlobRequest {
+                    key: blob_key.clone(),
+                    bytes: b"conflict".to_vec(),
+                    condition: PutCondition::IfAbsent,
+                })
+                .await
+                .unwrap_err(),
+            StorageError::Conflict
+        );
+        let updated_blob = store
+            .put_blob(PutBlobRequest {
+                key: blob_key.clone(),
+                bytes: b"second".to_vec(),
+                condition: PutCondition::IfVersion(first_blob.version.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated_blob.bytes, b"second");
+        assert_ne!(updated_blob.version, first_blob.version);
+        assert_eq!(
+            store.get_blob(&blob_key).await.unwrap().unwrap(),
+            updated_blob
+        );
+        store.delete_blob(&blob_key).await.unwrap();
+        assert!(store.get_blob(&blob_key).await.unwrap().is_none());
+
+        let record_key = StorageKey::new("records/example").unwrap();
+        let payload = RecordPayloadJson::new(r#"{"value":"hello"}"#).unwrap();
+        let stored_record = store
+            .put_record(PutRecordRequest {
+                key: record_key.clone(),
+                payload_json: payload.clone(),
+                condition: PutCondition::IfAbsent,
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored_record.payload_json, payload);
+        assert_eq!(
+            store.get_record(&record_key).await.unwrap().unwrap(),
+            stored_record
+        );
+        store.delete_record(&record_key).await.unwrap();
+        assert!(store.get_record(&record_key).await.unwrap().is_none());
     }
 
     #[test]
