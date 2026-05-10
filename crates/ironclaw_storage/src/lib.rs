@@ -147,7 +147,7 @@ impl StorageVersion {
     pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
         let value = value.into();
         validate_storage_token(&value, "storage version", 128)?;
-        Ok(Self(value))
+        validate_storage_token(&value, 128)?;
     }
 
     pub fn as_str(&self) -> &str {
