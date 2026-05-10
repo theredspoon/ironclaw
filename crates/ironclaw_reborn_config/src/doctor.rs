@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{RebornBootConfig, RebornHome, RebornProfile};
 
-/// Redaction-safe doctor snapshot for the standalone Reborn binary.
+/// Side-effect-free doctor snapshot for the standalone Reborn binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebornDoctorReport {
     home: RebornHome,

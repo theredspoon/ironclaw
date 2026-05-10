@@ -1,7 +1,7 @@
 use std::{
     env, error,
     ffi::OsString,
-    fmt,
+    fmt, io,
     path::{Component, Path, PathBuf},
 };
 
@@ -175,7 +175,7 @@ fn validate_not_v1_state_root(
     .into_iter()
     .flatten()
     {
-        if path == candidate {
+        if paths_overlap(path, candidate) {
             return Err(RebornConfigError::V1StateRoot {
                 name: REBORN_HOME_ENV,
                 path: path.to_path_buf(),
@@ -191,7 +191,20 @@ fn default_v1_state_root_from_home(raw_home: &OsString) -> Option<PathBuf> {
 }
 
 fn v1_state_root_from_base_dir(raw_base_dir: &OsString) -> Option<PathBuf> {
-    validated_absolute_candidate(raw_base_dir)
+    if raw_base_dir.as_os_str().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw_base_dir);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    if path.is_absolute() {
+        return Some(path);
+    }
+    env::current_dir().ok().map(|cwd| cwd.join(path))
 }
 
 fn validated_absolute_candidate(raw_path: &OsString) -> Option<PathBuf> {
@@ -207,6 +220,44 @@ fn validated_absolute_candidate(raw_path: &OsString) -> Option<PathBuf> {
         return None;
     }
     Some(path)
+}
+
+fn paths_overlap(path: &Path, candidate: &Path) -> bool {
+    if path == candidate {
+        return true;
+    }
+    if existing_canonical_pair(path, candidate).is_some_and(|(path, candidate)| path == candidate) {
+        return true;
+    }
+    match (
+        normalize_existing_prefix(path),
+        normalize_existing_prefix(candidate),
+    ) {
+        (Some(path), Some(candidate)) => path == candidate,
+        _ => false,
+    }
+}
+
+fn existing_canonical_pair(path: &Path, candidate: &Path) -> Option<(PathBuf, PathBuf)> {
+    match (path.canonicalize(), candidate.canonicalize()) {
+        (Ok(path), Ok(candidate)) => Some((path, candidate)),
+        (Err(error), _) | (_, Err(error)) if missing_path_error(&error) => None,
+        _ => None,
+    }
+}
+
+fn normalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if let Ok(canonical_ancestor) = ancestor.canonicalize() {
+            let suffix = path.strip_prefix(ancestor).ok()?;
+            return Some(canonical_ancestor.join(suffix));
+        }
+    }
+    None
+}
+
+fn missing_path_error(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::NotFound)
 }
 
 fn validate_not_root(path: &Path, name: &'static str) -> Result<(), RebornConfigError> {

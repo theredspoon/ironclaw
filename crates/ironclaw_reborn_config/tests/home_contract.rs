@@ -96,6 +96,29 @@ fn rejects_reborn_home_equal_to_userprofile_v1_state_root() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_reborn_home_symlink_to_home_v1_state_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let v1_root = temp.path().join(".ironclaw");
+    std::fs::create_dir(&v1_root).expect("create v1 root");
+    let reborn_link = temp.path().join("reborn-link");
+    symlink(&v1_root, &reborn_link).expect("symlink reborn home to v1 root");
+
+    let err = RebornHome::resolve_from_env_parts(
+        Some(reborn_link.clone().into_os_string()),
+        Some(temp.path().into()),
+        None,
+    )
+    .expect_err("Reborn home symlink to v1 state root must fail");
+
+    assert!(
+        matches!(err, RebornConfigError::V1StateRoot { name, path } if name == REBORN_HOME_ENV && path == reborn_link)
+    );
+}
+
 #[test]
 fn rejects_parent_components_in_reborn_home_override() {
     let path = root_path().join("tmp").join("..");
