@@ -52,9 +52,11 @@ use ironclaw_processes::{
 use ironclaw_reborn_event_store::{
     RebornEventStoreConfig, RebornEventStoreError, RebornProfile, build_reborn_event_stores,
 };
+#[cfg(feature = "libsql")]
+use ironclaw_resources::ResourceTally;
 use ironclaw_resources::{
     InMemoryResourceGovernor, JsonFileResourceGovernorStore, PersistentResourceGovernor,
-    ResourceAccount, ResourceError, ResourceGovernor, ResourceLimits, ResourceTally,
+    ResourceAccount, ResourceError, ResourceGovernor, ResourceLimits,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_run_state::LibSqlRunStateApprovalStore;
