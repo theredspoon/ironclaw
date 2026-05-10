@@ -4740,6 +4740,7 @@ dependencies = [
  "libsql",
  "serde",
  "serde_json",
+ "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
