@@ -1,24 +1,38 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
+use ironclaw_host_api::{
+    CapabilityId, CorrelationId, ExecutionContext, ExtensionId, InvocationId, ResourceEstimate,
+};
+use ironclaw_host_runtime::{
+    HostRuntime, HostRuntimeError, RuntimeBlockedReason, RuntimeCapabilityOutcome,
+    RuntimeCapabilityRequest, RuntimeFailureKind,
+};
 use ironclaw_loop_support::{
     EmptyLoopCapabilityPort, HostManagedModelGateway, ThreadBackedLoopContextPort,
     ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::{
-    CheckpointStateStore, GetCheckpointStateRequest, LoopCheckpointStore, PutLoopCheckpointRequest,
-    RunProfileId, TurnCheckpointId, TurnError, TurnStatus,
+    CheckpointStateStore, GetCheckpointStateRequest, LoopCheckpointStore, LoopGateRef,
+    LoopResultRef, PutLoopCheckpointRequest, RunProfileId, TurnCheckpointId, TurnError, TurnStatus,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
-        CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityInvocation, CapabilityOutcome,
-        FinalizeAssistantMessage, HostManagedLoopPromptPort, LoopCapabilityPort,
-        LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextPort,
-        LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch,
-        LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelResponse,
-        LoopProgressEvent, LoopProgressPort, LoopPromptBundle, LoopPromptBundleRequest,
-        LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, UpdateAssistantDraft,
-        VisibleCapabilityRequest, VisibleCapabilitySurface,
+        CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
+        CapabilityDescriptorView, CapabilityFailure, CapabilityInvocation, CapabilityOutcome,
+        CapabilityResultMessage, FinalizeAssistantMessage, HostManagedLoopPromptPort,
+        LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
+        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
+        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
+        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
+        LoopTranscriptPort, ProcessHandleSummary, UpdateAssistantDraft, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -59,6 +73,350 @@ impl Error for RebornLoopDriverHostError {}
 pub struct RebornLoopDriverHostRequest {
     pub claimed_run: ClaimedTurnRun,
     pub loop_run_context: LoopRunContext,
+}
+
+#[async_trait]
+pub trait LoopCapabilityInputResolver: Send + Sync {
+    async fn resolve_capability_input(
+        &self,
+        run_context: &LoopRunContext,
+        input_ref: &ironclaw_turns::run_profile::CapabilityInputRef,
+    ) -> Result<serde_json::Value, AgentLoopHostError>;
+}
+
+#[async_trait]
+pub trait LoopCapabilityResultWriter: Send + Sync {
+    async fn write_capability_result(
+        &self,
+        run_context: &LoopRunContext,
+        capability_id: &CapabilityId,
+        output: serde_json::Value,
+    ) -> Result<LoopResultRef, AgentLoopHostError>;
+}
+
+#[derive(Clone)]
+struct SurfaceCapabilitySnapshot {
+    provider: ExtensionId,
+    estimate: ResourceEstimate,
+}
+
+#[derive(Clone, Default)]
+struct SurfaceSnapshot {
+    capabilities: HashMap<CapabilityId, SurfaceCapabilitySnapshot>,
+}
+
+pub struct HostRuntimeLoopCapabilityPort {
+    runtime: Arc<dyn HostRuntime>,
+    run_context: LoopRunContext,
+    visible_request: ironclaw_host_runtime::VisibleCapabilityRequest,
+    input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+    result_writer: Arc<dyn LoopCapabilityResultWriter>,
+    milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    snapshots: Mutex<HashMap<String, SurfaceSnapshot>>,
+}
+
+impl HostRuntimeLoopCapabilityPort {
+    pub fn new(
+        runtime: Arc<dyn HostRuntime>,
+        run_context: LoopRunContext,
+        visible_request: ironclaw_host_runtime::VisibleCapabilityRequest,
+        input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+        result_writer: Arc<dyn LoopCapabilityResultWriter>,
+    ) -> Self {
+        Self {
+            runtime,
+            run_context,
+            visible_request,
+            input_resolver,
+            result_writer,
+            milestone_sink: None,
+            snapshots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_milestone_sink(mut self, sink: Arc<dyn LoopHostMilestoneSink>) -> Self {
+        self.milestone_sink = Some(sink);
+        self
+    }
+
+    fn snapshot_for(
+        &self,
+        version: &ironclaw_turns::run_profile::CapabilitySurfaceVersion,
+    ) -> Result<SurfaceSnapshot, AgentLoopHostError> {
+        let snapshots = self.snapshots.lock().map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "capability surface snapshot store is unavailable",
+            )
+        })?;
+        snapshots.get(version.as_str()).cloned().ok_or_else(|| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::StaleSurface,
+                "capability surface is stale or unknown",
+            )
+        })
+    }
+
+    async fn emit_capability_invoked(
+        &self,
+        capability_id: CapabilityId,
+    ) -> Result<(), AgentLoopHostError> {
+        if let Some(milestone_sink) = &self.milestone_sink {
+            let milestones =
+                LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
+            milestones.capability_invoked(capability_id).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
+    async fn visible_capabilities(
+        &self,
+        _request: VisibleCapabilityRequest,
+    ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        let runtime_surface = self
+            .runtime
+            .visible_capabilities(self.visible_request.clone())
+            .await
+            .map_err(host_runtime_error)?;
+        let version = loop_surface_version(runtime_surface.version.as_str())?;
+        let mut snapshot = SurfaceSnapshot::default();
+        let descriptors = runtime_surface
+            .capabilities
+            .into_iter()
+            .map(|capability| {
+                let capability_id = capability.descriptor.id.clone();
+                snapshot.capabilities.insert(
+                    capability_id.clone(),
+                    SurfaceCapabilitySnapshot {
+                        provider: capability.descriptor.provider.clone(),
+                        estimate: capability.estimated_resources.clone(),
+                    },
+                );
+                CapabilityDescriptorView {
+                    capability_id,
+                    provider: Some(capability.descriptor.provider),
+                    runtime: capability.descriptor.runtime,
+                    safe_name: capability.descriptor.id.as_str().to_string(),
+                    safe_description: capability.descriptor.description,
+                }
+            })
+            .collect();
+
+        let mut snapshots = self.snapshots.lock().map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "capability surface snapshot store is unavailable",
+            )
+        })?;
+        snapshots.clear();
+        snapshots.insert(version.as_str().to_string(), snapshot);
+
+        Ok(VisibleCapabilitySurface {
+            version,
+            descriptors,
+        })
+    }
+
+    async fn invoke_capability(
+        &self,
+        request: CapabilityInvocation,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        let snapshot = self.snapshot_for(&request.surface_version)?;
+        let Some(capability) = snapshot.capabilities.get(&request.capability_id).cloned() else {
+            return Ok(CapabilityOutcome::Denied(CapabilityDenied {
+                reason_kind: "outside_visible_surface".to_string(),
+                safe_summary: "capability was not visible on the cited surface".to_string(),
+            }));
+        };
+        let Some(trust_decision) = self
+            .visible_request
+            .provider_trust
+            .get(&capability.provider)
+            .cloned()
+        else {
+            return Ok(CapabilityOutcome::Denied(CapabilityDenied {
+                reason_kind: "missing_provider_trust".to_string(),
+                safe_summary: "capability provider trust is unavailable".to_string(),
+            }));
+        };
+        let input = self
+            .input_resolver
+            .resolve_capability_input(&self.run_context, &request.input_ref)
+            .await?;
+
+        self.emit_capability_invoked(request.capability_id.clone())
+            .await?;
+        let outcome = self
+            .runtime
+            .invoke_capability(RuntimeCapabilityRequest::new(
+                invocation_context_from_visible(&self.visible_request.context),
+                request.capability_id,
+                capability.estimate,
+                input,
+                trust_decision,
+            ))
+            .await
+            .map_err(host_runtime_error)?;
+        runtime_outcome_to_loop(&self.run_context, self.result_writer.as_ref(), outcome).await
+    }
+
+    async fn invoke_capability_batch(
+        &self,
+        request: CapabilityBatchInvocation,
+    ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+        let mut outcomes = Vec::new();
+        let mut stopped_on_suspension = false;
+        for invocation in request.invocations {
+            let outcome = self.invoke_capability(invocation).await?;
+            let is_suspension = outcome.is_suspension();
+            outcomes.push(outcome);
+            if request.stop_on_first_suspension && is_suspension {
+                stopped_on_suspension = true;
+                break;
+            }
+        }
+        Ok(CapabilityBatchOutcome {
+            outcomes,
+            stopped_on_suspension,
+        })
+    }
+}
+
+fn invocation_context_from_visible(base: &ExecutionContext) -> ExecutionContext {
+    let mut context = base.clone();
+    let invocation_id = InvocationId::new();
+    context.invocation_id = invocation_id;
+    context.correlation_id = CorrelationId::new();
+    context.process_id = None;
+    context.parent_process_id = None;
+    context.resource_scope.invocation_id = invocation_id;
+    context
+}
+
+fn loop_surface_version(
+    version: &str,
+) -> Result<ironclaw_turns::run_profile::CapabilitySurfaceVersion, AgentLoopHostError> {
+    ironclaw_turns::run_profile::CapabilitySurfaceVersion::new(version).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "host runtime capability surface version could not be represented",
+        )
+    })
+}
+
+async fn runtime_outcome_to_loop(
+    run_context: &LoopRunContext,
+    result_writer: &(dyn LoopCapabilityResultWriter + Send + Sync),
+    outcome: RuntimeCapabilityOutcome,
+) -> Result<CapabilityOutcome, AgentLoopHostError> {
+    Ok(match outcome {
+        RuntimeCapabilityOutcome::Completed(completed) => {
+            let result_ref = result_writer
+                .write_capability_result(
+                    run_context,
+                    &completed.capability_id,
+                    completed.output.clone(),
+                )
+                .await?;
+            CapabilityOutcome::Completed(CapabilityResultMessage {
+                result_ref,
+                safe_summary: "capability completed".to_string(),
+            })
+        }
+        RuntimeCapabilityOutcome::ApprovalRequired(gate) => CapabilityOutcome::ApprovalRequired {
+            gate_ref: loop_gate_ref("approval", gate.approval_request_id.to_string())?,
+            safe_summary: blocked_summary(gate.reason).to_string(),
+        },
+        RuntimeCapabilityOutcome::AuthRequired(gate) => CapabilityOutcome::AuthRequired {
+            gate_ref: loop_gate_ref("auth", gate.gate_id.to_string())?,
+            safe_summary: blocked_summary(gate.reason).to_string(),
+        },
+        RuntimeCapabilityOutcome::ResourceBlocked(gate) => CapabilityOutcome::ResourceBlocked {
+            gate_ref: loop_gate_ref("resource", gate.gate_id.to_string())?,
+            safe_summary: blocked_summary(gate.reason).to_string(),
+        },
+        RuntimeCapabilityOutcome::SpawnedProcess(process) => {
+            CapabilityOutcome::SpawnedProcess(ProcessHandleSummary {
+                process_ref: LoopProcessRef::new(format!("process:{}", process.process_id))
+                    .map_err(|_| {
+                        AgentLoopHostError::new(
+                            AgentLoopHostErrorKind::Internal,
+                            "process ref could not be represented",
+                        )
+                    })?,
+                safe_summary: "capability spawned background work".to_string(),
+            })
+        }
+        RuntimeCapabilityOutcome::Failed(failure) => {
+            if failure.kind == RuntimeFailureKind::Authorization {
+                CapabilityOutcome::Denied(CapabilityDenied {
+                    reason_kind: failure.kind.as_str().to_string(),
+                    safe_summary: runtime_safe_summary(
+                        failure.message,
+                        "capability authorization denied",
+                    ),
+                })
+            } else {
+                CapabilityOutcome::Failed(CapabilityFailure {
+                    error_kind: failure.kind.as_str().to_string(),
+                    safe_summary: runtime_safe_summary(
+                        failure.message,
+                        "capability invocation failed",
+                    ),
+                })
+            }
+        }
+        _ => CapabilityOutcome::Failed(CapabilityFailure {
+            error_kind: "unknown".to_string(),
+            safe_summary: "capability invocation returned an unknown outcome".to_string(),
+        }),
+    })
+}
+
+fn runtime_safe_summary(message: Option<String>, fallback: &'static str) -> String {
+    message
+        .and_then(|summary| LoopSafeSummary::new(summary).ok())
+        .map(|summary| summary.to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn loop_gate_ref(kind: &str, id: String) -> Result<LoopGateRef, AgentLoopHostError> {
+    LoopGateRef::new(format!("gate:{kind}-{id}")).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "capability gate ref could not be represented",
+        )
+    })
+}
+
+fn blocked_summary(reason: RuntimeBlockedReason) -> &'static str {
+    match reason {
+        RuntimeBlockedReason::ApprovalRequired => "capability requires approval",
+        RuntimeBlockedReason::AuthRequired => "capability requires authentication",
+        RuntimeBlockedReason::ResourceLimit => "capability is blocked by resource limits",
+        RuntimeBlockedReason::ResourceUnavailable => "capability resources are unavailable",
+        _ => "capability is blocked",
+    }
+}
+
+fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
+    match error {
+        HostRuntimeError::InvalidRequest { .. } => AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            "host runtime rejected capability request",
+        ),
+        HostRuntimeError::Unavailable { .. } => AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "host runtime capability service is unavailable",
+        ),
+        _ => AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "host runtime capability service failed",
+        ),
+    }
 }
 
 pub struct RebornLoopDriverHostFactory<S, G>
@@ -104,6 +462,15 @@ where
         &self,
         request: RebornLoopDriverHostRequest,
     ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
+        self.build_text_only_host_with_capabilities(request, Arc::new(EmptyLoopCapabilityPort))
+            .await
+    }
+
+    pub async fn build_text_only_host_with_capabilities(
+        &self,
+        request: RebornLoopDriverHostRequest,
+        capabilities: Arc<dyn LoopCapabilityPort>,
+    ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
         validate_claimed_run_context(&request.claimed_run, &request.loop_run_context)?;
         validate_thread_scope(&self.thread_scope, &request.loop_run_context)?;
 
@@ -115,7 +482,7 @@ where
             run_context.clone(),
             max_messages,
         ));
-        let current_surface_version = EmptyLoopCapabilityPort
+        let current_surface_version = capabilities
             .visible_capabilities(VisibleCapabilityRequest)
             .await
             .map_err(|error| RebornLoopDriverHostError::InvalidRequest {
@@ -148,7 +515,6 @@ where
             Arc::clone(&self.loop_checkpoint_store),
             Arc::clone(&self.milestone_sink),
         ));
-        let capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(EmptyLoopCapabilityPort);
         let transcript: Arc<dyn LoopTranscriptPort> =
             Arc::new(ThreadBackedLoopTranscriptPort::with_milestone_sink(
                 Arc::clone(&self.thread_service),

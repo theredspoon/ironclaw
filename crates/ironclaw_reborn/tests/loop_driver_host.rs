@@ -1,13 +1,28 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{
+    AgentId, CapabilityDescriptor, CapabilityId, CapabilitySet, EffectKind, ExecutionContext,
+    ExtensionId, MountView, PermissionMode, ProjectId, ResourceEstimate, ResourceUsage,
+    RuntimeKind, TenantId, ThreadId, TrustClass, UserId,
+};
+use ironclaw_host_runtime::{
+    CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, CapabilitySurfacePolicy, HostRuntime,
+    HostRuntimeError, HostRuntimeHealth, HostRuntimeStatus, RuntimeCapabilityCompleted,
+    RuntimeCapabilityFailure, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
+    RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeStatusRequest, SurfaceKind,
+    VisibleCapability, VisibleCapabilityAccess,
+};
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
     HostManagedModelResponse,
 };
 use ironclaw_reborn::{
+    HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
     RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
     turn_runner::HostFactory,
 };
@@ -15,25 +30,28 @@ use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
+use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 use ironclaw_turns::{
     AcceptedMessageRef, CheckpointStateStore, EventCursor, GetCheckpointStateRequest,
     GetLoopCheckpointRequest, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
     InMemoryRunProfileResolver, InMemoryTurnStateStore, InMemoryTurnStateStoreLimits,
-    LoopCheckpointRecord, LoopCheckpointStore, PutCheckpointStateRequest, PutLoopCheckpointRequest,
-    ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest, RunProfileResolver,
-    RunProfileVersion, SourceBindingRef, TurnError, TurnLeaseToken, TurnRunId, TurnRunnerId,
-    TurnScope, TurnStatus,
+    LoopCheckpointRecord, LoopCheckpointStore, LoopResultRef, PutCheckpointStateRequest,
+    PutLoopCheckpointRequest, ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest,
+    RunProfileResolver, RunProfileVersion, SourceBindingRef, TurnError, TurnLeaseToken, TurnRunId,
+    TurnRunnerId, TurnScope, TurnStatus,
     run_profile::{
-        AgentLoopDriverHost, AgentLoopHostErrorKind, CapabilityDeniedReasonKind,
-        CapabilityInputRef, CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
-        FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink, LoopCapabilityPort,
-        LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopContextRequest,
-        LoopDriverId, LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor, LoopInputCursorToken,
-        LoopInputPort, LoopModelRequest, LoopProgressEvent, LoopPromptBundleRequest,
-        LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode, VisibleCapabilityRequest,
+        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind,
+        CapabilityDeniedReasonKind, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
+        CapabilitySurfaceVersion, FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink,
+        LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
+        LoopContextRequest, LoopDriverId, LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor,
+        LoopInputCursorToken, LoopInputPort, LoopModelRequest, LoopProgressEvent,
+        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode,
+        VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
+use serde_json::{Value, json};
 
 #[tokio::test]
 async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
@@ -641,6 +659,324 @@ async fn text_only_host_checkpoint_port_maps_store_failures_to_unavailable() {
 }
 
 #[tokio::test]
+async fn text_only_host_routes_capability_invocation_through_host_runtime() {
+    let fixture = HostFixture::new("thread-host-runtime-capability", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"echoed": true}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:echo-request").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "hello tool"}));
+
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io.clone(),
+    )
+    .with_milestone_sink(fixture.milestone_sink.clone());
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(surface.descriptors[0].capability_id, capability_id);
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version.clone(),
+            capability_id: capability_id.clone(),
+            input_ref,
+        })
+        .await
+        .unwrap();
+
+    let CapabilityOutcome::Completed(message) = outcome else {
+        panic!("expected completed capability outcome");
+    };
+    assert!(message.result_ref.as_str().starts_with("result:"));
+    assert_eq!(message.safe_summary, "capability completed");
+    let invocations = runtime.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].capability_id, capability_id);
+    assert_eq!(invocations[0].input, json!({"message": "hello tool"}));
+    assert_eq!(io.results(), vec![(capability_id, json!({"echoed": true}))]);
+    assert!(fixture.milestone_names().contains(&"capability_invoked"));
+}
+
+#[tokio::test]
+async fn text_only_host_uses_fresh_execution_context_per_capability_invocation() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-context", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    for output in [json!({"call": 1}), json!({"call": 2})] {
+        runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+            RuntimeCapabilityCompleted {
+                capability_id: capability_id.clone(),
+                output,
+                usage: ResourceUsage::default(),
+            },
+        )));
+    }
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let first_input = CapabilityInputRef::new("input:first-call").unwrap();
+    let second_input = CapabilityInputRef::new("input:second-call").unwrap();
+    io.put_input(first_input.clone(), json!({"call": 1}));
+    io.put_input(second_input.clone(), json!({"call": 2}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    for input_ref in [first_input, second_input] {
+        let outcome = host
+            .invoke_capability(CapabilityInvocation {
+                surface_version: surface.version.clone(),
+                capability_id: capability_id.clone(),
+                input_ref,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CapabilityOutcome::Completed(_)));
+    }
+
+    let invocations = runtime.invocations();
+    assert_eq!(invocations.len(), 2);
+    assert_ne!(
+        invocations[0].context.invocation_id,
+        invocations[1].context.invocation_id
+    );
+    assert_eq!(
+        invocations[0].context.resource_scope.invocation_id,
+        invocations[0].context.invocation_id
+    );
+    assert_eq!(
+        invocations[1].context.resource_scope.invocation_id,
+        invocations[1].context.invocation_id
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_rejects_outside_surface_capability_before_host_runtime() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-deny", "hello").await;
+    let visible_id = CapabilityId::new("demo.echo").unwrap();
+    let hidden_id = CapabilityId::new("demo.hidden").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(visible_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let denied = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: hidden_id,
+            input_ref: CapabilityInputRef::new("input:hidden-request").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        denied,
+        CapabilityOutcome::Denied(denied) if denied.reason_kind == "outside_visible_surface"
+    ));
+    assert!(runtime.invocations().is_empty());
+
+    let stale = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: CapabilitySurfaceVersion::new("sha256:stale").unwrap(),
+            capability_id: visible_id,
+            input_ref: CapabilityInputRef::new("input:stale-request").unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.kind, AgentLoopHostErrorKind::StaleSurface);
+    assert!(runtime.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn text_only_host_sanitizes_runtime_failure_message_before_driver_output() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-failure", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Failed(RuntimeCapabilityFailure {
+        capability_id: capability_id.clone(),
+        kind: RuntimeFailureKind::Dispatcher,
+        message: Some("raw provider error sk-secret /host/path tool_input".to_string()),
+    }));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:failure-request").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "fail"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime,
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref,
+        })
+        .await
+        .unwrap();
+
+    let CapabilityOutcome::Failed(failure) = outcome else {
+        panic!("expected failed capability outcome");
+    };
+    assert_eq!(failure.safe_summary, "capability invocation failed");
+}
+
+#[tokio::test]
+async fn text_only_host_rejects_previous_surface_after_refetch() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-refetch", "hello").await;
+    let first_id = CapabilityId::new("demo.echo").unwrap();
+    let second_id = CapabilityId::new("demo.other").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(
+        host_runtime_surface_with_version(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            [capability_descriptor(first_id.as_str())],
+        ),
+    ));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: first_id.clone(),
+            output: json!({"stale": true}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:old-surface").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "old"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+
+    let first_surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    runtime.set_surface(host_runtime_surface_with_version(
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        [capability_descriptor(second_id.as_str())],
+    ));
+    let second_surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_ne!(first_surface.version, second_surface.version);
+
+    let stale = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: first_surface.version,
+            capability_id: first_id,
+            input_ref,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(stale.kind, AgentLoopHostErrorKind::StaleSurface);
+    assert!(runtime.invocations().is_empty());
+}
+
+#[tokio::test]
 async fn text_only_host_empty_capability_surface_denies_invocation() {
     let fixture = HostFixture::new("thread-host-capability", "hello").await;
     let host = fixture.build_host().await;
@@ -675,6 +1011,236 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
         .await
         .unwrap_err();
     assert_eq!(stale.kind, AgentLoopHostErrorKind::StaleSurface);
+}
+
+#[derive(Default)]
+struct InMemoryCapabilityIo {
+    inputs: Mutex<BTreeMap<String, Value>>,
+    results: Mutex<Vec<(CapabilityId, Value)>>,
+}
+
+impl InMemoryCapabilityIo {
+    fn put_input(&self, input_ref: CapabilityInputRef, input: Value) {
+        self.inputs
+            .lock()
+            .unwrap()
+            .insert(input_ref.as_str().to_string(), input);
+    }
+
+    fn results(&self) -> Vec<(CapabilityId, Value)> {
+        self.results.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityInputResolver for InMemoryCapabilityIo {
+    async fn resolve_capability_input(
+        &self,
+        _run_context: &LoopRunContext,
+        input_ref: &CapabilityInputRef,
+    ) -> Result<Value, AgentLoopHostError> {
+        self.inputs
+            .lock()
+            .unwrap()
+            .get(input_ref.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "capability input ref was not staged for this loop",
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
+    async fn write_capability_result(
+        &self,
+        run_context: &LoopRunContext,
+        capability_id: &CapabilityId,
+        output: Value,
+    ) -> Result<LoopResultRef, AgentLoopHostError> {
+        self.results
+            .lock()
+            .unwrap()
+            .push((capability_id.clone(), output));
+        LoopResultRef::new(format!(
+            "result:{}-{}",
+            run_context.run_id,
+            capability_id.as_str()
+        ))
+        .map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "capability result ref could not be represented",
+            )
+        })
+    }
+}
+
+struct RecordingHostRuntime {
+    surface: Mutex<ironclaw_host_runtime::VisibleCapabilitySurface>,
+    outcomes: Mutex<Vec<RuntimeCapabilityOutcome>>,
+    invocations: Mutex<Vec<RuntimeCapabilityRequest>>,
+}
+
+impl RecordingHostRuntime {
+    fn with_surface(surface: ironclaw_host_runtime::VisibleCapabilitySurface) -> Self {
+        Self {
+            surface: Mutex::new(surface),
+            outcomes: Mutex::new(Vec::new()),
+            invocations: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn push_outcome(&self, outcome: RuntimeCapabilityOutcome) {
+        self.outcomes.lock().unwrap().push(outcome);
+    }
+
+    fn set_surface(&self, surface: ironclaw_host_runtime::VisibleCapabilitySurface) {
+        *self.surface.lock().unwrap() = surface;
+    }
+
+    fn invocations(&self) -> Vec<RuntimeCapabilityRequest> {
+        self.invocations.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl HostRuntime for RecordingHostRuntime {
+    async fn invoke_capability(
+        &self,
+        request: RuntimeCapabilityRequest,
+    ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+        self.invocations.lock().unwrap().push(request);
+        Ok(self.outcomes.lock().unwrap().remove(0))
+    }
+
+    async fn resume_capability(
+        &self,
+        _request: RuntimeCapabilityResumeRequest,
+    ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+        unreachable!("resume is not used by loop capability tests")
+    }
+
+    async fn visible_capabilities(
+        &self,
+        _request: ironclaw_host_runtime::VisibleCapabilityRequest,
+    ) -> Result<ironclaw_host_runtime::VisibleCapabilitySurface, HostRuntimeError> {
+        Ok(self.surface.lock().unwrap().clone())
+    }
+
+    async fn cancel_work(
+        &self,
+        _request: CancelRuntimeWorkRequest,
+    ) -> Result<CancelRuntimeWorkOutcome, HostRuntimeError> {
+        Ok(CancelRuntimeWorkOutcome::default())
+    }
+
+    async fn runtime_status(
+        &self,
+        _request: RuntimeStatusRequest,
+    ) -> Result<HostRuntimeStatus, HostRuntimeError> {
+        Ok(HostRuntimeStatus::default())
+    }
+
+    async fn health(&self) -> Result<HostRuntimeHealth, HostRuntimeError> {
+        Ok(HostRuntimeHealth::default())
+    }
+}
+
+fn host_runtime_surface(
+    descriptors: impl IntoIterator<Item = CapabilityDescriptor>,
+) -> ironclaw_host_runtime::VisibleCapabilitySurface {
+    host_runtime_surface_with_version(
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        descriptors,
+    )
+}
+
+fn host_runtime_surface_with_version(
+    version: &str,
+    descriptors: impl IntoIterator<Item = CapabilityDescriptor>,
+) -> ironclaw_host_runtime::VisibleCapabilitySurface {
+    ironclaw_host_runtime::VisibleCapabilitySurface {
+        version: ironclaw_host_runtime::CapabilitySurfaceVersion::new(version).unwrap(),
+        capabilities: descriptors
+            .into_iter()
+            .map(|descriptor| VisibleCapability {
+                descriptor,
+                access: VisibleCapabilityAccess::Available,
+                estimated_resources: ResourceEstimate::default(),
+            })
+            .collect(),
+    }
+}
+
+fn capability_descriptor(id: &str) -> CapabilityDescriptor {
+    let provider = id.split('.').next().unwrap_or("demo");
+    CapabilityDescriptor {
+        id: CapabilityId::new(id).unwrap(),
+        provider: ExtensionId::new(provider).unwrap(),
+        runtime: RuntimeKind::Wasm,
+        trust_ceiling: TrustClass::Sandbox,
+        description: format!("Safe description for {id}"),
+        parameters_schema: json!({"type": "object"}),
+        effects: vec![EffectKind::DispatchCapability],
+        default_permission: PermissionMode::Allow,
+        resource_profile: None,
+    }
+}
+
+fn host_runtime_visible_request(
+    fixture: &HostFixture,
+    trusted_providers: impl IntoIterator<Item = &'static str>,
+) -> ironclaw_host_runtime::VisibleCapabilityRequest {
+    let user_id = fixture
+        .thread_scope
+        .owner_user_id
+        .clone()
+        .unwrap_or_else(|| UserId::new("user-text-host").unwrap());
+    let mut context = ExecutionContext::local_default(
+        user_id,
+        ExtensionId::new("loop-driver").unwrap(),
+        RuntimeKind::FirstParty,
+        TrustClass::System,
+        CapabilitySet::default(),
+        MountView::default(),
+    )
+    .unwrap();
+    context.tenant_id = fixture.context.scope.tenant_id.clone();
+    context.agent_id = fixture.context.scope.agent_id.clone();
+    context.project_id = fixture.context.scope.project_id.clone();
+    context.thread_id = Some(fixture.context.thread_id.clone());
+    context.resource_scope.tenant_id = context.tenant_id.clone();
+    context.resource_scope.agent_id = context.agent_id.clone();
+    context.resource_scope.project_id = context.project_id.clone();
+    context.resource_scope.thread_id = context.thread_id.clone();
+
+    let provider_trust = trusted_providers
+        .into_iter()
+        .map(|provider| (ExtensionId::new(provider).unwrap(), trust_decision()))
+        .collect::<BTreeMap<_, _>>();
+
+    ironclaw_host_runtime::VisibleCapabilityRequest::new(
+        context,
+        SurfaceKind::new("agent_loop").unwrap(),
+    )
+    .with_policy(CapabilitySurfacePolicy::allow_all())
+    .with_provider_trust(provider_trust)
+}
+
+fn trust_decision() -> TrustDecision {
+    TrustDecision {
+        effective_trust: EffectiveTrustClass::user_trusted(),
+        authority_ceiling: AuthorityCeiling {
+            allowed_effects: vec![EffectKind::DispatchCapability],
+            max_resource_ceiling: None,
+        },
+        provenance: TrustProvenance::AdminConfig,
+        evaluated_at: Utc::now(),
+    }
 }
 
 struct HostFixture {
