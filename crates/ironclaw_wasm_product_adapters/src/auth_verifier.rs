@@ -460,6 +460,19 @@ mod tests {
     }
 
     #[test]
+    fn hmac_verifier_with_zero_max_age_accepts_exact_timestamp() {
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&secret, &timestamp, body);
+        let verifier = verifier_at(1_700_000_000, 0, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Verified { .. } => {}
+            other => panic!("zero max_age with exact timestamp should pass, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn hmac_verifier_with_zero_max_age_rejects_any_drift() {
         let secret = b"super-shared-secret".to_vec();
         let timestamp = "1_700_000_000".replace('_', "");

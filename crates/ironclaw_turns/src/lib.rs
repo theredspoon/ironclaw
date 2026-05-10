@@ -6,6 +6,7 @@
 //! transition APIs are intentionally not re-exported from this crate prelude.
 
 pub mod admission;
+pub mod checkpoint_state;
 pub mod coordinator;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 pub mod db;
@@ -27,6 +28,12 @@ pub use admission::{
     TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionLimit,
     TurnAdmissionLimitProvider, TurnAdmissionLimitUnavailable, TurnAdmissionReservationRecord,
 };
+pub use checkpoint_state::{
+    CheckpointStateRecord, CheckpointStateStore, GetCheckpointStateRequest,
+    GetLoopCheckpointRequest, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
+    LoopCheckpointRecord, LoopCheckpointStore, MAX_CHECKPOINT_STATE_PAYLOAD_BYTES,
+    PutCheckpointStateRequest, PutLoopCheckpointRequest, RedactedCheckpointPayload,
+};
 pub use coordinator::{
     AllowAllTurnAdmissionPolicy, DefaultTurnCoordinator, NoopTurnRunWakeNotifier,
     TurnAdmissionPolicy, TurnCoordinator, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
@@ -36,7 +43,7 @@ pub use db::LibSqlTurnStateStore;
 #[cfg(feature = "postgres")]
 pub use db::PostgresTurnStateStore;
 pub use events::{
-    InMemoryTurnEventSink, TurnEventKind, TurnEventPage, TurnEventProjectionCursor,
+    EventCursor, InMemoryTurnEventSink, TurnEventKind, TurnEventPage, TurnEventProjectionCursor,
     TurnEventProjectionError, TurnEventProjectionRequest, TurnEventProjectionService,
     TurnEventProjectionSnapshot, TurnEventProjectionSource, TurnEventSink, TurnLifecycleEvent,
 };
@@ -61,12 +68,12 @@ pub use run_profile::{
     AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverResumeRequest,
     AgentLoopDriverRunRequest, CancellationPolicy, CapabilitySurfaceProfileId, CheckpointPolicy,
     CheckpointSchemaId, ConcurrencyClass, ContextProfileId, InMemoryRunProfileRegistry,
-    InMemoryRunProfileResolver, LoopDriverId, ModelProfileId, PrivilegedRunProfileDimension,
-    RedactedRunProfileProvenance, RedactedRunProfileSource, ResolvedRunProfile,
-    ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
-    RunProfileRequestAuthority, RunProfileResolutionError, RunProfileResolutionRequest,
-    RunProfileResolver, RunProfileSourceLayer, RunProfileSourceRef, RunnerPoolId,
-    RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
+    InMemoryRunProfileResolver, LoopCheckpointKind, LoopCheckpointStateRef, LoopDriverId,
+    ModelProfileId, PrivilegedRunProfileDimension, RedactedRunProfileProvenance,
+    RedactedRunProfileSource, ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier,
+    RunClassId, RunProfileFingerprint, RunProfileRequestAuthority, RunProfileResolutionError,
+    RunProfileResolutionRequest, RunProfileResolver, RunProfileSourceLayer, RunProfileSourceRef,
+    RunnerPoolId, RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
 };
 pub use scope::{TurnActor, TurnScope};
 pub use status::{

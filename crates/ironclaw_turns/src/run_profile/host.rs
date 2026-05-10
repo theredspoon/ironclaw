@@ -46,6 +46,64 @@ fn validate_prefixed_loop_ref(
     Ok(value)
 }
 
+fn validate_loop_opaque_token(
+    value: String,
+    label: &'static str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let value = validate_bounded_loop_string(value, label, max_bytes)?;
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return Err(format!(
+            "{label} must contain only ASCII letters, digits, _, -, or ."
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_loop_safe_identifier(
+    value: String,
+    label: &'static str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let value = validate_bounded_loop_string(value, label, max_bytes)?;
+    if !value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+    }) {
+        return Err(format!(
+            "{label} must contain only ASCII letters, digits, _, -, ., or :"
+        ));
+    }
+
+    let lower = value.to_ascii_lowercase();
+    for forbidden in [
+        "access_token",
+        "access-token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "password",
+        "passwd",
+        "secret",
+    ] {
+        if lower.contains(forbidden) {
+            return Err(format!(
+                "{label} must not contain sensitive marker `{forbidden}`"
+            ));
+        }
+    }
+    if lower
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .any(|token| token.starts_with("sk-"))
+    {
+        return Err(format!("{label} must not contain API-key-like tokens"));
+    }
+    Ok(value)
+}
+
 fn validate_loop_safe_summary(value: String) -> Result<String, String> {
     let value = validate_bounded_loop_string(value, "loop safe summary", 512)?;
     if value.chars().any(|character| {
@@ -150,6 +208,92 @@ bounded_loop_ref!(
 );
 bounded_loop_ref!(LoopProcessRef, "loop process ref", "process:", 256);
 
+impl LoopCheckpointStateRef {
+    pub fn for_run(context: &LoopRunContext, token: impl Into<String>) -> Result<Self, String> {
+        let token = validate_loop_opaque_token(token.into(), "loop checkpoint state token", 96)?;
+        Self::new(format!("checkpoint:{}:{token}", context.run_id))
+    }
+
+    pub fn is_for_run(&self, context: &LoopRunContext) -> bool {
+        let Some(token) = self
+            .0
+            .strip_prefix(&format!("checkpoint:{}:", context.run_id))
+        else {
+            return false;
+        };
+        validate_loop_opaque_token(token.to_string(), "loop checkpoint state token", 96).is_ok()
+    }
+}
+
+/// Opaque reference to a host-built prompt bundle for one loop run.
+///
+/// Serialized refs use `prompt:{run_id}:{opaque_token}`. Consumers must treat
+/// the token as opaque metadata and must not infer or persist raw prompt text
+/// from this value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct LoopPromptBundleRef(String);
+
+impl LoopPromptBundleRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value =
+            validate_prefixed_loop_ref("loop prompt bundle ref", "prompt:", 256, value.into())?;
+        let suffix = value
+            .strip_prefix("prompt:")
+            .ok_or_else(|| "loop prompt bundle ref must start with `prompt:`".to_string())?;
+        let (run_id, token) = suffix.split_once(':').ok_or_else(|| {
+            "loop prompt bundle ref must include scoped run id and opaque token".to_string()
+        })?;
+        uuid::Uuid::parse_str(run_id)
+            .map_err(|_| "loop prompt bundle ref run id must be a UUID".to_string())?;
+        validate_loop_opaque_token(token.to_string(), "loop prompt bundle token", 96)?;
+        Ok(Self(value))
+    }
+
+    pub fn for_run(context: &LoopRunContext, token: impl Into<String>) -> Result<Self, String> {
+        let token = validate_loop_opaque_token(token.into(), "loop prompt bundle token", 96)?;
+        Self::new(format!("prompt:{}:{token}", context.run_id))
+    }
+
+    pub(crate) fn fresh_for_run(context: &LoopRunContext) -> Self {
+        Self(format!(
+            "prompt:{}:{}",
+            context.run_id,
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_for_run(&self, context: &LoopRunContext) -> bool {
+        self.0.starts_with(&format!("prompt:{}:", context.run_id))
+    }
+}
+
+impl AsRef<str> for LoopPromptBundleRef {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for LoopPromptBundleRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LoopPromptBundleRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct LoopSafeSummary(String);
@@ -157,6 +301,10 @@ pub struct LoopSafeSummary(String);
 impl LoopSafeSummary {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         validate_loop_safe_summary(value.into()).map(Self)
+    }
+
+    pub fn model_gateway_failed() -> Self {
+        Self("model gateway failed".to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -411,7 +559,7 @@ pub struct CapabilitySurfaceVersion(String);
 
 impl CapabilitySurfaceVersion {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
-        validate_bounded_loop_string(value.into(), "capability surface version", 128).map(Self)
+        validate_loop_safe_identifier(value.into(), "capability surface version", 128).map(Self)
     }
 
     pub fn as_str(&self) -> &str {
@@ -452,6 +600,68 @@ pub struct LoopModelRequest {
 pub struct LoopModelMessage {
     pub role: String,
     pub content_ref: LoopMessageRef,
+}
+
+/// Prompt construction mode requested by an agent-loop driver.
+///
+/// `TextOnly` builds a prompt from transcript/context message refs and is the
+/// only mode supported by [`crate::run_profile::HostManagedLoopPromptPort`]
+/// today. `CodeAct` is reserved for a future checkpoint/tool-aware prompt
+/// bundle flow and is rejected by the text-only host port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptMode {
+    TextOnly,
+    #[serde(rename = "codeact")]
+    CodeAct,
+}
+
+impl PromptMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TextOnly => "text_only",
+            Self::CodeAct => "codeact",
+        }
+    }
+}
+
+/// Request for a host-managed prompt bundle.
+///
+/// The optional cursor and checkpoint refs are run-scoped and are validated by
+/// host ports before context is loaded. `max_messages` is a host budget hint;
+/// zero is rejected and oversized values may be clamped by the implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopPromptBundleRequest {
+    pub mode: PromptMode,
+    pub context_cursor: Option<LoopInputCursor>,
+    pub surface_version: Option<CapabilitySurfaceVersion>,
+    pub checkpoint_state_ref: Option<LoopCheckpointStateRef>,
+    pub max_messages: Option<u32>,
+}
+
+/// Prompt bundle returned to a driver.
+///
+/// The bundle carries model-message references rather than raw prompt text.
+/// Drivers pass these refs to [`LoopModelPort`], allowing the host to resolve
+/// content under the same run scope and policy checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopPromptBundle {
+    pub bundle_ref: LoopPromptBundleRef,
+    pub messages: Vec<LoopModelMessage>,
+    pub surface_version: Option<CapabilitySurfaceVersion>,
+}
+
+/// Host boundary for building prompt bundles before model invocation.
+///
+/// Implementations own context loading, scoping, prompt-shape policy, and
+/// milestone emission. Drivers should not assemble raw prompt strings when a
+/// prompt port is available.
+#[async_trait]
+pub trait LoopPromptPort: Send + Sync {
+    async fn build_prompt_bundle(
+        &self,
+        request: LoopPromptBundleRequest,
+    ) -> Result<LoopPromptBundle, AgentLoopHostError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,6 +943,7 @@ pub trait LoopProgressPort: Send + Sync {
 pub trait AgentLoopDriverHost:
     LoopRunInfoPort
     + LoopContextPort
+    + LoopPromptPort
     + LoopInputPort
     + LoopModelPort
     + LoopCapabilityPort
@@ -747,6 +958,7 @@ pub trait AgentLoopDriverHost:
 impl<T> AgentLoopDriverHost for T where
     T: LoopRunInfoPort
         + LoopContextPort
+        + LoopPromptPort
         + LoopInputPort
         + LoopModelPort
         + LoopCapabilityPort

@@ -63,6 +63,50 @@ fn reborn_crate_dependency_boundaries_hold() {
 }
 
 #[test]
+fn reborn_cli_binary_crate_stays_separate_from_v1_root() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+    let dependencies = packages
+        .iter()
+        .filter_map(package_dependencies)
+        .collect::<HashMap<_, _>>();
+
+    let root = workspace_root();
+    let manifest_path = root.join("crates/ironclaw_reborn_cli/Cargo.toml");
+    assert!(
+        manifest_path.exists(),
+        "Reborn should ship as a separate binary crate at {}",
+        manifest_path.display()
+    );
+
+    let manifest =
+        std::fs::read_to_string(&manifest_path).expect("Reborn CLI manifest must be readable");
+    assert!(
+        manifest.contains("name = \"ironclaw_reborn_cli\""),
+        "Reborn CLI crate package name should be ironclaw_reborn_cli"
+    );
+    assert!(
+        manifest.contains("[[bin]]") && manifest.contains("name = \"ironclaw-reborn\""),
+        "Reborn CLI crate must declare the ironclaw-reborn binary explicitly"
+    );
+    let actual_workspace_deps = dependencies
+        .get("ironclaw_reborn_cli")
+        .expect("ironclaw_reborn_cli must be in cargo metadata")
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_workspace_deps = ["ironclaw_reborn".to_string()]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        actual_workspace_deps, expected_workspace_deps,
+        "ironclaw_reborn_cli should enter Reborn through ironclaw_reborn only; add explicit architectural justification before depending on other workspace crates"
+    );
+}
+
+#[test]
 fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
     let root = workspace_root();
     let lib = std::fs::read_to_string(root.join("crates/ironclaw_host_runtime/src/lib.rs"))
@@ -125,6 +169,43 @@ fn reborn_turns_public_surface_keeps_runner_api_explicit() {
             "ironclaw_turns public prelude must not re-export trusted runner transition API `{pattern}`; adapters must import ironclaw_turns::runner explicitly"
         );
     }
+}
+
+#[test]
+fn reborn_loop_support_llm_wiring_stays_out_of_root_src() {
+    let root = workspace_root();
+    let root_lib =
+        std::fs::read_to_string(root.join("src/lib.rs")).expect("root src/lib.rs must be readable");
+    assert!(
+        !root_lib.contains("pub mod reborn_loop_support;"),
+        "Reborn loop LLM wiring must live under crates/ironclaw_reborn, not root src/lib.rs"
+    );
+    assert!(
+        !root.join("src/reborn_loop_support.rs").exists(),
+        "Reborn loop LLM wiring must not live under root src/"
+    );
+
+    let reborn_gateway = root.join("crates/ironclaw_reborn/src/model_gateway.rs");
+    assert!(
+        reborn_gateway.exists(),
+        "expected Reborn LLM gateway wiring at {}",
+        reborn_gateway.display()
+    );
+    let reborn_gateway_source = std::fs::read_to_string(&reborn_gateway)
+        .expect("Reborn model gateway source must be readable");
+    assert!(
+        reborn_gateway_source.contains("LlmProviderModelGateway"),
+        "Reborn LLM gateway wiring should expose LlmProviderModelGateway from crates/ironclaw_reborn"
+    );
+
+    let reborn_manifest = std::fs::read_to_string(root.join("crates/ironclaw_reborn/Cargo.toml"))
+        .expect("Reborn manifest must be readable");
+    assert!(
+        reborn_manifest.contains("optional = true")
+            && reborn_manifest.contains("default-features = false")
+            && reborn_manifest.contains("root-llm-provider"),
+        "ironclaw_reborn may reuse root LLM code only behind an explicit feature, without enabling the root app's default postgres/libsql/tui feature set"
+    );
 }
 
 #[test]
@@ -329,6 +410,16 @@ struct BoundaryRule {
 
 fn boundary_rules() -> Vec<BoundaryRule> {
     vec![
+        BoundaryRule {
+            crate_name: "ironclaw_reborn_cli",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_engine",
+                "ironclaw_gateway",
+                "ironclaw_skills",
+                "ironclaw_tui",
+            ],
+        },
         BoundaryRule {
             crate_name: "ironclaw_filesystem",
             forbidden: vec![
