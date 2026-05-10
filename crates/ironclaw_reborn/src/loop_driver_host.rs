@@ -8,9 +8,10 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_host_api::{
     CapabilityId, CorrelationId, ExecutionContext, ExtensionId, InvocationId, ResourceEstimate,
+    sha256_digest_token,
 };
 use ironclaw_host_runtime::{
-    HostRuntime, HostRuntimeError, RuntimeBlockedReason, RuntimeCapabilityOutcome,
+    HostRuntime, HostRuntimeError, IdempotencyKey, RuntimeBlockedReason, RuntimeCapabilityOutcome,
     RuntimeCapabilityRequest, RuntimeFailureKind,
 };
 use ironclaw_loop_support::{
@@ -25,14 +26,14 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDescriptorView, CapabilityFailure, CapabilityInvocation, CapabilityOutcome,
-        CapabilityResultMessage, FinalizeAssistantMessage, HostManagedLoopPromptPort,
+        CapabilityResultMessage, CapabilitySurfaceVersion, FinalizeAssistantMessage,
         LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
         LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest,
-        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
-        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
-        LoopTranscriptPort, ProcessHandleSummary, UpdateAssistantDraft, VisibleCapabilityRequest,
-        VisibleCapabilitySurface,
+        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelMessage, LoopModelPort,
+        LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
+        LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort,
+        LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ProcessHandleSummary,
+        PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -75,6 +76,79 @@ pub struct RebornLoopDriverHostRequest {
     pub loop_run_context: LoopRunContext,
 }
 
+const DEFAULT_TEXT_ONLY_MESSAGE_LIMIT: usize = 32;
+const MAX_TEXT_ONLY_MESSAGE_LIMIT: usize = 128;
+
+#[derive(Default)]
+struct CapabilitySurfaceState {
+    current: Mutex<Option<CapabilitySurfaceVersion>>,
+}
+
+impl CapabilitySurfaceState {
+    fn set_current(&self, version: CapabilitySurfaceVersion) -> Result<(), AgentLoopHostError> {
+        let mut current = self.current.lock().map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "capability surface state is unavailable",
+            )
+        })?;
+        *current = Some(version);
+        Ok(())
+    }
+
+    fn current(&self) -> Result<Option<CapabilitySurfaceVersion>, AgentLoopHostError> {
+        self.current
+            .lock()
+            .map(|current| current.clone())
+            .map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "capability surface state is unavailable",
+                )
+            })
+    }
+}
+
+struct SurfaceTrackingLoopCapabilityPort {
+    inner: Arc<dyn LoopCapabilityPort>,
+    surface_state: Arc<CapabilitySurfaceState>,
+}
+
+impl SurfaceTrackingLoopCapabilityPort {
+    fn new(inner: Arc<dyn LoopCapabilityPort>, surface_state: Arc<CapabilitySurfaceState>) -> Self {
+        Self {
+            inner,
+            surface_state,
+        }
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityPort for SurfaceTrackingLoopCapabilityPort {
+    async fn visible_capabilities(
+        &self,
+        request: VisibleCapabilityRequest,
+    ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        let surface = self.inner.visible_capabilities(request).await?;
+        self.surface_state.set_current(surface.version.clone())?;
+        Ok(surface)
+    }
+
+    async fn invoke_capability(
+        &self,
+        request: CapabilityInvocation,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        self.inner.invoke_capability(request).await
+    }
+
+    async fn invoke_capability_batch(
+        &self,
+        request: CapabilityBatchInvocation,
+    ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+        self.inner.invoke_capability_batch(request).await
+    }
+}
+
 #[async_trait]
 pub trait LoopCapabilityInputResolver: Send + Sync {
     async fn resolve_capability_input(
@@ -113,6 +187,7 @@ pub struct HostRuntimeLoopCapabilityPort {
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
     snapshots: Mutex<HashMap<String, SurfaceSnapshot>>,
+    dispatch_records: Mutex<HashMap<String, Result<CapabilityOutcome, AgentLoopHostError>>>,
 }
 
 impl HostRuntimeLoopCapabilityPort {
@@ -131,6 +206,7 @@ impl HostRuntimeLoopCapabilityPort {
             result_writer,
             milestone_sink: None,
             snapshots: Mutex::new(HashMap::new()),
+            dispatch_records: Mutex::new(HashMap::new()),
         }
     }
 
@@ -155,6 +231,39 @@ impl HostRuntimeLoopCapabilityPort {
                 "capability surface is stale or unknown",
             )
         })
+    }
+
+    fn cached_dispatch(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<Result<CapabilityOutcome, AgentLoopHostError>>, AgentLoopHostError> {
+        self.dispatch_records
+            .lock()
+            .map(|records| records.get(key.as_str()).cloned())
+            .map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "capability dispatch record store is unavailable",
+                )
+            })
+    }
+
+    fn record_dispatch(
+        &self,
+        key: &IdempotencyKey,
+        result: Result<CapabilityOutcome, AgentLoopHostError>,
+    ) -> Result<(), AgentLoopHostError> {
+        self.dispatch_records
+            .lock()
+            .map(|mut records| {
+                records.insert(key.as_str().to_string(), result);
+            })
+            .map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "capability dispatch record store is unavailable",
+                )
+            })
     }
 
     async fn emit_capability_invoked(
@@ -242,25 +351,47 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                 safe_summary: "capability provider trust is unavailable".to_string(),
             }));
         };
+        let idempotency_key = invocation_idempotency_key(&self.run_context, &request)?;
+        if let Some(cached) = self.cached_dispatch(&idempotency_key)? {
+            return cached;
+        }
         let input = self
             .input_resolver
             .resolve_capability_input(&self.run_context, &request.input_ref)
             .await?;
+        let requested_capability_id = request.capability_id.clone();
 
         self.emit_capability_invoked(request.capability_id.clone())
             .await?;
         let outcome = self
             .runtime
-            .invoke_capability(RuntimeCapabilityRequest::new(
-                invocation_context_from_visible(&self.visible_request.context),
-                request.capability_id,
-                capability.estimate,
-                input,
-                trust_decision,
-            ))
+            .invoke_capability(
+                RuntimeCapabilityRequest::new(
+                    invocation_context_from_visible(&self.visible_request.context),
+                    request.capability_id,
+                    capability.estimate,
+                    input,
+                    trust_decision,
+                )
+                .with_idempotency_key(idempotency_key.clone()),
+            )
             .await
             .map_err(host_runtime_error)?;
-        runtime_outcome_to_loop(&self.run_context, self.result_writer.as_ref(), outcome).await
+        let should_cache = matches!(
+            outcome,
+            RuntimeCapabilityOutcome::Completed(_) | RuntimeCapabilityOutcome::SpawnedProcess(_)
+        );
+        let result = runtime_outcome_to_loop(
+            &self.run_context,
+            self.result_writer.as_ref(),
+            &requested_capability_id,
+            outcome,
+        )
+        .await;
+        if should_cache {
+            self.record_dispatch(&idempotency_key, result.clone())?;
+        }
+        result
     }
 
     async fn invoke_capability_batch(
@@ -296,6 +427,24 @@ fn invocation_context_from_visible(base: &ExecutionContext) -> ExecutionContext 
     context
 }
 
+fn invocation_idempotency_key(
+    run_context: &LoopRunContext,
+    request: &CapabilityInvocation,
+) -> Result<IdempotencyKey, AgentLoopHostError> {
+    let payload = format!(
+        "loop-capability\nrun={}\nsurface={}\ncapability={}\ninput={}",
+        run_context.run_id,
+        request.surface_version.as_str(),
+        request.capability_id.as_str(),
+        request.input_ref.as_str()
+    );
+    IdempotencyKey::new(format!(
+        "loop-capability:{}",
+        sha256_digest_token(payload.as_bytes())
+    ))
+    .map_err(host_runtime_error)
+}
+
 fn loop_surface_version(
     version: &str,
 ) -> Result<ironclaw_turns::run_profile::CapabilitySurfaceVersion, AgentLoopHostError> {
@@ -310,8 +459,10 @@ fn loop_surface_version(
 async fn runtime_outcome_to_loop(
     run_context: &LoopRunContext,
     result_writer: &(dyn LoopCapabilityResultWriter + Send + Sync),
+    requested_capability_id: &CapabilityId,
     outcome: RuntimeCapabilityOutcome,
 ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+    ensure_runtime_outcome_matches(requested_capability_id, &outcome)?;
     Ok(match outcome {
         RuntimeCapabilityOutcome::Completed(completed) => {
             let result_ref = result_writer
@@ -376,6 +527,28 @@ async fn runtime_outcome_to_loop(
     })
 }
 
+fn ensure_runtime_outcome_matches(
+    expected: &CapabilityId,
+    outcome: &RuntimeCapabilityOutcome,
+) -> Result<(), AgentLoopHostError> {
+    let actual = match outcome {
+        RuntimeCapabilityOutcome::Completed(completed) => &completed.capability_id,
+        RuntimeCapabilityOutcome::ApprovalRequired(gate) => &gate.capability_id,
+        RuntimeCapabilityOutcome::AuthRequired(gate) => &gate.capability_id,
+        RuntimeCapabilityOutcome::ResourceBlocked(gate) => &gate.capability_id,
+        RuntimeCapabilityOutcome::SpawnedProcess(process) => &process.capability_id,
+        RuntimeCapabilityOutcome::Failed(failure) => &failure.capability_id,
+        _ => return Ok(()),
+    };
+    if actual != expected {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "host runtime returned outcome for a different capability",
+        ));
+    }
+    Ok(())
+}
+
 fn runtime_safe_summary(message: Option<String>, fallback: &'static str) -> String {
     message
         .and_then(|summary| LoopSafeSummary::new(summary).ok())
@@ -416,6 +589,172 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
             AgentLoopHostErrorKind::Unavailable,
             "host runtime capability service failed",
         ),
+    }
+}
+
+struct SurfaceAwareLoopPromptPort {
+    context: LoopRunContext,
+    context_port: Arc<dyn LoopContextPort>,
+    milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+    default_message_limit: usize,
+    surface_state: Arc<CapabilitySurfaceState>,
+}
+
+impl SurfaceAwareLoopPromptPort {
+    fn new(
+        context: LoopRunContext,
+        context_port: Arc<dyn LoopContextPort>,
+        milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+        surface_state: Arc<CapabilitySurfaceState>,
+    ) -> Self {
+        Self {
+            context,
+            context_port,
+            milestone_sink,
+            default_message_limit: DEFAULT_TEXT_ONLY_MESSAGE_LIMIT,
+            surface_state,
+        }
+    }
+
+    fn with_default_message_limit(mut self, default_message_limit: usize) -> Self {
+        self.default_message_limit = default_message_limit.clamp(1, MAX_TEXT_ONLY_MESSAGE_LIMIT);
+        self
+    }
+
+    fn validate_request(
+        &self,
+        request: &LoopPromptBundleRequest,
+    ) -> Result<(), AgentLoopHostError> {
+        if request.mode != PromptMode::TextOnly {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::PolicyDenied,
+                "prompt mode is not supported by the text-only prompt port",
+            ));
+        }
+
+        if request
+            .context_cursor
+            .as_ref()
+            .is_some_and(|cursor| !cursor.is_for_run(&self.context))
+        {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "prompt context cursor is not scoped to this loop run",
+            ));
+        }
+
+        if let Some(surface_version) = request.surface_version.as_ref() {
+            let Some(current_surface_version) = self.surface_state.current()? else {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "prompt surface version cannot be validated by this prompt port",
+                ));
+            };
+            if surface_version != &current_surface_version {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::StaleSurface,
+                    "prompt surface version is stale or unknown",
+                ));
+            }
+        }
+
+        if let Some(state_ref) = request.checkpoint_state_ref.as_ref() {
+            let run_prefix = format!("checkpoint:{}:", self.context.run_id);
+            if !state_ref.as_str().starts_with(&run_prefix) {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::ScopeMismatch,
+                    "prompt checkpoint state ref is not scoped to this loop run",
+                ));
+            }
+            if !state_ref.is_for_run(&self.context) {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "prompt checkpoint state ref is malformed",
+                ));
+            }
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "checkpoint prompt state is not supported by the text-only prompt port",
+            ));
+        }
+
+        if matches!(request.max_messages, Some(0)) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::BudgetExceeded,
+                "prompt message limit must be greater than zero",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn message_limit(&self, request: &LoopPromptBundleRequest) -> usize {
+        request
+            .max_messages
+            .map(|messages| messages as usize)
+            .unwrap_or(self.default_message_limit)
+            .clamp(1, MAX_TEXT_ONLY_MESSAGE_LIMIT)
+    }
+
+    fn ensure_supported_context_shape(
+        context: &LoopContextBundle,
+    ) -> Result<(), AgentLoopHostError> {
+        if !context.instruction_snippets.is_empty() || !context.memory_snippets.is_empty() {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::PolicyDenied,
+                "text-only prompt port cannot materialize instruction or memory snippets",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LoopPromptPort for SurfaceAwareLoopPromptPort {
+    async fn build_prompt_bundle(
+        &self,
+        request: LoopPromptBundleRequest,
+    ) -> Result<LoopPromptBundle, AgentLoopHostError> {
+        self.validate_request(&request)?;
+        let context = self
+            .context_port
+            .load_loop_context(LoopContextRequest {
+                after: request.context_cursor.clone(),
+                limit: self.message_limit(&request),
+            })
+            .await?;
+        Self::ensure_supported_context_shape(&context)?;
+        let messages = context
+            .messages
+            .into_iter()
+            .map(|message| LoopModelMessage {
+                role: message.role,
+                content_ref: message.message_ref,
+            })
+            .collect::<Vec<_>>();
+        let bundle = LoopPromptBundle {
+            bundle_ref: LoopPromptBundleRef::for_run(
+                &self.context,
+                CorrelationId::new().to_string(),
+            )
+            .map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Internal,
+                    "loop prompt bundle ref could not be represented",
+                )
+            })?,
+            messages,
+            surface_version: request.surface_version.clone(),
+        };
+        LoopHostMilestoneEmitter::new(self.context.clone(), Arc::clone(&self.milestone_sink))
+            .prompt_bundle_built(
+                bundle.bundle_ref.clone(),
+                request.mode,
+                bundle.surface_version.clone(),
+                bundle.messages.len(),
+            )
+            .await?;
+        Ok(bundle)
     }
 }
 
@@ -482,21 +821,24 @@ where
             run_context.clone(),
             max_messages,
         ));
-        let current_surface_version = capabilities
+        let surface_state = Arc::new(CapabilitySurfaceState::default());
+        let capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
+            SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
+        );
+        capabilities
             .visible_capabilities(VisibleCapabilityRequest)
             .await
             .map_err(|error| RebornLoopDriverHostError::InvalidRequest {
                 reason: error.safe_summary,
-            })?
-            .version;
+            })?;
         let prompt: Arc<dyn LoopPromptPort> = Arc::new(
-            HostManagedLoopPromptPort::new(
+            SurfaceAwareLoopPromptPort::new(
                 run_context.clone(),
                 Arc::clone(&context),
                 Arc::clone(&self.milestone_sink),
+                surface_state,
             )
-            .with_default_message_limit(max_messages)
-            .with_current_surface_version(current_surface_version),
+            .with_default_message_limit(max_messages),
         );
         let input: Arc<dyn LoopInputPort> =
             Arc::new(NoExtraLoopInputPort::new(run_context.clone()));

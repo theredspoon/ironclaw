@@ -910,6 +910,180 @@ async fn text_only_host_sanitizes_runtime_failure_message_before_driver_output()
 }
 
 #[tokio::test]
+async fn text_only_host_prompt_accepts_refetched_surface_version() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-prompt-refetch", "hello").await;
+    let first_id = CapabilityId::new("demo.echo").unwrap();
+    let second_id = CapabilityId::new("demo.other").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(
+        host_runtime_surface_with_version(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            [capability_descriptor(first_id.as_str())],
+        ),
+    ));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+
+    runtime.set_surface(host_runtime_surface_with_version(
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        [capability_descriptor(second_id.as_str())],
+    ));
+    let refreshed_surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let prompt = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: Some(refreshed_surface.version.clone()),
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(prompt.surface_version, Some(refreshed_surface.version));
+}
+
+#[tokio::test]
+async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_retry() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-idempotency", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"write": "fails"}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"duplicate": true}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    io.fail_result_writes();
+    let input_ref = CapabilityInputRef::new("input:idempotent-request").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "once"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let invocation = CapabilityInvocation {
+        surface_version: surface.version,
+        capability_id: capability_id.clone(),
+        input_ref,
+    };
+
+    let first = host
+        .invoke_capability(invocation.clone())
+        .await
+        .unwrap_err();
+    let second = host.invoke_capability(invocation).await.unwrap_err();
+
+    assert_eq!(first.kind, AgentLoopHostErrorKind::Unavailable);
+    assert_eq!(second.kind, AgentLoopHostErrorKind::Unavailable);
+    let invocations = runtime.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert!(invocations[0].idempotency_key.is_some());
+}
+
+#[tokio::test]
+async fn text_only_host_rejects_runtime_outcome_for_different_capability() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-mismatch", "hello").await;
+    let requested_id = CapabilityId::new("demo.echo").unwrap();
+    let returned_id = CapabilityId::new("demo.other").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(requested_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: returned_id,
+            output: json!({"wrong": true}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:mismatch-request").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "mismatch"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime,
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io.clone(),
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let error = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: requested_id,
+            input_ref,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::Internal);
+    assert!(io.results().is_empty());
+}
+
+#[tokio::test]
 async fn text_only_host_rejects_previous_surface_after_refetch() {
     let fixture = HostFixture::new("thread-host-runtime-capability-refetch", "hello").await;
     let first_id = CapabilityId::new("demo.echo").unwrap();
@@ -1017,6 +1191,7 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
 struct InMemoryCapabilityIo {
     inputs: Mutex<BTreeMap<String, Value>>,
     results: Mutex<Vec<(CapabilityId, Value)>>,
+    fail_result_writes: Mutex<bool>,
 }
 
 impl InMemoryCapabilityIo {
@@ -1029,6 +1204,10 @@ impl InMemoryCapabilityIo {
 
     fn results(&self) -> Vec<(CapabilityId, Value)> {
         self.results.lock().unwrap().clone()
+    }
+
+    fn fail_result_writes(&self) {
+        *self.fail_result_writes.lock().unwrap() = true;
     }
 }
 
@@ -1061,6 +1240,12 @@ impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
         capability_id: &CapabilityId,
         output: Value,
     ) -> Result<LoopResultRef, AgentLoopHostError> {
+        if *self.fail_result_writes.lock().unwrap() {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "capability result writer is unavailable",
+            ));
+        }
         self.results
             .lock()
             .unwrap()
