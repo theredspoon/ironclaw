@@ -1,10 +1,11 @@
 use ironclaw_authorization::TrustAwareCapabilityDispatchAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
 use ironclaw_host_api::{
-    CapabilityDescriptor, Decision, EffectKind, ResourceEstimate, RuntimeKind,
+    CapabilityDescriptor, CapabilityGrant, Decision, EffectKind, ResourceEstimate, RuntimeKind,
+    canonical_json_v1, sha256_digest_token,
 };
 use ironclaw_trust::TrustDecision;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     CapabilitySurfaceVersion, HostRuntimeError, VisibleCapabilityRequest, VisibleCapabilitySurface,
@@ -37,21 +38,22 @@ const ALL_EFFECT_KINDS: &[EffectKind] = &[
 /// Visibility-only policy applied before authorization estimates are rendered.
 ///
 /// This is a narrowing surface policy, not an authority source. A runtime/effect
-/// listed here can still be omitted by missing grants, denied trust ceilings, or
-/// an authorizer denial. A runtime/effect absent here is omitted before the
-/// authorizer is consulted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// listed here can still be omitted by missing grants, missing provider trust,
+/// denied trust ceilings, or an authorizer denial. A runtime/effect absent here
+/// is omitted before the authorizer is consulted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CapabilitySurfacePolicy {
     /// Runtime kinds that may appear on this projection.
     ///
-    /// Order and duplicates do not affect filtering or surface-version
-    /// fingerprinting.
+    /// Empty means allow none. Order and duplicates do not affect filtering or
+    /// surface-version fingerprinting.
     pub allowed_runtimes: Vec<RuntimeKind>,
     /// Effect ceiling for visible descriptors.
     ///
     /// This is strict subset semantics: every effect declared by a capability
-    /// must appear in this list or the capability is omitted. Order and
-    /// duplicates do not affect filtering or surface-version fingerprinting.
+    /// must appear in this list or the capability is omitted. Empty means allow
+    /// none. Order and duplicates do not affect filtering or surface-version
+    /// fingerprinting.
     pub allowed_effects: Vec<EffectKind>,
     /// Whether capabilities that require approval may be rendered as askable.
     ///
@@ -81,12 +83,6 @@ impl CapabilitySurfacePolicy {
         effects
             .iter()
             .all(|effect| self.allowed_effects.contains(effect))
-    }
-}
-
-impl Default for CapabilitySurfacePolicy {
-    fn default() -> Self {
-        Self::allow_all()
     }
 }
 
@@ -134,20 +130,17 @@ impl<'a> CapabilityCatalog<'a> {
         }
     }
 
-    pub(crate) async fn visible_capabilities<'b>(
+    pub(crate) async fn visible_capabilities(
         &self,
         request: VisibleCapabilityRequest,
-        mut trust_decision_for: impl FnMut(&'b CapabilityDescriptor) -> Option<TrustDecision>,
-    ) -> Result<VisibleCapabilitySurface, HostRuntimeError>
-    where
-        'a: 'b,
-    {
+    ) -> Result<VisibleCapabilitySurface, HostRuntimeError> {
         request.context.validate().map_err(|error| {
             HostRuntimeError::invalid_request(format!("invalid execution context: {error}"))
         })?;
 
         let max_capabilities = request.policy.max_capabilities.unwrap_or(usize::MAX);
         let mut capabilities = Vec::new();
+        let mut context = request.context.clone();
         for descriptor in self.registry.capabilities() {
             if capabilities.len() >= max_capabilities {
                 break;
@@ -157,7 +150,7 @@ impl<'a> CapabilityCatalog<'a> {
             {
                 continue;
             }
-            let Some(trust_decision) = trust_decision_for(descriptor) else {
+            let Some(trust_decision) = request.provider_trust.get(&descriptor.provider) else {
                 continue;
             };
             let estimate = descriptor
@@ -165,12 +158,11 @@ impl<'a> CapabilityCatalog<'a> {
                 .as_ref()
                 .map(|profile| profile.default_estimate.clone())
                 .unwrap_or_default();
-            let mut context = request.context.clone();
             context.trust = trust_decision.effective_trust.class();
 
             let access = match self
                 .authorizer
-                .authorize_dispatch_with_trust(&context, descriptor, &estimate, &trust_decision)
+                .authorize_dispatch_with_trust(&context, descriptor, &estimate, trust_decision)
                 .await
             {
                 Decision::Allow { .. } => VisibleCapabilityAccess::Available,
@@ -188,14 +180,9 @@ impl<'a> CapabilityCatalog<'a> {
         }
 
         let version = surface_version(self.base_version, &request, &capabilities)?;
-        let descriptors = capabilities
-            .iter()
-            .map(|capability| capability.descriptor.clone())
-            .collect();
         Ok(VisibleCapabilitySurface {
             version,
             capabilities,
-            descriptors,
         })
     }
 }
@@ -205,16 +192,22 @@ fn surface_version(
     request: &VisibleCapabilityRequest,
     capabilities: &[VisibleCapability],
 ) -> Result<CapabilitySurfaceVersion, HostRuntimeError> {
+    let context_payload = context_version_payload(request)?;
     let mut capability_payload = capabilities
         .iter()
         .map(|capability| {
             let descriptor = canonical_descriptor_for_version(&capability.descriptor);
+            let trust = request
+                .provider_trust
+                .get(&capability.descriptor.provider)
+                .map(trust_decision_version_payload);
             (
                 capability_version_key(capability),
                 json!({
                     "descriptor": descriptor,
                     "estimated_resources": &capability.estimated_resources,
                     "access": access_token(capability.access),
+                    "provider_trust": trust,
                 }),
             )
         })
@@ -225,8 +218,11 @@ fn surface_version(
         .map(|(_, payload)| payload)
         .collect::<Vec<_>>();
     let payload = json!({
+        "version": 1,
+        "kind": "visible_capability_surface",
         "base_version": base_version.as_str(),
         "surface_kind": request.surface_kind.as_str(),
+        "context": context_payload,
         "policy": {
             "allowed_runtimes": canonical_runtime_kinds(&request.policy.allowed_runtimes),
             "allowed_effects": canonical_effect_kinds(&request.policy.allowed_effects),
@@ -235,9 +231,57 @@ fn surface_version(
         },
         "capabilities": capability_payload,
     });
-    let canonical = serde_json::to_vec(&payload)
+    let canonical = canonical_json_v1(&payload).map_err(host_api_error)?;
+    let bytes = serde_json::to_vec(&canonical)
         .map_err(|error| HostRuntimeError::invalid_request(error.to_string()))?;
-    CapabilitySurfaceVersion::new(format!("surface-fnv1a-{:016x}", fnv1a64(&canonical)))
+    CapabilitySurfaceVersion::new(sha256_digest_token(&bytes))
+}
+
+fn context_version_payload(request: &VisibleCapabilityRequest) -> Result<Value, HostRuntimeError> {
+    let context = &request.context;
+    Ok(json!({
+        "tenant_id": &context.tenant_id,
+        "user_id": &context.user_id,
+        "agent_id": &context.agent_id,
+        "project_id": &context.project_id,
+        "mission_id": &context.mission_id,
+        "thread_id": &context.thread_id,
+        "extension_id": &context.extension_id,
+        "runtime": context.runtime,
+        "grants": canonical_grants(&context.grants.grants)?,
+    }))
+}
+
+fn canonical_grants(grants: &[CapabilityGrant]) -> Result<Vec<Value>, HostRuntimeError> {
+    let mut payload = grants
+        .iter()
+        .map(|grant| {
+            let value = json!({
+                "capability": &grant.capability,
+                "grantee": &grant.grantee,
+                "allowed_effects": canonical_effect_kinds(&grant.constraints.allowed_effects),
+                "resource_ceiling": &grant.constraints.resource_ceiling,
+                "expires_at": &grant.constraints.expires_at,
+                "max_invocations": grant.constraints.max_invocations,
+                "secret_count": grant.constraints.secrets.len(),
+            });
+            let canonical = canonical_json_v1(&value).map_err(host_api_error)?;
+            let key = stable_json_string(&canonical)?;
+            Ok((key, canonical))
+        })
+        .collect::<Result<Vec<_>, HostRuntimeError>>()?;
+    payload.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(payload.into_iter().map(|(_, value)| value).collect())
+}
+
+fn trust_decision_version_payload(trust_decision: &TrustDecision) -> Value {
+    json!({
+        "effective_trust": &trust_decision.effective_trust,
+        "authority_ceiling": {
+            "allowed_effects": canonical_effect_kinds(&trust_decision.authority_ceiling.allowed_effects),
+            "max_resource_ceiling": &trust_decision.authority_ceiling.max_resource_ceiling,
+        },
+    })
 }
 
 fn canonical_descriptor_for_version(descriptor: &CapabilityDescriptor) -> CapabilityDescriptor {
@@ -315,11 +359,11 @@ fn access_token(access: VisibleCapabilityAccess) -> &'static str {
     }
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+fn stable_json_string(value: &Value) -> Result<String, HostRuntimeError> {
+    serde_json::to_string(value)
+        .map_err(|error| HostRuntimeError::invalid_request(error.to_string()))
+}
+
+fn host_api_error(error: ironclaw_host_api::HostApiError) -> HostRuntimeError {
+    HostRuntimeError::invalid_request(error.to_string())
 }

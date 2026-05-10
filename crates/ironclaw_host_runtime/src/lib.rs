@@ -25,9 +25,8 @@
 
 use async_trait::async_trait;
 use ironclaw_host_api::{
-    ApprovalRequestId, CapabilityDescriptor, CapabilityId, CorrelationId, ExecutionContext,
-    NetworkPolicy, ProcessId, ResourceEstimate, ResourceScope, ResourceUsage, RuntimeKind,
-    SecretHandle,
+    ApprovalRequestId, CapabilityId, CorrelationId, ExecutionContext, ExtensionId, NetworkPolicy,
+    ProcessId, ResourceEstimate, ResourceScope, ResourceUsage, RuntimeKind, SecretHandle,
 };
 use ironclaw_host_api::{
     RuntimeCredentialInjection, RuntimeCredentialSource, RuntimeCredentialTarget,
@@ -42,7 +41,7 @@ use ironclaw_secrets::{SecretMaterial, SecretStore, SecretStoreError};
 use ironclaw_trust::TrustDecision;
 use secrecy::ExposeSecret;
 use serde_json::Value;
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
 mod obligations;
@@ -357,6 +356,12 @@ pub struct VisibleCapabilityRequest {
     /// cache/version dimension; deciding which surface labels a given caller
     /// may request is an upper-layer concern.
     pub surface_kind: SurfaceKind,
+    /// Caller/host-supplied trust decisions keyed by capability provider.
+    ///
+    /// `DefaultHostRuntime` does not evaluate trust while computing visibility;
+    /// missing provider trust fails closed by omitting that provider's
+    /// capabilities from the surface.
+    pub provider_trust: BTreeMap<ExtensionId, TrustDecision>,
     /// Upper/profile-supplied visibility ceiling. This only narrows what is
     /// shown; it never grants authority or bypasses invocation authorization.
     pub policy: CapabilitySurfacePolicy,
@@ -367,8 +372,17 @@ impl VisibleCapabilityRequest {
         Self {
             context,
             surface_kind,
+            provider_trust: BTreeMap::new(),
             policy: CapabilitySurfacePolicy::default(),
         }
+    }
+
+    pub fn with_provider_trust(
+        mut self,
+        provider_trust: BTreeMap<ExtensionId, TrustDecision>,
+    ) -> Self {
+        self.provider_trust = provider_trust;
+        self
     }
 
     pub fn with_policy(mut self, policy: CapabilitySurfacePolicy) -> Self {
@@ -392,9 +406,6 @@ pub struct VisibleCapabilitySurface {
     /// Typed visible capabilities, including access status and selected
     /// resource estimate.
     pub capabilities: Vec<VisibleCapability>,
-    /// Compatibility projection for existing prompt renderers. Entries are the
-    /// descriptors from [`Self::capabilities`] in the same filtered order.
-    pub descriptors: Vec<CapabilityDescriptor>,
 }
 
 /// Successful capability completion.

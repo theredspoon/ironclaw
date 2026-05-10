@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -11,9 +14,10 @@ use ironclaw_authorization::{
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry};
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
-    CancelReason, CancelRuntimeWorkRequest, CapabilitySurfaceVersion, DefaultHostRuntime,
-    HostRuntime, HostRuntimeError, IdempotencyKey, RuntimeBackendHealth, RuntimeCapabilityRequest,
-    RuntimeStatusRequest, RuntimeWorkId, SurfaceKind, VisibleCapabilityRequest,
+    CancelReason, CancelRuntimeWorkRequest, CapabilitySurfacePolicy, CapabilitySurfaceVersion,
+    DefaultHostRuntime, HostRuntime, HostRuntimeError, IdempotencyKey, RuntimeBackendHealth,
+    RuntimeCapabilityRequest, RuntimeStatusRequest, RuntimeWorkId, SurfaceKind,
+    VisibleCapabilityRequest,
 };
 use ironclaw_processes::{
     InMemoryProcessResultStore, InMemoryProcessStore, ProcessCancellationRegistry,
@@ -532,8 +536,8 @@ async fn default_runtime_visible_capabilities_returns_empty_descriptors_for_empt
         .unwrap();
 
     assert_ne!(surface.version.as_str(), "surface-v1");
+    assert!(surface.version.as_str().starts_with("sha256:"));
     assert!(surface.capabilities.is_empty());
-    assert!(surface.descriptors.is_empty());
 }
 
 #[tokio::test]
@@ -551,17 +555,14 @@ async fn default_runtime_returns_versioned_visible_surface_with_registry_descrip
 
     let context = execution_context_with_dispatch_grant();
     let surface = runtime
-        .visible_capabilities(VisibleCapabilityRequest::new(
-            context,
-            SurfaceKind::new("agent_loop").unwrap(),
-        ))
+        .visible_capabilities(visible_capability_request(context))
         .await
         .unwrap();
 
     assert_ne!(surface.version.as_str(), "surface-v1");
+    assert!(surface.version.as_str().starts_with("sha256:"));
     assert_eq!(surface.capabilities.len(), 1);
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].id, capability_id());
+    assert_eq!(surface.capabilities[0].descriptor.id, capability_id());
 }
 
 #[tokio::test]
@@ -1360,6 +1361,15 @@ fn execution_context_with_dispatch_grant() -> ExecutionContext {
         MountView::default(),
     )
     .unwrap()
+}
+
+fn visible_capability_request(context: ExecutionContext) -> VisibleCapabilityRequest {
+    VisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap())
+        .with_policy(CapabilitySurfacePolicy::allow_all())
+        .with_provider_trust(BTreeMap::from([(
+            extension_id(),
+            trust_decision_with_dispatch_authority(),
+        )]))
 }
 
 fn local_manifest_trust_policy() -> HostTrustPolicy {
