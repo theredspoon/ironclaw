@@ -964,29 +964,27 @@ async fn text_only_host_prompt_accepts_refetched_surface_version() {
 }
 
 #[tokio::test]
-async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_retry() {
-    let fixture = HostFixture::new("thread-host-runtime-capability-idempotency", "hello").await;
+async fn text_only_host_rejects_concurrent_duplicate_invocation_before_runtime() {
+    let fixture = HostFixture::new(
+        "thread-host-runtime-capability-concurrent-idempotency",
+        "hello",
+    )
+    .await;
     let capability_id = CapabilityId::new("demo.echo").unwrap();
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
         capability_descriptor(capability_id.as_str()),
     ])));
-    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
-        RuntimeCapabilityCompleted {
-            capability_id: capability_id.clone(),
-            output: json!({"write": "fails"}),
-            usage: ResourceUsage::default(),
-        },
-    )));
-    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
-        RuntimeCapabilityCompleted {
-            capability_id: capability_id.clone(),
-            output: json!({"duplicate": true}),
-            usage: ResourceUsage::default(),
-        },
-    )));
+    for output in [json!({"call": 1}), json!({"call": 2})] {
+        runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+            RuntimeCapabilityCompleted {
+                capability_id: capability_id.clone(),
+                output,
+                usage: ResourceUsage::default(),
+            },
+        )));
+    }
     let io = Arc::new(InMemoryCapabilityIo::default());
-    io.fail_result_writes();
-    let input_ref = CapabilityInputRef::new("input:idempotent-request").unwrap();
+    let input_ref = CapabilityInputRef::new("input:concurrent-idempotent-request").unwrap();
     io.put_input(input_ref.clone(), json!({"message": "once"}));
     let capability_port = HostRuntimeLoopCapabilityPort::new(
         runtime.clone(),
@@ -1016,17 +1014,126 @@ async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_ret
         input_ref,
     };
 
+    let (first, second) = tokio::join!(
+        host.invoke_capability(invocation.clone()),
+        host.invoke_capability(invocation)
+    );
+
+    let successes = [first.as_ref().ok(), second.as_ref().ok()]
+        .into_iter()
+        .flatten()
+        .filter(|outcome| matches!(outcome, CapabilityOutcome::Completed(_)))
+        .count();
+    assert_eq!(successes, 1);
+    assert_eq!(runtime.invocations().len(), 1);
+}
+
+#[tokio::test]
+async fn text_only_host_rejects_mismatched_capability_authority_context() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-scope-mismatch", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let mut visible_request = host_runtime_visible_request(&fixture, ["demo"]);
+    visible_request.context.tenant_id = TenantId::new("tenant-other").unwrap();
+    visible_request.context.resource_scope.tenant_id = visible_request.context.tenant_id.clone();
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        visible_request,
+        io.clone(),
+        io,
+    );
+
+    let error = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ironclaw_reborn::RebornLoopDriverHostError::InvalidRequest { .. }
+    ));
+    assert!(runtime.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_retry() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-idempotency", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"write": "fails"}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"duplicate": true}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    io.fail_next_result_write();
+    let input_ref = CapabilityInputRef::new("input:idempotent-request").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "once"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io.clone(),
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let invocation = CapabilityInvocation {
+        surface_version: surface.version,
+        capability_id: capability_id.clone(),
+        input_ref,
+    };
+
     let first = host
         .invoke_capability(invocation.clone())
         .await
         .unwrap_err();
-    let second = host.invoke_capability(invocation).await.unwrap_err();
+    let second = host.invoke_capability(invocation).await.unwrap();
 
     assert_eq!(first.kind, AgentLoopHostErrorKind::Unavailable);
-    assert_eq!(second.kind, AgentLoopHostErrorKind::Unavailable);
+    assert!(matches!(second, CapabilityOutcome::Completed(_)));
     let invocations = runtime.invocations();
     assert_eq!(invocations.len(), 1);
     assert!(invocations[0].idempotency_key.is_some());
+    assert_eq!(
+        io.results(),
+        vec![(capability_id, json!({"write": "fails"}))]
+    );
 }
 
 #[tokio::test]
@@ -1191,7 +1298,7 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
 struct InMemoryCapabilityIo {
     inputs: Mutex<BTreeMap<String, Value>>,
     results: Mutex<Vec<(CapabilityId, Value)>>,
-    fail_result_writes: Mutex<bool>,
+    fail_result_writes_remaining: Mutex<usize>,
 }
 
 impl InMemoryCapabilityIo {
@@ -1206,8 +1313,8 @@ impl InMemoryCapabilityIo {
         self.results.lock().unwrap().clone()
     }
 
-    fn fail_result_writes(&self) {
-        *self.fail_result_writes.lock().unwrap() = true;
+    fn fail_next_result_write(&self) {
+        *self.fail_result_writes_remaining.lock().unwrap() += 1;
     }
 }
 
@@ -1240,12 +1347,15 @@ impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
         capability_id: &CapabilityId,
         output: Value,
     ) -> Result<LoopResultRef, AgentLoopHostError> {
-        if *self.fail_result_writes.lock().unwrap() {
+        let mut remaining_failures = self.fail_result_writes_remaining.lock().unwrap();
+        if *remaining_failures > 0 {
+            *remaining_failures -= 1;
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Unavailable,
                 "capability result writer is unavailable",
             ));
         }
+        drop(remaining_failures);
         self.results
             .lock()
             .unwrap()
@@ -1298,6 +1408,7 @@ impl HostRuntime for RecordingHostRuntime {
         &self,
         request: RuntimeCapabilityRequest,
     ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+        tokio::task::yield_now().await;
         self.invocations.lock().unwrap().push(request);
         Ok(self.outcomes.lock().unwrap().remove(0))
     }

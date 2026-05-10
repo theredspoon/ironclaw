@@ -179,6 +179,16 @@ struct SurfaceSnapshot {
     capabilities: HashMap<CapabilityId, SurfaceCapabilitySnapshot>,
 }
 
+#[derive(Clone)]
+enum DispatchRecord {
+    InFlight,
+    RuntimeCompleted {
+        requested_capability_id: CapabilityId,
+        outcome: RuntimeCapabilityOutcome,
+    },
+    LoopCompleted(Result<CapabilityOutcome, AgentLoopHostError>),
+}
+
 pub struct HostRuntimeLoopCapabilityPort {
     runtime: Arc<dyn HostRuntime>,
     run_context: LoopRunContext,
@@ -187,7 +197,7 @@ pub struct HostRuntimeLoopCapabilityPort {
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
     snapshots: Mutex<HashMap<String, SurfaceSnapshot>>,
-    dispatch_records: Mutex<HashMap<String, Result<CapabilityOutcome, AgentLoopHostError>>>,
+    dispatch_records: Mutex<HashMap<String, DispatchRecord>>,
 }
 
 impl HostRuntimeLoopCapabilityPort {
@@ -233,13 +243,40 @@ impl HostRuntimeLoopCapabilityPort {
         })
     }
 
-    fn cached_dispatch(
+    fn reserve_dispatch(
         &self,
         key: &IdempotencyKey,
-    ) -> Result<Option<Result<CapabilityOutcome, AgentLoopHostError>>, AgentLoopHostError> {
+    ) -> Result<Option<DispatchRecord>, AgentLoopHostError> {
+        let mut records = self.dispatch_records.lock().map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "capability dispatch record store is unavailable",
+            )
+        })?;
+        if let Some(record) = records.get(key.as_str()).cloned() {
+            return Ok(Some(record));
+        }
+        records.insert(key.as_str().to_string(), DispatchRecord::InFlight);
+        Ok(None)
+    }
+
+    fn record_runtime_completed(
+        &self,
+        key: &IdempotencyKey,
+        requested_capability_id: CapabilityId,
+        outcome: RuntimeCapabilityOutcome,
+    ) -> Result<(), AgentLoopHostError> {
         self.dispatch_records
             .lock()
-            .map(|records| records.get(key.as_str()).cloned())
+            .map(|mut records| {
+                records.insert(
+                    key.as_str().to_string(),
+                    DispatchRecord::RuntimeCompleted {
+                        requested_capability_id,
+                        outcome,
+                    },
+                );
+            })
             .map_err(|_| {
                 AgentLoopHostError::new(
                     AgentLoopHostErrorKind::Unavailable,
@@ -248,7 +285,7 @@ impl HostRuntimeLoopCapabilityPort {
             })
     }
 
-    fn record_dispatch(
+    fn record_loop_completed(
         &self,
         key: &IdempotencyKey,
         result: Result<CapabilityOutcome, AgentLoopHostError>,
@@ -256,7 +293,10 @@ impl HostRuntimeLoopCapabilityPort {
         self.dispatch_records
             .lock()
             .map(|mut records| {
-                records.insert(key.as_str().to_string(), result);
+                records.insert(
+                    key.as_str().to_string(),
+                    DispatchRecord::LoopCompleted(result),
+                );
             })
             .map_err(|_| {
                 AgentLoopHostError::new(
@@ -264,6 +304,65 @@ impl HostRuntimeLoopCapabilityPort {
                     "capability dispatch record store is unavailable",
                 )
             })
+    }
+
+    fn clear_dispatch(&self, key: &IdempotencyKey) -> Result<(), AgentLoopHostError> {
+        self.dispatch_records
+            .lock()
+            .map(|mut records| {
+                records.remove(key.as_str());
+            })
+            .map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "capability dispatch record store is unavailable",
+                )
+            })
+    }
+
+    fn validate_visible_request_scope(&self) -> Result<(), AgentLoopHostError> {
+        let context = &self.visible_request.context;
+        context.validate().map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "capability execution context is invalid",
+            )
+        })?;
+        if context.tenant_id != self.run_context.scope.tenant_id
+            || context.agent_id != self.run_context.scope.agent_id
+            || context.project_id != self.run_context.scope.project_id
+            || context.thread_id.as_ref() != Some(&self.run_context.thread_id)
+            || context.resource_scope.tenant_id != self.run_context.scope.tenant_id
+            || context.resource_scope.agent_id != self.run_context.scope.agent_id
+            || context.resource_scope.project_id != self.run_context.scope.project_id
+            || context.resource_scope.thread_id.as_ref() != Some(&self.run_context.thread_id)
+        {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "capability execution context is not scoped to this loop run",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn finish_runtime_outcome(
+        &self,
+        key: &IdempotencyKey,
+        requested_capability_id: &CapabilityId,
+        outcome: RuntimeCapabilityOutcome,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        let result = runtime_outcome_to_loop(
+            &self.run_context,
+            self.result_writer.as_ref(),
+            requested_capability_id,
+            outcome.clone(),
+        )
+        .await;
+        if should_retry_result_write(&outcome, &result) {
+            return result;
+        }
+        self.record_loop_completed(key, result.clone())?;
+        result
     }
 
     async fn emit_capability_invoked(
@@ -285,6 +384,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
         &self,
         _request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        self.validate_visible_request_scope()?;
         let runtime_surface = self
             .runtime
             .visible_capabilities(self.visible_request.clone())
@@ -352,18 +452,43 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             }));
         };
         let idempotency_key = invocation_idempotency_key(&self.run_context, &request)?;
-        if let Some(cached) = self.cached_dispatch(&idempotency_key)? {
-            return cached;
+        if let Some(record) = self.reserve_dispatch(&idempotency_key)? {
+            return match record {
+                DispatchRecord::InFlight => Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "capability invocation is already in progress for this input",
+                )),
+                DispatchRecord::RuntimeCompleted {
+                    requested_capability_id,
+                    outcome,
+                } => {
+                    self.finish_runtime_outcome(&idempotency_key, &requested_capability_id, outcome)
+                        .await
+                }
+                DispatchRecord::LoopCompleted(result) => result,
+            };
         }
-        let input = self
+        let input = match self
             .input_resolver
             .resolve_capability_input(&self.run_context, &request.input_ref)
-            .await?;
+            .await
+        {
+            Ok(input) => input,
+            Err(error) => {
+                let _ = self.clear_dispatch(&idempotency_key);
+                return Err(error);
+            }
+        };
         let requested_capability_id = request.capability_id.clone();
 
-        self.emit_capability_invoked(request.capability_id.clone())
-            .await?;
-        let outcome = self
+        if let Err(error) = self
+            .emit_capability_invoked(request.capability_id.clone())
+            .await
+        {
+            let _ = self.clear_dispatch(&idempotency_key);
+            return Err(error);
+        }
+        let outcome = match self
             .runtime
             .invoke_capability(
                 RuntimeCapabilityRequest::new(
@@ -376,22 +501,31 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                 .with_idempotency_key(idempotency_key.clone()),
             )
             .await
-            .map_err(host_runtime_error)?;
-        let should_cache = matches!(
-            outcome,
-            RuntimeCapabilityOutcome::Completed(_) | RuntimeCapabilityOutcome::SpawnedProcess(_)
-        );
-        let result = runtime_outcome_to_loop(
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.clear_dispatch(&idempotency_key)?;
+                return Err(host_runtime_error(error));
+            }
+        };
+        if should_cache_runtime_outcome(&outcome) {
+            self.record_runtime_completed(
+                &idempotency_key,
+                requested_capability_id.clone(),
+                outcome.clone(),
+            )?;
+            return self
+                .finish_runtime_outcome(&idempotency_key, &requested_capability_id, outcome)
+                .await;
+        }
+        self.clear_dispatch(&idempotency_key)?;
+        runtime_outcome_to_loop(
             &self.run_context,
             self.result_writer.as_ref(),
             &requested_capability_id,
             outcome,
         )
-        .await;
-        if should_cache {
-            self.record_dispatch(&idempotency_key, result.clone())?;
-        }
-        result
+        .await
     }
 
     async fn invoke_capability_batch(
@@ -414,6 +548,26 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             stopped_on_suspension,
         })
     }
+}
+
+fn should_cache_runtime_outcome(outcome: &RuntimeCapabilityOutcome) -> bool {
+    !matches!(outcome, RuntimeCapabilityOutcome::Failed(_))
+}
+
+fn should_retry_result_write(
+    outcome: &RuntimeCapabilityOutcome,
+    result: &Result<CapabilityOutcome, AgentLoopHostError>,
+) -> bool {
+    matches!(outcome, RuntimeCapabilityOutcome::Completed(_))
+        && matches!(
+            result,
+            Err(error)
+                if matches!(
+                    error.kind,
+                    AgentLoopHostErrorKind::Unavailable
+                        | AgentLoopHostErrorKind::TranscriptWriteFailed
+                )
+        )
 }
 
 fn invocation_context_from_visible(base: &ExecutionContext) -> ExecutionContext {
