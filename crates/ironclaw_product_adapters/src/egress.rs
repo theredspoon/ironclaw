@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::error::ProductAdapterError;
 use crate::redaction::RedactedString;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct DeclaredEgressHost(String);
 
@@ -45,6 +45,12 @@ impl DeclaredEgressHost {
     }
 }
 
+impl std::fmt::Display for DeclaredEgressHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for DeclaredEgressHost {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -55,7 +61,7 @@ impl<'de> Deserialize<'de> for DeclaredEgressHost {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct EgressCredentialHandle(String);
 
@@ -85,6 +91,12 @@ impl EgressCredentialHandle {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for EgressCredentialHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

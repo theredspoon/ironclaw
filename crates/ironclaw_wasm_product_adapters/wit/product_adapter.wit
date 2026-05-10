@@ -79,6 +79,10 @@ interface product-adapter {
     }
 
     record auth-evidence {
+        // Host-serialized sealed auth evidence. Components treat this as
+        // opaque input; component-supplied JSON cannot impersonate a
+        // `verified` claim because the host-side Deserialize impl rejects
+        // unsealed verified variants.
         evidence-json: string,
     }
 

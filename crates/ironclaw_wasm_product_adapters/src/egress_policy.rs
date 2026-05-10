@@ -19,9 +19,9 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum EgressPolicyError {
     #[error("egress to undeclared host {host}")]
-    UndeclaredHost { host: String },
+    UndeclaredHost { host: DeclaredEgressHost },
     #[error("egress credential handle {handle} is unauthorized for this adapter installation")]
-    UnauthorizedCredentialHandle { handle: String },
+    UnauthorizedCredentialHandle { handle: EgressCredentialHandle },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +32,8 @@ pub struct EgressPolicyTarget<'a> {
 
 #[derive(Debug, Clone, Default)]
 pub struct EgressPolicy {
-    declared_hosts: BTreeSet<String>,
-    allowed_credential_handles: BTreeSet<String>,
+    declared_hosts: BTreeSet<DeclaredEgressHost>,
+    allowed_credential_handles: BTreeSet<EgressCredentialHandle>,
 }
 
 impl EgressPolicy {
@@ -42,39 +42,33 @@ impl EgressPolicy {
         allowed_credential_handles: impl IntoIterator<Item = EgressCredentialHandle>,
     ) -> Self {
         Self {
-            declared_hosts: declared_hosts
-                .into_iter()
-                .map(|h| h.as_str().to_string())
-                .collect(),
-            allowed_credential_handles: allowed_credential_handles
-                .into_iter()
-                .map(|h| h.as_str().to_string())
-                .collect(),
+            declared_hosts: declared_hosts.into_iter().collect(),
+            allowed_credential_handles: allowed_credential_handles.into_iter().collect(),
         }
     }
 
     pub fn check(&self, target: EgressPolicyTarget<'_>) -> Result<(), EgressPolicyError> {
-        if !self.declared_hosts.contains(target.host.as_str()) {
+        if !self.declared_hosts.contains(target.host) {
             return Err(EgressPolicyError::UndeclaredHost {
-                host: target.host.as_str().to_string(),
+                host: target.host.clone(),
             });
         }
         if let Some(handle) = target.credential_handle
-            && !self.allowed_credential_handles.contains(handle.as_str())
+            && !self.allowed_credential_handles.contains(handle)
         {
             return Err(EgressPolicyError::UnauthorizedCredentialHandle {
-                handle: handle.as_str().to_string(),
+                handle: handle.clone(),
             });
         }
         Ok(())
     }
 
-    pub fn declared_hosts(&self) -> impl Iterator<Item = &str> {
-        self.declared_hosts.iter().map(String::as_str)
+    pub fn declared_hosts(&self) -> impl Iterator<Item = &DeclaredEgressHost> {
+        self.declared_hosts.iter()
     }
 
-    pub fn allowed_credential_handles(&self) -> impl Iterator<Item = &str> {
-        self.allowed_credential_handles.iter().map(String::as_str)
+    pub fn allowed_credential_handles(&self) -> impl Iterator<Item = &EgressCredentialHandle> {
+        self.allowed_credential_handles.iter()
     }
 }
 
@@ -133,5 +127,72 @@ mod tests {
             err,
             EgressPolicyError::UnauthorizedCredentialHandle { .. }
         ));
+    }
+
+    #[test]
+    fn multiple_declared_hosts_and_handles_preserve_typed_policy_membership() {
+        let policy = EgressPolicy::new(
+            [host("api.slack.com"), host("api.telegram.org")],
+            [handle("slack_bot_token"), handle("telegram_bot_token")],
+        );
+
+        let declared_hosts = policy
+            .declared_hosts()
+            .map(DeclaredEgressHost::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(declared_hosts, ["api.slack.com", "api.telegram.org"]);
+
+        let allowed_handles = policy
+            .allowed_credential_handles()
+            .map(EgressCredentialHandle::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(allowed_handles, ["slack_bot_token", "telegram_bot_token"]);
+
+        let slack_host = host("api.slack.com");
+        let telegram_host = host("api.telegram.org");
+        let slack_handle = handle("slack_bot_token");
+        let telegram_handle = handle("telegram_bot_token");
+        assert!(
+            policy
+                .check(EgressPolicyTarget {
+                    host: &slack_host,
+                    credential_handle: Some(&slack_handle),
+                })
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(EgressPolicyTarget {
+                    host: &telegram_host,
+                    credential_handle: Some(&telegram_handle),
+                })
+                .is_ok()
+        );
+
+        let evil_host = host("evil.example.com");
+        let undeclared_err = policy
+            .check(EgressPolicyTarget {
+                host: &evil_host,
+                credential_handle: Some(&slack_handle),
+            })
+            .expect_err("undeclared host");
+        assert_eq!(
+            undeclared_err,
+            EgressPolicyError::UndeclaredHost { host: evil_host }
+        );
+
+        let ghost_handle = handle("ghost_token");
+        let unauthorized_err = policy
+            .check(EgressPolicyTarget {
+                host: &slack_host,
+                credential_handle: Some(&ghost_handle),
+            })
+            .expect_err("unauthorized handle");
+        assert_eq!(
+            unauthorized_err,
+            EgressPolicyError::UnauthorizedCredentialHandle {
+                handle: ghost_handle,
+            }
+        );
     }
 }

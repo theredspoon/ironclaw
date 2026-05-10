@@ -164,11 +164,16 @@ impl WebhookAuthVerifier for HmacWebhookAuth {
             };
         }
 
+        if self.signing_secret.is_empty() {
+            return VerificationOutcome::Failed {
+                failure: ProtocolAuthFailure::Malformed,
+            };
+        }
+
         let signed_payload = format!("v0:{timestamp_str}:");
         let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.signing_secret) else {
-            // HMAC-SHA-256 accepts arbitrary key lengths in the algorithm
-            // spec — `new_from_slice` should never reject a non-empty key.
-            // Treat the unexpected error as a malformed configuration.
+            // HMAC-SHA-256 accepts arbitrary non-empty key lengths in the
+            // algorithm spec; any error here is a malformed configuration.
             return VerificationOutcome::Failed {
                 failure: ProtocolAuthFailure::Malformed,
             };
@@ -218,10 +223,12 @@ impl WebhookAuthVerifier for SharedSecretHeaderAuth {
 }
 
 mod hex {
+    use std::fmt::Write as _;
+
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         let mut out = String::with_capacity(bytes.as_ref().len() * 2);
         for byte in bytes.as_ref() {
-            out.push_str(&format!("{byte:02x}"));
+            let _ = write!(&mut out, "{byte:02x}");
         }
         out
     }
@@ -406,6 +413,20 @@ mod tests {
     }
 
     #[test]
+    fn hmac_verifier_rejects_empty_signing_secret_as_malformed_config() {
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&[], &timestamp, body);
+        let verifier = verifier_at(1_700_000_000, 300, vec![]);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Malformed));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn hmac_verifier_accepts_timestamp_at_window_boundary() {
         let secret = b"super-shared-secret".to_vec();
         let timestamp = "1_700_000_000".replace('_', "");
@@ -435,6 +456,21 @@ mod tests {
                 assert!(matches!(failure, ProtocolAuthFailure::Other { .. }));
             }
             other => panic!("just-outside should fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_with_zero_max_age_rejects_any_drift() {
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "1_700_000_000".replace('_', "");
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&secret, &timestamp, body);
+        let verifier = verifier_at(1_700_000_001, 0, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Other { .. }));
+            }
+            other => panic!("zero max_age with drift should fail, got {other:?}"),
         }
     }
 }
