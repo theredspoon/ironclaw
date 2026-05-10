@@ -114,6 +114,7 @@ struct FailingClaimTransitions {
     notify_claim: Notify,
 }
 
+#[derive(Default)]
 struct DurableLikeTurnStore {
     inner: InMemoryTurnStateStore,
 }
@@ -259,14 +260,6 @@ impl TurnRunTransitionPort for FailingClaimTransitions {
         _request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
         panic!("failing claim transitions should not apply loop exits")
-    }
-}
-
-impl Default for DurableLikeTurnStore {
-    fn default() -> Self {
-        Self {
-            inner: InMemoryTurnStateStore::default(),
-        }
     }
 }
 

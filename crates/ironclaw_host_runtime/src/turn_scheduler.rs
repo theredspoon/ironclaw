@@ -233,6 +233,15 @@ enum SchedulerCommand {
     Shutdown,
 }
 
+struct SchedulerDrainContext {
+    transitions: Arc<dyn TurnRunTransitionPort>,
+    executor: Arc<dyn TurnRunExecutor>,
+    semaphore: Arc<Semaphore>,
+    command_tx: mpsc::Sender<SchedulerCommand>,
+    config: TurnRunSchedulerConfig,
+    runner_id: TurnRunnerId,
+}
+
 async fn run_scheduler_loop(
     mut command_rx: mpsc::Receiver<SchedulerCommand>,
     command_tx: mpsc::Sender<SchedulerCommand>,
@@ -247,6 +256,14 @@ async fn run_scheduler_loop(
     poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut recovery_tick = interval(config.lease_recovery_interval());
     recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let context = SchedulerDrainContext {
+        transitions,
+        executor,
+        semaphore,
+        command_tx,
+        config,
+        runner_id,
+    };
     let mut claim_retry_pending = false;
 
     loop {
@@ -256,68 +273,60 @@ async fn run_scheduler_loop(
                     SchedulerCommand::Wake(wake) => {
                         // Prefer the woken scope for locality; if that scope has no
                         // claimable work, fall back to the global queue below.
-                        if !claim_retry_pending {
-                            if drain_queued_runs(
-                                Arc::clone(&transitions),
-                                Arc::clone(&executor),
-                                Arc::clone(&semaphore),
-                                command_tx.clone(),
-                                &config,
-                                runner_id,
+                        if !claim_retry_pending
+                            && drain_queued_runs(
+                                &context,
                                 Some(wake.scope),
                                 &mut executor_tasks,
-                            ).await {
-                                claim_retry_pending = true;
-                                schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
-                            }
+                            ).await
+                        {
+                            claim_retry_pending = true;
+                            schedule_drain_after(
+                                context.command_tx.clone(),
+                                context.config.claim_error_backoff(),
+                            );
                         }
                         if !claim_retry_pending
                             && drain_queued_runs(
-                                Arc::clone(&transitions),
-                                Arc::clone(&executor),
-                                Arc::clone(&semaphore),
-                                command_tx.clone(),
-                                &config,
-                                runner_id,
+                                &context,
                                 None,
                                 &mut executor_tasks,
                             ).await
                         {
                             claim_retry_pending = true;
-                            schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                            schedule_drain_after(
+                                context.command_tx.clone(),
+                                context.config.claim_error_backoff(),
+                            );
                         }
                     }
                     SchedulerCommand::Drain => {
                         if !claim_retry_pending
                             && drain_queued_runs(
-                                Arc::clone(&transitions),
-                                Arc::clone(&executor),
-                                Arc::clone(&semaphore),
-                                command_tx.clone(),
-                                &config,
-                                runner_id,
+                                &context,
                                 None,
                                 &mut executor_tasks,
                             ).await
                         {
                             claim_retry_pending = true;
-                            schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                            schedule_drain_after(
+                                context.command_tx.clone(),
+                                context.config.claim_error_backoff(),
+                            );
                         }
                     }
                     SchedulerCommand::RetryDrain => {
                         claim_retry_pending = false;
                         if drain_queued_runs(
-                            Arc::clone(&transitions),
-                            Arc::clone(&executor),
-                            Arc::clone(&semaphore),
-                            command_tx.clone(),
-                            &config,
-                            runner_id,
+                            &context,
                             None,
                             &mut executor_tasks,
                         ).await {
                             claim_retry_pending = true;
-                            schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                            schedule_drain_after(
+                                context.command_tx.clone(),
+                                context.config.claim_error_backoff(),
+                            );
                         }
                     }
                     SchedulerCommand::Shutdown => {
@@ -329,18 +338,16 @@ async fn run_scheduler_loop(
             _ = poll_tick.tick() => {
                 if !claim_retry_pending
                     && drain_queued_runs(
-                        Arc::clone(&transitions),
-                        Arc::clone(&executor),
-                        Arc::clone(&semaphore),
-                        command_tx.clone(),
-                        &config,
-                        runner_id,
+                        &context,
                         None,
                         &mut executor_tasks,
                     ).await
                 {
                     claim_retry_pending = true;
-                    schedule_drain_after(command_tx.clone(), config.claim_error_backoff());
+                    schedule_drain_after(
+                        context.command_tx.clone(),
+                        context.config.claim_error_backoff(),
+                    );
                 }
             }
             Some(result) = executor_tasks.join_next(), if !executor_tasks.is_empty() => {
@@ -349,29 +356,25 @@ async fn run_scheduler_loop(
                 }
             }
             _ = recovery_tick.tick() => {
-                recover_expired_leases(Arc::clone(&transitions)).await;
+                recover_expired_leases(Arc::clone(&context.transitions)).await;
             }
         }
     }
 }
 
 async fn drain_queued_runs(
-    transitions: Arc<dyn TurnRunTransitionPort>,
-    executor: Arc<dyn TurnRunExecutor>,
-    semaphore: Arc<Semaphore>,
-    command_tx: mpsc::Sender<SchedulerCommand>,
-    config: &TurnRunSchedulerConfig,
-    runner_id: TurnRunnerId,
+    context: &SchedulerDrainContext,
     scope_filter: Option<TurnScope>,
     executor_tasks: &mut JoinSet<()>,
 ) -> bool {
     loop {
-        let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&context.semaphore).try_acquire_owned() else {
             return false;
         };
-        let claim = transitions
+        let claim = context
+            .transitions
             .claim_next_run(ClaimRunRequest {
-                runner_id,
+                runner_id: context.runner_id,
                 lease_token: ironclaw_turns::TurnLeaseToken::new(),
                 scope_filter: scope_filter.clone(),
             })
@@ -380,11 +383,11 @@ async fn drain_queued_runs(
             Ok(Some(claimed)) => {
                 spawn_executor_task(
                     claimed,
-                    Arc::clone(&transitions),
-                    Arc::clone(&executor),
-                    command_tx.clone(),
+                    Arc::clone(&context.transitions),
+                    Arc::clone(&context.executor),
+                    context.command_tx.clone(),
                     permit,
-                    config.runner_heartbeat_interval(),
+                    context.config.runner_heartbeat_interval(),
                     executor_tasks,
                 );
             }
@@ -399,7 +402,7 @@ async fn drain_queued_runs(
 
 enum ExecutorTaskOutcome {
     Completed,
-    RecoveryRequired(SanitizedFailure),
+    RecoveryRequired(Option<SanitizedFailure>),
 }
 
 fn spawn_executor_task(
@@ -426,9 +429,9 @@ fn spawn_executor_task(
                 result = &mut executor_result => {
                     break match result {
                         Ok(Ok(())) => ExecutorTaskOutcome::Completed,
-                        Ok(Err(error)) => ExecutorTaskOutcome::RecoveryRequired(
+                        Ok(Err(error)) => ExecutorTaskOutcome::RecoveryRequired(Some(
                             error.failure().clone(),
-                        ),
+                        )),
                         Err(_) => ExecutorTaskOutcome::RecoveryRequired(scheduler_failure(
                             "scheduler_executor_panic",
                         )),
@@ -451,15 +454,18 @@ fn spawn_executor_task(
 
         match outcome {
             ExecutorTaskOutcome::Completed => {}
-            ExecutorTaskOutcome::RecoveryRequired(category) => {
+            ExecutorTaskOutcome::RecoveryRequired(Some(failure)) => {
                 record_recovery_required(
                     Arc::clone(&transitions),
                     recovery_run_id,
                     recovery_runner_id,
                     recovery_lease_token,
-                    category,
+                    failure,
                 )
                 .await;
+            }
+            ExecutorTaskOutcome::RecoveryRequired(None) => {
+                debug!("turn run scheduler could not sanitize recovery category");
             }
         }
 
@@ -508,8 +514,17 @@ async fn record_recovery_required(
     }
 }
 
-fn scheduler_failure(category: &'static str) -> SanitizedFailure {
-    SanitizedFailure::new(category).expect("scheduler failure category must be sanitized")
+fn scheduler_failure(category: &'static str) -> Option<SanitizedFailure> {
+    match SanitizedFailure::new(category) {
+        Ok(failure) => Some(failure),
+        Err(error) => {
+            debug!(
+                category,
+                error, "turn run scheduler static recovery category failed validation"
+            );
+            None
+        }
+    }
 }
 
 async fn recover_expired_leases(transitions: Arc<dyn TurnRunTransitionPort>) {
