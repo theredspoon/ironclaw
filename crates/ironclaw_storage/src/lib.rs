@@ -77,7 +77,7 @@ pub enum StorageError {
 /// Callers that need operational diagnostics must log the raw error before
 /// passing it here; this function is the redaction boundary.
 pub fn redacted_backend_error(error: impl std::fmt::Display) -> StorageError {
-    let _ = error;
+    tracing::error!(%error, "storage backend operation failed");
     StorageError::Backend
 }
 
