@@ -266,7 +266,7 @@ pub trait BlobStore: Send + Sync {
 
     async fn get_blob(&self, key: &StorageKey) -> Result<Option<StoredBlob>, StorageError>;
 
-    async fn delete_blob(&self, key: &StorageKey) -> Result<(), StorageError>;
+    async fn delete_blob(&self, key: &StorageKey, condition: PutCondition) -> Result<(), StorageError>;
 }
 
 /// Primitive keyed structured-record storage. Domain stores own schemas.
