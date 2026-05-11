@@ -28,7 +28,7 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_telegram_v2_adapter::{
     GroupTriggerPolicy, TELEGRAM_API_HOST, TelegramV2Adapter, TelegramV2AdapterConfig,
-    telegram_declared_egress_hosts,
+    telegram_declared_egress_hosts, telegram_default_capabilities,
 };
 use ironclaw_turns::{ReplyTargetBindingRef, TurnRunId};
 use ironclaw_wasm_product_adapters::{
@@ -1176,6 +1176,11 @@ fn telegram_default_capabilities_pin_first_slice_behavior() {
     assert!(!caps.contains(ProductCapabilityFlag::ExternalProgressPush));
     assert!(!caps.contains(ProductCapabilityFlag::ExternalGatePush));
     assert_eq!(adapter.surface_kind(), ProductSurfaceKind::ExternalChannel);
+
+    // With `progress_push_enabled = false`, adapter caps must equal the
+    // exported default helper exactly — pins the doc claim in
+    // `docs/reborn/contracts/telegram-v2.md` against the helper.
+    assert_eq!(*caps, telegram_default_capabilities());
 }
 
 // ---------------------------------------------------------------------------
