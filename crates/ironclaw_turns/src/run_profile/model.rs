@@ -7,8 +7,9 @@ use thiserror::Error;
 use crate::LoopDiagnosticRef;
 
 use super::host::{
-    AgentLoopHostError, AgentLoopHostErrorKind, LoopModelPort, LoopModelRequest, LoopModelResponse,
-    LoopRunContext, LoopSafeSummary,
+    AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, LoopModelPort, LoopModelRequest,
+    LoopModelResponse, LoopRunContext, LoopSafeSummary, ParentLoopOutput,
+    sanitize_model_visible_text,
 };
 use super::milestones::{LoopHostMilestoneEmitter, LoopHostMilestoneSink};
 
@@ -39,9 +40,8 @@ pub trait LoopModelBudgetAccountant: Send + Sync {
     ) -> Result<(), LoopModelGatewayError>;
 
     /// Called **after** the model call completes (or fails). Implementations
-    /// should record usage and are expected to be infallible in practice; the
-    /// error return is provided for forward-compatibility but the caller logs
-    /// and discards it.
+    /// should record usage and must fail closed when success accounting cannot
+    /// be durably recorded.
     async fn post_model_call(
         &self,
         context: &LoopRunContext,
@@ -79,6 +79,22 @@ impl LoopModelGatewayError {
     pub fn with_diagnostic_ref(mut self, diagnostic_ref: LoopDiagnosticRef) -> Self {
         self.diagnostic_ref = Some(diagnostic_ref);
         self
+    }
+
+    fn from_host_error(error: AgentLoopHostError) -> Self {
+        let diagnostic_ref = error.diagnostic_ref;
+        let mut converted = match Self::new(error.kind, error.safe_summary) {
+            Ok(error) => error,
+            Err(_) => Self {
+                kind: error.kind,
+                safe_summary: LoopSafeSummary::model_gateway_failed(),
+                diagnostic_ref: None,
+            },
+        };
+        if let Some(diagnostic_ref) = diagnostic_ref {
+            converted = converted.with_diagnostic_ref(diagnostic_ref);
+        }
+        converted
     }
 
     fn into_host_error(self) -> AgentLoopHostError {
@@ -238,7 +254,11 @@ where
         }
 
         // Pre-call budget check — rejects before touching the provider.
-        if let Err(budget_error) = self.accountant.pre_model_call(&self.context, &request).await {
+        if let Err(budget_error) = self
+            .accountant
+            .pre_model_call(&self.context, &request)
+            .await
+        {
             return Err(budget_error.into_host_error());
         }
 
@@ -260,7 +280,8 @@ where
                 context: self.context.clone(),
                 request: request.clone(),
             })
-            .await;
+            .await
+            .map(sanitize_model_response);
 
         // Post-call accounting fires on BOTH success and failure.
         let outcome = match &gateway_result {
@@ -272,9 +293,12 @@ where
             .post_model_call(&self.context, &request, outcome)
             .await
         {
+            if gateway_result.is_ok() {
+                return Err(post_error.into_host_error());
+            }
             tracing::debug!(
                 kind = ?post_error.kind,
-                "post_model_call accounting failed; discarding accounting error"
+                "post_model_call accounting failed after model failure; preserving model error"
             );
         }
 
@@ -306,4 +330,15 @@ where
         }
         Ok(response)
     }
+}
+
+fn sanitize_model_response(mut response: LoopModelResponse) -> LoopModelResponse {
+    for chunk in &mut response.chunks {
+        chunk.safe_text_delta =
+            sanitize_model_visible_text(std::mem::take(&mut chunk.safe_text_delta));
+    }
+    if let ParentLoopOutput::AssistantReply(AssistantReply { content }) = &mut response.output {
+        *content = sanitize_model_visible_text(std::mem::take(content));
+    }
+    response
 }

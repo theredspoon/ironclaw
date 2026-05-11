@@ -39,7 +39,8 @@ pub use host::{
     LoopProgressPort, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
     LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
     ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode, UpdateAssistantDraft,
-    VisibleCapabilityRequest, VisibleCapabilitySurface, validate_model_route_component_value,
+    VisibleCapabilityRequest, VisibleCapabilitySurface, sanitize_model_visible_text,
+    validate_model_route_component_value,
 };
 pub use memory_context::{
     EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,

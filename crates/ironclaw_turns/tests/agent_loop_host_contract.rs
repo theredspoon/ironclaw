@@ -1239,6 +1239,25 @@ impl LoopHostMilestoneSink for FailingOnModelCompletedMilestoneSink {
 }
 
 #[derive(Default)]
+struct FailingOnModelStartedMilestoneSink;
+
+#[async_trait]
+impl LoopHostMilestoneSink for FailingOnModelStartedMilestoneSink {
+    async fn publish_loop_milestone(
+        &self,
+        milestone: LoopHostMilestone,
+    ) -> Result<(), AgentLoopHostError> {
+        if matches!(milestone.kind, LoopHostMilestoneKind::ModelStarted { .. }) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "milestone sink unavailable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct RecordingLoopModelGateway {
     requests: Mutex<Vec<LoopModelGatewayRequest>>,
     responses: Mutex<Vec<Result<LoopModelResponse, LoopModelGatewayError>>>,
@@ -1713,6 +1732,7 @@ struct RecordingBudgetAccountant {
     pre_called: AtomicBool,
     post_called: AtomicBool,
     reject_pre: AtomicBool,
+    reject_post: AtomicBool,
     post_saw_failure: AtomicBool,
 }
 
@@ -1722,6 +1742,7 @@ impl RecordingBudgetAccountant {
             pre_called: AtomicBool::new(false),
             post_called: AtomicBool::new(false),
             reject_pre: AtomicBool::new(false),
+            reject_post: AtomicBool::new(false),
             post_saw_failure: AtomicBool::new(false),
         }
     }
@@ -1729,6 +1750,12 @@ impl RecordingBudgetAccountant {
     fn rejecting() -> Self {
         let accountant = Self::new();
         accountant.reject_pre.store(true, Ordering::SeqCst);
+        accountant
+    }
+
+    fn rejecting_post() -> Self {
+        let accountant = Self::new();
+        accountant.reject_post.store(true, Ordering::SeqCst);
         accountant
     }
 
@@ -1772,6 +1799,13 @@ impl LoopModelBudgetAccountant for RecordingBudgetAccountant {
         self.post_called.store(true, Ordering::SeqCst);
         if matches!(outcome, ModelCallOutcome::Failure(_)) {
             self.post_saw_failure.store(true, Ordering::SeqCst);
+        }
+        if self.reject_post.load(Ordering::SeqCst) {
+            return Err(LoopModelGatewayError::new(
+                AgentLoopHostErrorKind::BudgetExceeded,
+                "model call accounting failed",
+            )
+            .expect("safe summary is valid"));
         }
         Ok(())
     }
@@ -1907,8 +1941,26 @@ async fn redaction_sentinels_never_leak_through_serialized_surfaces() {
         );
     }
 
-    // The response itself may carry raw content (it's the caller's job to handle it),
-    // but debug representation of the milestones must be clean.
+    let serialized_response = serde_json::to_string(&response).unwrap();
+    let debug_response = format!("{:?}", response);
+    for sentinel in ["RAW_CREDENTIAL_SENTINEL", "sk-test-key-12345"] {
+        assert!(
+            response
+                .chunks
+                .iter()
+                .all(|chunk| !chunk.safe_text_delta.contains(sentinel)),
+            "model chunks must not contain `{sentinel}`"
+        );
+        assert!(
+            !serialized_response.contains(sentinel),
+            "serialized response must not contain `{sentinel}`"
+        );
+        assert!(
+            !debug_response.contains(sentinel),
+            "debug response must not contain `{sentinel}`"
+        );
+    }
+
     let debug_milestones = format!("{:?}", milestone_sink.milestones());
     for sentinel in ["RAW_CREDENTIAL_SENTINEL", "sk-test-key-12345"] {
         assert!(
@@ -2014,6 +2066,65 @@ async fn budget_accounting_on_success_invokes_pre_and_post() {
     assert_eq!(gateway.requests().len(), 1);
 }
 
+/// Post-call accounting failure after provider success fails closed instead of
+/// returning an unaccounted successful response.
+#[tokio::test]
+async fn post_accounting_failure_after_success_fails_closed() {
+    let context = claimed_run_context().await;
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let gateway = Arc::new(RecordingLoopModelGateway::default());
+    gateway.push_response(Ok(success_response(&context)));
+    let accountant = Arc::new(RecordingBudgetAccountant::rejecting_post());
+
+    let port = HostManagedLoopModelPort::with_accountant(
+        context.clone(),
+        gateway.clone(),
+        milestone_sink.clone(),
+        accountant.clone(),
+    );
+
+    let error = port
+        .stream_model(simple_model_request(&context))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::BudgetExceeded);
+    assert_eq!(error.safe_summary, "model call accounting failed");
+    assert!(accountant.was_pre_called());
+    assert!(accountant.was_post_called());
+    assert!(!accountant.post_saw_failure());
+    assert_eq!(gateway.requests().len(), 1);
+}
+
+/// If a model-started milestone fails after pre-call reservation, post-call
+/// accounting receives a failure outcome so reservations can be released.
+#[tokio::test]
+async fn model_started_failure_releases_pre_call_reservation_without_gateway_call() {
+    let context = claimed_run_context().await;
+    let milestone_sink = Arc::new(FailingOnModelStartedMilestoneSink);
+    let gateway = Arc::new(RecordingLoopModelGateway::default());
+    gateway.push_response(Ok(success_response(&context)));
+    let accountant = Arc::new(RecordingBudgetAccountant::new());
+
+    let port = HostManagedLoopModelPort::with_accountant(
+        context.clone(),
+        gateway.clone(),
+        milestone_sink,
+        accountant.clone(),
+    );
+
+    let error = port
+        .stream_model(simple_model_request(&context))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
+    assert!(accountant.was_pre_called());
+    assert!(accountant.was_post_called());
+    assert!(accountant.post_saw_failure());
+    assert_eq!(gateway.requests().len(), 0);
+}
+
 /// Budget accounting on failure: post hook still fires.
 #[tokio::test]
 async fn budget_accounting_on_failure_still_fires_post() {
@@ -2110,11 +2221,8 @@ async fn error_kind_mapping_through_host_managed_port() {
             LoopModelGatewayError::new(expected_kind, summary).unwrap()
         ));
 
-        let port = HostManagedLoopModelPort::new(
-            context.clone(),
-            gateway.clone(),
-            milestone_sink.clone(),
-        );
+        let port =
+            HostManagedLoopModelPort::new(context.clone(), gateway.clone(), milestone_sink.clone());
 
         let error = port
             .stream_model(simple_model_request(&context))
