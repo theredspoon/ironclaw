@@ -42,7 +42,13 @@ use ironclaw_reborn_event_store::{
     RebornEventStoreConfig, RebornEventStoreError, RebornEventStores, RebornProfile,
     build_reborn_event_stores,
 };
+#[cfg(feature = "libsql")]
+use ironclaw_resources::LibSqlResourceGovernorStore;
+#[cfg(feature = "postgres")]
+use ironclaw_resources::PostgresResourceGovernorStore;
 use ironclaw_resources::ResourceGovernor;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_resources::{PersistentResourceGovernor, ResourceError};
 #[cfg(feature = "libsql")]
 use ironclaw_run_state::LibSqlRunStateApprovalStore;
 #[cfg(feature = "postgres")]
@@ -57,7 +63,9 @@ use ironclaw_trust::{HostTrustPolicy, TrustPolicy};
 use ironclaw_turns::LibSqlTurnStateStore;
 #[cfg(feature = "postgres")]
 use ironclaw_turns::PostgresTurnStateStore;
-use ironclaw_turns::{DefaultTurnCoordinator, TurnRunWakeNotifier, TurnStateStore};
+use ironclaw_turns::{
+    DefaultTurnCoordinator, TurnRunWakeNotifier, TurnStateStore, runner::TurnRunTransitionPort,
+};
 use ironclaw_wasm::{
     DenyWasmHostHttp, PreparedWitTool, WasmError, WasmRuntimeCredentialProvider,
     WasmRuntimeHttpAdapter, WasmRuntimePolicyDiscarder, WasmStagedRuntimeCredentials, WitToolHost,
@@ -69,7 +77,7 @@ use thiserror::Error;
 use crate::{
     BuiltinObligationHandler, CapabilitySurfaceVersion, DefaultHostRuntime, HostRuntimeError,
     NetworkObligationPolicyStore, ProcessObligationLifecycleStore, RuntimeBackendHealth,
-    RuntimeSecretInjectionStore,
+    RuntimeSecretInjectionStore, TurnRunExecutor, TurnRunScheduler, TurnRunSchedulerConfig,
 };
 
 type SharedRuntimeHttpEgress = Arc<Mutex<Option<Arc<dyn RuntimeHttpEgress>>>>;
@@ -249,6 +257,8 @@ struct ProductionComponentTypes {
     script_runtime: Option<&'static str>,
     mcp_runtime: Option<&'static str>,
     turn_state: Option<&'static str>,
+    turn_run_transition_port: Option<&'static str>,
+    turn_run_transition_port_verified: bool,
     turn_run_wake_notifier: Option<&'static str>,
 }
 
@@ -303,6 +313,7 @@ where
     mcp_runtime: Option<Arc<dyn McpExecutor>>,
     wasm_runtime: Option<Arc<WasmRuntimeAdapter>>,
     turn_state: Option<Arc<dyn TurnStateStore>>,
+    turn_run_transition_port: Option<Arc<dyn TurnRunTransitionPort>>,
     turn_run_wake_notifier: Option<Arc<dyn TurnRunWakeNotifier>>,
     component_types: ProductionComponentTypes,
 }
@@ -356,6 +367,7 @@ where
             mcp_runtime: None,
             wasm_runtime: None,
             turn_state: None,
+            turn_run_transition_port: None,
             turn_run_wake_notifier: None,
             component_types: ProductionComponentTypes {
                 trust_policy: None,
@@ -378,6 +390,8 @@ where
                 script_runtime: None,
                 mcp_runtime: None,
                 turn_state: None,
+                turn_run_transition_port: None,
+                turn_run_transition_port_verified: false,
                 turn_run_wake_notifier: None,
             },
         }
@@ -414,6 +428,7 @@ where
             mcp_runtime,
             wasm_runtime,
             turn_state,
+            turn_run_transition_port,
             turn_run_wake_notifier,
             mut component_types,
         } = self;
@@ -444,6 +459,7 @@ where
             mcp_runtime,
             wasm_runtime,
             turn_state,
+            turn_run_transition_port,
             turn_run_wake_notifier,
             component_types,
         }
@@ -463,6 +479,114 @@ where
         filesystem: Arc<LibSqlRootFilesystem>,
     ) -> HostRuntimeServices<LibSqlRootFilesystem, G, S, R> {
         self.with_root_filesystem(filesystem)
+    }
+
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    fn with_resource_governor<T>(self, governor: Arc<T>) -> HostRuntimeServices<F, T, S, R>
+    where
+        T: ResourceGovernor + 'static,
+    {
+        let Self {
+            registry,
+            trust_policy,
+            trust_policy_configured,
+            filesystem,
+            governor: _,
+            authorizer,
+            process_services,
+            surface_version,
+            run_state,
+            approval_requests,
+            run_state_approval_store,
+            capability_leases,
+            event_sink,
+            audit_sink,
+            secret_store,
+            network_policy_store,
+            secret_injection_store,
+            process_lifecycle_store: _,
+            runtime_http_egress,
+            wasm_credential_provider,
+            runtime_health,
+            script_runtime,
+            mcp_runtime,
+            wasm_runtime,
+            turn_state,
+            turn_run_transition_port,
+            turn_run_wake_notifier,
+            mut component_types,
+        } = self;
+        let lifecycle_governor: Arc<dyn ResourceGovernor> = governor.clone();
+        let process_lifecycle_store = Arc::new(ProcessObligationLifecycleStore::new(
+            process_services.process_store(),
+            Arc::clone(&network_policy_store),
+            Arc::clone(&secret_injection_store),
+            lifecycle_governor,
+        ));
+        if let Some(event_sink) = &event_sink {
+            process_lifecycle_store.set_event_sink(Arc::clone(event_sink));
+        }
+        component_types.resource_governor = type_name::<T>();
+        HostRuntimeServices {
+            registry,
+            trust_policy,
+            trust_policy_configured,
+            filesystem,
+            governor,
+            authorizer,
+            process_services,
+            surface_version,
+            run_state,
+            approval_requests,
+            run_state_approval_store,
+            capability_leases,
+            event_sink,
+            audit_sink,
+            secret_store,
+            network_policy_store,
+            secret_injection_store,
+            process_lifecycle_store,
+            runtime_http_egress,
+            wasm_credential_provider,
+            runtime_health,
+            script_runtime,
+            mcp_runtime,
+            wasm_runtime,
+            turn_state,
+            turn_run_transition_port,
+            turn_run_wake_notifier,
+            component_types,
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    pub async fn with_libsql_resource_governor(
+        self,
+        db: Arc<libsql::Database>,
+    ) -> Result<
+        HostRuntimeServices<F, PersistentResourceGovernor<LibSqlResourceGovernorStore>, S, R>,
+        ResourceError,
+    > {
+        let store = LibSqlResourceGovernorStore::new(db);
+        store.run_migrations().await?;
+        Ok(self.with_resource_governor(Arc::new(PersistentResourceGovernor::new(store))))
+    }
+
+    #[cfg(feature = "postgres")]
+    pub async fn with_postgres_resource_governor(
+        self,
+        pool: deadpool_postgres::Pool,
+    ) -> Result<
+        HostRuntimeServices<F, PersistentResourceGovernor<PostgresResourceGovernorStore>, S, R>,
+        ResourceError,
+    > {
+        let store = PostgresResourceGovernorStore::new(pool);
+        store.run_migrations().await?;
+        Ok(self.with_resource_governor(Arc::new(PersistentResourceGovernor::new(store))))
+    }
+
+    pub fn resource_governor(&self) -> Arc<G> {
+        Arc::clone(&self.governor)
     }
 
     /// Attaches the host-owned trust policy used by the produced
@@ -557,7 +681,34 @@ where
         T: TurnStateStore + 'static,
     {
         self.component_types.turn_state = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port = None;
+        self.component_types.turn_run_transition_port_verified = false;
         self.turn_state = Some(turn_state);
+        self.turn_run_transition_port = None;
+        self
+    }
+
+    pub fn with_turn_state_and_transition_port<T>(mut self, turn_state: Arc<T>) -> Self
+    where
+        T: TurnStateStore + TurnRunTransitionPort + 'static,
+    {
+        self.component_types.turn_state = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port_verified = true;
+        let state: Arc<dyn TurnStateStore> = turn_state.clone();
+        let transition_port: Arc<dyn TurnRunTransitionPort> = turn_state;
+        self.turn_state = Some(state);
+        self.turn_run_transition_port = Some(transition_port);
+        self
+    }
+
+    pub fn with_turn_run_transition_port<T>(mut self, transition_port: Arc<T>) -> Self
+    where
+        T: TurnRunTransitionPort + 'static,
+    {
+        self.component_types.turn_run_transition_port = Some(type_name::<T>());
+        self.component_types.turn_run_transition_port_verified = false;
+        self.turn_run_transition_port = Some(transition_port);
         self
     }
 
@@ -568,7 +719,7 @@ where
     ) -> Result<Self, ironclaw_turns::TurnError> {
         let store = Arc::new(LibSqlTurnStateStore::new(db));
         store.run_migrations().await?;
-        Ok(self.with_turn_state(store))
+        Ok(self.with_turn_state_and_transition_port(store))
     }
 
     #[cfg(feature = "postgres")]
@@ -578,7 +729,7 @@ where
     ) -> Result<Self, ironclaw_turns::TurnError> {
         let store = Arc::new(PostgresTurnStateStore::new(pool));
         store.run_migrations().await?;
-        Ok(self.with_turn_state(store))
+        Ok(self.with_turn_state_and_transition_port(store))
     }
 
     pub fn with_turn_run_wake_notifier<T>(mut self, notifier: Arc<T>) -> Self
@@ -1119,6 +1270,65 @@ where
         };
         Ok(DefaultTurnCoordinator::new(Arc::clone(turn_state))
             .with_wake_notifier(Arc::clone(notifier)))
+    }
+
+    /// Validates turn persistence wiring and builds a scheduler over the
+    /// configured trusted runner transition port. The concrete executor stays
+    /// injected so product loop strategy remains above host-runtime.
+    pub fn turn_scheduler_for_production(
+        &self,
+        executor: Arc<dyn TurnRunExecutor>,
+        config: TurnRunSchedulerConfig,
+    ) -> Result<TurnRunScheduler, ProductionWiringReport> {
+        let mut issues = Vec::new();
+        self.push_missing(
+            &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.turn_state.is_some(),
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.component_types.turn_state,
+        );
+        self.push_local_only(
+            &mut issues,
+            ProductionWiringComponent::TurnState,
+            self.component_types.turn_run_transition_port,
+        );
+        if self.turn_run_transition_port.is_some()
+            && !self.component_types.turn_run_transition_port_verified
+        {
+            self.push_issue(
+                &mut issues,
+                ProductionWiringComponent::TurnState,
+                ProductionWiringIssueKind::UnverifiedProductionImplementation,
+                self.component_types.turn_run_transition_port,
+            );
+        }
+        if self.turn_run_transition_port.is_none() {
+            self.push_issue(
+                &mut issues,
+                ProductionWiringComponent::TurnState,
+                ProductionWiringIssueKind::UnsupportedRequirement,
+                self.component_types.turn_state,
+            );
+        }
+        if !issues.is_empty() {
+            return Err(ProductionWiringReport { issues });
+        }
+        let Some(transition_port) = self.turn_run_transition_port.as_ref() else {
+            return Err(production_wiring_report(
+                ProductionWiringComponent::TurnState,
+                ProductionWiringIssueKind::UnsupportedRequirement,
+                self.component_types.turn_state,
+            ));
+        };
+        Ok(TurnRunScheduler::new(
+            Arc::clone(transition_port),
+            executor,
+            config,
+        ))
     }
 
     fn validate_production_turn_wiring(&self) -> Result<(), ProductionWiringReport> {

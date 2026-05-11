@@ -2,12 +2,12 @@
 //!
 //! The loop-support crate owns the host-facing model gateway contract. This
 //! adapter lives in the standalone Reborn composition crate because it bridges
-//! that contract to the existing root `src/llm` provider abstraction.
+//! that contract to the shared `ironclaw_llm` provider abstraction.
 
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use ironclaw::llm::{
+use ironclaw_llm::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmError, LlmProvider,
 };
 use ironclaw_loop_support::{
@@ -114,7 +114,7 @@ where
     }
 }
 
-/// Host-managed model gateway backed by the root `LlmProvider` abstraction.
+/// Host-managed model gateway backed by the shared `ironclaw_llm::LlmProvider` abstraction.
 #[derive(Clone)]
 pub struct LlmProviderModelGateway<P>
 where
@@ -160,10 +160,10 @@ where
         );
         completion
             .metadata
-            .insert("turn_id".to_string(), request.turn_id);
+            .insert("turn_id".to_string(), request.turn_id.to_string());
         completion
             .metadata
-            .insert("run_id".to_string(), request.run_id);
+            .insert("run_id".to_string(), request.run_id.to_string());
 
         let response = self
             .provider

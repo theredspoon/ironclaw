@@ -2923,6 +2923,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs4"
 version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4297,6 +4307,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "deadpool-postgres",
+ "futures-util",
  "ironclaw_approvals",
  "ironclaw_authorization",
  "ironclaw_capabilities",
@@ -4326,6 +4337,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
  "tracing",
  "url",
  "wat",
@@ -4503,13 +4515,37 @@ name = "ironclaw_reborn"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "ironclaw",
+ "chrono",
  "ironclaw_host_api",
+ "ironclaw_llm",
  "ironclaw_loop_support",
+ "ironclaw_secrets",
  "ironclaw_threads",
  "ironclaw_turns",
+ "libsql",
  "rust_decimal",
+ "secrecy",
+ "serde_json",
+ "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "ironclaw_reborn_cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ironclaw_reborn",
+ "ironclaw_reborn_config",
+ "tempfile",
+]
+
+[[package]]
+name = "ironclaw_reborn_config"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -4545,10 +4581,19 @@ dependencies = [
 name = "ironclaw_resources"
 version = "0.1.0"
 dependencies = [
+ "deadpool-postgres",
+ "fs2",
  "ironclaw_host_api",
+ "libsql",
  "rust_decimal",
  "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-postgres",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4726,6 +4771,7 @@ dependencies = [
  "libsql",
  "serde",
  "serde_json",
+ "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
