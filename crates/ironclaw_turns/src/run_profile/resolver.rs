@@ -238,6 +238,7 @@ fn interactive_profile() -> RunProfileDefinition {
             require_before_block: true,
             max_checkpoint_bytes: 64 * 1024,
             require_final_checkpoint: false,
+            allow_no_reply_completion: false,
         },
         resource_budget_policy: ResourceBudgetPolicy {
             tier: ResourceBudgetTier::from_trusted_static("interactive_standard"),
@@ -290,6 +291,7 @@ fn long_running_mission_profile() -> RunProfileDefinition {
             require_before_block: true,
             max_checkpoint_bytes: 256 * 1024,
             require_final_checkpoint: true,
+            allow_no_reply_completion: false,
         },
         resource_budget_policy: ResourceBudgetPolicy {
             tier: ResourceBudgetTier::from_trusted_static("mission_high"),
@@ -415,6 +417,10 @@ fn fingerprint_for(
     );
     update_bool(
         definition.checkpoint_policy.require_final_checkpoint,
+        &mut update,
+    );
+    update_bool(
+        definition.checkpoint_policy.allow_no_reply_completion,
         &mut update,
     );
     update(resource_budget_policy.tier.as_str());

@@ -54,10 +54,11 @@ pub use ids::{
     TurnLeaseToken, TurnRunId, TurnRunnerId,
 };
 pub use loop_exit::{
-    LoopBlocked, LoopBlockedKind, LoopCancelled, LoopCancelledReasonKind, LoopCompleted,
-    LoopCompletionKind, LoopExit, LoopExitInvalidHandling, LoopExitMapping,
-    LoopExitValidationDecision, LoopExitValidationPolicy, LoopExitViolation, LoopExitViolationKind,
-    LoopFailed, LoopFailureKind,
+    BlockedEvidenceRequest, CompletionEvidenceRequest, FailureEvidenceRequest,
+    FinalCheckpointEvidenceRequest, LoopBlocked, LoopBlockedKind, LoopCancelled,
+    LoopCancelledReasonKind, LoopCompleted, LoopCompletionKind, LoopExit, LoopExitApplier,
+    LoopExitEvidencePort, LoopExitInvalidHandling, LoopExitMapping, LoopExitValidationDecision,
+    LoopExitViolation, LoopExitViolationKind, LoopFailed, LoopFailureKind,
 };
 pub use memory::{InMemoryTurnStateStore, InMemoryTurnStateStoreLimits};
 pub use request::{
