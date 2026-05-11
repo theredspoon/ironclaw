@@ -100,7 +100,7 @@ impl MemoryPromptContextService for ProductionMemoryPromptContextService {
 
         let snippets = results
             .into_iter()
-            .filter_map(|result| map_search_result_to_snippet(result))
+            .filter_map(map_search_result_to_snippet)
             .collect();
 
         Ok(snippets)
