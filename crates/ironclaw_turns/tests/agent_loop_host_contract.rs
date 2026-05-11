@@ -622,6 +622,7 @@ async fn loop_prompt_bundle_public_serialization_hides_raw_content() {
         reply_target_binding_ref: ReplyTargetBindingRef::new("reply-loop-host").unwrap(),
         resolved_run_profile_id: host.context.resolved_run_profile.profile_id.clone(),
         resolved_run_profile_version: host.context.resolved_run_profile.profile_version,
+        resolved_model_route: None,
         received_at: Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap(),
         checkpoint_id: None,
         gate_ref: None,

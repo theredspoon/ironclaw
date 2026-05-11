@@ -9,7 +9,7 @@ use crate::{
     TurnCheckpointId, TurnError, TurnErrorCategory, TurnId, TurnLeaseToken, TurnLifecycleEvent,
     TurnRunId, TurnRunProfile, TurnRunState, TurnRunnerId, TurnScope, TurnStatus, TurnTimestamp,
     events::EventCursor,
-    run_profile::{LoopCheckpointKind, LoopCheckpointStateRef},
+    run_profile::{LoopCheckpointKind, LoopCheckpointStateRef, LoopModelRouteSnapshot},
 };
 
 #[async_trait]
@@ -86,6 +86,8 @@ pub struct TurnRunRecord {
     pub reply_target_binding_ref: ReplyTargetBindingRef,
     pub status: TurnStatus,
     pub profile: TurnRunProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<LoopModelRouteSnapshot>,
     pub checkpoint_id: Option<TurnCheckpointId>,
     pub gate_ref: Option<GateRef>,
     pub failure: Option<crate::SanitizedFailure>,

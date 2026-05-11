@@ -505,6 +505,7 @@ where
                 model_profile_id: model_profile_id.clone(),
                 messages: resolved_messages,
                 surface_version: request.surface_version,
+                resolved_model_route: self.run_context.resolved_model_route.clone(),
                 run_id: self.run_context.run_id,
                 turn_id: self.run_context.turn_id,
             })
@@ -645,9 +646,17 @@ pub struct HostManagedModelRequest {
     pub model_profile_id: ModelProfileId,
     pub messages: Vec<HostManagedModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<HostManagedModelRouteSnapshot>,
     pub run_id: TurnRunId,
     pub turn_id: TurnId,
 }
+
+/// Boundary alias for the route snapshot carried from turn/run state into
+/// host-managed model requests. This intentionally preserves the turn-owned
+/// wire shape across the loop-support boundary instead of defining a duplicate
+/// snapshot DTO here.
+pub type HostManagedModelRouteSnapshot = ironclaw_turns::run_profile::LoopModelRouteSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManagedModelMessage {
@@ -699,6 +708,7 @@ impl HostManagedModelResponse {
 pub enum HostManagedModelErrorKind {
     InvalidRequest,
     PolicyDenied,
+    ConfigurationError,
     BudgetExceeded,
     Unavailable,
     Cancelled,
@@ -941,6 +951,7 @@ fn model_error_kind(kind: HostManagedModelErrorKind) -> AgentLoopHostErrorKind {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => AgentLoopHostErrorKind::InvalidInvocation,
         HostManagedModelErrorKind::PolicyDenied => AgentLoopHostErrorKind::PolicyDenied,
+        HostManagedModelErrorKind::ConfigurationError => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::BudgetExceeded => AgentLoopHostErrorKind::BudgetExceeded,
         HostManagedModelErrorKind::Unavailable => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::Cancelled => AgentLoopHostErrorKind::Cancelled,
@@ -951,6 +962,7 @@ fn safe_model_summary(kind: HostManagedModelErrorKind) -> &'static str {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => "model request is invalid",
         HostManagedModelErrorKind::PolicyDenied => "model profile is not permitted",
+        HostManagedModelErrorKind::ConfigurationError => "model route configuration is invalid",
         HostManagedModelErrorKind::BudgetExceeded => "model request exceeded its budget",
         HostManagedModelErrorKind::Unavailable => "model service is unavailable",
         HostManagedModelErrorKind::Cancelled => "model request was cancelled",

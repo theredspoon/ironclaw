@@ -112,34 +112,49 @@ fn completed_exit_requires_host_verified_completion_refs_before_trusted_mapping(
 
 #[test]
 fn final_checkpoint_policy_rejects_terminal_exit_without_checkpoint() {
-    let decision = LoopExit::Completed(LoopCompleted {
-        completion_kind: LoopCompletionKind::FinalReply,
-        reply_message_refs: vec![message_ref("msg:assistant-final")],
-        result_refs: vec![],
-        final_checkpoint_id: None,
-        usage_summary_ref: None,
-        exit_id: exit_id("exit:no-final-checkpoint"),
-    })
-    .validate(LoopExitValidationPolicy {
-        require_final_checkpoint: true,
-        host_cancellation_observed: false,
-        invalid_handling: LoopExitInvalidHandling::FailTerminal,
-        completion_refs_verified: true,
-        blocked_evidence_verified: false,
-        failure_evidence_verified: false,
-    });
+    let cases = [
+        LoopExit::Completed(LoopCompleted {
+            completion_kind: LoopCompletionKind::FinalReply,
+            reply_message_refs: vec![message_ref("msg:assistant-final")],
+            result_refs: vec![],
+            final_checkpoint_id: None,
+            usage_summary_ref: None,
+            exit_id: exit_id("exit:no-final-checkpoint-completed"),
+        }),
+        LoopExit::Cancelled(LoopCancelled {
+            reason_kind: LoopCancelledReasonKind::HostCancellation,
+            checkpoint_id: None,
+            interrupted_message_refs: vec![],
+            exit_id: exit_id("exit:no-final-checkpoint-cancelled"),
+        }),
+        LoopExit::failed(
+            LoopFailureKind::DriverBug,
+            exit_id("exit:no-final-checkpoint-failed"),
+        ),
+    ];
 
-    assert_eq!(
-        decision.violation.unwrap().category(),
-        "missing_final_checkpoint"
-    );
-    assert_eq!(
-        decision.mapping,
-        TurnRunnerOutcome::Failed {
-            failure: SanitizedFailure::new("driver_protocol_violation").unwrap(),
-        }
-        .into()
-    );
+    for exit in cases {
+        let decision = exit.validate(LoopExitValidationPolicy {
+            require_final_checkpoint: true,
+            host_cancellation_observed: true,
+            invalid_handling: LoopExitInvalidHandling::FailTerminal,
+            completion_refs_verified: true,
+            blocked_evidence_verified: false,
+            failure_evidence_verified: true,
+        });
+
+        assert_eq!(
+            decision.violation.unwrap().category(),
+            "missing_final_checkpoint"
+        );
+        assert_eq!(
+            decision.mapping,
+            TurnRunnerOutcome::Failed {
+                failure: SanitizedFailure::new("driver_protocol_violation").unwrap(),
+            }
+            .into()
+        );
+    }
 }
 
 #[test]

@@ -31,11 +31,13 @@ use ironclaw_turns::{
     TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnStateStore,
     TurnStatus,
     events::EventCursor,
+    run_profile::LoopModelRouteSnapshot,
     runner::{
         ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
         CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest,
-        FailRunRequest, HeartbeatRequest, RecoverExpiredLeasesRequest,
-        RecoverExpiredLeasesResponse, TurnRunTransitionPort, apply_loop_exit,
+        FailRunRequest, HeartbeatRequest, RecordModelRouteSnapshotRequest,
+        RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse, TurnRunTransitionPort,
+        apply_loop_exit,
     },
 };
 
@@ -1376,6 +1378,208 @@ async fn snapshot_load_drops_released_reservations_without_retained_run_records(
             .persistence_snapshot()
             .admission_reservations
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn model_route_snapshot_persists_across_snapshot_restore_and_recovery() {
+    let source_store = Arc::new(InMemoryTurnStateStore::default());
+    let source_coordinator = DefaultTurnCoordinator::new(source_store.clone());
+    let run_id = accepted_run_id(
+        &source_coordinator
+            .submit_turn(submit_request("thread-route", "idem-route"))
+            .await
+            .unwrap(),
+    );
+    let first_runner = TurnRunnerId::new();
+    let first_lease = TurnLeaseToken::new();
+    source_store
+        .claim_next_run(ClaimRunRequest {
+            runner_id: first_runner,
+            lease_token: first_lease,
+            scope_filter: Some(scope("thread-route")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    source_store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id: first_runner,
+            lease_token: first_lease,
+            snapshot: snapshot.clone(),
+        })
+        .await
+        .unwrap();
+
+    let restored = Arc::new(
+        InMemoryTurnStateStore::from_persistence_snapshot(
+            source_store.persistence_snapshot(),
+            InMemoryTurnStateStoreLimits::default(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        restored
+            .get_run_state(GetRunStateRequest {
+                scope: scope("thread-route"),
+                run_id,
+            })
+            .await
+            .unwrap()
+            .resolved_model_route,
+        Some(snapshot.clone())
+    );
+
+    let recovered = restored
+        .recover_expired_leases(RecoverExpiredLeasesRequest {
+            now: Utc::now() + ChronoDuration::hours(1),
+            scope_filter: Some(scope("thread-route")),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.recovered[0].resolved_model_route, Some(snapshot));
+}
+
+#[tokio::test]
+async fn record_model_route_snapshot_rejects_secret_like_fields() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-route-secret", "idem-route-secret"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-route-secret")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    for snapshot in [
+        LoopModelRouteSnapshot::new("sk-secret-provider", "gpt-4", "config:v1", "auth:v1"),
+        LoopModelRouteSnapshot::new(
+            "openrouter",
+            "anthropic/secret-model",
+            "config:v1",
+            "auth:v1",
+        ),
+        LoopModelRouteSnapshot::new("openrouter", "gpt-4", "config:api_key", "auth:v1"),
+        LoopModelRouteSnapshot::new("openrouter", "gpt-4", "config:v1", "auth:bearer"),
+    ] {
+        let error = store
+            .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+                run_id,
+                runner_id,
+                lease_token,
+                snapshot,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TurnError::InvalidRequest { .. }));
+    }
+
+    assert_eq!(
+        store
+            .get_run_state(GetRunStateRequest {
+                scope: scope("thread-route-secret"),
+                run_id,
+            })
+            .await
+            .unwrap()
+            .resolved_model_route,
+        None
+    );
+}
+
+#[tokio::test]
+async fn record_model_route_snapshot_is_idempotent_and_rejects_route_changes() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request(
+                "thread-route-idempotent",
+                "idem-route-idempotent",
+            ))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-route-idempotent")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let initial = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let first = store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: initial.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.resolved_model_route, Some(initial.clone()));
+
+    let replay = store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: initial.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(replay.resolved_model_route, Some(initial.clone()));
+
+    let replacement = LoopModelRouteSnapshot::new("nearai", "qwen3-coder", "config:v2", "auth:v2");
+    let error = store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: replacement,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TurnError::Conflict { .. }));
+    assert_eq!(
+        store
+            .get_run_state(GetRunStateRequest {
+                scope: scope("thread-route-idempotent"),
+                run_id,
+            })
+            .await
+            .unwrap()
+            .resolved_model_route,
+        Some(initial)
     );
 }
 
@@ -3695,6 +3899,7 @@ impl TurnRunTransitionPort for AtomicLoopExitPort {
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
             resolved_run_profile_id: RunProfileId::new("default").unwrap(),
             resolved_run_profile_version: RunProfileVersion::new(1),
+            resolved_model_route: None,
             received_at: received_at(),
             checkpoint_id: None,
             gate_ref: None,
