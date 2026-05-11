@@ -25,8 +25,8 @@ use tracing::{debug, error, info, warn};
 
 use ironclaw_turns::{
     AgentLoopDriverError, AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, LoopExit,
-    LoopExitValidationPolicy, SanitizedFailure, TurnError, TurnLeaseToken, TurnRunId, TurnRunnerId,
-    TurnScope, TurnStatus,
+    LoopExitInvalidHandling, LoopExitValidationPolicy, SanitizedFailure, TurnError, TurnLeaseToken,
+    TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
     runner::{
         ApplyLoopExitRequest, ClaimRunRequest, ClaimedTurnRun, HeartbeatRequest,
         RecordRecoveryRequiredRequest, TurnRunTransitionPort,
@@ -67,6 +67,13 @@ pub struct TurnRunnerWorkerConfig {
 
     /// Optional scope filter to restrict which runs this worker claims.
     pub scope_filter: Option<TurnScope>,
+
+    /// Validation policy used when applying driver-returned loop exits.
+    ///
+    /// This is injected here so a durable evidence-backed applier can replace
+    /// the temporary trusted text-only policy without changing worker control
+    /// flow.
+    pub exit_validation_policy: LoopExitValidationPolicy,
 }
 
 impl Default for TurnRunnerWorkerConfig {
@@ -75,6 +82,7 @@ impl Default for TurnRunnerWorkerConfig {
             heartbeat_interval: Duration::from_secs(10),
             poll_interval: Duration::from_secs(5),
             scope_filter: None,
+            exit_validation_policy: trusted_text_only_exit_validation_policy(),
         }
     }
 }
@@ -233,7 +241,7 @@ impl TurnRunnerWorker {
                 break;
             }
 
-            if let Err(err) = self.try_claim_and_run().await {
+            if let Err(err) = self.try_claim_and_run(&cancel).await {
                 warn!(
                     runner_id = ?self.runner_id,
                     error = %err,
@@ -246,7 +254,7 @@ impl TurnRunnerWorker {
     }
 
     /// Attempt one claim-and-run cycle.
-    async fn try_claim_and_run(&self) -> Result<(), TurnRunnerError> {
+    async fn try_claim_and_run(&self, cancel: &CancellationToken) -> Result<(), TurnRunnerError> {
         let lease_token = TurnLeaseToken::new();
         let request = ClaimRunRequest {
             runner_id: self.runner_id,
@@ -275,45 +283,45 @@ impl TurnRunnerWorker {
             "claimed turn run"
         );
 
-        self.execute_claimed_run(claimed).await;
+        self.execute_claimed_run(claimed, cancel).await;
         Ok(())
     }
 
     /// Execute a claimed run: heartbeat, invoke driver, apply exit.
-    async fn execute_claimed_run(&self, claimed: ClaimedTurnRun) {
+    async fn execute_claimed_run(&self, claimed: ClaimedTurnRun, cancel: &CancellationToken) {
         let run_id = claimed.state.run_id;
         let runner_id = claimed.runner_id;
         let lease_token = claimed.lease_token;
 
-        // Start heartbeat task
         let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_handle = {
-            let port = Arc::clone(&self.transition_port);
-            let interval = self.config.heartbeat_interval;
-            let cancel = heartbeat_cancel.clone();
-            tokio::spawn(heartbeat_loop(
-                port,
-                run_id,
-                runner_id,
-                lease_token,
-                interval,
-                cancel,
-            ))
-        };
+        let heartbeat = heartbeat_loop(
+            Arc::clone(&self.transition_port),
+            run_id,
+            runner_id,
+            lease_token,
+            self.config.heartbeat_interval,
+            heartbeat_cancel.clone(),
+        );
+        tokio::pin!(heartbeat);
 
         // Resolve driver from registry and invoke it. Driver panics indicate
         // unknown partial state, so convert them to RecoveryRequired.
-        let exit_result = match AssertUnwindSafe(self.invoke_driver(&claimed))
-            .catch_unwind()
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(DriverInvocationError::DriverPanic),
+        let driver = AssertUnwindSafe(self.invoke_driver(&claimed)).catch_unwind();
+        tokio::pin!(driver);
+
+        let exit_result = tokio::select! {
+            result = &mut driver => match result {
+                Ok(result) => result,
+                Err(_) => Err(DriverInvocationError::DriverPanic),
+            },
+            heartbeat_result = &mut heartbeat => match heartbeat_result {
+                Ok(()) => Err(DriverInvocationError::HeartbeatStopped),
+                Err(err) => Err(DriverInvocationError::HeartbeatFailed(err)),
+            },
+            () = cancel.cancelled() => Err(DriverInvocationError::WorkerCancelled),
         };
 
-        // Stop heartbeat
         heartbeat_cancel.cancel();
-        let _ = heartbeat_handle.await;
 
         // Apply the exit or record recovery
         match exit_result {
@@ -418,7 +426,7 @@ impl TurnRunnerWorker {
             runner_id,
             lease_token,
             exit,
-            validation_policy: LoopExitValidationPolicy::default(),
+            validation_policy: self.config.exit_validation_policy,
         };
 
         match ironclaw_turns::runner::apply_loop_exit(self.transition_port.as_ref(), request).await
@@ -485,6 +493,10 @@ impl TurnRunnerWorker {
                 "driver_failed"
             }
             DriverInvocationError::DriverPanic => "driver_panic",
+            DriverInvocationError::HeartbeatFailed(_) | DriverInvocationError::HeartbeatStopped => {
+                "heartbeat_failed"
+            }
+            DriverInvocationError::WorkerCancelled => "worker_cancelled",
         };
 
         let Some(failure) = sanitized_failure(category) else {
@@ -508,7 +520,23 @@ impl TurnRunnerWorker {
     }
 }
 
-/// Heartbeat loop that runs in a spawned task for the duration of a driver run.
+/// Temporary trusted text-only validation policy for this narrow worker slice.
+///
+/// Completion refs are trusted because the only concrete host currently wired
+/// here finalizes assistant replies through the host-managed transcript port.
+/// Blocked, failed, and cancelled exits remain fail-closed until a durable
+/// evidence-backed applier is wired.
+fn trusted_text_only_exit_validation_policy() -> LoopExitValidationPolicy {
+    LoopExitValidationPolicy {
+        require_final_checkpoint: false,
+        host_cancellation_observed: false,
+        invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+        completion_refs_verified: true,
+        blocked_evidence_verified: false,
+        failure_evidence_verified: false,
+    }
+}
+
 async fn heartbeat_loop(
     port: Arc<dyn TurnRunTransitionPort>,
     run_id: TurnRunId,
@@ -516,7 +544,12 @@ async fn heartbeat_loop(
     lease_token: TurnLeaseToken,
     interval: Duration,
     cancel: CancellationToken,
-) {
+) -> Result<(), TurnError> {
+    let interval = if interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        interval
+    };
     let mut tick = tokio::time::interval(interval);
     // Skip the first immediate tick
     tick.tick().await;
@@ -529,7 +562,7 @@ async fn heartbeat_loop(
                     run_id = ?run_id,
                     "heartbeat loop stopped"
                 );
-                break;
+                return Ok(());
             }
             _ = tick.tick() => {
                 let request = HeartbeatRequest {
@@ -552,10 +585,7 @@ async fn heartbeat_loop(
                             error = %err,
                             "heartbeat failed"
                         );
-                        // Heartbeat failure is not fatal — the driver invocation
-                        // continues. If the lease actually expires, the store will
-                        // transition to RecoveryRequired on the next claim/recovery
-                        // sweep.
+                        return Err(err);
                     }
                 }
             }
@@ -584,6 +614,9 @@ enum DriverInvocationError {
     HostCreationFailed { reason: String },
     DriverError(AgentLoopDriverError),
     DriverPanic,
+    HeartbeatFailed(TurnError),
+    HeartbeatStopped,
+    WorkerCancelled,
 }
 
 impl std::fmt::Display for DriverInvocationError {
@@ -593,6 +626,9 @@ impl std::fmt::Display for DriverInvocationError {
             Self::HostCreationFailed { reason } => write!(f, "host creation failed: {reason}"),
             Self::DriverError(err) => write!(f, "driver error: {err}"),
             Self::DriverPanic => write!(f, "driver panicked before returning loop exit"),
+            Self::HeartbeatFailed(err) => write!(f, "heartbeat failed: {err}"),
+            Self::HeartbeatStopped => write!(f, "heartbeat stopped before driver completed"),
+            Self::WorkerCancelled => write!(f, "worker cancelled before driver completed"),
         }
     }
 }
