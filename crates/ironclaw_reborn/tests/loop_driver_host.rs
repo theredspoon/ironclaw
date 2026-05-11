@@ -5,34 +5,47 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ironclaw_authorization::GrantAuthorizer;
+use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry};
+use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{
-    AgentId, ApprovalRequestId, CapabilityDescriptor, CapabilityId, CapabilitySet, EffectKind,
-    ExecutionContext, ExtensionId, MountView, PermissionMode, ProcessId, ProjectId,
+    AgentId, ApprovalRequestId, CapabilityDescriptor, CapabilityGrant, CapabilityGrantId,
+    CapabilityId, CapabilitySet, EffectKind, ExecutionContext, ExtensionId, GrantConstraints,
+    MountView, NetworkPolicy, PackageId, PermissionMode, Principal, ProcessId, ProjectId,
     ResourceEstimate, ResourceUsage, RuntimeKind, SecretHandle, TenantId, ThreadId, TrustClass,
-    UserId,
+    UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
     CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, CapabilitySurfacePolicy, HostRuntime,
-    HostRuntimeError, HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
-    RuntimeBlockedReason, RuntimeCapabilityCompleted, RuntimeCapabilityFailure,
-    RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest,
-    RuntimeFailureKind, RuntimeGateId, RuntimeProcessHandle, RuntimeResourceGate,
-    RuntimeStatusRequest, SurfaceKind, VisibleCapability, VisibleCapabilityAccess,
+    HostRuntimeError, HostRuntimeHealth, HostRuntimeServices, HostRuntimeStatus,
+    RuntimeApprovalGate, RuntimeAuthGate, RuntimeBlockedReason, RuntimeCapabilityCompleted,
+    RuntimeCapabilityFailure, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
+    RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeGateId, RuntimeProcessHandle,
+    RuntimeResourceGate, RuntimeStatusRequest, SurfaceKind, VisibleCapability,
+    VisibleCapabilityAccess,
 };
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
     HostManagedModelResponse,
 };
+use ironclaw_processes::ProcessServices;
 use ironclaw_reborn::{
     HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
     RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
     turn_runner::HostFactory,
 };
+use ironclaw_resources::InMemoryResourceGovernor;
+use ironclaw_scripts::{
+    ScriptBackend, ScriptBackendOutput, ScriptBackendRequest, ScriptRuntime, ScriptRuntimeConfig,
+};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
-use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
+use ironclaw_trust::{
+    AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
+    HostTrustPolicy, TrustDecision, TrustProvenance,
+};
 use ironclaw_turns::{
     AcceptedMessageRef, CheckpointStateStore, EventCursor, GetCheckpointStateRequest,
     GetLoopCheckpointRequest, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
@@ -46,10 +59,10 @@ use ironclaw_turns::{
         CapabilityDeniedReasonKind, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
         CapabilitySurfaceVersion, FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink,
         LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
-        LoopContextRequest, LoopDriverId, LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor,
-        LoopInputCursorToken, LoopInputPort, LoopModelRequest, LoopProgressEvent,
-        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode,
-        VisibleCapabilityRequest,
+        LoopCheckpointStateRef, LoopContextRequest, LoopDriverId, LoopDriverNoteKind,
+        LoopHostMilestone, LoopInputCursor, LoopInputCursorToken, LoopInputPort, LoopModelRequest,
+        LoopProgressEvent, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
+        ParentLoopOutput, PromptMode, VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
@@ -361,6 +374,66 @@ async fn text_only_host_prompt_rejects_codeact_mode_and_zero_budget() {
         .await
         .unwrap_err();
     assert_eq!(zero_budget.kind, AgentLoopHostErrorKind::BudgetExceeded);
+}
+
+#[tokio::test]
+async fn text_only_host_prompt_rejects_foreign_context_and_checkpoint_refs() {
+    let fixture = HostFixture::new("thread-host-prompt-scope-refs", "hello reborn").await;
+    let host = fixture.build_host().await;
+    let other_context = LoopRunContext::new(
+        fixture.context.scope.clone(),
+        fixture.context.turn_id,
+        TurnRunId::new(),
+        fixture.context.resolved_run_profile.clone(),
+    );
+
+    let foreign_cursor = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: Some(LoopInputCursor::from_host_token(
+                &other_context,
+                LoopInputCursorToken::new("input-cursor:foreign-prompt").unwrap(),
+            )),
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(foreign_cursor.kind, AgentLoopHostErrorKind::ScopeMismatch);
+
+    let foreign_checkpoint = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: Some(LoopCheckpointStateRef::new("checkpoint:foreign").unwrap()),
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        foreign_checkpoint.kind,
+        AgentLoopHostErrorKind::ScopeMismatch
+    );
+
+    let malformed_checkpoint = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: Some(
+                LoopCheckpointStateRef::new(format!("checkpoint:{}:bad!", fixture.context.run_id))
+                    .unwrap(),
+            ),
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        malformed_checkpoint.kind,
+        AgentLoopHostErrorKind::InvalidInvocation
+    );
 }
 
 #[tokio::test]
@@ -1556,6 +1629,191 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
     assert_eq!(stale.kind, AgentLoopHostErrorKind::StaleSurface);
 }
 
+#[tokio::test]
+async fn text_only_host_e2e_invokes_script_capability_through_real_host_runtime() {
+    let fixture = HostFixture::new("thread-host-runtime-e2e-script", "hello e2e").await;
+    let runtime: Arc<dyn HostRuntime + Send + Sync> = Arc::new(
+        HostRuntimeServices::new(
+            Arc::new(e2e_registry_with_manifest(E2E_SCRIPT_MANIFEST)),
+            Arc::new(LocalFilesystem::new()),
+            Arc::new(InMemoryResourceGovernor::new()),
+            Arc::new(GrantAuthorizer::new()),
+            ProcessServices::in_memory(),
+            ironclaw_host_runtime::CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+        )
+        .with_trust_policy(Arc::new(e2e_trust_policy()))
+        .with_script_runtime(Arc::new(ScriptRuntime::new(
+            ScriptRuntimeConfig::for_testing(),
+            E2eEchoScriptBackend,
+        )))
+        .host_runtime_for_local_testing(),
+    );
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:e2e-script-happy-path").unwrap();
+    let input = json!({"message": "reborn adapter e2e happy path"});
+    io.put_input(input_ref.clone(), input.clone());
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime,
+        fixture.context.clone(),
+        host_runtime_visible_request_with_dispatch_grant(&fixture, e2e_script_capability_id()),
+        io.clone(),
+        io.clone(),
+    )
+    .with_milestone_sink(fixture.milestone_sink.clone());
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(
+        surface.descriptors[0].capability_id,
+        e2e_script_capability_id()
+    );
+    assert_eq!(surface.descriptors[0].runtime, RuntimeKind::Script);
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: e2e_script_capability_id(),
+            input_ref,
+        })
+        .await
+        .unwrap();
+
+    let CapabilityOutcome::Completed(completed) = outcome else {
+        panic!("expected completed script capability through host runtime");
+    };
+    assert!(completed.result_ref.as_str().starts_with("result:"));
+    assert_eq!(completed.safe_summary, "capability completed");
+    assert_eq!(io.results(), vec![(e2e_script_capability_id(), input)]);
+    assert!(fixture.milestone_names().contains(&"capability_invoked"));
+}
+
+#[tokio::test]
+async fn text_only_host_denies_capability_without_provider_trust_before_host_runtime() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-missing-trust", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:missing-provider-trust").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "must not dispatch"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, []),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let denied = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        denied,
+        CapabilityOutcome::Denied(denied)
+            if denied.reason_kind.as_str() == "missing_provider_trust"
+                && denied.safe_summary == "capability provider trust is unavailable"
+    ));
+    assert!(runtime.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn text_only_host_allows_retry_after_missing_capability_input_is_staged() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-input-retry", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"retried": true}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:stage-after-miss").unwrap();
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io.clone(),
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let invocation = CapabilityInvocation {
+        surface_version: surface.version,
+        capability_id: capability_id.clone(),
+        input_ref: input_ref.clone(),
+    };
+
+    let missing = host
+        .invoke_capability(invocation.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(missing.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    assert!(runtime.invocations().is_empty());
+
+    io.put_input(input_ref, json!({"message": "now staged"}));
+    let retried = host.invoke_capability(invocation).await.unwrap();
+
+    assert!(matches!(retried, CapabilityOutcome::Completed(_)));
+    assert_eq!(runtime.invocations().len(), 1);
+    assert_eq!(
+        io.results(),
+        vec![(capability_id, json!({"retried": true}))]
+    );
+}
+
 #[derive(Default)]
 struct InMemoryCapabilityIo {
     inputs: Mutex<BTreeMap<String, Value>>,
@@ -1800,6 +2058,89 @@ fn trust_decision() -> TrustDecision {
         evaluated_at: Utc::now(),
     }
 }
+
+fn host_runtime_visible_request_with_dispatch_grant(
+    fixture: &HostFixture,
+    capability_id: CapabilityId,
+) -> ironclaw_host_runtime::VisibleCapabilityRequest {
+    let mut request = host_runtime_visible_request(fixture, ["script"]);
+    request.context.grants.grants.push(CapabilityGrant {
+        id: CapabilityGrantId::new(),
+        capability: capability_id,
+        grantee: Principal::Extension(request.context.extension_id.clone()),
+        issued_by: Principal::HostRuntime,
+        constraints: GrantConstraints {
+            allowed_effects: vec![EffectKind::DispatchCapability],
+            mounts: MountView::default(),
+            network: NetworkPolicy::default(),
+            secrets: Vec::new(),
+            resource_ceiling: None,
+            expires_at: None,
+            max_invocations: None,
+        },
+    });
+    request
+}
+
+fn e2e_registry_with_manifest(manifest: &str) -> ExtensionRegistry {
+    let mut registry = ExtensionRegistry::new();
+    let manifest = ExtensionManifest::parse(manifest).unwrap();
+    let package = ExtensionPackage::from_manifest(
+        manifest,
+        VirtualPath::new("/system/extensions/script").unwrap(),
+    )
+    .unwrap();
+    registry.insert(package).unwrap();
+    registry
+}
+
+fn e2e_trust_policy() -> HostTrustPolicy {
+    HostTrustPolicy::new(vec![Box::new(AdminConfig::with_entries(vec![
+        AdminEntry::for_local_manifest(
+            PackageId::new("script").unwrap(),
+            "/system/extensions/script/manifest.toml".to_string(),
+            None,
+            HostTrustAssignment::user_trusted(),
+            vec![EffectKind::DispatchCapability],
+            None,
+        ),
+    ]))])
+    .unwrap()
+}
+
+fn e2e_script_capability_id() -> CapabilityId {
+    CapabilityId::new("script.echo").unwrap()
+}
+
+struct E2eEchoScriptBackend;
+
+impl ScriptBackend for E2eEchoScriptBackend {
+    fn execute(&self, request: ScriptBackendRequest) -> Result<ScriptBackendOutput, String> {
+        let value = serde_json::from_str(&request.stdin_json).map_err(|error| error.to_string())?;
+        Ok(ScriptBackendOutput::json(value))
+    }
+}
+
+const E2E_SCRIPT_MANIFEST: &str = r#"
+id = "script"
+name = "Script Echo"
+version = "0.1.0"
+description = "Script echo test extension"
+trust = "third_party"
+
+[runtime]
+kind = "script"
+runner = "sandboxed_process"
+command = "echo-script"
+args = []
+
+[[capabilities]]
+id = "script.echo"
+description = "Echo text through Reborn adapter e2e"
+effects = ["dispatch_capability"]
+default_permission = "allow"
+parameters_schema = { type = "object" }
+"#;
 
 struct HostFixture {
     thread_service: Arc<InMemorySessionThreadService>,
