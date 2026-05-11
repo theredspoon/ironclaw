@@ -40,5 +40,5 @@ pub use types::{
 };
 
 fn path_prefix_matches(prefix: &str, path: &str) -> bool {
-    path == prefix || path.starts_with(&format!("{prefix}/"))
+    std::path::Path::new(path).starts_with(std::path::Path::new(prefix))
 }
