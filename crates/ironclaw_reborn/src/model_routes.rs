@@ -356,11 +356,7 @@ impl ModelRouteResolver for StaticModelRouteResolver {
         slot: ModelSlot,
         route: &ModelRoute,
     ) -> Result<ModelSelectionMode, ModelRouteError> {
-        let configured = self
-            .routes
-            .get(&slot)
-            .ok_or_else(|| ModelRouteError::new(ModelRouteErrorKind::RouteUnavailable))?;
-        if configured.route != *route {
+        if !self.routes.contains_key(&slot) {
             return Err(ModelRouteError::new(ModelRouteErrorKind::RouteUnavailable));
         }
         if !self.policy.permits(route) {

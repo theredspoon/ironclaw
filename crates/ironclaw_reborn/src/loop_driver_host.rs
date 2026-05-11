@@ -200,6 +200,20 @@ where
             snapshot
                 .validate()
                 .map_err(|reason| RebornLoopDriverHostError::InvalidRequest { reason })?;
+            let Some(resolver) = &self.model_route_resolver else {
+                return Err(RebornLoopDriverHostError::InvalidRequest {
+                    reason: "model route resolver is required for this host".to_string(),
+                });
+            };
+            let slot = slot_for_model_profile(&run_context)?;
+            let route = crate::model_routes::ModelRoute::new(
+                snapshot.provider_id.clone(),
+                snapshot.model_id.clone(),
+            )
+            .map_err(model_route_error_to_host_error)?;
+            resolver
+                .validate_model_route(slot, &route)
+                .map_err(model_route_error_to_host_error)?;
             return Ok(run_context);
         }
         let Some(resolver) = &self.model_route_resolver else {
@@ -210,12 +224,7 @@ where
             }
             return Ok(run_context);
         };
-        let model_profile_id = &run_context.resolved_run_profile.model_profile_id;
-        let slot = ModelSlot::from_model_profile_id(model_profile_id).ok_or_else(|| {
-            RebornLoopDriverHostError::InvalidRequest {
-                reason: "model profile is not supported by the model route resolver".to_string(),
-            }
-        })?;
+        let slot = slot_for_model_profile(&run_context)?;
         let snapshot = resolver
             .resolve_model_route(slot)
             .map_err(model_route_error_to_host_error)?;
@@ -649,6 +658,16 @@ fn model_route_error_to_host_error(error: ModelRouteError) -> RebornLoopDriverHo
     RebornLoopDriverHostError::InvalidRequest {
         reason: format!("model route resolution failed: {}", error.kind().as_str()),
     }
+}
+
+fn slot_for_model_profile(
+    run_context: &LoopRunContext,
+) -> Result<ModelSlot, RebornLoopDriverHostError> {
+    ModelSlot::from_model_profile_id(&run_context.resolved_run_profile.model_profile_id).ok_or_else(
+        || RebornLoopDriverHostError::InvalidRequest {
+            reason: "model profile is not supported by the model route resolver".to_string(),
+        },
+    )
 }
 
 fn persisted_profile_id(profile_id: &RunProfileId) -> RunProfileId {

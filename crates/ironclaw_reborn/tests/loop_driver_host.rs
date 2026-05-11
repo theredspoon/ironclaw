@@ -391,7 +391,7 @@ async fn text_only_host_factory_create_host_uses_claimed_model_route_snapshot() 
         ))
         .with_route(
             ModelSlot::Default,
-            ModelRoute::new("nearai", "qwen3-coder").unwrap(),
+            ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap(),
         ),
     );
 
@@ -451,13 +451,14 @@ async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
 #[tokio::test]
 async fn text_only_host_factory_reuses_existing_model_route_snapshot_without_reresolving() {
     let fixture = HostFixture::new("thread-host-model-route-reuse", "hello routed host").await;
-    let approved_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let persisted_route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
+    let replacement_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
     let resolver = Arc::new(
         StaticModelRouteResolver::new(
             ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly)
-                .with_approved_route(approved_route.clone()),
+                .with_approved_route(persisted_route.clone()),
         )
-        .with_route(ModelSlot::Default, approved_route),
+        .with_route(ModelSlot::Default, replacement_route),
     );
     let persisted_snapshot = LoopModelRouteSnapshot::new(
         "openrouter",
@@ -487,6 +488,76 @@ async fn text_only_host_factory_reuses_existing_model_route_snapshot_without_rer
         host_dyn.run_context().resolved_model_route,
         Some(persisted_snapshot)
     );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_persisted_model_route_snapshot_without_resolver() {
+    let fixture =
+        HostFixture::new("thread-host-model-route-no-resolver", "hello routed host").await;
+    let persisted_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(persisted_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_snapshot);
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("model route resolver is required")
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_persisted_model_route_snapshot_denied_by_policy() {
+    let fixture = HostFixture::new("thread-host-model-route-denied", "hello routed host").await;
+    let allowed_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(
+            ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly)
+                .with_approved_route(allowed_route.clone()),
+        )
+        .with_route(ModelSlot::Default, allowed_route),
+    );
+    let denied_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(denied_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(denied_snapshot);
+
+    let error = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("model route resolution failed"));
 }
 
 #[tokio::test]
