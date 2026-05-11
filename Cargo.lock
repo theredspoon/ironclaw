@@ -4539,6 +4539,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "clap_complete",
  "ironclaw_reborn",
  "ironclaw_reborn_config",
  "tempfile",
