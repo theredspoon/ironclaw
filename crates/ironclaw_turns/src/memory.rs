@@ -1730,7 +1730,7 @@ impl Inner {
             // Placeholder — callers in block_run don't have the loop's actual state_ref.
             // Real values will be threaded in a follow-up task.
             state_ref: crate::run_profile::LoopCheckpointStateRef::new("checkpoint:block-state")
-                .unwrap(),
+                .unwrap(), // safety: literal satisfies the "checkpoint:" prefix and length constraints.
             created_at,
         });
     }

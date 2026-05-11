@@ -118,8 +118,7 @@ fn default_checkpoint_kind() -> LoopCheckpointKind {
 /// deserializing old persisted data that predates the `state_ref` field.
 /// Real values will be threaded from loop callers in a follow-up task.
 fn default_checkpoint_state_ref() -> LoopCheckpointStateRef {
-    // Safety: literal satisfies the "checkpoint:" prefix and length constraints.
-    LoopCheckpointStateRef::new("checkpoint:unknown").unwrap()
+    LoopCheckpointStateRef::new("checkpoint:unknown").unwrap() // safety: literal satisfies the "checkpoint:" prefix and length constraints.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
