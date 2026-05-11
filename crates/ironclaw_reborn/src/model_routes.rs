@@ -305,7 +305,7 @@ pub trait ModelRouteResolver: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticModelRouteResolver {
     policy: ModelRoutePolicy,
-    routes: HashMap<ModelSlot, ModelRoute>,
+    routes: HashMap<ModelSlot, ModelRouteProviderKey>,
 }
 
 impl StaticModelRouteResolver {
@@ -317,7 +317,13 @@ impl StaticModelRouteResolver {
     }
 
     pub fn with_route(mut self, slot: ModelSlot, route: ModelRoute) -> Self {
-        self.routes.insert(slot, route);
+        self.routes
+            .insert(slot, ModelRouteProviderKey::for_route(route));
+        self
+    }
+
+    pub fn with_provider_key(mut self, slot: ModelSlot, key: ModelRouteProviderKey) -> Self {
+        self.routes.insert(slot, key);
         self
     }
 
@@ -331,16 +337,16 @@ impl ModelRouteResolver for StaticModelRouteResolver {
         &self,
         slot: ModelSlot,
     ) -> Result<ResolvedModelRouteSnapshot, ModelRouteError> {
-        let route = self
+        let provider_key = self
             .routes
             .get(&slot)
             .ok_or_else(|| ModelRouteError::new(ModelRouteErrorKind::RouteUnavailable))?;
-        if !self.policy.permits(route) {
+        if !self.policy.permits(&provider_key.route) {
             return Err(ModelRouteError::new(ModelRouteErrorKind::RouteNotApproved));
         }
-        Ok(ResolvedModelRouteSnapshot::new(
+        Ok(ResolvedModelRouteSnapshot::with_provider_key(
             slot,
-            route.clone(),
+            provider_key.clone(),
             self.policy.mode(),
         ))
     }
@@ -350,7 +356,11 @@ impl ModelRouteResolver for StaticModelRouteResolver {
         slot: ModelSlot,
         route: &ModelRoute,
     ) -> Result<ModelSelectionMode, ModelRouteError> {
-        if !self.routes.contains_key(&slot) {
+        let configured = self
+            .routes
+            .get(&slot)
+            .ok_or_else(|| ModelRouteError::new(ModelRouteErrorKind::RouteUnavailable))?;
+        if configured.route != *route {
             return Err(ModelRouteError::new(ModelRouteErrorKind::RouteUnavailable));
         }
         if !self.policy.permits(route) {
@@ -419,6 +429,7 @@ fn validate_model_id(value: String) -> Result<String, ModelRouteError> {
     }) {
         return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
     }
+    reject_sensitive_markers(&trimmed)?;
     Ok(trimmed)
 }
 

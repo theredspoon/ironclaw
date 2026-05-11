@@ -40,6 +40,21 @@ fn provider_key_includes_route_config_and_auth_versions() {
 }
 
 #[test]
+fn static_resolver_preserves_provider_key_versions() {
+    let route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
+    let provider_key = ModelRouteProviderKey::new(route.clone(), "config:v3", "auth:v9").unwrap();
+    let resolver = StaticModelRouteResolver::new(ModelRoutePolicy::new(
+        ModelSelectionMode::DeveloperAnyConfigured,
+    ))
+    .with_provider_key(ModelSlot::Default, provider_key.clone());
+
+    let snapshot = resolver.resolve(ModelSlot::Default).unwrap();
+
+    assert_eq!(snapshot.provider_key(), &provider_key);
+    assert_eq!(snapshot.route(), &route);
+}
+
+#[test]
 fn developer_policy_allows_any_configured_default_route() {
     let route = ModelRoute::new("ollama", "qwen2.5-coder:7b").unwrap();
     let resolver = StaticModelRouteResolver::new(ModelRoutePolicy::new(
@@ -120,6 +135,13 @@ fn resolved_route_snapshot_remains_stable_after_settings_change() {
 #[test]
 fn route_validation_rejects_secret_like_provider_ids() {
     let error = ModelRoute::new("sk-secret-provider", "gpt-4").unwrap_err();
+
+    assert_eq!(error.kind().as_str(), "invalid_route");
+}
+
+#[test]
+fn route_validation_rejects_secret_like_model_ids() {
+    let error = ModelRoute::new("openrouter", "anthropic/secret-model").unwrap_err();
 
     assert_eq!(error.kind().as_str(), "invalid_route");
 }

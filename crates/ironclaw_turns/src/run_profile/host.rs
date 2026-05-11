@@ -13,6 +13,16 @@ use super::{
     snapshot::ResolvedRunProfile,
 };
 
+const FORBIDDEN_MODEL_ROUTE_MARKERS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "password",
+    "secret",
+];
+
 fn validate_bounded_loop_string(
     value: String,
     label: &'static str,
@@ -360,6 +370,66 @@ impl LoopModelRouteSnapshot {
             auth_version: auth_version.into(),
         }
     }
+
+    pub fn try_new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        config_version: impl Into<String>,
+        auth_version: impl Into<String>,
+    ) -> Result<Self, String> {
+        let snapshot = Self::new(provider_id, model_id, config_version, auth_version);
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_model_route_component("provider_id", &self.provider_id, 128, |character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })?;
+        validate_model_route_component("model_id", &self.model_id, 256, |character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':' | '/')
+        })?;
+        validate_model_route_component("config_version", &self.config_version, 128, |character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+        })?;
+        validate_model_route_component("auth_version", &self.auth_version, 128, |character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+        })?;
+        Ok(())
+    }
+}
+
+fn validate_model_route_component(
+    label: &'static str,
+    value: &str,
+    max_bytes: usize,
+    allowed: impl Fn(char) -> bool,
+) -> Result<(), String> {
+    validate_bounded_loop_string(value.to_string(), label, max_bytes)?;
+    if value.trim() != value {
+        return Err(format!("{label} must not contain surrounding whitespace"));
+    }
+    if !value.chars().all(allowed) {
+        return Err(format!("{label} contains unsupported characters"));
+    }
+    reject_sensitive_model_route_markers(label, value)?;
+    Ok(())
+}
+
+fn reject_sensitive_model_route_markers(label: &'static str, value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    for &forbidden in FORBIDDEN_MODEL_ROUTE_MARKERS {
+        if lower.contains(forbidden) {
+            return Err(format!("{label} contains a forbidden marker"));
+        }
+    }
+    if lower
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+        .any(|token| token.starts_with("sk-"))
+    {
+        return Err(format!("{label} contains a forbidden marker"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

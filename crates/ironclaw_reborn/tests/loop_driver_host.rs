@@ -375,6 +375,40 @@ async fn text_only_host_factory_implements_turn_runner_host_factory() {
 }
 
 #[tokio::test]
+async fn text_only_host_factory_create_host_uses_claimed_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-claimed-model-route", "hello routed host").await;
+    let persisted_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_snapshot.clone());
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(
+            ModelSlot::Default,
+            ModelRoute::new("nearai", "qwen3-coder").unwrap(),
+        ),
+    );
+
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .create_host(&claimed)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        host.run_context().resolved_model_route,
+        Some(persisted_snapshot)
+    );
+}
+
+#[tokio::test]
 async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
     let fixture = HostFixture::new("thread-host-model-route", "hello routed host").await;
     let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
@@ -415,8 +449,8 @@ async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
 }
 
 #[tokio::test]
-async fn text_only_host_factory_rejects_unapproved_existing_model_route_snapshot() {
-    let fixture = HostFixture::new("thread-host-model-route-reject", "hello routed host").await;
+async fn text_only_host_factory_reuses_existing_model_route_snapshot_without_reresolving() {
+    let fixture = HostFixture::new("thread-host-model-route-reuse", "hello routed host").await;
     let approved_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
     let resolver = Arc::new(
         StaticModelRouteResolver::new(
@@ -425,19 +459,51 @@ async fn text_only_host_factory_rejects_unapproved_existing_model_route_snapshot
         )
         .with_route(ModelSlot::Default, approved_route),
     );
+    let persisted_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(persisted_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_snapshot.clone());
+
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap();
+
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    assert_eq!(
+        host_dyn.run_context().resolved_model_route,
+        Some(persisted_snapshot)
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_unpersisted_context_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-injected", "hello routed host").await;
     let context = fixture
         .context
         .clone()
         .with_resolved_model_route(LoopModelRouteSnapshot::new(
             "openrouter",
             "anthropic/claude-sonnet-4",
-            "config:default",
-            "auth:default",
+            "config:v1",
+            "auth:v1",
         ));
 
     let error = fixture
         .factory()
-        .with_model_route_resolver(resolver)
         .build_text_only_host(RebornLoopDriverHostRequest {
             claimed_run: fixture.claimed.clone(),
             loop_run_context: context,
@@ -445,10 +511,89 @@ async fn text_only_host_factory_rejects_unapproved_existing_model_route_snapshot
         .await
         .unwrap_err();
 
-    assert!(matches!(
-        error,
-        ironclaw_reborn::RebornLoopDriverHostError::InvalidRequest { .. }
+    assert!(error.to_string().contains("was not persisted"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_mismatched_persisted_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-mismatch", "hello routed host").await;
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(LoopModelRouteSnapshot::new(
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            "config:v1",
+            "auth:v1",
+        ));
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(LoopModelRouteSnapshot::new(
+        "nearai",
+        "qwen3-coder",
+        "config:v1",
+        "auth:v1",
     ));
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("does not match claimed run"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_invalid_persisted_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-invalid", "hello routed host").await;
+    let invalid_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/secret-model",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(invalid_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(invalid_snapshot);
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("forbidden marker"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_fails_fast_when_model_route_snapshot_required_without_resolver() {
+    let fixture = HostFixture::new("thread-host-model-route-required", "hello routed host").await;
+    let error = fixture
+        .factory_with_config(TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: true,
+        })
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("model route resolver is required")
+    );
 }
 
 #[tokio::test]
@@ -671,7 +816,10 @@ async fn text_only_host_factory_rejects_thread_scope_mismatch() {
         fixture.checkpoint_state_store.clone(),
         fixture.loop_checkpoint_store.clone(),
         fixture.milestone_sink.clone(),
-        TextOnlyLoopHostConfig { max_messages: 8 },
+        TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: false,
+        },
     );
 
     let error = factory
@@ -1186,6 +1334,7 @@ impl HostFixture {
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
             resolved_run_profile_id: RunProfileId::default_profile(),
             resolved_run_profile_version: RunProfileVersion::new(1),
+            resolved_model_route: None,
             received_at: Utc::now(),
             checkpoint_id: None,
             gate_ref: None,
@@ -1236,6 +1385,30 @@ impl HostFixture {
         &self,
         loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
     ) -> RebornLoopDriverHostFactory<InMemorySessionThreadService, RecordingGateway> {
+        self.factory_with_config_and_loop_checkpoint_store(
+            TextOnlyLoopHostConfig {
+                max_messages: 8,
+                require_model_route_snapshot: false,
+            },
+            loop_checkpoint_store,
+        )
+    }
+
+    fn factory_with_config(
+        &self,
+        config: TextOnlyLoopHostConfig,
+    ) -> RebornLoopDriverHostFactory<InMemorySessionThreadService, RecordingGateway> {
+        self.factory_with_config_and_loop_checkpoint_store(
+            config,
+            self.loop_checkpoint_store.clone(),
+        )
+    }
+
+    fn factory_with_config_and_loop_checkpoint_store(
+        &self,
+        config: TextOnlyLoopHostConfig,
+        loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
+    ) -> RebornLoopDriverHostFactory<InMemorySessionThreadService, RecordingGateway> {
         RebornLoopDriverHostFactory::new(
             Arc::clone(&self.thread_service),
             self.thread_scope.clone(),
@@ -1243,7 +1416,7 @@ impl HostFixture {
             self.checkpoint_state_store.clone(),
             loop_checkpoint_store,
             self.milestone_sink.clone(),
-            TextOnlyLoopHostConfig { max_messages: 8 },
+            config,
         )
     }
 

@@ -7,7 +7,7 @@ use ironclaw_loop_support::{
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 
-use crate::model_routes::{ModelRoute, ModelRouteError, ModelRouteResolver, ModelSlot};
+use crate::model_routes::{ModelRouteError, ModelRouteResolver, ModelSlot};
 
 use ironclaw_turns::{
     CheckpointStateStore, GetCheckpointStateRequest, LoopCheckpointStore, PutLoopCheckpointRequest,
@@ -29,11 +29,15 @@ use ironclaw_turns::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextOnlyLoopHostConfig {
     pub max_messages: usize,
+    pub require_model_route_snapshot: bool,
 }
 
 impl Default for TextOnlyLoopHostConfig {
     fn default() -> Self {
-        Self { max_messages: 16 }
+        Self {
+            max_messages: 16,
+            require_model_route_snapshot: false,
+        }
     }
 }
 
@@ -192,7 +196,18 @@ where
         &self,
         run_context: LoopRunContext,
     ) -> Result<LoopRunContext, RebornLoopDriverHostError> {
+        if let Some(snapshot) = &run_context.resolved_model_route {
+            snapshot
+                .validate()
+                .map_err(|reason| RebornLoopDriverHostError::InvalidRequest { reason })?;
+            return Ok(run_context);
+        }
         let Some(resolver) = &self.model_route_resolver else {
+            if self.config.require_model_route_snapshot {
+                return Err(RebornLoopDriverHostError::InvalidRequest {
+                    reason: "model route resolver is required for this host".to_string(),
+                });
+            }
             return Ok(run_context);
         };
         let model_profile_id = &run_context.resolved_run_profile.model_profile_id;
@@ -201,17 +216,6 @@ where
                 reason: "model profile is not supported by the model route resolver".to_string(),
             }
         })?;
-        if let Some(existing_snapshot) = &run_context.resolved_model_route {
-            let route = ModelRoute::new(
-                existing_snapshot.provider_id.clone(),
-                existing_snapshot.model_id.clone(),
-            )
-            .map_err(model_route_error_to_host_error)?;
-            resolver
-                .validate_model_route(slot, &route)
-                .map_err(model_route_error_to_host_error)?;
-            return Ok(run_context);
-        }
         let snapshot = resolver
             .resolve_model_route(slot)
             .map_err(model_route_error_to_host_error)?;
@@ -551,6 +555,27 @@ fn validate_claimed_run_context(
             reason: "claimed run profile does not match loop run context".to_string(),
         });
     }
+    match (
+        &claimed_run.state.resolved_model_route,
+        &run_context.resolved_model_route,
+    ) {
+        (Some(expected), Some(actual)) if expected != actual => {
+            return Err(RebornLoopDriverHostError::ScopeMismatch {
+                reason: "loop run context model route does not match claimed run".to_string(),
+            });
+        }
+        (Some(_), None) => {
+            return Err(RebornLoopDriverHostError::ScopeMismatch {
+                reason: "loop run context is missing claimed run model route".to_string(),
+            });
+        }
+        (None, Some(_)) => {
+            return Err(RebornLoopDriverHostError::ScopeMismatch {
+                reason: "loop run context model route was not persisted on claimed run".to_string(),
+            });
+        }
+        _ => {}
+    }
     let expected_profile_id = persisted_profile_id(&run_context.resolved_run_profile.profile_id);
     if claimed_run.state.resolved_run_profile_id != expected_profile_id
         || claimed_run.state.resolved_run_profile_version
@@ -598,12 +623,15 @@ where
         Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>,
         crate::turn_runner::HostFactoryError,
     > {
-        let loop_run_context = LoopRunContext::new(
+        let mut loop_run_context = LoopRunContext::new(
             claimed.state.scope.clone(),
             claimed.state.turn_id,
             claimed.state.run_id,
             claimed.resolved_run_profile.clone(),
         );
+        if let Some(snapshot) = claimed.state.resolved_model_route.clone() {
+            loop_run_context = loop_run_context.with_resolved_model_route(snapshot);
+        }
         self.build_text_only_host(RebornLoopDriverHostRequest {
             claimed_run: claimed.clone(),
             loop_run_context,
