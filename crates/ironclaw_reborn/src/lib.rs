@@ -15,7 +15,8 @@ pub mod model_gateway;
 pub mod secrets;
 
 pub use loop_driver_host::{
-    HostManagedLoopCheckpointPort, HostManagedLoopProgressPort, NoExtraLoopInputPort,
+    HostManagedLoopCheckpointPort, HostManagedLoopProgressPort, HostRuntimeLoopCapabilityPort,
+    LoopCapabilityInputResolver, LoopCapabilityResultWriter, NoExtraLoopInputPort,
     RebornLoopDriverHost, RebornLoopDriverHostError, RebornLoopDriverHostFactory,
     RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
 };
