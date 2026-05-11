@@ -23,10 +23,14 @@ pub struct CheckpointPolicy {
     pub require_before_block: bool,
     pub max_checkpoint_bytes: u64,
     /// When true, terminal exits (Completed, Cancelled, Failed) require a
-    /// final_checkpoint_id. Production profiles set this; local/test profiles
-    /// may relax it.
-    #[serde(default)]
+    /// final_checkpoint_id. Missing wire fields default to required; local/test
+    /// profiles must explicitly relax the gate.
+    #[serde(default = "default_require_final_checkpoint")]
     pub require_final_checkpoint: bool,
+}
+
+fn default_require_final_checkpoint() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

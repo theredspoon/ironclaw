@@ -20,9 +20,9 @@ use ironclaw_host_runtime::{
     HostRuntimeError, HostRuntimeHealth, HostRuntimeServices, HostRuntimeStatus,
     RuntimeApprovalGate, RuntimeAuthGate, RuntimeBlockedReason, RuntimeCapabilityCompleted,
     RuntimeCapabilityFailure, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
-    RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeGateId, RuntimeProcessHandle,
-    RuntimeResourceGate, RuntimeStatusRequest, SurfaceKind, VisibleCapability,
-    VisibleCapabilityAccess,
+    RuntimeCapabilityResumeRequest, RuntimeCapabilityUnknown, RuntimeFailureKind, RuntimeGateId,
+    RuntimeProcessHandle, RuntimeResourceGate, RuntimeStatusRequest, SurfaceKind,
+    VisibleCapability, VisibleCapabilityAccess,
 };
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
@@ -1020,10 +1020,11 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
     let second_input = CapabilityInputRef::new("input:second-call").unwrap();
     io.put_input(first_input.clone(), json!({"call": 1}));
     io.put_input(second_input.clone(), json!({"call": 2}));
+    let visible_request = host_runtime_visible_request(&fixture, ["demo"]);
     let capability_port = HostRuntimeLoopCapabilityPort::new(
         runtime.clone(),
         fixture.context.clone(),
-        host_runtime_visible_request(&fixture, ["demo"]),
+        visible_request.clone(),
         io.clone(),
         io,
     );
@@ -1069,6 +1070,33 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
         invocations[1].context.resource_scope.invocation_id,
         invocations[1].context.invocation_id
     );
+    for invocation in invocations {
+        assert_eq!(
+            invocation.context.tenant_id,
+            visible_request.context.tenant_id
+        );
+        assert_eq!(invocation.context.user_id, visible_request.context.user_id);
+        assert_eq!(
+            invocation.context.agent_id,
+            visible_request.context.agent_id
+        );
+        assert_eq!(
+            invocation.context.project_id,
+            visible_request.context.project_id
+        );
+        assert_eq!(
+            invocation.context.thread_id,
+            visible_request.context.thread_id
+        );
+        assert_eq!(
+            invocation.context.extension_id,
+            visible_request.context.extension_id
+        );
+        assert_eq!(invocation.context.runtime, visible_request.context.runtime);
+        assert_eq!(invocation.context.trust, visible_request.context.trust);
+        assert_eq!(invocation.context.grants, visible_request.context.grants);
+        assert_eq!(invocation.context.mounts, visible_request.context.mounts);
+    }
 }
 
 #[tokio::test]
@@ -1310,6 +1338,132 @@ async fn text_only_host_maps_runtime_suspension_and_process_outcomes() {
 }
 
 #[tokio::test]
+async fn text_only_host_maps_explicit_unknown_runtime_outcome_to_failure() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-unknown", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Unknown(
+        RuntimeCapabilityUnknown {
+            capability_id: capability_id.clone(),
+            kind: "streaming".to_string(),
+            message: Some("streaming outcomes are not supported by this loop port".to_string()),
+        },
+    ));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:unknown-outcome").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "unknown"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime,
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref,
+        })
+        .await
+        .unwrap();
+
+    let CapabilityOutcome::Failed(failure) = outcome else {
+        panic!("expected failed capability outcome");
+    };
+    assert_eq!(failure.error_kind, "streaming");
+    assert_eq!(
+        failure.safe_summary,
+        "streaming outcomes are not supported by this loop port"
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_preserves_host_runtime_error_kind_and_summary() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-host-error", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_error(HostRuntimeError::invalid_request(
+        "capability input schema invalid",
+    ));
+    runtime.push_error(HostRuntimeError::unavailable(
+        "resource governor temporarily unavailable",
+    ));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let first_input = CapabilityInputRef::new("input:host-error-invalid").unwrap();
+    let second_input = CapabilityInputRef::new("input:host-error-unavailable").unwrap();
+    io.put_input(first_input.clone(), json!({"message": "invalid"}));
+    io.put_input(second_input.clone(), json!({"message": "unavailable"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime,
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let invalid = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version.clone(),
+            capability_id: capability_id.clone(),
+            input_ref: first_input,
+        })
+        .await
+        .unwrap_err();
+    let unavailable = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref: second_input,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(invalid.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    assert_eq!(invalid.safe_summary, "capability input schema invalid");
+    assert_eq!(unavailable.kind, AgentLoopHostErrorKind::Unavailable);
+    assert_eq!(
+        unavailable.safe_summary,
+        "resource governor temporarily unavailable"
+    );
+}
+
+#[tokio::test]
 async fn text_only_host_batch_stops_on_first_suspension_before_later_invocations() {
     let fixture = HostFixture::new("thread-host-runtime-capability-batch-stop", "hello").await;
     let approval_id = CapabilityId::new("demo.approval").unwrap();
@@ -1498,7 +1652,7 @@ async fn text_only_host_prompt_accepts_refetched_surface_version() {
 }
 
 #[tokio::test]
-async fn text_only_host_rejects_concurrent_duplicate_invocation_before_runtime() {
+async fn text_only_host_waits_for_concurrent_duplicate_invocation_result() {
     let fixture = HostFixture::new(
         "thread-host-runtime-capability-concurrent-idempotency",
         "hello",
@@ -1553,13 +1707,91 @@ async fn text_only_host_rejects_concurrent_duplicate_invocation_before_runtime()
         host.invoke_capability(invocation)
     );
 
-    let successes = [first.as_ref().ok(), second.as_ref().ok()]
-        .into_iter()
-        .flatten()
-        .filter(|outcome| matches!(outcome, CapabilityOutcome::Completed(_)))
-        .count();
-    assert_eq!(successes, 1);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(matches!(first, CapabilityOutcome::Completed(_)));
+    assert_eq!(first, second);
     assert_eq!(runtime.invocations().len(), 1);
+}
+
+#[tokio::test]
+async fn text_only_host_bounds_completed_dispatch_records() {
+    let fixture = HostFixture::new(
+        "thread-host-runtime-capability-bounded-idempotency",
+        "hello",
+    )
+    .await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let invocation_count = 130;
+    let mut input_refs = Vec::new();
+    for index in 0..invocation_count {
+        runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+            RuntimeCapabilityCompleted {
+                capability_id: capability_id.clone(),
+                output: json!({"call": index}),
+                usage: ResourceUsage::default(),
+            },
+        )));
+        let input_ref = CapabilityInputRef::new(format!("input:bounded-{index}")).unwrap();
+        io.put_input(input_ref.clone(), json!({"call": index}));
+        input_refs.push(input_ref);
+    }
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: capability_id.clone(),
+            output: json!({"call": "retried-after-eviction"}),
+            usage: ResourceUsage::default(),
+        },
+    )));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    for input_ref in input_refs.iter().cloned() {
+        let outcome = host
+            .invoke_capability(CapabilityInvocation {
+                surface_version: surface.version.clone(),
+                capability_id: capability_id.clone(),
+                input_ref,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CapabilityOutcome::Completed(_)));
+    }
+    let retried = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref: input_refs[0].clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(retried, CapabilityOutcome::Completed(_)));
+    assert_eq!(runtime.invocations().len(), invocation_count + 1);
 }
 
 #[tokio::test]
@@ -2096,6 +2328,7 @@ impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
 struct RecordingHostRuntime {
     surface: Mutex<ironclaw_host_runtime::VisibleCapabilitySurface>,
     outcomes: Mutex<Vec<RuntimeCapabilityOutcome>>,
+    errors: Mutex<Vec<HostRuntimeError>>,
     invocations: Mutex<Vec<RuntimeCapabilityRequest>>,
 }
 
@@ -2104,12 +2337,17 @@ impl RecordingHostRuntime {
         Self {
             surface: Mutex::new(surface),
             outcomes: Mutex::new(Vec::new()),
+            errors: Mutex::new(Vec::new()),
             invocations: Mutex::new(Vec::new()),
         }
     }
 
     fn push_outcome(&self, outcome: RuntimeCapabilityOutcome) {
         self.outcomes.lock().unwrap().push(outcome);
+    }
+
+    fn push_error(&self, error: HostRuntimeError) {
+        self.errors.lock().unwrap().push(error);
     }
 
     fn set_surface(&self, surface: ironclaw_host_runtime::VisibleCapabilitySurface) {
@@ -2129,6 +2367,11 @@ impl HostRuntime for RecordingHostRuntime {
     ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
         tokio::task::yield_now().await;
         self.invocations.lock().unwrap().push(request);
+        let mut errors = self.errors.lock().unwrap();
+        if !errors.is_empty() {
+            return Err(errors.remove(0));
+        }
+        drop(errors);
         Ok(self.outcomes.lock().unwrap().remove(0))
     }
 
