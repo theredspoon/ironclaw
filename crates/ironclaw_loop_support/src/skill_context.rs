@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use ironclaw_skills::{ParsedSkill, SkillTrust, parse_skill_md};
-use ironclaw_turns::{
-    LoopMessageRef,
-    run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, InstalledSkillSnapshot, LoopContextSnippet,
-        LoopRunContext, SkillContextError, SkillContextService, SkillContextSource,
-        SkillRunSnapshot, SkillTrustLevel, SkillVisibility,
-    },
+use ironclaw_turns::run_profile::{
+    AgentLoopHostError, AgentLoopHostErrorKind, InstalledSkillSnapshot, LoopContextSnippet,
+    LoopRunContext, SkillContextError, SkillContextService, SkillContextSource, SkillRunSnapshot,
+    SkillTrustLevel, SkillVisibility,
+};
+pub(crate) use ironclaw_turns::run_profile::{
+    is_skill_snippet_model_message_ref as is_snippet_model_message_ref,
+    skill_snippet_model_message_ref as snippet_model_message_ref,
 };
 use thiserror::Error;
 
@@ -162,12 +163,17 @@ fn parsed_skill_to_snapshot_entry(
     ordering_key: Option<String>,
 ) -> InstalledSkillSnapshot {
     let name = parsed.manifest.name;
+    let trust = skill_trust_level(trust);
+    let prompt_content = match trust {
+        SkillTrustLevel::Installed => None,
+        SkillTrustLevel::Trusted => Some(parsed.prompt_content),
+    };
     InstalledSkillSnapshot {
         ordering_key: ordering_key.unwrap_or_else(|| name.clone()),
         name,
-        trust: skill_trust_level(trust),
+        trust,
         visibility,
-        prompt_content: Some(parsed.prompt_content),
+        prompt_content,
         safe_description: parsed.manifest.description,
     }
 }
@@ -193,63 +199,4 @@ fn skill_context_error_to_host_error(error: SkillContextError) -> AgentLoopHostE
         }
     };
     build_error.into_host_error()
-}
-
-pub(crate) fn snippet_model_message_ref(
-    snippet_ref: &str,
-    safe_summary: &str,
-    ordinal: usize,
-) -> Result<LoopMessageRef, AgentLoopHostError> {
-    let slug = sanitize_ref_suffix(snippet_ref);
-    let hash = stable_snippet_ref_hash(snippet_ref, safe_summary, ordinal);
-    LoopMessageRef::new(format!("msg:snippet.{slug}.{ordinal}.{hash:016x}")).map_err(|_| {
-        AgentLoopHostError::new(
-            AgentLoopHostErrorKind::Internal,
-            "skill context snippet reference could not be represented",
-        )
-    })
-}
-
-pub(crate) fn is_snippet_model_message_ref(content_ref: &LoopMessageRef) -> bool {
-    content_ref.as_str().starts_with("msg:snippet.")
-}
-
-fn sanitize_ref_suffix(value: &str) -> String {
-    let mut suffix = String::with_capacity(value.len().min(96));
-    for character in value.chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
-            suffix.push(character);
-        } else {
-            suffix.push('.');
-        }
-        if suffix.len() >= 96 {
-            break;
-        }
-    }
-    let suffix = suffix.trim_matches('.');
-    if suffix.is_empty() {
-        "context".to_string()
-    } else {
-        suffix.to_string()
-    }
-}
-
-fn stable_snippet_ref_hash(snippet_ref: &str, safe_summary: &str, ordinal: usize) -> u64 {
-    let mut hash = FNV_OFFSET;
-    feed_hash(&mut hash, snippet_ref.as_bytes());
-    feed_hash(&mut hash, &[0xFF]);
-    feed_hash(&mut hash, safe_summary.as_bytes());
-    feed_hash(&mut hash, &[0xFF]);
-    feed_hash(&mut hash, ordinal.to_string().as_bytes());
-    hash
-}
-
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x00000100000001B3;
-
-fn feed_hash(hash: &mut u64, bytes: &[u8]) {
-    for &byte in bytes {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(FNV_PRIME);
-    }
 }

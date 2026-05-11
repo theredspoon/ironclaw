@@ -122,8 +122,8 @@ where
             run_context.clone(),
             max_messages,
         );
-        if let Some(source) = self.skill_context_source.clone() {
-            context_adapter = context_adapter.with_skill_context_source(source);
+        if let Some(source) = self.skill_context_source.as_ref() {
+            context_adapter = context_adapter.with_skill_context_source(source.clone());
         }
         let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
         let current_surface_version = EmptyLoopCapabilityPort
@@ -152,8 +152,8 @@ where
             max_messages,
             Arc::clone(&self.milestone_sink),
         );
-        if let Some(source) = self.skill_context_source.clone() {
-            model_adapter = model_adapter.with_skill_context_source(source);
+        if let Some(source) = self.skill_context_source.as_ref() {
+            model_adapter = model_adapter.with_skill_context_source(source.clone());
         }
         let model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
         let checkpoint: Arc<dyn LoopCheckpointPort> = Arc::new(HostManagedLoopCheckpointPort::new(

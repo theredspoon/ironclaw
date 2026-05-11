@@ -5,12 +5,14 @@ use chrono::Utc;
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
-    HostManagedModelResponse,
+    HostManagedModelResponse, HostSkillContextBuildError, HostSkillContextCandidate,
+    HostSkillContextSource,
 };
 use ironclaw_reborn::{
     RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
     turn_runner::HostFactory,
 };
+use ironclaw_skills::SkillTrust;
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
@@ -30,7 +32,8 @@ use ironclaw_turns::{
         LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopContextRequest,
         LoopDriverId, LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor, LoopInputCursorToken,
         LoopInputPort, LoopModelRequest, LoopProgressEvent, LoopPromptBundleRequest,
-        LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode, VisibleCapabilityRequest,
+        LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode, SkillVisibility,
+        VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
@@ -641,6 +644,65 @@ async fn text_only_host_checkpoint_port_maps_store_failures_to_unavailable() {
 }
 
 #[tokio::test]
+async fn text_only_host_skill_context_does_not_expand_capability_surface() {
+    let fixture = HostFixture::new("thread-host-skill-capability", "hello").await;
+    let source = Arc::new(StaticSkillContextSource::new(vec![
+        HostSkillContextCandidate::new(
+            skill_md(
+                "installed-alpha",
+                "installed skill description",
+                "installed prompt must not imply tool authority",
+            ),
+            Some(SkillTrust::Installed),
+            Some(SkillVisibility::Visible),
+        ),
+    ]));
+    let host = fixture
+        .factory()
+        .with_skill_context_source(source)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+
+    let prompt_bundle = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+    assert_eq!(prompt_bundle.messages.len(), 2);
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert!(surface.descriptors.is_empty());
+    let outcome = host
+        .invoke_capability_batch(ironclaw_turns::run_profile::CapabilityBatchInvocation {
+            invocations: vec![CapabilityInvocation {
+                surface_version: surface.version,
+                capability_id: CapabilityId::new("demo.echo").unwrap(),
+                input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+            }],
+            stop_on_first_suspension: true,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome.outcomes.as_slice(),
+        [CapabilityOutcome::Denied(denied)] if denied.reason_kind == CapabilityDeniedReasonKind::EmptySurface
+    ));
+}
+
+#[tokio::test]
 async fn text_only_host_empty_capability_surface_denies_invocation() {
     let fixture = HostFixture::new("thread-host-capability", "hello").await;
     let host = fixture.build_host().await;
@@ -675,6 +737,33 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
         .await
         .unwrap_err();
     assert_eq!(stale.kind, AgentLoopHostErrorKind::StaleSurface);
+}
+
+#[derive(Clone)]
+struct StaticSkillContextSource {
+    candidates: Vec<HostSkillContextCandidate>,
+}
+
+impl StaticSkillContextSource {
+    fn new(candidates: Vec<HostSkillContextCandidate>) -> Self {
+        Self { candidates }
+    }
+}
+
+#[async_trait]
+impl HostSkillContextSource for StaticSkillContextSource {
+    async fn load_skill_context_candidates(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<Vec<HostSkillContextCandidate>, HostSkillContextBuildError> {
+        Ok(self.candidates.clone())
+    }
+}
+
+fn skill_md(name: &str, description: &str, prompt: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: {description}\nactivation:\n  keywords: [{name}]\n---\n\n{prompt}\n"
+    )
 }
 
 struct HostFixture {

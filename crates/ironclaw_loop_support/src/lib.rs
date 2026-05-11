@@ -120,6 +120,7 @@ where
         };
 
         Ok(LoopContextBundle {
+            identity_messages: Vec::new(),
             messages: context
                 .messages
                 .into_iter()

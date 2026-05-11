@@ -4,10 +4,13 @@ use async_trait::async_trait;
 
 use super::host::{
     AgentLoopHostError, AgentLoopHostErrorKind, CapabilitySurfaceVersion, LoopContextBundle,
-    LoopContextPort, LoopContextRequest, LoopModelMessage, LoopPromptBundle, LoopPromptBundleRef,
-    LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, PromptMode,
+    LoopContextMessage, LoopContextPort, LoopContextRequest, LoopModelMessage, LoopPromptBundle,
+    LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, PromptMode,
 };
-use super::milestones::{LoopHostMilestoneEmitter, LoopHostMilestoneSink};
+use super::milestones::{
+    LoopHostMilestoneEmitter, LoopHostMilestoneSink, PromptSkillContextMetadata,
+};
+use super::skill_context::skill_snippet_model_message_ref;
 
 const DEFAULT_TEXT_ONLY_MESSAGE_LIMIT: usize = 32;
 const MAX_TEXT_ONLY_MESSAGE_LIMIT: usize = 128;
@@ -169,29 +172,49 @@ where
             })
             .await?;
         Self::ensure_supported_context_shape(&context)?;
-        let mut messages = context
-            .instruction_snippets
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, snippet)| {
-                Ok(LoopModelMessage {
-                    role: "system".to_string(),
-                    content_ref: snippet_model_message_ref(
-                        &snippet.snippet_ref,
-                        &snippet.safe_summary,
-                        ordinal,
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, AgentLoopHostError>>()?;
+        let mut messages = Vec::with_capacity(
+            context.identity_messages.len()
+                + context.instruction_snippets.len()
+                + context.messages.len(),
+        );
+        messages.extend(
+            context
+                .identity_messages
+                .into_iter()
+                .map(context_message_to_model_message),
+        );
+
+        let mut skill_context = Vec::with_capacity(context.instruction_snippets.len());
+        for (ordinal, snippet) in context.instruction_snippets.into_iter().enumerate() {
+            let content_ref = skill_snippet_model_message_ref(
+                &snippet.snippet_ref,
+                &snippet.safe_summary,
+                ordinal,
+            )?;
+            match snippet.metadata.as_ref() {
+                Some(metadata) => skill_context.push(PromptSkillContextMetadata {
+                    ordinal,
+                    source_name: metadata.source_name.clone(),
+                    trust_level: metadata.trust_level.clone(),
+                }),
+                None if snippet.snippet_ref.starts_with("skill:") => {
+                    return Err(AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::Internal,
+                        "skill instruction snippet metadata is missing",
+                    ));
+                }
+                None => {}
+            }
+            messages.push(LoopModelMessage {
+                role: "system".to_string(),
+                content_ref,
+            });
+        }
         messages.extend(
             context
                 .messages
                 .into_iter()
-                .map(|message| LoopModelMessage {
-                    role: message.role,
-                    content_ref: message.message_ref,
-                }),
+                .map(context_message_to_model_message),
         );
         let bundle = LoopPromptBundle {
             bundle_ref: LoopPromptBundleRef::fresh_for_run(&self.context),
@@ -204,63 +227,16 @@ where
                 request.mode,
                 bundle.surface_version.clone(),
                 bundle.messages.len(),
+                skill_context,
             )
             .await?;
         Ok(bundle)
     }
 }
 
-fn snippet_model_message_ref(
-    snippet_ref: &str,
-    safe_summary: &str,
-    ordinal: usize,
-) -> Result<crate::LoopMessageRef, AgentLoopHostError> {
-    let slug = sanitize_ref_suffix(snippet_ref);
-    let hash = stable_snippet_ref_hash(snippet_ref, safe_summary, ordinal);
-    crate::LoopMessageRef::new(format!("msg:snippet.{slug}.{ordinal}.{hash:016x}")).map_err(|_| {
-        AgentLoopHostError::new(
-            AgentLoopHostErrorKind::Internal,
-            "instruction snippet reference could not be represented",
-        )
-    })
-}
-
-fn sanitize_ref_suffix(value: &str) -> String {
-    let mut suffix = String::with_capacity(value.len().min(96));
-    for character in value.chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
-            suffix.push(character);
-        } else {
-            suffix.push('.');
-        }
-        if suffix.len() >= 96 {
-            break;
-        }
-    }
-    let suffix = suffix.trim_matches('.');
-    if suffix.is_empty() {
-        "context".to_string()
-    } else {
-        suffix.to_string()
-    }
-}
-
-fn stable_snippet_ref_hash(snippet_ref: &str, safe_summary: &str, ordinal: usize) -> u64 {
-    let mut hash = FNV_OFFSET;
-    feed_hash(&mut hash, snippet_ref.as_bytes());
-    feed_hash(&mut hash, &[0xFF]);
-    feed_hash(&mut hash, safe_summary.as_bytes());
-    feed_hash(&mut hash, &[0xFF]);
-    feed_hash(&mut hash, ordinal.to_string().as_bytes());
-    hash
-}
-
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x00000100000001B3;
-
-fn feed_hash(hash: &mut u64, bytes: &[u8]) {
-    for &byte in bytes {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(FNV_PRIME);
+fn context_message_to_model_message(message: LoopContextMessage) -> LoopModelMessage {
+    LoopModelMessage {
+        role: message.role,
+        content_ref: message.message_ref,
     }
 }

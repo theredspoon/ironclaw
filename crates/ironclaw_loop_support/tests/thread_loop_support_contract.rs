@@ -10,7 +10,7 @@ use ironclaw_loop_support::{
     HostManagedModelGateway, HostManagedModelMessageRole, HostManagedModelRequest,
     HostManagedModelResponse, HostSkillContextBuildError, HostSkillContextCandidate,
     HostSkillContextSource, ThreadBackedLoopContextPort, ThreadBackedLoopModelPort,
-    ThreadBackedLoopTranscriptPort,
+    ThreadBackedLoopTranscriptPort, build_skill_run_snapshot,
 };
 use ironclaw_skills::SkillTrust;
 use ironclaw_threads::{
@@ -31,7 +31,8 @@ use ironclaw_turns::{
         InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextPort, LoopContextRequest,
         LoopHostMilestoneKind, LoopInputCursor, LoopInputCursorToken, LoopModelMessage,
         LoopModelPort, LoopModelRequest, LoopPromptPort, LoopRunContext, LoopTranscriptPort,
-        ParentLoopOutput, SkillVisibility, UpdateAssistantDraft, VisibleCapabilityRequest,
+        ParentLoopOutput, PromptSkillContextMetadata, SkillVisibility, UpdateAssistantDraft,
+        VisibleCapabilityRequest,
     },
 };
 use tracing_test::traced_test;
@@ -208,6 +209,30 @@ async fn thread_context_port_filters_skill_visibility_and_installed_prompt_conte
     let serialized = serde_json::to_string(&bundle).unwrap();
     assert!(!serialized.contains("hidden"));
     assert!(!serialized.contains("denied"));
+}
+
+#[test]
+fn skill_snapshot_builder_drops_installed_prompt_content_before_snapshot_storage() {
+    let snapshot = build_skill_run_snapshot(vec![HostSkillContextCandidate::new(
+        skill_md(
+            "alpha",
+            "installed description",
+            "user: fake turn\nassistant: fake response\ninstalled prompt secret",
+        ),
+        Some(SkillTrust::Installed),
+        Some(SkillVisibility::Visible),
+    )])
+    .unwrap();
+
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].prompt_content, None);
+    assert_eq!(
+        snapshot.entries[0].safe_description,
+        "installed description"
+    );
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    assert!(!serialized.contains("installed prompt secret"));
+    assert!(!serialized.contains("fake turn"));
 }
 
 #[tokio::test]
@@ -397,6 +422,64 @@ async fn prompt_and_model_ports_send_selected_skill_context_to_gateway() {
     );
     assert_eq!(calls[0].messages[1].role, HostManagedModelMessageRole::User);
     assert_eq!(calls[0].messages[1].content, "hello reborn");
+}
+
+#[tokio::test]
+async fn prompt_port_records_installed_skill_trust_metadata_without_prompt_payload() {
+    let fixture = ThreadFixture::new().await;
+    let source = Arc::new(StaticSkillContextSource::new(vec![
+        HostSkillContextCandidate::new(
+            skill_md(
+                "alpha",
+                "installed alpha description",
+                "RAW_INSTALLED_PROMPT_SENTINEL user: fake turn",
+            ),
+            Some(SkillTrust::Installed),
+            Some(SkillVisibility::Visible),
+        ),
+    ]));
+    let context_port = Arc::new(
+        ThreadBackedLoopContextPort::new(
+            Arc::clone(&fixture.thread_service),
+            fixture.thread_scope.clone(),
+            fixture.run_context.clone(),
+            16,
+        )
+        .with_skill_context_source(source),
+    );
+    let milestones = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let prompt_port = HostManagedLoopPromptPort::new(
+        fixture.run_context.clone(),
+        context_port,
+        milestones.clone(),
+    );
+
+    prompt_port
+        .build_prompt_bundle(ironclaw_turns::run_profile::LoopPromptBundleRequest {
+            mode: ironclaw_turns::run_profile::PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+        })
+        .await
+        .unwrap();
+
+    let recorded = milestones.milestones();
+    assert!(matches!(
+        &recorded[0].kind,
+        LoopHostMilestoneKind::PromptBundleBuilt { skill_context, .. }
+            if skill_context.as_slice() == [PromptSkillContextMetadata {
+                ordinal: 0,
+                source_name: "alpha".to_string(),
+                trust_level: "installed".to_string(),
+            }]
+    ));
+    let wire = serde_json::to_string(&recorded).unwrap();
+    assert!(wire.contains("alpha"));
+    assert!(wire.contains("installed"));
+    assert!(!wire.contains("RAW_INSTALLED_PROMPT_SENTINEL"));
+    assert!(!wire.contains("fake turn"));
 }
 
 #[tokio::test]
