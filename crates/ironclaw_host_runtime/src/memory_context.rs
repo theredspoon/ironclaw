@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ironclaw_memory::{
-    MemoryBackend, MemoryContext, MemoryDocumentScope, MemorySearchRequest, MemorySearchResult,
+    MemoryBackend, MemoryContext, MemoryDocumentPath, MemoryDocumentScope, MemorySearchRequest,
+    MemorySearchResult,
 };
 use ironclaw_turns::run_profile::{
-    AgentLoopHostError, AgentLoopHostErrorKind, LoopContextSnippet, LoopSafeSummary,
-    MemoryPromptContextRequest, MemoryPromptContextService,
+    AgentLoopHostError, AgentLoopHostErrorKind, ContextProfileId, LoopContextSnippet,
+    LoopSafeSummary, MemoryPromptContextRequest, MemoryPromptContextService,
 };
 
 /// Maximum byte length for a snippet safe summary, matching `LoopSafeSummary`
@@ -58,7 +59,13 @@ impl MemoryPromptContextService for ProductionMemoryPromptContextService {
         &self,
         request: MemoryPromptContextRequest,
     ) -> Result<Vec<LoopContextSnippet>, AgentLoopHostError> {
-        let scope = build_memory_scope(&request)?;
+        if request.max_snippets == 0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(scope) = build_memory_scope(&request)? else {
+            return Ok(Vec::new());
+        };
         let context = MemoryContext::new(scope);
 
         let search_request = MemorySearchRequest::new(&request.query).map_err(|_| {
@@ -80,6 +87,8 @@ impl MemoryPromptContextService for ProductionMemoryPromptContextService {
                 )
             })?;
 
+        results.retain(|result| result.path.scope() == context.scope());
+
         // Enforce deterministic ordering: score descending, path ascending.
         // Production backends (libsql/postgres) already sort this way via
         // `fuse_memory_search_results`, but the `MemoryBackend::search` trait
@@ -89,11 +98,7 @@ impl MemoryPromptContextService for ProductionMemoryPromptContextService {
                 .score
                 .partial_cmp(&left.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| {
-                    left.path
-                        .relative_path()
-                        .cmp(right.path.relative_path())
-                })
+                .then_with(|| left.path.relative_path().cmp(right.path.relative_path()))
         });
 
         results.truncate(request.max_snippets);
@@ -110,19 +115,44 @@ impl MemoryPromptContextService for ProductionMemoryPromptContextService {
 /// Build a [`MemoryDocumentScope`] from the request's scope and actor fields.
 fn build_memory_scope(
     request: &MemoryPromptContextRequest,
-) -> Result<MemoryDocumentScope, AgentLoopHostError> {
-    MemoryDocumentScope::new_with_agent(
-        request.scope.tenant_id.as_str(),
-        request.actor.user_id.as_str(),
-        request.scope.agent_id.as_ref().map(|id| id.as_str()),
-        request.scope.project_id.as_ref().map(|id| id.as_str()),
-    )
-    .map_err(|_| {
-        AgentLoopHostError::new(
-            AgentLoopHostErrorKind::Internal,
-            "memory context scope construction failed",
+) -> Result<Option<MemoryDocumentScope>, AgentLoopHostError> {
+    match memory_context_policy(&request.context_profile_id) {
+        MemoryContextPolicy::Disabled => Ok(None),
+        MemoryContextPolicy::PrimaryScope => MemoryDocumentScope::new_with_agent(
+            request.scope.tenant_id.as_str(),
+            request.actor.user_id.as_str(),
+            request.scope.agent_id.as_ref().map(|id| id.as_str()),
+            request.scope.project_id.as_ref().map(|id| id.as_str()),
         )
-    })
+        .map(Some)
+        .map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "memory context scope construction failed",
+            )
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryContextPolicy {
+    Disabled,
+    PrimaryScope,
+}
+
+/// Resolve the narrow context-memory policy available in this slice.
+///
+/// The run-profile layer already resolves the profile identifier. Until a full
+/// context-policy registry exists here, the adapter supports an explicit
+/// memory-disabled profile and otherwise uses the request's primary
+/// tenant/user/agent/project scope.
+fn memory_context_policy(context_profile_id: &ContextProfileId) -> MemoryContextPolicy {
+    match context_profile_id.as_str() {
+        "memory_disabled" | "memory-disabled" | "disabled_context" | "context_disabled" => {
+            MemoryContextPolicy::Disabled
+        }
+        _ => MemoryContextPolicy::PrimaryScope,
+    }
 }
 
 /// Map a [`MemorySearchResult`] to a [`LoopContextSnippet`], sanitizing the
@@ -132,12 +162,31 @@ fn build_memory_scope(
 /// (e.g. it contains only forbidden characters). This is a graceful degradation
 /// — the snippet is silently dropped rather than failing the entire load.
 fn map_search_result_to_snippet(result: MemorySearchResult) -> Option<LoopContextSnippet> {
-    let snippet_ref = format!("memory:{}", result.path.relative_path());
+    let snippet_ref = snippet_ref_for_path(&result.path);
     let safe_summary = sanitize_snippet_text(&result.snippet)?;
     Some(LoopContextSnippet {
         snippet_ref,
         safe_summary,
     })
+}
+
+fn snippet_ref_for_path(path: &MemoryDocumentPath) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    update_hash(&mut hash, path.tenant_id());
+    update_hash(&mut hash, path.user_id());
+    update_hash(&mut hash, path.agent_id().unwrap_or(""));
+    update_hash(&mut hash, path.project_id().unwrap_or(""));
+    update_hash(&mut hash, path.relative_path());
+    format!("memory-snippet:{hash:016x}")
+}
+
+fn update_hash(hash: &mut u64, value: &str) {
+    for byte in value.as_bytes() {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(0x100000001b3);
 }
 
 /// Sanitize a raw snippet string into a model-safe summary.
@@ -150,10 +199,7 @@ fn map_search_result_to_snippet(result: MemorySearchResult) -> Option<LoopContex
 /// Returns `None` if the sanitized text fails `LoopSafeSummary` validation.
 fn sanitize_snippet_text(raw: &str) -> Option<String> {
     // Strip control characters first.
-    let cleaned: String = raw
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect();
+    let cleaned: String = raw.chars().filter(|ch| !ch.is_control()).collect();
 
     if cleaned.is_empty() {
         return None;

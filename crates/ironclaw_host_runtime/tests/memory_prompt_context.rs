@@ -87,9 +87,27 @@ impl MemoryBackend for MockMemoryBackend {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
 
-fn make_result(tenant: &str, user: &str, rel_path: &str, score: f32, snippet: &str) -> MemorySearchResult {
+fn make_result(
+    tenant: &str,
+    user: &str,
+    rel_path: &str,
+    score: f32,
+    snippet: &str,
+) -> MemorySearchResult {
+    make_result_with_agent(tenant, user, None, None, rel_path, score, snippet)
+}
+
+fn make_result_with_agent(
+    tenant: &str,
+    user: &str,
+    agent: Option<&str>,
+    project: Option<&str>,
+    rel_path: &str,
+    score: f32,
+    snippet: &str,
+) -> MemorySearchResult {
     MemorySearchResult {
-        path: MemoryDocumentPath::new(tenant, user, None, rel_path).unwrap(),
+        path: MemoryDocumentPath::new_with_agent(tenant, user, agent, project, rel_path).unwrap(),
         score,
         snippet: snippet.to_string(),
         full_text_rank: Some(1),
@@ -104,6 +122,17 @@ fn test_request(
     project: Option<&str>,
     max_snippets: usize,
 ) -> MemoryPromptContextRequest {
+    test_request_with_profile(tenant, user, agent, project, max_snippets, "default")
+}
+
+fn test_request_with_profile(
+    tenant: &str,
+    user: &str,
+    agent: Option<&str>,
+    project: Option<&str>,
+    max_snippets: usize,
+    context_profile_id: &str,
+) -> MemoryPromptContextRequest {
     MemoryPromptContextRequest {
         scope: TurnScope::new(
             TenantId::new(tenant).unwrap(),
@@ -114,7 +143,7 @@ fn test_request(
         actor: TurnActor::new(UserId::new(user).unwrap()),
         query: "test query".to_string(),
         max_snippets,
-        context_profile_id: ContextProfileId::new("default").unwrap(),
+        context_profile_id: ContextProfileId::new(context_profile_id).unwrap(),
     }
 }
 
@@ -132,6 +161,51 @@ async fn empty_memory_returns_empty_snippets() {
         .await
         .unwrap();
     assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn max_snippets_zero_returns_empty_without_backend_call() {
+    let backend = Arc::new(MockMemoryBackend::with_results(vec![make_result(
+        "tenant-a", "user-x", "note.md", 1.0, "snippet",
+    )]));
+    let service = ProductionMemoryPromptContextService::new(backend.clone());
+
+    let snippets = service
+        .load_memory_snippets(test_request("tenant-a", "user-x", None, None, 0))
+        .await
+        .unwrap();
+
+    assert!(snippets.is_empty());
+    assert!(
+        backend.captured_scopes().is_empty(),
+        "max_snippets=0 must not call backend"
+    );
+}
+
+#[tokio::test]
+async fn memory_disabled_context_profile_returns_empty_without_backend_call() {
+    let backend = Arc::new(MockMemoryBackend::with_results(vec![make_result(
+        "tenant-a", "user-x", "note.md", 1.0, "snippet",
+    )]));
+    let service = ProductionMemoryPromptContextService::new(backend.clone());
+
+    let snippets = service
+        .load_memory_snippets(test_request_with_profile(
+            "tenant-a",
+            "user-x",
+            None,
+            None,
+            10,
+            "memory_disabled",
+        ))
+        .await
+        .unwrap();
+
+    assert!(snippets.is_empty());
+    assert!(
+        backend.captured_scopes().is_empty(),
+        "memory-disabled profile must not call backend"
+    );
 }
 
 #[tokio::test]
@@ -171,7 +245,10 @@ async fn cross_tenant_isolation_scope_passed_to_backend() {
     assert_eq!(scopes.len(), 2);
     assert_eq!(scopes[0].tenant_id(), "tenant-a");
     assert_eq!(scopes[1].tenant_id(), "tenant-b");
-    assert_ne!(scopes[0], scopes[1], "different tenants must produce different scopes");
+    assert_ne!(
+        scopes[0], scopes[1],
+        "different tenants must produce different scopes"
+    );
 }
 
 #[tokio::test]
@@ -194,7 +271,37 @@ async fn cross_user_isolation_scope_passed_to_backend() {
     assert_eq!(scopes.len(), 2);
     assert_eq!(scopes[0].user_id(), "user-x");
     assert_eq!(scopes[1].user_id(), "user-y");
-    assert_ne!(scopes[0], scopes[1], "different users must produce different scopes");
+    assert_ne!(
+        scopes[0], scopes[1],
+        "different users must produce different scopes"
+    );
+}
+
+#[tokio::test]
+async fn cross_scope_backend_results_are_filtered() {
+    let results = vec![
+        make_result("tenant-a", "user-x", "allowed.md", 1.0, "allowed snippet"),
+        make_result("tenant-b", "user-x", "wrong-tenant.md", 0.9, "tenant leak"),
+        make_result("tenant-a", "user-y", "wrong-user.md", 0.8, "user leak"),
+        make_result_with_agent(
+            "tenant-a",
+            "user-x",
+            Some("agent-other"),
+            None,
+            "wrong-agent.md",
+            0.7,
+            "agent leak",
+        ),
+    ];
+    let service = make_service(MockMemoryBackend::with_results(results));
+
+    let snippets = service
+        .load_memory_snippets(test_request("tenant-a", "user-x", None, None, 10))
+        .await
+        .unwrap();
+
+    assert_eq!(snippets.len(), 1);
+    assert_eq!(snippets[0].safe_summary, "allowed snippet");
 }
 
 #[tokio::test]
@@ -242,17 +349,25 @@ async fn deterministic_ordering_score_desc_then_path_asc() {
     assert_eq!(first.len(), 3);
     assert_eq!(first, second, "ordering must be deterministic across calls");
 
-    // Highest score first
-    assert_eq!(first[0].snippet_ref, "memory:m-note.md");
-    // Tied scores: path ascending
-    assert_eq!(first[1].snippet_ref, "memory:a-note.md");
-    assert_eq!(first[2].snippet_ref, "memory:z-note.md");
+    // Highest score first.
+    assert_eq!(first[0].safe_summary, "snippet m");
+    // Tied scores: path ascending.
+    assert_eq!(first[1].safe_summary, "snippet a");
+    assert_eq!(first[2].safe_summary, "snippet z");
 }
 
 #[tokio::test]
 async fn snippet_truncation_respects_max_snippets() {
     let results = (0..20)
-        .map(|i| make_result("t", "u", &format!("note-{i:02}.md"), 1.0 - i as f32 * 0.01, &format!("snippet {i}")))
+        .map(|i| {
+            make_result(
+                "t",
+                "u",
+                &format!("note-{i:02}.md"),
+                1.0 - i as f32 * 0.01,
+                &format!("snippet {i}"),
+            )
+        })
         .collect();
     let service = make_service(MockMemoryBackend::with_results(results));
 
@@ -331,8 +446,14 @@ async fn safe_summary_length_is_bounded() {
 }
 
 #[tokio::test]
-async fn snippet_ref_has_memory_prefix() {
-    let results = vec![make_result("t", "u", "my-note.md", 1.0, "some content")];
+async fn snippet_ref_is_opaque_and_does_not_expose_memory_path() {
+    let results = vec![make_result(
+        "t",
+        "u",
+        "secrets/api-key-note.md",
+        1.0,
+        "some content",
+    )];
     let service = make_service(MockMemoryBackend::with_results(results));
 
     let snippets = service
@@ -341,9 +462,12 @@ async fn snippet_ref_has_memory_prefix() {
         .unwrap();
 
     assert_eq!(snippets.len(), 1);
+    let snippet_ref = &snippets[0].snippet_ref;
     assert!(
-        snippets[0].snippet_ref.starts_with("memory:"),
-        "snippet_ref must start with 'memory:' prefix"
+        snippet_ref.starts_with("memory-snippet:"),
+        "snippet_ref must use opaque memory-snippet prefix"
     );
-    assert_eq!(snippets[0].snippet_ref, "memory:my-note.md");
+    assert!(!snippet_ref.contains("secrets"));
+    assert!(!snippet_ref.contains("api-key"));
+    assert!(!snippet_ref.contains("note.md"));
 }
