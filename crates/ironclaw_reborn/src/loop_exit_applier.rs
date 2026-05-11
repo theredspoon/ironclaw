@@ -427,9 +427,7 @@ where
         if request.reply_message_refs.is_empty() {
             return Ok(true);
         }
-        let Some(thread_scope) = thread_scope_from_turn_scope(request.scope) else {
-            return Ok(false);
-        };
+        let thread_scope = thread_scope_from_turn_scope(request.scope)?;
         let history = self
             .thread_service
             .list_thread_history(ThreadHistoryRequest {
@@ -514,13 +512,20 @@ where
     }
 }
 
-fn thread_scope_from_turn_scope(scope: &TurnScope) -> Option<ThreadScope> {
-    // `ironclaw_threads::ThreadScope` is currently agent-scoped. Agentless
-    // Reborn turns therefore fail closed at this evidence boundary until the
-    // thread store grows an explicit agentless scope.
-    Some(ThreadScope {
+fn thread_scope_from_turn_scope(scope: &TurnScope) -> Result<ThreadScope, TurnError> {
+    // `ironclaw_threads::ThreadScope` is currently agent-scoped. Reject
+    // agentless Reborn turns explicitly until the thread store grows an
+    // agentless scope representation.
+    let Some(agent_id) = scope.agent_id.clone() else {
+        return Err(TurnError::InvalidRequest {
+            reason: "thread checkpoint loop-exit evidence requires agent-scoped turn scope"
+                .to_string(),
+        });
+    };
+
+    Ok(ThreadScope {
         tenant_id: scope.tenant_id.clone(),
-        agent_id: scope.agent_id.clone()?,
+        agent_id,
         project_id: scope.project_id.clone(),
         owner_user_id: None,
         mission_id: None,

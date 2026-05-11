@@ -204,10 +204,10 @@ async fn loop_exit_events_hide_raw_diagnostics() {
 }
 
 #[tokio::test]
-async fn thread_checkpoint_evidence_fails_closed_for_agentless_completion_refs() {
+async fn thread_checkpoint_evidence_rejects_agentless_completion_refs_explicitly() {
     let evidence = text_checkpoint_evidence(Arc::new(PanicLoopCheckpointStore));
     let claimed = claimed_run();
-    let verified = evidence
+    let err = evidence
         .verify_completion_refs(CompletionEvidenceRequest {
             scope: &claimed.state.scope,
             turn_id: claimed.state.turn_id,
@@ -216,9 +216,27 @@ async fn thread_checkpoint_evidence_fails_closed_for_agentless_completion_refs()
             result_refs: &[],
         })
         .await
-        .expect("agentless scope should fail closed without store errors");
+        .expect_err("agentless scope should be rejected explicitly");
 
-    assert!(!verified);
+    assert!(matches!(err, TurnError::InvalidRequest { .. }));
+    assert!(err.to_string().contains("agent-scoped"));
+}
+
+#[tokio::test]
+async fn applier_rejects_agentless_transcript_evidence_before_transition() {
+    let transition = Arc::new(RecordingTransitionPort::new());
+    let evidence = text_checkpoint_evidence(Arc::new(PanicLoopCheckpointStore));
+    let applier = LoopExitApplier::new(transition.clone(), Arc::new(evidence));
+    let claimed = claimed_run();
+    let exit = completed_exit(vec![LoopMessageRef::new("msg:reply").expect("valid")], None);
+
+    let err = applier
+        .apply(&claimed, exit)
+        .await
+        .expect_err("agentless transcript evidence should stop before transition");
+
+    assert!(matches!(err, TurnError::InvalidRequest { .. }));
+    assert_eq!(transition.apply_count(), 0);
 }
 
 #[tokio::test]
@@ -452,6 +470,7 @@ fn test_profile(
 #[derive(Default)]
 struct RecordingTransitionPort {
     raw_failures: Mutex<Vec<String>>,
+    apply_calls: Mutex<usize>,
 }
 
 impl RecordingTransitionPort {
@@ -461,6 +480,10 @@ impl RecordingTransitionPort {
 
     fn raw_failure_texts(&self) -> Vec<String> {
         self.raw_failures.lock().expect("lock").clone()
+    }
+
+    fn apply_count(&self) -> usize {
+        *self.apply_calls.lock().expect("lock")
     }
 }
 
@@ -547,6 +570,7 @@ impl TurnRunTransitionPort for RecordingTransitionPort {
         &self,
         request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError> {
+        *self.apply_calls.lock().expect("lock") += 1;
         match request.mapping {
             ironclaw_turns::LoopExitMapping::RunnerOutcome(outcome) => match outcome {
                 ironclaw_turns::runner::TurnRunnerOutcome::Completed => {
