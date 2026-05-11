@@ -652,7 +652,11 @@ pub struct HostManagedModelRequest {
     pub turn_id: TurnId,
 }
 
-pub use ironclaw_turns::run_profile::LoopModelRouteSnapshot as HostManagedModelRouteSnapshot;
+/// Boundary alias for the route snapshot carried from turn/run state into
+/// host-managed model requests. This intentionally preserves the turn-owned
+/// wire shape across the loop-support boundary instead of defining a duplicate
+/// snapshot DTO here.
+pub type HostManagedModelRouteSnapshot = ironclaw_turns::run_profile::LoopModelRouteSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManagedModelMessage {
@@ -704,6 +708,7 @@ impl HostManagedModelResponse {
 pub enum HostManagedModelErrorKind {
     InvalidRequest,
     PolicyDenied,
+    ConfigurationError,
     BudgetExceeded,
     Unavailable,
     Cancelled,
@@ -946,6 +951,7 @@ fn model_error_kind(kind: HostManagedModelErrorKind) -> AgentLoopHostErrorKind {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => AgentLoopHostErrorKind::InvalidInvocation,
         HostManagedModelErrorKind::PolicyDenied => AgentLoopHostErrorKind::PolicyDenied,
+        HostManagedModelErrorKind::ConfigurationError => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::BudgetExceeded => AgentLoopHostErrorKind::BudgetExceeded,
         HostManagedModelErrorKind::Unavailable => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::Cancelled => AgentLoopHostErrorKind::Cancelled,
@@ -956,6 +962,7 @@ fn safe_model_summary(kind: HostManagedModelErrorKind) -> &'static str {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => "model request is invalid",
         HostManagedModelErrorKind::PolicyDenied => "model profile is not permitted",
+        HostManagedModelErrorKind::ConfigurationError => "model route configuration is invalid",
         HostManagedModelErrorKind::BudgetExceeded => "model request exceeded its budget",
         HostManagedModelErrorKind::Unavailable => "model service is unavailable",
         HostManagedModelErrorKind::Cancelled => "model request was cancelled",

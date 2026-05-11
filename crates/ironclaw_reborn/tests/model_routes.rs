@@ -29,6 +29,30 @@ fn llm_config_resolves_to_default_model_route_settings() {
 }
 
 #[test]
+fn model_slots_cover_builtin_interactive_and_mission_profiles() {
+    let interactive_model =
+        ironclaw_turns::run_profile::ModelProfileId::new("interactive_model").unwrap();
+    let mission_model = ironclaw_turns::run_profile::ModelProfileId::new("mission_model").unwrap();
+
+    assert_eq!(
+        ModelSlot::from_model_profile_id(&interactive_model),
+        Some(ModelSlot::Default),
+    );
+    assert_eq!(
+        ModelSlot::from_model_profile_id(&mission_model),
+        Some(ModelSlot::Mission),
+    );
+    assert_eq!(ModelSlot::Mission.as_str(), "mission");
+}
+
+#[test]
+fn route_validation_allows_bearer_prefixed_provider_ids() {
+    let route = ModelRoute::new("bearer-mini", "qwen3-coder").unwrap();
+
+    assert_eq!(route.provider_id(), "bearer-mini");
+}
+
+#[test]
 fn provider_key_includes_route_config_and_auth_versions() {
     let route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
 

@@ -258,8 +258,8 @@ impl ModelRouteProviderPool for StaticModelRouteProviderPool {
             .cloned()
             .ok_or_else(|| {
                 HostManagedModelError::safe(
-                    HostManagedModelErrorKind::PolicyDenied,
-                    "model route provider is unavailable",
+                    HostManagedModelErrorKind::ConfigurationError,
+                    "model route provider is not configured",
                 )
             })?;
         validate_provider_identity_matches_route(&bound.provider_id, snapshot.route())?;
@@ -271,33 +271,29 @@ impl ModelRouteProviderPool for StaticModelRouteProviderPool {
 ///
 /// Route resolution is intentionally done by the host/run composition layer so
 /// resumed runs keep using the same persisted provider/model route. This gateway
-/// only validates the carried snapshot and selects the matching provider.
+/// validates the carried snapshot and selects the matching provider.
+///
+/// No mid-run fallback is attempted: if a pinned route becomes unavailable
+/// because config or auth versions rotated, operators must either restore the
+/// provider-pool entry for the persisted key or cancel/retry the run so host
+/// composition can attach a fresh route snapshot before driver side effects.
 pub struct RoutedLlmProviderModelGateway<P>
 where
     P: ModelRouteProviderPool + ?Sized,
 {
     provider_pool: Arc<P>,
-    route_resolver: Option<Arc<dyn ModelRouteResolver>>,
+    route_resolver: Arc<dyn ModelRouteResolver>,
 }
 
 impl<P> RoutedLlmProviderModelGateway<P>
 where
     P: ModelRouteProviderPool + ?Sized,
 {
-    pub fn new(provider_pool: Arc<P>) -> Self {
+    pub fn new(provider_pool: Arc<P>, route_resolver: Arc<dyn ModelRouteResolver>) -> Self {
         Self {
             provider_pool,
-            route_resolver: None,
+            route_resolver,
         }
-    }
-
-    pub fn with_model_route_resolver<R>(mut self, resolver: Arc<R>) -> Self
-    where
-        R: ModelRouteResolver + 'static,
-    {
-        let resolver: Arc<dyn ModelRouteResolver> = resolver;
-        self.route_resolver = Some(resolver);
-        self
     }
 }
 
@@ -344,15 +340,9 @@ where
         slot: ModelSlot,
         snapshot: &HostManagedModelRouteSnapshot,
     ) -> Result<ModelSelectionMode, HostManagedModelError> {
-        let Some(resolver) = &self.route_resolver else {
-            return Err(HostManagedModelError::safe(
-                HostManagedModelErrorKind::PolicyDenied,
-                "model route resolver is required for routed model gateway",
-            ));
-        };
         let route = ModelRoute::new(snapshot.provider_id.clone(), snapshot.model_id.clone())
             .map_err(map_model_route_error)?;
-        resolver
+        self.route_resolver
             .validate_model_route(slot, &route)
             .map_err(map_model_route_error)
     }
@@ -460,12 +450,14 @@ fn slot_for_model_profile(
 
 fn map_model_route_error(error: ModelRouteError) -> HostManagedModelError {
     match error.kind() {
-        ModelRouteErrorKind::RouteUnavailable | ModelRouteErrorKind::RouteNotApproved => {
-            HostManagedModelError::safe(
-                HostManagedModelErrorKind::PolicyDenied,
-                "model route is not permitted",
-            )
-        }
+        ModelRouteErrorKind::RouteUnavailable => HostManagedModelError::safe(
+            HostManagedModelErrorKind::ConfigurationError,
+            "model route is not configured",
+        ),
+        ModelRouteErrorKind::RouteNotApproved => HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model route is not permitted",
+        ),
         ModelRouteErrorKind::InvalidRoute => HostManagedModelError::safe(
             HostManagedModelErrorKind::InvalidRequest,
             "model route is invalid",

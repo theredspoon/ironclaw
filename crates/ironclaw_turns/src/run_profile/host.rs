@@ -18,10 +18,12 @@ const FORBIDDEN_MODEL_ROUTE_MARKERS: &[&str] = &[
     "api_key",
     "apikey",
     "authorization",
-    "bearer",
     "password",
+    "passwd",
     "secret",
 ];
+
+const FORBIDDEN_EXACT_MODEL_ROUTE_MARKERS: &[&str] = &["bearer"];
 
 fn validate_bounded_loop_string(
     value: String,
@@ -383,23 +385,35 @@ impl LoopModelRouteSnapshot {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        validate_model_route_component("provider_id", &self.provider_id, 128, |character| {
+        validate_model_route_component_value("provider_id", &self.provider_id, 128, |character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
         })?;
-        validate_model_route_component("model_id", &self.model_id, 256, |character| {
+        validate_model_route_component_value("model_id", &self.model_id, 256, |character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':' | '/')
         })?;
-        validate_model_route_component("config_version", &self.config_version, 128, |character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-        })?;
-        validate_model_route_component("auth_version", &self.auth_version, 128, |character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-        })?;
+        validate_model_route_component_value(
+            "config_version",
+            &self.config_version,
+            128,
+            |character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+            },
+        )?;
+        validate_model_route_component_value(
+            "auth_version",
+            &self.auth_version,
+            128,
+            |character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+            },
+        )?;
         Ok(())
     }
 }
 
-fn validate_model_route_component(
+/// Validate a persisted provider/model route component with the same redaction
+/// marker policy used by host-owned loop snapshots and Reborn route keys.
+pub fn validate_model_route_component_value(
     label: &'static str,
     value: &str,
     max_bytes: usize,
@@ -418,18 +432,33 @@ fn validate_model_route_component(
 
 fn reject_sensitive_model_route_markers(label: &'static str, value: &str) -> Result<(), String> {
     let lower = value.to_ascii_lowercase();
-    for &forbidden in FORBIDDEN_MODEL_ROUTE_MARKERS {
-        if lower.contains(forbidden) {
+    for token in model_route_marker_tokens(&lower) {
+        if FORBIDDEN_EXACT_MODEL_ROUTE_MARKERS.contains(&token)
+            || FORBIDDEN_MODEL_ROUTE_MARKERS
+                .iter()
+                .any(|forbidden| token_contains_sensitive_marker(token, forbidden))
+            || token.starts_with("sk-")
+        {
             return Err(format!("{label} contains a forbidden marker"));
         }
     }
-    if lower
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
-        .any(|token| token.starts_with("sk-"))
-    {
-        return Err(format!("{label} contains a forbidden marker"));
-    }
     Ok(())
+}
+
+fn model_route_marker_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+        })
+        .filter(|token| !token.is_empty())
+}
+
+fn token_contains_sensitive_marker(token: &str, marker: &str) -> bool {
+    let normalized = token.replace('-', "_");
+    normalized == marker
+        || normalized.starts_with(&format!("{marker}_"))
+        || normalized.ends_with(&format!("_{marker}"))
+        || normalized.contains(&format!("_{marker}_"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,19 +2,12 @@ use std::{collections::HashMap, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
-use ironclaw_turns::run_profile::{LoopModelRouteSnapshot, ModelProfileId};
+use ironclaw_turns::run_profile::{
+    LoopModelRouteSnapshot, ModelProfileId, validate_model_route_component_value,
+};
 
 const DEFAULT_CONFIG_VERSION: &str = "config:default";
 const DEFAULT_AUTH_VERSION: &str = "auth:default";
-const FORBIDDEN_ROUTE_MARKERS: &[&str] = &[
-    "access_token",
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer",
-    "password",
-    "secret",
-];
 
 /// Internal Reborn model purpose. Users choose provider/model routes; drivers
 /// request purpose slots instead of raw provider identifiers.
@@ -22,18 +15,21 @@ const FORBIDDEN_ROUTE_MARKERS: &[&str] = &[
 #[serde(rename_all = "snake_case")]
 pub enum ModelSlot {
     Default,
+    Mission,
 }
 
 impl ModelSlot {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Mission => "mission",
         }
     }
 
     pub fn from_model_profile_id(model_profile_id: &ModelProfileId) -> Option<Self> {
         match model_profile_id.as_str() {
             "default" | "default_model" | "interactive_model" => Some(Self::Default),
+            "mission_model" | "long_running_mission_model" => Some(Self::Mission),
             _ => None,
         }
     }
@@ -111,18 +107,7 @@ impl ActiveModelRouteSettings {
 
     #[cfg(feature = "root-llm-provider")]
     pub fn from_llm_config(config: &ironclaw_llm::LlmConfig) -> Result<Self, ModelRouteError> {
-        let provider_id = match config.backend.as_str() {
-            "nearai" | "near_ai" | "near" => "nearai".to_string(),
-            "bedrock" | "aws_bedrock" | "aws" => "bedrock".to_string(),
-            "gemini_oauth" | "gemini-oauth" => "gemini_oauth".to_string(),
-            "openai_codex" | "openai-codex" | "codex" => "openai_codex".to_string(),
-            _ => config
-                .provider
-                .as_ref()
-                .map(|provider| provider.provider_id.clone())
-                .unwrap_or_else(|| config.backend.clone()),
-        };
-        Self::new(provider_id, config.active_model_name())
+        Self::new(config.active_provider_id(), config.active_model_name())
     }
 }
 
@@ -407,64 +392,31 @@ impl fmt::Display for ModelRouteError {
 impl Error for ModelRouteError {}
 
 fn validate_provider_id(value: String) -> Result<String, ModelRouteError> {
-    let trimmed = validate_nonempty_bounded(value, 128)?;
-    if !trimmed
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-    {
-        return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
-    }
-    reject_sensitive_markers(&trimmed)?;
-    Ok(trimmed)
+    validate_route_component("provider_id", value, 128, |character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+    })
 }
 
 fn validate_model_id(value: String) -> Result<String, ModelRouteError> {
-    let trimmed = validate_nonempty_bounded(value, 256)?;
-    if !trimmed.chars().all(|character| {
+    validate_route_component("model_id", value, 256, |character| {
         character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':' | '/')
-    }) {
-        return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
-    }
-    reject_sensitive_markers(&trimmed)?;
-    Ok(trimmed)
-}
-
-fn validate_nonempty_bounded(value: String, max_bytes: usize) -> Result<String, ModelRouteError> {
-    let trimmed = value.trim().to_string();
-    if trimmed.is_empty()
-        || trimmed.len() > max_bytes
-        || trimmed
-            .chars()
-            .any(|character| character == '\0' || character.is_control())
-    {
-        return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
-    }
-    Ok(trimmed)
+    })
 }
 
 fn validate_version_token(value: String) -> Result<String, ModelRouteError> {
-    let trimmed = validate_nonempty_bounded(value, 128)?;
-    if !trimmed.chars().all(|character| {
+    validate_route_component("route version token", value, 128, |character| {
         character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-    }) {
-        return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
-    }
-    reject_sensitive_markers(&trimmed)?;
-    Ok(trimmed)
+    })
 }
 
-fn reject_sensitive_markers(value: &str) -> Result<(), ModelRouteError> {
-    let lower = value.to_ascii_lowercase();
-    for &forbidden in FORBIDDEN_ROUTE_MARKERS {
-        if lower.contains(forbidden) {
-            return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
-        }
-    }
-    if lower
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
-        .any(|token| token.starts_with("sk-"))
-    {
-        return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
-    }
-    Ok(())
+fn validate_route_component(
+    label: &'static str,
+    value: String,
+    max_bytes: usize,
+    allowed: impl Fn(char) -> bool,
+) -> Result<String, ModelRouteError> {
+    let trimmed = value.trim().to_string();
+    validate_model_route_component_value(label, &trimmed, max_bytes, allowed)
+        .map_err(|_| ModelRouteError::new(ModelRouteErrorKind::InvalidRoute))?;
+    Ok(trimmed)
 }

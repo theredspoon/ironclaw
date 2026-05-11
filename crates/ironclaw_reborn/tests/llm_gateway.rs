@@ -351,8 +351,7 @@ async fn routed_gateway_uses_provider_pool_route_not_request_model_override() {
         "routed response",
     ));
     let pool = provider_pool_for_route(route.clone(), provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool)
-        .with_model_route_resolver(route_resolver_for_route(route));
+    let gateway = RoutedLlmProviderModelGateway::new(pool, route_resolver_for_route(route));
 
     let response = gateway
         .stream_model(model_request_with_route(
@@ -419,8 +418,7 @@ async fn routed_gateway_rejects_provider_that_ignores_route_model_override_at_ca
     let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
     let provider = Arc::new(IgnoresModelOverrideProvider::new("qwen3-coder", "unused"));
     let pool = provider_pool_for_route(route.clone(), provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool)
-        .with_model_route_resolver(route_resolver_for_route(route));
+    let gateway = RoutedLlmProviderModelGateway::new(pool, route_resolver_for_route(route));
     provider.set_active_model("other-model");
 
     let error = gateway
@@ -443,8 +441,8 @@ async fn routed_gateway_rejects_missing_route_snapshot_before_provider_call() {
         "qwen3-coder",
         "unused",
     ));
-    let pool = provider_pool_for_route(route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool);
+    let pool = provider_pool_for_route(route.clone(), provider.clone());
+    let gateway = RoutedLlmProviderModelGateway::new(pool, route_resolver_for_route(route));
 
     let error = gateway
         .stream_model(model_request(interactive_model()))
@@ -456,14 +454,10 @@ async fn routed_gateway_rejects_missing_route_snapshot_before_provider_call() {
 }
 
 #[tokio::test]
-async fn routed_gateway_rejects_route_snapshot_without_route_resolver() {
+async fn routed_gateway_reports_configuration_error_for_missing_provider_pool_entry() {
     let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
-    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
-        "qwen3-coder",
-        "unused",
-    ));
-    let pool = provider_pool_for_route(route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool);
+    let pool = Arc::new(StaticModelRouteProviderPool::new());
+    let gateway = RoutedLlmProviderModelGateway::new(pool, route_resolver_for_route(route));
 
     let error = gateway
         .stream_model(model_request_with_route(
@@ -474,7 +468,33 @@ async fn routed_gateway_rejects_route_snapshot_without_route_resolver() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+    assert_eq!(error.kind, HostManagedModelErrorKind::ConfigurationError);
+    assert_eq!(error.safe_summary, "model route provider is not configured");
+}
+
+#[tokio::test]
+async fn routed_gateway_reports_configuration_error_for_missing_resolver_slot() {
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
+        "qwen3-coder",
+        "unused",
+    ));
+    let pool = provider_pool_for_route(route.clone(), provider.clone());
+    let resolver = Arc::new(StaticModelRouteResolver::new(
+        ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly).with_approved_route(route.clone()),
+    ));
+    let gateway = RoutedLlmProviderModelGateway::new(pool, resolver);
+
+    let error = gateway
+        .stream_model(model_request_with_route(
+            interactive_model(),
+            "nearai",
+            "qwen3-coder",
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::ConfigurationError);
     assert!(provider.requests.lock().unwrap().is_empty());
 }
 
@@ -487,8 +507,7 @@ async fn routed_gateway_rejects_route_snapshot_denied_by_policy() {
         "unused",
     ));
     let pool = provider_pool_for_route(denied_route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool)
-        .with_model_route_resolver(route_resolver_for_route(allowed_route));
+    let gateway = RoutedLlmProviderModelGateway::new(pool, route_resolver_for_route(allowed_route));
 
     let error = gateway
         .stream_model(model_request_with_route(
@@ -511,8 +530,7 @@ async fn routed_gateway_uses_request_route_snapshot() {
         "snapshot response",
     ));
     let pool = provider_pool_for_route(route.clone(), provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool)
-        .with_model_route_resolver(route_resolver_for_route(route));
+    let gateway = RoutedLlmProviderModelGateway::new(pool, route_resolver_for_route(route));
 
     let response = gateway
         .stream_model(model_request_with_route(
@@ -530,27 +548,31 @@ async fn routed_gateway_uses_request_route_snapshot() {
 }
 
 #[tokio::test]
-async fn routed_gateway_rejects_unsupported_non_default_model_profile() {
+async fn routed_gateway_accepts_mission_model_profile_when_slot_route_configured() {
     let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
     let provider = Arc::new(RecordingLlmProvider::reply_for_model(
         "qwen3-coder",
-        "unused",
+        "mission response",
     ));
-    let pool = provider_pool_for_route(route.clone(), provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(pool)
-        .with_model_route_resolver(route_resolver_for_route(route));
+    let pool = provider_pool_for_route(route.clone(), provider);
+    let gateway = RoutedLlmProviderModelGateway::new(
+        pool,
+        route_resolver_for_slot(ModelSlot::Mission, route),
+    );
 
-    let error = gateway
+    let response = gateway
         .stream_model(model_request_with_route(
             ModelProfileId::new("mission_model").unwrap(),
             "nearai",
             "qwen3-coder",
         ))
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
-    assert!(provider.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        response.safe_text_deltas,
+        vec!["mission response".to_string()]
+    );
 }
 
 struct ThreadFixture {
@@ -637,12 +659,16 @@ where
 }
 
 fn route_resolver_for_route(route: ModelRoute) -> Arc<StaticModelRouteResolver> {
+    route_resolver_for_slot(ModelSlot::Default, route)
+}
+
+fn route_resolver_for_slot(slot: ModelSlot, route: ModelRoute) -> Arc<StaticModelRouteResolver> {
     Arc::new(
         StaticModelRouteResolver::new(
             ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly)
                 .with_approved_route(route.clone()),
         )
-        .with_route(ModelSlot::Default, route),
+        .with_route(slot, route),
     )
 }
 

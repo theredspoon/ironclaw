@@ -37,7 +37,7 @@ pub use host::{
     LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
     LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
     ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
-    VisibleCapabilitySurface,
+    VisibleCapabilitySurface, validate_model_route_component_value,
 };
 pub use milestones::{
     InMemoryLoopHostMilestoneSink, LoopHostMilestone, LoopHostMilestoneEmitter,
