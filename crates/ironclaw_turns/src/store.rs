@@ -9,6 +9,7 @@ use crate::{
     TurnCheckpointId, TurnError, TurnErrorCategory, TurnId, TurnLeaseToken, TurnLifecycleEvent,
     TurnRunId, TurnRunProfile, TurnRunState, TurnRunnerId, TurnScope, TurnStatus, TurnTimestamp,
     events::EventCursor,
+    run_profile::{LoopCheckpointKind, LoopCheckpointStateRef},
 };
 
 #[async_trait]
@@ -107,14 +108,66 @@ pub struct TurnActiveLockRecord {
     pub updated_at: TurnTimestamp,
 }
 
+/// Serde default for `LoopCheckpointKind` — used when deserializing old
+/// persisted data that predates the `kind` field.
+fn default_checkpoint_kind() -> LoopCheckpointKind {
+    LoopCheckpointKind::BeforeBlock
+}
+
+/// Serde default for `LoopCheckpointStateRef` — sentinel value used when
+/// deserializing old persisted data that predates the `state_ref` field.
+/// Real values will be threaded from loop callers in a follow-up task.
+fn default_checkpoint_state_ref() -> LoopCheckpointStateRef {
+    // Safety: literal satisfies the "checkpoint:" prefix and length constraints.
+    LoopCheckpointStateRef::new("checkpoint:unknown").unwrap()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnCheckpointRecord {
     pub checkpoint_id: TurnCheckpointId,
     pub run_id: TurnRunId,
+    /// Scope of the run that created this checkpoint. `None` for legacy records
+    /// persisted before scope was added to checkpoints.
+    #[serde(default)]
+    pub scope: Option<TurnScope>,
     pub sequence: u64,
     pub status: TurnStatus,
     pub gate_ref: GateRef,
+    /// The semantic kind of checkpoint (before model, side-effect, block, final).
+    #[serde(default = "default_checkpoint_kind")]
+    pub kind: LoopCheckpointKind,
+    /// An opaque ref describing the loop state at the time of this checkpoint.
+    #[serde(default = "default_checkpoint_state_ref")]
+    pub state_ref: LoopCheckpointStateRef,
     pub created_at: TurnTimestamp,
+}
+
+/// Direct single-row checkpoint read/write operations.
+///
+/// Unlike the snapshot-based path (`TurnRunTransitionPort::block_run` →
+/// `libsql_replace_snapshot`/`postgres_replace_snapshot`) which loads the full
+/// `TurnPersistenceSnapshot`, `LoopCheckpointStore` provides targeted
+/// `INSERT`/`SELECT` operations scoped by checkpoint ID and run.
+///
+/// Implementations must preserve idempotent `put` semantics (re-inserting the
+/// same `checkpoint_id` is not an error) and cross-run isolation (`get` returns
+/// `None` when the checkpoint belongs to a different `run_id`).
+#[async_trait]
+pub trait LoopCheckpointStore: Send + Sync {
+    /// Insert a single checkpoint record scoped to the run.
+    /// Idempotent: re-inserting the same `checkpoint_id` is not an error.
+    async fn put_loop_checkpoint(
+        &self,
+        record: TurnCheckpointRecord,
+    ) -> Result<(), TurnError>;
+
+    /// Direct lookup by `checkpoint_id`. Returns `None` if not found or if the
+    /// checkpoint belongs to a different `run_id` (cross-run rejection).
+    async fn get_loop_checkpoint(
+        &self,
+        checkpoint_id: TurnCheckpointId,
+        run_id: TurnRunId,
+    ) -> Result<Option<TurnCheckpointRecord>, TurnError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

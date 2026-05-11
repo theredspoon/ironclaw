@@ -1722,9 +1722,15 @@ impl Inner {
         self.checkpoints.push(TurnCheckpointRecord {
             checkpoint_id,
             run_id: record.run_id,
+            scope: Some(record.scope.clone()),
             sequence,
             status: record.status,
             gate_ref,
+            kind: crate::run_profile::LoopCheckpointKind::BeforeBlock,
+            // Placeholder — callers in block_run don't have the loop's actual state_ref.
+            // Real values will be threaded in a follow-up task.
+            state_ref: crate::run_profile::LoopCheckpointStateRef::new("checkpoint:block-state")
+                .unwrap(),
             created_at,
         });
     }
