@@ -537,8 +537,8 @@ mod telegram_v2_tests {
 
     #[test]
     fn both_active_fails_closed() {
-        let err =
-            validate_telegram_v1_v2_exclusivity(&channels_cfg(true, true)).expect_err("must reject");
+        let err = validate_telegram_v1_v2_exclusivity(&channels_cfg(true, true))
+            .expect_err("must reject");
         assert!(
             matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED")
         );
@@ -560,7 +560,8 @@ mod telegram_v2_tests {
         let mut cfg = channels_cfg(false, true);
         cfg.wasm_channels_enabled = true;
         cfg.configured_wasm_channels = vec!["discord".to_string(), "slack".to_string()];
-        validate_telegram_v1_v2_exclusivity(&cfg).expect("non-telegram v1 channels do not block v2");
+        validate_telegram_v1_v2_exclusivity(&cfg)
+            .expect("non-telegram v1 channels do not block v2");
     }
 
     #[test]
