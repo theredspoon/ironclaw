@@ -26,12 +26,14 @@
 //!
 //! Output ordering is deterministic for the same [`SkillRunSnapshot`]: entries are sorted by
 //! a total ordering rooted in [`InstalledSkillSnapshot::ordering_key`], and the snapshot
-//! version is a deterministic hash of all entry data.
+//! version is a deterministic SHA-256 content digest of all entry data. The digest verifies
+//! snapshot consistency, not producer authenticity; host trust decisions remain authoritative.
 
 use std::cmp::Ordering;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::LoopContextSnippet;
@@ -56,6 +58,10 @@ pub enum SkillContextError {
     /// Snapshot version does not match the entry data.
     #[error("skill context: invalid snapshot version")]
     InvalidSnapshotVersion,
+
+    /// Skill context budget configuration is invalid.
+    #[error("skill context: budget misconfigured")]
+    BudgetMisconfigured,
 
     /// Model-visible skill context exceeds configured context budgets.
     #[error("skill context: context budget exceeded")]
@@ -163,8 +169,10 @@ pub struct InstalledSkillSnapshot {
 
 /// Complete set of installed skill snapshots for a run.
 ///
-/// The `snapshot_version` is a deterministic hash of all entries, used to verify
-/// the service is reading the same entry data approved by the host.
+/// The `snapshot_version` is a deterministic SHA-256 content digest of all entries,
+/// used to verify the service is reading the same entry data approved by the host.
+/// It is not an authenticity proof; trusted hosts remain responsible for producing
+/// approved snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRunSnapshot {
     /// All installed skill entries for this run.
@@ -295,7 +303,7 @@ impl SkillContextSource for SkillContextService {
         // Re-sort here even though `from_entries` sorts, because snapshots may
         // have been constructed manually. Use total-order sorting so duplicate
         // ordering keys cannot make output depend on input order.
-        visible.sort_by(|a, b| compare_skill_entries(a, b));
+        visible.sort_by(compare_visible_skill_entries);
 
         let mut snippets = Vec::with_capacity(visible.len());
         let mut total_bytes = 0usize;
@@ -317,12 +325,12 @@ impl SkillContextSource for SkillContextService {
             }
 
             let snippet_ref = format!("skill:{}", entry.name);
-            total_bytes = total_bytes
-                .saturating_add(snippet_ref.len())
-                .saturating_add(safe_summary.len());
-            if total_bytes > self.budget.max_context_bytes {
-                return Err(SkillContextError::ContextBudgetExceeded);
-            }
+            total_bytes = checked_context_total_bytes(
+                total_bytes,
+                snippet_ref.len(),
+                safe_summary.len(),
+                self.budget.max_context_bytes,
+            )?;
 
             snippets.push(SkillContextSnippet {
                 snippet_ref,
@@ -384,10 +392,17 @@ fn validate_budget(budget: SkillContextBudget) -> Result<(), SkillContextError> 
         || budget.max_context_bytes == 0
         || budget.max_snippet_bytes > budget.max_context_bytes
     {
-        return Err(SkillContextError::ContextBudgetExceeded);
+        return Err(SkillContextError::BudgetMisconfigured);
     }
 
     Ok(())
+}
+
+fn compare_visible_skill_entries(
+    a: &&InstalledSkillSnapshot,
+    b: &&InstalledSkillSnapshot,
+) -> Ordering {
+    compare_skill_entries(a, b)
 }
 
 fn compare_skill_entries(a: &InstalledSkillSnapshot, b: &InstalledSkillSnapshot) -> Ordering {
@@ -415,48 +430,75 @@ const fn visibility_rank(visibility: SkillVisibility) -> u8 {
     }
 }
 
-/// Compute a deterministic version string from sorted snapshot entries.
-///
-/// Uses a simple FNV-1a-style hash over the concatenated field data.
-/// This hash is stable across runs of the same binary. It is not cryptographic
-/// and should not be used for security purposes.
-fn compute_snapshot_version(sorted_entries: &[InstalledSkillSnapshot]) -> String {
-    // FNV-1a 64-bit — stable, simple, no external dependency.
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x00000100000001B3;
+fn checked_context_total_bytes(
+    current_total: usize,
+    snippet_ref_bytes: usize,
+    safe_summary_bytes: usize,
+    max_context_bytes: usize,
+) -> Result<usize, SkillContextError> {
+    let next_total = current_total
+        .checked_add(snippet_ref_bytes)
+        .and_then(|total| total.checked_add(safe_summary_bytes))
+        .ok_or(SkillContextError::ContextBudgetExceeded)?;
 
-    let mut hash = FNV_OFFSET;
-
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            hash ^= u64::from(b);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
-    };
-
-    for entry in sorted_entries {
-        feed(entry.name.as_bytes());
-        feed(&[0xFF]); // separator
-        feed(match entry.trust {
-            SkillTrustLevel::Installed => b"installed",
-            SkillTrustLevel::Trusted => b"trusted",
-        });
-        feed(&[0xFF]);
-        feed(match entry.visibility {
-            SkillVisibility::Visible => b"visible",
-            SkillVisibility::Hidden => b"hidden",
-            SkillVisibility::Denied => b"denied",
-        });
-        feed(&[0xFF]);
-        if let Some(ref content) = entry.prompt_content {
-            feed(content.as_bytes());
-        }
-        feed(&[0xFF]);
-        feed(entry.safe_description.as_bytes());
-        feed(&[0xFF]);
-        feed(entry.ordering_key.as_bytes());
-        feed(&[0xFE]); // entry separator
+    if next_total > max_context_bytes {
+        return Err(SkillContextError::ContextBudgetExceeded);
     }
 
-    format!("v1:{hash:016x}")
+    Ok(next_total)
+}
+
+/// Compute a deterministic version string from sorted snapshot entries.
+///
+/// Uses a SHA-256 digest over length-prefixed field data. The digest is collision-resistant
+/// for consistency checks, but is not an authenticity proof or authorization decision.
+fn compute_snapshot_version(sorted_entries: &[InstalledSkillSnapshot]) -> String {
+    let mut digest = Sha256::new();
+
+    for entry in sorted_entries {
+        feed_digest_field(&mut digest, entry.name.as_bytes());
+        feed_digest_field(
+            &mut digest,
+            match entry.trust {
+                SkillTrustLevel::Installed => b"installed",
+                SkillTrustLevel::Trusted => b"trusted",
+            },
+        );
+        feed_digest_field(
+            &mut digest,
+            match entry.visibility {
+                SkillVisibility::Visible => b"visible",
+                SkillVisibility::Hidden => b"hidden",
+                SkillVisibility::Denied => b"denied",
+            },
+        );
+        match entry.prompt_content {
+            Some(ref content) => {
+                digest.update([1]);
+                feed_digest_field(&mut digest, content.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        feed_digest_field(&mut digest, entry.safe_description.as_bytes());
+        feed_digest_field(&mut digest, entry.ordering_key.as_bytes());
+        digest.update([0xFE]);
+    }
+
+    format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
+fn feed_digest_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_byte_accumulator_reports_arithmetic_overflow() {
+        let err = checked_context_total_bytes(usize::MAX, 1, 0, usize::MAX).unwrap_err();
+        assert_eq!(err, SkillContextError::ContextBudgetExceeded);
+    }
 }
