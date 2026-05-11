@@ -8,10 +8,13 @@ use ironclaw_llm::{
 };
 use ironclaw_loop_support::{
     HostManagedModelErrorKind, HostManagedModelGateway, HostManagedModelMessage,
-    HostManagedModelMessageRole, HostManagedModelRequest,
+    HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelRouteSnapshot,
 };
 use ironclaw_reborn::{
-    LlmModelProfilePolicy, LlmProviderModelGateway, ThreadBackedLoopModelGateway,
+    LlmModelProfilePolicy, LlmProviderModelGateway, ModelRoute, ModelRouteError, ModelRoutePolicy,
+    ModelRouteResolver, ModelSelectionMode, ModelSlot, ResolvedModelRouteSnapshot,
+    RoutedLlmProviderModelGateway, StaticModelRouteProviderPool, StaticModelRouteResolver,
+    ThreadBackedLoopModelGateway,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
@@ -341,6 +344,189 @@ async fn gateway_sanitizes_provider_errors() {
     assert!(!format!("{error:?}").contains("RAW_PROVIDER_SECRET"));
 }
 
+#[tokio::test]
+async fn routed_gateway_uses_provider_pool_route_not_request_model_override() {
+    let route = ModelRoute::new("rig-openai", "gpt-4.1").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
+        "gpt-4.1",
+        "routed response",
+    ));
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, route.clone()),
+    );
+    let pool = Arc::new(
+        StaticModelRouteProviderPool::new()
+            .with_provider(route, provider.clone())
+            .unwrap(),
+    );
+    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+
+    let response = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.safe_text_deltas,
+        vec!["routed response".to_string()]
+    );
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, None);
+    assert_eq!(
+        requests[0]
+            .metadata
+            .get("model_route_provider_id")
+            .map(String::as_str),
+        Some("rig-openai")
+    );
+    assert_eq!(
+        requests[0]
+            .metadata
+            .get("model_route_model_id")
+            .map(String::as_str),
+        Some("gpt-4.1")
+    );
+}
+
+#[tokio::test]
+async fn provider_pool_rejects_route_bound_to_wrong_active_model() {
+    let route = ModelRoute::new("rig-openai", "gpt-4.1").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model("gpt-4o", "unused"));
+
+    let error = match StaticModelRouteProviderPool::new().with_provider(route, provider) {
+        Ok(_) => panic!("route/provider mismatch should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
+async fn routed_gateway_caches_resolved_route_for_same_run_when_request_lacks_snapshot() {
+    let first_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let replacement_route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
+    let first_provider = Arc::new(ReusableLlmProvider::new("qwen3-coder", "first route"));
+    let replacement_provider = Arc::new(ReusableLlmProvider::new(
+        "anthropic/claude-sonnet-4",
+        "replacement route",
+    ));
+    let resolver = Arc::new(MutableModelRouteResolver::new(first_route.clone()));
+    let pool = Arc::new(
+        StaticModelRouteProviderPool::new()
+            .with_provider(first_route, first_provider.clone())
+            .unwrap()
+            .with_provider(replacement_route.clone(), replacement_provider.clone())
+            .unwrap(),
+    );
+    let gateway = RoutedLlmProviderModelGateway::new(resolver.clone(), pool);
+    let request = model_request(interactive_model());
+
+    let first = gateway.stream_model(request.clone()).await.unwrap();
+    resolver.set_route(replacement_route);
+    let second = gateway.stream_model(request).await.unwrap();
+
+    assert_eq!(first.safe_text_deltas, vec!["first route".to_string()]);
+    assert_eq!(second.safe_text_deltas, vec!["first route".to_string()]);
+    assert_eq!(first_provider.request_count(), 2);
+    assert_eq!(replacement_provider.request_count(), 0);
+}
+
+#[tokio::test]
+async fn routed_gateway_uses_request_route_snapshot_over_current_resolver_route() {
+    let stale_current_route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
+    let snapshot_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
+        "qwen3-coder",
+        "snapshot response",
+    ));
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, stale_current_route),
+    );
+    let pool = Arc::new(
+        StaticModelRouteProviderPool::new()
+            .with_provider(snapshot_route, provider.clone())
+            .unwrap(),
+    );
+    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+
+    let mut request = model_request(interactive_model());
+    request.resolved_model_route = Some(HostManagedModelRouteSnapshot::new(
+        "nearai",
+        "qwen3-coder",
+        "config:default",
+        "auth:default",
+    ));
+    let response = gateway.stream_model(request).await.unwrap();
+
+    assert_eq!(
+        response.safe_text_deltas,
+        vec!["snapshot response".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn routed_gateway_rejects_unsupported_non_default_model_profile() {
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
+        "qwen3-coder",
+        "unused",
+    ));
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, route.clone()),
+    );
+    let pool = Arc::new(
+        StaticModelRouteProviderPool::new()
+            .with_provider(route, provider.clone())
+            .unwrap(),
+    );
+    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+
+    let error = gateway
+        .stream_model(model_request(ModelProfileId::new("mission_model").unwrap()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn routed_gateway_rejects_managed_unapproved_route_before_provider_call() {
+    let route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
+        "anthropic/claude-sonnet-4",
+        "unused",
+    ));
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly))
+            .with_route(ModelSlot::Default, route.clone()),
+    );
+    let pool = Arc::new(
+        StaticModelRouteProviderPool::new()
+            .with_provider(route, provider.clone())
+            .unwrap(),
+    );
+    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
+
 struct ThreadFixture {
     thread_service: Arc<InMemorySessionThreadService>,
     thread_scope: ThreadScope,
@@ -476,8 +662,91 @@ fn model_request(model_profile_id: ModelProfileId) -> HostManagedModelRequest {
             },
         ],
         surface_version: None,
+        resolved_model_route: None,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
+    }
+}
+
+struct MutableModelRouteResolver {
+    route: Mutex<ModelRoute>,
+}
+
+impl MutableModelRouteResolver {
+    fn new(route: ModelRoute) -> Self {
+        Self {
+            route: Mutex::new(route),
+        }
+    }
+
+    fn set_route(&self, route: ModelRoute) {
+        *self.route.lock().unwrap() = route;
+    }
+}
+
+impl ModelRouteResolver for MutableModelRouteResolver {
+    fn resolve_model_route(
+        &self,
+        slot: ModelSlot,
+    ) -> Result<ResolvedModelRouteSnapshot, ModelRouteError> {
+        Ok(ResolvedModelRouteSnapshot::new(
+            slot,
+            self.route.lock().unwrap().clone(),
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+    }
+}
+
+struct ReusableLlmProvider {
+    model_name: String,
+    content: String,
+    requests: Mutex<Vec<CompletionRequest>>,
+}
+
+impl ReusableLlmProvider {
+    fn new(model_name: &str, content: &str) -> Self {
+        Self {
+            model_name: model_name.to_string(),
+            content: content.to_string(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for ReusableLlmProvider {
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn cost_per_token(&self) -> (Decimal, Decimal) {
+        (Decimal::ZERO, Decimal::ZERO)
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        self.requests.lock().unwrap().push(request);
+        Ok(CompletionResponse {
+            content: self.content.clone(),
+            input_tokens: 1,
+            output_tokens: 1,
+            finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    }
+
+    async fn complete_with_tools(
+        &self,
+        _request: ToolCompletionRequest,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        Err(LlmError::RequestFailed {
+            provider: "reusable".to_string(),
+            reason: "tool completion is not used by the loop support gateway".to_string(),
+        })
     }
 }
 
@@ -503,17 +772,31 @@ impl HostManagedModelGateway for InvalidSummaryModelGateway {
 }
 
 struct RecordingLlmProvider {
+    model_name: String,
     requests: Mutex<Vec<CompletionRequest>>,
     response: Mutex<Option<Result<CompletionResponse, LlmError>>>,
 }
 
 impl RecordingLlmProvider {
     fn reply(content: &str) -> Self {
-        Self::reply_with_finish_reason(content, FinishReason::Stop)
+        Self::reply_for_model("recording-model", content)
+    }
+
+    fn reply_for_model(model_name: &str, content: &str) -> Self {
+        Self::reply_for_model_with_finish_reason(model_name, content, FinishReason::Stop)
     }
 
     fn reply_with_finish_reason(content: &str, finish_reason: FinishReason) -> Self {
+        Self::reply_for_model_with_finish_reason("recording-model", content, finish_reason)
+    }
+
+    fn reply_for_model_with_finish_reason(
+        model_name: &str,
+        content: &str,
+        finish_reason: FinishReason,
+    ) -> Self {
         Self {
+            model_name: model_name.to_string(),
             requests: Mutex::new(Vec::new()),
             response: Mutex::new(Some(Ok(CompletionResponse {
                 content: content.to_string(),
@@ -528,6 +811,7 @@ impl RecordingLlmProvider {
 
     fn fail(error: LlmError) -> Self {
         Self {
+            model_name: "recording-model".to_string(),
             requests: Mutex::new(Vec::new()),
             response: Mutex::new(Some(Err(error))),
         }
@@ -537,7 +821,7 @@ impl RecordingLlmProvider {
 #[async_trait]
 impl LlmProvider for RecordingLlmProvider {
     fn model_name(&self) -> &str {
-        "recording-model"
+        &self.model_name
     }
 
     fn cost_per_token(&self) -> (Decimal, Decimal) {

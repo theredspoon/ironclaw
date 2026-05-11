@@ -505,6 +505,7 @@ where
                 model_profile_id: model_profile_id.clone(),
                 messages: resolved_messages,
                 surface_version: request.surface_version,
+                resolved_model_route: self.run_context.resolved_model_route.clone(),
                 run_id: self.run_context.run_id,
                 turn_id: self.run_context.turn_id,
             })
@@ -645,9 +646,13 @@ pub struct HostManagedModelRequest {
     pub model_profile_id: ModelProfileId,
     pub messages: Vec<HostManagedModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<HostManagedModelRouteSnapshot>,
     pub run_id: TurnRunId,
     pub turn_id: TurnId,
 }
+
+pub use ironclaw_turns::run_profile::LoopModelRouteSnapshot as HostManagedModelRouteSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManagedModelMessage {

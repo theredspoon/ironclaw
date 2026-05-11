@@ -4,7 +4,10 @@
 //! adapter lives in the standalone Reborn composition crate because it bridges
 //! that contract to the shared `ironclaw_llm` provider abstraction.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use ironclaw_llm::{
@@ -13,12 +16,17 @@ use ironclaw_llm::{
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessage, HostManagedModelMessageRole, HostManagedModelRequest,
-    HostManagedModelResponse, ThreadBackedLoopModelPort,
+    HostManagedModelResponse, HostManagedModelRouteSnapshot, ThreadBackedLoopModelPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::run_profile::{
     AgentLoopHostError, LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest,
     LoopModelPort, LoopModelResponse, LoopSafeSummary, ModelProfileId,
+};
+
+use crate::model_routes::{
+    ModelRoute, ModelRouteError, ModelRouteProviderKey, ModelRouteResolver, ModelSlot,
+    ResolvedModelRouteSnapshot,
 };
 
 /// Fail-closed routing policy from resolved Reborn model profile ids to the
@@ -171,6 +179,244 @@ where
             .await
             .map_err(map_provider_error)?;
         response_to_host_reply(response)
+    }
+}
+
+#[async_trait]
+pub trait ModelRouteProviderPool: Send + Sync {
+    async fn provider_for_route(
+        &self,
+        snapshot: &ResolvedModelRouteSnapshot,
+    ) -> Result<Arc<dyn LlmProvider>, HostManagedModelError>;
+}
+
+#[derive(Clone, Default)]
+pub struct StaticModelRouteProviderPool {
+    providers: HashMap<ModelRouteProviderKey, Arc<dyn LlmProvider>>,
+}
+
+impl StaticModelRouteProviderPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_provider<P>(
+        self,
+        route: ModelRoute,
+        provider: Arc<P>,
+    ) -> Result<Self, HostManagedModelError>
+    where
+        P: LlmProvider + 'static,
+    {
+        self.with_provider_key(ModelRouteProviderKey::for_route(route), provider)
+    }
+
+    pub fn with_provider_key<P>(
+        mut self,
+        key: ModelRouteProviderKey,
+        provider: Arc<P>,
+    ) -> Result<Self, HostManagedModelError>
+    where
+        P: LlmProvider + 'static,
+    {
+        validate_provider_matches_route(key.route(), provider.as_ref())?;
+        let provider: Arc<dyn LlmProvider> = provider;
+        self.providers.insert(key, provider);
+        Ok(self)
+    }
+}
+
+#[async_trait]
+impl ModelRouteProviderPool for StaticModelRouteProviderPool {
+    async fn provider_for_route(
+        &self,
+        snapshot: &ResolvedModelRouteSnapshot,
+    ) -> Result<Arc<dyn LlmProvider>, HostManagedModelError> {
+        self.providers
+            .get(snapshot.provider_key())
+            .cloned()
+            .ok_or_else(|| {
+                HostManagedModelError::safe(
+                    HostManagedModelErrorKind::PolicyDenied,
+                    "model route provider is unavailable",
+                )
+            })
+    }
+}
+
+pub struct RoutedLlmProviderModelGateway<R, P>
+where
+    R: ModelRouteResolver + ?Sized,
+    P: ModelRouteProviderPool + ?Sized,
+{
+    resolver: Arc<R>,
+    provider_pool: Arc<P>,
+    route_snapshots: Mutex<HashMap<String, ResolvedModelRouteSnapshot>>,
+}
+
+impl<R, P> RoutedLlmProviderModelGateway<R, P>
+where
+    R: ModelRouteResolver + ?Sized,
+    P: ModelRouteProviderPool + ?Sized,
+{
+    pub fn new(resolver: Arc<R>, provider_pool: Arc<P>) -> Self {
+        Self {
+            resolver,
+            provider_pool,
+            route_snapshots: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl<R, P> HostManagedModelGateway for RoutedLlmProviderModelGateway<R, P>
+where
+    R: ModelRouteResolver + ?Sized + Send + Sync,
+    P: ModelRouteProviderPool + ?Sized + Send + Sync,
+{
+    async fn stream_model(
+        &self,
+        request: HostManagedModelRequest,
+    ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+        let slot = slot_for_model_profile(&request.model_profile_id)?;
+        let snapshot = self.resolve_or_load_snapshot(slot, &request)?;
+        let provider = self.provider_pool.provider_for_route(&snapshot).await?;
+        let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
+        completion.metadata.insert(
+            "model_profile_id".to_string(),
+            request.model_profile_id.as_str().to_string(),
+        );
+        completion.metadata.insert(
+            "model_slot".to_string(),
+            snapshot.slot().as_str().to_string(),
+        );
+        completion.metadata.insert(
+            "model_route_provider_id".to_string(),
+            snapshot.route().provider_id().to_string(),
+        );
+        completion.metadata.insert(
+            "model_route_model_id".to_string(),
+            snapshot.route().model_id().to_string(),
+        );
+        completion
+            .metadata
+            .insert("turn_id".to_string(), request.turn_id.to_string());
+        completion
+            .metadata
+            .insert("run_id".to_string(), request.run_id.to_string());
+
+        let response = provider
+            .complete(completion)
+            .await
+            .map_err(map_provider_error)?;
+        response_to_host_reply(response)
+    }
+}
+
+impl<R, P> RoutedLlmProviderModelGateway<R, P>
+where
+    R: ModelRouteResolver + ?Sized + Send + Sync,
+    P: ModelRouteProviderPool + ?Sized + Send + Sync,
+{
+    fn resolve_or_load_snapshot(
+        &self,
+        slot: ModelSlot,
+        request: &HostManagedModelRequest,
+    ) -> Result<ResolvedModelRouteSnapshot, HostManagedModelError> {
+        if let Some(snapshot) = &request.resolved_model_route {
+            return snapshot_from_host_request(slot, snapshot);
+        }
+
+        let cache_key = format!("{}:{}", request.run_id, slot.as_str());
+        if let Some(snapshot) = self
+            .route_snapshots
+            .lock()
+            .map_err(|_| {
+                HostManagedModelError::safe(
+                    HostManagedModelErrorKind::Unavailable,
+                    "model route snapshot cache is unavailable",
+                )
+            })?
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(snapshot);
+        }
+
+        let snapshot = self
+            .resolver
+            .resolve_model_route(slot)
+            .map_err(map_model_route_error)?;
+        self.route_snapshots
+            .lock()
+            .map_err(|_| {
+                HostManagedModelError::safe(
+                    HostManagedModelErrorKind::Unavailable,
+                    "model route snapshot cache is unavailable",
+                )
+            })?
+            .insert(cache_key, snapshot.clone());
+        Ok(snapshot)
+    }
+}
+
+fn snapshot_from_host_request(
+    slot: ModelSlot,
+    snapshot: &HostManagedModelRouteSnapshot,
+) -> Result<ResolvedModelRouteSnapshot, HostManagedModelError> {
+    let route = ModelRoute::new(snapshot.provider_id.clone(), snapshot.model_id.clone())
+        .map_err(map_model_route_error)?;
+    let key = ModelRouteProviderKey::new(
+        route,
+        snapshot.config_version.clone(),
+        snapshot.auth_version.clone(),
+    )
+    .map_err(map_model_route_error)?;
+    Ok(ResolvedModelRouteSnapshot::with_provider_key(
+        slot,
+        key,
+        crate::model_routes::ModelSelectionMode::DeveloperAnyConfigured,
+    ))
+}
+
+fn validate_provider_matches_route<P>(
+    route: &ModelRoute,
+    provider: &P,
+) -> Result<(), HostManagedModelError>
+where
+    P: LlmProvider + ?Sized,
+{
+    if provider.active_model_name() != route.model_id() {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::InvalidRequest,
+            "model route provider active model does not match route",
+        ));
+    }
+    Ok(())
+}
+
+fn slot_for_model_profile(
+    model_profile_id: &ModelProfileId,
+) -> Result<ModelSlot, HostManagedModelError> {
+    match model_profile_id.as_str() {
+        "default" | "default_model" | "interactive_model" => Ok(ModelSlot::Default),
+        _ => Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model profile is not supported by the default route resolver",
+        )),
+    }
+}
+
+fn map_model_route_error(error: ModelRouteError) -> HostManagedModelError {
+    match error.kind() {
+        "route_unavailable" | "route_not_approved" => HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model route is not permitted",
+        ),
+        _ => HostManagedModelError::safe(
+            HostManagedModelErrorKind::InvalidRequest,
+            "model route is invalid",
+        ),
     }
 }
 

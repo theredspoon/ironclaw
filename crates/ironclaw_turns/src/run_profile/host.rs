@@ -339,12 +339,38 @@ fn origin_input_cursor_token() -> LoopInputCursorToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopModelRouteSnapshot {
+    pub provider_id: String,
+    pub model_id: String,
+    pub config_version: String,
+    pub auth_version: String,
+}
+
+impl LoopModelRouteSnapshot {
+    pub fn new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        config_version: impl Into<String>,
+        auth_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            config_version: config_version.into(),
+            auth_version: auth_version.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopRunContext {
     pub scope: TurnScope,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub run_id: TurnRunId,
     pub resolved_run_profile: ResolvedRunProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<LoopModelRouteSnapshot>,
     pub loop_driver_id: LoopDriverId,
     pub loop_driver_version: RunProfileVersion,
     pub checkpoint_schema_id: CheckpointSchemaId,
@@ -369,7 +395,13 @@ impl LoopRunContext {
             checkpoint_schema_id: resolved_run_profile.checkpoint_schema_id.clone(),
             checkpoint_schema_version: resolved_run_profile.checkpoint_schema_version,
             resolved_run_profile,
+            resolved_model_route: None,
         }
+    }
+
+    pub fn with_resolved_model_route(mut self, snapshot: LoopModelRouteSnapshot) -> Self {
+        self.resolved_model_route = Some(snapshot);
+        self
     }
 }
 
