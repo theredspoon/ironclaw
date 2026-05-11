@@ -14,20 +14,22 @@ use ironclaw_turns::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, AllowAllTurnAdmissionPolicy,
     BlockedReason, CancelRunRequest, DefaultTurnCoordinator, GateRef, GetRunStateRequest,
     IdempotencyKey, InMemoryRunProfileResolver, InMemoryTurnEventSink, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, LoopCompleted, LoopCompletionKind, LoopExit,
-    LoopExitInvalidHandling, LoopExitValidationPolicy, LoopGateRef, LoopMessageRef,
-    ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest, RunProfileId, RunProfileRequest,
-    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
-    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider,
-    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionAxisKind,
-    TurnAdmissionBucketKind, TurnAdmissionBucketScope, TurnAdmissionCapacityDenial,
-    TurnAdmissionClass, TurnAdmissionPolicy, TurnCheckpointId, TurnCoordinator, TurnError,
-    TurnErrorCategory, TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError,
-    TurnEventProjectionRequest, TurnEventProjectionService, TurnEventSink,
-    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
-    TurnIdempotencyReplay, TurnLeaseToken, TurnLifecycleEvent, TurnLockVersion, TurnRunId,
-    TurnRunProfile, TurnRunState, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
-    TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
+    InMemoryTurnStateStoreLimits, LoopCancelled, LoopCancelledReasonKind, LoopCompleted,
+    LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopExitId, LoopExitInvalidHandling,
+    LoopExitValidationPolicy, LoopFailed, LoopFailureKind, LoopGateRef, LoopMessageRef,
+    LoopUsageSummaryRef, ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest,
+    RunProfileId, RunProfileRequest, RunProfileResolutionError, RunProfileResolutionRequest,
+    RunProfileResolver, RunProfileVersion, SanitizedCancelReason, SanitizedFailure,
+    SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitTurnRequest, SubmitTurnResponse,
+    ThreadBusy, TurnActor, TurnAdmissionAxisKind, TurnAdmissionBucketKind,
+    TurnAdmissionBucketScope, TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionPolicy,
+    TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind,
+    TurnEventProjectionCursor, TurnEventProjectionError, TurnEventProjectionRequest,
+    TurnEventProjectionService, TurnEventSink, TurnIdempotencyOperationKind,
+    TurnIdempotencyOutcomeKind, TurnIdempotencyRecord, TurnIdempotencyReplay, TurnLeaseToken,
+    TurnLifecycleEvent, TurnLockVersion, TurnRunId, TurnRunProfile, TurnRunState, TurnRunWake,
+    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnStateStore,
+    TurnStatus,
     events::EventCursor,
     runner::{
         ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
@@ -192,20 +194,270 @@ async fn turn_lifecycle_projection_replays_submit_block_resume_complete_without_
     ));
 
     let serialized = serde_json::to_string(&snapshot).unwrap();
-    for forbidden in [
-        "TURN_RAW_INPUT_SENTINEL_3022",
-        "/tmp/turn-private-path",
-        "TURN_SOURCE_SENTINEL_3022",
-        "TURN_REPLY_SENTINEL_3022",
-        "TURN_GATE_SENTINEL_3022",
-        "TURN_RESUME_SOURCE_SENTINEL_3022",
-        "TURN_RESUME_REPLY_SENTINEL_3022",
-    ] {
-        assert!(
-            !serialized.contains(forbidden),
-            "turn lifecycle projection leaked {forbidden}: {serialized}"
-        );
-    }
+    assert_no_forbidden_turn_event_content(
+        "turn lifecycle projection",
+        &serialized,
+        &[
+            "TURN_RAW_INPUT_SENTINEL_3022",
+            "/tmp/turn-private-path",
+            "TURN_SOURCE_SENTINEL_3022",
+            "TURN_REPLY_SENTINEL_3022",
+            "TURN_GATE_SENTINEL_3022",
+            "TURN_RESUME_SOURCE_SENTINEL_3022",
+            "TURN_RESUME_REPLY_SENTINEL_3022",
+        ],
+    );
+}
+
+#[tokio::test]
+async fn turn_lifecycle_projection_replays_failed_terminal_with_sanitized_reason_without_raw_refs()
+{
+    let (coordinator, store) = coordinator();
+    let mut request = submit_request("thread-turn-failed-events", "idem-turn-failed-submit");
+    request.accepted_message_ref = AcceptedMessageRef::new(
+        "message-TURN_FAILED_ACCEPTED_SENTINEL_3022 /tmp/turn-failed-private",
+    )
+    .unwrap();
+    request.source_binding_ref =
+        SourceBindingRef::new("source-TURN_FAILED_SOURCE_SENTINEL_3022").unwrap();
+    request.reply_target_binding_ref =
+        ReplyTargetBindingRef::new("reply-TURN_FAILED_REPLY_SENTINEL_3022").unwrap();
+
+    let run_id = accepted_run_id(&coordinator.submit_turn(request.clone()).await.unwrap());
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(request.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::Failed(LoopFailed {
+                reason_kind: LoopFailureKind::DriverBug,
+                checkpoint_id: None,
+                usage_summary_ref: Some(
+                    LoopUsageSummaryRef::new("usage:TURN_FAILED_USAGE_SENTINEL_3022").unwrap(),
+                ),
+                diagnostic_ref: Some(
+                    LoopDiagnosticRef::new("diag:TURN_FAILED_FAILURE_REASON_SENTINEL_3022")
+                        .unwrap(),
+                ),
+                exit_id: LoopExitId::new("exit:TURN_FAILED_EXIT_SENTINEL_3022").unwrap(),
+            }),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert_eq!(
+        failed.failure.as_ref().map(SanitizedFailure::category),
+        Some("driver_bug")
+    );
+
+    let projection = TurnEventProjectionService::new(store.clone());
+    let snapshot = projection
+        .snapshot(TurnEventProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TurnEventKind::Submitted,
+            TurnEventKind::RunnerClaimed,
+            TurnEventKind::Failed,
+        ]
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.scope == request.scope)
+    );
+    assert!(snapshot.entries.iter().all(|entry| entry.run_id == run_id));
+    let failed_entry = snapshot.entries.last().unwrap();
+    assert_eq!(failed_entry.status, TurnStatus::Failed);
+    assert_eq!(failed_entry.sanitized_reason.as_deref(), Some("driver_bug"));
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    assert!(projection_json.contains("driver_bug"));
+    let retained_events_json = serde_json::to_string(&store.persistence_snapshot().events).unwrap();
+    let forbidden = [
+        "TURN_FAILED_ACCEPTED_SENTINEL_3022",
+        "TURN_FAILED_SOURCE_SENTINEL_3022",
+        "TURN_FAILED_REPLY_SENTINEL_3022",
+        "TURN_FAILED_FAILURE_REASON_SENTINEL_3022",
+        "TURN_FAILED_USAGE_SENTINEL_3022",
+        "TURN_FAILED_EXIT_SENTINEL_3022",
+        "/tmp/turn-failed-private",
+    ];
+    assert_no_forbidden_turn_event_content(
+        "failed turn lifecycle projection",
+        &projection_json,
+        &forbidden,
+    );
+    assert_no_forbidden_turn_event_content(
+        "failed retained turn lifecycle events",
+        &retained_events_json,
+        &forbidden,
+    );
+}
+
+#[tokio::test]
+async fn turn_lifecycle_projection_replays_cancelled_terminal_without_raw_refs() {
+    let (coordinator, store) = coordinator();
+    let mut request = submit_request("thread-turn-cancelled-events", "idem-turn-cancel-submit");
+    request.accepted_message_ref = AcceptedMessageRef::new(
+        "message-TURN_CANCELLED_ACCEPTED_SENTINEL_3022 /tmp/turn-cancelled-private",
+    )
+    .unwrap();
+    request.source_binding_ref =
+        SourceBindingRef::new("source-TURN_CANCELLED_SOURCE_SENTINEL_3022").unwrap();
+    request.reply_target_binding_ref =
+        ReplyTargetBindingRef::new("reply-TURN_CANCELLED_REPLY_SENTINEL_3022").unwrap();
+
+    let run_id = accepted_run_id(&coordinator.submit_turn(request.clone()).await.unwrap());
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(request.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel_requested = coordinator
+        .cancel_run(CancelRunRequest {
+            scope: request.scope.clone(),
+            actor: actor(),
+            run_id,
+            reason: SanitizedCancelReason::OperatorRequested,
+            idempotency_key: IdempotencyKey::new("idem-turn-cancel-running").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancel_requested.status, TurnStatus::CancelRequested);
+
+    let cancelled = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::Cancelled(LoopCancelled {
+                reason_kind: LoopCancelledReasonKind::HostCancellation,
+                checkpoint_id: None,
+                interrupted_message_refs: vec![
+                    LoopMessageRef::new("msg:TURN_CANCELLED_REASON_SENTINEL_3022").unwrap(),
+                ],
+                exit_id: LoopExitId::new("exit:TURN_CANCELLED_EXIT_SENTINEL_3022").unwrap(),
+            }),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: true,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
+
+    let projection = TurnEventProjectionService::new(store.clone());
+    let snapshot = projection
+        .snapshot(TurnEventProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TurnEventKind::Submitted,
+            TurnEventKind::RunnerClaimed,
+            TurnEventKind::CancelRequested,
+            TurnEventKind::Cancelled,
+        ]
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.scope == request.scope)
+    );
+    assert!(snapshot.entries.iter().all(|entry| entry.run_id == run_id));
+    let cancel_requested_entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.kind == TurnEventKind::CancelRequested)
+        .unwrap();
+    assert_eq!(
+        cancel_requested_entry.sanitized_reason.as_deref(),
+        Some("operator_requested")
+    );
+    let cancelled_entry = snapshot.entries.last().unwrap();
+    assert_eq!(cancelled_entry.status, TurnStatus::Cancelled);
+    assert_eq!(cancelled_entry.sanitized_reason.as_deref(), None);
+
+    let projection_json = serde_json::to_string(&snapshot).unwrap();
+    assert!(projection_json.contains("operator_requested"));
+    let retained_events_json = serde_json::to_string(&store.persistence_snapshot().events).unwrap();
+    let forbidden = [
+        "TURN_CANCELLED_ACCEPTED_SENTINEL_3022",
+        "TURN_CANCELLED_SOURCE_SENTINEL_3022",
+        "TURN_CANCELLED_REPLY_SENTINEL_3022",
+        "TURN_CANCELLED_REASON_SENTINEL_3022",
+        "TURN_CANCELLED_EXIT_SENTINEL_3022",
+        "/tmp/turn-cancelled-private",
+    ];
+    assert_no_forbidden_turn_event_content(
+        "cancelled turn lifecycle projection",
+        &projection_json,
+        &forbidden,
+    );
+    assert_no_forbidden_turn_event_content(
+        "cancelled retained turn lifecycle events",
+        &retained_events_json,
+        &forbidden,
+    );
 }
 
 #[tokio::test]
@@ -276,16 +528,13 @@ async fn turn_lifecycle_projection_requires_rebase_for_pruned_or_fabricated_curs
 
     let serialized_events = serde_json::to_string(&store.events()).unwrap();
     let debug_errors = format!("{pruned_origin:?} {fabricated:?}");
-    for forbidden in ["TURN_GAP_RAW_SENTINEL_3022", "/tmp/turn-gap-private"] {
-        assert!(
-            !serialized_events.contains(forbidden),
-            "retained turn events leaked {forbidden}: {serialized_events}"
-        );
-        assert!(
-            !debug_errors.contains(forbidden),
-            "turn projection rebase error leaked {forbidden}: {debug_errors}"
-        );
-    }
+    let forbidden = ["TURN_GAP_RAW_SENTINEL_3022", "/tmp/turn-gap-private"];
+    assert_no_forbidden_turn_event_content("retained turn events", &serialized_events, &forbidden);
+    assert_no_forbidden_turn_event_content(
+        "turn projection rebase error",
+        &debug_errors,
+        &forbidden,
+    );
 }
 
 #[tokio::test]
@@ -3259,6 +3508,15 @@ async fn terminal_runner_outcome_releases_lock_exactly_once() {
         .await
         .unwrap_err();
     assert_eq!(stale, TurnError::LeaseMismatch);
+}
+
+fn assert_no_forbidden_turn_event_content(label: &str, serialized: &str, forbidden: &[&str]) {
+    for value in forbidden {
+        assert!(
+            !serialized.contains(value),
+            "{label} leaked forbidden marker {value}"
+        );
+    }
 }
 
 fn coordinator() -> (

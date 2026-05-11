@@ -14,16 +14,17 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CheckpointSchemaId, DefaultTurnCoordinator,
     GetLoopCheckpointRequest, IdempotencyKey, InMemoryRunProfileResolver,
-    InMemoryTurnStateStoreLimits, LoopCheckpointStateRef, LoopCheckpointStore, LoopCompleted,
-    LoopCompletionKind, LoopExit, LoopExitInvalidHandling, LoopExitValidationPolicy,
-    LoopMessageRef, PutLoopCheckpointRequest, ReplyTargetBindingRef, ResolvedRunProfile,
-    RunProfileRequest, RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver,
-    RunProfileVersion, SanitizedCancelReason, SanitizedFailure, SourceBindingRef,
-    StaticTurnAdmissionLimitProvider, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor,
-    TurnAdmissionAxisKind, TurnAdmissionCapacityDenial, TurnCoordinator, TurnError, TurnEventKind,
-    TurnEventProjectionCursor, TurnEventProjectionError, TurnEventProjectionRequest,
-    TurnEventProjectionService, TurnId, TurnLeaseToken, TurnRunId, TurnRunnerId, TurnScope,
-    TurnStatus,
+    InMemoryTurnStateStoreLimits, LoopCancelled, LoopCancelledReasonKind, LoopCheckpointStateRef,
+    LoopCheckpointStore, LoopCompleted, LoopCompletionKind, LoopDiagnosticRef, LoopExit,
+    LoopExitId, LoopExitInvalidHandling, LoopExitValidationPolicy, LoopFailed, LoopFailureKind,
+    LoopMessageRef, LoopUsageSummaryRef, PutLoopCheckpointRequest, ReplyTargetBindingRef,
+    ResolvedRunProfile, RunProfileRequest, RunProfileResolutionError, RunProfileResolutionRequest,
+    RunProfileResolver, RunProfileVersion, SanitizedCancelReason, SanitizedFailure,
+    SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitTurnRequest, SubmitTurnResponse,
+    ThreadBusy, TurnActor, TurnAdmissionAxisKind, TurnAdmissionCapacityDenial, TurnCoordinator,
+    TurnError, TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError,
+    TurnEventProjectionRequest, TurnEventProjectionService, TurnEventProjectionSource, TurnId,
+    TurnLeaseToken, TurnRunId, TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
     events::EventCursor,
     runner::{
         ApplyLoopExitRequest, ClaimRunRequest, CompleteRunRequest, HeartbeatRequest,
@@ -99,17 +100,50 @@ async fn libsql_turn_event_projection_replays_submit_after_reopen_without_raw_re
     assert_eq!(snapshot.entries[0].status, TurnStatus::Queued);
 
     let serialized = serde_json::to_string(&snapshot).unwrap();
-    for forbidden in [
-        "DB_TURN_RAW_SENTINEL_3022",
-        "/tmp/db-turn-private",
-        "DB_TURN_SOURCE_SENTINEL_3022",
-        "DB_TURN_REPLY_SENTINEL_3022",
-    ] {
-        assert!(
-            !serialized.contains(forbidden),
-            "libSQL turn lifecycle projection leaked {forbidden}: {serialized}"
-        );
-    }
+    assert_no_forbidden_turn_event_content(
+        "libSQL turn lifecycle projection",
+        &serialized,
+        &[
+            "DB_TURN_RAW_SENTINEL_3022",
+            "/tmp/db-turn-private",
+            "DB_TURN_SOURCE_SENTINEL_3022",
+            "DB_TURN_REPLY_SENTINEL_3022",
+        ],
+    );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_turn_event_projection_replays_failed_terminal_after_reopen_without_raw_refs() {
+    let (db, _dir) = libsql_db().await;
+    let store = Arc::new(LibSqlTurnStateStore::new(db.clone()));
+    store.run_migrations().await.unwrap();
+
+    assert_db_turn_event_projection_replays_failed_terminal_after_reopen_without_raw_refs(
+        store,
+        move || Arc::new(LibSqlTurnStateStore::new(db)),
+        "thread-turn-failed-events-db",
+        "idem-turn-failed-db",
+        "DB_TURN_FAILED",
+    )
+    .await;
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_turn_event_projection_replays_cancelled_terminal_after_reopen_without_raw_refs() {
+    let (db, _dir) = libsql_db().await;
+    let store = Arc::new(LibSqlTurnStateStore::new(db.clone()));
+    store.run_migrations().await.unwrap();
+
+    assert_db_turn_event_projection_replays_cancelled_terminal_after_reopen_without_raw_refs(
+        store,
+        move || Arc::new(LibSqlTurnStateStore::new(db)),
+        "thread-turn-cancelled-events-db",
+        "idem-turn-cancelled-db",
+        "DB_TURN_CANCELLED",
+    )
+    .await;
 }
 
 #[cfg(feature = "libsql")]
@@ -724,6 +758,46 @@ async fn libsql_turn_state_store_persists_runner_recovery_and_cancel_flow() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
+async fn postgres_turn_event_projection_replays_failed_terminal_after_reopen_when_configured() {
+    let Some(pool) = postgres_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let store = Arc::new(PostgresTurnStateStore::new(pool.clone()));
+    store.run_migrations().await.unwrap();
+
+    assert_db_turn_event_projection_replays_failed_terminal_after_reopen_without_raw_refs(
+        store,
+        move || Arc::new(PostgresTurnStateStore::new(pool)),
+        &format!("pg-turn-failed-events-{suffix}"),
+        &format!("idem-turn-failed-pg-{suffix}"),
+        "PG_TURN_FAILED",
+    )
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_turn_event_projection_replays_cancelled_terminal_after_reopen_when_configured() {
+    let Some(pool) = postgres_pool().await else {
+        return;
+    };
+    let suffix = unique_suffix();
+    let store = Arc::new(PostgresTurnStateStore::new(pool.clone()));
+    store.run_migrations().await.unwrap();
+
+    assert_db_turn_event_projection_replays_cancelled_terminal_after_reopen_without_raw_refs(
+        store,
+        move || Arc::new(PostgresTurnStateStore::new(pool)),
+        &format!("pg-turn-cancelled-events-{suffix}"),
+        &format!("idem-turn-cancelled-pg-{suffix}"),
+        "PG_TURN_CANCELLED",
+    )
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
 async fn postgres_loop_checkpoint_store_persists_mapping_across_instances_when_configured() {
     let Some(pool) = postgres_pool().await else {
         return;
@@ -1153,6 +1227,287 @@ fn postgres_turn_state_store_implements_turn_contract_traits() {
     assert_state_store::<PostgresTurnStateStore>();
     assert_runner_port::<PostgresTurnStateStore>();
     assert_loop_checkpoint_store::<PostgresTurnStateStore>();
+}
+
+async fn assert_db_turn_event_projection_replays_failed_terminal_after_reopen_without_raw_refs<
+    S,
+    Reopen,
+>(
+    store: Arc<S>,
+    reopen: Reopen,
+    thread: &str,
+    idempotency_key_prefix: &str,
+    marker_prefix: &str,
+) where
+    S: TurnStateStore + TurnRunTransitionPort + TurnEventProjectionSource + 'static,
+    Reopen: FnOnce() -> Arc<S>,
+{
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let submit_key = format!("{idempotency_key_prefix}-submit");
+    let accepted_marker = format!("{marker_prefix}_ACCEPTED_SENTINEL_3022");
+    let source_marker = format!("{marker_prefix}_SOURCE_SENTINEL_3022");
+    let reply_marker = format!("{marker_prefix}_REPLY_SENTINEL_3022");
+    let diagnostic_marker = format!("{marker_prefix}_FAILURE_REASON_SENTINEL_3022");
+    let usage_marker = format!("{marker_prefix}_USAGE_SENTINEL_3022");
+    let exit_marker = format!("{marker_prefix}_EXIT_SENTINEL_3022");
+    let private_path = format!("/tmp/{marker_prefix}-failed-private");
+    let mut request = submit_request(thread, &submit_key);
+    request.accepted_message_ref =
+        AcceptedMessageRef::new(format!("message-{accepted_marker} {private_path}")).unwrap();
+    request.source_binding_ref = SourceBindingRef::new(format!("source-{source_marker}")).unwrap();
+    request.reply_target_binding_ref =
+        ReplyTargetBindingRef::new(format!("reply-{reply_marker}")).unwrap();
+
+    let run_id = accepted_run_id(&coordinator.submit_turn(request.clone()).await.unwrap());
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(request.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let failed = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::Failed(LoopFailed {
+                reason_kind: LoopFailureKind::DriverBug,
+                checkpoint_id: None,
+                usage_summary_ref: Some(
+                    LoopUsageSummaryRef::new(format!("usage:{usage_marker}")).unwrap(),
+                ),
+                diagnostic_ref: Some(
+                    LoopDiagnosticRef::new(format!("diag:{diagnostic_marker}")).unwrap(),
+                ),
+                exit_id: LoopExitId::new(format!("exit:{exit_marker}")).unwrap(),
+            }),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: false,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: true,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.status, TurnStatus::Failed);
+    assert_eq!(
+        failed.failure.as_ref().map(SanitizedFailure::category),
+        Some("driver_bug")
+    );
+
+    let projection = TurnEventProjectionService::new(reopen());
+    let snapshot = projection
+        .snapshot(TurnEventProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TurnEventKind::Submitted,
+            TurnEventKind::RunnerClaimed,
+            TurnEventKind::Failed,
+        ]
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.scope == request.scope)
+    );
+    assert!(snapshot.entries.iter().all(|entry| entry.run_id == run_id));
+    let failed_entry = snapshot.entries.last().unwrap();
+    assert_eq!(failed_entry.status, TurnStatus::Failed);
+    assert_eq!(failed_entry.sanitized_reason.as_deref(), Some("driver_bug"));
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    assert!(serialized.contains("driver_bug"));
+    assert_no_forbidden_turn_event_content(
+        "durable failed turn lifecycle projection",
+        &serialized,
+        &[
+            accepted_marker,
+            source_marker,
+            reply_marker,
+            diagnostic_marker,
+            usage_marker,
+            exit_marker,
+            private_path,
+        ],
+    );
+}
+
+async fn assert_db_turn_event_projection_replays_cancelled_terminal_after_reopen_without_raw_refs<
+    S,
+    Reopen,
+>(
+    store: Arc<S>,
+    reopen: Reopen,
+    thread: &str,
+    idempotency_key_prefix: &str,
+    marker_prefix: &str,
+) where
+    S: TurnStateStore + TurnRunTransitionPort + TurnEventProjectionSource + 'static,
+    Reopen: FnOnce() -> Arc<S>,
+{
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let submit_key = format!("{idempotency_key_prefix}-submit");
+    let cancel_key = format!("{idempotency_key_prefix}-cancel-running");
+    let accepted_marker = format!("{marker_prefix}_ACCEPTED_SENTINEL_3022");
+    let source_marker = format!("{marker_prefix}_SOURCE_SENTINEL_3022");
+    let reply_marker = format!("{marker_prefix}_REPLY_SENTINEL_3022");
+    let reason_marker = format!("{marker_prefix}_REASON_SENTINEL_3022");
+    let exit_marker = format!("{marker_prefix}_EXIT_SENTINEL_3022");
+    let private_path = format!("/tmp/{marker_prefix}-cancelled-private");
+    let mut request = submit_request(thread, &submit_key);
+    request.accepted_message_ref =
+        AcceptedMessageRef::new(format!("message-{accepted_marker} {private_path}")).unwrap();
+    request.source_binding_ref = SourceBindingRef::new(format!("source-{source_marker}")).unwrap();
+    request.reply_target_binding_ref =
+        ReplyTargetBindingRef::new(format!("reply-{reply_marker}")).unwrap();
+
+    let run_id = accepted_run_id(&coordinator.submit_turn(request.clone()).await.unwrap());
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(request.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel_requested = coordinator
+        .cancel_run(CancelRunRequest {
+            scope: request.scope.clone(),
+            actor: actor(),
+            run_id,
+            reason: SanitizedCancelReason::OperatorRequested,
+            idempotency_key: IdempotencyKey::new(cancel_key).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancel_requested.status, TurnStatus::CancelRequested);
+
+    let cancelled = apply_loop_exit(
+        store.as_ref(),
+        ApplyLoopExitRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            exit: LoopExit::Cancelled(LoopCancelled {
+                reason_kind: LoopCancelledReasonKind::HostCancellation,
+                checkpoint_id: None,
+                interrupted_message_refs: vec![
+                    LoopMessageRef::new(format!("msg:{reason_marker}")).unwrap(),
+                ],
+                exit_id: LoopExitId::new(format!("exit:{exit_marker}")).unwrap(),
+            }),
+            validation_policy: LoopExitValidationPolicy {
+                require_final_checkpoint: false,
+                host_cancellation_observed: true,
+                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+                completion_refs_verified: false,
+                blocked_evidence_verified: false,
+                failure_evidence_verified: false,
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(cancelled.status, TurnStatus::Cancelled);
+
+    let projection = TurnEventProjectionService::new(reopen());
+    let snapshot = projection
+        .snapshot(TurnEventProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .entries
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TurnEventKind::Submitted,
+            TurnEventKind::RunnerClaimed,
+            TurnEventKind::CancelRequested,
+            TurnEventKind::Cancelled,
+        ]
+    );
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.scope == request.scope)
+    );
+    assert!(snapshot.entries.iter().all(|entry| entry.run_id == run_id));
+    let cancel_requested_entry = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.kind == TurnEventKind::CancelRequested)
+        .unwrap();
+    assert_eq!(
+        cancel_requested_entry.sanitized_reason.as_deref(),
+        Some("operator_requested")
+    );
+    let cancelled_entry = snapshot.entries.last().unwrap();
+    assert_eq!(cancelled_entry.status, TurnStatus::Cancelled);
+    assert_eq!(cancelled_entry.sanitized_reason.as_deref(), None);
+
+    let serialized = serde_json::to_string(&snapshot).unwrap();
+    assert!(serialized.contains("operator_requested"));
+    assert_no_forbidden_turn_event_content(
+        "durable cancelled turn lifecycle projection",
+        &serialized,
+        &[
+            accepted_marker,
+            source_marker,
+            reply_marker,
+            reason_marker,
+            exit_marker,
+            private_path,
+        ],
+    );
+}
+
+fn assert_no_forbidden_turn_event_content<T: AsRef<str>>(
+    label: &str,
+    serialized: &str,
+    forbidden: &[T],
+) {
+    for value in forbidden {
+        let marker = value.as_ref();
+        assert!(
+            !serialized.contains(marker),
+            "{label} leaked forbidden marker {marker}"
+        );
+    }
 }
 
 #[cfg(feature = "libsql")]
