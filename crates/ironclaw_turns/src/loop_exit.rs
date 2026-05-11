@@ -3,8 +3,8 @@ use std::{collections::HashSet, hash::Hash};
 use serde::{Deserialize, Serialize, de};
 
 use crate::{
-    BlockedReason, GateRef, LoopDiagnosticRef, LoopExitId, LoopGateRef, LoopMessageRef,
-    LoopResultRef, LoopUsageSummaryRef, SanitizedFailure, TurnCheckpointId,
+    BlockedReason, GateRef, LoopCheckpointStateRef, LoopDiagnosticRef, LoopExitId, LoopGateRef,
+    LoopMessageRef, LoopResultRef, LoopUsageSummaryRef, SanitizedFailure, TurnCheckpointId,
     runner::TurnRunnerOutcome,
 };
 
@@ -37,6 +37,7 @@ impl LoopExit {
                         exit_id,
                         TurnRunnerOutcome::Blocked {
                             checkpoint_id: exit.checkpoint_id,
+                            state_ref: exit.state_ref,
                             reason,
                         },
                     ),
@@ -130,6 +131,7 @@ pub struct LoopBlocked {
     pub kind: LoopBlockedKind,
     pub gate_ref: LoopGateRef,
     pub checkpoint_id: TurnCheckpointId,
+    pub state_ref: LoopCheckpointStateRef,
     pub exit_id: LoopExitId,
 }
 

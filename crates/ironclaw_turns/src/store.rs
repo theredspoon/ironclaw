@@ -114,11 +114,10 @@ fn default_checkpoint_kind() -> LoopCheckpointKind {
     LoopCheckpointKind::BeforeBlock
 }
 
-/// Serde default for `LoopCheckpointStateRef` — sentinel value used when
+/// Serde default for `LoopCheckpointStateRef` — legacy sentinel used only when
 /// deserializing old persisted data that predates the `state_ref` field.
-/// Real values will be threaded from loop callers in a follow-up task.
 fn default_checkpoint_state_ref() -> LoopCheckpointStateRef {
-    LoopCheckpointStateRef::new("checkpoint:unknown").unwrap() // safety: literal satisfies the "checkpoint:" prefix and length constraints.
+    LoopCheckpointStateRef::legacy_unknown()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

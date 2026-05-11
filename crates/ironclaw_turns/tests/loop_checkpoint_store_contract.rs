@@ -111,7 +111,10 @@ async fn inmemory_turn_state_loop_checkpoint_roundtrip_and_snapshot() {
     let snapshot = store.persistence_snapshot();
     assert_eq!(snapshot.loop_checkpoints.len(), 2);
     assert!(
-        snapshot.checkpoints.is_empty(),
+        snapshot
+            .checkpoints
+            .iter()
+            .all(|record| record.state_ref.as_str() != "checkpoint:test-state"),
         "loop checkpoint mappings must not use turn_checkpoints"
     );
 
@@ -143,7 +146,10 @@ async fn libsql_loop_checkpoint_roundtrip_uses_loop_mapping_table() {
     let snapshot = store.persistence_snapshot().await.unwrap();
     assert_eq!(snapshot.loop_checkpoints.len(), 2);
     assert!(
-        snapshot.checkpoints.is_empty(),
+        snapshot
+            .checkpoints
+            .iter()
+            .all(|record| record.state_ref.as_str() != "checkpoint:test-state"),
         "libSQL loop mappings must not be written to turn_checkpoints"
     );
 }

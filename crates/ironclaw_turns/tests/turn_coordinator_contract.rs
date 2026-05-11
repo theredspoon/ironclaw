@@ -14,14 +14,14 @@ use ironclaw_turns::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, AllowAllTurnAdmissionPolicy,
     BlockedReason, CancelRunRequest, DefaultTurnCoordinator, GateRef, GetRunStateRequest,
     IdempotencyKey, InMemoryRunProfileResolver, InMemoryTurnEventSink, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, LoopCancelled, LoopCancelledReasonKind, LoopCompleted,
-    LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopExitId, LoopExitInvalidHandling,
-    LoopExitValidationPolicy, LoopFailed, LoopFailureKind, LoopGateRef, LoopMessageRef,
-    LoopUsageSummaryRef, ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest,
-    RunProfileId, RunProfileRequest, RunProfileResolutionError, RunProfileResolutionRequest,
-    RunProfileResolver, RunProfileVersion, SanitizedCancelReason, SanitizedFailure,
-    SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitTurnRequest, SubmitTurnResponse,
-    ThreadBusy, TurnActor, TurnAdmissionAxisKind, TurnAdmissionBucketKind,
+    InMemoryTurnStateStoreLimits, LoopCancelled, LoopCancelledReasonKind, LoopCheckpointStateRef,
+    LoopCompleted, LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopExitId,
+    LoopExitInvalidHandling, LoopExitValidationPolicy, LoopFailed, LoopFailureKind, LoopGateRef,
+    LoopMessageRef, LoopUsageSummaryRef, ReplyTargetBindingRef, ResolvedRunProfile,
+    ResumeTurnRequest, RunProfileId, RunProfileRequest, RunProfileResolutionError,
+    RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion, SanitizedCancelReason,
+    SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitTurnRequest,
+    SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionAxisKind, TurnAdmissionBucketKind,
     TurnAdmissionBucketScope, TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionPolicy,
     TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind,
     TurnEventProjectionCursor, TurnEventProjectionError, TurnEventProjectionRequest,
@@ -102,6 +102,7 @@ async fn turn_lifecycle_projection_replays_submit_block_resume_complete_without_
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -762,6 +763,7 @@ async fn resume_turn_wakes_runner_for_same_run_after_requeue() {
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -847,6 +849,7 @@ async fn resume_turn_ignores_wake_notification_panic_after_requeue() {
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -1671,6 +1674,7 @@ async fn blocked_resume_and_recovery_required_keep_existing_admission_reservatio
                 gate_ref: gate_ref.clone(),
             },
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
         })
         .await
         .unwrap();
@@ -1807,12 +1811,14 @@ async fn runner_claim_and_block_update_persistent_run_lock_and_checkpoint_record
 
     let checkpoint_id = TurnCheckpointId::new();
     let gate_ref = GateRef::new("approval-gate").unwrap();
+    let state_ref = LoopCheckpointStateRef::new("checkpoint:requested-block-state").unwrap();
     store
         .block_run(BlockRunRequest {
             run_id,
             runner_id,
             lease_token,
             checkpoint_id,
+            state_ref: state_ref.clone(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -1844,6 +1850,7 @@ async fn runner_claim_and_block_update_persistent_run_lock_and_checkpoint_record
     assert_eq!(checkpoint.run_id, run_id);
     assert_eq!(checkpoint.sequence, 1);
     assert_eq!(checkpoint.gate_ref, gate_ref);
+    assert_eq!(checkpoint.state_ref, state_ref);
 }
 
 #[tokio::test]
@@ -1873,6 +1880,7 @@ async fn resume_updates_persisted_run_binding_refs_and_replay_envelope() {
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -2190,6 +2198,7 @@ async fn idempotency_persistence_snapshot_retains_each_operation_kind_capacity()
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -2286,6 +2295,7 @@ async fn idempotency_replay_helpers_require_matching_operation_kind() {
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -3119,6 +3129,7 @@ async fn blocked_run_persists_checkpoint_and_keeps_same_thread_lock_until_resume
             runner_id,
             lease_token,
             checkpoint_id,
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: gate_ref.clone(),
             },
@@ -3181,6 +3192,7 @@ async fn resume_turn_with_wrong_gate_resolution_ref_is_invalid_request() {
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: GateRef::new("approval-gate").unwrap(),
             },
@@ -3376,6 +3388,7 @@ async fn cancelled_running_run_cannot_be_reopened_as_blocked() {
             runner_id,
             lease_token,
             checkpoint_id: TurnCheckpointId::new(),
+            state_ref: block_state_ref(),
             reason: BlockedReason::Approval {
                 gate_ref: GateRef::new("approval-gate").unwrap(),
             },
@@ -3557,6 +3570,10 @@ fn cancel_request(thread: &str, run_id: TurnRunId, idempotency_key: &str) -> Can
 fn accepted_run_id(response: &SubmitTurnResponse) -> TurnRunId {
     let SubmitTurnResponse::Accepted { run_id, .. } = response;
     *run_id
+}
+
+fn block_state_ref() -> LoopCheckpointStateRef {
+    LoopCheckpointStateRef::new("checkpoint:block-state").unwrap()
 }
 
 fn scope(thread: &str) -> TurnScope {
@@ -3843,6 +3860,7 @@ async fn loop_exit_application_blocks_with_checkpoint_and_keeps_lock() {
         .unwrap();
     let checkpoint_id = TurnCheckpointId::new();
     let gate_ref = LoopGateRef::new("gate:approval-gate").unwrap();
+    let state_ref = block_state_ref();
 
     let blocked = apply_loop_exit(
         store.as_ref(),
@@ -3854,6 +3872,7 @@ async fn loop_exit_application_blocks_with_checkpoint_and_keeps_lock() {
                 kind: ironclaw_turns::LoopBlockedKind::Approval,
                 gate_ref: gate_ref.clone(),
                 checkpoint_id,
+                state_ref,
                 exit_id: ironclaw_turns::LoopExitId::new("exit:blocked").unwrap(),
             }),
             validation_policy: LoopExitValidationPolicy {
