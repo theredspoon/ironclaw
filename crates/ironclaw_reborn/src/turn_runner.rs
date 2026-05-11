@@ -600,6 +600,8 @@ fn recovery_record_rejection_is_expected(error: &TurnError) -> bool {
 fn default_text_only_exit_validation_policy() -> LoopExitValidationPolicy {
     LoopExitValidationPolicy {
         require_final_checkpoint: false,
+        allow_no_reply_completion: false,
+        final_checkpoint_verified: false,
         host_cancellation_observed: false,
         invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
         completion_refs_verified: false,

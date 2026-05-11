@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use ironclaw_host_api::{TenantId, ThreadId};
 use ironclaw_turns::{
     AcceptedMessageRef, AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError,
-    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, EventCursor, LoopCompleted,
-    LoopCompletionKind, LoopExit, LoopExitId, LoopExitMapping, LoopMessageRef,
+    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, EventCursor, LoopCheckpointKind,
+    LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopExitMapping, LoopMessageRef,
     ReplyTargetBindingRef, RunProfileVersion, SourceBindingRef, TurnCheckpointId, TurnError,
     TurnId, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     run_profile::{AgentLoopDriverHost, AgentLoopHostError, CheckpointSchemaId, LoopDriverId},
@@ -579,6 +579,16 @@ fn make_applier(port: Arc<MockTransitionPort>) -> Arc<LoopExitApplier> {
     ))
 }
 
+fn make_fail_closed_recovery_applier(port: Arc<MockTransitionPort>) -> Arc<LoopExitApplier> {
+    Arc::new(LoopExitApplier::new(
+        port,
+        Arc::new(
+            InMemoryLoopExitEvidencePort::new()
+                .with_latest_checkpoint_kind(Some(LoopCheckpointKind::BeforeSideEffect)),
+        ),
+    ))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -600,6 +610,7 @@ async fn worker_recovers_expired_leases_before_claiming() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -648,6 +659,7 @@ async fn worker_reuses_claim_runner_and_lease_for_heartbeat_and_exit() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -700,6 +712,7 @@ async fn default_worker_policy_rejects_fabricated_completion_refs() {
     let worker = TurnRunnerWorker::new(
         TurnRunnerWorkerConfig::default(),
         port.clone(),
+        make_fail_closed_recovery_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -784,6 +797,7 @@ async fn worker_records_recovery_when_heartbeat_fails() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -828,6 +842,7 @@ async fn worker_cancellation_stops_active_driver_promptly() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1095,6 +1110,7 @@ async fn wake_signal_drains_available_runs_until_queue_empty() {
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
