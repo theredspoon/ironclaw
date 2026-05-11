@@ -5,11 +5,11 @@ use ironclaw_host_api::{TenantId, ThreadId};
 use ironclaw_threads::InMemorySessionThreadService;
 use ironclaw_turns::{
     AcceptedMessageRef, EventCursor, GateRef, GetLoopCheckpointRequest, LoopBlocked,
-    LoopBlockedKind, LoopCheckpointKind, LoopCheckpointRecord, LoopCheckpointStore, LoopCompleted,
-    LoopCompletionKind, LoopExit, LoopExitId, LoopFailed, LoopFailureKind, LoopGateRef,
-    LoopMessageRef, PutLoopCheckpointRequest, ReplyTargetBindingRef, RunProfileVersion,
-    SanitizedFailure, SourceBindingRef, TurnCheckpointId, TurnError, TurnId, TurnLeaseToken,
-    TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
+    LoopBlockedKind, LoopCheckpointKind, LoopCheckpointRecord, LoopCheckpointStateRef,
+    LoopCheckpointStore, LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopFailed,
+    LoopFailureKind, LoopGateRef, LoopMessageRef, PutLoopCheckpointRequest, ReplyTargetBindingRef,
+    RunProfileVersion, SanitizedFailure, SourceBindingRef, TurnCheckpointId, TurnError, TurnId,
+    TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     run_profile::{CheckpointSchemaId, LoopDriverId},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -379,6 +379,7 @@ fn blocked_exit(kind: LoopBlockedKind) -> LoopExit {
         kind,
         gate_ref: LoopGateRef::new("gate:test").expect("valid"),
         checkpoint_id: TurnCheckpointId::new(),
+        state_ref: LoopCheckpointStateRef::new("checkpoint:blocked-state").expect("valid"),
         exit_id: test_exit_id(),
     })
 }
@@ -620,6 +621,7 @@ impl TurnRunTransitionPort for RecordingTransitionPort {
                 }
                 ironclaw_turns::runner::TurnRunnerOutcome::Blocked {
                     checkpoint_id: _,
+                    state_ref: _,
                     reason,
                 } => {
                     let status = reason.status();

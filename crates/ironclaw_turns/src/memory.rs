@@ -692,6 +692,7 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
             inner.record_checkpoint(
                 &record,
                 request.checkpoint_id,
+                request.state_ref,
                 request.reason.gate_ref().clone(),
                 now,
             );
@@ -1411,8 +1412,9 @@ impl Inner {
                 }
                 LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
                     checkpoint_id,
+                    state_ref,
                     reason,
-                }) => self.block_claimed_record(record, checkpoint_id, reason),
+                }) => self.block_claimed_record(record, checkpoint_id, state_ref, reason),
                 LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Failed { failure }) => {
                     self.fail_claimed_record(record, failure)
                 }
@@ -1502,6 +1504,7 @@ impl Inner {
         &mut self,
         mut record: RunRecord,
         checkpoint_id: TurnCheckpointId,
+        state_ref: crate::run_profile::LoopCheckpointStateRef,
         reason: BlockedReason,
     ) -> AppliedLoopTransition {
         if record.status != TurnStatus::Running {
@@ -1522,7 +1525,13 @@ impl Inner {
         record.lease_token = None;
         record.lease_expires_at = None;
         record.event_cursor = self.next_cursor();
-        self.record_checkpoint(&record, checkpoint_id, reason.gate_ref().clone(), now);
+        self.record_checkpoint(
+            &record,
+            checkpoint_id,
+            state_ref,
+            reason.gate_ref().clone(),
+            now,
+        );
         self.update_active_lock(&record, now);
         let state = record.state();
         self.push_event(&record, TurnEventKind::Blocked, None);
@@ -1749,6 +1758,7 @@ impl Inner {
         &mut self,
         record: &RunRecord,
         checkpoint_id: TurnCheckpointId,
+        state_ref: crate::run_profile::LoopCheckpointStateRef,
         gate_ref: crate::GateRef,
         created_at: crate::TurnTimestamp,
     ) {
@@ -1761,9 +1771,12 @@ impl Inner {
         self.checkpoints.push(TurnCheckpointRecord {
             checkpoint_id,
             run_id: record.run_id,
+            scope: Some(record.scope.clone()),
             sequence,
             status: record.status,
             gate_ref,
+            kind: crate::run_profile::LoopCheckpointKind::BeforeBlock,
+            state_ref,
             created_at,
         });
     }

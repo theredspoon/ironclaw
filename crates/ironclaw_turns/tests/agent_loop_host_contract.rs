@@ -946,10 +946,11 @@ impl AgentLoopDriver for CapabilityDriver {
                 reason_kind: "expected_approval".to_string(),
             });
         };
+        let state_ref = LoopCheckpointStateRef::new("checkpoint:approval-state").unwrap();
         let checkpoint_id = host
             .checkpoint(LoopCheckpointRequest {
                 kind: LoopCheckpointKind::BeforeBlock,
-                state_ref: LoopCheckpointStateRef::new("checkpoint:approval-state").unwrap(),
+                state_ref: state_ref.clone(),
             })
             .await
             .map_err(driver_error)?;
@@ -963,6 +964,7 @@ impl AgentLoopDriver for CapabilityDriver {
             kind: LoopBlockedKind::Approval,
             gate_ref,
             checkpoint_id,
+            state_ref,
             exit_id: LoopExitId::new("exit:capability-driver").unwrap(),
         }))
     }

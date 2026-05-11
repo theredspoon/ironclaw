@@ -8,7 +8,8 @@ use crate::{
     SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionPolicy, TurnAdmissionReservationRecord,
     TurnCheckpointId, TurnError, TurnErrorCategory, TurnId, TurnLeaseToken, TurnLifecycleEvent,
     TurnRunId, TurnRunProfile, TurnRunState, TurnRunnerId, TurnScope, TurnStatus, TurnTimestamp,
-    events::EventCursor, run_profile::LoopModelRouteSnapshot,
+    events::EventCursor,
+    run_profile::{LoopCheckpointKind, LoopCheckpointStateRef, LoopModelRouteSnapshot},
 };
 
 #[async_trait]
@@ -109,13 +110,35 @@ pub struct TurnActiveLockRecord {
     pub updated_at: TurnTimestamp,
 }
 
+/// Serde default for `LoopCheckpointKind` — used when deserializing old
+/// persisted data that predates the `kind` field.
+fn default_checkpoint_kind() -> LoopCheckpointKind {
+    LoopCheckpointKind::BeforeBlock
+}
+
+/// Serde default for `LoopCheckpointStateRef` — legacy sentinel used only when
+/// deserializing old persisted data that predates the `state_ref` field.
+fn default_checkpoint_state_ref() -> LoopCheckpointStateRef {
+    LoopCheckpointStateRef::legacy_unknown()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnCheckpointRecord {
     pub checkpoint_id: TurnCheckpointId,
     pub run_id: TurnRunId,
+    /// Scope of the run that created this checkpoint. `None` for legacy records
+    /// persisted before scope was added to checkpoints.
+    #[serde(default)]
+    pub scope: Option<TurnScope>,
     pub sequence: u64,
     pub status: TurnStatus,
     pub gate_ref: GateRef,
+    /// The semantic kind of checkpoint (before model, side-effect, block, final).
+    #[serde(default = "default_checkpoint_kind")]
+    pub kind: LoopCheckpointKind,
+    /// An opaque ref describing the loop state at the time of this checkpoint.
+    #[serde(default = "default_checkpoint_state_ref")]
+    pub state_ref: LoopCheckpointStateRef,
     pub created_at: TurnTimestamp,
 }
 

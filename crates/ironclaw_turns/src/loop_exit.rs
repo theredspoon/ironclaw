@@ -7,7 +7,7 @@ use crate::{
     BlockedReason, GateRef, LoopDiagnosticRef, LoopExitId, LoopGateRef, LoopMessageRef,
     LoopResultRef, LoopUsageSummaryRef, ResolvedRunProfile, SanitizedFailure, TurnCheckpointId,
     TurnError, TurnId, TurnRunId, TurnRunState, TurnScope,
-    run_profile::LoopCheckpointKind,
+    run_profile::{LoopCheckpointKind, LoopCheckpointStateRef},
     runner::{
         ApplyValidatedLoopExitRequest, ClaimedTurnRun, TurnRunTransitionPort, TurnRunnerOutcome,
     },
@@ -297,6 +297,7 @@ impl LoopExit {
                         exit_id,
                         TurnRunnerOutcome::Blocked {
                             checkpoint_id: exit.checkpoint_id,
+                            state_ref: exit.state_ref,
                             reason,
                         },
                     ),
@@ -371,6 +372,7 @@ pub struct LoopBlocked {
     pub kind: LoopBlockedKind,
     pub gate_ref: LoopGateRef,
     pub checkpoint_id: TurnCheckpointId,
+    pub state_ref: LoopCheckpointStateRef,
     pub exit_id: LoopExitId,
 }
 

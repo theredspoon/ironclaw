@@ -222,10 +222,12 @@ fn blocked_exit_maps_to_block_run_outcome_with_verified_checkpoint_and_gate_ref(
     let checkpoint_id = TurnCheckpointId::new();
     let loop_gate_ref = loop_gate_ref("gate:approval-gate");
     let gate_ref = GateRef::new(loop_gate_ref.as_str()).unwrap();
+    let state_ref = checkpoint_state_ref();
     let decision = LoopExit::Blocked(LoopBlocked {
         kind: LoopBlockedKind::Approval,
         gate_ref: loop_gate_ref,
         checkpoint_id,
+        state_ref: state_ref.clone(),
         exit_id: exit_id("exit:blocked"),
     })
     .validate(LoopExitValidationPolicy {
@@ -244,6 +246,7 @@ fn blocked_exit_maps_to_block_run_outcome_with_verified_checkpoint_and_gate_ref(
         decision.mapping,
         TurnRunnerOutcome::Blocked {
             checkpoint_id,
+            state_ref,
             reason: BlockedReason::Approval { gate_ref },
         }
         .into()
@@ -256,6 +259,7 @@ fn blocked_exit_requires_host_verified_gate_and_checkpoint_before_trusted_mappin
         kind: LoopBlockedKind::Approval,
         gate_ref: loop_gate_ref("gate:approval-gate"),
         checkpoint_id: TurnCheckpointId::new(),
+        state_ref: checkpoint_state_ref(),
         exit_id: exit_id("exit:unverified-blocked"),
     })
     .validate(LoopExitValidationPolicy {
@@ -535,11 +539,13 @@ fn blocked_variants_map_to_correct_blocked_reason() {
         let checkpoint_id = TurnCheckpointId::new();
         let lg = loop_gate_ref("gate:test-gate");
         let gate_ref = GateRef::new(lg.as_str()).unwrap();
+        let state_ref = checkpoint_state_ref();
 
         let decision = LoopExit::Blocked(LoopBlocked {
             kind,
             gate_ref: lg,
             checkpoint_id,
+            state_ref: state_ref.clone(),
             exit_id: exit_id("exit:blocked-variant"),
         })
         .validate(LoopExitValidationPolicy {
@@ -558,6 +564,7 @@ fn blocked_variants_map_to_correct_blocked_reason() {
             decision.mapping,
             TurnRunnerOutcome::Blocked {
                 checkpoint_id,
+                state_ref,
                 reason: expected_reason,
             }
             .into()
@@ -698,6 +705,10 @@ fn message_ref(value: &str) -> LoopMessageRef {
 
 fn loop_gate_ref(value: &str) -> LoopGateRef {
     LoopGateRef::new(value).unwrap()
+}
+
+fn checkpoint_state_ref() -> LoopCheckpointStateRef {
+    LoopCheckpointStateRef::new("checkpoint:blocked-state").unwrap()
 }
 
 fn result_ref(value: &str) -> LoopResultRef {

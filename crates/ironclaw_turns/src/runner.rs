@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BlockedReason, LoopExitMapping, ResolvedRunProfile, SanitizedFailure, TurnCheckpointId,
     TurnError, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnTimestamp,
-    events::EventCursor, run_profile::LoopModelRouteSnapshot,
+    events::EventCursor,
+    run_profile::{LoopCheckpointStateRef, LoopModelRouteSnapshot},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,7 @@ pub struct BlockRunRequest {
     pub runner_id: TurnRunnerId,
     pub lease_token: TurnLeaseToken,
     pub checkpoint_id: TurnCheckpointId,
+    pub state_ref: LoopCheckpointStateRef,
     pub reason: BlockedReason,
 }
 
@@ -101,6 +103,7 @@ pub enum TurnRunnerOutcome {
     Cancelled,
     Blocked {
         checkpoint_id: TurnCheckpointId,
+        state_ref: LoopCheckpointStateRef,
         reason: BlockedReason,
     },
     Failed {
