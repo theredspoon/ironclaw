@@ -650,8 +650,7 @@ fn validate_cancelled_exit(
         );
     }
     if policy.require_final_checkpoint
-        && exit.checkpoint_id.is_some()
-        && !policy.final_checkpoint_verified
+        && (exit.checkpoint_id.is_none() || !policy.final_checkpoint_verified)
     {
         return invalid_exit_decision(
             exit_id,
