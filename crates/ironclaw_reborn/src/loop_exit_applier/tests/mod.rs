@@ -2,12 +2,14 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ironclaw_host_api::{TenantId, ThreadId};
+use ironclaw_threads::InMemorySessionThreadService;
 use ironclaw_turns::{
-    AcceptedMessageRef, EventCursor, GateRef, LoopBlocked, LoopBlockedKind, LoopCheckpointKind,
-    LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopFailed, LoopFailureKind,
-    LoopGateRef, LoopMessageRef, ReplyTargetBindingRef, RunProfileVersion, SanitizedFailure,
-    SourceBindingRef, TurnCheckpointId, TurnError, TurnId, TurnLeaseToken, TurnRunId, TurnRunState,
-    TurnRunnerId, TurnScope, TurnStatus,
+    AcceptedMessageRef, EventCursor, GateRef, GetLoopCheckpointRequest, LoopBlocked,
+    LoopBlockedKind, LoopCheckpointKind, LoopCheckpointRecord, LoopCheckpointStore, LoopCompleted,
+    LoopCompletionKind, LoopExit, LoopExitId, LoopFailed, LoopFailureKind, LoopGateRef,
+    LoopMessageRef, PutLoopCheckpointRequest, ReplyTargetBindingRef, RunProfileVersion,
+    SanitizedFailure, SourceBindingRef, TurnCheckpointId, TurnError, TurnId, TurnLeaseToken,
+    TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     run_profile::{CheckpointSchemaId, LoopDriverId},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -215,6 +217,113 @@ async fn loop_exit_events_hide_raw_diagnostics() {
         fixture.transition.raw_failure_texts(),
         vec!["driver_protocol_violation"]
     );
+}
+
+#[tokio::test]
+async fn thread_checkpoint_evidence_fails_closed_for_agentless_completion_refs() {
+    let evidence = text_checkpoint_evidence(Arc::new(PanicLoopCheckpointStore));
+    let claimed = claimed_run();
+    let verified = evidence
+        .verify_completion_refs(CompletionEvidenceRequest {
+            scope: &claimed.state.scope,
+            turn_id: claimed.state.turn_id,
+            run_id: claimed.state.run_id,
+            reply_message_refs: &[LoopMessageRef::new("msg:reply").expect("valid")],
+            result_refs: &[],
+        })
+        .await
+        .expect("agentless scope should fail closed without store errors");
+
+    assert!(!verified);
+}
+
+#[tokio::test]
+async fn thread_checkpoint_evidence_does_not_read_checkpoint_for_blocked_claims() {
+    let evidence = text_checkpoint_evidence(Arc::new(PanicLoopCheckpointStore));
+    let claimed = claimed_run();
+    let exit = blocked_exit(LoopBlockedKind::Approval);
+    let LoopExit::Blocked(blocked) = &exit else {
+        unreachable!("blocked helper returns blocked exit")
+    };
+    let verified = evidence
+        .verify_blocked_evidence(BlockedEvidenceRequest {
+            scope: &claimed.state.scope,
+            turn_id: claimed.state.turn_id,
+            run_id: claimed.state.run_id,
+            blocked,
+        })
+        .await
+        .expect("blocked evidence should fail closed without checkpoint I/O");
+
+    assert!(!verified);
+}
+
+#[tokio::test]
+async fn thread_checkpoint_evidence_fails_closed_for_failure_evidence() {
+    let evidence = text_checkpoint_evidence(Arc::new(PanicLoopCheckpointStore));
+    let claimed = claimed_run();
+    let failed = LoopFailed {
+        reason_kind: LoopFailureKind::ModelError,
+        checkpoint_id: None,
+        usage_summary_ref: None,
+        diagnostic_ref: None,
+        exit_id: test_exit_id(),
+    };
+    let verified = evidence
+        .verify_failure_evidence(FailureEvidenceRequest {
+            scope: &claimed.state.scope,
+            turn_id: claimed.state.turn_id,
+            run_id: claimed.state.run_id,
+            failed: &failed,
+        })
+        .await
+        .expect("missing diagnostics store should fail closed");
+
+    assert!(!verified);
+}
+
+#[tokio::test]
+async fn thread_checkpoint_evidence_assumes_recovery_when_latest_checkpoint_unknown() {
+    let evidence = text_checkpoint_evidence(Arc::new(PanicLoopCheckpointStore));
+    let claimed = claimed_run();
+    let latest = evidence
+        .latest_checkpoint_kind(
+            &claimed.state.scope,
+            claimed.state.turn_id,
+            claimed.state.run_id,
+        )
+        .await
+        .expect("latest checkpoint fallback should not read store");
+
+    assert_eq!(latest, Some(LoopCheckpointKind::BeforeSideEffect));
+}
+
+fn text_checkpoint_evidence(
+    loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
+) -> ThreadCheckpointLoopExitEvidencePort<InMemorySessionThreadService> {
+    ThreadCheckpointLoopExitEvidencePort::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        loop_checkpoint_store,
+    )
+}
+
+struct PanicLoopCheckpointStore;
+
+#[async_trait]
+impl LoopCheckpointStore for PanicLoopCheckpointStore {
+    async fn put_loop_checkpoint(
+        &self,
+        _request: PutLoopCheckpointRequest,
+    ) -> Result<LoopCheckpointRecord, TurnError> {
+        panic!("put_loop_checkpoint should not be called by evidence tests")
+    }
+
+    async fn get_loop_checkpoint(
+        &self,
+        _request: GetLoopCheckpointRequest,
+    ) -> Result<Option<LoopCheckpointRecord>, TurnError> {
+        panic!("get_loop_checkpoint should not be called by fail-closed evidence tests")
+    }
 }
 
 fn test_exit_id() -> LoopExitId {

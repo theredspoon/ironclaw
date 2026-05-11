@@ -473,27 +473,12 @@ where
 
     async fn verify_blocked_evidence(
         &self,
-        request: BlockedEvidenceRequest<'_>,
+        _request: BlockedEvidenceRequest<'_>,
     ) -> Result<bool, TurnError> {
-        let checkpoint = self
-            .loop_checkpoint_store
-            .get_loop_checkpoint(ironclaw_turns::GetLoopCheckpointRequest {
-                scope: request.scope.clone(),
-                turn_id: request.turn_id,
-                run_id: request.run_id,
-                checkpoint_id: request.blocked.checkpoint_id,
-            })
-            .await?;
-        let has_before_block_checkpoint = checkpoint
-            .map(|record| record.kind == LoopCheckpointKind::BeforeBlock)
-            .unwrap_or(false);
-        if !has_before_block_checkpoint {
-            return Ok(false);
-        }
         // A BeforeBlock checkpoint alone is not sufficient: #3424 requires a
         // durable pending gate/process ref. The current text-only adapter has
-        // no gate/process outcome store, so it must fail closed instead of
-        // trusting driver-supplied block refs.
+        // no gate/process outcome store, so it must fail closed without doing
+        // unrelated checkpoint I/O.
         Ok(false)
     }
 
@@ -501,7 +486,10 @@ where
         &self,
         _request: FailureEvidenceRequest<'_>,
     ) -> Result<bool, TurnError> {
-        Ok(true)
+        // Failure exits require durable diagnostic evidence before trusting the
+        // driver-supplied failure kind. The text-only adapter does not yet own
+        // that diagnostics store, so it fails closed.
+        Ok(false)
     }
 
     async fn is_cancellation_observed(
@@ -519,11 +507,17 @@ where
         _turn_id: TurnId,
         _run_id: TurnRunId,
     ) -> Result<Option<LoopCheckpointKind>, TurnError> {
-        Ok(None)
+        // This adapter cannot query the latest checkpoint yet. Assume side
+        // effects may have happened so invalid exits recover instead of
+        // terminally failing a partially-applied run.
+        Ok(Some(LoopCheckpointKind::BeforeSideEffect))
     }
 }
 
 fn thread_scope_from_turn_scope(scope: &TurnScope) -> Option<ThreadScope> {
+    // `ironclaw_threads::ThreadScope` is currently agent-scoped. Agentless
+    // Reborn turns therefore fail closed at this evidence boundary until the
+    // thread store grows an explicit agentless scope.
     Some(ThreadScope {
         tenant_id: scope.tenant_id.clone(),
         agent_id: scope.agent_id.clone()?,
