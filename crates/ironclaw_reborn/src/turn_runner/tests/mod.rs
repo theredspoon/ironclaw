@@ -80,6 +80,7 @@ fn test_resolved_profile_with_driver(
             require_before_side_effect: false,
             require_before_block: true,
             max_checkpoint_bytes: 64 * 1024,
+            require_final_checkpoint: false,
         },
         resource_budget_policy: ResourceBudgetPolicy {
             tier: ResourceBudgetTier::new("test_tier").expect("valid"),
