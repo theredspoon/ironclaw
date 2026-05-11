@@ -12,10 +12,10 @@ pub(crate) enum Command {
 }
 
 impl Command {
-    pub(crate) fn execute(self) -> anyhow::Result<()> {
+    pub(crate) fn execute(self, context: crate::context::RebornCliContext) -> anyhow::Result<()> {
         match self {
-            Self::Doctor(command) => command.execute(),
-            Self::Run(command) => command.execute(),
+            Self::Doctor(command) => command.execute(context),
+            Self::Run(command) => command.execute(context),
         }
     }
 }

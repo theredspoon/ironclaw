@@ -7,8 +7,8 @@ use crate::context::RebornCliContext;
 pub(crate) struct RunCommand;
 
 impl RunCommand {
-    pub(crate) fn execute(self) -> anyhow::Result<()> {
-        RuntimeShellReport::initialize(RebornCliContext::resolve_from_env()?).print();
+    pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
+        RuntimeShellReport::initialize(context).print();
         Ok(())
     }
 }

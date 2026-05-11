@@ -14,5 +14,7 @@ struct Cli {
 }
 
 pub(crate) fn run() -> anyhow::Result<()> {
-    Cli::parse().command.execute()
+    let cli = Cli::parse();
+    let context = crate::context::RebornCliContext::resolve_from_env()?;
+    cli.command.execute(context)
 }

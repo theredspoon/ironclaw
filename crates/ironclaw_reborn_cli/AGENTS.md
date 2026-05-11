@@ -11,7 +11,7 @@ This crate owns the standalone `ironclaw-reborn` command surface. Keep it small,
 
 ## Boundaries
 
-- Use `RebornCliContext` to resolve Reborn boot config instead of reading env in each command.
+- Use the provided RebornCliContext to access Reborn boot config instead of reading env in each command.
 - Keep commands side-effect free unless the command name and issue explicitly require mutation.
 - Use `IRONCLAW_REBORN_HOME` / `~/.ironclaw/reborn`; do not write current v1 state.
 - no v1 runtime imports: do not depend on root `ironclaw`, `src/agent`, channels, worker, DB, setup, service, sandbox, or `ironclaw_engine`.
@@ -19,7 +19,7 @@ This crate owns the standalone `ironclaw-reborn` command surface. Keep it small,
 
 ## Adding a command
 
-1. Add `src/commands/<name>.rs` with a clap `Args` type and `execute(self) -> anyhow::Result<()>`.
+1. Add `src/commands/<name>.rs` with a clap `Args` type and `execute(self, context: RebornCliContext) -> anyhow::Result<()>`.
 2. Add a variant to `commands::Command`.
 3. Add a binary smoke test in `tests/smoke.rs` that invokes `env!("CARGO_BIN_EXE_ironclaw-reborn")`.
 4. If the command can touch state, assert it uses Reborn home only and does not create/read v1 DB/settings/secrets.
