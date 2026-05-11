@@ -1504,6 +1504,83 @@ async fn record_model_route_snapshot_rejects_secret_like_fields() {
 }
 
 #[tokio::test]
+async fn record_model_route_snapshot_is_idempotent_and_rejects_route_changes() {
+    let store = Arc::new(InMemoryTurnStateStore::default());
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request(
+                "thread-route-idempotent",
+                "idem-route-idempotent",
+            ))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-route-idempotent")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let initial = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let first = store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: initial.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(first.resolved_model_route, Some(initial.clone()));
+
+    let replay = store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: initial.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(replay.resolved_model_route, Some(initial.clone()));
+
+    let replacement = LoopModelRouteSnapshot::new("nearai", "qwen3-coder", "config:v2", "auth:v2");
+    let error = store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: replacement,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TurnError::Conflict { .. }));
+    assert_eq!(
+        store
+            .get_run_state(GetRunStateRequest {
+                scope: scope("thread-route-idempotent"),
+                run_id,
+            })
+            .await
+            .unwrap()
+            .resolved_model_route,
+        Some(initial)
+    );
+}
+
+#[tokio::test]
 async fn terminal_record_pruning_bounds_released_admission_reservations() {
     let store = Arc::new(InMemoryTurnStateStore::with_limits(
         InMemoryTurnStateStoreLimits {

@@ -264,6 +264,108 @@ async fn turn_runner_worker_drives_full_text_only_model_transcript_completion_af
 }
 
 #[tokio::test]
+async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
+    let fixture = HostFixture::new("thread-host-route-e2e", "hello routed e2e").await;
+    let persisted_route = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let stale_current_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, stale_current_route),
+    );
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_route.clone());
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(persisted_route.clone());
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+
+    let prompt_bundle = host_dyn
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+    let model_response = host_dyn
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+    let ParentLoopOutput::AssistantReply(reply) = model_response.output else {
+        panic!("expected assistant reply");
+    };
+    let reply_ref = host_dyn
+        .finalize_assistant_message(FinalizeAssistantMessage { reply })
+        .await
+        .unwrap();
+    let checkpoint_state = fixture
+        .stage_checkpoint_state(
+            LoopCheckpointKind::BeforeModel,
+            b"durable route e2e checkpoint",
+        )
+        .await;
+    let checkpoint_id = host_dyn
+        .checkpoint(LoopCheckpointRequest {
+            kind: LoopCheckpointKind::BeforeModel,
+            state_ref: checkpoint_state.state_ref.clone(),
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].resolved_model_route, Some(persisted_route));
+    assert_eq!(requests[0].messages[0].content, "hello routed e2e");
+    assert!(reply_ref.as_str().starts_with("msg:"));
+    assert!(
+        fixture
+            .loop_checkpoint_store
+            .get_loop_checkpoint(GetLoopCheckpointRequest {
+                scope: fixture.context.scope.clone(),
+                turn_id: fixture.context.turn_id,
+                run_id: fixture.context.run_id,
+                checkpoint_id,
+            })
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture.milestone_names(),
+        vec![
+            "prompt_bundle_built",
+            "model_started",
+            "model_completed",
+            "assistant_reply_finalized",
+            "checkpoint_created",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_claimed_scope() {
     let fixture = HostFixture::new_unsubmitted("thread-runner-host-edge", "hello edge").await;
     let turn_store = Arc::new(InMemoryTurnStateStore::default());
@@ -296,7 +398,10 @@ async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_clai
         fixture.checkpoint_state_store.clone(),
         turn_store.clone(),
         fixture.milestone_sink.clone(),
-        TextOnlyLoopHostConfig { max_messages: 8 },
+        TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: false,
+        },
     );
 
     let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
