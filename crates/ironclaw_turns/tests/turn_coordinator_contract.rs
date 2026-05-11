@@ -194,20 +194,19 @@ async fn turn_lifecycle_projection_replays_submit_block_resume_complete_without_
     ));
 
     let serialized = serde_json::to_string(&snapshot).unwrap();
-    for forbidden in [
-        "TURN_RAW_INPUT_SENTINEL_3022",
-        "/tmp/turn-private-path",
-        "TURN_SOURCE_SENTINEL_3022",
-        "TURN_REPLY_SENTINEL_3022",
-        "TURN_GATE_SENTINEL_3022",
-        "TURN_RESUME_SOURCE_SENTINEL_3022",
-        "TURN_RESUME_REPLY_SENTINEL_3022",
-    ] {
-        assert!(
-            !serialized.contains(forbidden),
-            "turn lifecycle projection leaked {forbidden}: {serialized}"
-        );
-    }
+    assert_no_forbidden_turn_event_content(
+        "turn lifecycle projection",
+        &serialized,
+        &[
+            "TURN_RAW_INPUT_SENTINEL_3022",
+            "/tmp/turn-private-path",
+            "TURN_SOURCE_SENTINEL_3022",
+            "TURN_REPLY_SENTINEL_3022",
+            "TURN_GATE_SENTINEL_3022",
+            "TURN_RESUME_SOURCE_SENTINEL_3022",
+            "TURN_RESUME_REPLY_SENTINEL_3022",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -529,16 +528,13 @@ async fn turn_lifecycle_projection_requires_rebase_for_pruned_or_fabricated_curs
 
     let serialized_events = serde_json::to_string(&store.events()).unwrap();
     let debug_errors = format!("{pruned_origin:?} {fabricated:?}");
-    for forbidden in ["TURN_GAP_RAW_SENTINEL_3022", "/tmp/turn-gap-private"] {
-        assert!(
-            !serialized_events.contains(forbidden),
-            "retained turn events leaked {forbidden}: {serialized_events}"
-        );
-        assert!(
-            !debug_errors.contains(forbidden),
-            "turn projection rebase error leaked {forbidden}: {debug_errors}"
-        );
-    }
+    let forbidden = ["TURN_GAP_RAW_SENTINEL_3022", "/tmp/turn-gap-private"];
+    assert_no_forbidden_turn_event_content("retained turn events", &serialized_events, &forbidden);
+    assert_no_forbidden_turn_event_content(
+        "turn projection rebase error",
+        &debug_errors,
+        &forbidden,
+    );
 }
 
 #[tokio::test]
@@ -3518,7 +3514,7 @@ fn assert_no_forbidden_turn_event_content(label: &str, serialized: &str, forbidd
     for value in forbidden {
         assert!(
             !serialized.contains(value),
-            "{label} leaked {value}: {serialized}"
+            "{label} leaked forbidden marker {value}"
         );
     }
 }
