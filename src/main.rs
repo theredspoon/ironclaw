@@ -994,11 +994,18 @@ async fn async_main() -> anyhow::Result<()> {
                 let gw_state = Arc::clone(gw.state());
                 tokio::spawn(async move {
                     while let Ok((_job_id, user_id, event)) = rx.recv().await {
-                        if user_id.is_empty() {
-                            gw_state.sse.broadcast(event);
-                        } else {
-                            gw_state.sse.broadcast_for_user(&user_id, event);
-                        }
+                        // Reuse the gateway's central status-event router so
+                        // the sandbox dispatch path inherits the same drop /
+                        // WARN / broadcast policy as `Channel::send_status`.
+                        // Empty `user_id` collapses into the None arm via
+                        // `dispatch_status_event`'s `!is_empty()` filter.
+                        let user_id_opt = (!user_id.is_empty()).then_some(user_id.as_str());
+                        ironclaw::channels::web::dispatch_status_event(
+                            &gw_state.sse,
+                            gw_state.multi_tenant_mode,
+                            user_id_opt,
+                            event,
+                        );
                     }
                 });
             }
