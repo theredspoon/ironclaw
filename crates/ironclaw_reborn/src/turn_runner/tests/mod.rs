@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 use ironclaw_host_api::{TenantId, ThreadId};
 use ironclaw_turns::{
     AcceptedMessageRef, AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError,
-    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, EventCursor, LoopCompleted,
-    LoopCompletionKind, LoopExit, LoopExitId, LoopExitMapping, LoopMessageRef,
+    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, EventCursor, LoopCheckpointKind,
+    LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopExitMapping, LoopMessageRef,
     ReplyTargetBindingRef, RunProfileVersion, SourceBindingRef, TurnCheckpointId, TurnError,
     TurnId, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnStatus,
     run_profile::{
@@ -24,7 +24,10 @@ use ironclaw_turns::{
     },
 };
 
-use crate::driver_registry::{DriverKind, DriverRegistry, DriverRequirements};
+use crate::{
+    driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
+    loop_exit_applier::{InMemoryLoopExitEvidencePort, LoopExitApplier},
+};
 
 use super::*;
 
@@ -85,6 +88,7 @@ fn test_resolved_profile_with_driver(
             require_before_block: true,
             max_checkpoint_bytes: 64 * 1024,
             require_final_checkpoint: false,
+            allow_no_reply_completion: false,
         },
         resource_budget_policy: ResourceBudgetPolicy {
             tier: ResourceBudgetTier::new("test_tier").expect("valid"),
@@ -636,6 +640,23 @@ fn setup_registry(driver: Arc<dyn AgentLoopDriver>) -> DriverRegistry {
     registry
 }
 
+fn make_applier(port: Arc<MockTransitionPort>) -> Arc<LoopExitApplier> {
+    Arc::new(LoopExitApplier::new(
+        port,
+        Arc::new(InMemoryLoopExitEvidencePort::all_verified()),
+    ))
+}
+
+fn make_fail_closed_recovery_applier(port: Arc<MockTransitionPort>) -> Arc<LoopExitApplier> {
+    Arc::new(LoopExitApplier::new(
+        port,
+        Arc::new(
+            InMemoryLoopExitEvidencePort::new()
+                .with_latest_checkpoint_kind(Some(LoopCheckpointKind::BeforeSideEffect)),
+        ),
+    ))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -651,12 +672,12 @@ async fn worker_recovers_expired_leases_before_claiming() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -699,12 +720,12 @@ async fn worker_reuses_claim_runner_and_lease_for_heartbeat_and_exit() {
         heartbeat_interval: Duration::from_millis(25),
         poll_interval: Duration::from_secs(60),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -765,9 +786,9 @@ async fn worker_persists_host_model_route_snapshot_before_driver_exit() {
             heartbeat_interval: Duration::from_secs(60),
             poll_interval: Duration::from_secs(60),
             scope_filter: None,
-            exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
         },
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(RouteSnapshotHostFactory {
             snapshot: snapshot.clone(),
@@ -811,9 +832,9 @@ async fn worker_rejects_unvalidated_host_route_snapshot_before_persist() {
             heartbeat_interval: Duration::from_secs(60),
             poll_interval: Duration::from_secs(60),
             scope_filter: None,
-            exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
         },
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(RouteSnapshotHostFactory {
             snapshot: LoopModelRouteSnapshot::new(
@@ -852,6 +873,7 @@ async fn default_worker_policy_rejects_fabricated_completion_refs() {
     let worker = TurnRunnerWorker::new(
         TurnRunnerWorkerConfig::default(),
         port.clone(),
+        make_fail_closed_recovery_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -883,12 +905,12 @@ async fn worker_claims_and_completes_run() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -929,12 +951,12 @@ async fn worker_records_recovery_when_heartbeat_fails() {
         heartbeat_interval: Duration::from_millis(10),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -973,12 +995,12 @@ async fn worker_cancellation_stops_active_driver_promptly() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1022,12 +1044,12 @@ async fn worker_records_recovery_on_driver_error() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1063,12 +1085,12 @@ async fn worker_records_recovery_on_driver_panic() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1102,14 +1124,20 @@ async fn worker_records_recovery_on_host_factory_error() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let host_factory = Arc::new(FailingHostFactory {
         reason: "test host creation failure".to_string(),
     });
 
-    let worker = TurnRunnerWorker::new(config, port.clone(), registry, host_factory, wake_receiver);
+    let worker = TurnRunnerWorker::new(
+        config,
+        port.clone(),
+        make_applier(port.clone()),
+        registry,
+        host_factory,
+        wake_receiver,
+    );
 
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -1143,12 +1171,12 @@ async fn worker_records_recovery_when_driver_not_found() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1181,12 +1209,12 @@ async fn worker_continues_when_no_runs_available() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1229,12 +1257,12 @@ async fn wake_signal_drains_available_runs_until_queue_empty() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1280,12 +1308,12 @@ async fn wake_signal_triggers_claim_attempt() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60), // very long so wake is the trigger
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1318,12 +1346,12 @@ async fn heartbeat_runs_during_driver_execution() {
         heartbeat_interval: Duration::from_millis(50), // fast heartbeats
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
         config,
         port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,
@@ -1358,7 +1386,8 @@ async fn worker_generates_stable_runner_id() {
 
     let worker = TurnRunnerWorker::new(
         TurnRunnerWorkerConfig::default(),
-        port,
+        port.clone(),
+        make_applier(port.clone()),
         registry,
         Arc::new(MockHostFactory),
         wake_receiver,

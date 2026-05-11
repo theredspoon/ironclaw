@@ -2,10 +2,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BlockedReason, LoopExit, LoopExitMapping, LoopExitValidationPolicy, ResolvedRunProfile,
-    SanitizedFailure, TurnCheckpointId, TurnError, TurnLeaseToken, TurnRunId, TurnRunState,
-    TurnRunnerId, TurnScope, TurnTimestamp, events::EventCursor,
-    run_profile::LoopModelRouteSnapshot,
+    BlockedReason, LoopExitMapping, ResolvedRunProfile, SanitizedFailure, TurnCheckpointId,
+    TurnError, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId, TurnScope, TurnTimestamp,
+    events::EventCursor, run_profile::LoopModelRouteSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,15 +96,6 @@ pub struct ApplyValidatedLoopExitRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplyLoopExitRequest {
-    pub run_id: TurnRunId,
-    pub runner_id: TurnRunnerId,
-    pub lease_token: TurnLeaseToken,
-    pub exit: LoopExit,
-    pub validation_policy: LoopExitValidationPolicy,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnRunnerOutcome {
     Completed,
     Cancelled,
@@ -161,21 +151,4 @@ pub trait TurnRunTransitionPort: Send + Sync {
         &self,
         request: ApplyValidatedLoopExitRequest,
     ) -> Result<TurnRunState, TurnError>;
-}
-
-pub async fn apply_loop_exit<P>(
-    port: &P,
-    request: ApplyLoopExitRequest,
-) -> Result<TurnRunState, TurnError>
-where
-    P: TurnRunTransitionPort + ?Sized,
-{
-    let decision = request.exit.validate(request.validation_policy);
-    port.apply_validated_loop_exit(ApplyValidatedLoopExitRequest {
-        run_id: request.run_id,
-        runner_id: request.runner_id,
-        lease_token: request.lease_token,
-        mapping: decision.mapping,
-    })
-    .await
 }

@@ -14,32 +14,79 @@ use ironclaw_turns::{
     AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, AllowAllTurnAdmissionPolicy,
     BlockedReason, CancelRunRequest, DefaultTurnCoordinator, GateRef, GetRunStateRequest,
     IdempotencyKey, InMemoryRunProfileResolver, InMemoryTurnEventSink, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, LoopCancelled, LoopCancelledReasonKind, LoopCompleted,
-    LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopExitId, LoopExitInvalidHandling,
-    LoopExitValidationPolicy, LoopFailed, LoopFailureKind, LoopGateRef, LoopMessageRef,
-    LoopUsageSummaryRef, ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest,
-    RunProfileId, RunProfileRequest, RunProfileResolutionError, RunProfileResolutionRequest,
-    RunProfileResolver, RunProfileVersion, SanitizedCancelReason, SanitizedFailure,
-    SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitTurnRequest, SubmitTurnResponse,
-    ThreadBusy, TurnActor, TurnAdmissionAxisKind, TurnAdmissionBucketKind,
-    TurnAdmissionBucketScope, TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionPolicy,
-    TurnCheckpointId, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind,
-    TurnEventProjectionCursor, TurnEventProjectionError, TurnEventProjectionRequest,
-    TurnEventProjectionService, TurnEventSink, TurnIdempotencyOperationKind,
-    TurnIdempotencyOutcomeKind, TurnIdempotencyRecord, TurnIdempotencyReplay, TurnLeaseToken,
-    TurnLifecycleEvent, TurnLockVersion, TurnRunId, TurnRunProfile, TurnRunState, TurnRunWake,
-    TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnStateStore,
-    TurnStatus,
+    InMemoryTurnStateStoreLimits, LoopExitMapping, LoopGateRef, ReplyTargetBindingRef,
+    ResolvedRunProfile, ResumeTurnRequest, RunProfileId, RunProfileRequest,
+    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
+    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionAxisKind,
+    TurnAdmissionBucketKind, TurnAdmissionBucketScope, TurnAdmissionCapacityDenial,
+    TurnAdmissionClass, TurnAdmissionPolicy, TurnCheckpointId, TurnCoordinator, TurnError,
+    TurnErrorCategory, TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError,
+    TurnEventProjectionRequest, TurnEventProjectionService, TurnEventSink,
+    TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
+    TurnIdempotencyReplay, TurnLeaseToken, TurnLifecycleEvent, TurnLockVersion, TurnRunId,
+    TurnRunProfile, TurnRunState, TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError,
+    TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
     events::EventCursor,
     run_profile::LoopModelRouteSnapshot,
     runner::{
-        ApplyLoopExitRequest, ApplyValidatedLoopExitRequest, BlockRunRequest,
-        CancelRunCompletionRequest, ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest,
-        FailRunRequest, HeartbeatRequest, RecordModelRouteSnapshotRequest,
-        RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse, TurnRunTransitionPort,
-        apply_loop_exit,
+        ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
+        ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
+        RecordModelRouteSnapshotRequest, RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse,
+        TurnRunTransitionPort, TurnRunnerOutcome,
     },
 };
+
+async fn apply_test_loop_exit<P>(
+    port: &P,
+    run_id: TurnRunId,
+    runner_id: TurnRunnerId,
+    lease_token: TurnLeaseToken,
+    mapping: LoopExitMapping,
+) -> Result<TurnRunState, TurnError>
+where
+    P: TurnRunTransitionPort + ?Sized,
+{
+    port.apply_validated_loop_exit(ApplyValidatedLoopExitRequest {
+        run_id,
+        runner_id,
+        lease_token,
+        mapping,
+    })
+    .await
+}
+
+fn completed_mapping() -> LoopExitMapping {
+    LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Completed)
+}
+
+fn protocol_recovery_mapping() -> LoopExitMapping {
+    LoopExitMapping::RecoveryRequired {
+        failure: SanitizedFailure::new("driver_protocol_violation").unwrap(),
+    }
+}
+
+fn cancelled_mapping() -> LoopExitMapping {
+    LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Cancelled)
+}
+
+fn failed_mapping(category: &'static str) -> LoopExitMapping {
+    LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Failed {
+        failure: SanitizedFailure::new(category).unwrap(),
+    })
+}
+
+fn approval_blocked_mapping(
+    checkpoint_id: TurnCheckpointId,
+    gate_ref: &LoopGateRef,
+) -> LoopExitMapping {
+    LoopExitMapping::RunnerOutcome(TurnRunnerOutcome::Blocked {
+        checkpoint_id,
+        reason: BlockedReason::Approval {
+            gate_ref: GateRef::new(gate_ref.as_str()).unwrap(),
+        },
+    })
+}
 
 struct BlockingRunProfileResolver {
     started: mpsc::Sender<()>,
@@ -238,33 +285,12 @@ async fn turn_lifecycle_projection_replays_failed_terminal_with_sanitized_reason
         .unwrap()
         .unwrap();
 
-    let failed = apply_loop_exit(
+    let failed = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: LoopExit::Failed(LoopFailed {
-                reason_kind: LoopFailureKind::DriverBug,
-                checkpoint_id: None,
-                usage_summary_ref: Some(
-                    LoopUsageSummaryRef::new("usage:TURN_FAILED_USAGE_SENTINEL_3022").unwrap(),
-                ),
-                diagnostic_ref: Some(
-                    LoopDiagnosticRef::new("diag:TURN_FAILED_FAILURE_REASON_SENTINEL_3022")
-                        .unwrap(),
-                ),
-                exit_id: LoopExitId::new("exit:TURN_FAILED_EXIT_SENTINEL_3022").unwrap(),
-            }),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: true,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        failed_mapping("driver_bug"),
     )
     .await
     .unwrap();
@@ -368,29 +394,12 @@ async fn turn_lifecycle_projection_replays_cancelled_terminal_without_raw_refs()
         .unwrap();
     assert_eq!(cancel_requested.status, TurnStatus::CancelRequested);
 
-    let cancelled = apply_loop_exit(
+    let cancelled = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: LoopExit::Cancelled(LoopCancelled {
-                reason_kind: LoopCancelledReasonKind::HostCancellation,
-                checkpoint_id: None,
-                interrupted_message_refs: vec![
-                    LoopMessageRef::new("msg:TURN_CANCELLED_REASON_SENTINEL_3022").unwrap(),
-                ],
-                exit_id: LoopExitId::new("exit:TURN_CANCELLED_EXIT_SENTINEL_3022").unwrap(),
-            }),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: true,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        cancelled_mapping(),
     )
     .await
     .unwrap();
@@ -3998,22 +4007,12 @@ async fn loop_exit_application_completes_after_validation_and_releases_lock() {
         .unwrap()
         .unwrap();
 
-    let completed = apply_loop_exit(
+    let completed = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: completed_exit("exit:completed"),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: true,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        completed_mapping(),
     )
     .await
     .unwrap();
@@ -4049,27 +4048,12 @@ async fn loop_exit_application_blocks_with_checkpoint_and_keeps_lock() {
     let checkpoint_id = TurnCheckpointId::new();
     let gate_ref = LoopGateRef::new("gate:approval-gate").unwrap();
 
-    let blocked = apply_loop_exit(
+    let blocked = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: LoopExit::Blocked(ironclaw_turns::LoopBlocked {
-                kind: ironclaw_turns::LoopBlockedKind::Approval,
-                gate_ref: gate_ref.clone(),
-                checkpoint_id,
-                exit_id: ironclaw_turns::LoopExitId::new("exit:blocked").unwrap(),
-            }),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: true,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        approval_blocked_mapping(checkpoint_id, &gate_ref),
     )
     .await
     .unwrap();
@@ -4110,22 +4094,12 @@ async fn invalid_loop_exit_application_records_recovery_required_and_keeps_lock(
         .unwrap()
         .unwrap();
 
-    let recovered = apply_loop_exit(
+    let recovered = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: completed_exit("exit:unverified-completed"),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        protocol_recovery_mapping(),
     )
     .await
     .unwrap();
@@ -4165,25 +4139,12 @@ async fn loop_exit_application_fails_after_validation_and_releases_lock() {
         .unwrap()
         .unwrap();
 
-    let failed = apply_loop_exit(
+    let failed = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: LoopExit::failed(
-                ironclaw_turns::LoopFailureKind::IterationLimit,
-                ironclaw_turns::LoopExitId::new("exit:failed").unwrap(),
-            ),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: true,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        failed_mapping("iteration_limit"),
     )
     .await
     .unwrap();
@@ -4206,22 +4167,12 @@ async fn loop_exit_application_uses_single_atomic_transition_port_call() {
         state: Mutex::new(TurnStatus::Cancelled),
     };
 
-    let state = apply_loop_exit(
+    let state = apply_test_loop_exit(
         &port,
-        ApplyLoopExitRequest {
-            run_id: TurnRunId::new(),
-            runner_id: TurnRunnerId::new(),
-            lease_token: TurnLeaseToken::new(),
-            exit: completed_exit("exit:completed-cancel-race"),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: true,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        TurnRunId::new(),
+        TurnRunnerId::new(),
+        TurnLeaseToken::new(),
+        completed_mapping(),
     )
     .await
     .unwrap();
@@ -4254,22 +4205,12 @@ async fn non_cancelled_loop_exit_after_public_cancel_does_not_terminally_cancel(
         .await
         .unwrap();
 
-    let completed_after_cancel = apply_loop_exit(
+    let completed_after_cancel = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: completed_exit("exit:completed-after-cancel"),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: true,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        completed_mapping(),
     )
     .await
     .unwrap_err();
@@ -4281,22 +4222,12 @@ async fn non_cancelled_loop_exit_after_public_cancel_does_not_terminally_cancel(
         }
     );
 
-    let recovered_after_cancel = apply_loop_exit(
+    let recovered_after_cancel = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: completed_exit("exit:invalid-after-cancel"),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: false,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        protocol_recovery_mapping(),
     )
     .await
     .unwrap();
@@ -4338,24 +4269,12 @@ async fn observed_cancelled_loop_exit_without_recorded_cancel_enters_recovery_re
         .unwrap()
         .unwrap();
 
-    let recovered = apply_loop_exit(
+    let recovered = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: LoopExit::cancelled_for_observed_interrupt(
-                ironclaw_turns::LoopExitId::new("exit:cancelled-unrecorded").unwrap(),
-            ),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: true,
-                invalid_handling: LoopExitInvalidHandling::FailTerminal,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        cancelled_mapping(),
     )
     .await
     .unwrap();
@@ -4418,24 +4337,12 @@ async fn loop_exit_application_cancels_only_after_public_cancel_request() {
         .await
         .unwrap();
 
-    let cancelled = apply_loop_exit(
+    let cancelled = apply_test_loop_exit(
         store.as_ref(),
-        ApplyLoopExitRequest {
-            run_id,
-            runner_id,
-            lease_token,
-            exit: LoopExit::cancelled_for_observed_interrupt(
-                ironclaw_turns::LoopExitId::new("exit:cancelled").unwrap(),
-            ),
-            validation_policy: LoopExitValidationPolicy {
-                require_final_checkpoint: false,
-                host_cancellation_observed: true,
-                invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-                completion_refs_verified: false,
-                blocked_evidence_verified: false,
-                failure_evidence_verified: false,
-            },
-        },
+        run_id,
+        runner_id,
+        lease_token,
+        cancelled_mapping(),
     )
     .await
     .unwrap();
@@ -4446,15 +4353,4 @@ async fn loop_exit_application_cancels_only_after_public_cancel_request() {
         .await
         .unwrap();
     assert_ne!(accepted_run_id(&next), run_id);
-}
-
-fn completed_exit(exit_id: &str) -> LoopExit {
-    LoopExit::Completed(LoopCompleted {
-        completion_kind: LoopCompletionKind::FinalReply,
-        reply_message_refs: vec![LoopMessageRef::new("msg:assistant-final").unwrap()],
-        result_refs: vec![],
-        final_checkpoint_id: None,
-        usage_summary_ref: None,
-        exit_id: ironclaw_turns::LoopExitId::new(exit_id).unwrap(),
-    })
 }

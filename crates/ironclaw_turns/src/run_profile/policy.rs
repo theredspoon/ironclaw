@@ -27,6 +27,10 @@ pub struct CheckpointPolicy {
     /// profiles must explicitly relax the gate.
     #[serde(default = "default_require_final_checkpoint")]
     pub require_final_checkpoint: bool,
+    /// `LoopCompletionKind::NoReply` is trusted only for profiles that
+    /// explicitly permit no-reply completion.
+    #[serde(default)]
+    pub allow_no_reply_completion: bool,
 }
 
 fn default_require_final_checkpoint() -> bool {
