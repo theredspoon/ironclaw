@@ -417,7 +417,7 @@ impl ChannelsConfig {
             None
         };
 
-        Ok(Self {
+        let cfg = Self {
             cli: CliConfig {
                 enabled: cli_enabled,
             },
@@ -457,26 +457,32 @@ impl ChannelsConfig {
                 ids
             },
             reborn_telegram_v2_enabled: parse_bool_env("REBORN_TELEGRAM_V2_ENABLED", false)?,
-        })
+        };
+        validate_telegram_v1_v2_exclusivity(&cfg)?;
+        Ok(cfg)
     }
 }
 
 /// Mutual-exclusion guard for Telegram v1/v2 paths.
 ///
 /// Returns an error when both v1 and v2 would handle the same telegram
-/// installation. The host startup glue calls this BEFORE registering any
-/// telegram webhook route — failing fast prevents two paths from receiving
-/// the same update and double-submitting the same canonical message.
+/// installation. Invoked at the end of [`ChannelsConfig::resolve`] so the
+/// invariant is enforced during `Config::from_env` / `Config::from_db` —
+/// preventing two paths from receiving the same update and
+/// double-submitting the same canonical message.
 ///
-/// `v1_active`: true when the legacy v1 Telegram WASM channel is configured
-/// for startup (i.e. `configured_wasm_channels` contains `telegram` AND
-/// `wasm_channels_enabled` is true).
-///
-/// `v2_active`: value of `reborn_telegram_v2_enabled`.
-pub fn validate_telegram_v1_v2_exclusivity(
-    v1_active: bool,
-    v2_active: bool,
-) -> Result<(), ConfigError> {
+/// v1 is considered active when [`ChannelsConfig::wasm_channels_enabled`]
+/// is true AND [`ChannelsConfig::configured_wasm_channels`] contains
+/// `"telegram"`. v2 is the value of
+/// [`ChannelsConfig::reborn_telegram_v2_enabled`]. Both rules are derived
+/// here so callers cannot drift from the invariant (see issue #3285).
+pub fn validate_telegram_v1_v2_exclusivity(channels: &ChannelsConfig) -> Result<(), ConfigError> {
+    let v1_active = channels.wasm_channels_enabled
+        && channels
+            .configured_wasm_channels
+            .iter()
+            .any(|c| c == "telegram");
+    let v2_active = channels.reborn_telegram_v2_enabled;
     if v1_active && v2_active {
         return Err(ConfigError::InvalidValue {
             key: "REBORN_TELEGRAM_V2_ENABLED".to_string(),
@@ -493,28 +499,85 @@ pub fn validate_telegram_v1_v2_exclusivity(
 #[cfg(test)]
 mod telegram_v2_tests {
     use super::*;
+    use crate::config::helpers::lock_env;
+
+    fn channels_cfg(v1_active: bool, v2_active: bool) -> ChannelsConfig {
+        ChannelsConfig {
+            cli: CliConfig { enabled: false },
+            http: None,
+            gateway: None,
+            signal: None,
+            tui: None,
+            wasm_channels_dir: PathBuf::from("/tmp/channels"),
+            wasm_channels_enabled: v1_active,
+            configured_wasm_channels: if v1_active {
+                vec!["telegram".to_string()]
+            } else {
+                Vec::new()
+            },
+            wasm_channel_owner_ids: HashMap::new(),
+            reborn_telegram_v2_enabled: v2_active,
+        }
+    }
 
     #[test]
     fn v2_disabled_with_v1_active_is_ok() {
-        validate_telegram_v1_v2_exclusivity(true, false).expect("v1 alone is fine");
+        validate_telegram_v1_v2_exclusivity(&channels_cfg(true, false)).expect("v1 alone is fine");
     }
 
     #[test]
     fn v2_enabled_with_v1_inactive_is_ok() {
-        validate_telegram_v1_v2_exclusivity(false, true).expect("v2 alone is fine");
+        validate_telegram_v1_v2_exclusivity(&channels_cfg(false, true)).expect("v2 alone is fine");
     }
 
     #[test]
     fn neither_active_is_ok() {
-        validate_telegram_v1_v2_exclusivity(false, false).expect("neither is fine");
+        validate_telegram_v1_v2_exclusivity(&channels_cfg(false, false)).expect("neither is fine");
     }
 
     #[test]
     fn both_active_fails_closed() {
-        let err = validate_telegram_v1_v2_exclusivity(true, true).expect_err("must reject");
+        let err =
+            validate_telegram_v1_v2_exclusivity(&channels_cfg(true, true)).expect_err("must reject");
         assert!(
             matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED")
         );
+    }
+
+    #[test]
+    fn v1_configured_but_wasm_channels_disabled_allows_v2() {
+        // configured_wasm_channels contains "telegram" but
+        // wasm_channels_enabled = false means v1 is NOT active for startup.
+        let mut cfg = channels_cfg(false, true);
+        cfg.configured_wasm_channels = vec!["telegram".to_string()];
+        validate_telegram_v1_v2_exclusivity(&cfg).expect("disabled v1 list does not block v2");
+    }
+
+    #[test]
+    fn v1_enabled_without_telegram_listed_allows_v2() {
+        // wasm_channels_enabled = true but the telegram channel is not in
+        // configured_wasm_channels — v1 is not handling telegram, so v2 OK.
+        let mut cfg = channels_cfg(false, true);
+        cfg.wasm_channels_enabled = true;
+        cfg.configured_wasm_channels = vec!["discord".to_string(), "slack".to_string()];
+        validate_telegram_v1_v2_exclusivity(&cfg).expect("non-telegram v1 channels do not block v2");
+    }
+
+    #[test]
+    fn resolve_rejects_v1_and_v2_telegram_together() {
+        let _guard = lock_env();
+        // SAFETY: under ENV_MUTEX
+        unsafe { std::env::set_var("REBORN_TELEGRAM_V2_ENABLED", "true") };
+        let mut settings = Settings::default();
+        settings.channels.wasm_channels_enabled = true;
+        settings.channels.wasm_channels = vec!["telegram".to_string()];
+        let err = ChannelsConfig::resolve(&settings, "owner").expect_err("must reject");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED"),
+            "expected REBORN_TELEGRAM_V2_ENABLED InvalidValue, got: {err:?}"
+        );
+        // SAFETY: under ENV_MUTEX
+        unsafe { std::env::remove_var("REBORN_TELEGRAM_V2_ENABLED") };
     }
 }
 
