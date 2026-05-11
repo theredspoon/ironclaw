@@ -16,7 +16,7 @@ mod policy;
 mod prompt;
 mod refs;
 mod resolver;
-pub mod skill_context;
+mod skill_context;
 mod snapshot;
 
 pub use driver::{

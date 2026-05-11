@@ -184,8 +184,11 @@ impl SkillContextSnippet {
 /// hidden/denied capabilities invokable.
 #[async_trait]
 pub trait SkillContextSource: Send + Sync {
-    /// Produce skill context snippets from the service's held state.
-    async fn skill_snippets(&self) -> Result<Vec<SkillContextSnippet>, SkillContextError>;
+    /// Produce skill context snippets for the given run snapshot.
+    async fn skill_snippets(
+        &self,
+        run_snapshot: &SkillRunSnapshot,
+    ) -> Result<Vec<SkillContextSnippet>, SkillContextError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +199,10 @@ pub trait SkillContextSource: Send + Sync {
 ///
 /// Holds a [`SkillRunSnapshot`] and produces model-visible context snippets
 /// following the trust/visibility rules documented at the module level.
+///
+/// The held snapshot is used as a convenience default via
+/// [`skill_snippets_from_held`](Self::skill_snippets_from_held). The trait
+/// method [`SkillContextSource::skill_snippets`] accepts any snapshot.
 pub struct SkillContextService {
     snapshot: SkillRunSnapshot,
 }
@@ -205,18 +212,27 @@ impl SkillContextService {
     pub fn new(snapshot: SkillRunSnapshot) -> Self {
         Self { snapshot }
     }
+
+    /// Convenience: produce snippets from the held snapshot.
+    pub async fn skill_snippets_from_held(
+        &self,
+    ) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
+        self.skill_snippets(&self.snapshot).await
+    }
 }
 
 #[async_trait]
 impl SkillContextSource for SkillContextService {
-    async fn skill_snippets(&self) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
+    async fn skill_snippets(
+        &self,
+        run_snapshot: &SkillRunSnapshot,
+    ) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
         // Fail closed on missing/corrupt trust data.
-        if self.snapshot.snapshot_version.is_empty() {
+        if run_snapshot.snapshot_version.is_empty() {
             return Err(SkillContextError::TrustDataMissing);
         }
 
-        let mut visible: Vec<&InstalledSkillSnapshot> = self
-            .snapshot
+        let mut visible: Vec<&InstalledSkillSnapshot> = run_snapshot
             .entries
             .iter()
             .filter(|entry| entry.visibility == SkillVisibility::Visible)
@@ -262,7 +278,10 @@ pub struct NoopSkillContextSource;
 
 #[async_trait]
 impl SkillContextSource for NoopSkillContextSource {
-    async fn skill_snippets(&self) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
+    async fn skill_snippets(
+        &self,
+        _run_snapshot: &SkillRunSnapshot,
+    ) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
         Ok(vec![])
     }
 }
