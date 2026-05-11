@@ -33,20 +33,20 @@ pub use host::{
     CapabilitySurfaceVersion, FinalizeAssistantMessage, LoopCancelReasonKind, LoopCapabilityPort,
     LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopCheckpointStateRef,
     LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest, LoopContextSnippet,
-    LoopDriverNoteKind, LoopInput, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
-    LoopInputPort, LoopInterruptKind, LoopModelMessage, LoopModelPort, LoopModelRequest,
-    LoopModelResponse, LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
-    LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
-    LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
-    ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
-    VisibleCapabilitySurface, validate_model_route_component_value,
+    LoopContextSnippetMetadata, LoopDriverNoteKind, LoopInput, LoopInputBatch, LoopInputCursor,
+    LoopInputCursorToken, LoopInputPort, LoopInterruptKind, LoopModelMessage, LoopModelPort,
+    LoopModelRequest, LoopModelResponse, LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent,
+    LoopProgressPort, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
+    LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
+    ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode, UpdateAssistantDraft,
+    VisibleCapabilityRequest, VisibleCapabilitySurface, validate_model_route_component_value,
 };
 pub use memory_context::{
     EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,
 };
 pub use milestones::{
     InMemoryLoopHostMilestoneSink, LoopHostMilestone, LoopHostMilestoneEmitter,
-    LoopHostMilestoneKind, LoopHostMilestoneSink,
+    LoopHostMilestoneKind, LoopHostMilestoneSink, PromptSkillContextMetadata,
 };
 pub use model::{
     HostManagedLoopModelPort, LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest,
@@ -70,6 +70,7 @@ pub use resolver::{
 pub use skill_context::{
     InstalledSkillSnapshot, NoopSkillContextSource, SkillContextBudget, SkillContextError,
     SkillContextService, SkillContextSnippet, SkillContextSource, SkillRunSnapshot,
-    SkillTrustLevel, SkillVisibility,
+    SkillTrustLevel, SkillVisibility, is_skill_snippet_model_message_ref,
+    skill_snippet_model_message_ref,
 };
 pub use snapshot::ResolvedRunProfile;

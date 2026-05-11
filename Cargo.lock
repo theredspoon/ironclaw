@@ -4391,6 +4391,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ironclaw_host_api",
+ "ironclaw_skills",
  "ironclaw_threads",
  "ironclaw_turns",
  "serde",
@@ -4529,6 +4530,7 @@ dependencies = [
  "ironclaw_resources",
  "ironclaw_scripts",
  "ironclaw_secrets",
+ "ironclaw_skills",
  "ironclaw_threads",
  "ironclaw_trust",
  "ironclaw_turns",

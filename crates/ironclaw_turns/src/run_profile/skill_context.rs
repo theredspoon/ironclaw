@@ -36,7 +36,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::LoopContextSnippet;
+use crate::LoopMessageRef;
+
+use super::{
+    AgentLoopHostError, AgentLoopHostErrorKind, LoopContextSnippet, LoopContextSnippetMetadata,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -110,6 +114,15 @@ pub enum SkillTrustLevel {
     Trusted,
 }
 
+impl SkillTrustLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Trusted => "trusted",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot types and context budgets
 // ---------------------------------------------------------------------------
@@ -117,6 +130,8 @@ pub enum SkillTrustLevel {
 const EMPTY_SNAPSHOT_VERSION: &str = "empty";
 const DEFAULT_MAX_SKILL_SNIPPET_BYTES: usize = 8 * 1024;
 const DEFAULT_MAX_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001B3;
 
 /// Byte budgets for model-visible skill context produced by [`SkillContextService`].
 ///
@@ -223,6 +238,10 @@ pub struct SkillContextSnippet {
     pub snippet_ref: String,
     /// Sanitized summary containing only the safe description and optionally prompt content.
     pub safe_summary: String,
+    /// Model-visible skill name used for telemetry, never for authority decisions.
+    pub skill_name: String,
+    /// Host-approved trust tier used for telemetry and downstream attenuation checks.
+    pub trust: SkillTrustLevel,
 }
 
 impl SkillContextSnippet {
@@ -231,6 +250,10 @@ impl SkillContextSnippet {
         LoopContextSnippet {
             snippet_ref: self.snippet_ref,
             safe_summary: self.safe_summary,
+            metadata: Some(LoopContextSnippetMetadata {
+                source_name: self.skill_name,
+                trust_level: self.trust.as_str().to_string(),
+            }),
         }
     }
 }
@@ -342,6 +365,8 @@ impl SkillContextSource for SkillContextService {
             snippets.push(SkillContextSnippet {
                 snippet_ref,
                 safe_summary,
+                skill_name: entry.name.clone(),
+                trust: entry.trust,
             });
         }
 
@@ -371,6 +396,66 @@ impl SkillContextSource for NoopSkillContextSource {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the model-message ref for a skill snippet.
+///
+/// Prompt construction and model-message resolution both use this exact helper
+/// so source/ordering drift fails closed instead of producing mismatched refs.
+pub fn skill_snippet_model_message_ref(
+    snippet_ref: &str,
+    safe_summary: &str,
+    ordinal: usize,
+) -> Result<LoopMessageRef, AgentLoopHostError> {
+    let slug = sanitize_ref_suffix(snippet_ref);
+    let hash = stable_snippet_ref_hash(snippet_ref, safe_summary, ordinal);
+    LoopMessageRef::new(format!("msg:snippet.{slug}.{ordinal}.{hash:016x}")).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "skill context snippet reference could not be represented",
+        )
+    })
+}
+
+pub fn is_skill_snippet_model_message_ref(content_ref: &LoopMessageRef) -> bool {
+    content_ref.as_str().starts_with("msg:snippet.")
+}
+
+fn sanitize_ref_suffix(value: &str) -> String {
+    let mut suffix = String::with_capacity(value.len().min(96));
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            suffix.push(character);
+        } else {
+            suffix.push('.');
+        }
+        if suffix.len() >= 96 {
+            break;
+        }
+    }
+    let suffix = suffix.trim_matches('.');
+    if suffix.is_empty() {
+        "context".to_string()
+    } else {
+        suffix.to_string()
+    }
+}
+
+fn stable_snippet_ref_hash(snippet_ref: &str, safe_summary: &str, ordinal: usize) -> u64 {
+    let mut hash = FNV_OFFSET;
+    feed_hash(&mut hash, snippet_ref.as_bytes());
+    feed_hash(&mut hash, &[0xFF]);
+    feed_hash(&mut hash, safe_summary.as_bytes());
+    feed_hash(&mut hash, &[0xFF]);
+    feed_hash(&mut hash, ordinal.to_string().as_bytes());
+    hash
+}
+
+fn feed_hash(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+}
 
 fn validate_snapshot(snapshot: &SkillRunSnapshot) -> Result<(), SkillContextError> {
     if snapshot.snapshot_version.is_empty() {

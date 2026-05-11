@@ -15,8 +15,8 @@ use ironclaw_host_runtime::{
     RuntimeCapabilityRequest, RuntimeFailureKind,
 };
 use ironclaw_loop_support::{
-    EmptyLoopCapabilityPort, HostManagedModelGateway, ThreadBackedLoopContextPort,
-    ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
+    EmptyLoopCapabilityPort, HostManagedModelGateway, HostSkillContextSource,
+    ThreadBackedLoopContextPort, ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 
@@ -36,8 +36,8 @@ use ironclaw_turns::{
         LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent,
         LoopProgressPort, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
         LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
-        ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
-        VisibleCapabilitySurface,
+        ProcessHandleSummary, PromptMode, PromptSkillContextMetadata, UpdateAssistantDraft,
+        VisibleCapabilityRequest, VisibleCapabilitySurface, skill_snippet_model_message_ref,
     },
     runner::ClaimedTurnRun,
 };
@@ -1024,10 +1024,10 @@ impl SurfaceAwareLoopPromptPort {
     fn ensure_supported_context_shape(
         context: &LoopContextBundle,
     ) -> Result<(), AgentLoopHostError> {
-        if !context.instruction_snippets.is_empty() || !context.memory_snippets.is_empty() {
+        if !context.memory_snippets.is_empty() {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::PolicyDenied,
-                "text-only prompt port cannot materialize instruction or memory snippets",
+                "text-only prompt port cannot materialize memory snippets",
             ));
         }
         Ok(())
@@ -1049,14 +1049,43 @@ impl LoopPromptPort for SurfaceAwareLoopPromptPort {
             })
             .await?;
         Self::ensure_supported_context_shape(&context)?;
-        let messages = context
-            .messages
-            .into_iter()
-            .map(|message| LoopModelMessage {
-                role: message.role,
-                content_ref: message.message_ref,
-            })
-            .collect::<Vec<_>>();
+        let mut messages =
+            Vec::with_capacity(context.instruction_snippets.len() + context.messages.len());
+        let mut skill_context = Vec::with_capacity(context.instruction_snippets.len());
+        for (ordinal, snippet) in context.instruction_snippets.into_iter().enumerate() {
+            let content_ref = skill_snippet_model_message_ref(
+                &snippet.snippet_ref,
+                &snippet.safe_summary,
+                ordinal,
+            )?;
+            match snippet.metadata.as_ref() {
+                Some(metadata) => skill_context.push(PromptSkillContextMetadata {
+                    ordinal,
+                    source_name: metadata.source_name.clone(),
+                    trust_level: metadata.trust_level.clone(),
+                }),
+                None if snippet.snippet_ref.starts_with("skill:") => {
+                    return Err(AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::Internal,
+                        "skill instruction snippet metadata is missing",
+                    ));
+                }
+                None => {}
+            }
+            messages.push(LoopModelMessage {
+                role: "system".to_string(),
+                content_ref,
+            });
+        }
+        messages.extend(
+            context
+                .messages
+                .into_iter()
+                .map(|message| LoopModelMessage {
+                    role: message.role,
+                    content_ref: message.message_ref,
+                }),
+        );
         let bundle = LoopPromptBundle {
             bundle_ref: LoopPromptBundleRef::for_run(
                 &self.context,
@@ -1077,6 +1106,7 @@ impl LoopPromptPort for SurfaceAwareLoopPromptPort {
                 request.mode,
                 bundle.surface_version.clone(),
                 bundle.messages.len(),
+                skill_context,
             )
             .await?;
         Ok(bundle)
@@ -1096,6 +1126,7 @@ where
     loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     config: TextOnlyLoopHostConfig,
+    skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
 }
 
 impl<S, G> RebornLoopDriverHostFactory<S, G>
@@ -1121,7 +1152,13 @@ where
             loop_checkpoint_store,
             milestone_sink,
             config,
+            skill_context_source: None,
         }
+    }
+
+    pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
+        self.skill_context_source = Some(source);
+        self
     }
 
     pub fn with_model_route_resolver<R>(mut self, resolver: Arc<R>) -> Self
@@ -1151,12 +1188,16 @@ where
 
         let max_messages = self.config.max_messages.max(1);
         let run_context = self.attach_model_route_snapshot(request.loop_run_context)?;
-        let context: Arc<dyn LoopContextPort> = Arc::new(ThreadBackedLoopContextPort::new(
+        let mut context_adapter = ThreadBackedLoopContextPort::new(
             Arc::clone(&self.thread_service),
             self.thread_scope.clone(),
             run_context.clone(),
             max_messages,
-        ));
+        );
+        if let Some(source) = self.skill_context_source.as_ref() {
+            context_adapter = context_adapter.with_skill_context_source(source.clone());
+        }
+        let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
         let surface_state = Arc::new(CapabilitySurfaceState::default());
         let capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
             SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
@@ -1178,15 +1219,18 @@ where
         );
         let input: Arc<dyn LoopInputPort> =
             Arc::new(NoExtraLoopInputPort::new(run_context.clone()));
-        let model: Arc<dyn LoopModelPort> =
-            Arc::new(ThreadBackedLoopModelPort::with_milestone_sink(
-                Arc::clone(&self.thread_service),
-                self.thread_scope.clone(),
-                run_context.clone(),
-                Arc::clone(&self.model_gateway),
-                max_messages,
-                Arc::clone(&self.milestone_sink),
-            ));
+        let mut model_adapter = ThreadBackedLoopModelPort::with_milestone_sink(
+            Arc::clone(&self.thread_service),
+            self.thread_scope.clone(),
+            run_context.clone(),
+            Arc::clone(&self.model_gateway),
+            max_messages,
+            Arc::clone(&self.milestone_sink),
+        );
+        if let Some(source) = self.skill_context_source.as_ref() {
+            model_adapter = model_adapter.with_skill_context_source(source.clone());
+        }
+        let model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
         let checkpoint: Arc<dyn LoopCheckpointPort> = Arc::new(HostManagedLoopCheckpointPort::new(
             run_context.clone(),
             Arc::clone(&self.checkpoint_state_store),

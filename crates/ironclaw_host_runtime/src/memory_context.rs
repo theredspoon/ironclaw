@@ -246,6 +246,7 @@ fn map_search_result_to_snippet(result: MemorySearchResult) -> Option<LoopContex
     Some(LoopContextSnippet {
         snippet_ref,
         safe_summary,
+        metadata: None,
     })
 }
 
