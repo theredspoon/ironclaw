@@ -268,6 +268,42 @@ async fn loop_prompt_port_builds_text_only_bundle_from_context_refs() {
 }
 
 #[tokio::test]
+async fn loop_prompt_port_materializes_instruction_snippets_as_system_refs() {
+    let host = Arc::new(
+        RecordingAgentLoopHost::new(claimed_run_context().await)
+            .with_context_instruction_snippet("skill:alpha", "alpha skill context available"),
+    );
+    let port = HostManagedLoopPromptPort::new(
+        host.context.clone(),
+        host.clone(),
+        host.milestone_sink.clone(),
+    );
+
+    let bundle = port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(bundle.messages.len(), 2);
+    assert_eq!(bundle.messages[0].role, "system");
+    assert!(
+        bundle.messages[0]
+            .content_ref
+            .as_str()
+            .starts_with("msg:snippet.skill.alpha.")
+    );
+    assert_eq!(bundle.messages[1].role, "user");
+    assert_eq!(host.effects(), vec!["context"]);
+    assert_eq!(host.milestone_kind_names(), vec!["prompt_bundle_built"]);
+}
+
+#[tokio::test]
 async fn loop_prompt_port_rejects_unsupported_prompt_mode() {
     let host = Arc::new(RecordingAgentLoopHost::new(codeact_run_context().await));
     let port = HostManagedLoopPromptPort::new(
@@ -464,7 +500,7 @@ async fn loop_prompt_port_rejects_stale_surface_version() {
 }
 
 #[tokio::test]
-async fn loop_prompt_port_rejects_snippets_it_cannot_materialize() {
+async fn loop_prompt_port_rejects_memory_snippets_it_cannot_materialize() {
     let host = Arc::new(
         RecordingAgentLoopHost::new(claimed_run_context().await)
             .with_context_instruction_snippet("instruction:system", "system instruction available")

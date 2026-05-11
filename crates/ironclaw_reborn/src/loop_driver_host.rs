@@ -2,8 +2,8 @@ use std::{error::Error, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use ironclaw_loop_support::{
-    EmptyLoopCapabilityPort, HostManagedModelGateway, ThreadBackedLoopContextPort,
-    ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
+    EmptyLoopCapabilityPort, HostManagedModelGateway, HostSkillContextSource,
+    ThreadBackedLoopContextPort, ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::{
@@ -73,6 +73,7 @@ where
     loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     config: TextOnlyLoopHostConfig,
+    skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
 }
 
 impl<S, G> RebornLoopDriverHostFactory<S, G>
@@ -97,7 +98,13 @@ where
             loop_checkpoint_store,
             milestone_sink,
             config,
+            skill_context_source: None,
         }
+    }
+
+    pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
+        self.skill_context_source = Some(source);
+        self
     }
 
     pub async fn build_text_only_host(
@@ -109,12 +116,16 @@ where
 
         let max_messages = self.config.max_messages.max(1);
         let run_context = request.loop_run_context;
-        let context: Arc<dyn LoopContextPort> = Arc::new(ThreadBackedLoopContextPort::new(
+        let mut context_adapter = ThreadBackedLoopContextPort::new(
             Arc::clone(&self.thread_service),
             self.thread_scope.clone(),
             run_context.clone(),
             max_messages,
-        ));
+        );
+        if let Some(source) = self.skill_context_source.clone() {
+            context_adapter = context_adapter.with_skill_context_source(source);
+        }
+        let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
         let current_surface_version = EmptyLoopCapabilityPort
             .visible_capabilities(VisibleCapabilityRequest)
             .await
@@ -133,15 +144,18 @@ where
         );
         let input: Arc<dyn LoopInputPort> =
             Arc::new(NoExtraLoopInputPort::new(run_context.clone()));
-        let model: Arc<dyn LoopModelPort> =
-            Arc::new(ThreadBackedLoopModelPort::with_milestone_sink(
-                Arc::clone(&self.thread_service),
-                self.thread_scope.clone(),
-                run_context.clone(),
-                Arc::clone(&self.model_gateway),
-                max_messages,
-                Arc::clone(&self.milestone_sink),
-            ));
+        let mut model_adapter = ThreadBackedLoopModelPort::with_milestone_sink(
+            Arc::clone(&self.thread_service),
+            self.thread_scope.clone(),
+            run_context.clone(),
+            Arc::clone(&self.model_gateway),
+            max_messages,
+            Arc::clone(&self.milestone_sink),
+        );
+        if let Some(source) = self.skill_context_source.clone() {
+            model_adapter = model_adapter.with_skill_context_source(source);
+        }
+        let model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
         let checkpoint: Arc<dyn LoopCheckpointPort> = Arc::new(HostManagedLoopCheckpointPort::new(
             run_context.clone(),
             Arc::clone(&self.checkpoint_state_store),

@@ -19,8 +19,8 @@ const MAX_TEXT_ONLY_MESSAGE_LIMIT: usize = 128;
 /// [`LoopContextPort`], returns model-message references, and emits a
 /// `prompt_bundle_built` milestone containing only metadata. It currently
 /// supports [`PromptMode::TextOnly`] only; checkpoint-backed prompt state and
-/// instruction/memory snippet materialization fail closed until dedicated host
-/// stores are wired.
+/// memory snippet materialization fail closed until dedicated host stores are
+/// wired. Instruction snippets are surfaced as host-owned system message refs.
 #[derive(Clone)]
 pub struct HostManagedLoopPromptPort<C, S>
 where
@@ -140,10 +140,10 @@ where
     fn ensure_supported_context_shape(
         context: &LoopContextBundle,
     ) -> Result<(), AgentLoopHostError> {
-        if !context.instruction_snippets.is_empty() || !context.memory_snippets.is_empty() {
+        if !context.memory_snippets.is_empty() {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::PolicyDenied,
-                "text-only prompt port cannot materialize instruction or memory snippets",
+                "text-only prompt port cannot materialize memory snippets",
             ));
         }
         Ok(())
@@ -169,14 +169,30 @@ where
             })
             .await?;
         Self::ensure_supported_context_shape(&context)?;
-        let messages = context
-            .messages
+        let mut messages = context
+            .instruction_snippets
             .into_iter()
-            .map(|message| LoopModelMessage {
-                role: message.role,
-                content_ref: message.message_ref,
+            .enumerate()
+            .map(|(ordinal, snippet)| {
+                Ok(LoopModelMessage {
+                    role: "system".to_string(),
+                    content_ref: snippet_model_message_ref(
+                        &snippet.snippet_ref,
+                        &snippet.safe_summary,
+                        ordinal,
+                    )?,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, AgentLoopHostError>>()?;
+        messages.extend(
+            context
+                .messages
+                .into_iter()
+                .map(|message| LoopModelMessage {
+                    role: message.role,
+                    content_ref: message.message_ref,
+                }),
+        );
         let bundle = LoopPromptBundle {
             bundle_ref: LoopPromptBundleRef::fresh_for_run(&self.context),
             messages,
@@ -191,5 +207,60 @@ where
             )
             .await?;
         Ok(bundle)
+    }
+}
+
+fn snippet_model_message_ref(
+    snippet_ref: &str,
+    safe_summary: &str,
+    ordinal: usize,
+) -> Result<crate::LoopMessageRef, AgentLoopHostError> {
+    let slug = sanitize_ref_suffix(snippet_ref);
+    let hash = stable_snippet_ref_hash(snippet_ref, safe_summary, ordinal);
+    crate::LoopMessageRef::new(format!("msg:snippet.{slug}.{ordinal}.{hash:016x}")).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "instruction snippet reference could not be represented",
+        )
+    })
+}
+
+fn sanitize_ref_suffix(value: &str) -> String {
+    let mut suffix = String::with_capacity(value.len().min(96));
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+            suffix.push(character);
+        } else {
+            suffix.push('.');
+        }
+        if suffix.len() >= 96 {
+            break;
+        }
+    }
+    let suffix = suffix.trim_matches('.');
+    if suffix.is_empty() {
+        "context".to_string()
+    } else {
+        suffix.to_string()
+    }
+}
+
+fn stable_snippet_ref_hash(snippet_ref: &str, safe_summary: &str, ordinal: usize) -> u64 {
+    let mut hash = FNV_OFFSET;
+    feed_hash(&mut hash, snippet_ref.as_bytes());
+    feed_hash(&mut hash, &[0xFF]);
+    feed_hash(&mut hash, safe_summary.as_bytes());
+    feed_hash(&mut hash, &[0xFF]);
+    feed_hash(&mut hash, ordinal.to_string().as_bytes());
+    hash
+}
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001B3;
+
+fn feed_hash(hash: &mut u64, bytes: &[u8]) {
+    for &byte in bytes {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
     }
 }
