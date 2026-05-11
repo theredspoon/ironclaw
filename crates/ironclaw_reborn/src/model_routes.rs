@@ -387,14 +387,14 @@ impl ModelRouteError {
         Self { kind }
     }
 
-    pub fn kind(&self) -> &'static str {
-        self.kind.as_str()
+    pub fn kind(&self) -> ModelRouteErrorKind {
+        self.kind
     }
 }
 
 impl fmt::Display for ModelRouteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.kind())
+        formatter.write_str(self.kind.as_str())
     }
 }
 

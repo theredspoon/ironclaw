@@ -84,7 +84,7 @@ fn managed_policy_rejects_unapproved_default_route() {
 
     let error = resolver.resolve(ModelSlot::Default).unwrap_err();
 
-    assert_eq!(error.kind(), "route_not_approved");
+    assert_eq!(error.kind().as_str(), "route_not_approved");
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn resolved_route_snapshot_remains_stable_after_settings_change() {
 fn route_validation_rejects_secret_like_provider_ids() {
     let error = ModelRoute::new("sk-secret-provider", "gpt-4").unwrap_err();
 
-    assert_eq!(error.kind(), "invalid_route");
+    assert_eq!(error.kind().as_str(), "invalid_route");
 }
 
 #[cfg(feature = "root-llm-provider")]

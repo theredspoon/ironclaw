@@ -619,7 +619,7 @@ where
 
 fn model_route_error_to_host_error(error: ModelRouteError) -> RebornLoopDriverHostError {
     RebornLoopDriverHostError::InvalidRequest {
-        reason: format!("model route resolution failed: {}", error.kind()),
+        reason: format!("model route resolution failed: {}", error.kind().as_str()),
     }
 }
 

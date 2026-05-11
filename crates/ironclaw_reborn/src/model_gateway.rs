@@ -25,8 +25,8 @@ use ironclaw_turns::{
 };
 
 use crate::model_routes::{
-    ModelRoute, ModelRouteError, ModelRouteProviderKey, ModelSelectionMode, ModelSlot,
-    ResolvedModelRouteSnapshot,
+    ModelRoute, ModelRouteError, ModelRouteErrorKind, ModelRouteProviderKey, ModelSelectionMode,
+    ModelSlot, ResolvedModelRouteSnapshot,
 };
 
 /// Fail-closed routing policy from resolved Reborn model profile ids to the
@@ -397,11 +397,13 @@ fn slot_for_model_profile(
 
 fn map_model_route_error(error: ModelRouteError) -> HostManagedModelError {
     match error.kind() {
-        "route_unavailable" | "route_not_approved" => HostManagedModelError::safe(
-            HostManagedModelErrorKind::PolicyDenied,
-            "model route is not permitted",
-        ),
-        _ => HostManagedModelError::safe(
+        ModelRouteErrorKind::RouteUnavailable | ModelRouteErrorKind::RouteNotApproved => {
+            HostManagedModelError::safe(
+                HostManagedModelErrorKind::PolicyDenied,
+                "model route is not permitted",
+            )
+        }
+        ModelRouteErrorKind::InvalidRoute => HostManagedModelError::safe(
             HostManagedModelErrorKind::InvalidRequest,
             "model route is invalid",
         ),
