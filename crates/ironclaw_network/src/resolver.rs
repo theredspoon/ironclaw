@@ -31,7 +31,7 @@ pub(crate) fn resolve_public_ips<R>(
     target: &NetworkTarget,
     policy: &NetworkPolicy,
     resolver: &R,
-    _request_bytes: u64,
+    request_bytes: u64,
 ) -> Result<Vec<IpAddr>, NetworkHttpError>
 where
     R: NetworkResolver,
@@ -44,14 +44,14 @@ where
             .resolve_ips(&target.host, port)
             .map_err(|error| NetworkHttpError::Dns {
                 reason: error.to_string(),
-                request_bytes: 0,
+                request_bytes,
                 response_bytes: error.response_bytes(),
             })?
     };
     if resolved_ips.is_empty() {
         return Err(NetworkHttpError::Dns {
             reason: "network target did not resolve to any IP addresses".to_string(),
-            request_bytes: 0,
+            request_bytes,
             response_bytes: 0,
         });
     }
@@ -59,7 +59,7 @@ where
     {
         return Err(NetworkHttpError::PolicyDenied {
             reason: "network target resolves to a private or host-local IP".to_string(),
-            request_bytes: 0,
+            request_bytes,
             response_bytes: 0,
         });
     }

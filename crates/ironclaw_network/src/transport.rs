@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::Read,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -237,6 +237,8 @@ fn reqwest_method(method: NetworkMethod) -> reqwest::Method {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
 
     #[test]

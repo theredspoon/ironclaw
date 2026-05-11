@@ -58,7 +58,6 @@ where
         &self,
         request: NetworkHttpRequest,
     ) -> Result<NetworkHttpResponse, NetworkHttpError> {
-        let request_body_bytes = request.body.len() as u64;
         let estimated_request_bytes = estimate_http_request_bytes(
             request.method,
             &request.url,
@@ -76,7 +75,7 @@ where
             })
             .map_err(|error| NetworkHttpError::PolicyDenied {
                 reason: error.to_string(),
-                request_bytes: 0,
+                request_bytes: estimated_request_bytes,
                 response_bytes: 0,
             })?;
         let resolved_ips = resolve_public_ips(
@@ -85,8 +84,6 @@ where
             &self.resolver,
             estimated_request_bytes,
         )?;
-        let first_resolved_ip = resolved_ips.first().copied();
-
         let transport_request = NetworkTransportRequest {
             method: permit.method,
             url: request.url,
@@ -96,10 +93,7 @@ where
             response_body_limit: request.response_body_limit,
             timeout_ms: request.timeout_ms,
         };
-        let mut response = self.transport.execute(transport_request)?;
-        response.usage.request_bytes = response.usage.request_bytes.max(request_body_bytes);
-        response.usage.resolved_ip = response.usage.resolved_ip.or(first_resolved_ip);
-        Ok(response)
+        self.transport.execute(transport_request)
     }
 }
 
