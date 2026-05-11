@@ -27,12 +27,11 @@
 //! lexicographically by [`InstalledSkillSnapshot::ordering_key`], and the snapshot version
 //! is a deterministic hash of all entry data.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::LoopContextSnippet;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -155,13 +154,23 @@ impl SkillRunSnapshot {
 }
 
 /// Snippet data produced by [`SkillContextSource`], ready for conversion into
-/// a [`LoopContextSnippet`](super::LoopContextSnippet).
+/// a [`LoopContextSnippet`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillContextSnippet {
     /// Reference identifier, e.g. `skill:<name>`.
     pub snippet_ref: String,
     /// Sanitized summary containing only the safe description and optionally prompt content.
     pub safe_summary: String,
+}
+
+impl SkillContextSnippet {
+    /// Convert into the loop-layer [`LoopContextSnippet`] type.
+    pub fn into_loop_snippet(self) -> LoopContextSnippet {
+        LoopContextSnippet {
+            snippet_ref: self.snippet_ref,
+            safe_summary: self.safe_summary,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -175,11 +184,8 @@ pub struct SkillContextSnippet {
 /// hidden/denied capabilities invokable.
 #[async_trait]
 pub trait SkillContextSource: Send + Sync {
-    /// Produce skill context snippets from the given run snapshot.
-    async fn skill_snippets(
-        &self,
-        run_snapshot: &SkillRunSnapshot,
-    ) -> Result<Vec<SkillContextSnippet>, SkillContextError>;
+    /// Produce skill context snippets from the service's held state.
+    async fn skill_snippets(&self) -> Result<Vec<SkillContextSnippet>, SkillContextError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +197,6 @@ pub trait SkillContextSource: Send + Sync {
 /// Holds a [`SkillRunSnapshot`] and produces model-visible context snippets
 /// following the trust/visibility rules documented at the module level.
 pub struct SkillContextService {
-    #[allow(dead_code)]
     snapshot: SkillRunSnapshot,
 }
 
@@ -204,22 +209,22 @@ impl SkillContextService {
 
 #[async_trait]
 impl SkillContextSource for SkillContextService {
-    async fn skill_snippets(
-        &self,
-        run_snapshot: &SkillRunSnapshot,
-    ) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
+    async fn skill_snippets(&self) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
         // Fail closed on missing/corrupt trust data.
-        if run_snapshot.snapshot_version.is_empty() {
+        if self.snapshot.snapshot_version.is_empty() {
             return Err(SkillContextError::TrustDataMissing);
         }
 
-        let mut visible: Vec<&InstalledSkillSnapshot> = run_snapshot
+        let mut visible: Vec<&InstalledSkillSnapshot> = self
+            .snapshot
             .entries
             .iter()
             .filter(|entry| entry.visibility == SkillVisibility::Visible)
             .collect();
 
         // Deterministic ordering by ordering_key.
+        // Re-sort here even though `from_entries` sorts, because the snapshot
+        // may have been constructed manually with unsorted entries.
         visible.sort_by(|a, b| a.ordering_key.cmp(&b.ordering_key));
 
         let snippets = visible
@@ -257,10 +262,7 @@ pub struct NoopSkillContextSource;
 
 #[async_trait]
 impl SkillContextSource for NoopSkillContextSource {
-    async fn skill_snippets(
-        &self,
-        _run_snapshot: &SkillRunSnapshot,
-    ) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
+    async fn skill_snippets(&self) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
         Ok(vec![])
     }
 }
@@ -269,17 +271,48 @@ impl SkillContextSource for NoopSkillContextSource {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Compute a deterministic version string from sorted snapshot entries.
+///
+/// Uses a simple FNV-1a-style hash over the concatenated field data.
+/// This hash is stable across runs of the same binary. It is not cryptographic
+/// and should not be used for security purposes.
 fn compute_snapshot_version(sorted_entries: &[InstalledSkillSnapshot]) -> String {
-    let mut hasher = DefaultHasher::new();
-    for entry in sorted_entries {
-        entry.name.hash(&mut hasher);
-        entry.trust.hash(&mut hasher);
-        entry.visibility.hash(&mut hasher);
-        if let Some(ref content) = entry.prompt_content {
-            content.hash(&mut hasher);
+    // FNV-1a 64-bit — stable, simple, no external dependency.
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+
+    let mut hash = FNV_OFFSET;
+
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(FNV_PRIME);
         }
-        entry.safe_description.hash(&mut hasher);
-        entry.ordering_key.hash(&mut hasher);
+    };
+
+    for entry in sorted_entries {
+        feed(entry.name.as_bytes());
+        feed(&[0xFF]); // separator
+        feed(match entry.trust {
+            SkillTrustLevel::Installed => b"installed",
+            SkillTrustLevel::Trusted => b"trusted",
+        });
+        feed(&[0xFF]);
+        feed(match entry.visibility {
+            SkillVisibility::Visible => b"visible",
+            SkillVisibility::Hidden => b"hidden",
+            SkillVisibility::Denied => b"denied",
+        });
+        feed(&[0xFF]);
+        if let Some(ref content) = entry.prompt_content {
+            feed(content.as_bytes());
+        }
+        feed(&[0xFF]);
+        feed(entry.safe_description.as_bytes());
+        feed(&[0xFF]);
+        feed(entry.ordering_key.as_bytes());
+        feed(&[0xFE]); // entry separator
     }
-    format!("v1:{:016x}", hasher.finish())
+
+    format!("v1:{hash:016x}")
 }
