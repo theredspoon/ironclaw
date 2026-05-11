@@ -29,7 +29,8 @@ use ironclaw_turns::{
     TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
     runner::{
         ApplyLoopExitRequest, ClaimRunRequest, ClaimedTurnRun, HeartbeatRequest,
-        RecordRecoveryRequiredRequest, RecoverExpiredLeasesRequest, TurnRunTransitionPort,
+        RecordModelRouteSnapshotRequest, RecordRecoveryRequiredRequest,
+        RecoverExpiredLeasesRequest, TurnRunTransitionPort,
     },
 };
 
@@ -405,6 +406,8 @@ impl TurnRunnerWorker {
             .create_host(claimed)
             .await
             .map_err(|err| DriverInvocationError::HostCreationFailed { reason: err.reason })?;
+        self.persist_model_route_snapshot(claimed, host.as_ref())
+            .await?;
 
         let status = claimed.state.status;
         let turn_id = claimed.state.turn_id;
@@ -448,6 +451,30 @@ impl TurnRunnerWorker {
                     .map_err(DriverInvocationError::DriverError)
             }
         }
+    }
+
+    /// Persist the host-attached model route before driver invocation can emit side effects.
+    async fn persist_model_route_snapshot(
+        &self,
+        claimed: &ClaimedTurnRun,
+        host: &(dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync),
+    ) -> Result<(), DriverInvocationError> {
+        let Some(snapshot) = host.run_context().resolved_model_route.clone() else {
+            return Ok(());
+        };
+        if claimed.state.resolved_model_route.as_ref() == Some(&snapshot) {
+            return Ok(());
+        }
+        self.transition_port
+            .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+                run_id: claimed.state.run_id,
+                runner_id: claimed.runner_id,
+                lease_token: claimed.lease_token,
+                snapshot,
+            })
+            .await
+            .map(|_| ())
+            .map_err(DriverInvocationError::RouteSnapshotPersistenceFailed)
     }
 
     /// Apply a `LoopExit` through the trusted transition port.
@@ -520,6 +547,9 @@ impl TurnRunnerWorker {
         let category = match error {
             DriverInvocationError::DriverNotFound { .. } => "driver_not_found",
             DriverInvocationError::HostCreationFailed { .. } => "host_creation_failed",
+            DriverInvocationError::RouteSnapshotPersistenceFailed(_) => {
+                "route_snapshot_persistence_failed"
+            }
             DriverInvocationError::DriverError(AgentLoopDriverError::InvalidRequest { .. }) => {
                 "driver_invalid_request"
             }
@@ -696,6 +726,7 @@ impl std::fmt::Display for TurnRunnerError {
 enum DriverInvocationError {
     DriverNotFound { reason: String },
     HostCreationFailed { reason: String },
+    RouteSnapshotPersistenceFailed(TurnError),
     DriverError(AgentLoopDriverError),
     DriverPanic,
     HeartbeatFailed(TurnError),
@@ -708,6 +739,9 @@ impl std::fmt::Display for DriverInvocationError {
         match self {
             Self::DriverNotFound { reason } => write!(f, "driver not found: {reason}"),
             Self::HostCreationFailed { reason } => write!(f, "host creation failed: {reason}"),
+            Self::RouteSnapshotPersistenceFailed(err) => {
+                write!(f, "route snapshot persistence failed: {err}")
+            }
             Self::DriverError(err) => write!(f, "driver error: {err}"),
             Self::DriverPanic => write!(f, "driver panicked before returning loop exit"),
             Self::HeartbeatFailed(err) => write!(f, "heartbeat failed: {err}"),

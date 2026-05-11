@@ -95,6 +95,35 @@ fn reborn_cli_binary_crate_stays_separate_from_v1_root() {
         manifest.contains("[[bin]]") && manifest.contains("name = \"ironclaw-reborn\""),
         "Reborn CLI crate must declare the ironclaw-reborn binary explicitly"
     );
+
+    let command_module_paths = [
+        "crates/ironclaw_reborn_cli/AGENTS.md",
+        "crates/ironclaw_reborn_cli/src/commands/mod.rs",
+        "crates/ironclaw_reborn_cli/src/commands/completion.rs",
+        "crates/ironclaw_reborn_cli/src/commands/doctor.rs",
+        "crates/ironclaw_reborn_cli/src/commands/run.rs",
+        "crates/ironclaw_reborn_cli/src/context.rs",
+    ];
+    for path in command_module_paths {
+        assert!(
+            root.join(path).exists(),
+            "Reborn CLI commands should use an agent-friendly one-command-per-file layout; missing {path}"
+        );
+    }
+
+    let agent_contract = std::fs::read_to_string(root.join("crates/ironclaw_reborn_cli/AGENTS.md"))
+        .expect("Reborn CLI crate-local AGENTS.md must be readable");
+    for required_phrase in [
+        "one command per file",
+        "RebornCliContext",
+        "no v1 runtime imports",
+    ] {
+        assert!(
+            agent_contract.contains(required_phrase),
+            "Reborn CLI AGENTS.md should document `{required_phrase}` for future command agents"
+        );
+    }
+
     assert_workspace_deps_exactly(
         &dependencies,
         "ironclaw_reborn_cli",

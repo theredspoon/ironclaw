@@ -5,6 +5,7 @@ use crate::{
     BlockedReason, LoopExit, LoopExitMapping, LoopExitValidationPolicy, ResolvedRunProfile,
     SanitizedFailure, TurnCheckpointId, TurnError, TurnLeaseToken, TurnRunId, TurnRunState,
     TurnRunnerId, TurnScope, TurnTimestamp, events::EventCursor,
+    run_profile::LoopModelRouteSnapshot,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +39,14 @@ pub struct RecoverExpiredLeasesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoverExpiredLeasesResponse {
     pub recovered: Vec<TurnRunState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordModelRouteSnapshotRequest {
+    pub run_id: TurnRunId,
+    pub runner_id: TurnRunnerId,
+    pub lease_token: TurnLeaseToken,
+    pub snapshot: LoopModelRouteSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +131,15 @@ pub trait TurnRunTransitionPort: Send + Sync {
         &self,
         request: RecoverExpiredLeasesRequest,
     ) -> Result<RecoverExpiredLeasesResponse, TurnError>;
+
+    async fn record_model_route_snapshot(
+        &self,
+        _request: RecordModelRouteSnapshotRequest,
+    ) -> Result<TurnRunState, TurnError> {
+        Err(TurnError::Unavailable {
+            reason: "model route snapshot persistence is unsupported".to_string(),
+        })
+    }
 
     async fn block_run(&self, request: BlockRunRequest) -> Result<TurnRunState, TurnError>;
 

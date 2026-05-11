@@ -427,6 +427,7 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
         reply_target_binding_ref: ReplyTargetBindingRef::new("reply-checkpoint-public").unwrap(),
         resolved_run_profile_id: RunProfileId::default_profile(),
         resolved_run_profile_version: RunProfileVersion::new(1),
+        resolved_model_route: None,
         received_at: fixed_time(),
         checkpoint_id: Some(checkpoint_id),
         gate_ref: Some(GateRef::new("gate-checkpoint-public").unwrap()),

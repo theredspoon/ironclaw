@@ -503,8 +503,8 @@ fn production_wiring_validation_rejects_unsupported_runtime_requirements() {
     );
 
     let report = services
-        .validate_production_wiring(&ProductionWiringConfig::new([RuntimeKind::FirstParty]))
-        .expect_err("first-party runtime requirements are not dispatcher backend requirements");
+        .validate_production_wiring(&ProductionWiringConfig::new([RuntimeKind::System]))
+        .expect_err("system runtime requirements are not dispatcher backend requirements");
 
     assert!(
         report.contains(
