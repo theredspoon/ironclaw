@@ -36,8 +36,9 @@ use ironclaw_turns::{
         FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink, LoopCapabilityPort,
         LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopContextRequest,
         LoopDriverId, LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor, LoopInputCursorToken,
-        LoopInputPort, LoopModelRequest, LoopProgressEvent, LoopPromptBundleRequest,
-        LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode, VisibleCapabilityRequest,
+        LoopInputPort, LoopModelRequest, LoopModelRouteSnapshot, LoopProgressEvent,
+        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode,
+        VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
@@ -411,6 +412,43 @@ async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
     let requests = fixture.gateway.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].resolved_model_route, Some(snapshot));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_unapproved_existing_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-reject", "hello routed host").await;
+    let approved_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(
+            ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly)
+                .with_approved_route(approved_route.clone()),
+        )
+        .with_route(ModelSlot::Default, approved_route),
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(LoopModelRouteSnapshot::new(
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            "config:default",
+            "auth:default",
+        ));
+
+    let error = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ironclaw_reborn::RebornLoopDriverHostError::InvalidRequest { .. }
+    ));
 }
 
 #[tokio::test]

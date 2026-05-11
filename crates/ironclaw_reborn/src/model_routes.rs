@@ -287,6 +287,19 @@ pub trait ModelRouteResolver: Send + Sync {
         &self,
         slot: ModelSlot,
     ) -> Result<ResolvedModelRouteSnapshot, ModelRouteError>;
+
+    fn validate_model_route(
+        &self,
+        slot: ModelSlot,
+        route: &ModelRoute,
+    ) -> Result<ModelSelectionMode, ModelRouteError> {
+        let snapshot = self.resolve_model_route(slot)?;
+        if snapshot.route() == route {
+            Ok(snapshot.policy_mode())
+        } else {
+            Err(ModelRouteError::new(ModelRouteErrorKind::RouteNotApproved))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +343,20 @@ impl ModelRouteResolver for StaticModelRouteResolver {
             route.clone(),
             self.policy.mode(),
         ))
+    }
+
+    fn validate_model_route(
+        &self,
+        slot: ModelSlot,
+        route: &ModelRoute,
+    ) -> Result<ModelSelectionMode, ModelRouteError> {
+        if !self.routes.contains_key(&slot) {
+            return Err(ModelRouteError::new(ModelRouteErrorKind::RouteUnavailable));
+        }
+        if !self.policy.permits(route) {
+            return Err(ModelRouteError::new(ModelRouteErrorKind::RouteNotApproved));
+        }
+        Ok(self.policy.mode())
     }
 }
 

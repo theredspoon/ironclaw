@@ -7,7 +7,7 @@ use ironclaw_loop_support::{
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 
-use crate::model_routes::{ModelRouteError, ModelRouteResolver, ModelSlot};
+use crate::model_routes::{ModelRoute, ModelRouteError, ModelRouteResolver, ModelSlot};
 
 use ironclaw_turns::{
     CheckpointStateStore, GetCheckpointStateRequest, LoopCheckpointStore, PutLoopCheckpointRequest,
@@ -192,9 +192,6 @@ where
         &self,
         run_context: LoopRunContext,
     ) -> Result<LoopRunContext, RebornLoopDriverHostError> {
-        if run_context.resolved_model_route.is_some() {
-            return Ok(run_context);
-        }
         let Some(resolver) = &self.model_route_resolver else {
             return Ok(run_context);
         };
@@ -204,6 +201,17 @@ where
                 reason: "model profile is not supported by the model route resolver".to_string(),
             }
         })?;
+        if let Some(existing_snapshot) = &run_context.resolved_model_route {
+            let route = ModelRoute::new(
+                existing_snapshot.provider_id.clone(),
+                existing_snapshot.model_id.clone(),
+            )
+            .map_err(model_route_error_to_host_error)?;
+            resolver
+                .validate_model_route(slot, &route)
+                .map_err(model_route_error_to_host_error)?;
+            return Ok(run_context);
+        }
         let snapshot = resolver
             .resolve_model_route(slot)
             .map_err(model_route_error_to_host_error)?;

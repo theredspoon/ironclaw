@@ -11,7 +11,8 @@ use ironclaw_loop_support::{
     HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelRouteSnapshot,
 };
 use ironclaw_reborn::{
-    LlmModelProfilePolicy, LlmProviderModelGateway, ModelRoute, RoutedLlmProviderModelGateway,
+    LlmModelProfilePolicy, LlmProviderModelGateway, ModelRoute, ModelRouteProviderPool,
+    ModelSelectionMode, ModelSlot, ResolvedModelRouteSnapshot, RoutedLlmProviderModelGateway,
     StaticModelRouteProviderPool, ThreadBackedLoopModelGateway,
 };
 use ironclaw_threads::{
@@ -398,6 +399,28 @@ async fn provider_pool_rejects_route_bound_to_wrong_active_model() {
 }
 
 #[tokio::test]
+async fn provider_pool_revalidates_active_model_at_lookup_time() {
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let provider = Arc::new(MutableActiveModelProvider::new("qwen3-coder", "unused"));
+    let pool = StaticModelRouteProviderPool::new()
+        .with_provider(route.clone(), provider.clone())
+        .unwrap();
+    provider.set_active_model("other-model");
+    let snapshot = ResolvedModelRouteSnapshot::new(
+        ModelSlot::Default,
+        route,
+        ModelSelectionMode::DeveloperAnyConfigured,
+    );
+
+    let error = match pool.provider_for_route(&snapshot).await {
+        Ok(_) => panic!("mutated active model should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+}
+
+#[tokio::test]
 async fn routed_gateway_rejects_missing_route_snapshot_before_provider_call() {
     let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
     let provider = Arc::new(RecordingLlmProvider::reply_for_model(
@@ -631,6 +654,63 @@ fn model_request(model_profile_id: ModelProfileId) -> HostManagedModelRequest {
         resolved_model_route: None,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
+    }
+}
+
+struct MutableActiveModelProvider {
+    model_name: Mutex<String>,
+    content: String,
+    requests: Mutex<Vec<CompletionRequest>>,
+}
+
+impl MutableActiveModelProvider {
+    fn new(model_name: &str, content: &str) -> Self {
+        Self {
+            model_name: Mutex::new(model_name.to_string()),
+            content: content.to_string(),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_active_model(&self, model_name: &str) {
+        *self.model_name.lock().unwrap() = model_name.to_string();
+    }
+}
+
+#[async_trait]
+impl LlmProvider for MutableActiveModelProvider {
+    fn model_name(&self) -> &str {
+        "mutable-active-model-provider"
+    }
+
+    fn active_model_name(&self) -> String {
+        self.model_name.lock().unwrap().clone()
+    }
+
+    fn cost_per_token(&self) -> (Decimal, Decimal) {
+        (Decimal::ZERO, Decimal::ZERO)
+    }
+
+    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+        self.requests.lock().unwrap().push(request);
+        Ok(CompletionResponse {
+            content: self.content.clone(),
+            input_tokens: 1,
+            output_tokens: 1,
+            finish_reason: FinishReason::Stop,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        })
+    }
+
+    async fn complete_with_tools(
+        &self,
+        _request: ToolCompletionRequest,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        Err(LlmError::RequestFailed {
+            provider: "mutable".to_string(),
+            reason: "tool completion is not used by the loop support gateway".to_string(),
+        })
     }
 }
 

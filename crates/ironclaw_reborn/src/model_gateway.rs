@@ -226,7 +226,8 @@ impl ModelRouteProviderPool for StaticModelRouteProviderPool {
         &self,
         snapshot: &ResolvedModelRouteSnapshot,
     ) -> Result<Arc<dyn LlmProvider>, HostManagedModelError> {
-        self.providers
+        let provider = self
+            .providers
             .get(snapshot.provider_key())
             .cloned()
             .ok_or_else(|| {
@@ -234,7 +235,9 @@ impl ModelRouteProviderPool for StaticModelRouteProviderPool {
                     HostManagedModelErrorKind::PolicyDenied,
                     "model route provider is unavailable",
                 )
-            })
+            })?;
+        validate_provider_active_model_matches_route(snapshot.route(), provider.as_ref())?;
+        Ok(provider)
     }
 }
 
@@ -360,6 +363,22 @@ where
         return Err(HostManagedModelError::safe(
             HostManagedModelErrorKind::InvalidRequest,
             "model route provider active model does not match route",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_active_model_matches_route<P>(
+    route: &ModelRoute,
+    provider: &P,
+) -> Result<(), HostManagedModelError>
+where
+    P: LlmProvider + ?Sized,
+{
+    if provider.active_model_name() != route.model_id() {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "model route provider is unavailable",
         ));
     }
     Ok(())
