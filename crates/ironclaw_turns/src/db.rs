@@ -9,9 +9,9 @@ use crate::{
     PutLoopCheckpointRequest, ResolvedRunProfile, ResumeTurnRequest, ResumeTurnResponse,
     RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, SubmitTurnRequest,
     SubmitTurnResponse, TurnActiveLockRecord, TurnAdmissionLimitProvider, TurnAdmissionPolicy,
-    TurnAdmissionReservationRecord, TurnCheckpointRecord, TurnError, TurnIdempotencyRecord,
-    TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRecord, TurnRunRecord, TurnRunState,
-    TurnScope, TurnStateStore,
+    TurnAdmissionReservationRecord, TurnCheckpointId, TurnCheckpointRecord, TurnError,
+    TurnIdempotencyRecord, TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRecord, TurnRunId,
+    TurnRunRecord, TurnRunState, TurnScope, TurnStateStore,
     events::{EventCursor, TurnEventPage, TurnEventProjectionSource, project_turn_events},
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
@@ -85,6 +85,8 @@ CREATE TABLE IF NOT EXISTS turn_checkpoints (
     checkpoint_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     sequence INTEGER NOT NULL,
+    scope_key TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'before_block',
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_run ON turn_checkpoints(run_id, sequence);
@@ -165,6 +167,8 @@ CREATE TABLE IF NOT EXISTS turn_checkpoints (
     checkpoint_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     sequence BIGINT NOT NULL,
+    scope_key TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'before_block',
     payload JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_run ON turn_checkpoints(run_id, sequence);
@@ -248,6 +252,20 @@ impl LibSqlTurnStateStore {
         conn.execute_batch(LIBSQL_TURN_STATE_SCHEMA)
             .await
             .map_err(db_error)?;
+
+        // Migration: add new columns to existing turn_checkpoints tables.
+        // For libSQL, ALTER TABLE ADD COLUMN fails if the column already exists,
+        // so we ignore "duplicate column name" errors.
+        for alter in [
+            "ALTER TABLE turn_checkpoints ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE turn_checkpoints ADD COLUMN kind TEXT NOT NULL DEFAULT 'before_block'",
+        ] {
+            match conn.execute(alter, ()).await {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("duplicate column name") => {}
+                Err(e) => return Err(db_error(e)),
+            }
+        }
         Ok(())
     }
 
@@ -538,6 +556,56 @@ impl TurnRunTransitionPort for LibSqlTurnStateStore {
     }
 }
 
+#[cfg(feature = "libsql")]
+#[async_trait]
+impl LoopCheckpointStore for LibSqlTurnStateStore {
+    async fn put_loop_checkpoint(
+        &self,
+        record: TurnCheckpointRecord,
+    ) -> Result<(), TurnError> {
+        let conn = self.connect().await?;
+        let checkpoint_scope_key = record.scope.as_ref().map(scope_key).transpose()?.unwrap_or_default();
+        conn.execute(
+            "INSERT OR REPLACE INTO turn_checkpoints (checkpoint_id, run_id, sequence, scope_key, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params![
+                record.checkpoint_id.as_uuid().to_string(),
+                record.run_id.to_string(),
+                record.sequence as i64,
+                checkpoint_scope_key,
+                record.kind.as_str(),
+                to_json(&record)?,
+            ],
+        )
+        .await
+        .map_err(db_error)?;
+        Ok(())
+    }
+
+    async fn get_loop_checkpoint(
+        &self,
+        checkpoint_id: TurnCheckpointId,
+        run_id: TurnRunId,
+    ) -> Result<Option<TurnCheckpointRecord>, TurnError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT payload FROM turn_checkpoints WHERE checkpoint_id = ?1 AND run_id = ?2",
+                libsql::params![
+                    checkpoint_id.as_uuid().to_string(),
+                    run_id.to_string(),
+                ],
+            )
+            .await
+            .map_err(db_error)?;
+        let Some(row) = rows.next().await.map_err(db_error)? else {
+            return Ok(None);
+        };
+        let payload: String = row.get(0).map_err(db_error)?;
+        let record: TurnCheckpointRecord = serde_json::from_str(&payload).map_err(db_error)?;
+        Ok(Some(record))
+    }
+}
+
 #[cfg(feature = "postgres")]
 pub struct PostgresTurnStateStore {
     pool: deadpool_postgres::Pool,
@@ -572,6 +640,16 @@ impl PostgresTurnStateStore {
         let client = self.client().await?;
         client
             .batch_execute(POSTGRES_TURN_STATE_SCHEMA)
+            .await
+            .map_err(db_error)?;
+
+        // Migration: add new columns to existing turn_checkpoints tables.
+        // Postgres supports ADD COLUMN IF NOT EXISTS natively.
+        client
+            .batch_execute(
+                "ALTER TABLE turn_checkpoints ADD COLUMN IF NOT EXISTS scope_key TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE turn_checkpoints ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'before_block';",
+            )
             .await
             .map_err(db_error)?;
         Ok(())
@@ -841,6 +919,65 @@ impl TurnRunTransitionPort for PostgresTurnStateStore {
     }
 }
 
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl LoopCheckpointStore for PostgresTurnStateStore {
+    async fn put_loop_checkpoint(
+        &self,
+        record: TurnCheckpointRecord,
+    ) -> Result<(), TurnError> {
+        let client = self.client().await?;
+        let payload = to_json(&record)?;
+        let checkpoint_scope_key = record.scope.as_ref().map(scope_key).transpose()?.unwrap_or_default();
+        client
+            .execute(
+                "INSERT INTO turn_checkpoints (checkpoint_id, run_id, sequence, scope_key, kind, payload)
+                 VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                 ON CONFLICT (checkpoint_id) DO UPDATE SET
+                     run_id = EXCLUDED.run_id,
+                     sequence = EXCLUDED.sequence,
+                     scope_key = EXCLUDED.scope_key,
+                     kind = EXCLUDED.kind,
+                     payload = EXCLUDED.payload",
+                &[
+                    &record.checkpoint_id.as_uuid().to_string(),
+                    &record.run_id.to_string(),
+                    &(record.sequence as i64),
+                    &checkpoint_scope_key,
+                    &record.kind.as_str(),
+                    &payload,
+                ],
+            )
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    async fn get_loop_checkpoint(
+        &self,
+        checkpoint_id: TurnCheckpointId,
+        run_id: TurnRunId,
+    ) -> Result<Option<TurnCheckpointRecord>, TurnError> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "SELECT payload::text FROM turn_checkpoints WHERE checkpoint_id = $1 AND run_id = $2",
+                &[
+                    &checkpoint_id.as_uuid().to_string(),
+                    &run_id.to_string(),
+                ],
+            )
+            .await
+            .map_err(db_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: String = row.get(0);
+        let record: TurnCheckpointRecord = serde_json::from_str(&payload).map_err(db_error)?;
+        Ok(Some(record))
+    }
+}
+
 #[cfg(feature = "libsql")]
 async fn libsql_load_payloads<T>(conn: &libsql::Connection, sql: &str) -> Result<Vec<T>, TurnError>
 where
@@ -1011,11 +1148,13 @@ async fn libsql_replace_snapshot(
     }
     for record in &snapshot.checkpoints {
         conn.execute(
-            "INSERT INTO turn_checkpoints (checkpoint_id, run_id, sequence, payload) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO turn_checkpoints (checkpoint_id, run_id, sequence, scope_key, kind, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             libsql::params![
                 record.checkpoint_id.as_uuid().to_string(),
                 record.run_id.to_string(),
                 record.sequence as i64,
+                record.scope.as_ref().map(scope_key).transpose()?.unwrap_or_default(),
+                record.kind.as_str(),
                 to_json(record)?,
             ],
         )
@@ -1259,12 +1398,15 @@ async fn postgres_replace_snapshot(
     }
     for record in &snapshot.checkpoints {
         let payload = to_json(record)?;
+        let checkpoint_scope_key = record.scope.as_ref().map(scope_key).transpose()?.unwrap_or_default();
         txn.execute(
-            "INSERT INTO turn_checkpoints (checkpoint_id, run_id, sequence, payload) VALUES ($1, $2, $3, $4::jsonb)",
+            "INSERT INTO turn_checkpoints (checkpoint_id, run_id, sequence, scope_key, kind, payload) VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
             &[
                 &record.checkpoint_id.as_uuid().to_string(),
                 &record.run_id.to_string(),
                 &(record.sequence as i64),
+                &checkpoint_scope_key,
+                &record.kind.as_str(),
                 &payload,
             ],
         )
