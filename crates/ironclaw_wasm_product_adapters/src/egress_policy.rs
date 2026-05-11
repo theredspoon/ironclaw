@@ -55,6 +55,11 @@ impl EgressPolicy {
 
     pub fn check(&self, target: EgressPolicyTarget<'_>) -> Result<(), EgressPolicyError> {
         if !self.declared_hosts.contains(target.host.as_str()) {
+            tracing::warn!(
+                target: "ironclaw.product_adapter.egress",
+                host = %target.host.as_str(),
+                "product adapter egress denied: undeclared host"
+            );
             return Err(EgressPolicyError::UndeclaredHost {
                 host: target.host.as_str().to_string(),
             });
@@ -62,6 +67,12 @@ impl EgressPolicy {
         if let Some(handle) = target.credential_handle
             && !self.allowed_credential_handles.contains(handle.as_str())
         {
+            tracing::warn!(
+                target: "ironclaw.product_adapter.egress",
+                host = %target.host.as_str(),
+                credential_handle = %handle.as_str(),
+                "product adapter egress denied: unauthorized credential handle"
+            );
             return Err(EgressPolicyError::UnauthorizedCredentialHandle {
                 handle: handle.as_str().to_string(),
             });

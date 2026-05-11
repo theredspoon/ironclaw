@@ -43,10 +43,17 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_unix_seconds(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs(),
+            Err(error) => {
+                tracing::error!(
+                    target: "ironclaw.product_adapter.auth",
+                    %error,
+                    "system clock is before Unix epoch; webhook replay window fails closed"
+                );
+                0
+            }
+        }
     }
 }
 
@@ -146,13 +153,13 @@ impl WebhookAuthVerifier for HmacWebhookAuth {
         // Replay-window check before computing HMAC. Reject stale or
         // far-future timestamps; both are forgery attempts. The window is
         // symmetric: |now - ts| > max_age_secs => fail.
-        let Ok(timestamp_secs) = timestamp_str.parse::<i64>() else {
+        let Ok(timestamp_secs) = timestamp_str.parse::<i128>() else {
             return VerificationOutcome::Failed {
                 failure: ProtocolAuthFailure::Malformed,
             };
         };
-        let now_secs = self.clock.now_unix_seconds() as i64;
-        let max_age = self.max_age_secs as i64;
+        let now_secs = i128::from(self.clock.now_unix_seconds());
+        let max_age = i128::from(self.max_age_secs);
         let drift = (now_secs - timestamp_secs).abs();
         if drift > max_age {
             return VerificationOutcome::Failed {
@@ -214,16 +221,6 @@ impl WebhookAuthVerifier for SharedSecretHeaderAuth {
         VerificationOutcome::Verified {
             subject: self.subject.clone(),
         }
-    }
-}
-
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        let mut out = String::with_capacity(bytes.as_ref().len() * 2);
-        for byte in bytes.as_ref() {
-            out.push_str(&format!("{byte:02x}"));
-        }
-        out
     }
 }
 
@@ -435,6 +432,21 @@ mod tests {
                 assert!(matches!(failure, ProtocolAuthFailure::Other { .. }));
             }
             other => panic!("just-outside should fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_extreme_clock_without_wrapping() {
+        let secret = b"super-shared-secret".to_vec();
+        let timestamp = "0";
+        let body = b"{}";
+        let (_, headers) = build_signed_request(&secret, timestamp, body);
+        let verifier = verifier_at(u64::MAX, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Other { .. }));
+            }
+            other => panic!("extreme clock should fail closed, got {other:?}"),
         }
     }
 }
