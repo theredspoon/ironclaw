@@ -23,6 +23,17 @@ fn visible_trusted(name: &str, description: &str, prompt: &str) -> InstalledSkil
     }
 }
 
+fn visible_trusted_without_prompt(name: &str, description: &str) -> InstalledSkillSnapshot {
+    InstalledSkillSnapshot {
+        name: name.to_string(),
+        trust: SkillTrustLevel::Trusted,
+        visibility: SkillVisibility::Visible,
+        prompt_content: None,
+        safe_description: description.to_string(),
+        ordering_key: name.to_string(),
+    }
+}
+
 fn visible_installed(name: &str, description: &str) -> InstalledSkillSnapshot {
     InstalledSkillSnapshot {
         name: name.to_string(),
@@ -146,6 +157,18 @@ async fn installed_skill_excludes_prompt_content() {
 }
 
 #[tokio::test]
+async fn trusted_skill_without_prompt_uses_description_only() {
+    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted_without_prompt(
+        "alpha",
+        "the description",
+    )]);
+    let service = SkillContextService::new(snapshot.clone());
+    let snippets = service.skill_snippets(&snapshot).await.unwrap();
+    assert_eq!(snippets.len(), 1);
+    assert_eq!(snippets[0].safe_summary, "the description");
+}
+
+#[tokio::test]
 async fn deterministic_ordering_same_snapshot() {
     let snapshot = SkillRunSnapshot::from_entries(vec![
         visible_trusted("charlie", "desc c", "prompt c"),
@@ -206,6 +229,22 @@ async fn snapshot_version_determinism() {
 }
 
 #[tokio::test]
+async fn snapshot_version_uses_sha256_digest() {
+    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", "prompt")]);
+
+    assert!(
+        snapshot.snapshot_version.starts_with("sha256:"),
+        "snapshot version must use collision-resistant digest, got {}",
+        snapshot.snapshot_version
+    );
+    assert_eq!(
+        snapshot.snapshot_version.len(),
+        "sha256:".len() + 64,
+        "SHA-256 digest must be hex-encoded"
+    );
+}
+
+#[tokio::test]
 async fn tampered_snapshot_version_fails_closed() {
     let mut snapshot =
         SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", "prompt")]);
@@ -234,10 +273,30 @@ async fn aggregate_skill_context_fails_budget() {
         visible_trusted("beta", "second description", "second prompt"),
     ]);
     let service =
-        SkillContextService::with_budget(snapshot.clone(), SkillContextBudget::new(128, 64));
+        SkillContextService::with_budget(snapshot.clone(), SkillContextBudget::new(40, 64));
 
     let err = service.skill_snippets(&snapshot).await.unwrap_err();
     assert_eq!(err, SkillContextError::ContextBudgetExceeded);
+}
+
+#[tokio::test]
+async fn invalid_budget_configuration_is_distinct_from_exceeded_budget() {
+    for budget in [
+        SkillContextBudget::new(0, 64),
+        SkillContextBudget::new(64, 0),
+        SkillContextBudget::new(128, 64),
+    ] {
+        let snapshot =
+            SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", "prompt")]);
+        let service = SkillContextService::with_budget(snapshot.clone(), budget);
+
+        let err = service.skill_snippets(&snapshot).await.unwrap_err();
+        assert_eq!(
+            err,
+            SkillContextError::BudgetMisconfigured,
+            "misconfiguration {budget:?} must not be reported as a runtime budget overflow"
+        );
+    }
 }
 
 #[tokio::test]
@@ -260,6 +319,46 @@ async fn duplicate_ordering_keys_use_total_order() {
     assert_eq!(output_a, output_b);
     let refs: Vec<&str> = output_a.iter().map(|s| s.snippet_ref.as_str()).collect();
     assert_eq!(refs, vec!["skill:alpha", "skill:beta"]);
+}
+
+#[tokio::test]
+async fn unsafe_visible_metadata_fails_before_loop_snippet_emission() {
+    let cases = vec![
+        (
+            "unsafe name would leak through snippet_ref",
+            SkillRunSnapshot::from_entries(vec![visible_trusted(
+                "/Users/alice/.ssh/id_rsa",
+                "safe description",
+                "safe prompt",
+            )]),
+        ),
+        (
+            "unsafe description would leak through safe_summary",
+            SkillRunSnapshot::from_entries(vec![visible_trusted(
+                "alpha",
+                "raw capability handle cap_file_read_123",
+                "safe prompt",
+            )]),
+        ),
+        (
+            "unsafe trusted prompt would leak through safe_summary",
+            SkillRunSnapshot::from_entries(vec![visible_trusted(
+                "alpha",
+                "safe description",
+                "load secret://oauth-token",
+            )]),
+        ),
+    ];
+
+    for (case, snapshot) in cases {
+        let service = SkillContextService::new(snapshot.clone());
+        let err = service.skill_snippets(&snapshot).await.unwrap_err();
+        assert_eq!(
+            err,
+            SkillContextError::UnsafeModelVisibleContent,
+            "{case} must fail closed before model-visible snippet emission"
+        );
+    }
 }
 
 #[tokio::test]

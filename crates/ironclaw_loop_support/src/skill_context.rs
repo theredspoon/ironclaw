@@ -82,6 +82,10 @@ pub enum HostSkillContextBuildError {
     VisibilityDataMissing,
     #[error("skill context budget exceeded")]
     ContextBudgetExceeded,
+    #[error("skill context unsafe model-visible content")]
+    UnsafeModelVisibleContent,
+    #[error("skill context budget misconfigured")]
+    BudgetMisconfigured,
     #[error("skill context internal error")]
     Internal,
 }
@@ -91,11 +95,11 @@ impl HostSkillContextBuildError {
         let kind = match self {
             Self::SourceUnavailable => AgentLoopHostErrorKind::Unavailable,
             Self::ParseFailed => AgentLoopHostErrorKind::InvalidInvocation,
-            Self::TrustDataMissing | Self::VisibilityDataMissing => {
-                AgentLoopHostErrorKind::PolicyDenied
-            }
+            Self::TrustDataMissing
+            | Self::VisibilityDataMissing
+            | Self::UnsafeModelVisibleContent => AgentLoopHostErrorKind::PolicyDenied,
             Self::ContextBudgetExceeded => AgentLoopHostErrorKind::BudgetExceeded,
-            Self::Internal => AgentLoopHostErrorKind::Internal,
+            Self::BudgetMisconfigured | Self::Internal => AgentLoopHostErrorKind::Internal,
         };
         AgentLoopHostError::new(kind, self.to_string())
     }
@@ -194,6 +198,10 @@ fn skill_context_error_to_host_error(error: SkillContextError) -> AgentLoopHostE
         SkillContextError::ContextBudgetExceeded => {
             HostSkillContextBuildError::ContextBudgetExceeded
         }
+        SkillContextError::UnsafeModelVisibleContent => {
+            HostSkillContextBuildError::UnsafeModelVisibleContent
+        }
+        SkillContextError::BudgetMisconfigured => HostSkillContextBuildError::BudgetMisconfigured,
         SkillContextError::InvalidSnapshotVersion | SkillContextError::Internal => {
             HostSkillContextBuildError::Internal
         }

@@ -18,20 +18,22 @@
 //! # Fail-closed semantics
 //!
 //! If trust or visibility data is missing, the snapshot version does not match entries,
-//! or prompt content exceeds configured context budgets, the service returns an error rather
-//! than silently degrading. This ensures that an unconfigured or corrupt snapshot never leaks
-//! capabilities to the model.
+//! model-visible fields contain unsafe internal markers, or prompt content exceeds configured
+//! context budgets, the service returns an error rather than silently degrading. This ensures
+//! that an unconfigured or corrupt snapshot never leaks capabilities to the model.
 //!
 //! # Determinism
 //!
 //! Output ordering is deterministic for the same [`SkillRunSnapshot`]: entries are sorted by
 //! a total ordering rooted in [`InstalledSkillSnapshot::ordering_key`], and the snapshot
-//! version is a deterministic hash of all entry data.
+//! version is a deterministic SHA-256 content digest of all entry data. The digest verifies
+//! snapshot consistency, not producer authenticity; host trust decisions remain authoritative.
 
 use std::cmp::Ordering;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::LoopMessageRef;
@@ -60,6 +62,14 @@ pub enum SkillContextError {
     /// Snapshot version does not match the entry data.
     #[error("skill context: invalid snapshot version")]
     InvalidSnapshotVersion,
+
+    /// Snapshot content is not safe to expose to the model.
+    #[error("skill context: unsafe model-visible content")]
+    UnsafeModelVisibleContent,
+
+    /// Skill context budget configuration is invalid.
+    #[error("skill context: budget misconfigured")]
+    BudgetMisconfigured,
 
     /// Model-visible skill context exceeds configured context budgets.
     #[error("skill context: context budget exceeded")]
@@ -178,8 +188,10 @@ pub struct InstalledSkillSnapshot {
 
 /// Complete set of installed skill snapshots for a run.
 ///
-/// The `snapshot_version` is a deterministic hash of all entries, used to verify
-/// the service is reading the same entry data approved by the host.
+/// The `snapshot_version` is a deterministic SHA-256 content digest of all entries,
+/// used to verify the service is reading the same entry data approved by the host.
+/// It is not an authenticity proof; trusted hosts remain responsible for producing
+/// approved snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRunSnapshot {
     /// All installed skill entries for this run.
@@ -318,7 +330,7 @@ impl SkillContextSource for SkillContextService {
         // Re-sort here even though `from_entries` sorts, because snapshots may
         // have been constructed manually. Use total-order sorting so duplicate
         // ordering keys cannot make output depend on input order.
-        visible.sort_by(|a, b| compare_skill_entries(a, b));
+        visible.sort_by(compare_visible_skill_entries);
 
         let mut snippets = Vec::with_capacity(visible.len());
         let mut total_bytes = 0usize;
@@ -339,13 +351,16 @@ impl SkillContextSource for SkillContextService {
                 return Err(SkillContextError::ContextBudgetExceeded);
             }
 
+            validate_model_visible_skill_name(&entry.name)?;
+            validate_model_visible_text(&safe_summary)?;
+
             let snippet_ref = format!("skill:{}", entry.name);
-            total_bytes = total_bytes
-                .saturating_add(snippet_ref.len())
-                .saturating_add(safe_summary.len());
-            if total_bytes > self.budget.max_context_bytes {
-                return Err(SkillContextError::ContextBudgetExceeded);
-            }
+            total_bytes = checked_context_total_bytes(
+                total_bytes,
+                snippet_ref.len(),
+                safe_summary.len(),
+                self.budget.max_context_bytes,
+            )?;
 
             snippets.push(SkillContextSnippet {
                 snippet_ref,
@@ -469,10 +484,17 @@ fn validate_budget(budget: SkillContextBudget) -> Result<(), SkillContextError> 
         || budget.max_context_bytes == 0
         || budget.max_snippet_bytes > budget.max_context_bytes
     {
-        return Err(SkillContextError::ContextBudgetExceeded);
+        return Err(SkillContextError::BudgetMisconfigured);
     }
 
     Ok(())
+}
+
+fn compare_visible_skill_entries(
+    a: &&InstalledSkillSnapshot,
+    b: &&InstalledSkillSnapshot,
+) -> Ordering {
+    compare_skill_entries(a, b)
 }
 
 fn compare_skill_entries(a: &InstalledSkillSnapshot, b: &InstalledSkillSnapshot) -> Ordering {
@@ -500,44 +522,130 @@ const fn visibility_rank(visibility: SkillVisibility) -> u8 {
     }
 }
 
+fn validate_model_visible_skill_name(name: &str) -> Result<(), SkillContextError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    };
+
+    if !first.is_ascii_alphanumeric()
+        || name.len() > 64
+        || chars.any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')))
+    {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    }
+
+    Ok(())
+}
+
+fn validate_model_visible_text(text: &str) -> Result<(), SkillContextError> {
+    if text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        || contains_raw_host_path(text)
+        || contains_internal_handle_marker(text)
+    {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    }
+
+    Ok(())
+}
+
+fn contains_raw_host_path(text: &str) -> bool {
+    text.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+    })
+    .any(|token| {
+        token.starts_with("/Users/")
+            || token.starts_with("/home/")
+            || token.starts_with("/private/")
+            || token.starts_with("/tmp/") // safety: this is a blocked host-path prefix pattern, not a test temp path.
+            || token.starts_with("/var/")
+            || token.starts_with("/etc/")
+            || token.as_bytes().get(0..3).is_some_and(|prefix| {
+                prefix[0].is_ascii_alphabetic() && prefix[1] == b':' && prefix[2] == b'\\'
+            })
+    })
+}
+
+fn contains_internal_handle_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("cap_") || lower.contains("secret://") || lower.contains("secret:")
+}
+
+fn checked_context_total_bytes(
+    current_total: usize,
+    snippet_ref_bytes: usize,
+    safe_summary_bytes: usize,
+    max_context_bytes: usize,
+) -> Result<usize, SkillContextError> {
+    let next_total = current_total
+        .checked_add(snippet_ref_bytes)
+        .and_then(|total| total.checked_add(safe_summary_bytes))
+        .ok_or(SkillContextError::ContextBudgetExceeded)?;
+
+    if next_total > max_context_bytes {
+        return Err(SkillContextError::ContextBudgetExceeded);
+    }
+
+    Ok(next_total)
+}
+
 /// Compute a deterministic version string from sorted snapshot entries.
 ///
-/// Uses a simple FNV-1a-style hash over the concatenated field data.
-/// This hash is stable across runs of the same binary. It is not cryptographic
-/// and should not be used for security purposes.
+/// Uses a SHA-256 digest over length-prefixed field data. The digest is collision-resistant
+/// for consistency checks, but is not an authenticity proof or authorization decision.
 fn compute_snapshot_version(sorted_entries: &[InstalledSkillSnapshot]) -> String {
-    // FNV-1a 64-bit — stable, simple, no external dependency.
-    let mut hash = FNV_OFFSET;
+    let mut digest = Sha256::new();
 
     for entry in sorted_entries {
-        feed_hash(&mut hash, entry.name.as_bytes());
-        feed_hash(&mut hash, &[0xFF]); // separator
-        feed_hash(
-            &mut hash,
+        feed_digest_field(&mut digest, entry.name.as_bytes());
+        feed_digest_field(
+            &mut digest,
             match entry.trust {
                 SkillTrustLevel::Installed => b"installed",
                 SkillTrustLevel::Trusted => b"trusted",
             },
         );
-        feed_hash(&mut hash, &[0xFF]);
-        feed_hash(
-            &mut hash,
+        feed_digest_field(
+            &mut digest,
             match entry.visibility {
                 SkillVisibility::Visible => b"visible",
                 SkillVisibility::Hidden => b"hidden",
                 SkillVisibility::Denied => b"denied",
             },
         );
-        feed_hash(&mut hash, &[0xFF]);
-        if let Some(ref content) = entry.prompt_content {
-            feed_hash(&mut hash, content.as_bytes());
+        match entry.prompt_content {
+            Some(ref content) => {
+                digest.update([1]);
+                feed_digest_field(&mut digest, content.as_bytes());
+            }
+            None => digest.update([0]),
         }
-        feed_hash(&mut hash, &[0xFF]);
-        feed_hash(&mut hash, entry.safe_description.as_bytes());
-        feed_hash(&mut hash, &[0xFF]);
-        feed_hash(&mut hash, entry.ordering_key.as_bytes());
-        feed_hash(&mut hash, &[0xFE]); // entry separator
+        feed_digest_field(&mut digest, entry.safe_description.as_bytes());
+        feed_digest_field(&mut digest, entry.ordering_key.as_bytes());
+        digest.update([0xFE]);
     }
 
-    format!("v1:{hash:016x}")
+    format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
+fn feed_digest_field(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_byte_accumulator_reports_arithmetic_overflow() {
+        let err = checked_context_total_bytes(usize::MAX, 1, 0, usize::MAX).unwrap_err();
+        assert_eq!(err, SkillContextError::ContextBudgetExceeded);
+    }
 }
