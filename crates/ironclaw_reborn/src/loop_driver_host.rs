@@ -6,6 +6,9 @@ use ironclaw_loop_support::{
     ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
+
+use crate::model_routes::{ModelRouteError, ModelRouteResolver, ModelSlot};
+
 use ironclaw_turns::{
     CheckpointStateStore, GetCheckpointStateRequest, LoopCheckpointStore, PutLoopCheckpointRequest,
     RunProfileId, TurnCheckpointId, TurnError, TurnStatus,
@@ -69,6 +72,7 @@ where
     thread_service: Arc<S>,
     thread_scope: ThreadScope,
     model_gateway: Arc<G>,
+    model_route_resolver: Option<Arc<dyn ModelRouteResolver>>,
     checkpoint_state_store: Arc<dyn CheckpointStateStore>,
     loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
@@ -93,11 +97,21 @@ where
             thread_service,
             thread_scope,
             model_gateway,
+            model_route_resolver: None,
             checkpoint_state_store,
             loop_checkpoint_store,
             milestone_sink,
             config,
         }
+    }
+
+    pub fn with_model_route_resolver<R>(mut self, resolver: Arc<R>) -> Self
+    where
+        R: ModelRouteResolver + 'static,
+    {
+        let resolver: Arc<dyn ModelRouteResolver> = resolver;
+        self.model_route_resolver = Some(resolver);
+        self
     }
 
     pub async fn build_text_only_host(
@@ -108,7 +122,7 @@ where
         validate_thread_scope(&self.thread_scope, &request.loop_run_context)?;
 
         let max_messages = self.config.max_messages.max(1);
-        let run_context = request.loop_run_context;
+        let run_context = self.attach_model_route_snapshot(request.loop_run_context)?;
         let context: Arc<dyn LoopContextPort> = Arc::new(ThreadBackedLoopContextPort::new(
             Arc::clone(&self.thread_service),
             self.thread_scope.clone(),
@@ -172,6 +186,28 @@ where
             transcript,
             progress,
         })
+    }
+
+    fn attach_model_route_snapshot(
+        &self,
+        run_context: LoopRunContext,
+    ) -> Result<LoopRunContext, RebornLoopDriverHostError> {
+        if run_context.resolved_model_route.is_some() {
+            return Ok(run_context);
+        }
+        let Some(resolver) = &self.model_route_resolver else {
+            return Ok(run_context);
+        };
+        let model_profile_id = &run_context.resolved_run_profile.model_profile_id;
+        let slot = ModelSlot::from_model_profile_id(model_profile_id).ok_or_else(|| {
+            RebornLoopDriverHostError::InvalidRequest {
+                reason: "model profile is not supported by the model route resolver".to_string(),
+            }
+        })?;
+        let snapshot = resolver
+            .resolve_model_route(slot)
+            .map_err(model_route_error_to_host_error)?;
+        Ok(run_context.with_resolved_model_route(snapshot.to_loop_model_route_snapshot()))
     }
 }
 
@@ -570,6 +606,12 @@ where
                 as Box<dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync>
         })
         .map_err(|error| crate::turn_runner::HostFactoryError::new(error.to_string()))
+    }
+}
+
+fn model_route_error_to_host_error(error: ModelRouteError) -> RebornLoopDriverHostError {
+    RebornLoopDriverHostError::InvalidRequest {
+        reason: format!("model route resolution failed: {}", error.kind()),
     }
 }
 

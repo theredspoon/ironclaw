@@ -11,10 +11,8 @@ use ironclaw_loop_support::{
     HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelRouteSnapshot,
 };
 use ironclaw_reborn::{
-    LlmModelProfilePolicy, LlmProviderModelGateway, ModelRoute, ModelRouteError, ModelRoutePolicy,
-    ModelRouteResolver, ModelSelectionMode, ModelSlot, ResolvedModelRouteSnapshot,
-    RoutedLlmProviderModelGateway, StaticModelRouteProviderPool, StaticModelRouteResolver,
-    ThreadBackedLoopModelGateway,
+    LlmModelProfilePolicy, LlmProviderModelGateway, ModelRoute, RoutedLlmProviderModelGateway,
+    StaticModelRouteProviderPool, ThreadBackedLoopModelGateway,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
@@ -351,12 +349,15 @@ async fn routed_gateway_uses_provider_pool_route_not_request_model_override() {
         "gpt-4.1",
         "routed response",
     ));
-    let resolver = developer_route_resolver(route.clone());
     let pool = provider_pool_for_route(route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+    let gateway = RoutedLlmProviderModelGateway::new(pool);
 
     let response = gateway
-        .stream_model(model_request(interactive_model()))
+        .stream_model(model_request_with_route(
+            interactive_model(),
+            "rig-openai",
+            "gpt-4.1",
+        ))
         .await
         .unwrap();
 
@@ -397,55 +398,42 @@ async fn provider_pool_rejects_route_bound_to_wrong_active_model() {
 }
 
 #[tokio::test]
-async fn routed_gateway_caches_resolved_route_for_same_run_when_request_lacks_snapshot() {
-    let first_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
-    let replacement_route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
-    let first_provider = Arc::new(ReusableLlmProvider::new("qwen3-coder", "first route"));
-    let replacement_provider = Arc::new(ReusableLlmProvider::new(
-        "anthropic/claude-sonnet-4",
-        "replacement route",
+async fn routed_gateway_rejects_missing_route_snapshot_before_provider_call() {
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
+        "qwen3-coder",
+        "unused",
     ));
-    let resolver = Arc::new(MutableModelRouteResolver::new(first_route.clone()));
-    let pool = Arc::new(
-        StaticModelRouteProviderPool::new()
-            .with_provider(first_route, first_provider.clone())
-            .unwrap()
-            .with_provider(replacement_route.clone(), replacement_provider.clone())
-            .unwrap(),
-    );
-    let gateway = RoutedLlmProviderModelGateway::new(resolver.clone(), pool);
-    let request = model_request(interactive_model());
+    let pool = provider_pool_for_route(route, provider.clone());
+    let gateway = RoutedLlmProviderModelGateway::new(pool);
 
-    let first = gateway.stream_model(request.clone()).await.unwrap();
-    resolver.set_route(replacement_route);
-    let second = gateway.stream_model(request).await.unwrap();
+    let error = gateway
+        .stream_model(model_request(interactive_model()))
+        .await
+        .unwrap_err();
 
-    assert_eq!(first.safe_text_deltas, vec!["first route".to_string()]);
-    assert_eq!(second.safe_text_deltas, vec!["first route".to_string()]);
-    assert_eq!(first_provider.request_count(), 2);
-    assert_eq!(replacement_provider.request_count(), 0);
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+    assert!(provider.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn routed_gateway_uses_request_route_snapshot_over_current_resolver_route() {
-    let stale_current_route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
-    let snapshot_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+async fn routed_gateway_uses_request_route_snapshot() {
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
     let provider = Arc::new(RecordingLlmProvider::reply_for_model(
         "qwen3-coder",
         "snapshot response",
     ));
-    let resolver = developer_route_resolver(stale_current_route);
-    let pool = provider_pool_for_route(snapshot_route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+    let pool = provider_pool_for_route(route, provider.clone());
+    let gateway = RoutedLlmProviderModelGateway::new(pool);
 
-    let mut request = model_request(interactive_model());
-    request.resolved_model_route = Some(HostManagedModelRouteSnapshot::new(
-        "nearai",
-        "qwen3-coder",
-        "config:default",
-        "auth:default",
-    ));
-    let response = gateway.stream_model(request).await.unwrap();
+    let response = gateway
+        .stream_model(model_request_with_route(
+            interactive_model(),
+            "nearai",
+            "qwen3-coder",
+        ))
+        .await
+        .unwrap();
 
     assert_eq!(
         response.safe_text_deltas,
@@ -460,35 +448,15 @@ async fn routed_gateway_rejects_unsupported_non_default_model_profile() {
         "qwen3-coder",
         "unused",
     ));
-    let resolver = developer_route_resolver(route.clone());
     let pool = provider_pool_for_route(route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
+    let gateway = RoutedLlmProviderModelGateway::new(pool);
 
     let error = gateway
-        .stream_model(model_request(ModelProfileId::new("mission_model").unwrap()))
-        .await
-        .unwrap_err();
-
-    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
-    assert!(provider.requests.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn routed_gateway_rejects_managed_unapproved_route_before_provider_call() {
-    let route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
-    let provider = Arc::new(RecordingLlmProvider::reply_for_model(
-        "anthropic/claude-sonnet-4",
-        "unused",
-    ));
-    let resolver = route_resolver(
-        ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly),
-        route.clone(),
-    );
-    let pool = provider_pool_for_route(route, provider.clone());
-    let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
-
-    let error = gateway
-        .stream_model(model_request(interactive_model()))
+        .stream_model(model_request_with_route(
+            ModelProfileId::new("mission_model").unwrap(),
+            "nearai",
+            "qwen3-coder",
+        ))
         .await
         .unwrap_err();
 
@@ -565,17 +533,6 @@ fn interactive_model() -> ModelProfileId {
     ModelProfileId::new("interactive_model").unwrap()
 }
 
-fn developer_route_resolver(route: ModelRoute) -> Arc<StaticModelRouteResolver> {
-    route_resolver(
-        ModelRoutePolicy::new(ModelSelectionMode::DeveloperAnyConfigured),
-        route,
-    )
-}
-
-fn route_resolver(policy: ModelRoutePolicy, route: ModelRoute) -> Arc<StaticModelRouteResolver> {
-    Arc::new(StaticModelRouteResolver::new(policy).with_route(ModelSlot::Default, route))
-}
-
 fn provider_pool_for_route<P>(
     route: ModelRoute,
     provider: Arc<P>,
@@ -638,6 +595,21 @@ fn host_managed_model_request_rejects_invalid_legacy_identity_strings() {
     assert!(serde_json::from_value::<HostManagedModelRequest>(wire).is_err());
 }
 
+fn model_request_with_route(
+    model_profile_id: ModelProfileId,
+    provider_id: &str,
+    model_id: &str,
+) -> HostManagedModelRequest {
+    let mut request = model_request(model_profile_id);
+    request.resolved_model_route = Some(HostManagedModelRouteSnapshot::new(
+        provider_id,
+        model_id,
+        "config:default",
+        "auth:default",
+    ));
+    request
+}
+
 fn model_request(model_profile_id: ModelProfileId) -> HostManagedModelRequest {
     HostManagedModelRequest {
         model_profile_id,
@@ -659,88 +631,6 @@ fn model_request(model_profile_id: ModelProfileId) -> HostManagedModelRequest {
         resolved_model_route: None,
         run_id: TurnRunId::new(),
         turn_id: TurnId::new(),
-    }
-}
-
-struct MutableModelRouteResolver {
-    route: Mutex<ModelRoute>,
-}
-
-impl MutableModelRouteResolver {
-    fn new(route: ModelRoute) -> Self {
-        Self {
-            route: Mutex::new(route),
-        }
-    }
-
-    fn set_route(&self, route: ModelRoute) {
-        *self.route.lock().unwrap() = route;
-    }
-}
-
-impl ModelRouteResolver for MutableModelRouteResolver {
-    fn resolve_model_route(
-        &self,
-        slot: ModelSlot,
-    ) -> Result<ResolvedModelRouteSnapshot, ModelRouteError> {
-        Ok(ResolvedModelRouteSnapshot::new(
-            slot,
-            self.route.lock().unwrap().clone(),
-            ModelSelectionMode::DeveloperAnyConfigured,
-        ))
-    }
-}
-
-struct ReusableLlmProvider {
-    model_name: String,
-    content: String,
-    requests: Mutex<Vec<CompletionRequest>>,
-}
-
-impl ReusableLlmProvider {
-    fn new(model_name: &str, content: &str) -> Self {
-        Self {
-            model_name: model_name.to_string(),
-            content: content.to_string(),
-            requests: Mutex::new(Vec::new()),
-        }
-    }
-
-    fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
-    }
-}
-
-#[async_trait]
-impl LlmProvider for ReusableLlmProvider {
-    fn model_name(&self) -> &str {
-        &self.model_name
-    }
-
-    fn cost_per_token(&self) -> (Decimal, Decimal) {
-        (Decimal::ZERO, Decimal::ZERO)
-    }
-
-    async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        self.requests.lock().unwrap().push(request);
-        Ok(CompletionResponse {
-            content: self.content.clone(),
-            input_tokens: 1,
-            output_tokens: 1,
-            finish_reason: FinishReason::Stop,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        })
-    }
-
-    async fn complete_with_tools(
-        &self,
-        _request: ToolCompletionRequest,
-    ) -> Result<ToolCompletionResponse, LlmError> {
-        Err(LlmError::RequestFailed {
-            provider: "reusable".to_string(),
-            reason: "tool completion is not used by the loop support gateway".to_string(),
-        })
     }
 }
 

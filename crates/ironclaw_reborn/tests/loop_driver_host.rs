@@ -8,7 +8,8 @@ use ironclaw_loop_support::{
     HostManagedModelResponse,
 };
 use ironclaw_reborn::{
-    RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
+    ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornLoopDriverHostFactory,
+    RebornLoopDriverHostRequest, StaticModelRouteResolver, TextOnlyLoopHostConfig,
     driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
     turn_runner::{HostFactory, TurnRunnerWakeReceiver, TurnRunnerWorker, TurnRunnerWorkerConfig},
 };
@@ -370,6 +371,46 @@ async fn text_only_host_factory_implements_turn_runner_host_factory() {
         .await
         .unwrap();
     assert_eq!(context.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
+    let fixture = HostFixture::new("thread-host-model-route", "hello routed host").await;
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, route),
+    );
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    let snapshot = host_dyn
+        .run_context()
+        .resolved_model_route
+        .clone()
+        .expect("factory should attach model route snapshot");
+
+    host_dyn
+        .stream_model(LoopModelRequest {
+            messages: Vec::new(),
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].resolved_model_route, Some(snapshot));
 }
 
 #[tokio::test]

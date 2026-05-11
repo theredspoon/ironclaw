@@ -2,6 +2,8 @@ use std::{collections::HashMap, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
+use ironclaw_turns::run_profile::{LoopModelRouteSnapshot, ModelProfileId};
+
 const DEFAULT_CONFIG_VERSION: &str = "config:default";
 const DEFAULT_AUTH_VERSION: &str = "auth:default";
 const FORBIDDEN_ROUTE_MARKERS: &[&str] = &[
@@ -26,6 +28,13 @@ impl ModelSlot {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+        }
+    }
+
+    pub fn from_model_profile_id(model_profile_id: &ModelProfileId) -> Option<Self> {
+        match model_profile_id.as_str() {
+            "default" | "default_model" | "interactive_model" => Some(Self::Default),
+            _ => None,
         }
     }
 }
@@ -261,6 +270,15 @@ impl ResolvedModelRouteSnapshot {
 
     pub fn source(&self) -> ModelRouteSource {
         self.source
+    }
+
+    pub fn to_loop_model_route_snapshot(&self) -> LoopModelRouteSnapshot {
+        LoopModelRouteSnapshot::new(
+            self.provider_key.route().provider_id(),
+            self.provider_key.route().model_id(),
+            self.provider_key.config_version(),
+            self.provider_key.auth_version(),
+        )
     }
 }
 
