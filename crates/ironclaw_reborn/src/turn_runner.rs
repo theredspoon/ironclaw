@@ -8,7 +8,7 @@
 //! # Architecture boundary
 //!
 //! `ironclaw_turns` owns `TurnRunTransitionPort`, claim/heartbeat/transition
-//! DTOs, state-machine invariants, and the `apply_loop_exit` helper.
+//! DTOs, state-machine invariants, and the trusted `LoopExitApplier`.
 //!
 //! This module owns the concrete worker loop, driver registry lookup, host
 //! factory, readiness/config, and worker lifecycle.

@@ -1,8 +1,7 @@
-//! Trusted `LoopExit` applier for the Reborn turn-runner composition.
+//! Trusted `LoopExit` applier adapters for the Reborn turn-runner composition.
 //!
-//! `LoopExit` is a driver claim. The applier derives trust policy from
-//! evidence ports owned by the runner/host composition, validates the claim,
-//! and applies only the validated mapping through the turn transition port.
+//! `ironclaw_turns` owns the trusted applier and the private validation policy.
+//! This module provides Reborn-specific evidence adapters.
 
 use std::sync::Arc;
 
@@ -10,265 +9,18 @@ use async_trait::async_trait;
 use ironclaw_threads::{
     MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadMessageId, ThreadScope,
 };
-use ironclaw_turns::{
-    LoopBlocked, LoopCheckpointKind, LoopExit, LoopExitInvalidHandling, LoopExitValidationPolicy,
-    LoopFailed, LoopMessageRef, LoopResultRef, ResolvedRunProfile, TurnCheckpointId, TurnError,
-    TurnId, TurnRunId, TurnRunState, TurnScope,
-    runner::{ApplyValidatedLoopExitRequest, ClaimedTurnRun, TurnRunTransitionPort},
+use ironclaw_turns::{LoopCheckpointKind, LoopMessageRef, TurnError, TurnId, TurnRunId, TurnScope};
+
+pub use ironclaw_turns::loop_exit::{
+    BlockedEvidenceRequest, CompletionEvidenceRequest, FailureEvidenceRequest,
+    FinalCheckpointEvidenceRequest, LoopExitApplier, LoopExitEvidencePort,
 };
 
-/// Evidence request for completion refs returned by a driver.
-#[derive(Debug, Clone)]
-pub struct CompletionEvidenceRequest<'a> {
-    pub scope: &'a TurnScope,
-    pub turn_id: TurnId,
-    pub run_id: TurnRunId,
-    pub reply_message_refs: &'a [LoopMessageRef],
-    pub result_refs: &'a [LoopResultRef],
-}
-
-/// Evidence request for a terminal final checkpoint.
-#[derive(Debug, Clone)]
-pub struct FinalCheckpointEvidenceRequest<'a> {
-    pub scope: &'a TurnScope,
-    pub turn_id: TurnId,
-    pub run_id: TurnRunId,
-    pub checkpoint_id: &'a TurnCheckpointId,
-}
-
-/// Evidence request for a blocked loop exit.
-#[derive(Debug, Clone)]
-pub struct BlockedEvidenceRequest<'a> {
-    pub scope: &'a TurnScope,
-    pub turn_id: TurnId,
-    pub run_id: TurnRunId,
-    pub blocked: &'a LoopBlocked,
-}
-
-/// Evidence request for a failed loop exit.
-#[derive(Debug, Clone)]
-pub struct FailureEvidenceRequest<'a> {
-    pub scope: &'a TurnScope,
-    pub turn_id: TurnId,
-    pub run_id: TurnRunId,
-    pub failed: &'a LoopFailed,
-}
-
-/// Read-only durable evidence port used to validate driver-owned claims.
-#[async_trait]
-pub trait LoopExitEvidencePort: Send + Sync {
-    async fn verify_completion_refs(
-        &self,
-        request: CompletionEvidenceRequest<'_>,
-    ) -> Result<bool, TurnError>;
-
-    async fn verify_final_checkpoint(
-        &self,
-        request: FinalCheckpointEvidenceRequest<'_>,
-    ) -> Result<bool, TurnError>;
-
-    async fn verify_blocked_evidence(
-        &self,
-        request: BlockedEvidenceRequest<'_>,
-    ) -> Result<bool, TurnError>;
-
-    async fn verify_failure_evidence(
-        &self,
-        request: FailureEvidenceRequest<'_>,
-    ) -> Result<bool, TurnError>;
-
-    async fn is_cancellation_observed(
-        &self,
-        scope: &TurnScope,
-        turn_id: TurnId,
-        run_id: TurnRunId,
-    ) -> Result<bool, TurnError>;
-
-    async fn latest_checkpoint_kind(
-        &self,
-        scope: &TurnScope,
-        turn_id: TurnId,
-        run_id: TurnRunId,
-    ) -> Result<Option<LoopCheckpointKind>, TurnError>;
-}
-
-/// Trusted loop-exit applier used by `TurnRunnerWorker`.
-pub struct LoopExitApplier {
-    transition_port: Arc<dyn TurnRunTransitionPort>,
-    evidence_port: Arc<dyn LoopExitEvidencePort>,
-}
-
-impl LoopExitApplier {
-    pub fn new(
-        transition_port: Arc<dyn TurnRunTransitionPort>,
-        evidence_port: Arc<dyn LoopExitEvidencePort>,
-    ) -> Self {
-        Self {
-            transition_port,
-            evidence_port,
-        }
-    }
-
-    /// Derive policy from durable evidence, validate the exit, and apply the
-    /// validated transition under the claimed run's lease.
-    pub async fn apply(
-        &self,
-        claimed: &ClaimedTurnRun,
-        exit: LoopExit,
-    ) -> Result<TurnRunState, TurnError> {
-        let policy = self.derive_policy(claimed, &exit).await?;
-        let decision = exit.validate(policy);
-        self.transition_port
-            .apply_validated_loop_exit(ApplyValidatedLoopExitRequest {
-                run_id: claimed.state.run_id,
-                runner_id: claimed.runner_id,
-                lease_token: claimed.lease_token,
-                mapping: decision.mapping,
-            })
-            .await
-    }
-
-    async fn derive_policy(
-        &self,
-        claimed: &ClaimedTurnRun,
-        exit: &LoopExit,
-    ) -> Result<LoopExitValidationPolicy, TurnError> {
-        let scope = &claimed.state.scope;
-        let turn_id = claimed.state.turn_id;
-        let run_id = claimed.state.run_id;
-        let profile = &claimed.resolved_run_profile;
-        let mut policy = LoopExitValidationPolicy {
-            require_final_checkpoint: profile.checkpoint_policy.require_final_checkpoint,
-            allow_no_reply_completion: profile.checkpoint_policy.allow_no_reply_completion,
-            final_checkpoint_verified: false,
-            host_cancellation_observed: false,
-            invalid_handling: self.invalid_handling(scope, turn_id, run_id).await?,
-            completion_refs_verified: false,
-            blocked_evidence_verified: false,
-            failure_evidence_verified: false,
-        };
-
-        match exit {
-            LoopExit::Completed(completed) => {
-                policy.completion_refs_verified = self
-                    .evidence_port
-                    .verify_completion_refs(CompletionEvidenceRequest {
-                        scope,
-                        turn_id,
-                        run_id,
-                        reply_message_refs: &completed.reply_message_refs,
-                        result_refs: &completed.result_refs,
-                    })
-                    .await?;
-                policy.final_checkpoint_verified = self
-                    .verify_terminal_final_checkpoint(
-                        scope,
-                        turn_id,
-                        run_id,
-                        profile,
-                        completed.final_checkpoint_id.as_ref(),
-                    )
-                    .await?;
-            }
-            LoopExit::Blocked(blocked) => {
-                policy.blocked_evidence_verified = self
-                    .evidence_port
-                    .verify_blocked_evidence(BlockedEvidenceRequest {
-                        scope,
-                        turn_id,
-                        run_id,
-                        blocked,
-                    })
-                    .await?;
-            }
-            LoopExit::Cancelled(cancelled) => {
-                policy.host_cancellation_observed = self
-                    .evidence_port
-                    .is_cancellation_observed(scope, turn_id, run_id)
-                    .await?;
-                policy.final_checkpoint_verified = self
-                    .verify_terminal_final_checkpoint(
-                        scope,
-                        turn_id,
-                        run_id,
-                        profile,
-                        cancelled.checkpoint_id.as_ref(),
-                    )
-                    .await?;
-            }
-            LoopExit::Failed(failed) => {
-                policy.failure_evidence_verified = self
-                    .evidence_port
-                    .verify_failure_evidence(FailureEvidenceRequest {
-                        scope,
-                        turn_id,
-                        run_id,
-                        failed,
-                    })
-                    .await?;
-                policy.final_checkpoint_verified = self
-                    .verify_terminal_final_checkpoint(
-                        scope,
-                        turn_id,
-                        run_id,
-                        profile,
-                        failed.checkpoint_id.as_ref(),
-                    )
-                    .await?;
-            }
-        }
-
-        Ok(policy)
-    }
-
-    async fn verify_terminal_final_checkpoint(
-        &self,
-        scope: &TurnScope,
-        turn_id: TurnId,
-        run_id: TurnRunId,
-        profile: &ResolvedRunProfile,
-        checkpoint_id: Option<&TurnCheckpointId>,
-    ) -> Result<bool, TurnError> {
-        if !profile.checkpoint_policy.require_final_checkpoint {
-            return Ok(true);
-        }
-        let Some(checkpoint_id) = checkpoint_id else {
-            return Ok(false);
-        };
-        self.evidence_port
-            .verify_final_checkpoint(FinalCheckpointEvidenceRequest {
-                scope,
-                turn_id,
-                run_id,
-                checkpoint_id,
-            })
-            .await
-    }
-
-    async fn invalid_handling(
-        &self,
-        scope: &TurnScope,
-        turn_id: TurnId,
-        run_id: TurnRunId,
-    ) -> Result<LoopExitInvalidHandling, TurnError> {
-        match self
-            .evidence_port
-            .latest_checkpoint_kind(scope, turn_id, run_id)
-            .await?
-        {
-            Some(
-                LoopCheckpointKind::BeforeSideEffect
-                | LoopCheckpointKind::BeforeBlock
-                | LoopCheckpointKind::Final,
-            ) => Ok(LoopExitInvalidHandling::RecoveryRequired),
-            Some(LoopCheckpointKind::BeforeModel) | None => {
-                Ok(LoopExitInvalidHandling::FailTerminal)
-            }
-        }
-    }
-}
-
 /// Strict test/local evidence port. Defaults to distrust everything.
+///
+/// Production builds expose only the distrust-by-default constructor; permissive
+/// evidence mutators are test-gated so production code cannot mint fully trusted
+/// loop-exit evidence through this in-memory adapter.
 #[derive(Debug, Clone)]
 pub struct InMemoryLoopExitEvidencePort {
     completion_refs_verified: bool,
@@ -291,6 +43,7 @@ impl InMemoryLoopExitEvidencePort {
         }
     }
 
+    #[cfg(test)]
     pub fn all_verified() -> Self {
         Self::new()
             .with_completion_refs_verified(true)
@@ -300,31 +53,37 @@ impl InMemoryLoopExitEvidencePort {
             .with_cancellation_observed(true)
     }
 
+    #[cfg(test)]
     pub fn with_completion_refs_verified(mut self, verified: bool) -> Self {
         self.completion_refs_verified = verified;
         self
     }
 
+    #[cfg(test)]
     pub fn with_final_checkpoint_verified(mut self, verified: bool) -> Self {
         self.final_checkpoint_verified = verified;
         self
     }
 
+    #[cfg(test)]
     pub fn with_blocked_evidence_verified(mut self, verified: bool) -> Self {
         self.blocked_evidence_verified = verified;
         self
     }
 
+    #[cfg(test)]
     pub fn with_failure_evidence_verified(mut self, verified: bool) -> Self {
         self.failure_evidence_verified = verified;
         self
     }
 
+    #[cfg(test)]
     pub fn with_cancellation_observed(mut self, observed: bool) -> Self {
         self.cancellation_observed = observed;
         self
     }
 
+    #[cfg(test)]
     pub fn with_latest_checkpoint_kind(mut self, kind: Option<LoopCheckpointKind>) -> Self {
         self.latest_checkpoint_kind = kind;
         self

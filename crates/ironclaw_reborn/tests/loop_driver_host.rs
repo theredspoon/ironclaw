@@ -10,6 +10,7 @@ use ironclaw_loop_support::{
 use ironclaw_reborn::{
     RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
     driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
+    loop_exit_applier::{LoopExitApplier, ThreadCheckpointLoopExitEvidencePort},
     turn_runner::{HostFactory, TurnRunnerWakeReceiver, TurnRunnerWorker, TurnRunnerWorkerConfig},
 };
 use ironclaw_threads::{
@@ -24,11 +25,10 @@ use ironclaw_turns::{
     InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryRunProfileResolver,
     InMemoryTurnStateStore, InMemoryTurnStateStoreLimits, LoopCheckpointRecord,
     LoopCheckpointStore, LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId,
-    LoopExitInvalidHandling, LoopExitValidationPolicy, PutCheckpointStateRequest,
-    PutLoopCheckpointRequest, ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest,
-    RunProfileResolver, RunProfileVersion, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse,
-    TurnActor, TurnError, TurnLeaseToken, TurnRunId, TurnRunnerId, TurnScope, TurnStateStore,
-    TurnStatus,
+    PutCheckpointStateRequest, PutLoopCheckpointRequest, ReplyTargetBindingRef, RunProfileId,
+    RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnError, TurnLeaseToken, TurnRunId,
+    TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopDriverHost, AgentLoopHostErrorKind, CapabilityDeniedReasonKind,
         CapabilityInputRef, CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
@@ -190,9 +190,9 @@ async fn turn_runner_worker_drives_full_text_only_model_transcript_completion_af
             heartbeat_interval: std::time::Duration::from_millis(20),
             poll_interval: std::time::Duration::from_millis(10),
             scope_filter: Some(fixture.context.scope.clone()),
-            exit_validation_policy: trusted_completion_refs_policy_for_test(),
         },
         turn_store.clone(),
+        loop_exit_applier_for_fixture(&fixture, turn_store.clone()),
         Arc::new(registry),
         Arc::new(fixture.factory_with_loop_checkpoint_store(turn_store.clone())),
         wake_receiver,
@@ -303,9 +303,9 @@ async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_clai
             heartbeat_interval: std::time::Duration::from_millis(20),
             poll_interval: std::time::Duration::from_millis(10),
             scope_filter: Some(fixture.context.scope.clone()),
-            exit_validation_policy: trusted_completion_refs_policy_for_test(),
         },
         turn_store.clone(),
+        loop_exit_applier_for_fixture(&fixture, turn_store.clone()),
         Arc::new(registry),
         Arc::new(rejecting_factory),
         wake_receiver,
@@ -958,15 +958,16 @@ fn driver_host_error(
     }
 }
 
-fn trusted_completion_refs_policy_for_test() -> LoopExitValidationPolicy {
-    LoopExitValidationPolicy {
-        require_final_checkpoint: false,
-        host_cancellation_observed: false,
-        invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-        completion_refs_verified: true,
-        blocked_evidence_verified: false,
-        failure_evidence_verified: false,
-    }
+fn loop_exit_applier_for_fixture(
+    fixture: &HostFixture,
+    turn_store: Arc<InMemoryTurnStateStore>,
+) -> Arc<LoopExitApplier> {
+    let loop_checkpoint_store: Arc<dyn LoopCheckpointStore> = turn_store.clone();
+    let evidence = Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
+        Arc::clone(&fixture.thread_service),
+        loop_checkpoint_store,
+    ));
+    Arc::new(LoopExitApplier::new(turn_store, evidence))
 }
 
 async fn queue_fixture_turn(

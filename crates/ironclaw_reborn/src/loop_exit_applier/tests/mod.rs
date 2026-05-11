@@ -150,6 +150,31 @@ async fn cancelled_exit_requires_observed_cancel_input() {
 }
 
 #[tokio::test]
+async fn observed_host_cancellation_can_preempt_final_checkpoint() {
+    let mut claimed = claimed_run();
+    claimed
+        .resolved_run_profile
+        .checkpoint_policy
+        .require_final_checkpoint = true;
+    let transition = Arc::new(RecordingTransitionPort::new());
+    let applier = Arc::new(LoopExitApplier::new(
+        transition,
+        Arc::new(InMemoryLoopExitEvidencePort::new().with_cancellation_observed(true)),
+    ));
+    let exit = LoopExit::Cancelled(ironclaw_turns::LoopCancelled {
+        reason_kind: ironclaw_turns::LoopCancelledReasonKind::HostCancellation,
+        checkpoint_id: None,
+        interrupted_message_refs: vec![],
+        exit_id: test_exit_id(),
+    });
+
+    let state = applier.apply(&claimed, exit).await.expect("applied");
+
+    assert_eq!(state.status, TurnStatus::Cancelled);
+    assert_eq!(state.failure, None);
+}
+
+#[tokio::test]
 async fn invalid_exit_after_before_side_effect_requires_recovery() {
     let evidence = InMemoryLoopExitEvidencePort::new()
         .with_latest_checkpoint_kind(Some(LoopCheckpointKind::BeforeSideEffect));

@@ -1,8 +1,6 @@
-use ironclaw_turns::{
-    BlockedReason, GateRef, LoopBlocked, LoopBlockedKind, LoopCancelled, LoopCancelledReasonKind,
-    LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopExitInvalidHandling,
-    LoopExitValidationDecision, LoopExitValidationPolicy, LoopExitViolationKind, LoopFailureKind,
-    LoopGateRef, LoopMessageRef, LoopResultRef, SanitizedFailure, TurnCheckpointId, TurnStatus,
+use super::*;
+use crate::{
+    BlockedReason, GateRef, SanitizedFailure, TurnCheckpointId, TurnStatus,
     runner::TurnRunnerOutcome,
 };
 use serde_json::json;
@@ -80,7 +78,7 @@ fn completed_exit_without_durable_refs_maps_to_protocol_failure_or_recovery() {
     assert!(matches!(
         uncertain_decision,
         LoopExitValidationDecision {
-            mapping: ironclaw_turns::LoopExitMapping::RecoveryRequired { .. },
+            mapping: LoopExitMapping::RecoveryRequired { .. },
             ..
         }
     ));
@@ -114,7 +112,7 @@ fn completed_exit_requires_host_verified_completion_refs_before_trusted_mapping(
     );
     assert!(matches!(
         decision.mapping,
-        ironclaw_turns::LoopExitMapping::RecoveryRequired { .. }
+        LoopExitMapping::RecoveryRequired { .. }
     ));
 }
 
@@ -262,7 +260,7 @@ fn blocked_exit_requires_host_verified_gate_and_checkpoint_before_trusted_mappin
     );
     assert!(matches!(
         decision.mapping,
-        ironclaw_turns::LoopExitMapping::RecoveryRequired { .. }
+        LoopExitMapping::RecoveryRequired { .. }
     ));
 }
 
@@ -337,7 +335,7 @@ fn failed_exit_requires_host_verified_failure_evidence_before_trusted_mapping() 
     );
     assert!(matches!(
         decision.mapping,
-        ironclaw_turns::LoopExitMapping::RecoveryRequired { .. }
+        LoopExitMapping::RecoveryRequired { .. }
     ));
 }
 
