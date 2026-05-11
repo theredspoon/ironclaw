@@ -137,6 +137,7 @@ fn test_completed_exit() -> LoopExit {
 enum TransitionCall {
     Claim,
     Heartbeat,
+    RecoverExpiredLeases,
     ApplyValidatedLoopExit,
     RecordRecoveryRequired,
 }
@@ -144,10 +145,16 @@ enum TransitionCall {
 struct MockTransitionPort {
     claim_results: Mutex<Vec<Result<Option<ClaimedTurnRun>, TurnError>>>,
     heartbeat_result: Mutex<Result<EventCursor, TurnError>>,
+    recover_result: Mutex<Result<RecoverExpiredLeasesResponse, TurnError>>,
     apply_exit_result: Mutex<Result<TurnRunState, TurnError>>,
     recovery_result: Mutex<Result<TurnRunState, TurnError>>,
     applied_mappings: Mutex<Vec<LoopExitMapping>>,
     calls: Mutex<Vec<TransitionCall>>,
+    claim_requests: Mutex<Vec<ClaimRunRequest>>,
+    heartbeat_requests: Mutex<Vec<HeartbeatRequest>>,
+    recover_requests: Mutex<Vec<RecoverExpiredLeasesRequest>>,
+    apply_exit_requests: Mutex<Vec<ApplyValidatedLoopExitRequest>>,
+    recovery_requests: Mutex<Vec<RecordRecoveryRequiredRequest>>,
 }
 
 impl MockTransitionPort {
@@ -155,6 +162,9 @@ impl MockTransitionPort {
         Self {
             claim_results: Mutex::new(Vec::new()),
             heartbeat_result: Mutex::new(Ok(EventCursor(1))),
+            recover_result: Mutex::new(Ok(RecoverExpiredLeasesResponse {
+                recovered: Vec::new(),
+            })),
             apply_exit_result: Mutex::new(Ok(test_run_state(test_scope(), TurnStatus::Completed))),
             recovery_result: Mutex::new(Ok(test_run_state(
                 test_scope(),
@@ -162,6 +172,11 @@ impl MockTransitionPort {
             ))),
             applied_mappings: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
+            claim_requests: Mutex::new(Vec::new()),
+            heartbeat_requests: Mutex::new(Vec::new()),
+            recover_requests: Mutex::new(Vec::new()),
+            apply_exit_requests: Mutex::new(Vec::new()),
+            recovery_requests: Mutex::new(Vec::new()),
         }
     }
 
@@ -188,32 +203,46 @@ impl MockTransitionPort {
 impl TurnRunTransitionPort for MockTransitionPort {
     async fn claim_next_run(
         &self,
-        _request: ClaimRunRequest,
+        request: ClaimRunRequest,
     ) -> Result<Option<ClaimedTurnRun>, TurnError> {
         self.calls.lock().expect("lock").push(TransitionCall::Claim);
+        self.claim_requests
+            .lock()
+            .expect("lock")
+            .push(request.clone());
         let mut results = self.claim_results.lock().expect("lock");
         if results.is_empty() {
             Ok(None)
         } else {
-            results.remove(0)
+            results.remove(0).map(|maybe_claimed| {
+                maybe_claimed.map(|mut claimed| {
+                    claimed.runner_id = request.runner_id;
+                    claimed.lease_token = request.lease_token;
+                    claimed
+                })
+            })
         }
     }
 
-    async fn heartbeat(&self, _request: HeartbeatRequest) -> Result<EventCursor, TurnError> {
+    async fn heartbeat(&self, request: HeartbeatRequest) -> Result<EventCursor, TurnError> {
         self.calls
             .lock()
             .expect("lock")
             .push(TransitionCall::Heartbeat);
+        self.heartbeat_requests.lock().expect("lock").push(request);
         self.heartbeat_result.lock().expect("lock").clone()
     }
 
     async fn recover_expired_leases(
         &self,
-        _request: RecoverExpiredLeasesRequest,
+        request: RecoverExpiredLeasesRequest,
     ) -> Result<RecoverExpiredLeasesResponse, TurnError> {
-        Ok(RecoverExpiredLeasesResponse {
-            recovered: Vec::new(),
-        })
+        self.calls
+            .lock()
+            .expect("lock")
+            .push(TransitionCall::RecoverExpiredLeases);
+        self.recover_requests.lock().expect("lock").push(request);
+        self.recover_result.lock().expect("lock").clone()
     }
 
     async fn block_run(&self, _request: BlockRunRequest) -> Result<TurnRunState, TurnError> {
@@ -237,12 +266,13 @@ impl TurnRunTransitionPort for MockTransitionPort {
 
     async fn record_recovery_required(
         &self,
-        _request: RecordRecoveryRequiredRequest,
+        request: RecordRecoveryRequiredRequest,
     ) -> Result<TurnRunState, TurnError> {
         self.calls
             .lock()
             .expect("lock")
             .push(TransitionCall::RecordRecoveryRequired);
+        self.recovery_requests.lock().expect("lock").push(request);
         self.recovery_result.lock().expect("lock").clone()
     }
 
@@ -257,7 +287,8 @@ impl TurnRunTransitionPort for MockTransitionPort {
         self.applied_mappings
             .lock()
             .expect("lock")
-            .push(request.mapping);
+            .push(request.mapping.clone());
+        self.apply_exit_requests.lock().expect("lock").push(request);
         self.apply_exit_result.lock().expect("lock").clone()
     }
 }
@@ -510,6 +541,20 @@ fn make_claimed_run(
     }
 }
 
+fn assert_first_recovery_matches_first_claim(port: &MockTransitionPort, run_id: TurnRunId) {
+    let claim_requests = port.claim_requests.lock().expect("lock");
+    let recovery_requests = port.recovery_requests.lock().expect("lock");
+    let claim = claim_requests
+        .first()
+        .expect("worker should issue a claim request before recovery");
+    let recovery = recovery_requests
+        .first()
+        .expect("worker should record recovery");
+    assert_eq!(recovery.run_id, run_id);
+    assert_eq!(recovery.runner_id, claim.runner_id);
+    assert_eq!(recovery.lease_token, claim.lease_token);
+}
+
 fn setup_registry(driver: Arc<dyn AgentLoopDriver>) -> DriverRegistry {
     let mut registry = DriverRegistry::new();
     registry
@@ -525,6 +570,143 @@ fn setup_registry(driver: Arc<dyn AgentLoopDriver>) -> DriverRegistry {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn worker_recovers_expired_leases_before_claiming() {
+    let desc = test_descriptor();
+    let driver = Arc::new(MockDriver::completing(desc.clone()));
+    let registry = Arc::new(setup_registry(driver));
+    let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
+
+    let (wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let config = TurnRunnerWorkerConfig {
+        heartbeat_interval: Duration::from_secs(60),
+        poll_interval: Duration::from_secs(60),
+        scope_filter: None,
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
+    };
+
+    let worker = TurnRunnerWorker::new(
+        config,
+        port.clone(),
+        registry,
+        Arc::new(MockHostFactory),
+        wake_receiver,
+    );
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+    wake_sender.wake();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    cancel.cancel();
+    handle.await.expect("worker task should complete");
+
+    let calls = port.calls();
+    let recover_pos = calls
+        .iter()
+        .position(|call| *call == TransitionCall::RecoverExpiredLeases)
+        .expect("worker should recover expired leases before claiming");
+    let claim_pos = calls
+        .iter()
+        .position(|call| *call == TransitionCall::Claim)
+        .expect("worker should claim after recovery sweep");
+    assert!(recover_pos < claim_pos);
+    assert!(!port.recover_requests.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn worker_reuses_claim_runner_and_lease_for_heartbeat_and_exit() {
+    let desc = test_descriptor();
+    let driver =
+        Arc::new(MockDriver::completing(desc.clone()).with_delay(Duration::from_millis(150)));
+    let registry = Arc::new(setup_registry(driver));
+    let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let run_id = claimed.state.run_id;
+    let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
+
+    let (wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let config = TurnRunnerWorkerConfig {
+        heartbeat_interval: Duration::from_millis(25),
+        poll_interval: Duration::from_secs(60),
+        scope_filter: None,
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
+    };
+
+    let worker = TurnRunnerWorker::new(
+        config,
+        port.clone(),
+        registry,
+        Arc::new(MockHostFactory),
+        wake_receiver,
+    );
+    let worker_runner_id = worker.runner_id();
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+    wake_sender.wake();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    cancel.cancel();
+    handle.await.expect("worker task should complete");
+
+    let claim_requests = port.claim_requests.lock().expect("lock").clone();
+    let first_claim = claim_requests
+        .first()
+        .expect("worker should issue a claim request");
+    assert_eq!(first_claim.runner_id, worker_runner_id);
+
+    let heartbeat_requests = port.heartbeat_requests.lock().expect("lock").clone();
+    assert!(
+        heartbeat_requests
+            .iter()
+            .any(|request| request.run_id == run_id
+                && request.runner_id == first_claim.runner_id
+                && request.lease_token == first_claim.lease_token),
+        "heartbeat must use the same runner and lease token as the claim"
+    );
+
+    let apply_requests = port.apply_exit_requests.lock().expect("lock").clone();
+    assert!(
+        apply_requests.iter().any(|request| request.run_id == run_id
+            && request.runner_id == first_claim.runner_id
+            && request.lease_token == first_claim.lease_token),
+        "exit application must use the same runner and lease token as the claim"
+    );
+}
+
+#[tokio::test]
+async fn default_worker_policy_rejects_fabricated_completion_refs() {
+    let desc = test_descriptor();
+    let driver = Arc::new(MockDriver::completing(desc.clone()));
+    let registry = Arc::new(setup_registry(driver));
+    let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
+
+    let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let worker = TurnRunnerWorker::new(
+        TurnRunnerWorkerConfig::default(),
+        port.clone(),
+        registry,
+        Arc::new(MockHostFactory),
+        wake_receiver,
+    );
+
+    let cancel = CancellationToken::new();
+    worker.try_claim_and_run(&cancel).await.unwrap();
+
+    assert!(
+        port.calls()
+            .contains(&TransitionCall::ApplyValidatedLoopExit)
+    );
+    assert!(matches!(
+        port.applied_mappings().as_slice(),
+        [LoopExitMapping::RecoveryRequired { .. }]
+    ));
+}
+
+#[tokio::test]
 async fn worker_claims_and_completes_run() {
     let desc = test_descriptor();
     let driver = Arc::new(MockDriver::completing(desc.clone()));
@@ -537,7 +719,7 @@ async fn worker_claims_and_completes_run() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -571,6 +753,7 @@ async fn worker_records_recovery_when_heartbeat_fails() {
     let driver = Arc::new(MockDriver::completing(desc.clone()).with_delay(Duration::from_secs(60)));
     let registry = Arc::new(setup_registry(driver));
     let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let run_id = claimed.state.run_id;
     let port = Arc::new(
         MockTransitionPort::new()
             .with_claim_result(Ok(Some(claimed)))
@@ -582,7 +765,7 @@ async fn worker_records_recovery_when_heartbeat_fails() {
         heartbeat_interval: Duration::from_millis(10),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -609,6 +792,7 @@ async fn worker_records_recovery_when_heartbeat_fails() {
         port.calls()
             .contains(&TransitionCall::RecordRecoveryRequired)
     );
+    assert_first_recovery_matches_first_claim(&port, run_id);
 }
 
 #[tokio::test]
@@ -617,6 +801,7 @@ async fn worker_cancellation_stops_active_driver_promptly() {
     let driver = Arc::new(MockDriver::completing(desc.clone()).with_delay(Duration::from_secs(60)));
     let registry = Arc::new(setup_registry(driver));
     let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let run_id = claimed.state.run_id;
     let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
 
     let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
@@ -624,7 +809,7 @@ async fn worker_cancellation_stops_active_driver_promptly() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -651,6 +836,7 @@ async fn worker_cancellation_stops_active_driver_promptly() {
         port.calls()
             .contains(&TransitionCall::RecordRecoveryRequired)
     );
+    assert_first_recovery_matches_first_claim(&port, run_id);
 }
 
 #[tokio::test]
@@ -664,6 +850,7 @@ async fn worker_records_recovery_on_driver_error() {
     ));
     let registry = Arc::new(setup_registry(driver));
     let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let run_id = claimed.state.run_id;
     let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
 
     let (_ws, wake_receiver) = TurnRunnerWakeReceiver::new();
@@ -671,7 +858,7 @@ async fn worker_records_recovery_on_driver_error() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -694,6 +881,7 @@ async fn worker_records_recovery_on_driver_error() {
         port.calls()
             .contains(&TransitionCall::RecordRecoveryRequired)
     );
+    assert_first_recovery_matches_first_claim(&port, run_id);
 }
 
 #[tokio::test]
@@ -711,7 +899,7 @@ async fn worker_records_recovery_on_driver_panic() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -742,6 +930,7 @@ async fn worker_records_recovery_on_host_factory_error() {
     let driver = Arc::new(MockDriver::completing(desc.clone()));
     let registry = Arc::new(setup_registry(driver));
     let claimed = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let run_id = claimed.state.run_id;
     let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
 
     let (_ws, wake_receiver) = TurnRunnerWakeReceiver::new();
@@ -749,7 +938,7 @@ async fn worker_records_recovery_on_host_factory_error() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let host_factory = Arc::new(FailingHostFactory {
@@ -770,6 +959,7 @@ async fn worker_records_recovery_on_host_factory_error() {
         port.calls()
             .contains(&TransitionCall::RecordRecoveryRequired)
     );
+    assert_first_recovery_matches_first_claim(&port, run_id);
 }
 
 #[tokio::test]
@@ -781,6 +971,7 @@ async fn worker_records_recovery_when_driver_not_found() {
     let mut claimed_desc = test_descriptor();
     claimed_desc.id = LoopDriverId::new("missing_driver").expect("valid");
     let claimed = make_claimed_run(&claimed_desc, test_scope(), TurnStatus::Queued);
+    let run_id = claimed.state.run_id;
     let port = Arc::new(MockTransitionPort::new().with_claim_result(Ok(Some(claimed))));
 
     let (_ws, wake_receiver) = TurnRunnerWakeReceiver::new();
@@ -788,7 +979,7 @@ async fn worker_records_recovery_when_driver_not_found() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -811,6 +1002,7 @@ async fn worker_records_recovery_when_driver_not_found() {
         port.calls()
             .contains(&TransitionCall::RecordRecoveryRequired)
     );
+    assert_first_recovery_matches_first_claim(&port, run_id);
 }
 
 #[tokio::test]
@@ -825,7 +1017,7 @@ async fn worker_continues_when_no_runs_available() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -856,6 +1048,63 @@ async fn worker_continues_when_no_runs_available() {
 }
 
 #[tokio::test]
+async fn wake_signal_drains_available_runs_until_queue_empty() {
+    let desc = test_descriptor();
+    let driver = Arc::new(MockDriver::completing(desc.clone()));
+    let registry = Arc::new(setup_registry(driver));
+    let first = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let second = make_claimed_run(&desc, test_scope(), TurnStatus::Queued);
+    let port = Arc::new(
+        MockTransitionPort::new()
+            .with_claim_result(Ok(Some(first)))
+            .with_claim_result(Ok(Some(second))),
+    );
+
+    let (wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let config = TurnRunnerWorkerConfig {
+        heartbeat_interval: Duration::from_secs(60),
+        poll_interval: Duration::from_secs(60),
+        scope_filter: None,
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
+    };
+
+    let worker = TurnRunnerWorker::new(
+        config,
+        port.clone(),
+        registry,
+        Arc::new(MockHostFactory),
+        wake_receiver,
+    );
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+    wake_sender.wake();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    cancel.cancel();
+    handle.await.expect("worker task should complete");
+
+    let calls = port.calls();
+    let claim_count = calls
+        .iter()
+        .filter(|call| **call == TransitionCall::Claim)
+        .count();
+    let apply_count = calls
+        .iter()
+        .filter(|call| **call == TransitionCall::ApplyValidatedLoopExit)
+        .count();
+    assert!(
+        claim_count >= 3,
+        "drain should process queued runs and observe an empty claim"
+    );
+    assert_eq!(
+        apply_count, 2,
+        "single wake should process both queued runs"
+    );
+}
+
+#[tokio::test]
 async fn wake_signal_triggers_claim_attempt() {
     let desc = test_descriptor();
     let driver = Arc::new(MockDriver::completing(desc.clone()));
@@ -867,7 +1116,7 @@ async fn wake_signal_triggers_claim_attempt() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60), // very long so wake is the trigger
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -905,7 +1154,7 @@ async fn heartbeat_runs_during_driver_execution() {
         heartbeat_interval: Duration::from_millis(50), // fast heartbeats
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        ..TurnRunnerWorkerConfig::default()
+        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(

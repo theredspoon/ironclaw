@@ -17,6 +17,7 @@ libsql-secrets = ["dep:ironclaw_secrets", "ironclaw_secrets/libsql", "dep:libsql
 
 [dependencies]
 async-trait = "0.1"
+chrono = "0.4"
 futures-util = { version = "0.3", default-features = false }
 ironclaw_llm = { path = "../ironclaw_llm", version = "0.1.0", optional = true, default-features = false }
 ironclaw_loop_support = { path = "../ironclaw_loop_support", version = "0.1.0" }

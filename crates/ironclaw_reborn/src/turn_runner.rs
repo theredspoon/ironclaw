@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use ironclaw_turns::{
     AgentLoopDriverError, AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, LoopExit,
@@ -29,7 +29,7 @@ use ironclaw_turns::{
     TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
     runner::{
         ApplyLoopExitRequest, ClaimRunRequest, ClaimedTurnRun, HeartbeatRequest,
-        RecordRecoveryRequiredRequest, TurnRunTransitionPort,
+        RecordRecoveryRequiredRequest, RecoverExpiredLeasesRequest, TurnRunTransitionPort,
     },
 };
 
@@ -82,7 +82,7 @@ impl Default for TurnRunnerWorkerConfig {
             heartbeat_interval: Duration::from_secs(10),
             poll_interval: Duration::from_secs(5),
             scope_filter: None,
-            exit_validation_policy: trusted_text_only_exit_validation_policy(),
+            exit_validation_policy: default_text_only_exit_validation_policy(),
         }
     }
 }
@@ -201,7 +201,7 @@ impl TurnRunnerWorker {
         wake_receiver: TurnRunnerWakeReceiver,
     ) -> Self {
         let runner_id = TurnRunnerId::new();
-        info!(runner_id = ?runner_id, "turn runner worker created");
+        debug!(runner_id = ?runner_id, "turn runner worker created");
         Self {
             runner_id,
             config,
@@ -220,41 +220,78 @@ impl TurnRunnerWorker {
     /// Run the worker claim loop until the cancellation token fires.
     ///
     /// This is the main entry point. It loops:
-    /// 1. Wait for a wake signal or fallback poll tick
-    /// 2. Claim the next available run
-    /// 3. If none claimed, continue
-    /// 4. Run the claimed run to `LoopExit` / application
-    /// 5. Repeat
+    /// 1. Sweep expired leases so crashed workers do not strand runs
+    /// 2. Claim and run queued work until the queue is empty
+    /// 3. Wait for a wake signal or fallback poll tick when no work remains
+    /// 4. Repeat until cancelled
     pub async fn run(&self, cancel: CancellationToken) {
-        info!(runner_id = ?self.runner_id, "turn runner worker started");
+        debug!(runner_id = ?self.runner_id, "turn runner worker started");
 
         loop {
+            if cancel.is_cancelled() {
+                debug!(runner_id = ?self.runner_id, "turn runner worker shutting down");
+                break;
+            }
+
+            if let Err(err) = self.recover_expired_leases().await {
+                warn!(
+                    runner_id = ?self.runner_id,
+                    error = %err,
+                    "expired lease recovery failed"
+                );
+            }
+
+            while !cancel.is_cancelled() {
+                match self.try_claim_and_run(&cancel).await {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(err) => {
+                        warn!(
+                            runner_id = ?self.runner_id,
+                            error = %err,
+                            "claim-and-run cycle failed"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            if cancel.is_cancelled() {
+                continue;
+            }
+
             tokio::select! {
                 () = cancel.cancelled() => {
-                    info!(runner_id = ?self.runner_id, "turn runner worker shutting down");
+                    debug!(runner_id = ?self.runner_id, "turn runner worker shutting down");
                     break;
                 }
                 () = self.wake_receiver.wait_or_timeout(self.config.poll_interval) => {}
             }
-
-            if cancel.is_cancelled() {
-                break;
-            }
-
-            if let Err(err) = self.try_claim_and_run(&cancel).await {
-                warn!(
-                    runner_id = ?self.runner_id,
-                    error = %err,
-                    "claim-and-run cycle failed"
-                );
-            }
         }
 
-        info!(runner_id = ?self.runner_id, "turn runner worker stopped");
+        debug!(runner_id = ?self.runner_id, "turn runner worker stopped");
+    }
+
+    async fn recover_expired_leases(&self) -> Result<(), TurnError> {
+        let response = self
+            .transition_port
+            .recover_expired_leases(RecoverExpiredLeasesRequest {
+                now: chrono::Utc::now(),
+                scope_filter: self.config.scope_filter.clone(),
+            })
+            .await?;
+        if !response.recovered.is_empty() {
+            debug!(
+                runner_id = ?self.runner_id,
+                recovered = response.recovered.len(),
+                "expired turn-run leases recovered"
+            );
+        }
+        Ok(())
     }
 
     /// Attempt one claim-and-run cycle.
-    async fn try_claim_and_run(&self, cancel: &CancellationToken) -> Result<(), TurnRunnerError> {
+    async fn try_claim_and_run(&self, cancel: &CancellationToken) -> Result<bool, TurnRunnerError> {
         let lease_token = TurnLeaseToken::new();
         let request = ClaimRunRequest {
             runner_id: self.runner_id,
@@ -270,13 +307,13 @@ impl TurnRunnerWorker {
 
         let Some(claimed) = claimed else {
             debug!(runner_id = ?self.runner_id, "no runs available to claim");
-            return Ok(());
+            return Ok(false);
         };
 
         let run_id = claimed.state.run_id;
         let status = claimed.state.status;
 
-        info!(
+        debug!(
             runner_id = ?self.runner_id,
             run_id = ?run_id,
             status = ?status,
@@ -284,7 +321,7 @@ impl TurnRunnerWorker {
         );
 
         self.execute_claimed_run(claimed, cancel).await;
-        Ok(())
+        Ok(true)
     }
 
     /// Execute a claimed run: heartbeat, invoke driver, apply exit.
@@ -432,7 +469,7 @@ impl TurnRunnerWorker {
         match ironclaw_turns::runner::apply_loop_exit(self.transition_port.as_ref(), request).await
         {
             Ok(state) => {
-                info!(
+                debug!(
                     runner_id = ?runner_id,
                     run_id = ?run_id,
                     status = ?state.status,
@@ -461,11 +498,11 @@ impl TurnRunnerWorker {
                     .record_recovery_required(recovery_request)
                     .await
                 {
-                    error!(
-                        runner_id = ?runner_id,
-                        run_id = ?run_id,
-                        error = %recovery_err,
-                        "failed to record recovery after exit application failure"
+                    log_recovery_record_failure(
+                        runner_id,
+                        run_id,
+                        &recovery_err,
+                        "failed to record recovery after exit application failure",
                     );
                 }
             }
@@ -510,30 +547,77 @@ impl TurnRunnerWorker {
         };
 
         if let Err(err) = self.transition_port.record_recovery_required(request).await {
-            error!(
-                runner_id = ?runner_id,
-                run_id = ?run_id,
-                error = %err,
-                "failed to record recovery required"
+            log_recovery_record_failure(
+                runner_id,
+                run_id,
+                &err,
+                "failed to record recovery required",
             );
         }
     }
 }
 
-/// Temporary trusted text-only validation policy for this narrow worker slice.
+fn log_recovery_record_failure(
+    runner_id: TurnRunnerId,
+    run_id: TurnRunId,
+    error: &TurnError,
+    message: &'static str,
+) {
+    if recovery_record_rejection_is_expected(error) {
+        debug!(
+            runner_id = ?runner_id,
+            run_id = ?run_id,
+            error = %error,
+            message
+        );
+    } else {
+        error!(
+            runner_id = ?runner_id,
+            run_id = ?run_id,
+            error = %error,
+            message
+        );
+    }
+}
+
+fn recovery_record_rejection_is_expected(error: &TurnError) -> bool {
+    matches!(error, TurnError::LeaseMismatch)
+        || matches!(
+            error,
+            TurnError::InvalidTransition {
+                from: TurnStatus::Completed
+                    | TurnStatus::Cancelled
+                    | TurnStatus::Failed
+                    | TurnStatus::BlockedApproval
+                    | TurnStatus::BlockedAuth
+                    | TurnStatus::BlockedResource
+                    | TurnStatus::RecoveryRequired,
+                to: TurnStatus::RecoveryRequired,
+            }
+        )
+}
+
+/// Default text-only validation policy for this narrow worker slice.
 ///
-/// Completion refs are trusted because the only concrete host currently wired
-/// here finalizes assistant replies through the host-managed transcript port.
-/// Blocked, failed, and cancelled exits remain fail-closed until a durable
-/// evidence-backed applier is wired.
-fn trusted_text_only_exit_validation_policy() -> LoopExitValidationPolicy {
+/// Completion refs remain fail-closed until a durable host-issued completion
+/// evidence path is wired into this worker. Blocked, failed, and cancelled exits
+/// also remain fail-closed unless tests inject a narrower trusted policy.
+fn default_text_only_exit_validation_policy() -> LoopExitValidationPolicy {
     LoopExitValidationPolicy {
         require_final_checkpoint: false,
         host_cancellation_observed: false,
         invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-        completion_refs_verified: true,
+        completion_refs_verified: false,
         blocked_evidence_verified: false,
         failure_evidence_verified: false,
+    }
+}
+
+#[cfg(test)]
+fn trusted_text_only_exit_validation_policy_for_tests() -> LoopExitValidationPolicy {
+    LoopExitValidationPolicy {
+        completion_refs_verified: true,
+        ..default_text_only_exit_validation_policy()
     }
 }
 
