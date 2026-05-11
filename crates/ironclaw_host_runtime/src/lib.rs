@@ -44,6 +44,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
+mod first_party;
 mod obligations;
 mod planner;
 mod production;
@@ -51,6 +52,10 @@ mod services;
 mod surface;
 mod turn_scheduler;
 
+pub use first_party::{
+    FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
+    FirstPartyCapabilityRequest, FirstPartyCapabilityResult,
+};
 pub use obligations::{
     BuiltinObligationHandler, BuiltinObligationServices, NetworkObligationPolicyStore,
     ProcessObligationLifecycleStore, RuntimeSecretInjectionStore, RuntimeSecretInjectionStoreError,
