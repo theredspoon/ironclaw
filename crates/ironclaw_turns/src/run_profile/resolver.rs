@@ -289,7 +289,7 @@ fn long_running_mission_profile() -> RunProfileDefinition {
             require_before_side_effect: true,
             require_before_block: true,
             max_checkpoint_bytes: 256 * 1024,
-            require_final_checkpoint: false,
+            require_final_checkpoint: true,
         },
         resource_budget_policy: ResourceBudgetPolicy {
             tier: ResourceBudgetTier::from_trusted_static("mission_high"),
@@ -459,6 +459,15 @@ fn fingerprint_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_running_mission_profile_requires_final_checkpoint() {
+        assert!(
+            long_running_mission_profile()
+                .checkpoint_policy
+                .require_final_checkpoint
+        );
+    }
 
     #[test]
     fn fingerprint_changes_when_final_checkpoint_requirement_changes() {

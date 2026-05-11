@@ -910,6 +910,61 @@ async fn text_only_host_sanitizes_runtime_failure_message_before_driver_output()
 }
 
 #[tokio::test]
+async fn text_only_host_does_not_reinvoke_runtime_after_failed_outcome_retry() {
+    let fixture =
+        HostFixture::new("thread-host-runtime-capability-failed-idempotency", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Failed(RuntimeCapabilityFailure {
+        capability_id: capability_id.clone(),
+        kind: RuntimeFailureKind::Dispatcher,
+        message: None,
+    }));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let input_ref = CapabilityInputRef::new("input:failed-idempotent-request").unwrap();
+    io.put_input(input_ref.clone(), json!({"message": "fail once"}));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io.clone(),
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let invocation = CapabilityInvocation {
+        surface_version: surface.version,
+        capability_id: capability_id.clone(),
+        input_ref,
+    };
+
+    let first = host.invoke_capability(invocation.clone()).await.unwrap();
+    let second = host.invoke_capability(invocation).await.unwrap();
+
+    assert!(matches!(first, CapabilityOutcome::Failed(_)));
+    assert_eq!(first, second);
+    let invocations = runtime.invocations();
+    assert_eq!(invocations.len(), 1);
+    assert!(invocations[0].idempotency_key.is_some());
+    assert!(io.results().is_empty());
+}
+
+#[tokio::test]
 async fn text_only_host_prompt_accepts_refetched_surface_version() {
     let fixture = HostFixture::new("thread-host-runtime-capability-prompt-refetch", "hello").await;
     let first_id = CapabilityId::new("demo.echo").unwrap();

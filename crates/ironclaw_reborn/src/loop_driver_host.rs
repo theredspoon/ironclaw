@@ -509,24 +509,13 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                 return Err(host_runtime_error(error));
             }
         };
-        if should_cache_runtime_outcome(&outcome) {
-            self.record_runtime_completed(
-                &idempotency_key,
-                requested_capability_id.clone(),
-                outcome.clone(),
-            )?;
-            return self
-                .finish_runtime_outcome(&idempotency_key, &requested_capability_id, outcome)
-                .await;
-        }
-        self.clear_dispatch(&idempotency_key)?;
-        runtime_outcome_to_loop(
-            &self.run_context,
-            self.result_writer.as_ref(),
-            &requested_capability_id,
-            outcome,
-        )
-        .await
+        self.record_runtime_completed(
+            &idempotency_key,
+            requested_capability_id.clone(),
+            outcome.clone(),
+        )?;
+        self.finish_runtime_outcome(&idempotency_key, &requested_capability_id, outcome)
+            .await
     }
 
     async fn invoke_capability_batch(
@@ -549,10 +538,6 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             stopped_on_suspension,
         })
     }
-}
-
-fn should_cache_runtime_outcome(outcome: &RuntimeCapabilityOutcome) -> bool {
-    !matches!(outcome, RuntimeCapabilityOutcome::Failed(_))
 }
 
 fn should_retry_result_write(
