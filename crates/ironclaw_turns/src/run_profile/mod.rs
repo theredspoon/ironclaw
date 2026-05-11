@@ -49,7 +49,8 @@ pub use milestones::{
     LoopHostMilestoneKind, LoopHostMilestoneSink, PromptSkillContextMetadata,
 };
 pub use model::{
-    HostManagedLoopModelPort, LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest,
+    HostManagedLoopModelPort, LoopModelBudgetAccountant, LoopModelGateway, LoopModelGatewayError,
+    LoopModelGatewayRequest, ModelCallOutcome, NoOpBudgetAccountant,
 };
 pub use policy::{
     CancellationPolicy, CheckpointPolicy, PrivilegedRunProfileDimension,
