@@ -55,6 +55,10 @@ where
     })?;
     let mut entries = Vec::new();
     let mut current_cursor = 0u64;
+    // Intentionally parse every non-empty line, including lines before the
+    // requested cursor and beyond the returned page. The JSONL durability
+    // contract treats malformed records as errors; skipping them would turn a
+    // corrupted log into a partial replay.
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         current_cursor += 1;
         let record = serde_json::from_str::<T>(line).map_err(|error| EventError::Serialize {

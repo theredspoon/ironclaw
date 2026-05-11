@@ -122,12 +122,12 @@ impl<T: Clone> StreamState<T> {
         // marker even when a record is filtered out so the consumer's
         // resume cursor moves forward and they don't see filtered records
         // again on the next call.
+        let start_index = self
+            .entries
+            .partition_point(|entry| entry.cursor.as_u64() <= after.as_u64());
         let mut entries = Vec::new();
         let mut last_scanned = after;
-        for entry in &self.entries {
-            if entry.cursor.as_u64() <= after.as_u64() {
-                continue;
-            }
+        for entry in &self.entries[start_index..] {
             last_scanned = entry.cursor;
             if !is_match(&entry.record) {
                 continue;
