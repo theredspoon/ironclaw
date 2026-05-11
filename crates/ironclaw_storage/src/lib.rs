@@ -147,7 +147,7 @@ impl StorageVersion {
     pub fn new(value: impl Into<String>) -> Result<Self, StorageError> {
         let value = value.into();
         validate_storage_token(&value, "storage version", 128)?;
-        validate_storage_token(&value, 128)?;
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -266,7 +266,11 @@ pub trait BlobStore: Send + Sync {
 
     async fn get_blob(&self, key: &StorageKey) -> Result<Option<StoredBlob>, StorageError>;
 
-    async fn delete_blob(&self, key: &StorageKey, condition: PutCondition) -> Result<(), StorageError>;
+    async fn delete_blob(
+        &self,
+        key: &StorageKey,
+        condition: PutCondition,
+    ) -> Result<(), StorageError>;
 }
 
 /// Primitive keyed structured-record storage. Domain stores own schemas.
@@ -276,7 +280,11 @@ pub trait RecordStore: Send + Sync {
 
     async fn get_record(&self, key: &StorageKey) -> Result<Option<StoredRecord>, StorageError>;
 
-    async fn delete_record(&self, key: &StorageKey, condition: PutCondition) -> Result<(), StorageError>;
+    async fn delete_record(
+        &self,
+        key: &StorageKey,
+        condition: PutCondition,
+    ) -> Result<(), StorageError>;
 }
 
 fn validate_storage_key(value: &str) -> Result<(), StorageError> {
@@ -408,8 +416,15 @@ mod tests {
             Ok(blobs.get(key).cloned())
         }
 
-        async fn delete_blob(&self, key: &StorageKey) -> Result<(), StorageError> {
+        async fn delete_blob(
+            &self,
+            key: &StorageKey,
+            condition: PutCondition,
+        ) -> Result<(), StorageError> {
             let mut blobs = self.blobs.lock().map_err(|_| StorageError::Backend)?;
+            if !condition.allows(blobs.get(key).map(|blob| &blob.version)) {
+                return Err(StorageError::Conflict);
+            }
             blobs.remove(key);
             Ok(())
         }
@@ -442,8 +457,15 @@ mod tests {
             Ok(records.get(key).cloned())
         }
 
-        async fn delete_record(&self, key: &StorageKey) -> Result<(), StorageError> {
+        async fn delete_record(
+            &self,
+            key: &StorageKey,
+            condition: PutCondition,
+        ) -> Result<(), StorageError> {
             let mut records = self.records.lock().map_err(|_| StorageError::Backend)?;
+            if !condition.allows(records.get(key).map(|record| &record.version)) {
+                return Err(StorageError::Conflict);
+            }
             records.remove(key);
             Ok(())
         }
@@ -600,7 +622,10 @@ mod tests {
             store.get_blob(&blob_key).await.unwrap().unwrap(),
             updated_blob
         );
-        store.delete_blob(&blob_key).await.unwrap();
+        store
+            .delete_blob(&blob_key, PutCondition::Any)
+            .await
+            .unwrap();
         assert!(store.get_blob(&blob_key).await.unwrap().is_none());
 
         let record_key = StorageKey::new("records/example").unwrap();
@@ -618,7 +643,10 @@ mod tests {
             store.get_record(&record_key).await.unwrap().unwrap(),
             stored_record
         );
-        store.delete_record(&record_key).await.unwrap();
+        store
+            .delete_record(&record_key, PutCondition::Any)
+            .await
+            .unwrap();
         assert!(store.get_record(&record_key).await.unwrap().is_none());
     }
 
