@@ -10,6 +10,7 @@
 
 mod driver;
 mod host;
+mod memory_context;
 mod milestones;
 mod model;
 mod policy;
@@ -21,6 +22,9 @@ mod snapshot;
 pub use driver::{
     AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverResumeRequest,
     AgentLoopDriverRunRequest,
+};
+pub use memory_context::{
+    EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,
 };
 pub use host::{
     AgentLoopDriverHost, AgentLoopHost, AgentLoopHostError, AgentLoopHostErrorKind,
