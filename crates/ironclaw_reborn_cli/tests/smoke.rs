@@ -22,6 +22,58 @@ fn help_mentions_reborn_commands() {
         "stdout: {stdout}"
     );
     assert!(stdout.contains("doctor"), "stdout: {stdout}");
+    assert!(stdout.contains("run"), "stdout: {stdout}");
+}
+
+#[test]
+fn run_initializes_minimal_runtime_shell_without_touching_v1_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    let home_dir = temp.path().join("home");
+    let v1_base_dir = temp.path().join("v1-state");
+
+    let output = Command::new(reborn_bin())
+        .arg("run")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .env("HOME", &home_dir)
+        .env("IRONCLAW_BASE_DIR", &v1_base_dir)
+        .env_remove("USERPROFILE")
+        .env_remove("IRONCLAW_REBORN_PROFILE")
+        .output()
+        .expect("ironclaw-reborn run should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("IronClaw Reborn runtime shell"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(reborn_home.to_str().expect("utf8 path")),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("profile: local-dev"), "stdout: {stdout}");
+    assert!(stdout.contains("v1_state: not-used"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("runtime_shell: initialized"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !reborn_home.exists(),
+        "minimal runtime shell should not create Reborn state directories"
+    );
+    assert!(
+        !home_dir.join(".ironclaw").exists(),
+        "minimal runtime shell should not create default v1 state directories"
+    );
+    assert!(
+        !v1_base_dir.exists(),
+        "minimal runtime shell should not create explicit v1 base directories"
+    );
 }
 
 #[test]
