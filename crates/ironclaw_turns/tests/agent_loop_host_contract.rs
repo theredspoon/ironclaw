@@ -774,6 +774,7 @@ async fn loop_prompt_bundle_public_serialization_hides_raw_content() {
         reply_target_binding_ref: ReplyTargetBindingRef::new("reply-loop-host").unwrap(),
         resolved_run_profile_id: host.context.resolved_run_profile.profile_id.clone(),
         resolved_run_profile_version: host.context.resolved_run_profile.profile_version,
+        resolved_model_route: None,
         received_at: Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap(),
         checkpoint_id: None,
         gate_ref: None,
@@ -1097,10 +1098,11 @@ impl AgentLoopDriver for CapabilityDriver {
                 reason_kind: "expected_approval".to_string(),
             });
         };
+        let state_ref = LoopCheckpointStateRef::new("checkpoint:approval-state").unwrap();
         let checkpoint_id = host
             .checkpoint(LoopCheckpointRequest {
                 kind: LoopCheckpointKind::BeforeBlock,
-                state_ref: LoopCheckpointStateRef::new("checkpoint:approval-state").unwrap(),
+                state_ref: state_ref.clone(),
             })
             .await
             .map_err(driver_error)?;
@@ -1114,6 +1116,7 @@ impl AgentLoopDriver for CapabilityDriver {
             kind: LoopBlockedKind::Approval,
             gate_ref,
             checkpoint_id,
+            state_ref,
             exit_id: LoopExitId::new("exit:capability-driver").unwrap(),
         }))
     }

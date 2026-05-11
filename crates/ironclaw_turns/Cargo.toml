@@ -13,7 +13,7 @@ publish = false
 
 [features]
 default = []
-postgres = ["dep:deadpool-postgres", "dep:tokio-postgres"]
+postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "tokio-postgres/with-chrono-0_4"]
 libsql = ["dep:libsql"]
 
 [dependencies]

@@ -10,6 +10,7 @@
 
 mod driver;
 mod host;
+mod memory_context;
 mod milestones;
 mod model;
 mod policy;
@@ -34,11 +35,14 @@ pub use host::{
     LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest, LoopContextSnippet,
     LoopContextSnippetMetadata, LoopDriverNoteKind, LoopInput, LoopInputBatch, LoopInputCursor,
     LoopInputCursorToken, LoopInputPort, LoopInterruptKind, LoopModelMessage, LoopModelPort,
-    LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
-    LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
-    LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
-    ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
-    VisibleCapabilitySurface,
+    LoopModelRequest, LoopModelResponse, LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent,
+    LoopProgressPort, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
+    LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
+    ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode, UpdateAssistantDraft,
+    VisibleCapabilityRequest, VisibleCapabilitySurface, validate_model_route_component_value,
+};
+pub use memory_context::{
+    EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,
 };
 pub use milestones::{
     InMemoryLoopHostMilestoneSink, LoopHostMilestone, LoopHostMilestoneEmitter,
