@@ -25,8 +25,7 @@ use tracing::{debug, error, warn};
 
 use ironclaw_turns::{
     AgentLoopDriverError, AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, LoopExit,
-    LoopExitInvalidHandling, LoopExitValidationPolicy, SanitizedFailure, TurnError, TurnLeaseToken,
-    TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
+    SanitizedFailure, TurnError, TurnLeaseToken, TurnRunId, TurnRunnerId, TurnScope, TurnStatus,
     runner::{
         ClaimRunRequest, ClaimedTurnRun, HeartbeatRequest, RecordRecoveryRequiredRequest,
         RecoverExpiredLeasesRequest, TurnRunTransitionPort,
@@ -70,13 +69,6 @@ pub struct TurnRunnerWorkerConfig {
 
     /// Optional scope filter to restrict which runs this worker claims.
     pub scope_filter: Option<TurnScope>,
-
-    /// Validation policy used when applying driver-returned loop exits.
-    ///
-    /// This is injected here so a durable evidence-backed applier can replace
-    /// the temporary trusted text-only policy without changing worker control
-    /// flow.
-    pub exit_validation_policy: LoopExitValidationPolicy,
 }
 
 impl Default for TurnRunnerWorkerConfig {
@@ -85,7 +77,6 @@ impl Default for TurnRunnerWorkerConfig {
             heartbeat_interval: Duration::from_secs(10),
             poll_interval: Duration::from_secs(5),
             scope_filter: None,
-            exit_validation_policy: default_text_only_exit_validation_policy(),
         }
     }
 }
@@ -590,32 +581,6 @@ fn recovery_record_rejection_is_expected(error: &TurnError) -> bool {
                 to: TurnStatus::RecoveryRequired,
             }
         )
-}
-
-/// Default text-only validation policy for this narrow worker slice.
-///
-/// Completion refs remain fail-closed until a durable host-issued completion
-/// evidence path is wired into this worker. Blocked, failed, and cancelled exits
-/// also remain fail-closed unless tests inject a narrower trusted policy.
-fn default_text_only_exit_validation_policy() -> LoopExitValidationPolicy {
-    LoopExitValidationPolicy {
-        require_final_checkpoint: false,
-        allow_no_reply_completion: false,
-        final_checkpoint_verified: false,
-        host_cancellation_observed: false,
-        invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
-        completion_refs_verified: false,
-        blocked_evidence_verified: false,
-        failure_evidence_verified: false,
-    }
-}
-
-#[cfg(test)]
-fn trusted_text_only_exit_validation_policy_for_tests() -> LoopExitValidationPolicy {
-    LoopExitValidationPolicy {
-        completion_refs_verified: true,
-        ..default_text_only_exit_validation_policy()
-    }
 }
 
 async fn heartbeat_loop(

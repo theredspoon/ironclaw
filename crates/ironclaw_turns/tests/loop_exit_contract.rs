@@ -538,7 +538,6 @@ fn blocked_variants_map_to_correct_blocked_reason() {
             LoopBlockedKind::Approval => BlockedReason::Approval { gate_ref },
             LoopBlockedKind::Auth => BlockedReason::Auth { gate_ref },
             LoopBlockedKind::Resource => BlockedReason::Resource { gate_ref },
-            LoopBlockedKind::Process => BlockedReason::Process { gate_ref },
         };
 
         assert_eq!(decision.violation, None);
@@ -656,7 +655,6 @@ fn terminal_statuses_release_lock_and_non_terminal_keep_it() {
             TurnStatus::BlockedApproval => (false, true),
             TurnStatus::BlockedAuth => (false, true),
             TurnStatus::BlockedResource => (false, true),
-            TurnStatus::BlockedProcess => (false, true),
             TurnStatus::CancelRequested => (false, true),
             TurnStatus::Cancelled => (true, false),
             TurnStatus::Completed => (true, false),

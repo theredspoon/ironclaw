@@ -604,7 +604,6 @@ async fn worker_recovers_expired_leases_before_claiming() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -653,7 +652,6 @@ async fn worker_reuses_claim_runner_and_lease_for_heartbeat_and_exit() {
         heartbeat_interval: Duration::from_millis(25),
         poll_interval: Duration::from_secs(60),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -744,7 +742,6 @@ async fn worker_claims_and_completes_run() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -791,7 +788,6 @@ async fn worker_records_recovery_when_heartbeat_fails() {
         heartbeat_interval: Duration::from_millis(10),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -836,7 +832,6 @@ async fn worker_cancellation_stops_active_driver_promptly() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -886,7 +881,6 @@ async fn worker_records_recovery_on_driver_error() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -928,7 +922,6 @@ async fn worker_records_recovery_on_driver_panic() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -968,7 +961,6 @@ async fn worker_records_recovery_on_host_factory_error() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let host_factory = Arc::new(FailingHostFactory {
@@ -1016,7 +1008,6 @@ async fn worker_records_recovery_when_driver_not_found() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -1055,7 +1046,6 @@ async fn worker_continues_when_no_runs_available() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -1104,7 +1094,6 @@ async fn wake_signal_drains_available_runs_until_queue_empty() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -1156,7 +1145,6 @@ async fn wake_signal_triggers_claim_attempt() {
         heartbeat_interval: Duration::from_secs(60),
         poll_interval: Duration::from_secs(60), // very long so wake is the trigger
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(
@@ -1195,7 +1183,6 @@ async fn heartbeat_runs_during_driver_execution() {
         heartbeat_interval: Duration::from_millis(50), // fast heartbeats
         poll_interval: Duration::from_millis(50),
         scope_filter: None,
-        exit_validation_policy: trusted_text_only_exit_validation_policy_for_tests(),
     };
 
     let worker = TurnRunnerWorker::new(

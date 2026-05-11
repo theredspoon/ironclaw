@@ -126,22 +126,6 @@ async fn blocked_exit_requires_before_block_checkpoint() {
 }
 
 #[tokio::test]
-async fn spawned_process_maps_to_process_blocked_exit() {
-    let evidence = InMemoryLoopExitEvidencePort::all_verified();
-    let fixture = Fixture::new(evidence);
-    let exit = blocked_exit(LoopBlockedKind::Process);
-
-    let state = fixture
-        .applier
-        .apply(&fixture.claimed, exit)
-        .await
-        .expect("applied");
-
-    assert_eq!(state.status, TurnStatus::BlockedProcess);
-    assert!(state.gate_ref.is_some());
-}
-
-#[tokio::test]
 async fn cancelled_exit_requires_observed_cancel_input() {
     let fixture =
         Fixture::new(InMemoryLoopExitEvidencePort::new().with_final_checkpoint_verified(true));

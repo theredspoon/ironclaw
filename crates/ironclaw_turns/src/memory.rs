@@ -1228,7 +1228,6 @@ impl Inner {
                 | TurnStatus::BlockedApproval
                 | TurnStatus::BlockedAuth
                 | TurnStatus::BlockedResource
-                | TurnStatus::BlockedProcess
                 | TurnStatus::RecoveryRequired => (TurnStatus::Cancelled, TurnEventKind::Cancelled),
                 TurnStatus::Running | TurnStatus::CancelRequested => {
                     (TurnStatus::CancelRequested, TurnEventKind::CancelRequested)
