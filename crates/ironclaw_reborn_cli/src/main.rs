@@ -1,5 +1,6 @@
 mod cli;
-mod runtime;
+mod commands;
+mod context;
 
 fn main() -> anyhow::Result<()> {
     cli::run()

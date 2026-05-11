@@ -1,22 +1,35 @@
+use clap::Args;
 use ironclaw_reborn_config::RebornBootConfig;
+
+use crate::context::RebornCliContext;
+
+#[derive(Debug, Args)]
+pub(crate) struct RunCommand;
+
+impl RunCommand {
+    pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
+        RuntimeShellReport::initialize(context).print();
+        Ok(())
+    }
+}
 
 /// Side-effect-free runtime-shell snapshot for the standalone Reborn binary.
 #[derive(Debug, Clone)]
-pub(crate) struct RuntimeShellReport {
+struct RuntimeShellReport {
     config: RebornBootConfig,
     driver_registry_initialized: bool,
 }
 
 impl RuntimeShellReport {
-    pub(crate) fn initialize(config: RebornBootConfig) -> Self {
+    fn initialize(context: RebornCliContext) -> Self {
         let _registry = ironclaw_reborn::driver_registry::DriverRegistry::new();
         Self {
-            config,
+            config: context.boot_config().clone(),
             driver_registry_initialized: true,
         }
     }
 
-    pub(crate) fn print(&self) {
+    fn print(&self) {
         println!("IronClaw Reborn runtime shell");
         println!("binary: ironclaw-reborn");
         println!("version: {}", env!("CARGO_PKG_VERSION"));
