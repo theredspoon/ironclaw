@@ -2,6 +2,18 @@ use std::{collections::HashMap, error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_CONFIG_VERSION: &str = "config:default";
+const DEFAULT_AUTH_VERSION: &str = "auth:default";
+const FORBIDDEN_ROUTE_MARKERS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "password",
+    "secret",
+];
+
 /// Internal Reborn model purpose. Users choose provider/model routes; drivers
 /// request purpose slots instead of raw provider identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,8 +185,8 @@ impl ModelRouteProviderKey {
     pub fn for_route(route: ModelRoute) -> Self {
         Self {
             route,
-            config_version: "config:default".to_string(),
-            auth_version: "auth:default".to_string(),
+            config_version: DEFAULT_CONFIG_VERSION.to_string(),
+            auth_version: DEFAULT_AUTH_VERSION.to_string(),
         }
     }
 
@@ -391,15 +403,7 @@ fn validate_version_token(value: String) -> Result<String, ModelRouteError> {
 
 fn reject_sensitive_markers(value: &str) -> Result<(), ModelRouteError> {
     let lower = value.to_ascii_lowercase();
-    for forbidden in [
-        "access_token",
-        "api_key",
-        "apikey",
-        "authorization",
-        "bearer",
-        "password",
-        "secret",
-    ] {
+    for &forbidden in FORBIDDEN_ROUTE_MARKERS {
         if lower.contains(forbidden) {
             return Err(ModelRouteError::new(ModelRouteErrorKind::InvalidRoute));
         }

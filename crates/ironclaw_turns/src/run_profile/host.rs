@@ -385,17 +385,21 @@ impl LoopRunContext {
         resolved_run_profile: ResolvedRunProfile,
     ) -> Self {
         let thread_id = scope.thread_id.clone();
+        let loop_driver_id = resolved_run_profile.loop_driver.id.clone();
+        let loop_driver_version = resolved_run_profile.loop_driver.version;
+        let checkpoint_schema_id = resolved_run_profile.checkpoint_schema_id.clone();
+        let checkpoint_schema_version = resolved_run_profile.checkpoint_schema_version;
         Self {
             scope,
             thread_id,
             turn_id,
             run_id,
-            loop_driver_id: resolved_run_profile.loop_driver.id.clone(),
-            loop_driver_version: resolved_run_profile.loop_driver.version,
-            checkpoint_schema_id: resolved_run_profile.checkpoint_schema_id.clone(),
-            checkpoint_schema_version: resolved_run_profile.checkpoint_schema_version,
             resolved_run_profile,
             resolved_model_route: None,
+            loop_driver_id,
+            loop_driver_version,
+            checkpoint_schema_id,
+            checkpoint_schema_version,
         }
     }
 

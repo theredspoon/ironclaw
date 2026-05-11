@@ -351,17 +351,8 @@ async fn routed_gateway_uses_provider_pool_route_not_request_model_override() {
         "gpt-4.1",
         "routed response",
     ));
-    let resolver = Arc::new(
-        StaticModelRouteResolver::new(ModelRoutePolicy::new(
-            ModelSelectionMode::DeveloperAnyConfigured,
-        ))
-        .with_route(ModelSlot::Default, route.clone()),
-    );
-    let pool = Arc::new(
-        StaticModelRouteProviderPool::new()
-            .with_provider(route, provider.clone())
-            .unwrap(),
-    );
+    let resolver = developer_route_resolver(route.clone());
+    let pool = provider_pool_for_route(route, provider.clone());
     let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
 
     let response = gateway
@@ -443,17 +434,8 @@ async fn routed_gateway_uses_request_route_snapshot_over_current_resolver_route(
         "qwen3-coder",
         "snapshot response",
     ));
-    let resolver = Arc::new(
-        StaticModelRouteResolver::new(ModelRoutePolicy::new(
-            ModelSelectionMode::DeveloperAnyConfigured,
-        ))
-        .with_route(ModelSlot::Default, stale_current_route),
-    );
-    let pool = Arc::new(
-        StaticModelRouteProviderPool::new()
-            .with_provider(snapshot_route, provider.clone())
-            .unwrap(),
-    );
+    let resolver = developer_route_resolver(stale_current_route);
+    let pool = provider_pool_for_route(snapshot_route, provider.clone());
     let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
 
     let mut request = model_request(interactive_model());
@@ -478,17 +460,8 @@ async fn routed_gateway_rejects_unsupported_non_default_model_profile() {
         "qwen3-coder",
         "unused",
     ));
-    let resolver = Arc::new(
-        StaticModelRouteResolver::new(ModelRoutePolicy::new(
-            ModelSelectionMode::DeveloperAnyConfigured,
-        ))
-        .with_route(ModelSlot::Default, route.clone()),
-    );
-    let pool = Arc::new(
-        StaticModelRouteProviderPool::new()
-            .with_provider(route, provider.clone())
-            .unwrap(),
-    );
+    let resolver = developer_route_resolver(route.clone());
+    let pool = provider_pool_for_route(route, provider.clone());
     let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
 
     let error = gateway
@@ -507,15 +480,11 @@ async fn routed_gateway_rejects_managed_unapproved_route_before_provider_call() 
         "anthropic/claude-sonnet-4",
         "unused",
     ));
-    let resolver = Arc::new(
-        StaticModelRouteResolver::new(ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly))
-            .with_route(ModelSlot::Default, route.clone()),
+    let resolver = route_resolver(
+        ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly),
+        route.clone(),
     );
-    let pool = Arc::new(
-        StaticModelRouteProviderPool::new()
-            .with_provider(route, provider.clone())
-            .unwrap(),
-    );
+    let pool = provider_pool_for_route(route, provider.clone());
     let gateway = RoutedLlmProviderModelGateway::new(resolver, pool);
 
     let error = gateway
@@ -594,6 +563,31 @@ impl ThreadFixture {
 
 fn interactive_model() -> ModelProfileId {
     ModelProfileId::new("interactive_model").unwrap()
+}
+
+fn developer_route_resolver(route: ModelRoute) -> Arc<StaticModelRouteResolver> {
+    route_resolver(
+        ModelRoutePolicy::new(ModelSelectionMode::DeveloperAnyConfigured),
+        route,
+    )
+}
+
+fn route_resolver(policy: ModelRoutePolicy, route: ModelRoute) -> Arc<StaticModelRouteResolver> {
+    Arc::new(StaticModelRouteResolver::new(policy).with_route(ModelSlot::Default, route))
+}
+
+fn provider_pool_for_route<P>(
+    route: ModelRoute,
+    provider: Arc<P>,
+) -> Arc<StaticModelRouteProviderPool>
+where
+    P: LlmProvider + 'static,
+{
+    Arc::new(
+        StaticModelRouteProviderPool::new()
+            .with_provider(route, provider)
+            .unwrap(),
+    )
 }
 
 #[test]

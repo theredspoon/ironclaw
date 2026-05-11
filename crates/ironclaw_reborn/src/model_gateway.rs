@@ -19,14 +19,17 @@ use ironclaw_loop_support::{
     HostManagedModelResponse, HostManagedModelRouteSnapshot, ThreadBackedLoopModelPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
-use ironclaw_turns::run_profile::{
-    AgentLoopHostError, LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest,
-    LoopModelPort, LoopModelResponse, LoopSafeSummary, ModelProfileId,
+use ironclaw_turns::{
+    TurnId, TurnRunId,
+    run_profile::{
+        AgentLoopHostError, LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest,
+        LoopModelPort, LoopModelResponse, LoopSafeSummary, ModelProfileId,
+    },
 };
 
 use crate::model_routes::{
-    ModelRoute, ModelRouteError, ModelRouteProviderKey, ModelRouteResolver, ModelSlot,
-    ResolvedModelRouteSnapshot,
+    ModelRoute, ModelRouteError, ModelRouteProviderKey, ModelRouteResolver, ModelSelectionMode,
+    ModelSlot, ResolvedModelRouteSnapshot,
 };
 
 /// Fail-closed routing policy from resolved Reborn model profile ids to the
@@ -160,18 +163,12 @@ where
                 )
             })?;
         let model_override = pinned_model_override(route)?;
+        let model_profile_id = request.model_profile_id.clone();
+        let run_id = request.run_id;
+        let turn_id = request.turn_id;
         let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
         completion.model = Some(model_override.to_string());
-        completion.metadata.insert(
-            "model_profile_id".to_string(),
-            request.model_profile_id.as_str().to_string(),
-        );
-        completion
-            .metadata
-            .insert("turn_id".to_string(), request.turn_id.to_string());
-        completion
-            .metadata
-            .insert("run_id".to_string(), request.run_id.to_string());
+        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
 
         let response = self
             .provider
@@ -281,29 +278,12 @@ where
         let slot = slot_for_model_profile(&request.model_profile_id)?;
         let snapshot = self.resolve_or_load_snapshot(slot, &request)?;
         let provider = self.provider_pool.provider_for_route(&snapshot).await?;
+        let model_profile_id = request.model_profile_id.clone();
+        let run_id = request.run_id;
+        let turn_id = request.turn_id;
         let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
-        completion.metadata.insert(
-            "model_profile_id".to_string(),
-            request.model_profile_id.as_str().to_string(),
-        );
-        completion.metadata.insert(
-            "model_slot".to_string(),
-            snapshot.slot().as_str().to_string(),
-        );
-        completion.metadata.insert(
-            "model_route_provider_id".to_string(),
-            snapshot.route().provider_id().to_string(),
-        );
-        completion.metadata.insert(
-            "model_route_model_id".to_string(),
-            snapshot.route().model_id().to_string(),
-        );
-        completion
-            .metadata
-            .insert("turn_id".to_string(), request.turn_id.to_string());
-        completion
-            .metadata
-            .insert("run_id".to_string(), request.run_id.to_string());
+        add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
+        add_route_metadata(&mut completion, &snapshot);
 
         let response = provider
             .complete(completion)
@@ -327,19 +307,8 @@ where
             return snapshot_from_host_request(slot, snapshot);
         }
 
-        let cache_key = format!("{}:{}", request.run_id, slot.as_str());
-        if let Some(snapshot) = self
-            .route_snapshots
-            .lock()
-            .map_err(|_| {
-                HostManagedModelError::safe(
-                    HostManagedModelErrorKind::Unavailable,
-                    "model route snapshot cache is unavailable",
-                )
-            })?
-            .get(&cache_key)
-            .cloned()
-        {
+        let cache_key = snapshot_cache_key(request, slot);
+        if let Some(snapshot) = self.cached_snapshot(&cache_key)? {
             return Ok(snapshot);
         }
 
@@ -347,17 +316,77 @@ where
             .resolver
             .resolve_model_route(slot)
             .map_err(map_model_route_error)?;
-        self.route_snapshots
-            .lock()
-            .map_err(|_| {
-                HostManagedModelError::safe(
-                    HostManagedModelErrorKind::Unavailable,
-                    "model route snapshot cache is unavailable",
-                )
-            })?
-            .insert(cache_key, snapshot.clone());
+        self.cache_snapshot(cache_key, snapshot.clone())?;
         Ok(snapshot)
     }
+
+    fn cached_snapshot(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<ResolvedModelRouteSnapshot>, HostManagedModelError> {
+        Ok(self
+            .route_snapshots
+            .lock()
+            .map_err(|_| route_snapshot_cache_error())?
+            .get(cache_key)
+            .cloned())
+    }
+
+    fn cache_snapshot(
+        &self,
+        cache_key: String,
+        snapshot: ResolvedModelRouteSnapshot,
+    ) -> Result<(), HostManagedModelError> {
+        self.route_snapshots
+            .lock()
+            .map_err(|_| route_snapshot_cache_error())?
+            .insert(cache_key, snapshot);
+        Ok(())
+    }
+}
+
+fn add_request_metadata(
+    completion: &mut CompletionRequest,
+    model_profile_id: &ModelProfileId,
+    run_id: TurnRunId,
+    turn_id: TurnId,
+) {
+    completion.metadata.insert(
+        "model_profile_id".to_string(),
+        model_profile_id.as_str().to_string(),
+    );
+    completion
+        .metadata
+        .insert("turn_id".to_string(), turn_id.to_string());
+    completion
+        .metadata
+        .insert("run_id".to_string(), run_id.to_string());
+}
+
+fn add_route_metadata(completion: &mut CompletionRequest, snapshot: &ResolvedModelRouteSnapshot) {
+    completion.metadata.insert(
+        "model_slot".to_string(),
+        snapshot.slot().as_str().to_string(),
+    );
+    completion.metadata.insert(
+        "model_route_provider_id".to_string(),
+        snapshot.route().provider_id().to_string(),
+    );
+    completion.metadata.insert(
+        "model_route_model_id".to_string(),
+        snapshot.route().model_id().to_string(),
+    );
+}
+
+fn snapshot_cache_key(request: &HostManagedModelRequest, slot: ModelSlot) -> String {
+    format!("{}:{}", request.run_id, slot.as_str())
+}
+
+fn route_snapshot_cache_error() -> HostManagedModelError {
+    HostManagedModelError::safe(
+        HostManagedModelErrorKind::Unavailable,
+        "model route snapshot cache is unavailable",
+    )
 }
 
 fn snapshot_from_host_request(
@@ -375,7 +404,7 @@ fn snapshot_from_host_request(
     Ok(ResolvedModelRouteSnapshot::with_provider_key(
         slot,
         key,
-        crate::model_routes::ModelSelectionMode::DeveloperAnyConfigured,
+        ModelSelectionMode::DeveloperAnyConfigured,
     ))
 }
 
