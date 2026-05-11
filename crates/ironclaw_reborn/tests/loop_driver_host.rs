@@ -31,7 +31,8 @@ use ironclaw_loop_support::{
 use ironclaw_processes::ProcessServices;
 use ironclaw_reborn::{
     HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
-    RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
+    ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornLoopDriverHostFactory,
+    RebornLoopDriverHostRequest, StaticModelRouteResolver, TextOnlyLoopHostConfig,
     driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
     turn_runner::{HostFactory, TurnRunnerWakeReceiver, TurnRunnerWorker, TurnRunnerWorkerConfig},
 };
@@ -67,8 +68,8 @@ use ironclaw_turns::{
         LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
         LoopCheckpointStateRef, LoopContextRequest, LoopDriverId, LoopDriverNoteKind,
         LoopHostMilestone, LoopInputCursor, LoopInputCursorToken, LoopInputPort, LoopModelRequest,
-        LoopProgressEvent, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
-        ParentLoopOutput, PromptMode, VisibleCapabilityRequest,
+        LoopModelRouteSnapshot, LoopProgressEvent, LoopPromptBundleRequest, LoopPromptPort,
+        LoopRunContext, ParentLoopOutput, PromptMode, VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
@@ -295,6 +296,108 @@ async fn turn_runner_worker_drives_full_text_only_model_transcript_completion_af
 }
 
 #[tokio::test]
+async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
+    let fixture = HostFixture::new("thread-host-route-e2e", "hello routed e2e").await;
+    let persisted_route = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let stale_current_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, stale_current_route),
+    );
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_route.clone());
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(persisted_route.clone());
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+
+    let prompt_bundle = host_dyn
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+    let model_response = host_dyn
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+    let ParentLoopOutput::AssistantReply(reply) = model_response.output else {
+        panic!("expected assistant reply");
+    };
+    let reply_ref = host_dyn
+        .finalize_assistant_message(FinalizeAssistantMessage { reply })
+        .await
+        .unwrap();
+    let checkpoint_state = fixture
+        .stage_checkpoint_state(
+            LoopCheckpointKind::BeforeModel,
+            b"durable route e2e checkpoint",
+        )
+        .await;
+    let checkpoint_id = host_dyn
+        .checkpoint(LoopCheckpointRequest {
+            kind: LoopCheckpointKind::BeforeModel,
+            state_ref: checkpoint_state.state_ref.clone(),
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].resolved_model_route, Some(persisted_route));
+    assert_eq!(requests[0].messages[0].content, "hello routed e2e");
+    assert!(reply_ref.as_str().starts_with("msg:"));
+    assert!(
+        fixture
+            .loop_checkpoint_store
+            .get_loop_checkpoint(GetLoopCheckpointRequest {
+                scope: fixture.context.scope.clone(),
+                turn_id: fixture.context.turn_id,
+                run_id: fixture.context.run_id,
+                checkpoint_id,
+            })
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture.milestone_names(),
+        vec![
+            "prompt_bundle_built",
+            "model_started",
+            "model_completed",
+            "assistant_reply_finalized",
+            "checkpoint_created",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_claimed_scope() {
     let fixture = HostFixture::new_unsubmitted("thread-runner-host-edge", "hello edge").await;
     let turn_store = Arc::new(InMemoryTurnStateStore::default());
@@ -327,7 +430,10 @@ async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_clai
         fixture.checkpoint_state_store.clone(),
         turn_store.clone(),
         fixture.milestone_sink.clone(),
-        TextOnlyLoopHostConfig { max_messages: 8 },
+        TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: false,
+        },
     );
 
     let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
@@ -403,6 +509,299 @@ async fn text_only_host_factory_implements_turn_runner_host_factory() {
         .await
         .unwrap();
     assert_eq!(context.messages.len(), 1);
+}
+
+#[tokio::test]
+async fn text_only_host_factory_create_host_uses_claimed_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-claimed-model-route", "hello routed host").await;
+    let persisted_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_snapshot.clone());
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(
+            ModelSlot::Default,
+            ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap(),
+        ),
+    );
+
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .create_host(&claimed)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        host.run_context().resolved_model_route,
+        Some(persisted_snapshot)
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
+    let fixture = HostFixture::new("thread-host-model-route", "hello routed host").await;
+    let route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(ModelRoutePolicy::new(
+            ModelSelectionMode::DeveloperAnyConfigured,
+        ))
+        .with_route(ModelSlot::Default, route),
+    );
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    let snapshot = host_dyn
+        .run_context()
+        .resolved_model_route
+        .clone()
+        .expect("factory should attach model route snapshot");
+
+    host_dyn
+        .stream_model(LoopModelRequest {
+            messages: Vec::new(),
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].resolved_model_route, Some(snapshot));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_reuses_existing_model_route_snapshot_without_reresolving() {
+    let fixture = HostFixture::new("thread-host-model-route-reuse", "hello routed host").await;
+    let persisted_route = ModelRoute::new("openrouter", "anthropic/claude-sonnet-4").unwrap();
+    let replacement_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(
+            ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly)
+                .with_approved_route(persisted_route.clone()),
+        )
+        .with_route(ModelSlot::Default, replacement_route),
+    );
+    let persisted_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(persisted_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_snapshot.clone());
+
+    let host = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap();
+
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    assert_eq!(
+        host_dyn.run_context().resolved_model_route,
+        Some(persisted_snapshot)
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_persisted_model_route_snapshot_without_resolver() {
+    let fixture =
+        HostFixture::new("thread-host-model-route-no-resolver", "hello routed host").await;
+    let persisted_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(persisted_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(persisted_snapshot);
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("model route resolver is required")
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_persisted_model_route_snapshot_denied_by_policy() {
+    let fixture = HostFixture::new("thread-host-model-route-denied", "hello routed host").await;
+    let allowed_route = ModelRoute::new("nearai", "qwen3-coder").unwrap();
+    let resolver = Arc::new(
+        StaticModelRouteResolver::new(
+            ModelRoutePolicy::new(ModelSelectionMode::ManagedOnly)
+                .with_approved_route(allowed_route.clone()),
+        )
+        .with_route(ModelSlot::Default, allowed_route),
+    );
+    let denied_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(denied_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(denied_snapshot);
+
+    let error = fixture
+        .factory()
+        .with_model_route_resolver(resolver)
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("model route resolution failed"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_unpersisted_context_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-injected", "hello routed host").await;
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(LoopModelRouteSnapshot::new(
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            "config:v1",
+            "auth:v1",
+        ));
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("was not persisted"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_mismatched_persisted_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-mismatch", "hello routed host").await;
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(LoopModelRouteSnapshot::new(
+            "openrouter",
+            "anthropic/claude-sonnet-4",
+            "config:v1",
+            "auth:v1",
+        ));
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(LoopModelRouteSnapshot::new(
+        "nearai",
+        "qwen3-coder",
+        "config:v1",
+        "auth:v1",
+    ));
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("does not match claimed run"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_rejects_invalid_persisted_model_route_snapshot() {
+    let fixture = HostFixture::new("thread-host-model-route-invalid", "hello routed host").await;
+    let invalid_snapshot = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/secret-model",
+        "config:v1",
+        "auth:v1",
+    );
+    let context = fixture
+        .context
+        .clone()
+        .with_resolved_model_route(invalid_snapshot.clone());
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_model_route = Some(invalid_snapshot);
+
+    let error = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: claimed,
+            loop_run_context: context,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("forbidden marker"));
+}
+
+#[tokio::test]
+async fn text_only_host_factory_fails_fast_when_model_route_snapshot_required_without_resolver() {
+    let fixture = HostFixture::new("thread-host-model-route-required", "hello routed host").await;
+    let error = fixture
+        .factory_with_config(TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: true,
+        })
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("model route resolver is required")
+    );
 }
 
 #[tokio::test]
@@ -685,7 +1084,10 @@ async fn text_only_host_factory_rejects_thread_scope_mismatch() {
         fixture.checkpoint_state_store.clone(),
         fixture.loop_checkpoint_store.clone(),
         fixture.milestone_sink.clone(),
-        TextOnlyLoopHostConfig { max_messages: 8 },
+        TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: false,
+        },
     );
 
     let error = factory
@@ -2815,6 +3217,7 @@ impl HostFixture {
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
             resolved_run_profile_id: RunProfileId::default_profile(),
             resolved_run_profile_version: RunProfileVersion::new(1),
+            resolved_model_route: None,
             received_at: Utc::now(),
             checkpoint_id: None,
             gate_ref: None,
@@ -2865,6 +3268,30 @@ impl HostFixture {
         &self,
         loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
     ) -> RebornLoopDriverHostFactory<InMemorySessionThreadService, RecordingGateway> {
+        self.factory_with_config_and_loop_checkpoint_store(
+            TextOnlyLoopHostConfig {
+                max_messages: 8,
+                require_model_route_snapshot: false,
+            },
+            loop_checkpoint_store,
+        )
+    }
+
+    fn factory_with_config(
+        &self,
+        config: TextOnlyLoopHostConfig,
+    ) -> RebornLoopDriverHostFactory<InMemorySessionThreadService, RecordingGateway> {
+        self.factory_with_config_and_loop_checkpoint_store(
+            config,
+            self.loop_checkpoint_store.clone(),
+        )
+    }
+
+    fn factory_with_config_and_loop_checkpoint_store(
+        &self,
+        config: TextOnlyLoopHostConfig,
+        loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
+    ) -> RebornLoopDriverHostFactory<InMemorySessionThreadService, RecordingGateway> {
         RebornLoopDriverHostFactory::new(
             Arc::clone(&self.thread_service),
             self.thread_scope.clone(),
@@ -2872,7 +3299,7 @@ impl HostFixture {
             self.checkpoint_state_store.clone(),
             loop_checkpoint_store,
             self.milestone_sink.clone(),
-            TextOnlyLoopHostConfig { max_messages: 8 },
+            config,
         )
     }
 

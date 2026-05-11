@@ -28,8 +28,8 @@ use ironclaw_turns::{
         FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink, InMemoryRunProfileResolver,
         LoopCapabilityPort, LoopContextPort, LoopContextRequest, LoopHostMilestoneKind,
         LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest,
-        LoopRunContext, LoopTranscriptPort, ParentLoopOutput, UpdateAssistantDraft,
-        VisibleCapabilityRequest,
+        LoopModelRouteSnapshot, LoopRunContext, LoopTranscriptPort, ParentLoopOutput,
+        UpdateAssistantDraft, VisibleCapabilityRequest,
     },
 };
 use tracing_test::traced_test;
@@ -573,6 +573,39 @@ async fn model_port_resolves_thread_message_refs_and_delegates_to_gateway() {
     assert_eq!(calls[0].turn_id, fixture.run_context.turn_id);
     assert_eq!(calls[0].messages[0].role, HostManagedModelMessageRole::User);
     assert_eq!(calls[0].messages[0].content, "hello reborn");
+}
+
+#[tokio::test]
+async fn model_port_threads_resolved_model_route_snapshot_to_gateway() {
+    let fixture = ThreadFixture::new().await;
+    let snapshot = LoopModelRouteSnapshot::new("anthropic", "claude-opus-4", "cfg-1", "auth-1");
+    let run_context = fixture
+        .run_context
+        .clone()
+        .with_resolved_model_route(snapshot.clone());
+    let gateway = Arc::new(RecordingGateway::reply("model says hi"));
+    let port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        run_context,
+        gateway.clone(),
+        16,
+    );
+
+    port.stream_model(LoopModelRequest {
+        messages: vec![LoopModelMessage {
+            role: "user".to_string(),
+            content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+        }],
+        surface_version: None,
+        model_preference: None,
+    })
+    .await
+    .unwrap();
+
+    let calls = gateway.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].resolved_model_route, Some(snapshot));
 }
 
 #[tokio::test]
