@@ -45,6 +45,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
 mod first_party;
+pub mod memory_context;
 mod obligations;
 mod planner;
 mod production;

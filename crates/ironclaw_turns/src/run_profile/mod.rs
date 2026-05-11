@@ -10,6 +10,7 @@
 
 mod driver;
 mod host;
+mod memory_context;
 mod milestones;
 mod model;
 mod policy;
@@ -39,6 +40,9 @@ pub use host::{
     LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
     ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
     VisibleCapabilitySurface, validate_model_route_component_value,
+};
+pub use memory_context::{
+    EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,
 };
 pub use milestones::{
     InMemoryLoopHostMilestoneSink, LoopHostMilestone, LoopHostMilestoneEmitter,
