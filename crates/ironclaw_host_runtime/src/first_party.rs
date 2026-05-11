@@ -45,15 +45,25 @@ impl FirstPartyCapabilityResult {
 #[error("first-party capability dispatch failed: {kind}")]
 pub struct FirstPartyCapabilityError {
     kind: RuntimeDispatchErrorKind,
+    usage: Option<ResourceUsage>,
 }
 
 impl FirstPartyCapabilityError {
     pub fn new(kind: RuntimeDispatchErrorKind) -> Self {
-        Self { kind }
+        Self { kind, usage: None }
+    }
+
+    pub fn with_usage(mut self, usage: ResourceUsage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 
     pub fn kind(&self) -> RuntimeDispatchErrorKind {
         self.kind
+    }
+
+    pub fn usage(&self) -> Option<&ResourceUsage> {
+        self.usage.as_ref()
     }
 }
 
@@ -98,6 +108,10 @@ impl FirstPartyCapabilityRegistry {
         capability_id: &CapabilityId,
     ) -> Option<Arc<dyn FirstPartyCapabilityHandler>> {
         self.handlers.get(capability_id).cloned()
+    }
+
+    pub fn contains_handler(&self, capability_id: &CapabilityId) -> bool {
+        self.handlers.contains_key(capability_id)
     }
 
     pub fn is_empty(&self) -> bool {

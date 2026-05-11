@@ -9,10 +9,12 @@
 use std::{
     any::type_name,
     collections::HashMap,
+    panic::AssertUnwindSafe,
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use ironclaw_approvals::ApprovalResolver;
 use ironclaw_authorization::{CapabilityLeaseStore, TrustAwareCapabilityDispatchAuthorizer};
 use ironclaw_dispatcher::{
@@ -1110,7 +1112,7 @@ where
             self.push_missing(
                 &mut issues,
                 ProductionWiringComponent::FirstPartyRuntime,
-                self.first_party_runtime.is_some(),
+                self.first_party_runtime_covers_declared_capabilities(),
             );
         }
 
@@ -1568,10 +1570,25 @@ where
         if self.script_runtime.is_some() {
             backends.push(RuntimeKind::Script);
         }
-        if self.first_party_runtime.is_some() {
+        if self.first_party_runtime_covers_declared_capabilities() {
             backends.push(RuntimeKind::FirstParty);
         }
         backends
+    }
+
+    fn first_party_runtime_covers_declared_capabilities(&self) -> bool {
+        let Some(first_party_runtime) = &self.first_party_runtime else {
+            return false;
+        };
+        let mut declared = self
+            .registry
+            .capabilities()
+            .filter(|descriptor| descriptor.runtime == RuntimeKind::FirstParty)
+            .peekable();
+        if declared.peek().is_none() {
+            return false;
+        }
+        declared.all(|descriptor| first_party_runtime.contains_handler(&descriptor.id))
     }
 }
 
@@ -1789,26 +1806,30 @@ where
                 })?,
         };
 
-        let result = match handler
-            .dispatch(FirstPartyCapabilityRequest {
-                capability_id: request.capability_id.clone(),
-                scope: request.scope.clone(),
-                estimate: request.estimate,
-                mounts: request.mounts,
-                input: request.input,
-            })
-            .await
+        let result = match AssertUnwindSafe(handler.dispatch(FirstPartyCapabilityRequest {
+            capability_id: request.capability_id.clone(),
+            scope: request.scope.clone(),
+            estimate: request.estimate,
+            mounts: request.mounts,
+            input: request.input,
+        }))
+        .catch_unwind()
+        .await
         {
-            Ok(result) => result,
-            Err(error) => {
-                if let Err(release_error) = request.governor.release(reservation.id) {
-                    tracing::warn!(
-                        reservation_id = %reservation.id,
-                        error = %release_error,
-                        "failed to release first-party resource reservation after handler failure"
-                    );
-                }
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => {
+                account_or_release_failed_first_party_execution(
+                    request.governor,
+                    reservation.id,
+                    error.usage(),
+                )?;
                 return Err(DispatchError::FirstParty { kind: error.kind() });
+            }
+            Err(_) => {
+                release_first_party_reservation(request.governor, reservation.id);
+                return Err(DispatchError::FirstParty {
+                    kind: RuntimeDispatchErrorKind::Backend,
+                });
             }
         };
 
@@ -2127,6 +2148,40 @@ where
         usage: execution.usage,
         receipt,
     })
+}
+
+fn account_or_release_failed_first_party_execution<G>(
+    governor: &G,
+    reservation_id: ResourceReservationId,
+    usage: Option<&ResourceUsage>,
+) -> Result<(), DispatchError>
+where
+    G: ResourceGovernor + ?Sized,
+{
+    let Some(usage) = usage else {
+        release_first_party_reservation(governor, reservation_id);
+        return Ok(());
+    };
+    if !has_accountable_effects(usage) {
+        release_first_party_reservation(governor, reservation_id);
+        return Ok(());
+    }
+
+    if governor.reconcile(reservation_id, usage.clone()).is_err() {
+        release_first_party_reservation(governor, reservation_id);
+        return Err(DispatchError::FirstParty {
+            kind: RuntimeDispatchErrorKind::Resource,
+        });
+    }
+
+    Ok(())
+}
+
+fn release_first_party_reservation<G>(governor: &G, reservation_id: ResourceReservationId)
+where
+    G: ResourceGovernor + ?Sized,
+{
+    let _ = governor.release(reservation_id);
 }
 
 fn account_or_release_failed_wasm_execution<G>(
