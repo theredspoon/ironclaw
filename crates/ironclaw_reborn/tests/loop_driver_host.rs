@@ -9,20 +9,26 @@ use ironclaw_loop_support::{
 };
 use ironclaw_reborn::{
     RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
-    turn_runner::HostFactory,
+    driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
+    turn_runner::{HostFactory, TurnRunnerWakeReceiver, TurnRunnerWorker, TurnRunnerWorkerConfig},
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
-    MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
+    MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadMessageId,
+    ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, CheckpointStateStore, EventCursor, GetCheckpointStateRequest,
-    GetLoopCheckpointRequest, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
-    InMemoryRunProfileResolver, InMemoryTurnStateStore, InMemoryTurnStateStoreLimits,
-    LoopCheckpointRecord, LoopCheckpointStore, PutCheckpointStateRequest, PutLoopCheckpointRequest,
-    ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest, RunProfileResolver,
-    RunProfileVersion, SourceBindingRef, TurnError, TurnLeaseToken, TurnRunId, TurnRunnerId,
-    TurnScope, TurnStatus,
+    AcceptedMessageRef, AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError,
+    AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, CheckpointStateStore, EventCursor,
+    GetCheckpointStateRequest, GetLoopCheckpointRequest, GetRunStateRequest, IdempotencyKey,
+    InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryRunProfileResolver,
+    InMemoryTurnStateStore, InMemoryTurnStateStoreLimits, LoopCheckpointRecord,
+    LoopCheckpointStore, LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId,
+    LoopExitInvalidHandling, LoopExitValidationPolicy, PutCheckpointStateRequest,
+    PutLoopCheckpointRequest, ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest,
+    RunProfileResolver, RunProfileVersion, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse,
+    TurnActor, TurnError, TurnLeaseToken, TurnRunId, TurnRunnerId, TurnScope, TurnStateStore,
+    TurnStatus,
     run_profile::{
         AgentLoopDriverHost, AgentLoopHostErrorKind, CapabilityDeniedReasonKind,
         CapabilityInputRef, CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
@@ -153,6 +159,199 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
         ]
     );
     assert_public_milestones_hide_raw_payloads(&fixture.milestones());
+}
+
+#[tokio::test]
+async fn turn_runner_worker_drives_full_text_only_model_transcript_completion_after_missed_wake() {
+    let fixture = HostFixture::new_unsubmitted("thread-runner-e2e", "hello full runner").await;
+    let turn_store = Arc::new(InMemoryTurnStateStore::default());
+    let resolver = InMemoryRunProfileResolver::default();
+    let resolved = resolver
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let descriptor = resolved.loop_driver.clone();
+
+    let run_id =
+        queue_fixture_turn(&fixture, turn_store.as_ref(), &resolver, "idem-runner-e2e").await;
+
+    let mut registry = DriverRegistry::new();
+    registry
+        .register_driver(
+            Arc::new(TextOnlyFinalReplyDriver { descriptor }),
+            DriverRequirements::all_required(),
+            DriverKind::Reference,
+        )
+        .unwrap();
+
+    let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let worker = TurnRunnerWorker::new(
+        TurnRunnerWorkerConfig {
+            heartbeat_interval: std::time::Duration::from_millis(20),
+            poll_interval: std::time::Duration::from_millis(10),
+            scope_filter: Some(fixture.context.scope.clone()),
+            exit_validation_policy: trusted_completion_refs_policy_for_test(),
+        },
+        turn_store.clone(),
+        Arc::new(registry),
+        Arc::new(fixture.factory_with_loop_checkpoint_store(turn_store.clone())),
+        wake_receiver,
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let state = turn_store
+            .get_run_state(GetRunStateRequest {
+                scope: fixture.context.scope.clone(),
+                run_id,
+            })
+            .await
+            .unwrap();
+        if state.status == TurnStatus::Completed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker should complete queued run via fallback polling after missed wake"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    handle.await.unwrap();
+
+    let final_state = turn_store
+        .get_run_state(GetRunStateRequest {
+            scope: fixture.context.scope.clone(),
+            run_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_state.status, TurnStatus::Completed);
+
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(history.messages.iter().any(|message| {
+        message.kind == MessageKind::Assistant
+            && message.status == MessageStatus::Finalized
+            && message.content.as_deref() == Some("model says hi")
+    }));
+    assert_eq!(fixture.gateway.requests().len(), 1);
+    assert_eq!(
+        fixture.gateway.requests()[0].messages[0].content,
+        "hello full runner"
+    );
+    assert_eq!(
+        fixture.milestone_names(),
+        vec![
+            "prompt_bundle_built",
+            "model_started",
+            "model_completed",
+            "assistant_reply_finalized",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_claimed_scope() {
+    let fixture = HostFixture::new_unsubmitted("thread-runner-host-edge", "hello edge").await;
+    let turn_store = Arc::new(InMemoryTurnStateStore::default());
+    let resolver = InMemoryRunProfileResolver::default();
+    let resolved = resolver
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let descriptor = resolved.loop_driver.clone();
+    let run_id =
+        queue_fixture_turn(&fixture, turn_store.as_ref(), &resolver, "idem-runner-edge").await;
+
+    let mut registry = DriverRegistry::new();
+    registry
+        .register_driver(
+            Arc::new(TextOnlyFinalReplyDriver { descriptor }),
+            DriverRequirements::all_required(),
+            DriverKind::Reference,
+        )
+        .unwrap();
+
+    let wrong_thread_scope = ThreadScope {
+        tenant_id: TenantId::new("tenant-other").unwrap(),
+        ..fixture.thread_scope.clone()
+    };
+    let rejecting_factory = RebornLoopDriverHostFactory::new(
+        Arc::clone(&fixture.thread_service),
+        wrong_thread_scope,
+        Arc::clone(&fixture.gateway),
+        fixture.checkpoint_state_store.clone(),
+        turn_store.clone(),
+        fixture.milestone_sink.clone(),
+        TextOnlyLoopHostConfig { max_messages: 8 },
+    );
+
+    let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let worker = TurnRunnerWorker::new(
+        TurnRunnerWorkerConfig {
+            heartbeat_interval: std::time::Duration::from_millis(20),
+            poll_interval: std::time::Duration::from_millis(10),
+            scope_filter: Some(fixture.context.scope.clone()),
+            exit_validation_policy: trusted_completion_refs_policy_for_test(),
+        },
+        turn_store.clone(),
+        Arc::new(registry),
+        Arc::new(rejecting_factory),
+        wake_receiver,
+    );
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let state = turn_store
+            .get_run_state(GetRunStateRequest {
+                scope: fixture.context.scope.clone(),
+                run_id,
+            })
+            .await
+            .unwrap();
+        if state.status == TurnStatus::RecoveryRequired {
+            assert!(state.failure.is_some());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "host factory scope rejection should record RecoveryRequired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    cancel.cancel();
+    handle.await.unwrap();
+
+    assert!(fixture.gateway.requests().is_empty());
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !history
+            .messages
+            .iter()
+            .any(|message| message.kind == MessageKind::Assistant)
+    );
 }
 
 #[tokio::test]
@@ -677,6 +876,147 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
     assert_eq!(stale.kind, AgentLoopHostErrorKind::StaleSurface);
 }
 
+struct TextOnlyFinalReplyDriver {
+    descriptor: AgentLoopDriverDescriptor,
+}
+
+#[async_trait]
+impl AgentLoopDriver for TextOnlyFinalReplyDriver {
+    fn descriptor(&self) -> AgentLoopDriverDescriptor {
+        self.descriptor.clone()
+    }
+
+    async fn run(
+        &self,
+        _request: AgentLoopDriverRunRequest,
+        host: &(dyn AgentLoopDriverHost + Send + Sync),
+    ) -> Result<LoopExit, AgentLoopDriverError> {
+        let surface = host
+            .visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .map_err(driver_host_error)?;
+        let prompt_bundle = host
+            .build_prompt_bundle(LoopPromptBundleRequest {
+                mode: PromptMode::TextOnly,
+                context_cursor: None,
+                surface_version: Some(surface.version.clone()),
+                checkpoint_state_ref: None,
+                max_messages: Some(8),
+            })
+            .await
+            .map_err(driver_host_error)?;
+        let model_response = host
+            .stream_model(LoopModelRequest {
+                messages: prompt_bundle.messages,
+                surface_version: Some(surface.version),
+                model_preference: None,
+            })
+            .await
+            .map_err(driver_host_error)?;
+        let ParentLoopOutput::AssistantReply(reply) = model_response.output else {
+            return Err(AgentLoopDriverError::Failed {
+                reason_kind: "unexpected_model_output".to_string(),
+            });
+        };
+        let reply_ref = host
+            .finalize_assistant_message(FinalizeAssistantMessage { reply })
+            .await
+            .map_err(driver_host_error)?;
+
+        Ok(LoopExit::Completed(LoopCompleted {
+            completion_kind: LoopCompletionKind::FinalReply,
+            reply_message_refs: vec![reply_ref],
+            result_refs: vec![],
+            final_checkpoint_id: None,
+            usage_summary_ref: None,
+            exit_id: LoopExitId::new("exit:turn-runner-e2e").unwrap(),
+        }))
+    }
+
+    async fn resume(
+        &self,
+        request: AgentLoopDriverResumeRequest,
+        host: &(dyn AgentLoopDriverHost + Send + Sync),
+    ) -> Result<LoopExit, AgentLoopDriverError> {
+        self.run(
+            AgentLoopDriverRunRequest {
+                turn_id: request.turn_id,
+                run_id: request.run_id,
+                resolved_run_profile: request.resolved_run_profile,
+            },
+            host,
+        )
+        .await
+    }
+}
+
+fn driver_host_error(
+    error: ironclaw_turns::run_profile::AgentLoopHostError,
+) -> AgentLoopDriverError {
+    AgentLoopDriverError::Failed {
+        reason_kind: format!("{:?}", error.kind),
+    }
+}
+
+fn trusted_completion_refs_policy_for_test() -> LoopExitValidationPolicy {
+    LoopExitValidationPolicy {
+        require_final_checkpoint: false,
+        host_cancellation_observed: false,
+        invalid_handling: LoopExitInvalidHandling::RecoveryRequired,
+        completion_refs_verified: true,
+        blocked_evidence_verified: false,
+        failure_evidence_verified: false,
+    }
+}
+
+async fn queue_fixture_turn(
+    fixture: &HostFixture,
+    turn_store: &InMemoryTurnStateStore,
+    resolver: &dyn RunProfileResolver,
+    idempotency_key: &str,
+) -> TurnRunId {
+    let submit = turn_store
+        .submit_turn(
+            SubmitTurnRequest {
+                scope: fixture.context.scope.clone(),
+                actor: TurnActor::new(UserId::new("user-text-host").unwrap()),
+                accepted_message_ref: AcceptedMessageRef::new(format!(
+                    "accepted-{idempotency_key}"
+                ))
+                .unwrap(),
+                source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
+                reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
+                requested_run_profile: None,
+                idempotency_key: IdempotencyKey::new(idempotency_key).unwrap(),
+                received_at: Utc::now(),
+            },
+            &ironclaw_turns::AllowAllTurnAdmissionPolicy,
+            resolver,
+        )
+        .await
+        .unwrap();
+    let SubmitTurnResponse::Accepted {
+        turn_id,
+        run_id,
+        status,
+        ..
+    } = submit;
+    assert_eq!(status, TurnStatus::Queued);
+
+    fixture
+        .thread_service
+        .mark_message_submitted(
+            &fixture.thread_scope,
+            &fixture.thread_id,
+            fixture.accepted_message_id,
+            turn_id.to_string(),
+            run_id.to_string(),
+        )
+        .await
+        .unwrap();
+    run_id
+}
+
 struct HostFixture {
     thread_service: Arc<InMemorySessionThreadService>,
     checkpoint_state_store: Arc<InMemoryCheckpointStateStore>,
@@ -685,12 +1025,25 @@ struct HostFixture {
     milestone_sink: Arc<InMemoryLoopHostMilestoneSink>,
     thread_scope: ThreadScope,
     thread_id: ThreadId,
+    accepted_message_id: ThreadMessageId,
     claimed: ClaimedTurnRun,
     context: LoopRunContext,
 }
 
 impl HostFixture {
     async fn new(thread_name: &str, user_content: &str) -> Self {
+        Self::new_with_submission_state(thread_name, user_content, true).await
+    }
+
+    async fn new_unsubmitted(thread_name: &str, user_content: &str) -> Self {
+        Self::new_with_submission_state(thread_name, user_content, false).await
+    }
+
+    async fn new_with_submission_state(
+        thread_name: &str,
+        user_content: &str,
+        mark_submitted: bool,
+    ) -> Self {
         let thread_service = Arc::new(InMemorySessionThreadService::default());
         let checkpoint_state_store = Arc::new(InMemoryCheckpointStateStore::default());
         let loop_checkpoint_store = Arc::new(InMemoryLoopCheckpointStore::default());
@@ -767,16 +1120,18 @@ impl HostFixture {
             lease_token: TurnLeaseToken::new(),
         };
         let context = LoopRunContext::new(turn_scope, turn_id, run_id, resolved);
-        thread_service
-            .mark_message_submitted(
-                &thread_scope_from_turn(&context.scope),
-                &thread_id,
-                accepted.message_id,
-                turn_id.to_string(),
-                run_id.to_string(),
-            )
-            .await
-            .unwrap();
+        if mark_submitted {
+            thread_service
+                .mark_message_submitted(
+                    &thread_scope_from_turn(&context.scope),
+                    &thread_id,
+                    accepted.message_id,
+                    turn_id.to_string(),
+                    run_id.to_string(),
+                )
+                .await
+                .unwrap();
+        }
 
         Self {
             thread_service,
@@ -786,6 +1141,7 @@ impl HostFixture {
             milestone_sink,
             thread_scope,
             thread_id,
+            accepted_message_id: accepted.message_id,
             claimed,
             context,
         }
