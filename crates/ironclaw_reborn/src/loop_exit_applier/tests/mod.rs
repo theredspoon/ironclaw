@@ -150,7 +150,7 @@ async fn cancelled_exit_requires_observed_cancel_input() {
 }
 
 #[tokio::test]
-async fn observed_host_cancellation_can_preempt_final_checkpoint() {
+async fn observed_host_cancellation_still_requires_final_checkpoint_when_configured() {
     let mut claimed = claimed_run();
     claimed
         .resolved_run_profile
@@ -170,8 +170,11 @@ async fn observed_host_cancellation_can_preempt_final_checkpoint() {
 
     let state = applier.apply(&claimed, exit).await.expect("applied");
 
-    assert_eq!(state.status, TurnStatus::Cancelled);
-    assert_eq!(state.failure, None);
+    assert_eq!(state.status, TurnStatus::Failed);
+    assert_eq!(
+        state.failure.expect("failure").category(),
+        "driver_protocol_violation"
+    );
 }
 
 #[tokio::test]
@@ -426,6 +429,7 @@ fn claimed_run() -> ClaimedTurnRun {
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply").expect("valid"),
             resolved_run_profile_id: ironclaw_turns::RunProfileId::default_profile(),
             resolved_run_profile_version: RunProfileVersion::new(1),
+            resolved_model_route: None,
             received_at: chrono::Utc::now(),
             checkpoint_id: None,
             gate_ref: None,
@@ -670,6 +674,7 @@ fn state_for_mapping(
         reply_target_binding_ref: ReplyTargetBindingRef::new("reply").expect("valid"),
         resolved_run_profile_id: ironclaw_turns::RunProfileId::default_profile(),
         resolved_run_profile_version: RunProfileVersion::new(1),
+        resolved_model_route: None,
         received_at: chrono::Utc::now(),
         checkpoint_id: None,
         gate_ref,

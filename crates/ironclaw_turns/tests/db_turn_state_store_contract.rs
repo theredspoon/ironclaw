@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CheckpointSchemaId, DefaultTurnCoordinator,
-    GetLoopCheckpointRequest, IdempotencyKey, InMemoryRunProfileResolver,
+    GetLoopCheckpointRequest, GetRunStateRequest, IdempotencyKey, InMemoryRunProfileResolver,
     InMemoryTurnStateStoreLimits, LoopCheckpointStateRef, LoopCheckpointStore, LoopExitMapping,
     PutLoopCheckpointRequest, ReplyTargetBindingRef, ResolvedRunProfile, RunProfileRequest,
     RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
@@ -24,9 +24,11 @@ use ironclaw_turns::{
     TurnEventProjectionService, TurnEventProjectionSource, TurnId, TurnLeaseToken, TurnRunId,
     TurnRunState, TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
     events::EventCursor,
+    run_profile::LoopModelRouteSnapshot,
     runner::{
         ApplyValidatedLoopExitRequest, ClaimRunRequest, CompleteRunRequest, HeartbeatRequest,
-        RecoverExpiredLeasesRequest, TurnRunTransitionPort, TurnRunnerOutcome,
+        RecordModelRouteSnapshotRequest, RecoverExpiredLeasesRequest, TurnRunTransitionPort,
+        TurnRunnerOutcome,
     },
 };
 
@@ -280,6 +282,70 @@ async fn libsql_turn_state_store_persists_submit_and_busy_across_instances() {
         .await
         .unwrap();
     assert_eq!(duplicate, accepted);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_turn_state_store_persists_model_route_snapshot_across_reopen_and_recovery() {
+    let (db, _dir) = libsql_db().await;
+    let store = Arc::new(LibSqlTurnStateStore::new(db.clone()));
+    store.run_migrations().await.unwrap();
+    let coordinator = DefaultTurnCoordinator::new(store.clone());
+    let run_id = accepted_run_id(
+        &coordinator
+            .submit_turn(submit_request("thread-route-db", "idem-route-db"))
+            .await
+            .unwrap(),
+    );
+    let runner_id = TurnRunnerId::new();
+    let lease_token = TurnLeaseToken::new();
+    store
+        .claim_next_run(ClaimRunRequest {
+            runner_id,
+            lease_token,
+            scope_filter: Some(scope("thread-route-db")),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let route = LoopModelRouteSnapshot::new(
+        "openrouter",
+        "anthropic/claude-sonnet-4",
+        "config:v1",
+        "auth:v1",
+    );
+    store
+        .record_model_route_snapshot(RecordModelRouteSnapshotRequest {
+            run_id,
+            runner_id,
+            lease_token,
+            snapshot: route.clone(),
+        })
+        .await
+        .unwrap();
+
+    let reopened = Arc::new(LibSqlTurnStateStore::new(db));
+    assert_eq!(
+        reopened
+            .get_run_state(GetRunStateRequest {
+                scope: scope("thread-route-db"),
+                run_id,
+            })
+            .await
+            .unwrap()
+            .resolved_model_route,
+        Some(route.clone())
+    );
+
+    let recovered = reopened
+        .recover_expired_leases(RecoverExpiredLeasesRequest {
+            now: Utc::now() + ChronoDuration::hours(1),
+            scope_filter: Some(scope("thread-route-db")),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered.recovered.len(), 1);
+    assert_eq!(recovered.recovered[0].resolved_model_route, Some(route));
 }
 
 #[cfg(feature = "libsql")]

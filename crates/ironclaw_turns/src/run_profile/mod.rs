@@ -16,6 +16,7 @@ mod policy;
 mod prompt;
 mod refs;
 mod resolver;
+mod skill_context;
 mod snapshot;
 
 pub use driver::{
@@ -33,10 +34,11 @@ pub use host::{
     LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest, LoopContextSnippet,
     LoopDriverNoteKind, LoopInput, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
     LoopInputPort, LoopInterruptKind, LoopModelMessage, LoopModelPort, LoopModelRequest,
-    LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
-    LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort,
-    LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary,
-    PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    LoopModelResponse, LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
+    LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
+    LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
+    ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
+    VisibleCapabilitySurface, validate_model_route_component_value,
 };
 pub use milestones::{
     InMemoryLoopHostMilestoneSink, LoopHostMilestone, LoopHostMilestoneEmitter,
@@ -60,5 +62,10 @@ pub use refs::{
 pub use resolver::{
     InMemoryRunProfileRegistry, InMemoryRunProfileResolver, RunProfileDefinition,
     RunProfileResolutionRequest, RunProfileResolver,
+};
+pub use skill_context::{
+    InstalledSkillSnapshot, NoopSkillContextSource, SkillContextBudget, SkillContextError,
+    SkillContextService, SkillContextSnippet, SkillContextSource, SkillRunSnapshot,
+    SkillTrustLevel, SkillVisibility,
 };
 pub use snapshot::ResolvedRunProfile;
