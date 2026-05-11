@@ -25,15 +25,16 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
-        CapabilityDescriptorView, CapabilityFailure, CapabilityInvocation, CapabilityOutcome,
-        CapabilityResultMessage, CapabilitySurfaceVersion, FinalizeAssistantMessage,
-        LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
-        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelMessage, LoopModelPort,
-        LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
-        LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort,
-        LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ProcessHandleSummary,
-        PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityFailure,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
+        FinalizeAssistantMessage, LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest,
+        LoopContextBundle, LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter,
+        LoopHostMilestoneSink, LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelMessage,
+        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent,
+        LoopProgressPort, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
+        LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
+        ProcessHandleSummary, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -436,7 +437,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
         let snapshot = self.snapshot_for(&request.surface_version)?;
         let Some(capability) = snapshot.capabilities.get(&request.capability_id).cloned() else {
             return Ok(CapabilityOutcome::Denied(CapabilityDenied {
-                reason_kind: "outside_visible_surface".to_string(),
+                reason_kind: capability_denied_reason_kind("outside_visible_surface")?,
                 safe_summary: "capability was not visible on the cited surface".to_string(),
             }));
         };
@@ -447,7 +448,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             .cloned()
         else {
             return Ok(CapabilityOutcome::Denied(CapabilityDenied {
-                reason_kind: "missing_provider_trust".to_string(),
+                reason_kind: capability_denied_reason_kind("missing_provider_trust")?,
                 safe_summary: "capability provider trust is unavailable".to_string(),
             }));
         };
@@ -658,7 +659,7 @@ async fn runtime_outcome_to_loop(
         RuntimeCapabilityOutcome::Failed(failure) => {
             if failure.kind == RuntimeFailureKind::Authorization {
                 CapabilityOutcome::Denied(CapabilityDenied {
-                    reason_kind: failure.kind.as_str().to_string(),
+                    reason_kind: capability_denied_reason_kind(failure.kind.as_str())?,
                     safe_summary: runtime_safe_summary(
                         failure.message,
                         "capability authorization denied",
@@ -701,6 +702,17 @@ fn ensure_runtime_outcome_matches(
         ));
     }
     Ok(())
+}
+
+fn capability_denied_reason_kind(
+    value: impl Into<String>,
+) -> Result<CapabilityDeniedReasonKind, AgentLoopHostError> {
+    CapabilityDeniedReasonKind::unknown(value).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "capability denied reason kind could not be represented",
+        )
+    })
 }
 
 fn runtime_safe_summary(message: Option<String>, fallback: &'static str) -> String {

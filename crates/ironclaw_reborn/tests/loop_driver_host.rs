@@ -840,7 +840,7 @@ async fn text_only_host_rejects_outside_surface_capability_before_host_runtime()
 
     assert!(matches!(
         denied,
-        CapabilityOutcome::Denied(denied) if denied.reason_kind == "outside_visible_surface"
+        CapabilityOutcome::Denied(denied) if denied.reason_kind.as_str() == "outside_visible_surface"
     ));
     assert!(runtime.invocations().is_empty());
 
