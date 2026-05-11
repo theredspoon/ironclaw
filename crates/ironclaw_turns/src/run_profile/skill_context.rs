@@ -18,9 +18,9 @@
 //! # Fail-closed semantics
 //!
 //! If trust or visibility data is missing, the snapshot version does not match entries,
-//! or prompt content exceeds configured context budgets, the service returns an error rather
-//! than silently degrading. This ensures that an unconfigured or corrupt snapshot never leaks
-//! capabilities to the model.
+//! model-visible fields contain unsafe internal markers, or prompt content exceeds configured
+//! context budgets, the service returns an error rather than silently degrading. This ensures
+//! that an unconfigured or corrupt snapshot never leaks capabilities to the model.
 //!
 //! # Determinism
 //!
@@ -58,6 +58,10 @@ pub enum SkillContextError {
     /// Snapshot version does not match the entry data.
     #[error("skill context: invalid snapshot version")]
     InvalidSnapshotVersion,
+
+    /// Snapshot content is not safe to expose to the model.
+    #[error("skill context: unsafe model-visible content")]
+    UnsafeModelVisibleContent,
 
     /// Skill context budget configuration is invalid.
     #[error("skill context: budget misconfigured")]
@@ -324,6 +328,9 @@ impl SkillContextSource for SkillContextService {
                 return Err(SkillContextError::ContextBudgetExceeded);
             }
 
+            validate_model_visible_skill_name(&entry.name)?;
+            validate_model_visible_text(&safe_summary)?;
+
             let snippet_ref = format!("skill:{}", entry.name);
             total_bytes = checked_context_total_bytes(
                 total_bytes,
@@ -428,6 +435,61 @@ const fn visibility_rank(visibility: SkillVisibility) -> u8 {
         SkillVisibility::Hidden => 1,
         SkillVisibility::Denied => 2,
     }
+}
+
+fn validate_model_visible_skill_name(name: &str) -> Result<(), SkillContextError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    };
+
+    if !first.is_ascii_alphanumeric()
+        || name.len() > 64
+        || chars.any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')))
+    {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    }
+
+    Ok(())
+}
+
+fn validate_model_visible_text(text: &str) -> Result<(), SkillContextError> {
+    if text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        || contains_raw_host_path(text)
+        || contains_internal_handle_marker(text)
+    {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    }
+
+    Ok(())
+}
+
+fn contains_raw_host_path(text: &str) -> bool {
+    text.split(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+    })
+    .any(|token| {
+        token.starts_with("/Users/")
+            || token.starts_with("/home/")
+            || token.starts_with("/private/")
+            || token.starts_with("/tmp/") // safety: this is a blocked host-path prefix pattern, not a test temp path.
+            || token.starts_with("/var/")
+            || token.starts_with("/etc/")
+            || token.as_bytes().get(0..3).is_some_and(|prefix| {
+                prefix[0].is_ascii_alphabetic() && prefix[1] == b':' && prefix[2] == b'\\'
+            })
+    })
+}
+
+fn contains_internal_handle_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("cap_") || lower.contains("secret://") || lower.contains("secret:")
 }
 
 fn checked_context_total_bytes(

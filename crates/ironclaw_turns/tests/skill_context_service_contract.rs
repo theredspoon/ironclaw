@@ -322,6 +322,46 @@ async fn duplicate_ordering_keys_use_total_order() {
 }
 
 #[tokio::test]
+async fn unsafe_visible_metadata_fails_before_loop_snippet_emission() {
+    let cases = vec![
+        (
+            "unsafe name would leak through snippet_ref",
+            SkillRunSnapshot::from_entries(vec![visible_trusted(
+                "/Users/alice/.ssh/id_rsa",
+                "safe description",
+                "safe prompt",
+            )]),
+        ),
+        (
+            "unsafe description would leak through safe_summary",
+            SkillRunSnapshot::from_entries(vec![visible_trusted(
+                "alpha",
+                "raw capability handle cap_file_read_123",
+                "safe prompt",
+            )]),
+        ),
+        (
+            "unsafe trusted prompt would leak through safe_summary",
+            SkillRunSnapshot::from_entries(vec![visible_trusted(
+                "alpha",
+                "safe description",
+                "load secret://oauth-token",
+            )]),
+        ),
+    ];
+
+    for (case, snapshot) in cases {
+        let service = SkillContextService::new(snapshot.clone());
+        let err = service.skill_snippets(&snapshot).await.unwrap_err();
+        assert_eq!(
+            err,
+            SkillContextError::UnsafeModelVisibleContent,
+            "{case} must fail closed before model-visible snippet emission"
+        );
+    }
+}
+
+#[tokio::test]
 async fn redaction_no_raw_paths_or_internals() {
     let snapshot = SkillRunSnapshot::from_entries(vec![
         visible_trusted("alpha", "A helpful skill", "Use this skill to help"),
