@@ -44,6 +44,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
+pub mod memory_context;
 mod obligations;
 mod planner;
 mod production;
