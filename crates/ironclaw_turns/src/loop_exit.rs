@@ -52,6 +52,15 @@ impl LoopExit {
                 LoopExitViolationKind::UnverifiedBlockedEvidence,
                 policy.invalid_handling,
             ),
+            Self::Cancelled(exit)
+                if policy.require_final_checkpoint && exit.checkpoint_id.is_none() =>
+            {
+                invalid_exit_decision(
+                    exit_id,
+                    LoopExitViolationKind::MissingFinalCheckpoint,
+                    policy.invalid_handling,
+                )
+            }
             Self::Cancelled(_exit) if policy.host_cancellation_observed => {
                 LoopExitValidationDecision::trusted(exit_id, TurnRunnerOutcome::Cancelled)
             }
@@ -60,6 +69,15 @@ impl LoopExit {
                 LoopExitViolationKind::CancellationNotObserved,
                 policy.invalid_handling,
             ),
+            Self::Failed(exit)
+                if policy.require_final_checkpoint && exit.checkpoint_id.is_none() =>
+            {
+                invalid_exit_decision(
+                    exit_id,
+                    LoopExitViolationKind::MissingFinalCheckpoint,
+                    policy.invalid_handling,
+                )
+            }
             Self::Failed(exit) if policy.failure_evidence_verified => {
                 LoopExitValidationDecision::trusted(
                     exit_id,
