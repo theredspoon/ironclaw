@@ -393,14 +393,13 @@ async fn wasm_lane_rejects_unsupported_import_through_dispatcher_without_reserva
 }
 
 #[tokio::test]
-async fn wasm_lane_enforces_aggregate_memory_budget_through_dispatcher() {
-    let multi_memory = COUNTER_TOOL_WAT.replace(
-        r#"(memory (export "memory") 1)"#,
-        r#"(memory (export "memory") 1)
-  (memory 1)"#,
+async fn wasm_lane_enforces_memory_growth_budget_through_dispatcher() {
+    let memory_growth = COUNTER_TOOL_WAT.replace(
+        "global.get $count\n    i32.const 1\n    i32.add",
+        "i32.const 1\n    memory.grow\n    i32.const -1\n    i32.eq\n    if\n      unreachable\n    end\n\n    global.get $count\n    i32.const 1\n    i32.add",
     );
-    assert_ne!(multi_memory, COUNTER_TOOL_WAT);
-    let component = tool_component(&multi_memory);
+    assert_ne!(memory_growth, COUNTER_TOOL_WAT);
+    let component = tool_component(&memory_growth);
     let fs = filesystem_with_wasm_component("wasm-smoke", "wasm/counter.wasm", &component).await;
     let registry = Arc::new(registry_with_package(WASM_MANIFEST));
     let governor = Arc::new(governor_with_default_limit(sample_account()));
@@ -427,14 +426,10 @@ async fn wasm_lane_enforces_aggregate_memory_budget_through_dispatcher() {
         matches!(
             err,
             DispatchError::Wasm {
-                kind: RuntimeDispatchErrorKind::Manifest
-                    | RuntimeDispatchErrorKind::Memory
-                    | RuntimeDispatchErrorKind::Executor
-                    | RuntimeDispatchErrorKind::Guest
-                    | RuntimeDispatchErrorKind::MethodMissing
+                kind: RuntimeDispatchErrorKind::Guest | RuntimeDispatchErrorKind::Memory
             }
         ),
-        "unexpected memory-bound dispatch error: {err:?}"
+        "unexpected memory-growth-bound dispatch error: {err:?}"
     );
     assert_eq!(
         governor.reserved_for(&sample_account()),
