@@ -63,7 +63,8 @@ pub use resolver::{
     RunProfileResolutionRequest, RunProfileResolver,
 };
 pub use skill_context::{
-    InstalledSkillSnapshot, NoopSkillContextSource, SkillContextError, SkillContextService,
-    SkillContextSnippet, SkillContextSource, SkillRunSnapshot, SkillTrustLevel, SkillVisibility,
+    InstalledSkillSnapshot, NoopSkillContextSource, SkillContextBudget, SkillContextError,
+    SkillContextService, SkillContextSnippet, SkillContextSource, SkillRunSnapshot,
+    SkillTrustLevel, SkillVisibility,
 };
 pub use snapshot::ResolvedRunProfile;

@@ -17,15 +17,18 @@
 //!
 //! # Fail-closed semantics
 //!
-//! If trust or visibility data is missing (e.g., the snapshot version is empty), the service
-//! returns an error rather than silently degrading. This ensures that an unconfigured or
-//! corrupt snapshot never leaks capabilities to the model.
+//! If trust or visibility data is missing, the snapshot version does not match entries,
+//! or prompt content exceeds configured context budgets, the service returns an error rather
+//! than silently degrading. This ensures that an unconfigured or corrupt snapshot never leaks
+//! capabilities to the model.
 //!
 //! # Determinism
 //!
-//! Output ordering is deterministic for the same [`SkillRunSnapshot`]: entries are sorted
-//! lexicographically by [`InstalledSkillSnapshot::ordering_key`], and the snapshot version
-//! is a deterministic hash of all entry data.
+//! Output ordering is deterministic for the same [`SkillRunSnapshot`]: entries are sorted by
+//! a total ordering rooted in [`InstalledSkillSnapshot::ordering_key`], and the snapshot
+//! version is a deterministic hash of all entry data.
+
+use std::cmp::Ordering;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -50,7 +53,15 @@ pub enum SkillContextError {
     #[error("skill context: visibility data missing")]
     VisibilityDataMissing,
 
-    /// An internal error that cannot be attributed to trust or visibility.
+    /// Snapshot version does not match the entry data.
+    #[error("skill context: invalid snapshot version")]
+    InvalidSnapshotVersion,
+
+    /// Model-visible skill context exceeds configured context budgets.
+    #[error("skill context: context budget exceeded")]
+    ContextBudgetExceeded,
+
+    /// An internal error that cannot be attributed to trust, visibility, or budget validation.
     #[error("skill context: internal error")]
     Internal,
 }
@@ -90,8 +101,43 @@ pub enum SkillTrustLevel {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot types
+// Snapshot types and context budgets
 // ---------------------------------------------------------------------------
+
+const EMPTY_SNAPSHOT_VERSION: &str = "empty";
+const DEFAULT_MAX_SKILL_SNIPPET_BYTES: usize = 8 * 1024;
+const DEFAULT_MAX_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
+
+/// Byte budgets for model-visible skill context produced by [`SkillContextService`].
+///
+/// Hosts can map a run's context profile to these limits via
+/// [`SkillContextService::with_budget`]. Both limits fail closed when exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillContextBudget {
+    /// Maximum bytes for one snippet summary.
+    pub max_snippet_bytes: usize,
+    /// Maximum aggregate bytes across emitted snippet refs and summaries.
+    pub max_context_bytes: usize,
+}
+
+impl SkillContextBudget {
+    /// Create explicit skill-context budget limits.
+    pub const fn new(max_snippet_bytes: usize, max_context_bytes: usize) -> Self {
+        Self {
+            max_snippet_bytes,
+            max_context_bytes,
+        }
+    }
+}
+
+impl Default for SkillContextBudget {
+    fn default() -> Self {
+        Self {
+            max_snippet_bytes: DEFAULT_MAX_SKILL_SNIPPET_BYTES,
+            max_context_bytes: DEFAULT_MAX_SKILL_CONTEXT_BYTES,
+        }
+    }
+}
 
 /// Immutable, host-approved state of a single installed skill for a run.
 ///
@@ -111,14 +157,14 @@ pub struct InstalledSkillSnapshot {
     pub prompt_content: Option<String>,
     /// Sanitized description safe for model consumption.
     pub safe_description: String,
-    /// Key used for deterministic lexicographic sorting of output.
+    /// Primary key used for deterministic sorting of output.
     pub ordering_key: String,
 }
 
 /// Complete set of installed skill snapshots for a run.
 ///
 /// The `snapshot_version` is a deterministic hash of all entries, used to verify
-/// that two snapshots built from the same data produce identical context.
+/// the service is reading the same entry data approved by the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillRunSnapshot {
     /// All installed skill entries for this run.
@@ -135,16 +181,20 @@ impl SkillRunSnapshot {
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
-            snapshot_version: "empty".to_string(),
+            snapshot_version: EMPTY_SNAPSHOT_VERSION.to_string(),
         }
     }
 
     /// Build a snapshot from a list of entries with a deterministic version hash.
     ///
-    /// Entries are sorted by `ordering_key` before hashing so that insertion order
-    /// does not affect the version.
+    /// Entries are total-order sorted before hashing so that insertion order and
+    /// duplicate ordering keys do not affect the version.
     pub fn from_entries(mut entries: Vec<InstalledSkillSnapshot>) -> Self {
-        entries.sort_by(|a, b| a.ordering_key.cmp(&b.ordering_key));
+        if entries.is_empty() {
+            return Self::empty();
+        }
+
+        entries.sort_by(compare_skill_entries);
         let version = compute_snapshot_version(&entries);
         Self {
             entries,
@@ -205,12 +255,18 @@ pub trait SkillContextSource: Send + Sync {
 /// method [`SkillContextSource::skill_snippets`] accepts any snapshot.
 pub struct SkillContextService {
     snapshot: SkillRunSnapshot,
+    budget: SkillContextBudget,
 }
 
 impl SkillContextService {
-    /// Create a new service from a host-approved run snapshot.
+    /// Create a new service from a host-approved run snapshot with default context limits.
     pub fn new(snapshot: SkillRunSnapshot) -> Self {
-        Self { snapshot }
+        Self::with_budget(snapshot, SkillContextBudget::default())
+    }
+
+    /// Create a new service from a host-approved run snapshot with explicit context limits.
+    pub fn with_budget(snapshot: SkillRunSnapshot, budget: SkillContextBudget) -> Self {
+        Self { snapshot, budget }
     }
 
     /// Convenience: produce snippets from the held snapshot.
@@ -227,10 +283,8 @@ impl SkillContextSource for SkillContextService {
         &self,
         run_snapshot: &SkillRunSnapshot,
     ) -> Result<Vec<SkillContextSnippet>, SkillContextError> {
-        // Fail closed on missing/corrupt trust data.
-        if run_snapshot.snapshot_version.is_empty() {
-            return Err(SkillContextError::TrustDataMissing);
-        }
+        validate_snapshot(run_snapshot)?;
+        validate_budget(self.budget)?;
 
         let mut visible: Vec<&InstalledSkillSnapshot> = run_snapshot
             .entries
@@ -238,30 +292,43 @@ impl SkillContextSource for SkillContextService {
             .filter(|entry| entry.visibility == SkillVisibility::Visible)
             .collect();
 
-        // Deterministic ordering by ordering_key.
-        // Re-sort here even though `from_entries` sorts, because the snapshot
-        // may have been constructed manually with unsorted entries.
-        visible.sort_by(|a, b| a.ordering_key.cmp(&b.ordering_key));
+        // Re-sort here even though `from_entries` sorts, because snapshots may
+        // have been constructed manually. Use total-order sorting so duplicate
+        // ordering keys cannot make output depend on input order.
+        visible.sort_by(|a, b| compare_skill_entries(a, b));
 
-        let snippets = visible
-            .into_iter()
-            .map(|entry| {
-                let safe_summary = match entry.trust {
-                    SkillTrustLevel::Trusted => {
-                        if let Some(ref content) = entry.prompt_content {
-                            format!("{}\n\n{}", entry.safe_description, content)
-                        } else {
-                            entry.safe_description.clone()
-                        }
+        let mut snippets = Vec::with_capacity(visible.len());
+        let mut total_bytes = 0usize;
+
+        for entry in visible {
+            let safe_summary = match entry.trust {
+                SkillTrustLevel::Trusted => {
+                    if let Some(ref content) = entry.prompt_content {
+                        format!("{}\n\n{}", entry.safe_description, content)
+                    } else {
+                        entry.safe_description.clone()
                     }
-                    SkillTrustLevel::Installed => entry.safe_description.clone(),
-                };
-                SkillContextSnippet {
-                    snippet_ref: format!("skill:{}", entry.name),
-                    safe_summary,
                 }
-            })
-            .collect();
+                SkillTrustLevel::Installed => entry.safe_description.clone(),
+            };
+
+            if safe_summary.len() > self.budget.max_snippet_bytes {
+                return Err(SkillContextError::ContextBudgetExceeded);
+            }
+
+            let snippet_ref = format!("skill:{}", entry.name);
+            total_bytes = total_bytes
+                .saturating_add(snippet_ref.len())
+                .saturating_add(safe_summary.len());
+            if total_bytes > self.budget.max_context_bytes {
+                return Err(SkillContextError::ContextBudgetExceeded);
+            }
+
+            snippets.push(SkillContextSnippet {
+                snippet_ref,
+                safe_summary,
+            });
+        }
 
         Ok(snippets)
     }
@@ -289,6 +356,64 @@ impl SkillContextSource for NoopSkillContextSource {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn validate_snapshot(snapshot: &SkillRunSnapshot) -> Result<(), SkillContextError> {
+    if snapshot.snapshot_version.is_empty() {
+        return Err(SkillContextError::TrustDataMissing);
+    }
+
+    if snapshot.entries.is_empty() {
+        if snapshot.snapshot_version == EMPTY_SNAPSHOT_VERSION {
+            return Ok(());
+        }
+        return Err(SkillContextError::InvalidSnapshotVersion);
+    }
+
+    let mut sorted_entries = snapshot.entries.clone();
+    sorted_entries.sort_by(compare_skill_entries);
+    let expected_version = compute_snapshot_version(&sorted_entries);
+    if snapshot.snapshot_version != expected_version {
+        return Err(SkillContextError::InvalidSnapshotVersion);
+    }
+
+    Ok(())
+}
+
+fn validate_budget(budget: SkillContextBudget) -> Result<(), SkillContextError> {
+    if budget.max_snippet_bytes == 0
+        || budget.max_context_bytes == 0
+        || budget.max_snippet_bytes > budget.max_context_bytes
+    {
+        return Err(SkillContextError::ContextBudgetExceeded);
+    }
+
+    Ok(())
+}
+
+fn compare_skill_entries(a: &InstalledSkillSnapshot, b: &InstalledSkillSnapshot) -> Ordering {
+    a.ordering_key
+        .cmp(&b.ordering_key)
+        .then_with(|| a.name.cmp(&b.name))
+        .then_with(|| trust_rank(a.trust).cmp(&trust_rank(b.trust)))
+        .then_with(|| visibility_rank(a.visibility).cmp(&visibility_rank(b.visibility)))
+        .then_with(|| a.safe_description.cmp(&b.safe_description))
+        .then_with(|| a.prompt_content.cmp(&b.prompt_content))
+}
+
+const fn trust_rank(trust: SkillTrustLevel) -> u8 {
+    match trust {
+        SkillTrustLevel::Installed => 0,
+        SkillTrustLevel::Trusted => 1,
+    }
+}
+
+const fn visibility_rank(visibility: SkillVisibility) -> u8 {
+    match visibility {
+        SkillVisibility::Visible => 0,
+        SkillVisibility::Hidden => 1,
+        SkillVisibility::Denied => 2,
+    }
+}
 
 /// Compute a deterministic version string from sorted snapshot entries.
 ///

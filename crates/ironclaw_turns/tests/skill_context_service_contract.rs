@@ -4,8 +4,8 @@
 //! deterministic ordering/rebuild, and redaction of non-model-safe metadata.
 
 use ironclaw_turns::run_profile::{
-    InstalledSkillSnapshot, NoopSkillContextSource, SkillContextError, SkillContextService,
-    SkillContextSource, SkillRunSnapshot, SkillTrustLevel, SkillVisibility,
+    InstalledSkillSnapshot, NoopSkillContextSource, SkillContextBudget, SkillContextError,
+    SkillContextService, SkillContextSource, SkillRunSnapshot, SkillTrustLevel, SkillVisibility,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,7 +155,10 @@ async fn deterministic_ordering_same_snapshot() {
     let service = SkillContextService::new(snapshot.clone());
     let first = service.skill_snippets(&snapshot).await.unwrap();
     let second = service.skill_snippets(&snapshot).await.unwrap();
-    assert_eq!(first, second, "same snapshot must produce byte-equal output");
+    assert_eq!(
+        first, second,
+        "same snapshot must produce byte-equal output"
+    );
     // Verify sorted order
     let names: Vec<&str> = first.iter().map(|s| s.snippet_ref.as_str()).collect();
     assert_eq!(names, vec!["skill:alpha", "skill:bravo", "skill:charlie"]);
@@ -203,6 +206,63 @@ async fn snapshot_version_determinism() {
 }
 
 #[tokio::test]
+async fn tampered_snapshot_version_fails_closed() {
+    let mut snapshot =
+        SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", "prompt")]);
+    snapshot.entries[0].safe_description = "tampered desc".to_string();
+
+    let service = SkillContextService::new(snapshot.clone());
+    let err = service.skill_snippets(&snapshot).await.unwrap_err();
+    assert_eq!(err, SkillContextError::InvalidSnapshotVersion);
+}
+
+#[tokio::test]
+async fn oversized_single_snippet_fails_budget() {
+    let snapshot =
+        SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", &"x".repeat(128))]);
+    let service =
+        SkillContextService::with_budget(snapshot.clone(), SkillContextBudget::new(64, 512));
+
+    let err = service.skill_snippets(&snapshot).await.unwrap_err();
+    assert_eq!(err, SkillContextError::ContextBudgetExceeded);
+}
+
+#[tokio::test]
+async fn aggregate_skill_context_fails_budget() {
+    let snapshot = SkillRunSnapshot::from_entries(vec![
+        visible_trusted("alpha", "first description", "first prompt"),
+        visible_trusted("beta", "second description", "second prompt"),
+    ]);
+    let service =
+        SkillContextService::with_budget(snapshot.clone(), SkillContextBudget::new(128, 64));
+
+    let err = service.skill_snippets(&snapshot).await.unwrap_err();
+    assert_eq!(err, SkillContextError::ContextBudgetExceeded);
+}
+
+#[tokio::test]
+async fn duplicate_ordering_keys_use_total_order() {
+    let mut alpha = visible_trusted("alpha", "desc a", "prompt a");
+    alpha.ordering_key = "same".to_string();
+    let mut beta = visible_trusted("beta", "desc b", "prompt b");
+    beta.ordering_key = "same".to_string();
+
+    let snap_a = SkillRunSnapshot::from_entries(vec![beta.clone(), alpha.clone()]);
+    let snap_b = SkillRunSnapshot::from_entries(vec![alpha, beta]);
+
+    assert_eq!(snap_a.snapshot_version, snap_b.snapshot_version);
+
+    let service_a = SkillContextService::new(snap_a.clone());
+    let service_b = SkillContextService::new(snap_b.clone());
+    let output_a = service_a.skill_snippets(&snap_a).await.unwrap();
+    let output_b = service_b.skill_snippets(&snap_b).await.unwrap();
+
+    assert_eq!(output_a, output_b);
+    let refs: Vec<&str> = output_a.iter().map(|s| s.snippet_ref.as_str()).collect();
+    assert_eq!(refs, vec!["skill:alpha", "skill:beta"]);
+}
+
+#[tokio::test]
 async fn redaction_no_raw_paths_or_internals() {
     let snapshot = SkillRunSnapshot::from_entries(vec![
         visible_trusted("alpha", "A helpful skill", "Use this skill to help"),
@@ -242,11 +302,7 @@ async fn redaction_no_raw_paths_or_internals() {
 #[tokio::test]
 async fn noop_skill_context_source_returns_empty() {
     let noop = NoopSkillContextSource;
-    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted(
-        "alpha",
-        "desc",
-        "prompt",
-    )]);
+    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", "prompt")]);
     let result = noop.skill_snippets(&snapshot).await.unwrap();
     assert!(result.is_empty());
 }
@@ -266,12 +322,18 @@ async fn mixed_visibility_correct_filtering() {
     assert_eq!(snippets.len(), 2);
 
     // Trusted includes prompt
-    let alpha = snippets.iter().find(|s| s.snippet_ref == "skill:alpha").unwrap();
+    let alpha = snippets
+        .iter()
+        .find(|s| s.snippet_ref == "skill:alpha")
+        .unwrap();
     assert!(alpha.safe_summary.contains("trusted visible"));
     assert!(alpha.safe_summary.contains("trusted prompt"));
 
     // Installed excludes prompt
-    let beta = snippets.iter().find(|s| s.snippet_ref == "skill:beta").unwrap();
+    let beta = snippets
+        .iter()
+        .find(|s| s.snippet_ref == "skill:beta")
+        .unwrap();
     assert!(beta.safe_summary.contains("installed visible"));
     assert!(
         !beta.safe_summary.contains("secret prompt"),
@@ -288,11 +350,7 @@ async fn mixed_visibility_correct_filtering() {
 async fn into_loop_snippet_conversion() {
     use ironclaw_turns::run_profile::LoopContextSnippet;
 
-    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted(
-        "alpha",
-        "desc",
-        "prompt",
-    )]);
+    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", "prompt")]);
     let service = SkillContextService::new(snapshot.clone());
     let snippets = service.skill_snippets(&snapshot).await.unwrap();
     let loop_snippet: LoopContextSnippet = snippets.into_iter().next().unwrap().into_loop_snippet();
