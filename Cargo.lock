@@ -4754,11 +4754,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "http 1.4.0",
- "ironclaw_host_api",
  "ironclaw_product_adapters",
  "ironclaw_turns",
- "ironclaw_wasm_product_adapters",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
