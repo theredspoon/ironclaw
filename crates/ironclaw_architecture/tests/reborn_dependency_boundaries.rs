@@ -336,6 +336,59 @@ fn wasm_product_adapter_wit_preserves_product_adapter_trust_boundary() {
 }
 
 #[test]
+fn wasm_product_adapter_wit_declares_egress_targets_as_paired_records() {
+    // Henry's review (PR #3352, 2026-05-12T05:04:30Z) flagged that the
+    // WIT manifest previously exposed `declared-egress-hosts: list<string>`
+    // and `declared-credential-handles: list<string>` as independent
+    // lists, which contradicted the Rust `EgressPolicy` that now
+    // requires exact `(host, Option<credential_handle>)` pairs.
+    // Independent lists could not express "Slack token only for Slack",
+    // forcing the future host glue to either reintroduce the cross-pair
+    // leak the Rust policy closes or invent pair metadata the manifest
+    // did not carry.
+    //
+    // The WIT now declares a `declared-egress-target` record and the
+    // manifest carries `declared-egress-targets: list<declared-egress-
+    // target>`. This boundary test pins the new shape — a regression
+    // that splits the pair back into independent lists fails here.
+    let wit = std::fs::read_to_string(
+        workspace_root().join("crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit"),
+    )
+    .expect("product adapter WIT must be readable");
+
+    assert!(
+        wit.contains("record declared-egress-target"),
+        "WIT must declare a paired `declared-egress-target` record so the manifest can express the (host, optional credential_handle) contract the Rust EgressPolicy enforces"
+    );
+    assert!(
+        wit.contains("declared-egress-targets: list<declared-egress-target>"),
+        "adapter-manifest must carry `declared-egress-targets: list<declared-egress-target>` (paired) instead of independent host/handle lists"
+    );
+
+    // Egress-request must reference the paired target by a single
+    // index, not split into separate host/handle indexes — the WIT
+    // shape mirrors the Rust pair-contract.
+    assert!(
+        wit.contains("egress-target-index: u32"),
+        "egress-request must reference a single paired target via `egress-target-index`"
+    );
+
+    // Forbidden: the prior independent-list shape and split indexes
+    // that allowed cross-pair leak by construction.
+    for forbidden in [
+        "declared-egress-hosts: list<string>",
+        "declared-credential-handles: list<string>",
+        "host-index: u32",
+        "credential-handle-index: option<u32>",
+    ] {
+        assert!(
+            !wit.contains(forbidden),
+            "WIT must not carry the prior independent-list / split-index shape `{forbidden}` — it could not express the paired Rust contract and would reintroduce the cross-pair credential leak"
+        );
+    }
+}
+
+#[test]
 fn wasm_product_adapter_wit_pins_json_shim_shape() {
     // Henry's review on PR #3352 flagged that the WIT carries adapter
     // payloads as JSON strings (`parsed-json`, `evidence-json`,
