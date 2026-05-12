@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::bootstrap::ironclaw_base_dir;
@@ -458,7 +458,12 @@ impl ChannelsConfig {
             },
             reborn_telegram_v2_enabled: parse_bool_env("REBORN_TELEGRAM_V2_ENABLED", false)?,
         };
-        validate_telegram_v1_v2_exclusivity(&cfg)?;
+        // Config-time check: only the env-var view of v1 is available here.
+        // The runtime startup path re-runs the validator with the
+        // persisted-active set so an installation whose `activated_channels`
+        // row carries telegram (independently of `WASM_CHANNELS`) also
+        // fails closed (issue #3285, follow-up to PR #3356 review).
+        validate_telegram_v1_v2_exclusivity(&cfg, None)?;
         Ok(cfg)
     }
 }
@@ -466,22 +471,38 @@ impl ChannelsConfig {
 /// Mutual-exclusion guard for Telegram v1/v2 paths.
 ///
 /// Returns an error when both v1 and v2 would handle the same telegram
-/// installation. Invoked at the end of [`ChannelsConfig::resolve`] so the
-/// invariant is enforced during `Config::from_env` / `Config::from_db` —
-/// preventing two paths from receiving the same update and
-/// double-submitting the same canonical message.
+/// installation. Called twice during startup so the invariant is
+/// enforced fail-closed:
+///
+/// 1. [`ChannelsConfig::resolve`] invokes it with `persisted_active = None`
+///    so env-level misconfigurations fail during `Config::from_env` /
+///    `Config::from_db` before any runtime state loads.
+/// 2. The runtime startup path (see `src/main.rs` ahead of
+///    `setup_wasm_channels`) invokes it again with the persisted-active
+///    set fed in. The setup helper auto-loads persisted-active WASM
+///    channels independently of `configured_wasm_channels`, so the
+///    env-only check would let v1 stand up alongside v2 for an install
+///    whose persisted `activated_channels` row carries `telegram` while
+///    the env var omits it (Henry's review on PR #3356).
 ///
 /// v1 is considered active when [`ChannelsConfig::wasm_channels_enabled`]
-/// is true AND [`ChannelsConfig::configured_wasm_channels`] contains
-/// `"telegram"`. v2 is the value of
-/// [`ChannelsConfig::reborn_telegram_v2_enabled`]. Both rules are derived
-/// here so callers cannot drift from the invariant (see issue #3285).
-pub fn validate_telegram_v1_v2_exclusivity(channels: &ChannelsConfig) -> Result<(), ConfigError> {
-    let v1_active = channels.wasm_channels_enabled
-        && channels
-            .configured_wasm_channels
-            .iter()
-            .any(|c| c == "telegram");
+/// is true AND either [`ChannelsConfig::configured_wasm_channels`] lists
+/// `"telegram"` OR the persisted-active set contains `"telegram"`. v2 is
+/// the value of [`ChannelsConfig::reborn_telegram_v2_enabled`]. Both
+/// rules are derived here so callers cannot drift from the invariant
+/// (issue #3285).
+pub fn validate_telegram_v1_v2_exclusivity(
+    channels: &ChannelsConfig,
+    persisted_active_wasm_channels: Option<&HashSet<String>>,
+) -> Result<(), ConfigError> {
+    let v1_telegram_configured = channels
+        .configured_wasm_channels
+        .iter()
+        .any(|c| c == "telegram");
+    let v1_telegram_persisted =
+        persisted_active_wasm_channels.is_some_and(|active| active.iter().any(|c| c == "telegram"));
+    let v1_active =
+        channels.wasm_channels_enabled && (v1_telegram_configured || v1_telegram_persisted);
     let v2_active = channels.reborn_telegram_v2_enabled;
     if v1_active && v2_active {
         return Err(ConfigError::InvalidValue {
@@ -520,24 +541,31 @@ mod telegram_v2_tests {
         }
     }
 
+    fn persisted_with(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn v2_disabled_with_v1_active_is_ok() {
-        validate_telegram_v1_v2_exclusivity(&channels_cfg(true, false)).expect("v1 alone is fine");
+        validate_telegram_v1_v2_exclusivity(&channels_cfg(true, false), None)
+            .expect("v1 alone is fine");
     }
 
     #[test]
     fn v2_enabled_with_v1_inactive_is_ok() {
-        validate_telegram_v1_v2_exclusivity(&channels_cfg(false, true)).expect("v2 alone is fine");
+        validate_telegram_v1_v2_exclusivity(&channels_cfg(false, true), None)
+            .expect("v2 alone is fine");
     }
 
     #[test]
     fn neither_active_is_ok() {
-        validate_telegram_v1_v2_exclusivity(&channels_cfg(false, false)).expect("neither is fine");
+        validate_telegram_v1_v2_exclusivity(&channels_cfg(false, false), None)
+            .expect("neither is fine");
     }
 
     #[test]
     fn both_active_fails_closed() {
-        let err = validate_telegram_v1_v2_exclusivity(&channels_cfg(true, true))
+        let err = validate_telegram_v1_v2_exclusivity(&channels_cfg(true, true), None)
             .expect_err("must reject");
         assert!(
             matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED")
@@ -550,7 +578,8 @@ mod telegram_v2_tests {
         // wasm_channels_enabled = false means v1 is NOT active for startup.
         let mut cfg = channels_cfg(false, true);
         cfg.configured_wasm_channels = vec!["telegram".to_string()];
-        validate_telegram_v1_v2_exclusivity(&cfg).expect("disabled v1 list does not block v2");
+        validate_telegram_v1_v2_exclusivity(&cfg, None)
+            .expect("disabled v1 list does not block v2");
     }
 
     #[test]
@@ -560,15 +589,57 @@ mod telegram_v2_tests {
         let mut cfg = channels_cfg(false, true);
         cfg.wasm_channels_enabled = true;
         cfg.configured_wasm_channels = vec!["discord".to_string(), "slack".to_string()];
-        validate_telegram_v1_v2_exclusivity(&cfg)
+        validate_telegram_v1_v2_exclusivity(&cfg, None)
             .expect("non-telegram v1 channels do not block v2");
+    }
+
+    #[test]
+    fn persisted_active_telegram_blocks_v2_even_when_not_in_configured_list() {
+        // Henry's #3356 finding: an existing install can have telegram in
+        // persisted `activated_channels` while the env var `WASM_CHANNELS`
+        // does NOT list it. The env-only guard would let v2 stand up
+        // alongside v1; this case must fail closed when persisted state
+        // is fed in.
+        let mut cfg = channels_cfg(false, true);
+        cfg.wasm_channels_enabled = true;
+        cfg.configured_wasm_channels = Vec::new();
+        let persisted = persisted_with(&["telegram"]);
+        let err = validate_telegram_v1_v2_exclusivity(&cfg, Some(&persisted))
+            .expect_err("persisted v1 + v2 must reject");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED")
+        );
+    }
+
+    #[test]
+    fn persisted_active_without_telegram_allows_v2() {
+        // Persisted-active set carries other WASM channels but not telegram.
+        let mut cfg = channels_cfg(false, true);
+        cfg.wasm_channels_enabled = true;
+        cfg.configured_wasm_channels = Vec::new();
+        let persisted = persisted_with(&["slack", "discord"]);
+        validate_telegram_v1_v2_exclusivity(&cfg, Some(&persisted))
+            .expect("non-telegram persisted set does not block v2");
+    }
+
+    #[test]
+    fn persisted_active_telegram_with_wasm_channels_disabled_allows_v2() {
+        // `wasm_channels_enabled = false` means setup_wasm_channels never
+        // runs; the persisted set is moot in that case. v2 is fine.
+        let mut cfg = channels_cfg(false, true);
+        cfg.wasm_channels_enabled = false;
+        let persisted = persisted_with(&["telegram"]);
+        validate_telegram_v1_v2_exclusivity(&cfg, Some(&persisted))
+            .expect("wasm channels disabled — persisted list is dormant");
     }
 
     #[test]
     fn resolve_rejects_v1_and_v2_telegram_together() {
         let _guard = lock_env();
-        // SAFETY: under ENV_MUTEX
-        unsafe { std::env::set_var("REBORN_TELEGRAM_V2_ENABLED", "true") };
+        // Save-and-restore so a process that already exported the env var
+        // (e.g. a developer shell with REBORN_TELEGRAM_V2_ENABLED set) does
+        // not lose its value when the test ends (Copilot #2 on PR #3356).
+        let _env_guard = ScopedEnv::set("REBORN_TELEGRAM_V2_ENABLED", "true");
         let mut settings = Settings::default();
         settings.channels.wasm_channels_enabled = true;
         settings.channels.wasm_channels = vec!["telegram".to_string()];
@@ -577,8 +648,38 @@ mod telegram_v2_tests {
             matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED"),
             "expected REBORN_TELEGRAM_V2_ENABLED InvalidValue, got: {err:?}"
         );
-        // SAFETY: under ENV_MUTEX
-        unsafe { std::env::remove_var("REBORN_TELEGRAM_V2_ENABLED") };
+    }
+
+    /// Test-only RAII guard that scopes a `std::env` set/remove to the
+    /// guard's lifetime. Used together with `lock_env()` so concurrent
+    /// tests do not race on the process-wide environment, and so a
+    /// developer's existing env-var value is restored after the test.
+    struct ScopedEnv {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: callers hold `lock_env()` so the process-wide env is
+            // serialized for the lifetime of this guard.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: same lock as above; held until the test function returns.
+            unsafe {
+                if let Some(ref prev) = self.previous {
+                    std::env::set_var(self.key, prev);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
     }
 }
 
