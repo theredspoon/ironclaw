@@ -63,6 +63,82 @@ fn reborn_crate_dependency_boundaries_hold() {
 }
 
 #[test]
+fn reborn_cli_binary_crate_stays_separate_from_v1_root() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+    let dependencies = packages
+        .iter()
+        .filter_map(package_dependencies)
+        .collect::<HashMap<_, _>>();
+    let dependencies_all_kinds = packages
+        .iter()
+        .filter_map(package_dependencies_all_kinds)
+        .collect::<HashMap<_, _>>();
+
+    let root = workspace_root();
+    let manifest_path = root.join("crates/ironclaw_reborn_cli/Cargo.toml");
+    assert!(
+        manifest_path.exists(),
+        "Reborn should ship as a separate binary crate at {}",
+        manifest_path.display()
+    );
+
+    let manifest =
+        std::fs::read_to_string(&manifest_path).expect("Reborn CLI manifest must be readable");
+    assert!(
+        manifest.contains("name = \"ironclaw_reborn_cli\""),
+        "Reborn CLI crate package name should be ironclaw_reborn_cli"
+    );
+    assert!(
+        manifest.contains("[[bin]]") && manifest.contains("name = \"ironclaw-reborn\""),
+        "Reborn CLI crate must declare the ironclaw-reborn binary explicitly"
+    );
+
+    let command_module_paths = [
+        "crates/ironclaw_reborn_cli/AGENTS.md",
+        "crates/ironclaw_reborn_cli/src/commands/mod.rs",
+        "crates/ironclaw_reborn_cli/src/commands/completion.rs",
+        "crates/ironclaw_reborn_cli/src/commands/doctor.rs",
+        "crates/ironclaw_reborn_cli/src/commands/run.rs",
+        "crates/ironclaw_reborn_cli/src/context.rs",
+    ];
+    for path in command_module_paths {
+        assert!(
+            root.join(path).exists(),
+            "Reborn CLI commands should use an agent-friendly one-command-per-file layout; missing {path}"
+        );
+    }
+
+    let agent_contract = std::fs::read_to_string(root.join("crates/ironclaw_reborn_cli/AGENTS.md"))
+        .expect("Reborn CLI crate-local AGENTS.md must be readable");
+    for required_phrase in [
+        "one command per file",
+        "RebornCliContext",
+        "no v1 runtime imports",
+    ] {
+        assert!(
+            agent_contract.contains(required_phrase),
+            "Reborn CLI AGENTS.md should document `{required_phrase}` for future command agents"
+        );
+    }
+
+    assert_workspace_deps_exactly(
+        &dependencies,
+        "ironclaw_reborn_cli",
+        ["ironclaw_reborn", "ironclaw_reborn_config"],
+        "ironclaw_reborn_cli should enter Reborn through ironclaw_reborn and ironclaw_reborn_config only; add explicit architectural justification before depending on other workspace crates",
+    );
+    assert_workspace_deps_exactly(
+        &dependencies_all_kinds,
+        "ironclaw_reborn_config",
+        [],
+        "ironclaw_reborn_config must remain a standalone boot contract crate with no IronClaw workspace dependencies of any dependency kind",
+    );
+}
+
+#[test]
 fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
     let root = workspace_root();
     let lib = std::fs::read_to_string(root.join("crates/ironclaw_host_runtime/src/lib.rs"))
@@ -128,6 +204,43 @@ fn reborn_turns_public_surface_keeps_runner_api_explicit() {
 }
 
 #[test]
+fn reborn_loop_support_llm_wiring_stays_out_of_root_src() {
+    let root = workspace_root();
+    let root_lib =
+        std::fs::read_to_string(root.join("src/lib.rs")).expect("root src/lib.rs must be readable");
+    assert!(
+        !root_lib.contains("pub mod reborn_loop_support;"),
+        "Reborn loop LLM wiring must live under crates/ironclaw_reborn, not root src/lib.rs"
+    );
+    assert!(
+        !root.join("src/reborn_loop_support.rs").exists(),
+        "Reborn loop LLM wiring must not live under root src/"
+    );
+
+    let reborn_gateway = root.join("crates/ironclaw_reborn/src/model_gateway.rs");
+    assert!(
+        reborn_gateway.exists(),
+        "expected Reborn LLM gateway wiring at {}",
+        reborn_gateway.display()
+    );
+    let reborn_gateway_source = std::fs::read_to_string(&reborn_gateway)
+        .expect("Reborn model gateway source must be readable");
+    assert!(
+        reborn_gateway_source.contains("LlmProviderModelGateway"),
+        "Reborn LLM gateway wiring should expose LlmProviderModelGateway from crates/ironclaw_reborn"
+    );
+
+    let reborn_manifest = std::fs::read_to_string(root.join("crates/ironclaw_reborn/Cargo.toml"))
+        .expect("Reborn manifest must be readable");
+    assert!(
+        reborn_manifest.contains("optional = true")
+            && reborn_manifest.contains("default-features = false")
+            && reborn_manifest.contains("root-llm-provider"),
+        "ironclaw_reborn may reuse root LLM code only behind an explicit feature, without enabling the root app's default postgres/libsql/tui feature set"
+    );
+}
+
+#[test]
 fn reborn_turns_public_surface_uses_turn_ids_not_runtime_or_process_ids() {
     let root = workspace_root();
     let turns_src = root.join("crates/ironclaw_turns/src");
@@ -138,6 +251,103 @@ fn reborn_turns_public_surface_uses_turn_ids_not_runtime_or_process_ids() {
         violations.is_empty(),
         "ironclaw_turns public API must use TurnId/TurnRunId instead of lower runtime/process identifiers:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn wasm_product_adapter_crate_has_local_guardrails() {
+    let guardrails = workspace_root().join("crates/ironclaw_wasm_product_adapters/CLAUDE.md");
+    assert!(
+        guardrails.exists(),
+        "ironclaw_wasm_product_adapters needs local CLAUDE.md guardrails before becoming a Reborn boundary crate"
+    );
+}
+
+#[test]
+fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+    let package = packages
+        .iter()
+        .find(|package| package["name"] == "ironclaw_wasm_product_adapters")
+        .expect("ironclaw_wasm_product_adapters must be a workspace package");
+    let mut deps = package["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .filter(|dependency| is_normal_dependency(dependency))
+        .filter_map(|dependency| dependency["name"].as_str())
+        .collect::<Vec<_>>();
+    deps.sort_unstable();
+
+    // Deliberate additions beyond the original auth/egress primitives:
+    //   * async-trait, tokio  — required by the native ProductAdapter runner
+    //     (async traits, semaphore-based admission control, timeout).
+    //   * chrono              — receive-timestamp for TrustedInboundContext.
+    //   * hex                 — HMAC signature encoding in the auth verifier.
+    //   * tracing             — structured logging for hardened error paths
+    //                           added in the zmanian review.
+    // Every addition is justified by a concrete call site in src/. Adding a
+    // dep here without a matching call site is a contract violation — and
+    // adding workflow/runtime crates beyond this list still requires
+    // updating both the wasm crate's CLAUDE.md and this expected set.
+    let expected = vec![
+        "async-trait",
+        "chrono",
+        "hex",
+        "hmac",
+        "http",
+        "ironclaw_product_adapters",
+        "sha2",
+        "subtle",
+        "thiserror",
+        "tokio",
+        "tracing",
+    ];
+    assert_eq!(
+        deps, expected,
+        "ironclaw_wasm_product_adapters should stay thin host glue; add runtime/workflow dependencies only when a call-site proves they are required"
+    );
+}
+
+#[test]
+fn wasm_product_adapter_wit_preserves_product_adapter_trust_boundary() {
+    let wit = std::fs::read_to_string(
+        workspace_root().join("crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit"),
+    )
+    .expect("product adapter WIT must be readable");
+
+    assert!(
+        wit.contains("record parsed-inbound"),
+        "WIT should name adapter output as ParsedProductInbound, not a trusted envelope"
+    );
+    assert!(
+        wit.contains("result<parsed-inbound, string>"),
+        "parse-inbound should return a parsed inbound payload; host glue stamps TrustedInboundContext and builds ProductInboundEnvelope"
+    );
+    for forbidden in [
+        "result<option<parsed-envelope>",
+        "record parsed-envelope",
+        "envelope-json",
+        "Returns `none`",
+        "ProductInboundEnvelope",
+    ] {
+        assert!(
+            !wit.contains(forbidden),
+            "WIT must not use `{forbidden}`; no-op events are ProductInboundPayload::NoOp and envelopes are host-stamped"
+        );
+    }
+
+    let response_record = wit
+        .split("record egress-response {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("egress-response record must exist");
+    assert!(
+        !response_record.contains("headers"),
+        "WASM egress responses must not expose raw response headers to adapters"
     );
 }
 
@@ -248,6 +458,101 @@ struct BoundaryRule {
 
 fn boundary_rules() -> Vec<BoundaryRule> {
     vec![
+        BoundaryRule {
+            crate_name: "ironclaw_storage",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_approvals",
+                "ironclaw_architecture",
+                "ironclaw_authorization",
+                "ironclaw_capabilities",
+                "ironclaw_common",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_event_projections",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_api",
+                "ironclaw_host_runtime",
+                "ironclaw_llm",
+                "ironclaw_loop_support",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                "ironclaw_product_adapters",
+                "ironclaw_reborn",
+                "ironclaw_reborn_cli",
+                "ironclaw_reborn_config",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_threads",
+                "ironclaw_trust",
+                "ironclaw_tui",
+                "ironclaw_turns",
+                "ironclaw_wasm",
+            ],
+        },
+        BoundaryRule {
+            crate_name: "ironclaw_reborn_config",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_approvals",
+                "ironclaw_authorization",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_api",
+                "ironclaw_host_runtime",
+                "ironclaw_llm",
+                "ironclaw_loop_support",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                "ironclaw_product_adapters",
+                "ironclaw_reborn",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_threads",
+                "ironclaw_trust",
+                "ironclaw_tui",
+                "ironclaw_turns",
+                "ironclaw_wasm",
+            ],
+        },
+        BoundaryRule {
+            crate_name: "ironclaw_reborn_cli",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_engine",
+                "ironclaw_gateway",
+                "ironclaw_skills",
+                "ironclaw_tui",
+            ],
+        },
         BoundaryRule {
             crate_name: "ironclaw_filesystem",
             forbidden: vec![
@@ -386,6 +691,68 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_resources",
                 "ironclaw_run_state",
                 "ironclaw_scripts",
+                "ironclaw_wasm",
+            ],
+        },
+        BoundaryRule {
+            crate_name: "ironclaw_outbound",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_authorization",
+                "ironclaw_approvals",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_runtime",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_processes",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_tui",
+                "ironclaw_wasm",
+            ],
+        },
+        BoundaryRule {
+            crate_name: "ironclaw_wasm_product_adapters",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_authorization",
+                "ironclaw_approvals",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_runtime",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_threads",
+                "ironclaw_tui",
+                "ironclaw_turns",
                 "ironclaw_wasm",
             ],
         },
@@ -628,16 +995,33 @@ fn workspace_root() -> PathBuf {
 
 fn package_dependencies(package: &Value) -> Option<(String, Vec<String>)> {
     let name = package["name"].as_str()?.to_string();
-    let dependencies = package["dependencies"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let dependencies = workspace_dependency_names(package)
         .filter(|dependency| is_normal_dependency(dependency))
         .filter_map(|dependency| dependency["name"].as_str())
-        .filter(|name| *name == "ironclaw" || name.starts_with("ironclaw_"))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     Some((name, dependencies))
+}
+
+fn package_dependencies_all_kinds(package: &Value) -> Option<(String, Vec<String>)> {
+    let name = package["name"].as_str()?.to_string();
+    let dependencies = workspace_dependency_names(package)
+        .filter_map(|dependency| dependency["name"].as_str())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    Some((name, dependencies))
+}
+
+fn workspace_dependency_names(package: &Value) -> impl Iterator<Item = &Value> {
+    package["dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|dependency| {
+            dependency["name"]
+                .as_str()
+                .is_some_and(|name| name == "ironclaw" || name.starts_with("ironclaw_"))
+        })
 }
 
 fn is_normal_dependency(dependency: &Value) -> bool {
@@ -654,6 +1038,25 @@ fn workspace_ironclaw_crates(dependencies: &HashMap<String, Vec<String>>) -> Vec
             (name == "ironclaw" || name.starts_with("ironclaw_")).then_some(name.as_str())
         })
         .collect()
+}
+
+fn assert_workspace_deps_exactly<'a>(
+    dependencies: &HashMap<String, Vec<String>>,
+    crate_name: &str,
+    expected: impl IntoIterator<Item = &'a str>,
+    message: &str,
+) {
+    let actual = dependencies
+        .get(crate_name)
+        .unwrap_or_else(|| panic!("{crate_name} must be in cargo metadata"))
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = expected
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, expected, "{message}");
 }
 
 fn assert_no_normal_workspace_deps<'a>(

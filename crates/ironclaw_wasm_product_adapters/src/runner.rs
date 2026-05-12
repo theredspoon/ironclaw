@@ -26,8 +26,9 @@ use ironclaw_product_adapters::auth::{
     mark_shared_secret_header_verified,
 };
 use ironclaw_product_adapters::{
-    ProductAdapter, ProductAdapterError, ProductInboundAck, ProductWorkflow, ProtocolAuthEvidence,
-    ProtocolAuthFailure,
+    ProductAdapter, ProductAdapterError, ProductInboundAck, ProductInboundEnvelope,
+    ProductInboundPayload, ProductWorkflow, ProtocolAuthEvidence, ProtocolAuthFailure,
+    TrustedInboundContext,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -223,14 +224,28 @@ impl NativeProductAdapterRunner {
             }
         })?;
         let parse_result = catch_unwind(AssertUnwindSafe(|| {
-            self.adapter.parse_inbound(body, evidence)
+            self.adapter.parse_inbound(body, &evidence)
         }));
-        let Some(envelope) = (match parse_result {
+        let parsed = match parse_result {
             Ok(result) => result?,
             Err(_) => return Err(RunnerError::AdapterPanicked),
-        }) else {
-            return Ok(WebhookProcessOutcome::NoOp);
         };
+        // Host stamps the trusted context (adapter id, installation id,
+        // verified auth claim, received-at timestamp) before the workflow
+        // ever sees the envelope. Adapters can't fabricate this surface.
+        let context = TrustedInboundContext::from_verified_evidence(
+            self.adapter.adapter_id().clone(),
+            self.adapter.installation_id().clone(),
+            chrono::Utc::now(),
+            &evidence,
+        )?;
+        let envelope = ProductInboundEnvelope::from_trusted_parse(context, parsed)?;
+        // Authenticated-but-ignored events surface as `NoOp` payloads, not as
+        // an out-of-band `None` parse result. The protocol layer still acks
+        // 200 OK so the upstream webhook does not retry.
+        if matches!(envelope.payload(), ProductInboundPayload::NoOp) {
+            return Ok(WebhookProcessOutcome::NoOp);
+        }
         let workflow = Arc::clone(&self.workflow);
         let mut workflow_task =
             tokio::spawn(async move { workflow.accept_inbound(envelope).await });
@@ -260,7 +275,6 @@ mod tests {
     use async_trait::async_trait;
     use http::HeaderMap;
     use http::header::HeaderValue;
-    use ironclaw_product_adapters::auth::VerifiedAuthClaim;
     use ironclaw_product_adapters::capabilities::ProductAdapterCapabilities;
     use ironclaw_product_adapters::external::{
         ExternalActorRef, ExternalConversationRef, ExternalEventId,
@@ -269,27 +283,39 @@ mod tests {
         AdapterInstallationId, ProductAdapterId, ProductSurfaceKind,
     };
     use ironclaw_product_adapters::{
-        AuthRequirement, ProductInboundEnvelope, ProductInboundPayload, ProductOutboundEnvelope,
-        ProtocolHttpEgress,
+        AuthRequirement, OutboundDeliverySink, ParsedProductInbound, ProductInboundPayload,
+        ProductOutboundEnvelope, ProductRenderOutcome, ProductTriggerReason,
+        ProjectionSubscriptionRequest, ProtocolHttpEgress, UserMessagePayload,
     };
     use tokio::sync::Notify;
 
     use super::*;
 
+    /// Shared `AuthRequirement` for the stub adapters. Matches the
+    /// `SharedSecretHeader` strategy used by `shared_secret_auth()` below so
+    /// the host-side seal is satisfiable for the success-path tests.
+    fn stub_auth_requirement() -> AuthRequirement {
+        AuthRequirement::SharedSecretHeader {
+            header_name: "X-Test-Secret".into(),
+        }
+    }
+
     struct StaticAdapter {
         adapter_id: ProductAdapterId,
         installation_id: AdapterInstallationId,
         capabilities: ProductAdapterCapabilities,
-        envelope: ProductInboundEnvelope,
+        auth_requirement: AuthRequirement,
+        parsed: ParsedProductInbound,
     }
 
     impl StaticAdapter {
-        fn new(envelope: ProductInboundEnvelope) -> Self {
+        fn new(parsed: ParsedProductInbound) -> Self {
             Self {
                 adapter_id: ProductAdapterId::new("telegram_v2").expect("valid"),
                 installation_id: AdapterInstallationId::new("install_alpha").expect("valid"),
                 capabilities: ProductAdapterCapabilities::empty(),
-                envelope,
+                auth_requirement: stub_auth_requirement(),
+                parsed,
             }
         }
     }
@@ -312,20 +338,25 @@ mod tests {
             &self.capabilities
         }
 
+        fn auth_requirement(&self) -> &AuthRequirement {
+            &self.auth_requirement
+        }
+
         fn parse_inbound(
             &self,
             _raw_payload: &[u8],
-            _auth_evidence: ProtocolAuthEvidence,
-        ) -> Result<Option<ProductInboundEnvelope>, ProductAdapterError> {
-            Ok(Some(self.envelope.clone()))
+            _auth_evidence: &ProtocolAuthEvidence,
+        ) -> Result<ParsedProductInbound, ProductAdapterError> {
+            Ok(self.parsed.clone())
         }
 
         async fn render_outbound(
             &self,
             _envelope: ProductOutboundEnvelope,
             _egress: &dyn ProtocolHttpEgress,
-        ) -> Result<(), ProductAdapterError> {
-            Ok(())
+            _delivery_sink: &dyn OutboundDeliverySink,
+        ) -> Result<ProductRenderOutcome, ProductAdapterError> {
+            Ok(ProductRenderOutcome::DeliveryRecorded)
         }
     }
 
@@ -333,6 +364,7 @@ mod tests {
         adapter_id: ProductAdapterId,
         installation_id: AdapterInstallationId,
         capabilities: ProductAdapterCapabilities,
+        auth_requirement: AuthRequirement,
     }
 
     impl PanicAdapter {
@@ -341,6 +373,7 @@ mod tests {
                 adapter_id: ProductAdapterId::new("telegram_v2").expect("valid"),
                 installation_id: AdapterInstallationId::new("install_alpha").expect("valid"),
                 capabilities: ProductAdapterCapabilities::empty(),
+                auth_requirement: stub_auth_requirement(),
             }
         }
     }
@@ -363,11 +396,15 @@ mod tests {
             &self.capabilities
         }
 
+        fn auth_requirement(&self) -> &AuthRequirement {
+            &self.auth_requirement
+        }
+
         fn parse_inbound(
             &self,
             _raw_payload: &[u8],
-            _auth_evidence: ProtocolAuthEvidence,
-        ) -> Result<Option<ProductInboundEnvelope>, ProductAdapterError> {
+            _auth_evidence: &ProtocolAuthEvidence,
+        ) -> Result<ParsedProductInbound, ProductAdapterError> {
             panic!("adapter parse panic must be contained")
         }
 
@@ -375,8 +412,21 @@ mod tests {
             &self,
             _envelope: ProductOutboundEnvelope,
             _egress: &dyn ProtocolHttpEgress,
-        ) -> Result<(), ProductAdapterError> {
-            Ok(())
+            _delivery_sink: &dyn OutboundDeliverySink,
+        ) -> Result<ProductRenderOutcome, ProductAdapterError> {
+            Ok(ProductRenderOutcome::DeliveryRecorded)
+        }
+    }
+
+    /// Helper for workflow stubs: `resolve_projection_subscription` is never
+    /// exercised by the runner tests (the runner only invokes `accept_inbound`),
+    /// but the trait requires it. Return a deterministic adapter-shape error
+    /// so accidental calls fail loudly.
+    fn projection_subscription_unimplemented() -> ProductAdapterError {
+        ProductAdapterError::Internal {
+            detail: ironclaw_product_adapters::redaction::RedactedString::new(
+                "test stub: resolve_projection_subscription not supported",
+            ),
         }
     }
 
@@ -390,6 +440,13 @@ mod tests {
         ) -> Result<ProductInboundAck, ProductAdapterError> {
             Ok(ProductInboundAck::NoOp)
         }
+
+        async fn resolve_projection_subscription(
+            &self,
+            _envelope: ProductInboundEnvelope,
+        ) -> Result<ProjectionSubscriptionRequest, ProductAdapterError> {
+            Err(projection_subscription_unimplemented())
+        }
     }
 
     struct PendingWorkflow;
@@ -402,6 +459,13 @@ mod tests {
         ) -> Result<ProductInboundAck, ProductAdapterError> {
             std::future::pending().await
         }
+
+        async fn resolve_projection_subscription(
+            &self,
+            _envelope: ProductInboundEnvelope,
+        ) -> Result<ProjectionSubscriptionRequest, ProductAdapterError> {
+            Err(projection_subscription_unimplemented())
+        }
     }
 
     struct PanicWorkflow;
@@ -413,6 +477,13 @@ mod tests {
             _envelope: ProductInboundEnvelope,
         ) -> Result<ProductInboundAck, ProductAdapterError> {
             panic!("workflow panic must be contained")
+        }
+
+        async fn resolve_projection_subscription(
+            &self,
+            _envelope: ProductInboundEnvelope,
+        ) -> Result<ProjectionSubscriptionRequest, ProductAdapterError> {
+            Err(projection_subscription_unimplemented())
         }
     }
 
@@ -431,30 +502,31 @@ mod tests {
             self.release.notified().await;
             Ok(ProductInboundAck::NoOp)
         }
+
+        async fn resolve_projection_subscription(
+            &self,
+            _envelope: ProductInboundEnvelope,
+        ) -> Result<ProjectionSubscriptionRequest, ProductAdapterError> {
+            Err(projection_subscription_unimplemented())
+        }
     }
 
-    fn sample_envelope() -> ProductInboundEnvelope {
-        ProductInboundEnvelope {
-            adapter_id: ProductAdapterId::new("telegram_v2").expect("valid"),
-            installation_id: AdapterInstallationId::new("install_alpha").expect("valid"),
-            external_event_id: ExternalEventId::new("update:42").expect("valid"),
-            external_actor_ref: ExternalActorRef::new("telegram_user", "777", None).expect("valid"),
-            external_conversation_ref: ExternalConversationRef::new(
-                None,
-                "12345",
-                Some("topic-7"),
-                Some("msg-100"),
-            )
-            .expect("valid"),
-            auth_claim: VerifiedAuthClaim {
-                requirement: AuthRequirement::SharedSecretHeader {
-                    header_name: "X-Telegram-Bot-Api-Secret-Token".into(),
-                },
-                subject: "telegram_install_alpha".into(),
-            },
-            received_at: chrono::Utc::now(),
-            payload: ProductInboundPayload::NoOp,
-        }
+    /// Sample `ParsedProductInbound` with a non-NoOp payload. The runner's
+    /// success-path tests need the workflow to actually be invoked, so the
+    /// payload must NOT be `ProductInboundPayload::NoOp` (which would short-
+    /// circuit before `accept_inbound`).
+    fn sample_parsed() -> ParsedProductInbound {
+        ParsedProductInbound::new(
+            ExternalEventId::new("update:42").expect("valid"),
+            ExternalActorRef::new("telegram_user", "777", None::<String>).expect("valid"),
+            ExternalConversationRef::new(None, "12345", Some("topic-7"), Some("msg-100"))
+                .expect("valid"),
+            ProductInboundPayload::UserMessage(
+                UserMessagePayload::new("hello", Vec::new(), ProductTriggerReason::DirectChat)
+                    .expect("valid"),
+            ),
+        )
+        .expect("valid parsed")
     }
 
     fn shared_secret_auth() -> WebhookAuth {
@@ -481,7 +553,7 @@ mod tests {
     #[tokio::test]
     async fn process_webhook_times_out_slow_workflow() {
         let runner = NativeProductAdapterRunner::with_config(
-            Arc::new(StaticAdapter::new(sample_envelope())),
+            Arc::new(StaticAdapter::new(sample_parsed())),
             Arc::new(PendingWorkflow),
             shared_secret_auth(),
             test_config(1, Duration::from_millis(5)),
@@ -498,7 +570,7 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let runner = Arc::new(NativeProductAdapterRunner::with_config(
-            Arc::new(StaticAdapter::new(sample_envelope())),
+            Arc::new(StaticAdapter::new(sample_parsed())),
             Arc::new(BlockingWorkflow {
                 entered: Arc::clone(&entered),
                 release: Arc::clone(&release),
@@ -540,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn process_webhook_contains_workflow_panics() {
         let runner = NativeProductAdapterRunner::with_config(
-            Arc::new(StaticAdapter::new(sample_envelope())),
+            Arc::new(StaticAdapter::new(sample_parsed())),
             Arc::new(PanicWorkflow),
             shared_secret_auth(),
             test_config(1, Duration::from_secs(1)),

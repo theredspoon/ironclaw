@@ -483,6 +483,192 @@ pub trait EventProjectionService: Send + Sync {
     ) -> Result<ProjectionReplay, ProjectionError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStreamResume {
+    Snapshot {
+        snapshot: Box<ProjectionSnapshot>,
+        rebased_from: Option<ProjectionCursor>,
+        earliest_available: Option<ProjectionCursor>,
+    },
+    Updates(ProjectionReplay),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStreamResume {
+    Snapshot {
+        snapshot: Box<AuditProjectionSnapshot>,
+        rebased_from: Option<AuditProjectionCursor>,
+        earliest_available: Option<AuditProjectionCursor>,
+    },
+    Updates(AuditProjectionReplay),
+}
+
+/// Transport-agnostic facade for scoped Reborn projection replay.
+///
+/// Product transports should enter through this manager rather than reaching
+/// directly into durable logs. The manager intentionally keeps runtime and
+/// audit projections domain-specific: it validates and routes requests to the
+/// owning projection services without flattening them into a generic event
+/// union DTO.
+#[derive(Clone)]
+pub struct EventStreamManager {
+    runtime_projection: Arc<dyn EventProjectionService>,
+    audit_projection: Arc<dyn AuditProjectionService>,
+}
+
+impl EventStreamManager {
+    pub fn new<R, A>(runtime_projection: Arc<R>, audit_projection: Arc<A>) -> Self
+    where
+        R: EventProjectionService + 'static,
+        A: AuditProjectionService + 'static,
+    {
+        let runtime_projection: Arc<dyn EventProjectionService> = runtime_projection;
+        let audit_projection: Arc<dyn AuditProjectionService> = audit_projection;
+        Self {
+            runtime_projection,
+            audit_projection,
+        }
+    }
+
+    pub fn from_services(
+        runtime_projection: Arc<dyn EventProjectionService>,
+        audit_projection: Arc<dyn AuditProjectionService>,
+    ) -> Self {
+        Self {
+            runtime_projection,
+            audit_projection,
+        }
+    }
+
+    pub async fn runtime_snapshot(
+        &self,
+        request: ProjectionRequest,
+    ) -> Result<ProjectionSnapshot, ProjectionError> {
+        self.runtime_projection.snapshot(request).await
+    }
+
+    pub async fn runtime_updates(
+        &self,
+        request: ProjectionRequest,
+    ) -> Result<ProjectionReplay, ProjectionError> {
+        self.runtime_projection.updates(request).await
+    }
+
+    pub async fn runtime_resume(
+        &self,
+        request: ProjectionRequest,
+    ) -> Result<RuntimeStreamResume, ProjectionError> {
+        if request.after.is_none() {
+            let snapshot = self.runtime_projection.snapshot(request).await?;
+            return Ok(RuntimeStreamResume::Snapshot {
+                snapshot: Box::new(snapshot),
+                rebased_from: None,
+                earliest_available: None,
+            });
+        }
+
+        if let Some(cursor) = request.after.as_ref()
+            && cursor.scope != request.scope
+        {
+            return Err(ProjectionError::RebaseRequired {
+                requested: Box::new(cursor.clone()),
+                earliest: Box::new(ProjectionCursor::origin_for_scope(request.scope)),
+            });
+        }
+
+        let snapshot_request = ProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: request.limit,
+        };
+        match self.runtime_projection.updates(request).await {
+            Ok(replay) => Ok(RuntimeStreamResume::Updates(replay)),
+            Err(ProjectionError::RebaseRequired {
+                requested,
+                earliest,
+            }) => {
+                let snapshot = self.runtime_projection.snapshot(snapshot_request).await?;
+                Ok(RuntimeStreamResume::Snapshot {
+                    snapshot: Box::new(snapshot),
+                    rebased_from: Some(*requested),
+                    earliest_available: Some(*earliest),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn audit_snapshot(
+        &self,
+        request: AuditProjectionRequest,
+    ) -> Result<AuditProjectionSnapshot, AuditProjectionError> {
+        self.audit_projection.snapshot(request).await
+    }
+
+    pub async fn audit_updates(
+        &self,
+        request: AuditProjectionRequest,
+    ) -> Result<AuditProjectionReplay, AuditProjectionError> {
+        self.audit_projection.updates(request).await
+    }
+
+    pub async fn audit_resume(
+        &self,
+        request: AuditProjectionRequest,
+    ) -> Result<AuditStreamResume, AuditProjectionError> {
+        if request.after.is_none() {
+            let snapshot = self.audit_projection.snapshot(request).await?;
+            return Ok(AuditStreamResume::Snapshot {
+                snapshot: Box::new(snapshot),
+                rebased_from: None,
+                earliest_available: None,
+            });
+        }
+
+        if let Some(cursor) = request.after.as_ref()
+            && cursor.scope != request.scope
+        {
+            return Err(AuditProjectionError::RebaseRequired {
+                requested: Box::new(cursor.clone()),
+                earliest: Box::new(AuditProjectionCursor::origin_for_scope(request.scope)),
+            });
+        }
+
+        let snapshot_request = AuditProjectionRequest {
+            scope: request.scope.clone(),
+            after: None,
+            limit: request.limit,
+        };
+        match self.audit_projection.updates(request).await {
+            Ok(replay) => Ok(AuditStreamResume::Updates(replay)),
+            Err(AuditProjectionError::RebaseRequired {
+                requested,
+                earliest,
+            }) => {
+                let snapshot = self.audit_projection.snapshot(snapshot_request).await?;
+                Ok(AuditStreamResume::Snapshot {
+                    snapshot: Box::new(snapshot),
+                    rebased_from: Some(*requested),
+                    earliest_available: Some(*earliest),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl std::fmt::Debug for EventStreamManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EventStreamManager")
+            .field("runtime_projection", &"<event_projection_service>")
+            .field("audit_projection", &"<audit_projection_service>")
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct ReplayEventProjectionService {
     runtime_log: Arc<dyn DurableEventLog>,
