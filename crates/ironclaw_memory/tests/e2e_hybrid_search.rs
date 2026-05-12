@@ -65,9 +65,17 @@ mod libsql_e2e {
 
     #[tokio::test]
     async fn hybrid_search_includes_path_in_caller_scope_only_under_libsql() {
-        // Seed two scopes with the same FTS+vector token and a hit-attracting
-        // chunk. Search from one scope must only return that scope's document,
-        // proving the search path classifies by scope at the SQL boundary.
+        // Seed documents along EVERY scope axis with the same FTS+vector
+        // token. Search from one scope must only return that scope's
+        // document. The active hybrid-search isolation guarantee is that
+        // `backend.search` filters by the full `MemoryDocumentScope`
+        // (tenant_id, user_id, agent_id, project_id) at the SQL boundary
+        // — a regression that filters only by `user_id` (or drops one
+        // of the other axes) would leak same-token documents from the
+        // dropped-axis siblings.
+        //
+        // Caller scope: tenant-a / alice / agent=None / project=None.
+        // Variants seeded below differ along exactly one axis each.
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
         repository.run_migrations().await.unwrap();
@@ -83,30 +91,90 @@ mod libsql_e2e {
                 .with_capabilities(full_search_capabilities()),
         );
 
-        let alice_scope = MemoryDocumentScope::new("tenant-a", "alice", None).unwrap();
-        let bob_scope = MemoryDocumentScope::new("tenant-a", "bob", None).unwrap();
+        let caller_scope =
+            MemoryDocumentScope::new_with_agent("tenant-a", "alice", None, None).unwrap();
+        let caller_path =
+            MemoryDocumentPath::new_with_agent("tenant-a", "alice", None, None, "notes/visible.md")
+                .unwrap();
+        // Sibling scopes differing along one axis at a time. Each must
+        // be invisible to a search rooted at `caller_scope`.
+        let sibling_paths = [
+            // Different user (was the only axis exercised before).
+            (
+                MemoryDocumentScope::new_with_agent("tenant-a", "bob", None, None).unwrap(),
+                MemoryDocumentPath::new_with_agent(
+                    "tenant-a",
+                    "bob",
+                    None,
+                    None,
+                    "notes/leaked-user.md",
+                )
+                .unwrap(),
+            ),
+            // Different tenant.
+            (
+                MemoryDocumentScope::new_with_agent("tenant-b", "alice", None, None).unwrap(),
+                MemoryDocumentPath::new_with_agent(
+                    "tenant-b",
+                    "alice",
+                    None,
+                    None,
+                    "notes/leaked-tenant.md",
+                )
+                .unwrap(),
+            ),
+            // Different project (same tenant + user + agent).
+            (
+                MemoryDocumentScope::new_with_agent("tenant-a", "alice", None, Some("project-1"))
+                    .unwrap(),
+                MemoryDocumentPath::new_with_agent(
+                    "tenant-a",
+                    "alice",
+                    None,
+                    Some("project-1"),
+                    "notes/leaked-project.md",
+                )
+                .unwrap(),
+            ),
+            // Different agent (same tenant + user + project).
+            (
+                MemoryDocumentScope::new_with_agent("tenant-a", "alice", Some("agent-x"), None)
+                    .unwrap(),
+                MemoryDocumentPath::new_with_agent(
+                    "tenant-a",
+                    "alice",
+                    Some("agent-x"),
+                    None,
+                    "notes/leaked-agent.md",
+                )
+                .unwrap(),
+            ),
+        ];
 
         backend
             .write_document(
-                &MemoryContext::new(alice_scope.clone()),
-                &MemoryDocumentPath::new("tenant-a", "alice", None, "notes/visible.md").unwrap(),
+                &MemoryContext::new(caller_scope.clone()),
+                &caller_path,
                 b"literal hybrid-vector",
             )
             .await
             .unwrap();
-        backend
-            .write_document(
-                &MemoryContext::new(bob_scope.clone()),
-                &MemoryDocumentPath::new("tenant-a", "bob", None, "notes/leaked.md").unwrap(),
-                b"literal hybrid-vector",
-            )
-            .await
-            .unwrap();
+        for (scope, path) in &sibling_paths {
+            backend
+                .write_document(
+                    &MemoryContext::new(scope.clone()),
+                    path,
+                    b"literal hybrid-vector",
+                )
+                .await
+                .unwrap();
+        }
 
-        // Alice's search must only see Alice's document.
-        let alice_results = backend
+        // Caller's search must only see the caller's document — every
+        // sibling axis must be filtered out at the SQL boundary.
+        let caller_results = backend
             .search(
-                &MemoryContext::new(alice_scope),
+                &MemoryContext::new(caller_scope),
                 MemorySearchRequest::new("literal")
                     .unwrap()
                     .with_limit(10)
@@ -115,22 +183,32 @@ mod libsql_e2e {
             .await
             .unwrap();
 
-        let returned_paths: Vec<String> = alice_results
+        let returned_paths: Vec<String> = caller_results
             .iter()
             .map(|r| r.path.relative_path().to_string())
             .collect();
         assert_eq!(
             returned_paths,
             vec!["notes/visible.md".to_string()],
-            "alice's search must only return alice's document",
+            "search must only return the caller-scope document; got {returned_paths:?}",
         );
-        for result in &alice_results {
+        // Defense-in-depth: confirm each returned hit matches the caller
+        // along all four axes, so a regression that returned the caller's
+        // own path under a sibling scope (impossible by construction, but
+        // pinned for future-proofing) is still caught.
+        for result in &caller_results {
+            assert_eq!(result.path.tenant_id(), "tenant-a");
             assert_eq!(result.path.user_id(), "alice");
+            assert_eq!(result.path.agent_id(), None);
+            assert_eq!(result.path.project_id(), None);
         }
     }
 
     #[tokio::test]
-    #[ignore = "requires PR #3180 min_score-after-normalization fix (pre-#3180 filters against pre-fusion scores ≪ 1.0)"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 min_score-after-normalization fix (pre-#3180 filters against pre-fusion scores ≪ 1.0); enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn min_score_filter_drops_results_below_threshold_under_libsql() {
         // Seed two documents — one is a hybrid hit (FTS + vector), one is FTS-only.
         // Setting a min_score above the FTS-only RRF-normalized score must drop it.
@@ -167,11 +245,26 @@ mod libsql_e2e {
             .await
             .unwrap();
 
+        // Pin the query embedding to exactly the hybrid.md vector so the
+        // vector-side contribution unambiguously favors hybrid.md over
+        // fts-only.md. Without this, the query "literal" would fall through
+        // the embedder's fallback branch ([0,0,1]) and have zero cosine
+        // similarity with either document — the vector side could not
+        // separate them and the test would not reliably create the
+        // hybrid-above-FTS-only score gap it advertises.
+        //
+        // FTS still matches both docs (both contain the token "literal");
+        // the override only constrains the vector side.
+        let hybrid_doc_embedding = vec![1.0_f32, 0.0, 0.0];
+
         // Without min_score, both docs should be returned.
         let unfiltered = backend
             .search(
                 &context,
-                MemorySearchRequest::new("literal").unwrap().with_limit(10),
+                MemorySearchRequest::new("literal")
+                    .unwrap()
+                    .with_limit(10)
+                    .with_query_embedding(hybrid_doc_embedding.clone()),
             )
             .await
             .unwrap();
@@ -181,12 +274,16 @@ mod libsql_e2e {
             unfiltered_paths.contains(&"notes/hybrid.md"),
             "unfiltered search should include hybrid.md, got {unfiltered_paths:?}",
         );
+        assert!(
+            unfiltered_paths.contains(&"notes/fts-only.md"),
+            "unfiltered search should include fts-only.md so the min_score gap is real, \
+             got {unfiltered_paths:?}",
+        );
 
-        // Apply a min_score that is between the two scores. The hybrid result
-        // (FTS+vector) must clear the threshold; the FTS-only result must drop.
-        // We don't assume the absolute score values — instead, derive the
-        // threshold from the actual results so the test stays robust against
-        // RRF/k changes.
+        // Apply a min_score strictly between the two scores. The hybrid
+        // result (FTS+vector) must clear the threshold; the FTS-only
+        // result must drop. With the pinned query embedding above, this
+        // is now a hard ordering invariant — no `* 0.99` fallback path.
         let hybrid_score = unfiltered
             .iter()
             .find(|r| r.path.relative_path() == "notes/hybrid.md")
@@ -195,14 +292,16 @@ mod libsql_e2e {
         let fts_only_score = unfiltered
             .iter()
             .find(|r| r.path.relative_path() == "notes/fts-only.md")
-            .map(|r| r.score);
-        // If the FTS-only doc never matched (e.g., feature pruned it pre-#3180),
-        // the test still proves the threshold gate works: a min_score above the
-        // hybrid score drops everything.
-        let threshold = match fts_only_score {
-            Some(score) if score < hybrid_score => (score + hybrid_score) / 2.0,
-            _ => hybrid_score * 0.99, // cannot meaningfully threshold; gate on hybrid only
-        };
+            .map(|r| r.score)
+            .expect(
+                "fts-only.md should be present in the unfiltered result so the gap is testable",
+            );
+        assert!(
+            fts_only_score < hybrid_score,
+            "with pinned query embedding favoring hybrid.md, the FTS-only doc must score \
+             strictly below the hybrid doc; got hybrid={hybrid_score} fts_only={fts_only_score}",
+        );
+        let threshold = (fts_only_score + hybrid_score) / 2.0;
 
         let filtered = backend
             .search(
@@ -210,34 +309,28 @@ mod libsql_e2e {
                 MemorySearchRequest::new("literal")
                     .unwrap()
                     .with_limit(10)
+                    .with_query_embedding(hybrid_doc_embedding)
                     .with_min_score(threshold),
             )
             .await
             .unwrap();
 
         let filtered_paths: Vec<&str> = filtered.iter().map(|r| r.path.relative_path()).collect();
-        if let Some(fts_score) = fts_only_score
-            && fts_score < hybrid_score
-        {
-            assert!(
-                filtered_paths.contains(&"notes/hybrid.md"),
-                "hybrid hit must clear threshold {threshold}: {filtered_paths:?}",
-            );
-            assert!(
-                !filtered_paths.contains(&"notes/fts-only.md"),
-                "fts-only hit (score {fts_score}) must be filtered below {threshold}: {filtered_paths:?}",
-            );
-        } else {
-            // Sanity: the hybrid result still clears its own near-threshold gate.
-            assert!(
-                filtered_paths.contains(&"notes/hybrid.md"),
-                "hybrid hit must clear threshold {threshold}: {filtered_paths:?}",
-            );
-        }
+        assert!(
+            filtered_paths.contains(&"notes/hybrid.md"),
+            "hybrid hit must clear threshold {threshold}: {filtered_paths:?}",
+        );
+        assert!(
+            !filtered_paths.contains(&"notes/fts-only.md"),
+            "fts-only hit (score {fts_only_score}) must be filtered below {threshold}: {filtered_paths:?}",
+        );
     }
 
     #[tokio::test]
-    #[ignore = "requires PR #3180 deterministic tiebreaker (path ascending)"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 deterministic tiebreaker (path ascending); enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn search_breaks_ties_by_relative_path_ascending_under_libsql() {
         // Seed three docs with identical FTS+vector hits. PR #3180 fixes ties to
         // resolve by path ascending; pre-#3180 ordering is implementation-defined.
@@ -289,12 +382,20 @@ mod libsql_e2e {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_writes_against_same_path_leave_no_orphan_chunks_under_libsql() {
         // Two writes against the same MemoryDocumentPath through one backend.
         // After both finish, the document table holds exactly one row, the
         // chunk table reflects the persisted content, and no chunk references
         // the losing race's content.
+        //
+        // Runs on a multi-threaded runtime + `tokio::spawn` per writer.
+        // Default `#[tokio::test]` is single-threaded current-thread, where
+        // `tokio::join!` polls cooperatively on one thread — that only
+        // catches races at `.await` points and gives false confidence about
+        // `replace_document_chunks_if_current`'s real preemptive
+        // interleaving behavior, which is the canonical guard for PR #3180
+        // invariant 6.
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
         repository.run_migrations().await.unwrap();
@@ -312,7 +413,7 @@ mod libsql_e2e {
         let context = MemoryContext::new(scope_alice());
         let path = doc_alice("notes/race.md");
 
-        let writer_a = {
+        let writer_a = tokio::spawn({
             let backend = backend.clone();
             let context = context.clone();
             let path = path.clone();
@@ -325,8 +426,8 @@ mod libsql_e2e {
                     )
                     .await
             }
-        };
-        let writer_b = {
+        });
+        let writer_b = tokio::spawn({
             let backend = backend.clone();
             let context = context.clone();
             let path = path.clone();
@@ -339,10 +440,14 @@ mod libsql_e2e {
                     )
                     .await
             }
-        };
-        let (a_outcome, b_outcome) = tokio::join!(writer_a, writer_b);
-        a_outcome.unwrap();
-        b_outcome.unwrap();
+        });
+        // Each `tokio::spawn` returns a `JoinHandle<Result<(), MemoryBackendError>>`.
+        // Outer `.unwrap()` unwraps the join (panic if the task panicked or
+        // was cancelled); inner `.unwrap()` unwraps the backend's write
+        // result (panic if the write itself returned Err).
+        let (a_join, b_join) = tokio::join!(writer_a, writer_b);
+        a_join.unwrap().unwrap();
+        b_join.unwrap().unwrap();
 
         // Exactly one document row.
         assert_eq!(count_documents(&db, "notes/race.md").await, 1);

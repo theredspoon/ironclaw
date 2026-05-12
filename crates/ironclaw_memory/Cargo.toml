@@ -14,6 +14,14 @@ publish = false
 default = []
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:pgvector"]
 libsql = ["dep:libsql"]
+# Conditional gate for the test suite. Enables regression tests that
+# depend on the memory surface landing in PR #3180 (min_score-after-
+# normalization, deterministic tiebreaking, ensure_path_matches_context,
+# `.system/engine/orchestrator/*` protected paths). The dependent PR
+# must enable `pr3180-ready` in the merge commit so these tests run in
+# CI on its merge-queue branch. See `tests/e2e_*` files for the
+# specific guards each gated test pins.
+pr3180-ready = []
 
 [dependencies]
 async-trait = "0.1"
@@ -33,4 +41,10 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+# `rt-multi-thread` is required by the race-safety test's
+# `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` —
+# without it, the macro silently falls back to current-thread and
+# `tokio::join!` polls cooperatively on one thread, hiding real
+# preemptive races against `replace_document_chunks_if_current`
+# (PR #3180 invariant 6).
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

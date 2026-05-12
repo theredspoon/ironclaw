@@ -11,8 +11,10 @@
 //!
 //! Note: PR #3180 also lands `ensure_path_matches_context` /
 //! `ensure_scope_matches_context` fail-closed guards. Those tests live behind
-//! `#[ignore]` here because the guards do not exist on `reborn-integration`
-//! pre-#3180; un-ignore once this branch picks up #3180.
+//! `#[cfg_attr(not(feature = "pr3180-ready"), ignore)]` because the guards do
+//! not exist on `reborn-integration` pre-#3180. The dependent PR must
+//! enable `--features pr3180-ready` in its merge commit so the gated guards
+//! fire in CI; see the `pr3180-ready` feature in `Cargo.toml`.
 
 #[cfg(feature = "libsql")]
 mod libsql_e2e {
@@ -22,11 +24,10 @@ mod libsql_e2e {
     use ironclaw_filesystem::{FilesystemError, FilesystemOperation, RootFilesystem};
     use ironclaw_host_api::VirtualPath;
     use ironclaw_memory::{
-        InMemoryMemoryDocumentRepository, LibSqlMemoryDocumentRepository, MemoryBackend,
-        MemoryBackendFilesystemAdapter, MemoryContext, MemoryDocumentPath,
-        MemoryDocumentRepository, MemoryDocumentScope, PromptSafetyAllowanceId,
-        PromptSafetyReasonCode, PromptWriteSafetyEvent, PromptWriteSafetyEventKind,
-        PromptWriteSafetyEventSink, RepositoryMemoryBackend,
+        LibSqlMemoryDocumentRepository, MemoryBackend, MemoryBackendFilesystemAdapter,
+        MemoryContext, MemoryDocumentPath, MemoryDocumentRepository, MemoryDocumentScope,
+        PromptSafetyAllowanceId, PromptSafetyReasonCode, PromptWriteSafetyEvent,
+        PromptWriteSafetyEventKind, PromptWriteSafetyEventSink, RepositoryMemoryBackend,
     };
 
     /// Protected paths whose registration is stable across both
@@ -82,7 +83,13 @@ mod libsql_e2e {
         // Database has zero rows after every protected-path write was rejected.
         assert_eq!(count_documents_total(&db).await, 0);
 
-        // Every rejection produced a Rejected event with the matching path class.
+        // Every rejection produced a Rejected event whose
+        // `protected_path_class.relative_path()` matches the path that
+        // was actually rejected. Asserting just `.is_some()` (the old
+        // shape) would still pass if every rejection was audited as the
+        // WRONG class — e.g. a regression that always emits SOUL.md's
+        // class for any protected path would leave the audit signal
+        // misleading without failing this test.
         let recorded = events.events();
         assert_eq!(recorded.len(), PROTECTED_PATHS.len());
         for (relative, event) in PROTECTED_PATHS.iter().zip(recorded.iter()) {
@@ -92,13 +99,21 @@ mod libsql_e2e {
                 Some(PromptSafetyReasonCode::HighRiskPromptInjection),
                 "{relative}",
             );
-            let path_class = event
+            let class_path = event
                 .protected_path_class
                 .as_ref()
-                .map(|c| c.relative_path().to_string());
+                .unwrap_or_else(|| panic!("expected protected_path_class for {relative}, got None"))
+                .relative_path();
+            // Case-insensitive equality: the protected-path registry
+            // case-folds the canonical key so a lookup of `SOUL.md`
+            // matches `soul.md` etc. A regression that emits a class for
+            // a different path (e.g. always SOUL.md for every rejection)
+            // would still fail this assertion because the underlying
+            // string would be different, not just a different case.
             assert!(
-                path_class.is_some(),
-                "expected protected_path_class for {relative}, got None",
+                class_path.eq_ignore_ascii_case(relative),
+                "audit class must identify the actual rejected path; \
+                 rejected `{relative}` but audit emitted class for `{class_path}`",
             );
         }
     }
@@ -292,6 +307,69 @@ mod libsql_e2e {
     }
 
     #[tokio::test]
+    async fn working_event_sink_admits_bypass_persistence_under_libsql() {
+        // Bracket for the bypass audit-ordering contract. The two
+        // siblings below cover the failure shapes:
+        //   * missing_event_sink_blocks_bypass_persistence_under_libsql
+        //   * failing_event_sink_blocks_bypass_persistence_under_libsql
+        // This test covers the success shape: with a working sink, the
+        // bypass write must succeed AND the audit event must be present
+        // in the sink. Together the three tests pin a load-bearing
+        // invariant the previous coverage couldn't distinguish from
+        // "persist-then-rollback": if the audit row exists whenever
+        // persistence succeeds, the audit emission is on the persistence
+        // path (not a parallel best-effort hop).
+        //
+        // Gap: zmanian's review notes that the strongest form would be
+        // "sink succeeds + DB write fails → audit row still exists"
+        // (proves audit-emission-before-persist). That requires a fault
+        // injector on the libSQL repository handle, which doesn't exist
+        // yet — track as a follow-up against the dependent #3180 land.
+        let (db, _dir) = libsql_db().await;
+        let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
+        repository.run_migrations().await.unwrap();
+        let events = Arc::new(RecordingPromptSafetyEventSink::default());
+        let backend = Arc::new(
+            RepositoryMemoryBackend::new(repository.clone())
+                .with_prompt_write_safety_event_sink(events.clone()),
+        );
+        let context = MemoryContext::new(scope_alice())
+            .with_prompt_write_safety_allowance(PromptSafetyAllowanceId::empty_prompt_file_clear());
+        let path = doc_path_alice("BOOTSTRAP.md");
+
+        backend
+            .write_document(&context, &path, b"")
+            .await
+            .expect("bypass write must succeed when sink accepts the audit event");
+
+        // Bypass actually persisted the empty clear (the document row
+        // exists; content is empty).
+        let stored = repository
+            .read_document(&path)
+            .await
+            .unwrap()
+            .expect("BOOTSTRAP.md must be persisted after successful bypass");
+        assert!(
+            stored.is_empty(),
+            "empty-prompt-file-clear bypass must persist empty content, got {} bytes",
+            stored.len(),
+        );
+        assert_eq!(count_documents_total(&db).await, 1);
+
+        // Audit was emitted exactly once. The presence of the audit row
+        // alongside the persisted document proves the sink was on the
+        // critical path before persistence committed — if the sink were
+        // best-effort, the persisted row could exist without the audit
+        // and this assertion would catch that regression.
+        let recorded = events.events();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "bypass write must emit exactly one audit event; got {recorded:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn failing_event_sink_blocks_bypass_persistence_under_libsql() {
         // When the configured sink errors out, the bypass must error and not
         // persist. Mirrors memory_backend_contract.rs:181 against libSQL.
@@ -320,7 +398,10 @@ mod libsql_e2e {
     }
 
     #[tokio::test]
-    #[ignore = "requires PR #3180 .system/engine/orchestrator/* registration"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 .system/engine/orchestrator/* registration; enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn protected_orchestrator_path_blocked_at_libsql_backend() {
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
@@ -343,32 +424,56 @@ mod libsql_e2e {
 
     #[tokio::test]
     async fn dispatch_protected_path_normalization_through_filesystem_adapter_under_libsql() {
-        // Drive the adapter against canonical and lexically-equivalent variants of
-        // a protected path. Each form must reject and persist nothing — the
-        // protected-path registry classifies the document by its normalized
-        // relative path, not the surface VirtualPath.
+        // Drive the adapter against canonical AND lexically-equivalent
+        // variants of a protected path. Each form must reject and persist
+        // nothing — the protected-path registry classifies the document
+        // by its normalized relative path, not the surface VirtualPath.
+        //
+        // `VirtualPath::new` normalizes `.` segments and skips empty
+        // segments (double slashes), so a regression that classifies
+        // against the raw VirtualPath rather than the normalized form
+        // would be caught by the variant assertions below. `..` segments
+        // are rejected at VirtualPath construction so they can't reach
+        // the adapter — there's no test variant for them.
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
         repository.run_migrations().await.unwrap();
         let backend = Arc::new(RepositoryMemoryBackend::new(repository));
         let filesystem = MemoryBackendFilesystemAdapter::new(backend);
 
-        // Canonical form: proves the path class fires through the adapter.
-        let canonical = VirtualPath::new(
+        let variants = [
+            // Canonical form.
             "/memory/tenants/tenant-a/users/alice/agents/_none/projects/_none/SOUL.md",
-        )
-        .unwrap();
+            // Same path with an explicit `.` segment immediately before
+            // the protected leaf — VirtualPath collapses `.` segments,
+            // so this exercises the adapter against a non-canonical
+            // input string that normalizes to SOUL.md.
+            "/memory/tenants/tenant-a/users/alice/agents/_none/projects/_none/./SOUL.md",
+            // Empty segment (double slash) before the protected leaf —
+            // VirtualPath drops empty segments, same canonical target.
+            "/memory/tenants/tenant-a/users/alice/agents/_none/projects/_none//SOUL.md",
+        ];
 
-        let err = filesystem
-            .write_file(&canonical, INJECTION_PAYLOAD)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("high_risk_prompt_injection"),
-            "expected rejection through filesystem adapter, got {err}",
-        );
-        assert_eq!(count_documents_total(&db).await, 0);
+        for raw in variants {
+            let path = VirtualPath::new(raw)
+                .unwrap_or_else(|err| panic!("variant {raw:?} must parse as VirtualPath: {err}"));
+            let err = match filesystem.write_file(&path, INJECTION_PAYLOAD).await {
+                Ok(()) => panic!("variant {raw:?} must reject through filesystem adapter; got Ok"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("high_risk_prompt_injection"),
+                "variant {raw:?}: expected high_risk_prompt_injection rejection, got {err}",
+            );
+            // Persistence must be zero after EACH variant, not just at
+            // the end — otherwise a later variant could mask an earlier
+            // partial write.
+            assert_eq!(
+                count_documents_total(&db).await,
+                0,
+                "variant {raw:?}: no row may persist for any lexical variant of SOUL.md",
+            );
+        }
     }
 
     /// PR #3180 guards. These tests are gated until the branch picks up the
@@ -377,7 +482,10 @@ mod libsql_e2e {
     /// verifies the backend rejects the call without side effects. Until #3180
     /// lands the call goes through and the assertion would fail.
     #[tokio::test]
-    #[ignore = "requires PR #3180 ensure_path_matches_context guards"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 ensure_path_matches_context guards; enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn context_path_mismatch_along_tenant_axis_fails_closed_under_libsql() {
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
@@ -397,7 +505,10 @@ mod libsql_e2e {
     }
 
     #[tokio::test]
-    #[ignore = "requires PR #3180 ensure_path_matches_context guards"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 ensure_path_matches_context guards; enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn context_path_mismatch_along_user_axis_fails_closed_under_libsql() {
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
@@ -417,7 +528,10 @@ mod libsql_e2e {
     }
 
     #[tokio::test]
-    #[ignore = "requires PR #3180 ensure_path_matches_context guards"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 ensure_path_matches_context guards; enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn context_path_mismatch_along_project_axis_fails_closed_under_libsql() {
         let (db, _dir) = libsql_db().await;
         let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
@@ -437,7 +551,10 @@ mod libsql_e2e {
     }
 
     #[tokio::test]
-    #[ignore = "requires PR #3180 ensure_path_matches_context guards"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR #3180 ensure_path_matches_context guards; enable with --features pr3180-ready when #3180 lands"
+    )]
     async fn context_path_mismatch_along_agent_axis_fails_closed_under_libsql() {
         // Context with agent=None must reject a path with agent=Some(...). PR #3180
         // forbids constructing a scope with agent="_none" through the public
@@ -515,13 +632,6 @@ mod libsql_e2e {
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         row.get::<i64>(0).unwrap()
-    }
-
-    // Touch the InMemoryMemoryDocumentRepository symbol so adding/removing this
-    // import next to the libSQL flag does not produce a warning.
-    #[allow(dead_code)]
-    fn _link_in_memory_repo_for_unused_imports() -> InMemoryMemoryDocumentRepository {
-        InMemoryMemoryDocumentRepository::new()
     }
 
     #[derive(Default)]

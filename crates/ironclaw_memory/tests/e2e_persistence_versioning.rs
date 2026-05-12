@@ -111,12 +111,21 @@ mod libsql_e2e {
 
     #[tokio::test]
     async fn documents_chunks_versions_durable_across_repository_reopen() {
-        // Build a libSQL DB, write through the full stack with chunking + indexing,
-        // then drop the repository handle and reopen a fresh one against the same
-        // `libsql::Database`. Reads must succeed and preserve every row.
-        let (db, _dir) = libsql_db().await;
-        let provider = Arc::new(DeterministicEmbeddingProvider::default());
+        // Build a libSQL DB on a real temp file, write through the full
+        // stack (chunking + indexing + version-on-overwrite), then drop
+        // EVERY handle that holds an Arc to the database — repository,
+        // backend, indexer, provider, AND the `libsql::Database` itself.
+        // Re-open by constructing a fresh `libsql::Database` from the
+        // same path. This is the only shape that exercises true on-disk
+        // durability: re-wrapping the same `Arc<libsql::Database>` would
+        // pass even for a bug that only surfaces after the OS-level file
+        // handle is closed and reopened.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memory.db");
+
         {
+            let db = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+            let provider = Arc::new(DeterministicEmbeddingProvider::default());
             let repository = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
             repository.run_migrations().await.unwrap();
             let indexer = Arc::new(
@@ -143,10 +152,22 @@ mod libsql_e2e {
                 )
                 .await
                 .unwrap();
-        } // first repository / backend dropped here
+            // Explicit drops to make the close-then-reopen intent visible
+            // at the call site (otherwise the values just go out of scope
+            // at the block's `}`).
+            drop(backend);
+            drop(repository);
+            drop(provider);
+            drop(db);
+        }
 
-        // Reopen.
-        let repository_reopened = Arc::new(LibSqlMemoryDocumentRepository::new(db.clone()));
+        // Re-open: a brand new `libsql::Database` against the same path,
+        // not a re-wrapped Arc. Migrations are idempotent so the second
+        // run is a no-op against the existing schema.
+        let db_reopened = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+        let repository_reopened =
+            Arc::new(LibSqlMemoryDocumentRepository::new(db_reopened.clone()));
+        repository_reopened.run_migrations().await.unwrap();
         let stored = repository_reopened
             .read_document(&doc_path("notes/durable.md"))
             .await
@@ -154,10 +175,52 @@ mod libsql_e2e {
             .unwrap();
         assert_eq!(stored, b"durable content body");
 
-        // Document, version, and chunk rows all survived the drop.
-        assert_eq!(count_documents(&db, "notes/durable.md").await, 1);
-        assert!(count_chunks(&db, "notes/durable.md").await >= 1);
-        assert_eq!(count_versions(&db, "notes/durable.md").await, 0); // first write has no prior version
+        // Document and chunk rows survived the close-then-reopen.
+        assert_eq!(count_documents(&db_reopened, "notes/durable.md").await, 1);
+        assert!(count_chunks(&db_reopened, "notes/durable.md").await >= 1);
+        // A first write has no prior content, so no version row exists.
+        // Asserting `== 0` here was tautological against `read_versions`
+        // for an unwritten path (zmanian's review): the strong test is
+        // to perform a SECOND write through a fresh backend on the
+        // reopened handle and assert exactly one prior-content version
+        // row appears. That actually exercises version-durability across
+        // the drop.
+        assert_eq!(count_versions(&db_reopened, "notes/durable.md").await, 0);
+
+        let provider_reopened = Arc::new(DeterministicEmbeddingProvider::default());
+        let indexer_reopened = Arc::new(
+            ChunkingMemoryDocumentIndexer::new(repository_reopened.clone())
+                .with_chunk_config(ChunkConfig {
+                    chunk_size: 6,
+                    overlap_percent: 0.0,
+                    min_chunk_size: 1,
+                })
+                .with_embedding_provider(provider_reopened.clone()),
+        );
+        let backend_reopened = Arc::new(
+            RepositoryMemoryBackend::new(repository_reopened.clone())
+                .with_indexer(indexer_reopened)
+                .with_embedding_provider(provider_reopened)
+                .with_capabilities(full_capabilities()),
+        );
+        let context = MemoryContext::new(scope());
+        backend_reopened
+            .write_document(
+                &context,
+                &doc_path("notes/durable.md"),
+                b"durable content body v2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_versions(&db_reopened, "notes/durable.md").await, 1);
+        assert_eq!(
+            repository_reopened
+                .read_document(&doc_path("notes/durable.md"))
+                .await
+                .unwrap()
+                .unwrap(),
+            b"durable content body v2"
+        );
     }
 
     #[tokio::test]
@@ -287,12 +350,22 @@ mod libsql_e2e {
             repository.read_document(&path).await.unwrap().unwrap(),
             b"hello world"
         );
-        // Version row count after one replace + one append: prior content was
-        // recorded once before the append (the initial `"hello "`).
+        // Version row count after one initial write + one successful
+        // append: EXACTLY one prior-content version row (capturing the
+        // initial `"hello "`). Asserting `!versions.is_empty()` would
+        // still pass if `compare_and_append_document` regressed to
+        // emitting duplicate version rows for a single logical change —
+        // exactly the row-cardinality regression this test is here to
+        // catch.
         let versions = read_versions(&db, "notes/append-versioned.md").await;
-        assert!(
-            !versions.is_empty(),
-            "compare_and_append must emit at least one version row capturing the prior content"
+        assert_eq!(
+            versions.len(),
+            1,
+            "compare_and_append must emit exactly one version row per logical change \
+             (initial write has no prior content; append produces one prior-content row); \
+             got {} rows: {:?}",
+            versions.len(),
+            versions,
         );
         let (prior_content, prior_hash, _) = &versions[0];
         assert_eq!(prior_content, "hello ");

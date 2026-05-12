@@ -256,6 +256,12 @@ html-to-markdown = ["dep:html-to-markdown-rs", "dep:readabilityrs"]
 bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types"]
 tui = ["dep:ironclaw_tui"]
 import = ["dep:json5", "libsql"]
+# Conditional gate for memory-substrate regression tests that depend on
+# PR #3180 (memory backend hardening) and PR 7 (product-tool migration
+# routing memory_write through ironclaw_memory's PromptWriteSafetyPolicy).
+# The dependent PR must enable this in its merge commit so the gated
+# tests fire in CI. Mirrors the same-named feature on `ironclaw_memory`.
+pr3180-ready = []
 
 [[test]]
 name = "e2e_thread_scheduling"

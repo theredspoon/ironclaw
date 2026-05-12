@@ -2,6 +2,7 @@
   "model_name": "memory-isolation-protected-rejected",
   "expects": {
     "tools_used": ["memory_write"],
+    "all_tools_succeeded": false,
     "min_responses": 1
   },
   "turns": [

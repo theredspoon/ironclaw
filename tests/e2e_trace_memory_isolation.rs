@@ -37,8 +37,9 @@ mod tests {
         rig.run_and_verify_trace(&trace, Duration::from_secs(20))
             .await;
 
-        // Tool result for memory_read must contain the exact marker that the
-        // first-turn memory_write persisted.
+        // Tool result for memory_read must round-trip the exact marker —
+        // checked as a loose contains() first so a tool that drops the
+        // payload entirely fails fast with a readable error...
         let results = rig.tool_results();
         let read_result = results
             .iter()
@@ -48,6 +49,25 @@ mod tests {
         assert!(
             read_result.contains("deterministic-marker-42"),
             "memory_read tool result must round-trip the marker; got {read_result:?}",
+        );
+
+        // ...then go to the source of truth and assert exact persisted
+        // bytes. The tool output is a renderable preview and may decorate
+        // the content; `contains()` alone would still pass if the tool
+        // returned the marker plus stale or mutated surrounding bytes.
+        // The Database trait's `get_document_by_path` reads the persisted
+        // row directly, which is the byte-level invariant PR #3180
+        // invariant 1 actually pins.
+        let doc = rig
+            .database()
+            .get_document_by_path(rig.channel_user_id(), None, "notes/round-trip.md")
+            .await
+            .expect("notes/round-trip.md must be persisted under channel user");
+        assert_eq!(
+            doc.content, "deterministic-marker-42",
+            "persisted content must equal exactly the bytes the agent sent; \
+             got {:?}",
+            doc.content,
         );
 
         rig.shutdown();
@@ -60,7 +80,10 @@ mod tests {
     /// reborn substrate's `PromptWriteSafetyPolicy`, so the assertion would
     /// fail prematurely.
     #[tokio::test]
-    #[ignore = "requires PR 7 (product-tool migration) to route memory_write through ironclaw_memory's PromptWriteSafetyPolicy"]
+    #[cfg_attr(
+        not(feature = "pr3180-ready"),
+        ignore = "requires PR 7 (product-tool migration) to route memory_write through ironclaw_memory's PromptWriteSafetyPolicy; enable with --features pr3180-ready when PR 7 lands"
+    )]
     async fn memory_write_to_soul_md_rejects_through_tool_layer_no_persistence() {
         let trace = LlmTrace::from_file(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -91,13 +114,32 @@ mod tests {
         // `Err(WorkspaceError::NotFound)` when the row is absent — the cleanest
         // way to assert non-persistence without bypassing the trait into
         // dialect-specific raw SQL.
+        //
+        // Query under `rig.channel_user_id()`, NOT `rig.owner_id()`: the
+        // memory_write tool runs as the effective channel user (default
+        // `"test-user"`), and a regression that persists SOUL.md would
+        // write it under that scope. An owner-keyed lookup (config owner =
+        // `"default"`) would silently miss the persisted row and the
+        // non-persistence assertion would become a false negative.
         let lookup = rig
+            .database()
+            .get_document_by_path(rig.channel_user_id(), None, "SOUL.md")
+            .await;
+        assert!(
+            lookup.is_err(),
+            "SOUL.md must not be persisted under channel user {}; got {lookup:?}",
+            rig.channel_user_id(),
+        );
+        // Defense-in-depth: also check the owner scope, so a regression
+        // that mis-routes the write to the owner identity is still caught.
+        let owner_lookup = rig
             .database()
             .get_document_by_path(rig.owner_id(), None, "SOUL.md")
             .await;
         assert!(
-            lookup.is_err(),
-            "SOUL.md must not be persisted under test owner; got {lookup:?}",
+            owner_lookup.is_err(),
+            "SOUL.md must not be persisted under owner {}; got {owner_lookup:?}",
+            rig.owner_id(),
         );
 
         rig.shutdown();
