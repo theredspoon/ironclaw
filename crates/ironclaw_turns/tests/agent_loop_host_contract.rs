@@ -2156,6 +2156,40 @@ async fn budget_accounting_on_failure_still_fires_post() {
     assert!(accountant.post_saw_failure());
 }
 
+/// Post-call accounting failure after provider failure must fail closed so
+/// reservation cleanup/reconciliation loss cannot hide behind the model error.
+#[tokio::test]
+async fn post_accounting_failure_after_gateway_failure_fails_closed() {
+    let context = claimed_run_context().await;
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let gateway = Arc::new(RecordingLoopModelGateway::default());
+    gateway.push_response(Err(LoopModelGatewayError::new(
+        AgentLoopHostErrorKind::Unavailable,
+        "model unavailable",
+    )
+    .unwrap()));
+    let accountant = Arc::new(RecordingBudgetAccountant::rejecting_post());
+
+    let port = HostManagedLoopModelPort::with_accountant(
+        context.clone(),
+        gateway.clone(),
+        milestone_sink,
+        accountant.clone(),
+    );
+
+    let error = port
+        .stream_model(simple_model_request(&context))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::BudgetExceeded);
+    assert_eq!(error.safe_summary, "model call accounting failed");
+    assert!(accountant.was_pre_called());
+    assert!(accountant.was_post_called());
+    assert!(accountant.post_saw_failure());
+    assert_eq!(gateway.requests().len(), 1);
+}
+
 /// Budget-exceeded pre-call rejection prevents gateway call.
 #[tokio::test]
 async fn budget_exceeded_pre_call_rejects_without_calling_gateway() {

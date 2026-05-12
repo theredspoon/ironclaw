@@ -516,7 +516,9 @@ impl LoopRunContext {
 #[serde(rename_all = "snake_case")]
 pub enum AgentLoopHostErrorKind {
     Unauthorized,
-    /// The credential required for the model provider is missing or expired.
+    /// Host-owned credential acquisition failed for the requested provider/model.
+    /// The error summary must stay sanitized and must not expose secret material,
+    /// token refresh details, or backend-specific credential-store errors.
     CredentialUnavailable,
     ScopeMismatch,
     StaleSurface,

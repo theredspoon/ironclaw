@@ -40,8 +40,10 @@ pub trait LoopModelBudgetAccountant: Send + Sync {
     ) -> Result<(), LoopModelGatewayError>;
 
     /// Called **after** the model call completes (or fails). Implementations
-    /// should record usage and must fail closed when success accounting cannot
-    /// be durably recorded.
+    /// should record success usage and reconcile or release any pre-call
+    /// reservation for provider failures. Any durable accounting/reconciliation
+    /// failure must be returned so callers fail closed instead of hiding stuck
+    /// reservations or missing failed-call accounting behind the provider error.
     async fn post_model_call(
         &self,
         context: &LoopRunContext,
@@ -58,6 +60,13 @@ pub struct LoopModelGatewayRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("loop model gateway {kind:?}: {safe_summary}")]
+/// Sanitized model-gateway failure surfaced through the loop-host wire contract.
+///
+/// `AgentLoopHostErrorKind::CredentialUnavailable` means the host could not
+/// provide a scoped, non-reusable credential for the selected provider/model;
+/// callers must treat it as a host-owned credential acquisition failure, not as
+/// provider output. `AgentLoopHostErrorKind::BudgetExceeded` can also surface
+/// after a provider failure when post-call accounting/release fails closed.
 pub struct LoopModelGatewayError {
     pub kind: AgentLoopHostErrorKind,
     pub safe_summary: LoopSafeSummary,
@@ -293,13 +302,7 @@ where
             .post_model_call(&self.context, &request, outcome)
             .await
         {
-            if gateway_result.is_ok() {
-                return Err(post_error.into_host_error());
-            }
-            tracing::debug!(
-                kind = ?post_error.kind,
-                "post_model_call accounting failed after model failure; preserving model error"
-            );
+            return Err(post_error.into_host_error());
         }
 
         let response = match gateway_result {
