@@ -49,7 +49,6 @@ use ironclaw_secrets::{CreateSecretParams, LibSqlSecretsStore, SecretsStore};
 /// to the row, never the other row's value.
 #[cfg(feature = "libsql")]
 #[tokio::test]
-#[ignore = "PoC for finding H3 — fails today; remove #[ignore] together with the AAD/scope-binding fix"]
 async fn h3_libsql_secret_row_swap_must_not_return_other_rows_plaintext() {
     let dir = tempfile::tempdir().unwrap().keep();
     let db_path = dir.join("secrets.db");

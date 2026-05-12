@@ -6,7 +6,7 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, AeadCore, OsRng},
+    aead::{Aead, AeadCore, OsRng, Payload},
 };
 use hkdf::Hkdf;
 use secrecy::{ExposeSecret, SecretString};
@@ -60,14 +60,28 @@ impl SecretsCrypto {
         salt
     }
 
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
+    /// Encrypt `plaintext` and authenticate it against `aad`.
+    ///
+    /// The `aad` (additional authenticated data) is *not* encrypted but is
+    /// covered by the AES-GCM authentication tag. Callers must pass the same
+    /// `aad` to [`Self::decrypt`] or the tag check fails. Storage layers use
+    /// this to bind ciphertext to the row identity (scope/handle, account id,
+    /// session id, etc.) so an attacker with DB write access cannot swap
+    /// `(encrypted_value, key_salt)` between rows — the swapped ciphertext
+    /// was authenticated under a different `aad` and decryption fails with
+    /// `SecretError::DecryptionFailed`.
+    pub fn encrypt(
+        &self,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
         let salt = Self::generate_salt();
         let derived_key = self.derive_key(&salt)?;
         let cipher = Aes256Gcm::new_from_slice(&derived_key)
             .map_err(|error| SecretError::EncryptionFailed(error.to_string()))?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(&nonce, Payload { msg: plaintext, aad })
             .map_err(|error| SecretError::EncryptionFailed(error.to_string()))?;
         let mut encrypted = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
         encrypted.extend_from_slice(&nonce);
@@ -75,10 +89,15 @@ impl SecretsCrypto {
         Ok((encrypted, salt))
     }
 
+    /// Decrypt `encrypted_value` and verify the AES-GCM tag against `aad`.
+    ///
+    /// Must pass the same `aad` that was supplied to [`Self::encrypt`]; a
+    /// mismatch returns `SecretError::DecryptionFailed`.
     pub fn decrypt(
         &self,
         encrypted_value: &[u8],
         salt: &[u8],
+        aad: &[u8],
     ) -> Result<DecryptedSecret, SecretError> {
         if encrypted_value.len() < NONCE_SIZE + TAG_SIZE {
             return Err(SecretError::DecryptionFailed(
@@ -91,7 +110,7 @@ impl SecretsCrypto {
         let (nonce_bytes, ciphertext) = encrypted_value.split_at(NONCE_SIZE);
         let nonce = Nonce::from_slice(nonce_bytes);
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(nonce, Payload { msg: ciphertext, aad })
             .map_err(|error| SecretError::DecryptionFailed(error.to_string()))?;
         DecryptedSecret::from_bytes(plaintext)
     }
@@ -112,6 +131,54 @@ impl std::fmt::Debug for SecretsCrypto {
             .field("master_key", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Build domain-separated, length-prefixed AAD bytes.
+///
+/// Each call writes the domain tag followed by every part as
+/// `(u32-be length || bytes)`. Length prefixes keep the encoding unambiguous
+/// even when parts contain arbitrary bytes (delimiters in part contents
+/// cannot be confused with the framing), and the domain tag prevents
+/// cross-shape replay (a credential-account ciphertext cannot be replayed as
+/// a secret-record ciphertext, etc.).
+pub(crate) fn build_aad(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    let capacity = domain.len() + parts.iter().map(|part| 4 + part.len()).sum::<usize>();
+    let mut aad = Vec::with_capacity(capacity);
+    aad.extend_from_slice(domain);
+    for part in parts {
+        let length =
+            u32::try_from(part.len()).expect("AAD part length must fit in u32 for framing");
+        aad.extend_from_slice(&length.to_be_bytes());
+        aad.extend_from_slice(part);
+    }
+    aad
+}
+
+pub(crate) const AAD_DOMAIN_SECRET_RECORD: &[u8] = b"reborn/v1/secret_record";
+pub(crate) const AAD_DOMAIN_CREDENTIAL_ACCOUNT: &[u8] = b"reborn/v1/credential_account";
+pub(crate) const AAD_DOMAIN_CREDENTIAL_SESSION: &[u8] = b"reborn/v1/credential_session";
+pub(crate) const AAD_DOMAIN_SECRET_STORE_KEY_CHECK: &[u8] = b"reborn/v1/secret_store_key_check";
+
+/// AAD for the secret-record AES-GCM payload, binding ciphertext to
+/// `(user_id, name)`.
+///
+/// Production storage code reaches this through the higher-level
+/// `SecretStore` / `SecretsStore` API and never needs to call it directly.
+/// It is `pub` so contract tests and integration fixtures that bypass the
+/// store and write directly to `reborn_secret_records` can construct
+/// ciphertext the production code will accept.
+pub fn secret_record_aad(user_id: &str, name: &str) -> Vec<u8> {
+    build_aad(
+        AAD_DOMAIN_SECRET_RECORD,
+        &[user_id.as_bytes(), name.as_bytes()],
+    )
+}
+
+/// AAD for the readiness sentinel row in `reborn_secret_store_key_check`.
+///
+/// Same fixture-only motivation as [`secret_record_aad`].
+pub fn secret_store_key_check_aad() -> Vec<u8> {
+    build_aad(AAD_DOMAIN_SECRET_STORE_KEY_CHECK, &[])
 }
 
 /// Count of distinct byte values in the slice.

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-pub use crypto::SecretsCrypto;
+pub use crypto::{SecretsCrypto, secret_record_aad, secret_store_key_check_aad};
 use ironclaw_host_api::{
     AgentId, CapabilityId, ExtensionId, InvocationId, MissionId, NetworkMethod, ProjectId,
     ResourceScope, SecretHandle, TenantId, ThreadId, Timestamp, UserId,
