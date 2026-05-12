@@ -282,13 +282,29 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
         .collect::<Vec<_>>();
     deps.sort_unstable();
 
+    // Deliberate additions beyond the original auth/egress primitives:
+    //   * async-trait, tokio  — required by the native ProductAdapter runner
+    //     (async traits, semaphore-based admission control, timeout).
+    //   * chrono              — receive-timestamp for TrustedInboundContext.
+    //   * hex                 — HMAC signature encoding in the auth verifier.
+    //   * tracing             — structured logging for hardened error paths
+    //                           added in the zmanian review.
+    // Every addition is justified by a concrete call site in src/. Adding a
+    // dep here without a matching call site is a contract violation — and
+    // adding workflow/runtime crates beyond this list still requires
+    // updating both the wasm crate's CLAUDE.md and this expected set.
     let expected = vec![
+        "async-trait",
+        "chrono",
+        "hex",
         "hmac",
         "http",
         "ironclaw_product_adapters",
         "sha2",
         "subtle",
         "thiserror",
+        "tokio",
+        "tracing",
     ];
     assert_eq!(
         deps, expected,
