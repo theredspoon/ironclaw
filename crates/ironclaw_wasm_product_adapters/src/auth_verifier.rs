@@ -146,13 +146,23 @@ impl WebhookAuthVerifier for HmacWebhookAuth {
         // Replay-window check before computing HMAC. Reject stale or
         // far-future timestamps; both are forgery attempts. The window is
         // symmetric: |now - ts| > max_age_secs => fail.
-        let Ok(timestamp_secs) = timestamp_str.parse::<i64>() else {
+        //
+        // Parse the (untrusted) header value as i128, not i64: in
+        // overflow-checked builds (default for `cargo test` / debug),
+        // `(now_secs - timestamp_secs).abs()` with `i64` panics on
+        // `timestamp_secs = i64::MIN` (subtraction overflows for any
+        // nonnegative `now_secs`, and `i64::MIN.abs()` itself overflows).
+        // A pathological header like `-9223372036854775808` would crash
+        // the verifier before it could return `Malformed`. `i128` covers
+        // the full `i64` value range with several orders of magnitude of
+        // headroom, so neither the subtraction nor the abs() can overflow.
+        let Ok(timestamp_secs) = timestamp_str.parse::<i128>() else {
             return VerificationOutcome::Failed {
                 failure: ProtocolAuthFailure::Malformed,
             };
         };
-        let now_secs = self.clock.now_unix_seconds() as i64;
-        let max_age = self.max_age_secs as i64;
+        let now_secs = i128::from(self.clock.now_unix_seconds());
+        let max_age = i128::from(self.max_age_secs);
         let drift = (now_secs - timestamp_secs).abs();
         if drift > max_age {
             return VerificationOutcome::Failed {
@@ -448,6 +458,45 @@ mod tests {
                 assert!(matches!(failure, ProtocolAuthFailure::Malformed));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_extreme_negative_timestamp_without_overflow() {
+        // `i64::MIN` as the timestamp header would have panicked the
+        // previous `(now - ts as i64).abs()` arithmetic in overflow-
+        // checked builds (subtraction overflows for any nonnegative
+        // `now_secs`, and `i64::MIN.abs()` itself overflows). With i128
+        // arithmetic the drift is computable and the verifier must
+        // return `Failed` for an out-of-window timestamp, not panic.
+        let secret = b"super-shared-secret".to_vec();
+        let body = b"{}";
+        let headers = header_map(&[
+            ("X-Slack-Signature", "v0=abc"),
+            ("X-Slack-Request-Timestamp", "-9223372036854775808"),
+        ]);
+        let verifier = verifier_at(1_700_000_000, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { .. } => {}
+            other => panic!("extreme negative timestamp must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_extreme_positive_timestamp_without_overflow() {
+        // Mirror of the negative case for symmetry: `i64::MAX` would
+        // also have overflowed the previous arithmetic on a typical
+        // `now_secs ~ 1.7e9`. Must fail closed without panicking.
+        let secret = b"super-shared-secret".to_vec();
+        let body = b"{}";
+        let headers = header_map(&[
+            ("X-Slack-Signature", "v0=abc"),
+            ("X-Slack-Request-Timestamp", "9223372036854775807"),
+        ]);
+        let verifier = verifier_at(1_700_000_000, 300, secret);
+        match verifier.verify(&headers, body) {
+            VerificationOutcome::Failed { .. } => {}
+            other => panic!("extreme positive timestamp must fail closed, got {other:?}"),
         }
     }
 
