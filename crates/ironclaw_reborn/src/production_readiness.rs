@@ -551,7 +551,7 @@ fn push_active_run_profile_issues(
                 RebornLoopProductionIssue::blocking(
                     RebornLoopProductionComponent::RunProfile,
                     RebornLoopProductionIssueKind::ActiveRunsRequireVersion,
-                    run.run_ref.clone(),
+                    active_run_subject(),
                 )
                 .with_active_run(run),
             );
@@ -574,7 +574,7 @@ fn push_driver_readiness_issues(
         .filter(|run| !run.status.is_terminal())
         .map(|run| {
             PersistedRunDriverIdentity::new(
-                run.run_ref.clone(),
+                active_run_subject(),
                 run.status,
                 run.driver_identity.clone(),
             )
@@ -648,6 +648,10 @@ fn push_mapped_driver_issues(
 
 fn configured_driver_profile(profile: &RebornConfiguredRunProfile) -> ConfiguredRunProfile {
     ConfiguredRunProfile::enabled(profile.profile_id.as_str(), profile.driver_identity.clone())
+}
+
+fn active_run_subject() -> &'static str {
+    "active_run"
 }
 
 fn component_subject(component: RebornLoopProductionComponent) -> &'static str {

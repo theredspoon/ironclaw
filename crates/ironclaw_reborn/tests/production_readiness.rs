@@ -270,6 +270,81 @@ fn production_readiness_rejects_active_run_driver_identity_mismatch() {
 }
 
 #[test]
+fn production_readiness_rejects_active_run_checkpoint_schema_identity_mismatch() {
+    let mut registry = DriverRegistry::new();
+    let configured_key = registry
+        .register_driver(
+            Arc::new(TestDriver::new(descriptor(
+                "text_loop",
+                1,
+                "new_text_checkpoint",
+                1,
+            ))),
+            DriverRequirements::all_required(),
+            DriverKind::Production,
+        )
+        .expect("configured driver registration succeeds");
+    let active_run_key = register_driver(&mut registry, "text_loop", DriverKind::Production);
+    let profile = RebornConfiguredRunProfile::selected(
+        RunProfileId::new("interactive_default").expect("valid profile id"),
+        RunProfileVersion::new(1),
+        configured_key,
+        CheckpointSchemaId::new("new_text_checkpoint").expect("valid checkpoint id"),
+        RunProfileVersion::new(1),
+    );
+    let active_run = RebornActiveRunIdentity::new(
+        "run-active-1",
+        TurnStatus::Running,
+        RunProfileId::new("interactive_default").expect("valid profile id"),
+        RunProfileVersion::new(1),
+        active_run_key,
+    );
+
+    let report = validate_reborn_loop_production_readiness(RebornLoopProductionInputs {
+        mode: RebornLoopReadinessMode::Production,
+        driver_registry: &registry,
+        component_graph: RebornLoopComponentGraphReadiness::production_verified(),
+        configured_profiles: vec![profile],
+        active_runs: vec![active_run],
+    });
+
+    assert_eq!(report.status, RebornLoopProductionStatus::NotReady);
+    assert!(report.contains(
+        RebornLoopProductionComponent::RunProfile,
+        RebornLoopProductionIssueKind::ActiveRunsRequireVersion
+    ));
+}
+
+#[test]
+fn readiness_surface_redacts_active_run_subject() {
+    let mut registry = DriverRegistry::new();
+    let key = register_driver(&mut registry, "text_loop", DriverKind::Production);
+    let active_run = RebornActiveRunIdentity::new(
+        "provider/sk-secret/prompt",
+        TurnStatus::Running,
+        RunProfileId::new("old_interactive").expect("valid profile id"),
+        RunProfileVersion::new(1),
+        missing_key("missing_loop", 1, "text_checkpoint", 1),
+    );
+
+    let report = validate_reborn_loop_production_readiness(RebornLoopProductionInputs {
+        mode: RebornLoopReadinessMode::Production,
+        driver_registry: &registry,
+        component_graph: RebornLoopComponentGraphReadiness::production_verified(),
+        configured_profiles: vec![selected_profile(key)],
+        active_runs: vec![active_run],
+    });
+
+    assert_eq!(report.status, RebornLoopProductionStatus::NotReady);
+    for issue in report.issues {
+        assert!(!issue.subject.contains('/'));
+        assert!(!issue.subject.contains("sk-"));
+        assert!(!issue.subject.contains("provider"));
+        assert!(!issue.subject.contains("prompt"));
+    }
+}
+
+#[test]
 fn optional_profile_unavailable_does_not_block_startup() {
     let mut registry = DriverRegistry::new();
     let key = register_driver(&mut registry, "text_loop", DriverKind::Production);
