@@ -11,9 +11,9 @@ use ironclaw_turns::{
 };
 
 use crate::driver_registry::{
-    ConfiguredRunProfile, DriverReadinessInputs, DriverReadinessMode, DriverReadinessStatus,
-    DriverRegistry, DriverRequirements, HostGraphReadiness, LoopDriverRegistryKey,
-    PersistedRunDriverIdentity, RequirementLevel,
+    ConfiguredRunProfile, DriverReadinessInputs, DriverReadinessMode, DriverRegistry,
+    DriverRequirements, HostGraphReadiness, LoopDriverRegistryKey, PersistedRunDriverIdentity,
+    RequirementLevel,
 };
 
 /// Readiness mode for the Reborn loop graph.
@@ -62,16 +62,14 @@ impl RebornComponentSafetyClass {
         self != Self::ProductionVerified
     }
 
-    fn issue_kind(self) -> RebornLoopProductionIssueKind {
+    fn issue_kind(self) -> Option<RebornLoopProductionIssueKind> {
         match self {
-            Self::ProductionVerified => {
-                RebornLoopProductionIssueKind::UnverifiedProductionImplementation
-            }
-            Self::TestOnly => RebornLoopProductionIssueKind::TestOnlyImplementation,
-            Self::NonDurable => RebornLoopProductionIssueKind::NonDurableImplementation,
-            Self::Noop => RebornLoopProductionIssueKind::NoopImplementation,
+            Self::ProductionVerified => None,
+            Self::TestOnly => Some(RebornLoopProductionIssueKind::TestOnlyImplementation),
+            Self::NonDurable => Some(RebornLoopProductionIssueKind::NonDurableImplementation),
+            Self::Noop => Some(RebornLoopProductionIssueKind::NoopImplementation),
             Self::UnverifiedProductionImplementation => {
-                RebornLoopProductionIssueKind::UnverifiedProductionImplementation
+                Some(RebornLoopProductionIssueKind::UnverifiedProductionImplementation)
             }
         }
     }
@@ -111,7 +109,6 @@ pub enum RebornLoopProductionIssueKind {
     UnverifiedProductionImplementation,
     UnsupportedRequirement,
     VersionMismatch,
-    ProfileUnavailable,
     ActiveRunsRequireVersion,
     PolicyDenied,
 }
@@ -486,18 +483,24 @@ fn push_component_issues(
                 RebornComponentRequirement::Required,
                 Some(safety),
             ) if safety.blocks_production() => {
+                let Some(issue_kind) = safety.issue_kind() else {
+                    continue;
+                };
                 issues.push(RebornLoopProductionIssue::blocking(
                     component,
-                    safety.issue_kind(),
+                    issue_kind,
                     component_subject(component),
                 ));
             }
             (RebornLoopReadinessMode::LocalDevTest, _, Some(safety))
                 if safety.degraded_in_local_dev() =>
             {
+                let Some(issue_kind) = safety.issue_kind() else {
+                    continue;
+                };
                 issues.push(RebornLoopProductionIssue::warning(
                     component,
-                    safety.issue_kind(),
+                    issue_kind,
                     component_subject(component),
                 ));
             }
@@ -610,8 +613,6 @@ fn push_mapped_driver_issues(
     keep_blocking: bool,
     issues: &mut Vec<RebornLoopProductionIssue>,
 ) {
-    let status = report.status;
-    let had_diagnostics = !report.diagnostics.is_empty();
     for diagnostic in report.diagnostics {
         let (component, kind) = match diagnostic.code {
             "missing_configured_driver" => (
@@ -650,14 +651,6 @@ fn push_mapped_driver_issues(
             blocks_ready,
         });
     }
-
-    if !keep_blocking && status == DriverReadinessStatus::NotReady && !had_diagnostics {
-        issues.push(RebornLoopProductionIssue::warning(
-            RebornLoopProductionComponent::RunProfile,
-            RebornLoopProductionIssueKind::ProfileUnavailable,
-            "optional_profile",
-        ));
-    }
 }
 
 fn configured_driver_profile(profile: &RebornConfiguredRunProfile) -> ConfiguredRunProfile {
@@ -694,5 +687,35 @@ pub fn text_only_driver_requirements() -> DriverRequirements {
         input_polling: RequirementLevel::Required,
         capabilities: RequirementLevel::Required,
         progress_events: RequirementLevel::Required,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver_registry::{DriverReadinessReport, DriverReadinessStatus};
+
+    #[test]
+    fn production_verified_safety_has_no_issue_kind() {
+        assert_eq!(
+            RebornComponentSafetyClass::ProductionVerified.issue_kind(),
+            None
+        );
+    }
+
+    #[test]
+    fn mapped_driver_issues_do_not_invent_unavailable_profiles_without_diagnostics() {
+        let mut issues = Vec::new();
+
+        push_mapped_driver_issues(
+            DriverReadinessReport {
+                status: DriverReadinessStatus::NotReady,
+                diagnostics: Vec::new(),
+            },
+            false,
+            &mut issues,
+        );
+
+        assert!(issues.is_empty());
     }
 }
