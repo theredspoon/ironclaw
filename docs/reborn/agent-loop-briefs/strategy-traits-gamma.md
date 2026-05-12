@@ -153,8 +153,8 @@ use crate::state::LoopExecutionState;
 /// Hard caps on loop execution. Sync, pure policy.
 ///
 /// The executor enforces these AFTER each tick:
-/// - if `state.iteration > iteration_limit()` → `LoopExit::Failed { IterationLimit }`
-/// - if `wall_clock_limit()` is `Some(d)` and elapsed > d → `LoopExit::Failed { IterationLimit }`
+/// - if `state.iteration >= iteration_limit(&state)` → `LoopExit::Failed { IterationLimit }`
+/// - if `wall_clock_limit(&state)` is `Some(d)` and elapsed > d → `LoopExit::Failed { IterationLimit }`
 ///
 /// Strategies cannot mutate state; this is a read-only policy gate.
 pub trait BudgetStrategy: Send + Sync {

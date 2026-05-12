@@ -320,7 +320,7 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 
 - **Checkpoint discipline is executor-owned.** Four kinds: `BeforeModel`, `BeforeSideEffect`, `BeforeBlock`, optionally `Final`. Strategies cannot trigger checkpoints; they only return state slots.
 - **Cancellation observed between strategy calls.** Strategies never see the signal directly.
-- **Visible surface version pinned per iteration** before `plan_model_request`, held in `LoopExecutionState.surface_version`. On stale-surface outcome, executor reloads + retries that iteration; counts against `BudgetStrategy.iteration_limit()`.
+- **Visible surface version pinned per iteration** before `plan_model_request`, held in `LoopExecutionState.surface_version`. On stale-surface outcome, executor reloads + retries that iteration; counts against `BudgetStrategy.iteration_limit(&state)`.
 - **Error sanitization at the host boundary.** Strategies receive `CapabilityErrorSummary` / `ModelErrorSummary` (already redacted by the host). Raw provider errors never reach planner code. Honors [`error-handling.md`](../../.claude/rules/error-handling.md) channel-edge rule.
 - **Fallback chain is intended but deferred.** Skeleton keeps the existing `Option<LoopModelRouteSnapshot>` on `LoopRunContext` and reserves `model_state.fallback_index: u32` (always 0 in skeleton). When a future `RecoveryStrategy` needs to switch models, that PR adds `ModelRouteChain` to `host.rs` and migrates the storage layer call sites. Until then, `RecoveryOutcome::Retry { alter }` cannot include a model-route swap — only context/prompt-shape alterations.
 - **Async only where genuinely needed.** Pure-policy strategies (`BudgetStrategy`, `BatchPolicyStrategy`) are sync `fn`. Strategies that may consult host state (recovery, gate handling, drain) are async.
@@ -335,7 +335,7 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 
 The `Default*` strategies provide three independent stuck-loop safety nets, layered:
 
-1. **Iteration cap.** `DefaultBudgetStrategy.iteration_limit() = 32`. Hard ceiling. Returns `LoopExit::Failed { reason_kind: IterationLimit }`.
+1. **Iteration cap.** `DefaultBudgetStrategy.iteration_limit(&state)` returns `32`. Hard ceiling. Returns `LoopExit::Failed { reason_kind: IterationLimit }`.
 2. **Per-error retry budget.** `DefaultRecoveryStrategy` aborts after 2 retries on a single error class. Returns `LoopExit::Failed { reason_kind: <originating-class> }`.
 3. **Repetition / no-progress escape.** `DefaultStopConditionStrategy` returns `Stop { kind: NoProgressDetected }` if either:
    - the same `CapabilityCallSignature` is observed in ≥3 of the last 5 iterations, OR

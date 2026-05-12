@@ -95,7 +95,7 @@ pub enum MockHostCall {
     BuildPromptBundle,
     StreamModel,
     InvokeCapabilityBatch { call_count: usize },
-    InvokeCapabilitySingle { capability_name: String },  // for retry-path tests (WS-6 §3.6)
+    InvokeCapability { capability_name: String },        // single-call path used by retries (WS-6 §3.6)
     FinalizeAssistantMessage,
     SaveCheckpoint(crate::state::CheckpointKind),
     TakePendingInputs(/* intent */),
