@@ -1,15 +1,23 @@
 //! Telegram Bot API payload normalization.
 //!
-//! Inputs are raw webhook update bytes. Outputs are structured envelopes the
-//! adapter can hand to the workflow facade — or `None` when the update should
-//! produce a successful no-op acknowledgement (ambient group messages,
-//! channel posts, edited-message kinds we don't act on, etc.).
+//! Inputs are raw webhook update bytes. Outputs are
+//! [`ParsedProductInbound`] values — the host stamps trusted context
+//! ([`TrustedInboundContext::from_verified_evidence`]) and wraps the
+//! result in a [`ProductInboundEnvelope`] outside this crate.
+//!
+//! Ignored-but-authenticated updates (ambient group messages, channel
+//! posts, edited-message kinds we don't act on, messages without a
+//! `from` we can't actor-ref) return `ParsedProductInbound { payload:
+//! ProductInboundPayload::NoOp, .. }` with synthetic external refs for
+//! the slots we genuinely have no source for. This matches the
+//! `ironclaw_product_adapters` contract that says NoOps must be a
+//! parsed inbound with the explicit `NoOp` payload variant, NOT an
+//! out-of-band `None` path.
 
-use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_product_adapters::{
     AdapterInstallationId, ExternalActorRef, ExternalConversationRef, ExternalEventId,
-    InboundCommandPayload, ProductAdapterId, ProductAttachmentDescriptor, ProductAttachmentKind,
-    ProductInboundEnvelope, ProductInboundPayload, ProductTriggerReason, ProtocolAuthEvidence,
+    InboundCommandPayload, ParsedProductInbound, ProductAdapterError, ProductAttachmentDescriptor,
+    ProductAttachmentKind, ProductInboundPayload, ProductTriggerReason, ProtocolAuthEvidence,
     UserMessagePayload,
 };
 use serde::Deserialize;
@@ -39,17 +47,6 @@ pub struct GroupTriggerPolicy {
     pub recognized_commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TelegramParsedInbound {
-    /// Adapter produces an envelope and forwards to the workflow. Boxed
-    /// because the envelope is much larger than the `NoOp` variant.
-    Envelope(Box<ProductInboundEnvelope>),
-    /// Successful no-op (ambient group message, edited message we ignore,
-    /// channel post, ...). Webhook responds 200 OK without invoking the
-    /// workflow.
-    NoOp,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PayloadParseError {
     #[error("invalid Telegram update JSON: {reason}")]
@@ -65,20 +62,29 @@ pub enum PayloadParseError {
     UnauthenticatedPayload,
 }
 
-/// Parse a Telegram webhook payload into the `ProductInboundEnvelope` shape.
+/// Parse a Telegram webhook payload into a [`ParsedProductInbound`]. The
+/// host stamps trusted context outside this function and wraps the
+/// result in a `ProductInboundEnvelope` — that is the kernel/adapter
+/// trust boundary and must not be crossed inside the adapter itself.
+///
+/// Ignored-but-authenticated updates (no message, no `from`, ambient
+/// group chatter, etc.) return a parsed inbound with
+/// `payload = ProductInboundPayload::NoOp` and synthetic external refs
+/// for the slots that genuinely have no source. The webhook still
+/// acks 200 OK; the NoOp payload variant short-circuits inside the
+/// workflow facade.
 pub fn parse_telegram_update(
     raw_payload: &[u8],
-    auth_evidence: ProtocolAuthEvidence,
-    adapter_id: &ProductAdapterId,
+    auth_evidence: &ProtocolAuthEvidence,
     installation_id: &AdapterInstallationId,
     group_trigger_policy: &GroupTriggerPolicy,
-) -> Result<TelegramParsedInbound, PayloadParseError> {
-    let auth_claim = match auth_evidence {
-        ProtocolAuthEvidence::Verified { claim, .. } => claim,
-        ProtocolAuthEvidence::Failed { .. } => {
-            return Err(PayloadParseError::UnauthenticatedPayload);
-        }
-    };
+) -> Result<ParsedProductInbound, PayloadParseError> {
+    // `ProtocolAuthEvidence` is a sealed struct (formerly an enum). The
+    // host mints verified evidence; components cannot fabricate one.
+    // Reject anything else up front.
+    if !auth_evidence.is_verified() {
+        return Err(PayloadParseError::UnauthenticatedPayload);
+    }
 
     let update: TelegramUpdate =
         serde_json::from_slice(raw_payload).map_err(|err| PayloadParseError::InvalidJson {
@@ -89,38 +95,78 @@ pub fn parse_telegram_update(
         return Err(PayloadParseError::MissingUpdateId);
     }
 
+    let event_id = build_event_id(installation_id, update_id)?;
+
     // Choose the message variant. We act on `message` and explicitly drop
-    // `edited_message`, `channel_post`, and other update kinds in the first
-    // slice. They are NoOp acks.
-    let message = match update.message {
-        Some(m) => m,
-        None => return Ok(TelegramParsedInbound::NoOp),
+    // `edited_message`, `channel_post`, and other update kinds — they
+    // become `ProductInboundPayload::NoOp` parsed inbounds with
+    // synthetic refs.
+    let Some(message) = update.message else {
+        return noop_parsed_inbound(event_id);
     };
+
+    // `message.from` is optional in the Telegram schema (anonymous group
+    // admins, channel-style updates that slipped through). Without it we
+    // can't build a real `ExternalActorRef`; return a synthetic-ref NoOp
+    // so the webhook acks 200 OK rather than triggering retries.
+    if message.from.is_none() {
+        return noop_parsed_inbound(event_id);
+    }
 
     let chat_kind = TelegramChatKind::from_str(message.chat.kind.as_str());
     let trigger_outcome = classify_trigger(&message, chat_kind, group_trigger_policy);
     let Some(trigger) = trigger_outcome else {
-        return Ok(TelegramParsedInbound::NoOp);
+        // Ambient group message / unsupported chat kind. We have the
+        // message context so the NoOp gets real refs.
+        let actor_ref = build_actor_ref(message.from.as_ref())?;
+        let conversation_ref = build_conversation_ref(&message)?;
+        return ParsedProductInbound::new(
+            event_id,
+            actor_ref,
+            conversation_ref,
+            ProductInboundPayload::NoOp,
+        )
+        .map_err(adapter_error_to_payload_error);
     };
 
-    let event_id = build_event_id(installation_id, update_id)?;
     let actor_ref = build_actor_ref(message.from.as_ref())?;
     let conversation_ref = build_conversation_ref(&message)?;
-    let received_at = telegram_date_to_utc(message.date);
-
     let payload = build_payload(message, trigger, group_trigger_policy)?;
 
-    let envelope = ProductInboundEnvelope {
-        adapter_id: adapter_id.clone(),
-        installation_id: installation_id.clone(),
-        external_event_id: event_id,
-        external_actor_ref: actor_ref,
-        external_conversation_ref: conversation_ref,
-        auth_claim,
-        received_at,
-        payload,
-    };
-    Ok(TelegramParsedInbound::Envelope(Box::new(envelope)))
+    ParsedProductInbound::new(event_id, actor_ref, conversation_ref, payload)
+        .map_err(adapter_error_to_payload_error)
+}
+
+/// Construct a `ParsedProductInbound { payload: NoOp, .. }` with
+/// synthetic external refs for adapter-side "I can't extract real
+/// context" cases (no `message` field, no `from` field). The synthetic
+/// actor/conversation kinds are deliberate sentinels so a workflow
+/// that mistakenly tries to route a NoOp produces a recognizable
+/// signal in logs.
+fn noop_parsed_inbound(
+    event_id: ExternalEventId,
+) -> Result<ParsedProductInbound, PayloadParseError> {
+    let actor = ExternalActorRef::new("telegram_system", "noop", None::<&str>).map_err(|err| {
+        PayloadParseError::InvalidExternalRef {
+            kind: "external_actor_ref",
+            reason: err.to_string(),
+        }
+    })?;
+    let conversation = ExternalConversationRef::new(None, "noop", None::<&str>, None::<&str>)
+        .map_err(|err| PayloadParseError::InvalidExternalRef {
+            kind: "external_conversation_ref",
+            reason: err.to_string(),
+        })?;
+    ParsedProductInbound::new(event_id, actor, conversation, ProductInboundPayload::NoOp)
+        .map_err(adapter_error_to_payload_error)
+}
+
+fn adapter_error_to_payload_error(err: ProductAdapterError) -> PayloadParseError {
+    // Surface the renderable message; the underlying error variants are
+    // already host-redacted by `ProductAdapterError`.
+    PayloadParseError::InvalidJson {
+        reason: err.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +203,11 @@ fn classify_trigger(
     policy: &GroupTriggerPolicy,
 ) -> Option<ProductTriggerReason> {
     if chat_kind == TelegramChatKind::Private {
+        // The `trigger` reflects WHY a message was forwarded; for private
+        // chats that's always `DirectChat`. Whether the message ALSO
+        // contains a `/command` entity is a payload-shape decision made
+        // by `build_payload` independently — see Copilot's review note
+        // on the trigger/payload decoupling.
         return Some(ProductTriggerReason::DirectChat);
     }
 
@@ -185,25 +236,41 @@ fn classify_trigger(
     None
 }
 
+/// Iterate every `(text, entities)` window on a Telegram message in the
+/// order Telegram delivers them: first the message `text+entities`, then
+/// the `caption+caption_entities` for media messages. Yields nothing for
+/// either side when its companion field is missing — the offsets in
+/// `entities` are bound to `text` and similarly for `caption_entities`
+/// against `caption`, so the pair is meaningless apart.
+fn text_entity_windows(
+    message: &TelegramMessage,
+) -> impl Iterator<Item = (&str, &[MessageEntity])> {
+    let text_window = message
+        .text
+        .as_deref()
+        .zip(message.entities.as_deref().map(|e| e as &[_]));
+    let caption_window = message
+        .caption
+        .as_deref()
+        .zip(message.caption_entities.as_deref().map(|e| e as &[_]));
+    text_window.into_iter().chain(caption_window)
+}
+
 fn has_bot_mention(message: &TelegramMessage, policy: &GroupTriggerPolicy) -> bool {
-    let Some(text) = message.text.as_deref() else {
-        return false;
-    };
-    let Some(entities) = message.entities.as_deref() else {
-        return false;
-    };
     let target_lower = policy.bot_username.to_ascii_lowercase();
-    for entity in entities {
-        if entity.entity_type != "mention" {
-            continue;
-        }
-        let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
-            continue;
-        };
-        // Mentions look like `@botname`. Strip the `@`.
-        let trimmed = slice.strip_prefix('@').unwrap_or(slice);
-        if trimmed.eq_ignore_ascii_case(&target_lower) {
-            return true;
+    for (text, entities) in text_entity_windows(message) {
+        for entity in entities {
+            if entity.entity_type != "mention" {
+                continue;
+            }
+            let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
+                continue;
+            };
+            // Mentions look like `@botname`. Strip the `@`.
+            let trimmed = slice.strip_prefix('@').unwrap_or(slice);
+            if trimmed.eq_ignore_ascii_case(&target_lower) {
+                return true;
+            }
         }
     }
     false
@@ -220,36 +287,32 @@ fn reply_to_bot(message: &TelegramMessage, bot_user_id: i64) -> bool {
 }
 
 fn recognized_bot_command(message: &TelegramMessage, policy: &GroupTriggerPolicy) -> bool {
-    let Some(text) = message.text.as_deref() else {
-        return false;
-    };
-    let Some(entities) = message.entities.as_deref() else {
-        return false;
-    };
-    for entity in entities {
-        if entity.entity_type != "bot_command" {
-            continue;
-        }
-        let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
-            continue;
-        };
-        let raw = slice.strip_prefix('/').unwrap_or(slice);
-        let cmd = match raw.split_once('@') {
-            Some((cmd, target)) => {
-                if !target.eq_ignore_ascii_case(&policy.bot_username) {
-                    continue;
-                }
-                cmd
+    for (text, entities) in text_entity_windows(message) {
+        for entity in entities {
+            if entity.entity_type != "bot_command" {
+                continue;
             }
-            None => raw,
-        };
-        let cmd_lower = cmd.to_ascii_lowercase();
-        if policy
-            .recognized_commands
-            .iter()
-            .any(|recognized| recognized.to_ascii_lowercase() == cmd_lower)
-        {
-            return true;
+            let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
+                continue;
+            };
+            let raw = slice.strip_prefix('/').unwrap_or(slice);
+            let cmd = match raw.split_once('@') {
+                Some((cmd, target)) => {
+                    if !target.eq_ignore_ascii_case(&policy.bot_username) {
+                        continue;
+                    }
+                    cmd
+                }
+                None => raw,
+            };
+            let cmd_lower = cmd.to_ascii_lowercase();
+            if policy
+                .recognized_commands
+                .iter()
+                .any(|recognized| recognized.to_ascii_lowercase() == cmd_lower)
+            {
+                return true;
+            }
         }
     }
     false
@@ -428,15 +491,31 @@ fn build_payload(
     trigger: ProductTriggerReason,
     policy: &GroupTriggerPolicy,
 ) -> Result<ProductInboundPayload, PayloadParseError> {
-    // Bot command path produces a Command payload. Otherwise UserMessage.
-    if trigger == ProductTriggerReason::BotCommand
-        && let Some((command, arguments)) = extract_first_bot_command(&message, policy)
-    {
-        let command_payload = InboundCommandPayload {
-            command,
-            arguments,
-            trigger,
-        };
+    // Emit `Command` whenever the message carries a recognized
+    // `bot_command` entity, regardless of why the message was forwarded.
+    // The `trigger` field still records the forwarding reason
+    // (DirectChat for DMs, BotMention/ReplyToBot for groups, etc.), but
+    // the payload kind is determined by whether a command entity is
+    // actually present. Previously this branch gated on
+    // `trigger == BotCommand` and silently downgraded `/help` to
+    // `UserMessage` in private chats and in mention-triggered group
+    // messages that also contained a `/command`.
+    if let Some((command, arguments)) = extract_first_bot_command(&message, policy) {
+        // Route through `InboundCommandPayload::new` so the shared
+        // `ironclaw_product_adapters` validation fires on the
+        // untrusted Telegram text: command-token shape and byte limit,
+        // arguments byte limit, control-character rejection. A struct
+        // literal here would bypass those checks and let oversized or
+        // NUL/control-containing arguments cross into the trusted
+        // inbound envelope. Mirrors the `UserMessagePayload::new` call
+        // shape below for the user-message arm.
+        let command_payload =
+            InboundCommandPayload::new(command, arguments, trigger).map_err(|err| {
+                PayloadParseError::InvalidExternalRef {
+                    kind: "inbound_command_payload",
+                    reason: err.to_string(),
+                }
+            })?;
         return Ok(ProductInboundPayload::Command(command_payload));
     }
 
@@ -460,37 +539,44 @@ fn extract_first_bot_command(
     message: &TelegramMessage,
     policy: &GroupTriggerPolicy,
 ) -> Option<(String, String)> {
-    let text = message.text.as_deref()?;
-    let entities = message.entities.as_deref()?;
-    for entity in entities {
-        if entity.entity_type != "bot_command" {
-            continue;
-        }
-        let slice = slice_text_by_offset(text, entity.offset, entity.length)?;
-        let trimmed = slice.strip_prefix('/').unwrap_or(slice);
-        let cmd_only = match trimmed.split_once('@') {
-            Some((cmd, target)) => {
-                if !target.eq_ignore_ascii_case(&policy.bot_username) {
-                    continue;
-                }
-                cmd
+    // Consult both `text+entities` and `caption+caption_entities` so a
+    // recognized `/command` in a media-message caption is extracted
+    // correctly. The first matching command in `text` wins; otherwise
+    // the first matching command in `caption` wins. Offsets in each
+    // entities list are bound to their companion string.
+    for (text, entities) in text_entity_windows(message) {
+        for entity in entities {
+            if entity.entity_type != "bot_command" {
+                continue;
             }
-            None => trimmed,
-        };
-        let cmd_lower = cmd_only.to_ascii_lowercase();
-        if !policy
-            .recognized_commands
-            .iter()
-            .any(|c| c.to_ascii_lowercase() == cmd_lower)
-        {
-            continue;
+            let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
+                continue;
+            };
+            let trimmed = slice.strip_prefix('/').unwrap_or(slice);
+            let cmd_only = match trimmed.split_once('@') {
+                Some((cmd, target)) => {
+                    if !target.eq_ignore_ascii_case(&policy.bot_username) {
+                        continue;
+                    }
+                    cmd
+                }
+                None => trimmed,
+            };
+            let cmd_lower = cmd_only.to_ascii_lowercase();
+            if !policy
+                .recognized_commands
+                .iter()
+                .any(|c| c.to_ascii_lowercase() == cmd_lower)
+            {
+                continue;
+            }
+            let after_offset = entity.offset + entity.length;
+            let arguments = slice_text_to_end(text, after_offset)
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            return Some((cmd_lower, arguments));
         }
-        let after_offset = entity.offset + entity.length;
-        let arguments = slice_text_to_end(text, after_offset)
-            .unwrap_or("")
-            .trim_start()
-            .to_string();
-        return Some((cmd_lower, arguments));
     }
     None
 }
@@ -590,10 +676,6 @@ fn make_attachment(
     )
 }
 
-fn telegram_date_to_utc(date: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(date, 0).single().unwrap_or_else(Utc::now)
-}
-
 // ---------------------------------------------------------------------------
 // Telegram payload deserialization shapes (only the fields we read).
 // ---------------------------------------------------------------------------
@@ -618,13 +700,19 @@ struct TelegramMessage {
     from: Option<TelegramUser>,
     chat: TelegramChat,
     #[serde(default)]
-    date: i64,
-    #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     caption: Option<String>,
     #[serde(default)]
     entities: Option<Vec<MessageEntity>>,
+    /// `caption_entities` mirrors `entities` for media messages whose
+    /// human-readable text lives in `caption` rather than `text`
+    /// (photos, documents, videos, ...). Mentions and `bot_command`
+    /// entities can appear here too; trigger detection must consult
+    /// both `(text, entities)` and `(caption, caption_entities)` or
+    /// it silently NoOps media messages that should fire.
+    #[serde(default)]
+    caption_entities: Option<Vec<MessageEntity>>,
     #[serde(default)]
     reply_to_message: Option<Box<TelegramMessage>>,
     #[serde(default)]
@@ -734,6 +822,7 @@ fn _suppress_unused_field_warnings(update: &TelegramUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_product_adapters::ProductAdapterId;
     use ironclaw_product_adapters::auth::mark_shared_secret_header_verified;
 
     fn evidence() -> ProtocolAuthEvidence {
@@ -743,6 +832,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn adapter_id() -> ProductAdapterId {
         ProductAdapterId::new("telegram_v2").expect("valid")
     }
@@ -762,12 +852,295 @@ mod tests {
     #[test]
     fn unauthenticated_payload_fails_closed() {
         let payload = br#"{"update_id":1}"#;
-        let evidence = ProtocolAuthEvidence::Failed {
-            failure: ironclaw_product_adapters::ProtocolAuthFailure::SharedSecretMismatch,
-        };
-        let err = parse_telegram_update(payload, evidence, &adapter_id(), &install_id(), &policy())
+        // `ProtocolAuthEvidence` is now a sealed struct, not an enum;
+        // `failed(failure)` constructs an unverified evidence.
+        let evidence = ProtocolAuthEvidence::failed(
+            ironclaw_product_adapters::ProtocolAuthFailure::SharedSecretMismatch,
+        );
+        let err = parse_telegram_update(payload, &evidence, &install_id(), &policy())
             .expect_err("unauthenticated must error");
         assert!(matches!(err, PayloadParseError::UnauthenticatedPayload));
+    }
+
+    #[test]
+    fn private_chat_recognized_bot_command_emits_command_payload() {
+        // Henry's review (PR #3354) + Copilot's payload.rs:469 finding:
+        // `/help` in a DM was previously downgraded to `UserMessage`
+        // because the old `build_payload` gated `Command` emission on
+        // `trigger == BotCommand`, and private chats always returned
+        // `DirectChat`. The fix decouples them: payload kind is decided
+        // by whether a recognized `bot_command` entity exists; the
+        // trigger keeps its forwarding-reason semantics (DirectChat for
+        // DMs).
+        let payload = br#"{
+            "update_id": 110,
+            "message": {
+                "message_id": 11,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice", "username": "alice"},
+                "chat": {"id": 777, "type": "private"},
+                "text": "/help",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 5}]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
+            ProductInboundPayload::Command(cmd) => {
+                assert_eq!(cmd.command, "help");
+                assert_eq!(cmd.arguments, "");
+                // Trigger reflects WHY the message was forwarded
+                // (it's a DM); command-ness is captured in the payload
+                // variant, not the trigger.
+                assert_eq!(cmd.trigger, ProductTriggerReason::DirectChat);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_mention_with_bot_command_emits_command_payload() {
+        // Copilot's payload.rs:469 finding: a `/command` inside a
+        // mention-triggered group message previously emitted
+        // `UserMessage` because `build_payload` only produced `Command`
+        // when `trigger == BotCommand` — but in groups the mention
+        // check fires first and sets `trigger = BotMention`. The
+        // decoupled `build_payload` now produces `Command` whenever a
+        // recognized command is present, and the trigger preserves
+        // the BotMention forwarding reason.
+        let payload = br#"{
+            "update_id": 220,
+            "message": {
+                "message_id": 12,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": -42, "type": "supergroup"},
+                "text": "@ironclaw_bot /help",
+                "entities": [
+                    {"type": "mention", "offset": 0, "length": 13},
+                    {"type": "bot_command", "offset": 14, "length": 5}
+                ]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
+            ProductInboundPayload::Command(cmd) => {
+                assert_eq!(cmd.command, "help");
+                assert_eq!(cmd.trigger, ProductTriggerReason::BotMention);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn private_chat_unknown_command_still_classifies_as_direct_chat() {
+        // Defense-in-depth for the fix above: an UNRECOGNIZED command
+        // (`/nope` is not in the policy's `recognized_commands`) must
+        // still fall through to `DirectChat`, not silently become a
+        // `Command` for a command the adapter doesn't know about.
+        let payload = br#"{
+            "update_id": 111,
+            "message": {
+                "message_id": 12,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": 777, "type": "private"},
+                "text": "/nope",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 5}]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
+            ProductInboundPayload::UserMessage(user) => {
+                assert_eq!(user.trigger, ProductTriggerReason::DirectChat);
+            }
+            other => panic!("expected UserMessage with DirectChat trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_arguments_with_control_char_rejected_via_shared_validation() {
+        // Henry's review (PR #3354, 2026-05-12T18:59:39Z) — Critical:
+        // `build_payload` previously constructed `InboundCommandPayload`
+        // with a struct literal, bypassing `InboundCommandPayload::new`
+        // and the shared `ironclaw_product_adapters` validation
+        // (token shape, byte limits, control-char rejection). Untrusted
+        // Telegram webhook text could carry control characters into
+        // the trusted inbound envelope.
+        //
+        // Asserts the validation now fires: a `/help` with a U+0001
+        // control character in the argument text must be rejected with
+        // `InvalidExternalRef { kind: "inbound_command_payload" }`,
+        // mirroring how the user-message arm reports its own
+        // validation failures.
+        //
+        // The control char is embedded via JSON's `` escape so
+        // the raw bytes the JSON parser produces include a literal
+        // control character.
+        let payload = br#"{
+            "update_id": 250,
+            "message": {
+                "message_id": 16,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": 777, "type": "private"},
+                "text": "/help \u0001oops",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 5}]
+            }
+        }"#;
+        let err = parse_telegram_update(payload, &evidence(), &install_id(), &policy())
+            .expect_err("control-character arguments must be rejected");
+        match err {
+            PayloadParseError::InvalidExternalRef { kind, reason } => {
+                assert_eq!(kind, "inbound_command_payload");
+                // `MalformedInboundPayload` carries a `RedactedString`,
+                // so its Display surface is the redaction marker, not
+                // the raw failure detail (security contract). Asserting
+                // on `<redacted>` proves the shared validator was
+                // reached AND its redaction is intact — a regression
+                // that leaked the control-char-bearing content into
+                // the error message would fail this assertion.
+                assert!(
+                    reason.contains("<redacted>"),
+                    "rejection reason must be redacted (control-char content must not leak); got {reason}",
+                );
+            }
+            other => {
+                panic!("expected InvalidExternalRef{{kind:inbound_command_payload}}, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn command_arguments_exceeding_byte_limit_rejected_via_shared_validation() {
+        // Defense-in-depth for the same fix: synthesize a command with
+        // arguments larger than `COMMAND_ARGUMENTS_MAX_BYTES` (64 KiB
+        // per `ironclaw_product_adapters::inbound`) and assert the
+        // shared validator rejects it through `InboundCommandPayload::new`.
+        // 70_000 bytes is comfortably over the 64 * 1024 = 65_536 limit.
+        let oversized = "a".repeat(70_000);
+        let payload = format!(
+            r#"{{
+                "update_id": 251,
+                "message": {{
+                    "message_id": 17,
+                    "date": 1700000000,
+                    "from": {{"id": 777, "is_bot": false, "first_name": "Alice"}},
+                    "chat": {{"id": 777, "type": "private"}},
+                    "text": "/help {oversized}",
+                    "entities": [{{"type": "bot_command", "offset": 0, "length": 5}}]
+                }}
+            }}"#
+        );
+        let err = parse_telegram_update(payload.as_bytes(), &evidence(), &install_id(), &policy())
+            .expect_err("oversized arguments must be rejected");
+        match err {
+            PayloadParseError::InvalidExternalRef { kind, reason } => {
+                assert_eq!(kind, "inbound_command_payload");
+                // Same redaction contract as the control-char test
+                // above. The 70_000-byte payload must not leak into
+                // the error message.
+                assert!(
+                    reason.contains("<redacted>"),
+                    "rejection reason must be redacted (oversized content must not leak); got {reason}",
+                );
+            }
+            other => {
+                panic!("expected InvalidExternalRef{{kind:inbound_command_payload}}, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn group_media_caption_mention_is_recognized_as_bot_mention() {
+        // Copilot's payload.rs:222 finding: trigger detection previously
+        // consulted only `text + entities`. A photo with caption
+        // `@ironclaw_bot help` carries its mention in
+        // `caption_entities`, so `classify_trigger` returned None and
+        // the update was silently NoOp'd. The fix consults both text-
+        // and caption-anchored entity lists.
+        let payload = br#"{
+            "update_id": 230,
+            "message": {
+                "message_id": 13,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": -42, "type": "supergroup"},
+                "photo": [
+                    {"file_id": "AAAA", "file_unique_id": "u1", "width": 100, "height": 100, "file_size": 500}
+                ],
+                "caption": "@ironclaw_bot please look",
+                "caption_entities": [{"type": "mention", "offset": 0, "length": 13}]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
+            ProductInboundPayload::UserMessage(user) => {
+                assert_eq!(user.trigger, ProductTriggerReason::BotMention);
+            }
+            other => panic!("expected UserMessage with BotMention trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_media_caption_bot_command_emits_command_payload() {
+        // Caption-anchored `/help` must reach the Command path too.
+        let payload = br#"{
+            "update_id": 231,
+            "message": {
+                "message_id": 14,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": -42, "type": "supergroup"},
+                "photo": [
+                    {"file_id": "BBBB", "file_unique_id": "u2", "width": 100, "height": 100, "file_size": 500}
+                ],
+                "caption": "/help on this photo",
+                "caption_entities": [{"type": "bot_command", "offset": 0, "length": 5}]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
+            ProductInboundPayload::Command(cmd) => {
+                assert_eq!(cmd.command, "help");
+                assert_eq!(cmd.trigger, ProductTriggerReason::BotCommand);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_without_from_classifies_as_noop_not_error() {
+        // Copilot's payload.rs:419 finding: `message.from` is optional
+        // in the Telegram schema (anonymous group admins, channel
+        // posts that slipped through the kind filter, etc.). Returning
+        // a hard `PayloadParseError` would force the webhook to retry
+        // an otherwise-parseable update. The fail-soft path is `NoOp`
+        // — the webhook acks 200 OK and Telegram does not retry.
+        let payload = br#"{
+            "update_id": 240,
+            "message": {
+                "message_id": 15,
+                "date": 1700000000,
+                "chat": {"id": -42, "type": "supergroup"},
+                "text": "anonymous admin message"
+            }
+        }"#;
+        let parsed = parse_telegram_update(payload, &evidence(), &install_id(), &policy())
+            .expect("parse must not hard-error on missing `from`");
+        assert!(
+            matches!(parsed.payload, ProductInboundPayload::NoOp),
+            "missing `from` must fail-soft to NoOp, got {parsed:?}"
+        );
     }
 
     #[test]
@@ -783,11 +1156,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         assert_eq!(envelope.external_event_id.as_str(), "tg-install_alpha-100");
         assert_eq!(envelope.external_actor_ref.id(), "777");
         assert_eq!(envelope.external_conversation_ref.conversation_id(), "777");
@@ -817,9 +1187,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
@@ -836,11 +1205,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.trigger, ProductTriggerReason::BotMention);
@@ -870,11 +1236,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.trigger, ProductTriggerReason::ReplyToBot);
@@ -897,11 +1260,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         match envelope.payload {
             ProductInboundPayload::Command(cmd) => {
                 assert_eq!(cmd.command, "help");
@@ -927,9 +1287,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
@@ -947,11 +1306,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         assert_eq!(
             envelope.external_conversation_ref.topic_id(),
             Some("7"),
@@ -975,17 +1331,9 @@ mod tests {
                 "entities": [{"type": "mention", "offset": 0, "length": 13}]
             }
         }"#;
-        let parsed2 = parse_telegram_update(
-            payload2,
-            evidence(),
-            &adapter_id(),
-            &install_id(),
-            &policy(),
-        )
-        .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope2) = parsed2 else {
-            panic!("expected envelope");
-        };
+        let parsed2 =
+            parse_telegram_update(payload2, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope2 = parsed2;
         assert_eq!(
             envelope
                 .external_conversation_ref
@@ -1020,11 +1368,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.attachments.len(), 1);
@@ -1050,9 +1395,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
@@ -1068,17 +1412,15 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
     fn malformed_json_is_invalid_json_error() {
         let payload = b"this is not json";
-        let err =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect_err("malformed");
+        let err = parse_telegram_update(payload, &evidence(), &install_id(), &policy())
+            .expect_err("malformed");
         assert!(matches!(err, PayloadParseError::InvalidJson { .. }));
     }
 }

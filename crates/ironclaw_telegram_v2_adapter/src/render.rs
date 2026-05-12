@@ -5,11 +5,9 @@
 //! adapter's egress credential handle (the host resolves it to the bot
 //! token at request time).
 
-use std::collections::BTreeMap;
-
 use ironclaw_product_adapters::{
-    DeclaredEgressHost, EgressCredentialHandle, EgressRequest, FinalReplyView, ProgressKind,
-    ProgressUpdateView,
+    DeclaredEgressHost, EgressCredentialHandle, EgressHeader, EgressMethod, EgressPath,
+    EgressRequest, FinalReplyView, ProgressKind, ProgressUpdateView,
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 use thiserror::Error;
@@ -81,6 +79,17 @@ pub fn parse_reply_target(
             }
         })?)
     };
+    // Copilot's review: reject any reply target with more than three
+    // colon-separated segments after the `tg:` prefix. The encoding is
+    // exactly `tg:<chat_id>:<topic_id>:<reply_message_id>`; silently
+    // ignoring trailing segments (`tg:1:_:2:extra`) would let corrupted
+    // data pass parse and make the encoding ambiguous.
+    if segments.next().is_some() {
+        return Err(TelegramRenderError::InvalidReplyTarget {
+            target: raw.to_string(),
+            reason: "extra segments after reply_message_id".into(),
+        });
+    }
     Ok(TelegramReplyTarget {
         chat_id: chat_id_num,
         topic_id,
@@ -138,17 +147,11 @@ pub fn render_final_reply(
     let body_bytes =
         serde_json::to_vec(&serde_json::Value::Object(body)).expect("body serializes to JSON"); // safety: body is a serde_json::Value::Object built from owned Strings/Numbers; serialization cannot fail
 
-    let mut headers = BTreeMap::new();
-    headers.insert("content-type".to_string(), "application/json".to_string());
-
-    Ok(EgressRequest {
-        host: DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"), // safety: TELEGRAM_API_HOST is a compile-time const that satisfies the host validator
-        method: "POST".into(),
-        path: "/sendMessage".into(),
-        headers,
-        body: body_bytes,
-        credential_handle: Some(credential_handle),
-    })
+    Ok(build_egress_request(
+        "/sendMessage",
+        body_bytes,
+        credential_handle,
+    ))
 }
 
 /// Render a `ProgressUpdateView` (typing indicator) into a
@@ -177,17 +180,31 @@ pub fn render_progress_typing(
     let body_bytes =
         serde_json::to_vec(&serde_json::Value::Object(body)).expect("progress body serializes"); // safety: progress body is a serde_json::Value::Object built from owned scalars; serialization cannot fail
 
-    let mut headers = BTreeMap::new();
-    headers.insert("content-type".to_string(), "application/json".to_string());
+    Ok(Some(build_egress_request(
+        "/sendChatAction",
+        body_bytes,
+        credential_handle,
+    )))
+}
 
-    Ok(Some(EgressRequest {
-        host: DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"), // safety: TELEGRAM_API_HOST is a compile-time const that satisfies the host validator
-        method: "POST".into(),
-        path: "/sendChatAction".into(),
-        headers,
-        body: body_bytes,
-        credential_handle: Some(credential_handle),
-    }))
+/// Build a Telegram Bot API egress request via the
+/// `ironclaw_product_adapters::EgressRequest` builder. All Telegram
+/// outbound requests target `api.telegram.org`, are POST, and carry an
+/// `application/json` body.
+fn build_egress_request(
+    path: &'static str,
+    body: Vec<u8>,
+    credential_handle: EgressCredentialHandle,
+) -> EgressRequest {
+    let host = DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"); // safety: TELEGRAM_API_HOST is a compile-time const that satisfies the host validator
+    let method = EgressMethod::post();
+    let egress_path = EgressPath::new(path).expect("static path valid"); // safety: only `/sendMessage` / `/sendChatAction` are passed here, both static
+    let content_type =
+        EgressHeader::new("content-type", "application/json").expect("static header valid"); // safety: static name/value satisfies the header validator
+    EgressRequest::new(host, method, egress_path)
+        .with_header(content_type)
+        .with_body(body)
+        .with_credential_handle(Some(credential_handle))
 }
 
 #[cfg(test)]
@@ -223,16 +240,19 @@ mod tests {
             generated_at: Utc::now(),
         };
         let request = render_final_reply(&target, &view, handle()).expect("render");
-        assert_eq!(request.host.as_str(), TELEGRAM_API_HOST);
-        assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/sendMessage");
-        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("body json");
+        assert_eq!(request.host().as_str(), TELEGRAM_API_HOST);
+        assert_eq!(request.method().as_str(), "POST");
+        assert_eq!(request.path().as_str(), "/sendMessage");
+        let body: serde_json::Value = serde_json::from_slice(request.body()).expect("body json");
         assert_eq!(body["chat_id"], -100);
         assert_eq!(body["text"], "hello!");
         assert_eq!(body["message_thread_id"], 7);
         assert_eq!(body["reply_to_message_id"], 42);
         assert_eq!(
-            request.credential_handle.unwrap().as_str(),
+            request
+                .credential_handle()
+                .expect("handle present")
+                .as_str(),
             "telegram_bot_token"
         );
     }
@@ -248,8 +268,8 @@ mod tests {
         let request = render_progress_typing(&target, &view, handle())
             .expect("render")
             .expect("typing produces request");
-        assert_eq!(request.path, "/sendChatAction");
-        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("body json");
+        assert_eq!(request.path().as_str(), "/sendChatAction");
+        let body: serde_json::Value = serde_json::from_slice(request.body()).expect("body json");
         assert_eq!(body["chat_id"], -100);
         assert_eq!(body["action"], "typing");
     }
