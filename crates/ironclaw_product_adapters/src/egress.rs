@@ -270,6 +270,8 @@ fn validate_header_name(name: &str) -> Result<(), ProductAdapterError> {
         "proxy-authorization",
         "cookie",
         "set-cookie",
+        "forwarded",
+        "x-forwarded-for",
         "x-forwarded-host",
         "x-forwarded-proto",
         "x-real-ip",
@@ -489,6 +491,63 @@ mod tests {
         assert!(EgressMethod::new("CONNECT").is_err());
         assert!(EgressPath::new("//metadata").is_err());
         assert!(EgressHeader::new("Authorization", "secret").is_err());
+    }
+
+    #[test]
+    fn egress_path_rejects_url_and_header_injection_shapes() {
+        for path in [
+            "http://metadata.local/latest",
+            "https://api.example.com/send",
+            "//metadata",
+            "/path#fragment",
+            "/redirect/http://metadata.local/latest",
+            "/windows\\path",
+            "/line\nbreak",
+            "/carriage\rreturn",
+            "/nul\0byte",
+        ] {
+            let res = EgressPath::new(path);
+            assert!(
+                res.is_err(),
+                "{path:?} must not be accepted as an origin-form egress path"
+            );
+        }
+
+        assert!(EgressPath::new("/v1/messages?chat_id=42").is_ok());
+    }
+
+    #[test]
+    fn egress_header_rejects_host_identity_and_proxy_metadata_headers() {
+        for header in [
+            "host",
+            "Host",
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+            "forwarded",
+            "x-forwarded-for",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-real-ip",
+        ] {
+            let res = EgressHeader::new(header, "anything");
+            assert!(
+                res.is_err(),
+                "{header} must be rejected because identity/proxy metadata is host-managed",
+            );
+        }
+    }
+
+    #[test]
+    fn egress_header_rejects_invalid_header_name_syntax() {
+        for header in ["", "Bad Header", "X:Bad", "X/Bad", "X.Bad", "X\r\nInjected"] {
+            let res = EgressHeader::new(header, "anything");
+            assert!(
+                res.is_err(),
+                "{header:?} must be rejected as an invalid header name token"
+            );
+        }
     }
 
     #[test]

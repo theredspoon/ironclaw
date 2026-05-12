@@ -377,6 +377,32 @@ mod tests {
     }
 
     #[test]
+    fn hmac_verifier_rejects_missing_signature_header() {
+        let secret = b"super-shared-secret".to_vec();
+        let headers = header_map(&[("X-Slack-Request-Timestamp", "1234567890")]);
+        let verifier = verifier_at(1_234_567_900, 60, secret);
+        match verifier.verify(&headers, b"{}") {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Missing));
+            }
+            other => panic!("expected Failed(Missing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmac_verifier_rejects_missing_timestamp_header() {
+        let secret = b"super-shared-secret".to_vec();
+        let headers = header_map(&[("X-Slack-Signature", "v0=abc")]);
+        let verifier = verifier_at(1_234_567_900, 60, secret);
+        match verifier.verify(&headers, b"{}") {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Missing));
+            }
+            other => panic!("expected Failed(Missing), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn hmac_verifier_accepts_canonical_signature_within_window() {
         let secret = b"super-shared-secret".to_vec();
         let timestamp = "1234567890";
