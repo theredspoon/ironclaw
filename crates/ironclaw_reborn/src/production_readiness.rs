@@ -11,7 +11,7 @@ use ironclaw_turns::{
 };
 
 use crate::driver_registry::{
-    ConfiguredRunProfile, DriverReadinessInputs, DriverReadinessMode, DriverRegistry,
+    ConfiguredRunProfile, DriverReadinessDiagnosticCode, DriverReadinessMode, DriverRegistry,
     DriverRequirements, HostGraphReadiness, LoopDriverRegistryKey, PersistedRunDriverIdentity,
     RequirementLevel,
 };
@@ -375,7 +375,9 @@ impl RebornLoopComponentGraphReadiness {
         }
     }
 
-    fn components(&self) -> [(RebornLoopProductionComponent, RebornComponentReadiness); 11] {
+    fn components(
+        &self,
+    ) -> impl Iterator<Item = (RebornLoopProductionComponent, RebornComponentReadiness)> {
         [
             (
                 RebornLoopProductionComponent::HostFactory,
@@ -419,6 +421,7 @@ impl RebornLoopComponentGraphReadiness {
                 self.progress_events,
             ),
         ]
+        .into_iter()
     }
 }
 
@@ -538,7 +541,10 @@ fn push_active_run_profile_issues(
 ) {
     for run in active_runs.iter().filter(|run| !run.status.is_terminal()) {
         let keeps_profile_version = profiles.iter().any(|profile| {
-            profile.profile_id == run.profile_id && profile.profile_version == run.profile_version
+            profile.selected
+                && profile.profile_id == run.profile_id
+                && profile.profile_version == run.profile_version
+                && profile.driver_identity == run.driver_identity
         });
         if !keeps_profile_version {
             issues.push(
@@ -561,8 +567,7 @@ fn push_driver_readiness_issues(
         .configured_profiles
         .iter()
         .filter(|profile| profile.selected)
-        .map(configured_driver_profile)
-        .collect();
+        .map(configured_driver_profile);
     let persisted_runs = inputs
         .active_runs
         .iter()
@@ -573,16 +578,13 @@ fn push_driver_readiness_issues(
                 run.status,
                 run.driver_identity.clone(),
             )
-        })
-        .collect();
+        });
 
-    let report = inputs.driver_registry.validate_readiness(
+    let report = inputs.driver_registry.validate_readiness_from_iter(
         inputs.mode.into(),
-        DriverReadinessInputs {
-            host_graph: inputs.component_graph.host_graph_for(inputs.mode),
-            configured_profiles: selected_profiles,
-            persisted_runs,
-        },
+        inputs.component_graph.host_graph_for(inputs.mode),
+        selected_profiles,
+        persisted_runs,
     );
     push_mapped_driver_issues(report, true, issues);
 }
@@ -591,21 +593,19 @@ fn push_optional_profile_issues(
     inputs: &RebornLoopProductionInputs<'_>,
     issues: &mut Vec<RebornLoopProductionIssue>,
 ) {
-    for profile in inputs
+    let optional_profiles = inputs
         .configured_profiles
         .iter()
         .filter(|profile| !profile.selected)
-    {
-        let report = inputs.driver_registry.validate_readiness(
-            inputs.mode.into(),
-            DriverReadinessInputs {
-                host_graph: inputs.component_graph.host_graph_for(inputs.mode),
-                configured_profiles: vec![configured_driver_profile(profile)],
-                persisted_runs: Vec::new(),
-            },
-        );
-        push_mapped_driver_issues(report, false, issues);
-    }
+        .map(configured_driver_profile);
+
+    let report = inputs.driver_registry.validate_readiness_from_iter(
+        inputs.mode.into(),
+        inputs.component_graph.host_graph_for(inputs.mode),
+        optional_profiles,
+        std::iter::empty::<PersistedRunDriverIdentity>(),
+    );
+    push_mapped_driver_issues(report, false, issues);
 }
 
 fn push_mapped_driver_issues(
@@ -615,29 +615,22 @@ fn push_mapped_driver_issues(
 ) {
     for diagnostic in report.diagnostics {
         let (component, kind) = match diagnostic.code {
-            "missing_configured_driver" => (
+            DriverReadinessDiagnosticCode::MissingConfiguredDriver => (
                 RebornLoopProductionComponent::LoopDriver,
                 RebornLoopProductionIssueKind::Missing,
             ),
-            "missing_non_terminal_run_driver" => (
+            DriverReadinessDiagnosticCode::MissingNonTerminalRunDriver => (
                 RebornLoopProductionComponent::LoopDriver,
                 RebornLoopProductionIssueKind::ActiveRunsRequireVersion,
             ),
-            "reference_driver_not_production_ready" => (
+            DriverReadinessDiagnosticCode::ReferenceDriverNotProductionReady
+            | DriverReadinessDiagnosticCode::ReferenceDriverAllowedForLocalDev => (
                 RebornLoopProductionComponent::LoopDriver,
                 RebornLoopProductionIssueKind::TestOnlyImplementation,
             ),
-            "reference_driver_allowed_for_local_dev" => (
-                RebornLoopProductionComponent::LoopDriver,
-                RebornLoopProductionIssueKind::TestOnlyImplementation,
-            ),
-            "missing_required_driver_requirement" => (
+            DriverReadinessDiagnosticCode::MissingRequiredDriverRequirement => (
                 RebornLoopProductionComponent::RunProfile,
                 RebornLoopProductionIssueKind::Missing,
-            ),
-            _ => (
-                RebornLoopProductionComponent::RunProfile,
-                RebornLoopProductionIssueKind::PolicyDenied,
             ),
         };
         let blocks_ready = keep_blocking && diagnostic.blocks_ready;

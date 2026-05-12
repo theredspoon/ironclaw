@@ -242,6 +242,34 @@ fn production_readiness_rejects_removed_profile_version_with_active_runs() {
 }
 
 #[test]
+fn production_readiness_rejects_active_run_driver_identity_mismatch() {
+    let mut registry = DriverRegistry::new();
+    let configured_key = register_driver(&mut registry, "text_loop_v2", DriverKind::Production);
+    let active_run_key = register_driver(&mut registry, "text_loop_v1", DriverKind::Production);
+    let active_run = RebornActiveRunIdentity::new(
+        "run-active-1",
+        TurnStatus::Running,
+        RunProfileId::new("interactive_default").expect("valid profile id"),
+        RunProfileVersion::new(1),
+        active_run_key,
+    );
+
+    let report = validate_reborn_loop_production_readiness(RebornLoopProductionInputs {
+        mode: RebornLoopReadinessMode::Production,
+        driver_registry: &registry,
+        component_graph: RebornLoopComponentGraphReadiness::production_verified(),
+        configured_profiles: vec![selected_profile(configured_key)],
+        active_runs: vec![active_run],
+    });
+
+    assert_eq!(report.status, RebornLoopProductionStatus::NotReady);
+    assert!(report.contains(
+        RebornLoopProductionComponent::RunProfile,
+        RebornLoopProductionIssueKind::ActiveRunsRequireVersion
+    ));
+}
+
+#[test]
 fn optional_profile_unavailable_does_not_block_startup() {
     let mut registry = DriverRegistry::new();
     let key = register_driver(&mut registry, "text_loop", DriverKind::Production);
