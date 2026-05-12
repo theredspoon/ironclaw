@@ -1179,6 +1179,85 @@ fn telegram_default_capabilities_pin_first_slice_behavior() {
 }
 
 // ---------------------------------------------------------------------------
+// Outbound render error mapping: malformed reply targets surface as
+// `InvalidIdentifier`, not the generic `Internal`, matching how
+// `parse_inbound` reports malformed external refs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn final_reply_with_invalid_reply_target_returns_invalid_identifier() {
+    let adapter = TelegramV2Adapter::new(config());
+    let egress = FakeProtocolHttpEgress::new(["api.telegram.org".to_string()]);
+    egress.allow_credential_handle(TELEGRAM_BOT_TOKEN_HANDLE);
+    // A `ReplyTargetBindingRef` that the constructor accepts but
+    // `parse_reply_target` (inside `render_final_reply`) cannot parse —
+    // missing the `tg:` prefix the renderer expects.
+    let bogus_target = ReplyTargetBindingRef::new("not-tg-format").expect("ref ctor accepts");
+    let envelope = ProductOutboundEnvelope {
+        adapter_id: adapter.adapter_id().clone(),
+        installation_id: adapter.installation_id().clone(),
+        target: bogus_target,
+        projection_cursor: None,
+        payload: ProductOutboundPayload::FinalReply(FinalReplyView {
+            turn_run_id: TurnRunId::new(),
+            text: "ignored — render fails before egress".into(),
+            generated_at: chrono::Utc::now(),
+        }),
+        delivery_attempt_id: uuid::Uuid::new_v4(),
+    };
+    let err = adapter
+        .render_outbound(envelope, &egress)
+        .await
+        .expect_err("must fail with malformed reply target");
+    match err {
+        ProductAdapterError::InvalidIdentifier { kind, reason } => {
+            assert_eq!(kind, "reply_target", "kind discriminates the source seam");
+            assert!(
+                reason.contains("not-tg-format") || reason.contains("tg:"),
+                "reason carries diagnostic detail: {reason}"
+            );
+        }
+        other => panic!("expected InvalidIdentifier {{ kind: reply_target }}, got: {other:?}"),
+    }
+    // Egress must not have been called — the renderer failed before the
+    // outbound request was built.
+    assert!(egress.calls().is_empty(), "no egress call on render error");
+}
+
+#[tokio::test]
+async fn progress_with_invalid_reply_target_returns_invalid_identifier() {
+    let mut cfg = config();
+    cfg.progress_push_enabled = true;
+    let adapter = TelegramV2Adapter::new(cfg);
+    let egress = FakeProtocolHttpEgress::new(["api.telegram.org".to_string()]);
+    egress.allow_credential_handle(TELEGRAM_BOT_TOKEN_HANDLE);
+    let bogus_target = ReplyTargetBindingRef::new("not-tg-format").expect("ref ctor accepts");
+    let envelope = ProductOutboundEnvelope {
+        adapter_id: adapter.adapter_id().clone(),
+        installation_id: adapter.installation_id().clone(),
+        target: bogus_target,
+        projection_cursor: None,
+        payload: ProductOutboundPayload::Progress(ironclaw_product_adapters::ProgressUpdateView {
+            turn_run_id: TurnRunId::new(),
+            kind: ironclaw_product_adapters::ProgressKind::Typing,
+            generated_at: chrono::Utc::now(),
+        }),
+        delivery_attempt_id: uuid::Uuid::new_v4(),
+    };
+    let err = adapter
+        .render_outbound(envelope, &egress)
+        .await
+        .expect_err("must fail with malformed reply target");
+    match err {
+        ProductAdapterError::InvalidIdentifier { kind, .. } => {
+            assert_eq!(kind, "reply_target", "kind discriminates the source seam");
+        }
+        other => panic!("expected InvalidIdentifier {{ kind: reply_target }}, got: {other:?}"),
+    }
+    assert!(egress.calls().is_empty(), "no egress call on render error");
+}
+
+// ---------------------------------------------------------------------------
 // Projection subscription contract: Telegram does not consume them.
 // ---------------------------------------------------------------------------
 

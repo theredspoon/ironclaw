@@ -124,9 +124,7 @@ impl ProductAdapter for TelegramV2Adapter {
                 &view,
                 self.config.egress_credential_handle.clone(),
             )
-            .map_err(|err| ProductAdapterError::Internal {
-                detail: RedactedString::new(err.to_string()),
-            })?,
+            .map_err(map_render_error)?,
             ProductOutboundPayload::Progress(view) => {
                 if !self
                     .capabilities
@@ -143,9 +141,7 @@ impl ProductAdapter for TelegramV2Adapter {
                     &view,
                     self.config.egress_credential_handle.clone(),
                 )
-                .map_err(|err| ProductAdapterError::Internal {
-                    detail: RedactedString::new(err.to_string()),
-                })?
+                .map_err(map_render_error)?
                 else {
                     return Ok(());
                 };
@@ -179,6 +175,21 @@ impl ProductAdapter for TelegramV2Adapter {
             return Err(ProductAdapterError::EgressDenied { reason });
         }
         Ok(())
+    }
+}
+
+/// Map a `TelegramRenderError` to a `ProductAdapterError`. Malformed reply
+/// targets surface as `InvalidIdentifier` (matching how `parse_inbound`
+/// surfaces malformed inbound external refs) so callers can distinguish
+/// data-shape problems from genuine internal failures.
+fn map_render_error(err: crate::render::TelegramRenderError) -> ProductAdapterError {
+    match err {
+        crate::render::TelegramRenderError::InvalidReplyTarget { .. } => {
+            ProductAdapterError::InvalidIdentifier {
+                kind: "reply_target",
+                reason: err.to_string(),
+            }
+        }
     }
 }
 
