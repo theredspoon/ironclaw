@@ -207,7 +207,7 @@ mod libsql_e2e {
     #[tokio::test]
     #[cfg_attr(
         not(feature = "pr3180-ready"),
-        ignore = "requires PR #3180 min_score-after-normalization fix (pre-#3180 filters against pre-fusion scores ≪ 1.0); enable with --features pr3180-ready when #3180 lands"
+        ignore = "requires the min_score-after-normalization fix. Empirically (2026-05-12) #3180 as merged scores both hybrid and FTS-only documents equally (1.0/1.0) under RRF fusion even with a pinned query embedding, so the test's premise that pinned-embedding favors the hybrid doc doesn't hold against the merged substrate yet. Stays gated for a followup PR that normalizes scores so they reflect actual vector contribution."
     )]
     async fn min_score_filter_drops_results_below_threshold_under_libsql() {
         // Seed two documents — one is a hybrid hit (FTS + vector), one is FTS-only.
@@ -329,7 +329,7 @@ mod libsql_e2e {
     #[tokio::test]
     #[cfg_attr(
         not(feature = "pr3180-ready"),
-        ignore = "requires PR #3180 deterministic tiebreaker (path ascending); enable with --features pr3180-ready when #3180 lands"
+        ignore = "requires deterministic tie-breaking by path ascending. Empirically (2026-05-12) #3180 as merged orders tied results by some other key (observed [a, c, b] vs expected [a, b, c]) — likely document insertion order or row id. No `tiebreak`/`deterministic_order` symbol exists in `crates/ironclaw_memory/src/` yet. Stays gated for the followup PR that adds the path-ascending secondary sort."
     )]
     async fn search_breaks_ties_by_relative_path_ascending_under_libsql() {
         // Seed three docs with identical FTS+vector hits. PR #3180 fixes ties to

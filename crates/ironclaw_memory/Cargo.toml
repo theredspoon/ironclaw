@@ -14,13 +14,19 @@ publish = false
 default = []
 postgres = ["dep:deadpool-postgres", "dep:tokio-postgres", "dep:pgvector"]
 libsql = ["dep:libsql"]
-# Conditional gate for the test suite. Enables regression tests that
-# depend on the memory surface landing in PR #3180 (min_score-after-
-# normalization, deterministic tiebreaking, ensure_path_matches_context,
-# `.system/engine/orchestrator/*` protected paths). The dependent PR
-# must enable `pr3180-ready` in the merge commit so these tests run in
-# CI on its merge-queue branch. See `tests/e2e_*` files for the
-# specific guards each gated test pins.
+# Conditional gate for substrate-level regression tests that anticipate
+# specific guards beyond what #3180 itself delivers: min_score-after-
+# normalization, deterministic tiebreaking, `ensure_path_matches_context`
+# / `ensure_scope_matches_context` checks, and `.system/engine/
+# orchestrator/*` protected-path registration. The followup PR(s) that
+# implement these must enable `pr3180-ready` in their merge commit so
+# the gated tests run in CI on the merge-queue branch.
+#
+# Empirical note (2026-05-12): on `reborn-integration` HEAD (#3180
+# merged), enabling this feature surfaces ~7 test failures because the
+# anticipated APIs (`ensure_path_matches_context`, deterministic
+# tie-breakers, orchestrator path registration) do not exist yet. The
+# gates are accurate; the substrate just isn't there yet.
 pr3180-ready = []
 
 [dependencies]
