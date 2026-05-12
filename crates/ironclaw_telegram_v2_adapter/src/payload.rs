@@ -487,11 +487,21 @@ fn build_payload(
     // `UserMessage` in private chats and in mention-triggered group
     // messages that also contained a `/command`.
     if let Some((command, arguments)) = extract_first_bot_command(&message, policy) {
-        let command_payload = InboundCommandPayload {
-            command,
-            arguments,
-            trigger,
-        };
+        // Route through `InboundCommandPayload::new` so the shared
+        // `ironclaw_product_adapters` validation fires on the
+        // untrusted Telegram text: command-token shape and byte limit,
+        // arguments byte limit, control-character rejection. A struct
+        // literal here would bypass those checks and let oversized or
+        // NUL/control-containing arguments cross into the trusted
+        // inbound envelope. Mirrors the `UserMessagePayload::new` call
+        // shape below for the user-message arm.
+        let command_payload =
+            InboundCommandPayload::new(command, arguments, trigger).map_err(|err| {
+                PayloadParseError::InvalidExternalRef {
+                    kind: "inbound_command_payload",
+                    reason: err.to_string(),
+                }
+            })?;
         return Ok(ProductInboundPayload::Command(command_payload));
     }
 
@@ -949,6 +959,106 @@ mod tests {
                 assert_eq!(user.trigger, ProductTriggerReason::DirectChat);
             }
             other => panic!("expected UserMessage with DirectChat trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_arguments_with_control_char_rejected_via_shared_validation() {
+        // Henry's review (PR #3354, 2026-05-12T18:59:39Z) — Critical:
+        // `build_payload` previously constructed `InboundCommandPayload`
+        // with a struct literal, bypassing `InboundCommandPayload::new`
+        // and the shared `ironclaw_product_adapters` validation
+        // (token shape, byte limits, control-char rejection). Untrusted
+        // Telegram webhook text could carry control characters into
+        // the trusted inbound envelope.
+        //
+        // Asserts the validation now fires: a `/help` with a U+0001
+        // control character in the argument text must be rejected with
+        // `InvalidExternalRef { kind: "inbound_command_payload" }`,
+        // mirroring how the user-message arm reports its own
+        // validation failures.
+        //
+        // The control char is embedded via JSON's `` escape so
+        // the raw bytes the JSON parser produces include a literal
+        // control character.
+        let payload = br#"{
+            "update_id": 250,
+            "message": {
+                "message_id": 16,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": 777, "type": "private"},
+                "text": "/help \u0001oops",
+                "entities": [{"type": "bot_command", "offset": 0, "length": 5}]
+            }
+        }"#;
+        let err =
+            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
+                .expect_err("control-character arguments must be rejected");
+        match err {
+            PayloadParseError::InvalidExternalRef { kind, reason } => {
+                assert_eq!(kind, "inbound_command_payload");
+                // `MalformedInboundPayload` carries a `RedactedString`,
+                // so its Display surface is the redaction marker, not
+                // the raw failure detail (security contract). Asserting
+                // on `<redacted>` proves the shared validator was
+                // reached AND its redaction is intact — a regression
+                // that leaked the control-char-bearing content into
+                // the error message would fail this assertion.
+                assert!(
+                    reason.contains("<redacted>"),
+                    "rejection reason must be redacted (control-char content must not leak); got {reason}",
+                );
+            }
+            other => {
+                panic!("expected InvalidExternalRef{{kind:inbound_command_payload}}, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn command_arguments_exceeding_byte_limit_rejected_via_shared_validation() {
+        // Defense-in-depth for the same fix: synthesize a command with
+        // arguments larger than `COMMAND_ARGUMENTS_MAX_BYTES` (64 KiB
+        // per `ironclaw_product_adapters::inbound`) and assert the
+        // shared validator rejects it through `InboundCommandPayload::new`.
+        // 70_000 bytes is comfortably over the 64 * 1024 = 65_536 limit.
+        let oversized = "a".repeat(70_000);
+        let payload = format!(
+            r#"{{
+                "update_id": 251,
+                "message": {{
+                    "message_id": 17,
+                    "date": 1700000000,
+                    "from": {{"id": 777, "is_bot": false, "first_name": "Alice"}},
+                    "chat": {{"id": 777, "type": "private"}},
+                    "text": "/help {oversized}",
+                    "entities": [{{"type": "bot_command", "offset": 0, "length": 5}}]
+                }}
+            }}"#
+        );
+        let err = parse_telegram_update(
+            payload.as_bytes(),
+            evidence(),
+            &adapter_id(),
+            &install_id(),
+            &policy(),
+        )
+        .expect_err("oversized arguments must be rejected");
+        match err {
+            PayloadParseError::InvalidExternalRef { kind, reason } => {
+                assert_eq!(kind, "inbound_command_payload");
+                // Same redaction contract as the control-char test
+                // above. The 70_000-byte payload must not leak into
+                // the error message.
+                assert!(
+                    reason.contains("<redacted>"),
+                    "rejection reason must be redacted (oversized content must not leak); got {reason}",
+                );
+            }
+            other => {
+                panic!("expected InvalidExternalRef{{kind:inbound_command_payload}}, got {other:?}")
+            }
         }
     }
 
