@@ -856,12 +856,22 @@ where
             let Some(value) = value else {
                 continue;
             };
-            if let Err(error) = apply_credential_injection(&mut request, &injection.target, &value)
+            // Borrow the leased plaintext only for the narrow window where the
+            // egress code needs it (header/query injection + redaction-token
+            // generation). The `SecretMaterial` stays inside the cache; the
+            // exposed `&str` does not outlive this loop iteration. Plaintext
+            // does land in `request.headers` and `redaction_values` after
+            // injection — those copies are unavoidable because the network
+            // layer and response-body scanner consume raw bytes — but the
+            // cache itself never holds a non-zeroizing copy.
+            let plaintext = value.expose_secret();
+            if let Err(error) =
+                apply_credential_injection(&mut request, &injection.target, plaintext)
             {
                 self.discard_staged_policy_for_request(&request);
                 return Err(error);
             }
-            redaction_values.extend(redaction_values_for_secret(&value));
+            redaction_values.extend(redaction_values_for_secret(plaintext));
         }
 
         let response = self
@@ -888,7 +898,12 @@ where
 
 struct RuntimeCredentialMaterialCacheEntry {
     key: RuntimeCredentialMaterialKey,
-    value: Option<String>,
+    /// Leased secret material kept inside `SecretString` so the bytes are
+    /// zeroized when this entry — and its enclosing `Vec` — is dropped at
+    /// the end of the egress call. Holding plaintext as `String` here
+    /// instead would leave the leased credential on the heap for the
+    /// duration of the request, defeating `SecretMaterial::ZeroizeOnDrop`.
+    value: Option<SecretMaterial>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -916,31 +931,33 @@ impl RuntimeCredentialMaterialKey {
     }
 }
 
-fn credential_value_for_injection<S>(
-    cache: &mut Vec<RuntimeCredentialMaterialCacheEntry>,
+fn credential_value_for_injection<'cache, S>(
+    cache: &'cache mut Vec<RuntimeCredentialMaterialCacheEntry>,
     secrets: &S,
     secret_injections: Option<&RuntimeSecretInjectionStore>,
     request: &RuntimeHttpEgressRequest,
     injection: &RuntimeCredentialInjection,
-) -> Result<Option<String>, RuntimeHttpEgressError>
+) -> Result<Option<&'cache SecretMaterial>, RuntimeHttpEgressError>
 where
     S: SecretStore,
 {
     let key = RuntimeCredentialMaterialKey::for_injection(injection);
-    if let Some(entry) = cache.iter().find(|entry| entry.key == key) {
-        return match &entry.value {
-            Some(value) => Ok(Some(value.clone())),
-            None => missing_runtime_credential(injection.required).map(|_| None),
-        };
+    if let Some(idx) = cache.iter().position(|entry| entry.key == key) {
+        // Negative cache hit (missing optional credential on a prior pass)
+        // must still error out if *this* injection marks the same handle as
+        // required. `required` is per-injection, not per-cache-entry.
+        if cache[idx].value.is_none() && injection.required {
+            return Err(RuntimeHttpEgressError::Credential {
+                reason: "required credential is unavailable".to_string(),
+            });
+        }
+        return Ok(cache[idx].value.as_ref());
     }
 
-    let value = secret_material_for_injection(secrets, secret_injections, request, injection)?
-        .map(|material| material.expose_secret().to_string());
-    cache.push(RuntimeCredentialMaterialCacheEntry {
-        key,
-        value: value.clone(),
-    });
-    Ok(value)
+    let value = secret_material_for_injection(secrets, secret_injections, request, injection)?;
+    let pushed_index = cache.len();
+    cache.push(RuntimeCredentialMaterialCacheEntry { key, value });
+    Ok(cache[pushed_index].value.as_ref())
 }
 
 fn secret_material_for_injection<S>(
@@ -1393,27 +1410,26 @@ mod security_findings_poc {
     //!
     //! Findings covered here:
     //!
-    //! - **H1** — `RuntimeCredentialMaterialCacheEntry::value` is
-    //!   `Option<String>`. Once a `SecretMaterial` is leased, we copy its
-    //!   plaintext into a plain `String` and stash it in the cache `Vec` for
-    //!   the lifetime of the egress request. `String` has no `ZeroizeOnDrop`,
-    //!   so the plaintext sits on the heap and is freed-without-wipe at the
-    //!   end of the request, defeating the whole `SecretMaterial = SecretString`
-    //!   protection.
+    //! - **H1** — `RuntimeCredentialMaterialCacheEntry::value` once held
+    //!   `Option<String>`, so the leased plaintext stayed on the heap until
+    //!   the egress request ended and was then freed without zeroization.
+    //!   The cache now holds `Option<SecretMaterial>` so the bytes are
+    //!   wiped when the `Vec` is dropped at end-of-call. The test is kept
+    //!   as a regression guard: any future refactor that downgrades the
+    //!   cache value back to a non-zeroizing type fails the assertion.
 
     use super::{RuntimeCredentialMaterialCacheEntry, RuntimeCredentialMaterialKey};
     use ironclaw_host_api::SecretHandle;
 
-    /// **Finding H1.** The credential material cache value must be a
-    /// zeroize-on-drop type. Today the field is `Option<String>` so the
-    /// plaintext copied out of `SecretMaterial` is freed without wiping.
-    ///
-    /// The fix is to store the leased material as `Option<SecretMaterial>`
-    /// (alias for `secrecy::SecretString`), which carries `ZeroizeOnDrop`
-    /// semantics. Once that change lands, the type name of the value field
-    /// will contain `SecretString` and this assertion passes.
+    /// **Finding H1 — regression guard.** The credential material cache
+    /// value must be a zeroize-on-drop type. Holding the leased plaintext
+    /// as `Option<String>` (the original bug) leaves it on the heap until
+    /// the cache `Vec` is dropped at end-of-call, then frees the bytes
+    /// without wiping. `Option<SecretMaterial>` (alias for
+    /// `secrecy::SecretString = SecretBox<str>`) carries `ZeroizeOnDrop`
+    /// semantics: the assertion checks that the value-field type name
+    /// names a zeroize-on-drop carrier.
     #[test]
-    #[ignore = "PoC for finding H1 — fails today; remove #[ignore] together with the cache-type fix"]
     fn h1_credential_material_cache_value_must_be_zeroizing() {
         let entry = RuntimeCredentialMaterialCacheEntry {
             key: RuntimeCredentialMaterialKey::SecretStoreLease {
@@ -1422,12 +1438,18 @@ mod security_findings_poc {
             value: None,
         };
         let value_type = std::any::type_name_of_val(&entry.value);
+        // `secrecy::SecretString` is `type SecretString = SecretBox<str>`, so
+        // the concrete type name from `type_name_of_val` is the inner
+        // `SecretBox<...>`. Accept any of the zeroize-on-drop carriers in
+        // the secrecy family.
         assert!(
-            value_type.contains("SecretString") || value_type.contains("SecretMaterial"),
+            value_type.contains("SecretBox<")
+                || value_type.contains("SecretString")
+                || value_type.contains("SecretMaterial"),
             "H1: credential cache value type must be zeroize-on-drop \
-             (Option<SecretString>/Option<SecretMaterial>), got {value_type}. \
-             A plain String leaves plaintext on the heap for the duration of \
-             the egress request, defeating SecretString::ZeroizeOnDrop."
+             (SecretBox/SecretString/SecretMaterial), got {value_type}. A plain \
+             String leaves plaintext on the heap for the duration of the \
+             egress request, defeating SecretMaterial::ZeroizeOnDrop."
         );
     }
 }
