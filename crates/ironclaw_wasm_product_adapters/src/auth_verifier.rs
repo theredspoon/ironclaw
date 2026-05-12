@@ -203,6 +203,15 @@ pub struct SharedSecretHeaderAuth {
 
 impl WebhookAuthVerifier for SharedSecretHeaderAuth {
     fn verify(&self, headers: &http::HeaderMap, _body: &[u8]) -> VerificationOutcome {
+        // Fail closed on misconfigured installation: an empty configured
+        // secret would `ct_eq("", "")` to true, letting an attacker who
+        // knows the header name authenticate with an empty value. Mirrors
+        // the `HmacWebhookAuth` empty-signing-secret check above.
+        if self.expected_secret.is_empty() {
+            return VerificationOutcome::Failed {
+                failure: ProtocolAuthFailure::Malformed,
+            };
+        }
         let Some(received) = headers
             .get(self.header_name.as_str())
             .and_then(|v| v.to_str().ok())
@@ -296,6 +305,36 @@ mod tests {
                 assert!(matches!(failure, ProtocolAuthFailure::Missing));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_secret_header_rejects_empty_expected_secret_as_malformed_config() {
+        // Misconfigured installation: empty `expected_secret`. Without the
+        // fail-closed guard, `ct_eq("", "")` returns true and any request
+        // with an empty header value would authenticate. Verifier must
+        // reject as `Malformed`, mirroring the HMAC empty-signing-secret
+        // check.
+        let verifier = SharedSecretHeaderAuth {
+            header_name: "X-Telegram-Bot-Api-Secret-Token".into(),
+            expected_secret: String::new(),
+            subject: "telegram_install_alpha".into(),
+        };
+        let headers = header_map(&[("X-Telegram-Bot-Api-Secret-Token", "")]);
+        match verifier.verify(&headers, b"") {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Malformed));
+            }
+            other => panic!("expected Failed(Malformed), got {other:?}"),
+        }
+        // Independent of what header value is sent — the misconfiguration
+        // rejection must precede any per-request comparison.
+        let with_value = header_map(&[("X-Telegram-Bot-Api-Secret-Token", "anything")]);
+        match verifier.verify(&with_value, b"") {
+            VerificationOutcome::Failed { failure } => {
+                assert!(matches!(failure, ProtocolAuthFailure::Malformed));
+            }
+            other => panic!("expected Failed(Malformed), got {other:?}"),
         }
     }
 
