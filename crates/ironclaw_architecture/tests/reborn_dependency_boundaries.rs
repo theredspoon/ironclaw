@@ -362,6 +362,20 @@ struct BoundaryRule {
 fn boundary_rules() -> Vec<BoundaryRule> {
     vec![
         BoundaryRule {
+            crate_name: "ironclaw_product_workflow",
+            forbidden: vec![
+                "ironclaw_dispatcher",
+                "ironclaw_extensions",
+                "ironclaw_host_runtime",
+                "ironclaw_mcp",
+                "ironclaw_wasm",
+                "ironclaw_scripts",
+                "ironclaw_network",
+                "ironclaw_engine",
+                "ironclaw_gateway",
+            ],
+        },
+        BoundaryRule {
             crate_name: "ironclaw_storage",
             forbidden: vec![
                 "ironclaw",
