@@ -159,7 +159,6 @@ fn h3_test_crypto() -> Arc<SecretsCrypto> {
 /// and provide a narrow `fn expose(&self) -> Uuid` for the small number of
 /// call sites that genuinely need the value.
 #[test]
-#[ignore = "PoC for finding M1 — fails today; remove #[ignore] together with the Display redaction fix"]
 fn m1_credential_session_id_display_must_not_emit_raw_uuid() {
     let id = CredentialSessionId::new();
     let displayed = format!("{id}");

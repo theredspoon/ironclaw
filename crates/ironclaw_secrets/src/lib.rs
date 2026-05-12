@@ -244,6 +244,17 @@ impl CredentialSessionId {
     pub fn parse(value: &str) -> Result<Self, uuid::Error> {
         Uuid::parse_str(value).map(Self)
     }
+
+    /// Returns the underlying UUID as a storage-formatted string.
+    ///
+    /// This is the **only** way to obtain the bearer-like value of a
+    /// `CredentialSessionId`. It exists so durable backends can write the id
+    /// into their primary-key columns; callers must not log, audit, or echo
+    /// the result to runtime/plugin code. `Display` and `Debug` deliberately
+    /// redact, so `format!("{id}")` and `{id:?}` both refuse to leak.
+    pub fn expose_for_storage(&self) -> String {
+        self.0.to_string()
+    }
 }
 
 impl Default for CredentialSessionId {
@@ -260,7 +271,12 @@ impl fmt::Debug for CredentialSessionId {
 
 impl fmt::Display for CredentialSessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        // Bearer-like identifier: Display must not leak the raw UUID, because
+        // `format!("{id}")`, `tracing::info!(%id, ...)`, and any
+        // `error.to_string()` interpolation would otherwise echo a value an
+        // attacker can reuse. Narrow storage paths must call
+        // `expose_for_storage()` instead.
+        formatter.write_str("[REDACTED]")
     }
 }
 
@@ -1546,7 +1562,15 @@ mod tests {
         let debug = format!("{session:?}");
         assert!(!debug.contains("sk-live-sentinel"));
         assert!(!debug.contains("token"));
-        assert!(!debug.contains(&session.correlation_id().to_string()));
+        // CredentialSessionId is bearer-like: the raw UUID (obtainable only via
+        // expose_for_storage) must never appear in Debug output. Display is now
+        // redacted to "[REDACTED]" so a contains-on-Display check would be
+        // tautologically true here; this assertion still catches a regression
+        // that would leak the underlying UUID.
+        assert!(
+            !debug.contains(&session.correlation_id().expose_for_storage()),
+            "CredentialSession Debug must not include the raw correlation UUID"
+        );
     }
 
     #[test]
