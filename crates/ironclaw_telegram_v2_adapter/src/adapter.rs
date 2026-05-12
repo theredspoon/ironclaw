@@ -2,11 +2,11 @@
 
 use async_trait::async_trait;
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, DeclaredEgressHost, EgressCredentialHandle,
-    OutboundDeliverySink, ParsedProductInbound, ProductAdapter, ProductAdapterCapabilities,
-    ProductAdapterError, ProductAdapterId, ProductCapabilityFlag, ProductOutboundEnvelope,
-    ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind, ProtocolAuthEvidence,
-    ProtocolHttpEgress, ProtocolHttpEgressError,
+    AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
+    EgressCredentialHandle, OutboundDeliverySink, ParsedProductInbound, ProductAdapter,
+    ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId, ProductCapabilityFlag,
+    ProductOutboundEnvelope, ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind,
+    ProtocolAuthEvidence, ProtocolHttpEgress, ProtocolHttpEgressError,
 };
 
 use crate::payload::{GroupTriggerPolicy, TELEGRAM_API_HOST, parse_telegram_update};
@@ -35,6 +35,13 @@ pub struct TelegramV2AdapterConfig {
 pub struct TelegramV2Adapter {
     config: TelegramV2AdapterConfig,
     capabilities: ProductAdapterCapabilities,
+    /// Per-installation egress allowlist. One paired
+    /// `(api.telegram.org, Some(bot_token_handle))` entry — the host
+    /// enforces this declaration when policing outbound requests, so
+    /// without overriding the trait default the adapter would
+    /// implicitly declare an empty allowlist and every Telegram send
+    /// would be denied (Copilot review on PR #3355).
+    declared_egress: Vec<DeclaredEgressTarget>,
 }
 
 impl TelegramV2Adapter {
@@ -43,9 +50,14 @@ impl TelegramV2Adapter {
         if config.progress_push_enabled {
             capabilities = capabilities.with(ProductCapabilityFlag::ExternalProgressPush);
         }
+        let declared_egress = vec![DeclaredEgressTarget::new(
+            DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid"), // safety: compile-time const "api.telegram.org" satisfies DeclaredEgressHost validator
+            Some(config.egress_credential_handle.clone()),
+        )];
         Self {
             config,
             capabilities,
+            declared_egress,
         }
     }
 
@@ -55,6 +67,12 @@ impl TelegramV2Adapter {
 }
 
 /// Egress hosts that any Telegram v2 installation may target.
+///
+/// Helper retained for tests and host-glue code that needs the
+/// installation-agnostic host list (no credential pairing). Production
+/// hosts should drive policy from
+/// [`ProductAdapter::declared_egress`] on a concrete adapter instance,
+/// which carries the paired `(host, credential_handle)` shape.
 pub fn telegram_declared_egress_hosts() -> Vec<DeclaredEgressHost> {
     vec![DeclaredEgressHost::new(TELEGRAM_API_HOST).expect("static host valid")] // safety: compile-time const "api.telegram.org" satisfies DeclaredEgressHost validator
 }
@@ -79,6 +97,10 @@ impl ProductAdapter for TelegramV2Adapter {
 
     fn auth_requirement(&self) -> &AuthRequirement {
         &self.config.auth_requirement
+    }
+
+    fn declared_egress(&self) -> &[DeclaredEgressTarget] {
+        &self.declared_egress
     }
 
     fn parse_inbound(
@@ -301,6 +323,24 @@ mod tests {
         let hosts = telegram_declared_egress_hosts();
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].as_str(), "api.telegram.org");
+    }
+
+    #[test]
+    fn declared_egress_pairs_telegram_host_with_bot_token_handle() {
+        // Copilot review on PR #3355: the trait default returns `&[]`,
+        // which would make hosts that enforce `DeclaredEgressTarget`-based
+        // policy deny every Telegram send. The override must surface the
+        // installation's `(api.telegram.org, Some(<bot_token_handle>))`
+        // pair so policy admits the requests rendered by `render_outbound`.
+        let adapter = TelegramV2Adapter::new(config(false));
+        let declared = adapter.declared_egress();
+        assert_eq!(declared.len(), 1, "expected exactly one declared target");
+        assert_eq!(declared[0].host.as_str(), "api.telegram.org");
+        let handle = declared[0]
+            .credential_handle
+            .as_ref()
+            .expect("credential handle paired with telegram host");
+        assert_eq!(handle.as_str(), "telegram_bot_token");
     }
 
     #[test]

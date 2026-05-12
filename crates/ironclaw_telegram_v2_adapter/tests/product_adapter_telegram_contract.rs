@@ -11,19 +11,27 @@
 //! mapping is owned by the host glue (`NativeProductAdapterRunner`) and
 //! exercised in the runner-level tests at the end of this file.
 //!
-//! TEMPORARILY DISABLED: This integration test file was written against the
-//! pre-#3352 `ironclaw_product_adapters` API. After syncing this PR with
-//! `reborn-integration` (which carries the post-#3352 changes —
-//! `ProtocolAuthEvidence` enum→sealed-struct, `ProductInboundEnvelope`
-//! private fields, 4-arg `render_outbound` returning `ProductRenderOutcome`,
-//! `EgressRequest` builder API, paired `(host, credential)` egress policy,
-//! and the `parse_inbound -> Result<ParsedProductInbound, _>` trust-
-//! boundary shift), many ~20+ test fixtures need case-by-case porting.
-//! The library code, payload.rs unit tests, and adapter.rs unit tests
-//! have been ported in this commit; this contract suite is gated off
-//! via `#![cfg(any())]` until the test-fixture surgery lands in a
-//! followup commit. Copilot #2 (alias-skip false-negatives) and #3
-//! (AC16 mismatch) are scoped to this file and deferred with it.
+//! PORT IN PROGRESS — entire suite disabled until ~20+ fixtures are
+//! migrated to the post-#3352 product-adapter API
+//! (`ProtocolAuthEvidence` enum→sealed-struct,
+//! `ProductInboundEnvelope` private fields, 4-arg `render_outbound`
+//! returning `ProductRenderOutcome`, `EgressRequest` builder API,
+//! paired `(host, credential)` egress policy, and the
+//! `parse_inbound -> Result<ParsedProductInbound, _>` trust-boundary
+//! shift).
+//!
+//! A real `[features] contract-tests-todo` flag is the natural way to
+//! gate this (Copilot review on PR #3355), but the workspace CI runs
+//! `cargo clippy --all --tests --examples --all-features -- -D warnings`
+//! — `--all-features` would enable the flag and surface the 49
+//! pre-existing port errors as a lint regression. Until the fixtures
+//! compile under the new API, the suite stays gated by
+//! `#![cfg(any())]` (the existing convention for "compile out
+//! entirely; do not surface to tooling") and tracked alongside Copilot
+//! #2 (alias-skip false-negatives) and #3 (AC16 mismatch), which are
+//! scoped to this file. The port is followup work; this file's
+//! presence is intentional so the fixture inventory does not get
+//! lost.
 #![cfg(any())]
 
 use std::path::Path;
