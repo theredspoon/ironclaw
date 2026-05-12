@@ -1,9 +1,13 @@
 //! Telegram Bot API payload normalization.
 //!
-//! Inputs are raw webhook update bytes. Outputs are structured envelopes the
-//! adapter can hand to the workflow facade — or `None` when the update should
-//! produce a successful no-op acknowledgement (ambient group messages,
-//! channel posts, edited-message kinds we don't act on, etc.).
+//! Inputs are raw webhook update bytes. Outputs are
+//! [`TelegramParsedInbound`] values — either an
+//! [`Envelope`](TelegramParsedInbound::Envelope) wrapping a
+//! [`ProductInboundEnvelope`] the adapter can hand to the workflow
+//! facade, or [`NoOp`](TelegramParsedInbound::NoOp) when the update
+//! should produce a successful no-op acknowledgement (ambient group
+//! messages, channel posts, edited-message kinds we don't act on,
+//! missing `message.from` we can't actor-ref, etc.).
 
 use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_product_adapters::{
@@ -102,6 +106,15 @@ pub fn parse_telegram_update(
         None => return Ok(TelegramParsedInbound::NoOp),
     };
 
+    // `message.from` is optional in the Telegram schema (anonymous group
+    // admins, channel-style updates that slipped through, etc.). Without
+    // a `from` we can't build an `ExternalActorRef`, so fail-soft to
+    // `NoOp` rather than returning a hard error that triggers webhook
+    // retries on an otherwise-parseable update.
+    if message.from.is_none() {
+        return Ok(TelegramParsedInbound::NoOp);
+    }
+
     let chat_kind = TelegramChatKind::from_str(message.chat.kind.as_str());
     let trigger_outcome = classify_trigger(&message, chat_kind, group_trigger_policy);
     let Some(trigger) = trigger_outcome else {
@@ -176,15 +189,11 @@ fn classify_trigger(
     policy: &GroupTriggerPolicy,
 ) -> Option<ProductTriggerReason> {
     if chat_kind == TelegramChatKind::Private {
-        // Recognized bot commands in DMs MUST classify as `BotCommand` so
-        // `build_payload` emits `ProductInboundPayload::Command`. Previously
-        // the private-chat branch returned `DirectChat` immediately and
-        // every DM — including `/help` — fell into the `UserMessage` arm,
-        // contradicting the adapter advertising `InboundCommands`.
-        // Non-command private messages still classify as `DirectChat`.
-        if recognized_bot_command(message, policy) {
-            return Some(ProductTriggerReason::BotCommand);
-        }
+        // The `trigger` reflects WHY a message was forwarded; for private
+        // chats that's always `DirectChat`. Whether the message ALSO
+        // contains a `/command` entity is a payload-shape decision made
+        // by `build_payload` independently — see Copilot's review note
+        // on the trigger/payload decoupling.
         return Some(ProductTriggerReason::DirectChat);
     }
 
@@ -213,25 +222,41 @@ fn classify_trigger(
     None
 }
 
+/// Iterate every `(text, entities)` window on a Telegram message in the
+/// order Telegram delivers them: first the message `text+entities`, then
+/// the `caption+caption_entities` for media messages. Yields nothing for
+/// either side when its companion field is missing — the offsets in
+/// `entities` are bound to `text` and similarly for `caption_entities`
+/// against `caption`, so the pair is meaningless apart.
+fn text_entity_windows(
+    message: &TelegramMessage,
+) -> impl Iterator<Item = (&str, &[MessageEntity])> {
+    let text_window = message
+        .text
+        .as_deref()
+        .zip(message.entities.as_deref().map(|e| e as &[_]));
+    let caption_window = message
+        .caption
+        .as_deref()
+        .zip(message.caption_entities.as_deref().map(|e| e as &[_]));
+    text_window.into_iter().chain(caption_window)
+}
+
 fn has_bot_mention(message: &TelegramMessage, policy: &GroupTriggerPolicy) -> bool {
-    let Some(text) = message.text.as_deref() else {
-        return false;
-    };
-    let Some(entities) = message.entities.as_deref() else {
-        return false;
-    };
     let target_lower = policy.bot_username.to_ascii_lowercase();
-    for entity in entities {
-        if entity.entity_type != "mention" {
-            continue;
-        }
-        let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
-            continue;
-        };
-        // Mentions look like `@botname`. Strip the `@`.
-        let trimmed = slice.strip_prefix('@').unwrap_or(slice);
-        if trimmed.eq_ignore_ascii_case(&target_lower) {
-            return true;
+    for (text, entities) in text_entity_windows(message) {
+        for entity in entities {
+            if entity.entity_type != "mention" {
+                continue;
+            }
+            let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
+                continue;
+            };
+            // Mentions look like `@botname`. Strip the `@`.
+            let trimmed = slice.strip_prefix('@').unwrap_or(slice);
+            if trimmed.eq_ignore_ascii_case(&target_lower) {
+                return true;
+            }
         }
     }
     false
@@ -248,36 +273,32 @@ fn reply_to_bot(message: &TelegramMessage, bot_user_id: i64) -> bool {
 }
 
 fn recognized_bot_command(message: &TelegramMessage, policy: &GroupTriggerPolicy) -> bool {
-    let Some(text) = message.text.as_deref() else {
-        return false;
-    };
-    let Some(entities) = message.entities.as_deref() else {
-        return false;
-    };
-    for entity in entities {
-        if entity.entity_type != "bot_command" {
-            continue;
-        }
-        let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
-            continue;
-        };
-        let raw = slice.strip_prefix('/').unwrap_or(slice);
-        let cmd = match raw.split_once('@') {
-            Some((cmd, target)) => {
-                if !target.eq_ignore_ascii_case(&policy.bot_username) {
-                    continue;
-                }
-                cmd
+    for (text, entities) in text_entity_windows(message) {
+        for entity in entities {
+            if entity.entity_type != "bot_command" {
+                continue;
             }
-            None => raw,
-        };
-        let cmd_lower = cmd.to_ascii_lowercase();
-        if policy
-            .recognized_commands
-            .iter()
-            .any(|recognized| recognized.to_ascii_lowercase() == cmd_lower)
-        {
-            return true;
+            let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
+                continue;
+            };
+            let raw = slice.strip_prefix('/').unwrap_or(slice);
+            let cmd = match raw.split_once('@') {
+                Some((cmd, target)) => {
+                    if !target.eq_ignore_ascii_case(&policy.bot_username) {
+                        continue;
+                    }
+                    cmd
+                }
+                None => raw,
+            };
+            let cmd_lower = cmd.to_ascii_lowercase();
+            if policy
+                .recognized_commands
+                .iter()
+                .any(|recognized| recognized.to_ascii_lowercase() == cmd_lower)
+            {
+                return true;
+            }
         }
     }
     false
@@ -456,10 +477,16 @@ fn build_payload(
     trigger: ProductTriggerReason,
     policy: &GroupTriggerPolicy,
 ) -> Result<ProductInboundPayload, PayloadParseError> {
-    // Bot command path produces a Command payload. Otherwise UserMessage.
-    if trigger == ProductTriggerReason::BotCommand
-        && let Some((command, arguments)) = extract_first_bot_command(&message, policy)
-    {
+    // Emit `Command` whenever the message carries a recognized
+    // `bot_command` entity, regardless of why the message was forwarded.
+    // The `trigger` field still records the forwarding reason
+    // (DirectChat for DMs, BotMention/ReplyToBot for groups, etc.), but
+    // the payload kind is determined by whether a command entity is
+    // actually present. Previously this branch gated on
+    // `trigger == BotCommand` and silently downgraded `/help` to
+    // `UserMessage` in private chats and in mention-triggered group
+    // messages that also contained a `/command`.
+    if let Some((command, arguments)) = extract_first_bot_command(&message, policy) {
         let command_payload = InboundCommandPayload {
             command,
             arguments,
@@ -488,37 +515,44 @@ fn extract_first_bot_command(
     message: &TelegramMessage,
     policy: &GroupTriggerPolicy,
 ) -> Option<(String, String)> {
-    let text = message.text.as_deref()?;
-    let entities = message.entities.as_deref()?;
-    for entity in entities {
-        if entity.entity_type != "bot_command" {
-            continue;
-        }
-        let slice = slice_text_by_offset(text, entity.offset, entity.length)?;
-        let trimmed = slice.strip_prefix('/').unwrap_or(slice);
-        let cmd_only = match trimmed.split_once('@') {
-            Some((cmd, target)) => {
-                if !target.eq_ignore_ascii_case(&policy.bot_username) {
-                    continue;
-                }
-                cmd
+    // Consult both `text+entities` and `caption+caption_entities` so a
+    // recognized `/command` in a media-message caption is extracted
+    // correctly. The first matching command in `text` wins; otherwise
+    // the first matching command in `caption` wins. Offsets in each
+    // entities list are bound to their companion string.
+    for (text, entities) in text_entity_windows(message) {
+        for entity in entities {
+            if entity.entity_type != "bot_command" {
+                continue;
             }
-            None => trimmed,
-        };
-        let cmd_lower = cmd_only.to_ascii_lowercase();
-        if !policy
-            .recognized_commands
-            .iter()
-            .any(|c| c.to_ascii_lowercase() == cmd_lower)
-        {
-            continue;
+            let Some(slice) = slice_text_by_offset(text, entity.offset, entity.length) else {
+                continue;
+            };
+            let trimmed = slice.strip_prefix('/').unwrap_or(slice);
+            let cmd_only = match trimmed.split_once('@') {
+                Some((cmd, target)) => {
+                    if !target.eq_ignore_ascii_case(&policy.bot_username) {
+                        continue;
+                    }
+                    cmd
+                }
+                None => trimmed,
+            };
+            let cmd_lower = cmd_only.to_ascii_lowercase();
+            if !policy
+                .recognized_commands
+                .iter()
+                .any(|c| c.to_ascii_lowercase() == cmd_lower)
+            {
+                continue;
+            }
+            let after_offset = entity.offset + entity.length;
+            let arguments = slice_text_to_end(text, after_offset)
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            return Some((cmd_lower, arguments));
         }
-        let after_offset = entity.offset + entity.length;
-        let arguments = slice_text_to_end(text, after_offset)
-            .unwrap_or("")
-            .trim_start()
-            .to_string();
-        return Some((cmd_lower, arguments));
     }
     None
 }
@@ -653,6 +687,14 @@ struct TelegramMessage {
     caption: Option<String>,
     #[serde(default)]
     entities: Option<Vec<MessageEntity>>,
+    /// `caption_entities` mirrors `entities` for media messages whose
+    /// human-readable text lives in `caption` rather than `text`
+    /// (photos, documents, videos, ...). Mentions and `bot_command`
+    /// entities can appear here too; trigger detection must consult
+    /// both `(text, entities)` and `(caption, caption_entities)` or
+    /// it silently NoOps media messages that should fire.
+    #[serde(default)]
+    caption_entities: Option<Vec<MessageEntity>>,
     #[serde(default)]
     reply_to_message: Option<Box<TelegramMessage>>,
     #[serde(default)]
@@ -801,13 +843,15 @@ mod tests {
     }
 
     #[test]
-    fn private_chat_recognized_bot_command_classifies_as_command() {
-        // Henry's review (PR #3354): `/help` in a DM was previously
-        // downgraded to `UserMessage` because the private-chat arm in
-        // `classify_trigger` returned `DirectChat` before checking
-        // `bot_command` entities. The adapter advertises
-        // `InboundCommands`, so this contradicted the manifest. The fix
-        // recognizes commands before the private-chat early return.
+    fn private_chat_recognized_bot_command_emits_command_payload() {
+        // Henry's review (PR #3354) + Copilot's payload.rs:469 finding:
+        // `/help` in a DM was previously downgraded to `UserMessage`
+        // because the old `build_payload` gated `Command` emission on
+        // `trigger == BotCommand`, and private chats always returned
+        // `DirectChat`. The fix decouples them: payload kind is decided
+        // by whether a recognized `bot_command` entity exists; the
+        // trigger keeps its forwarding-reason semantics (DirectChat for
+        // DMs).
         let payload = br#"{
             "update_id": 110,
             "message": {
@@ -829,7 +873,49 @@ mod tests {
             ProductInboundPayload::Command(cmd) => {
                 assert_eq!(cmd.command, "help");
                 assert_eq!(cmd.arguments, "");
-                assert_eq!(cmd.trigger, ProductTriggerReason::BotCommand);
+                // Trigger reflects WHY the message was forwarded
+                // (it's a DM); command-ness is captured in the payload
+                // variant, not the trigger.
+                assert_eq!(cmd.trigger, ProductTriggerReason::DirectChat);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_mention_with_bot_command_emits_command_payload() {
+        // Copilot's payload.rs:469 finding: a `/command` inside a
+        // mention-triggered group message previously emitted
+        // `UserMessage` because `build_payload` only produced `Command`
+        // when `trigger == BotCommand` — but in groups the mention
+        // check fires first and sets `trigger = BotMention`. The
+        // decoupled `build_payload` now produces `Command` whenever a
+        // recognized command is present, and the trigger preserves
+        // the BotMention forwarding reason.
+        let payload = br#"{
+            "update_id": 220,
+            "message": {
+                "message_id": 12,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": -42, "type": "supergroup"},
+                "text": "@ironclaw_bot /help",
+                "entities": [
+                    {"type": "mention", "offset": 0, "length": 13},
+                    {"type": "bot_command", "offset": 14, "length": 5}
+                ]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
+                .expect("parse");
+        let TelegramParsedInbound::Envelope(envelope) = parsed else {
+            panic!("expected envelope");
+        };
+        match envelope.payload() {
+            ProductInboundPayload::Command(cmd) => {
+                assert_eq!(cmd.command, "help");
+                assert_eq!(cmd.trigger, ProductTriggerReason::BotMention);
             }
             other => panic!("expected Command, got {other:?}"),
         }
@@ -864,6 +950,100 @@ mod tests {
             }
             other => panic!("expected UserMessage with DirectChat trigger, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn group_media_caption_mention_is_recognized_as_bot_mention() {
+        // Copilot's payload.rs:222 finding: trigger detection previously
+        // consulted only `text + entities`. A photo with caption
+        // `@ironclaw_bot help` carries its mention in
+        // `caption_entities`, so `classify_trigger` returned None and
+        // the update was silently NoOp'd. The fix consults both text-
+        // and caption-anchored entity lists.
+        let payload = br#"{
+            "update_id": 230,
+            "message": {
+                "message_id": 13,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": -42, "type": "supergroup"},
+                "photo": [
+                    {"file_id": "AAAA", "file_unique_id": "u1", "width": 100, "height": 100, "file_size": 500}
+                ],
+                "caption": "@ironclaw_bot please look",
+                "caption_entities": [{"type": "mention", "offset": 0, "length": 13}]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
+                .expect("parse");
+        let TelegramParsedInbound::Envelope(envelope) = parsed else {
+            panic!("expected envelope (caption mention must fire trigger), got NoOp");
+        };
+        match envelope.payload() {
+            ProductInboundPayload::UserMessage(user) => {
+                assert_eq!(user.trigger, ProductTriggerReason::BotMention);
+            }
+            other => panic!("expected UserMessage with BotMention trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_media_caption_bot_command_emits_command_payload() {
+        // Caption-anchored `/help` must reach the Command path too.
+        let payload = br#"{
+            "update_id": 231,
+            "message": {
+                "message_id": 14,
+                "date": 1700000000,
+                "from": {"id": 777, "is_bot": false, "first_name": "Alice"},
+                "chat": {"id": -42, "type": "supergroup"},
+                "photo": [
+                    {"file_id": "BBBB", "file_unique_id": "u2", "width": 100, "height": 100, "file_size": 500}
+                ],
+                "caption": "/help on this photo",
+                "caption_entities": [{"type": "bot_command", "offset": 0, "length": 5}]
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
+                .expect("parse");
+        let TelegramParsedInbound::Envelope(envelope) = parsed else {
+            panic!("expected envelope (caption command must fire trigger), got NoOp");
+        };
+        match envelope.payload() {
+            ProductInboundPayload::Command(cmd) => {
+                assert_eq!(cmd.command, "help");
+                assert_eq!(cmd.trigger, ProductTriggerReason::BotCommand);
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_without_from_classifies_as_noop_not_error() {
+        // Copilot's payload.rs:419 finding: `message.from` is optional
+        // in the Telegram schema (anonymous group admins, channel
+        // posts that slipped through the kind filter, etc.). Returning
+        // a hard `PayloadParseError` would force the webhook to retry
+        // an otherwise-parseable update. The fail-soft path is `NoOp`
+        // — the webhook acks 200 OK and Telegram does not retry.
+        let payload = br#"{
+            "update_id": 240,
+            "message": {
+                "message_id": 15,
+                "date": 1700000000,
+                "chat": {"id": -42, "type": "supergroup"},
+                "text": "anonymous admin message"
+            }
+        }"#;
+        let parsed =
+            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
+                .expect("parse must not hard-error on missing `from`");
+        assert!(
+            matches!(parsed, TelegramParsedInbound::NoOp),
+            "missing `from` must fail-soft to NoOp, got {parsed:?}"
+        );
     }
 
     #[test]
