@@ -18,6 +18,16 @@ const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 12;
 const SALT_SIZE: usize = 32;
 const TAG_SIZE: usize = 16;
+/// Minimum distinct-byte count for a master key.
+///
+/// HKDF accepts any IKM but its security degrades to brute-force when the IKM
+/// has trivial entropy. A length-only check accepts 32 bytes of `0`, 32 bytes
+/// of `a`, or short alphabet repeats — all of which an operator might paste
+/// while bootstrapping. Requiring at least 8 distinct bytes rejects those
+/// cases while leaving room for legitimate hex/base64 keys (typical 32-byte
+/// hex strings use 16 distinct alphabet characters; random 32-byte keys have
+/// ~30 distinct byte values on average).
+const KEY_MIN_DISTINCT_BYTES: usize = 8;
 
 pub struct SecretsCrypto {
     master_key: SecretString,
@@ -25,7 +35,11 @@ pub struct SecretsCrypto {
 
 impl SecretsCrypto {
     pub fn new(master_key: SecretString) -> Result<Self, SecretError> {
-        if master_key.expose_secret().len() < KEY_SIZE {
+        let bytes = master_key.expose_secret().as_bytes();
+        if bytes.len() < KEY_SIZE {
+            return Err(SecretError::InvalidMasterKey);
+        }
+        if distinct_byte_count(bytes) < KEY_MIN_DISTINCT_BYTES {
             return Err(SecretError::InvalidMasterKey);
         }
         Ok(Self { master_key })
@@ -98,4 +112,20 @@ impl std::fmt::Debug for SecretsCrypto {
             .field("master_key", &"[REDACTED]")
             .finish()
     }
+}
+
+/// Count of distinct byte values in the slice.
+///
+/// Used as a low-entropy heuristic in [`SecretsCrypto::new`]. A 32-bit bitmap
+/// over the 256-byte alphabet (one bit per byte value) keeps this branch
+/// constant-time-ish on key length, which matters because the input is a
+/// secret.
+fn distinct_byte_count(bytes: &[u8]) -> usize {
+    let mut seen = [0u64; 4];
+    for byte in bytes {
+        let slot = (byte >> 6) as usize;
+        let bit = byte & 0x3f;
+        seen[slot] |= 1u64 << bit;
+    }
+    seen.iter().map(|word| word.count_ones() as usize).sum()
 }

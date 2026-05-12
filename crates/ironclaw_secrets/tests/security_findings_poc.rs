@@ -189,7 +189,6 @@ fn m1_credential_session_id_display_must_not_emit_raw_uuid() {
 /// The exact entropy heuristic is a design choice; the test here only asserts
 /// that the three most-obvious weak keys are rejected.
 #[test]
-#[ignore = "PoC for finding M2 — fails today; remove #[ignore] together with the master-key entropy check"]
 fn m2_secrets_crypto_must_reject_low_entropy_master_keys() {
     let weak_inputs = [
         // 32 bytes of '0' — passes length check today.
