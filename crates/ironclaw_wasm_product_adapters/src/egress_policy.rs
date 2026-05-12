@@ -37,6 +37,10 @@ pub enum EgressPolicyError {
         host: DeclaredEgressHost,
         handle: EgressCredentialHandle,
     },
+    #[error(
+        "unauthenticated egress to {host} is not declared (host is declared only with credentialed pairs)"
+    )]
+    UnauthenticatedEgressNotDeclared { host: DeclaredEgressHost },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,35 +82,59 @@ impl EgressPolicy {
                 host: target.host.clone(),
             });
         }
-        // 2. If a credential is presented, the exact (host, handle) pair
-        //    must be declared. Two failure modes:
-        //      a. The handle is paired with a DIFFERENT host in this
-        //         policy — `CredentialHandleNotPairedWithHost`. This is
-        //         the cross-pair leak this policy now denies (e.g.
-        //         `slack_token` to `api.telegram.org`).
-        //      b. The handle isn't declared for any host — `Unauthorized
-        //         CredentialHandle`. Preserves the existing diagnostic
-        //         for handles that simply aren't part of the policy.
-        if let Some(handle) = target.credential_handle {
-            let pair_declared = self
-                .targets
-                .contains(&(target.host.clone(), Some(handle.clone())));
-            if pair_declared {
-                return Ok(());
+        // 2. Authorize only the EXACT `(host, credential_handle)` pair
+        //    the adapter declared. The credential side is symmetric:
+        //
+        //    a. Request carries no credential. The pair `(host, None)`
+        //       must be explicitly declared. Without this check, an
+        //       adapter that declared only credentialed pairs (e.g.
+        //       `(api.telegram.org, Some(telegram_token))`) could be
+        //       bypassed by an unauthenticated request to the same
+        //       host — the adapter said "I always send a credential
+        //       here," but the policy would let through traffic that
+        //       didn't.
+        //
+        //    b. Request carries a credential. The pair `(host,
+        //       Some(handle))` must be declared. Two distinct failure
+        //       modes when it isn't:
+        //         - The handle is paired with a DIFFERENT host in this
+        //           policy — `CredentialHandleNotPairedWithHost`. This
+        //           is the cross-pair leak the policy denies (e.g.
+        //           `slack_token` against `api.telegram.org`).
+        //         - The handle isn't declared for any host —
+        //           `UnauthorizedCredentialHandle`. Distinct diagnostic
+        //           for the simpler "unknown handle" case.
+        match target.credential_handle {
+            None => {
+                let unauthenticated_declared = self.targets.contains(&(target.host.clone(), None));
+                if unauthenticated_declared {
+                    Ok(())
+                } else {
+                    Err(EgressPolicyError::UnauthenticatedEgressNotDeclared {
+                        host: target.host.clone(),
+                    })
+                }
             }
-            let handle_declared_for_other_host =
-                self.targets.iter().any(|(_, h)| h.as_ref() == Some(handle));
-            if handle_declared_for_other_host {
-                return Err(EgressPolicyError::CredentialHandleNotPairedWithHost {
-                    host: target.host.clone(),
+            Some(handle) => {
+                let pair_declared = self
+                    .targets
+                    .contains(&(target.host.clone(), Some(handle.clone())));
+                if pair_declared {
+                    return Ok(());
+                }
+                let handle_declared_for_other_host =
+                    self.targets.iter().any(|(_, h)| h.as_ref() == Some(handle));
+                if handle_declared_for_other_host {
+                    return Err(EgressPolicyError::CredentialHandleNotPairedWithHost {
+                        host: target.host.clone(),
+                        handle: handle.clone(),
+                    });
+                }
+                Err(EgressPolicyError::UnauthorizedCredentialHandle {
                     handle: handle.clone(),
-                });
+                })
             }
-            return Err(EgressPolicyError::UnauthorizedCredentialHandle {
-                handle: handle.clone(),
-            });
         }
-        Ok(())
     }
 
     /// Distinct declared hosts across all `(host, handle)` pairs. A host
@@ -316,6 +344,63 @@ mod tests {
             EgressPolicyError::UnauthorizedCredentialHandle {
                 handle: ghost_handle,
             }
+        );
+    }
+
+    #[test]
+    fn unauthenticated_request_to_credential_only_host_is_denied() {
+        // Henry's review: when an adapter declares ONLY credentialed
+        // pairs for a host (e.g. `(api.telegram.org,
+        // Some(telegram_bot_token))`) and never declares the bare
+        // `(host, None)` pair, a request that arrives WITHOUT a
+        // credential must be rejected. Otherwise a component can
+        // bypass the `(host, credential_handle)` contract by sending
+        // unauthenticated traffic to a host the adapter explicitly
+        // told the host requires a credential.
+        let policy = EgressPolicy::new([pair("api.telegram.org", "telegram_bot_token")]);
+        let target_host = host("api.telegram.org");
+        let err = policy
+            .check(EgressPolicyTarget {
+                host: &target_host,
+                credential_handle: None,
+            })
+            .expect_err("unauthenticated egress to a credential-only host must fail closed");
+        assert_eq!(
+            err,
+            EgressPolicyError::UnauthenticatedEgressNotDeclared { host: target_host },
+        );
+    }
+
+    #[test]
+    fn host_declared_with_both_pairs_admits_both_request_shapes() {
+        // An adapter can declare BOTH `(host, None)` and `(host,
+        // Some(handle))` if it wants to allow either egress shape
+        // against the same host. Pin this admit-both contract so a
+        // future tightening doesn't inadvertently force adapters to
+        // pick one.
+        let policy = EgressPolicy::new([
+            DeclaredEgressTarget::new(host("api.example.com"), None),
+            pair("api.example.com", "example_token"),
+        ]);
+        let target_host = host("api.example.com");
+        let target_handle = handle("example_token");
+        // Bare request passes.
+        assert!(
+            policy
+                .check(EgressPolicyTarget {
+                    host: &target_host,
+                    credential_handle: None,
+                })
+                .is_ok()
+        );
+        // Credentialed request passes.
+        assert!(
+            policy
+                .check(EgressPolicyTarget {
+                    host: &target_host,
+                    credential_handle: Some(&target_handle),
+                })
+                .is_ok()
         );
     }
 

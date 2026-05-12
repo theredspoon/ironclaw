@@ -336,6 +336,54 @@ fn wasm_product_adapter_wit_preserves_product_adapter_trust_boundary() {
 }
 
 #[test]
+fn wasm_product_adapter_wit_pins_json_shim_shape() {
+    // Henry's review on PR #3352 flagged that the WIT carries adapter
+    // payloads as JSON strings (`parsed-json`, `evidence-json`,
+    // `outbound-json`, `egress-request-json`, `capabilities-json`),
+    // which weakens the typed component-model boundary. The host
+    // re-validates every JSON crossing on the Rust side via serde, so
+    // the seal contract still holds — but the typed redesign is a
+    // followup. This test pins the current shim shape so a future
+    // change must EITHER:
+    //   (a) update this test alongside the corresponding typed record
+    //       (deliberate redesign), OR
+    //   (b) fail boundary checks (accidental shape drift).
+    let wit = std::fs::read_to_string(
+        workspace_root().join("crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit"),
+    )
+    .expect("product adapter WIT must be readable");
+
+    // Top-level documentation MUST call out the shim explicitly so a
+    // reviewer doesn't have to infer the intent from the field names.
+    for required_doc in ["TEMPORARY", "JSON-string payload shim", "Follow-up"] {
+        assert!(
+            wit.contains(required_doc),
+            "WIT must document the JSON-shim status (`{required_doc}` missing); \
+             see top-of-file comment block before `package`"
+        );
+    }
+
+    // The five known JSON-shim fields. Each is the temporary surface
+    // covering a typed Rust DTO in `ironclaw_product_adapters`.
+    let shim_fields = [
+        ("parsed-inbound", "parsed-json: string"),
+        ("auth-evidence", "evidence-json: string"),
+        ("outbound-envelope", "outbound-json: string"),
+        ("outbound-render", "egress-request-json: string"),
+        ("adapter-manifest", "capabilities-json: string"),
+    ];
+    for (record, field) in shim_fields {
+        assert!(
+            wit.contains(field),
+            "WIT JSON-shim field `{field}` in record `{record}` is missing. \
+             If you removed it as part of a typed redesign, update this test \
+             to assert the new typed shape instead — otherwise the boundary \
+             is silently drifting"
+        );
+    }
+}
+
+#[test]
 fn reborn_runtime_http_egress_has_single_network_boundary() {
     let forbidden = [
         ForbiddenRuntimeNetworkUse {

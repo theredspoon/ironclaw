@@ -25,6 +25,26 @@
 //   them. Raw response headers remain host-only and are not exposed here.
 // - `log` and `now-millis` are the only general-purpose host imports. WASM
 //   gets no filesystem, no env, no random, no raw clock outside `now-millis`.
+//
+// TEMPORARY: JSON-string payload shim
+// ===================================
+// The `parsed-inbound`, `auth-evidence`, `outbound-envelope`,
+// `outbound-render`, and `adapter-manifest.capabilities-json` records
+// carry their payloads as `string` (JSON-encoded) instead of typed
+// component-model records. This is a deliberate temporary shim so the
+// host-side Rust DTOs in `ironclaw_product_adapters` can evolve without
+// rev'ing the WIT signature on every field addition. The host still
+// type-checks every JSON crossing back into Rust via serde, so it
+// cannot fabricate verified evidence or smuggle host-only fields —
+// the seal mechanism is enforced on the Rust side.
+//
+// Follow-up: replace these `*-json: string` fields with typed records
+// once the DTOs in `ironclaw_product_adapters` stabilize. The boundary
+// test `wasm_product_adapter_wit_pins_json_shim_shape` in
+// `crates/ironclaw_architecture/tests/reborn_dependency_boundaries.rs`
+// pins the current shape so future changes are deliberate — removing
+// any of the JSON-shim fields without also updating that test (and
+// landing the corresponding typed record) will fail boundary checks.
 
 package near:product-adapter@0.1.0;
 
