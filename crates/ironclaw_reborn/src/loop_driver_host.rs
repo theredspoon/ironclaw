@@ -29,12 +29,13 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityFailure,
-        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
-        FinalizeAssistantMessage, HostManagedLoopPromptPort, LoopCapabilityPort,
-        LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextPort,
-        LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch,
-        LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelResponse,
-        LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
+        HostManagedLoopPromptPort,
+        InMemoryInstructionMaterializationStore, InstructionMaterializationStore,
+        LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
+        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
+        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
         LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
         LoopTranscriptPort, ProcessHandleSummary, UpdateAssistantDraft, VisibleCapabilityRequest,
         VisibleCapabilitySurface,
@@ -87,22 +88,22 @@ pub struct RebornLoopDriverHostRequest {
 
 #[derive(Default)]
 struct CapabilitySurfaceState {
-    current: Mutex<Option<CapabilitySurfaceVersion>>,
+    current: Mutex<Option<VisibleCapabilitySurface>>,
 }
 
 impl CapabilitySurfaceState {
-    fn set_current(&self, version: CapabilitySurfaceVersion) -> Result<(), AgentLoopHostError> {
+    fn set_current(&self, surface: VisibleCapabilitySurface) -> Result<(), AgentLoopHostError> {
         let mut current = self.current.lock().map_err(|_| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Unavailable,
                 "capability surface state is unavailable",
             )
         })?;
-        *current = Some(version);
+        *current = Some(surface);
         Ok(())
     }
 
-    fn current(&self) -> Result<Option<CapabilitySurfaceVersion>, AgentLoopHostError> {
+    fn current(&self) -> Result<Option<VisibleCapabilitySurface>, AgentLoopHostError> {
         self.current
             .lock()
             .map(|current| current.clone())
@@ -136,7 +137,7 @@ impl LoopCapabilityPort for SurfaceTrackingLoopCapabilityPort {
         request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         let surface = self.inner.visible_capabilities(request).await?;
-        self.surface_state.set_current(surface.version.clone())?;
+        self.surface_state.set_current(surface.clone())?;
         Ok(surface)
     }
 
@@ -998,6 +999,8 @@ where
             context_adapter = context_adapter.with_skill_context_source(source.clone());
         }
         let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
+        let instruction_materialization_store: Arc<dyn InstructionMaterializationStore> =
+            Arc::new(InMemoryInstructionMaterializationStore::default());
         let surface_state = Arc::new(CapabilitySurfaceState::default());
         let capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
             SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
@@ -1016,7 +1019,8 @@ where
                 Arc::clone(&self.milestone_sink),
             )
             .with_default_message_limit(max_messages)
-            .with_current_surface_version_lookup(move || surface_state_for_prompt.current()),
+            .with_current_surface_lookup(move || surface_state_for_prompt.current())
+            .with_instruction_materialization_store(Arc::clone(&instruction_materialization_store)),
         );
         let input: Arc<dyn LoopInputPort> =
             Arc::new(NoExtraLoopInputPort::new(run_context.clone()));
@@ -1031,6 +1035,8 @@ where
         if let Some(source) = self.skill_context_source.as_ref() {
             model_adapter = model_adapter.with_skill_context_source(source.clone());
         }
+        model_adapter =
+            model_adapter.with_instruction_materialization_store(instruction_materialization_store);
         let model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
         let checkpoint: Arc<dyn LoopCheckpointPort> = Arc::new(HostManagedLoopCheckpointPort::new(
             run_context.clone(),

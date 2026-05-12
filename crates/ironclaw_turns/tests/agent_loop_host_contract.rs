@@ -19,7 +19,9 @@ use ironclaw_turns::{
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityInputRef,
         CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
         FinalizeAssistantMessage, HostManagedLoopModelPort, HostManagedLoopPromptPort,
-        InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
+        InMemoryInstructionMaterializationStore, InMemoryLoopHostMilestoneSink,
+        InstructionBundleBuilder, InstructionBundleFingerprint, InstructionBundleRequest,
+        InstructionSafetyContext, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
         LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextBundle, LoopContextMessage,
         LoopContextPort, LoopContextRequest, LoopContextSnippet, LoopContextSnippetMetadata,
         LoopDriverId, LoopDriverNoteKind, LoopHostMilestone, LoopHostMilestoneEmitter,
@@ -271,6 +273,245 @@ async fn host_managed_model_port_sanitizes_gateway_errors() {
 }
 
 #[tokio::test]
+async fn instruction_bundle_builder_orders_sections_and_rebuilds_deterministically() {
+    let context = claimed_run_context().await;
+    let surface = VisibleCapabilitySurface {
+        version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+        descriptors: vec![CapabilityDescriptorView {
+            capability_id: CapabilityId::new("demo.echo").unwrap(),
+            provider: None,
+            runtime: RuntimeKind::FirstParty,
+            safe_name: "Echo".to_string(),
+            safe_description: "Echo safe input".to_string(),
+        }],
+    };
+    let request = InstructionBundleRequest {
+        context_bundle: LoopContextBundle {
+            identity_messages: vec![LoopContextMessage {
+                message_ref: LoopMessageRef::new("msg:identity").unwrap(),
+                role: "system".to_string(),
+                safe_summary: "identity safe".to_string(),
+            }],
+            messages: vec![LoopContextMessage {
+                message_ref: LoopMessageRef::new("msg:user-message").unwrap(),
+                role: "user".to_string(),
+                safe_summary: "user safe".to_string(),
+            }],
+            instruction_snippets: vec![
+                LoopContextSnippet {
+                    snippet_ref: "instruction:project".to_string(),
+                    safe_summary: "project rule".to_string(),
+                    metadata: None,
+                },
+                LoopContextSnippet {
+                    snippet_ref: "skill:alpha".to_string(),
+                    safe_summary: "alpha skill".to_string(),
+                    metadata: Some(LoopContextSnippetMetadata {
+                        source_name: "alpha".to_string(),
+                        trust_level: "trusted".to_string(),
+                    }),
+                },
+                LoopContextSnippet {
+                    snippet_ref: "instruction:system".to_string(),
+                    safe_summary: "system rule".to_string(),
+                    metadata: None,
+                },
+                LoopContextSnippet {
+                    snippet_ref: "instruction:user".to_string(),
+                    safe_summary: "user rule".to_string(),
+                    metadata: None,
+                },
+                LoopContextSnippet {
+                    snippet_ref: "instruction:agent".to_string(),
+                    safe_summary: "agent rule".to_string(),
+                    metadata: None,
+                },
+            ],
+            memory_snippets: vec![LoopContextSnippet {
+                snippet_ref: "memory:project-summary".to_string(),
+                safe_summary: "project memory".to_string(),
+                metadata: None,
+            }],
+        },
+        visible_surface: Some(surface),
+        safety_context: Some(
+            InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
+                .unwrap(),
+        ),
+    };
+
+    let builder = InstructionBundleBuilder::new(context);
+    let first = builder.build(request.clone()).unwrap();
+    let second = builder.build(request).unwrap();
+
+    assert_eq!(first.fingerprint, second.fingerprint);
+    assert_eq!(first.messages, second.messages);
+    assert_eq!(
+        first
+            .messages
+            .iter()
+            .map(|message| message.content_ref.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec![
+            "msg:identity".to_string(),
+            first.messages[1].content_ref.as_str().to_string(),
+            first.messages[2].content_ref.as_str().to_string(),
+            first.messages[3].content_ref.as_str().to_string(),
+            first.messages[4].content_ref.as_str().to_string(),
+            first.messages[5].content_ref.as_str().to_string(),
+            first.messages[6].content_ref.as_str().to_string(),
+            first.messages[7].content_ref.as_str().to_string(),
+            first.messages[8].content_ref.as_str().to_string(),
+            "msg:user-message".to_string(),
+        ]
+    );
+    assert!(
+        first.messages[1]
+            .content_ref
+            .as_str()
+            .starts_with("msg:instruction.instruction.system.")
+    );
+    assert!(
+        first.messages[2]
+            .content_ref
+            .as_str()
+            .starts_with("msg:instruction.instruction.user.")
+    );
+    assert!(
+        first.messages[3]
+            .content_ref
+            .as_str()
+            .starts_with("msg:instruction.instruction.agent.")
+    );
+    assert!(
+        first.messages[4]
+            .content_ref
+            .as_str()
+            .starts_with("msg:instruction.instruction.project.")
+    );
+    assert!(
+        first.messages[5]
+            .content_ref
+            .as_str()
+            .starts_with("msg:snippet.skill.alpha.")
+    );
+    assert!(
+        first.messages[6]
+            .content_ref
+            .as_str()
+            .starts_with("msg:memory.memory.project-summary.")
+    );
+    assert!(
+        first.messages[7]
+            .content_ref
+            .as_str()
+            .starts_with("msg:safety.safety.prompt-write.")
+    );
+    assert!(
+        first.messages[8]
+            .content_ref
+            .as_str()
+            .starts_with("msg:surface.surface-v1.")
+    );
+    assert_eq!(first.skill_context.len(), 1);
+    assert_eq!(first.skill_context[0].source_name, "alpha");
+}
+
+#[test]
+fn instruction_bundle_fingerprint_deserialize_rejects_invalid_values() {
+    let error = serde_json::from_value::<InstructionBundleFingerprint>(serde_json::json!(
+        "not-a-sha256-fingerprint"
+    ))
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("instruction bundle fingerprint must start with sha256:")
+    );
+}
+
+#[tokio::test]
+async fn instruction_bundle_builder_allows_safe_domain_terms_in_summaries() {
+    let context = claimed_run_context().await;
+    let builder = InstructionBundleBuilder::new(context);
+
+    builder
+        .build(InstructionBundleRequest {
+            context_bundle: LoopContextBundle {
+                identity_messages: Vec::new(),
+                messages: Vec::new(),
+                instruction_snippets: vec![LoopContextSnippet {
+                    snippet_ref: "instruction:system".to_string(),
+                    safe_summary: "Explain how to rotate a secret without exposing values"
+                        .to_string(),
+                    metadata: None,
+                }],
+                memory_snippets: Vec::new(),
+            },
+            visible_surface: None,
+            safety_context: None,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn instruction_bundle_serialization_hides_materialized_content() {
+    let context = claimed_run_context().await;
+    let bundle = InstructionBundleBuilder::new(context)
+        .build(InstructionBundleRequest {
+            context_bundle: LoopContextBundle {
+                identity_messages: Vec::new(),
+                messages: Vec::new(),
+                instruction_snippets: vec![LoopContextSnippet {
+                    snippet_ref: "instruction:system".to_string(),
+                    safe_summary: "RAW_MATERIALIZED_PROMPT_SENTINEL".to_string(),
+                    metadata: None,
+                }],
+                memory_snippets: Vec::new(),
+            },
+            visible_surface: None,
+            safety_context: None,
+        })
+        .unwrap();
+
+    assert!(
+        bundle
+            .materialized_messages
+            .iter()
+            .any(|message| message.safe_content == "RAW_MATERIALIZED_PROMPT_SENTINEL")
+    );
+    let wire = serde_json::to_string(&bundle).unwrap();
+    assert!(!wire.contains("RAW_MATERIALIZED_PROMPT_SENTINEL"));
+    assert!(!wire.contains("materialized_messages"));
+}
+
+#[tokio::test]
+async fn instruction_bundle_builder_rejects_unsafe_instruction_context() {
+    let context = claimed_run_context().await;
+    let builder = InstructionBundleBuilder::new(context);
+
+    let error = builder
+        .build(InstructionBundleRequest {
+            context_bundle: LoopContextBundle {
+                identity_messages: Vec::new(),
+                messages: Vec::new(),
+                instruction_snippets: vec![LoopContextSnippet {
+                    snippet_ref: "instruction:system".to_string(),
+                    safe_summary: "leaks /Users/alice/.ssh/id_rsa path".to_string(),
+                    metadata: None,
+                }],
+                memory_snippets: Vec::new(),
+            },
+            visible_surface: None,
+            safety_context: None,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+}
+
+#[tokio::test]
 async fn loop_prompt_port_builds_text_only_bundle_from_context_refs() {
     let host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
     let surface_version = CapabilitySurfaceVersion::new("surface-v1").unwrap();
@@ -444,7 +685,10 @@ async fn loop_prompt_port_keeps_identity_before_skill_snippets_and_records_skill
         host.context.clone(),
         host.clone(),
         host.milestone_sink.clone(),
-    );
+    )
+    .with_instruction_materialization_store(Arc::new(
+        InMemoryInstructionMaterializationStore::default(),
+    ));
 
     let bundle = port
         .build_prompt_bundle(LoopPromptBundleRequest {
@@ -699,11 +943,10 @@ async fn loop_prompt_port_rejects_stale_surface_version() {
 }
 
 #[tokio::test]
-async fn loop_prompt_port_rejects_memory_snippets_it_cannot_materialize() {
+async fn loop_prompt_port_rejects_unstored_synthetic_instruction_refs() {
     let host = Arc::new(
         RecordingAgentLoopHost::new(claimed_run_context().await)
-            .with_context_instruction_snippet("instruction:system", "system instruction available")
-            .with_context_memory_snippet("memory:project", "project memory available"),
+            .with_context_instruction_snippet("instruction:system", "system instruction available"),
     );
     let port = HostManagedLoopPromptPort::new(
         host.context.clone(),
@@ -722,9 +965,72 @@ async fn loop_prompt_port_rejects_memory_snippets_it_cannot_materialize() {
         .await
         .unwrap_err();
 
-    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+    assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+}
+
+#[tokio::test]
+async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_refs() {
+    let host = Arc::new(
+        RecordingAgentLoopHost::new(claimed_run_context().await)
+            .with_context_instruction_snippet("instruction:system", "system instruction available")
+            .with_context_memory_snippet("memory:project", "project memory available"),
+    );
+    let surface = VisibleCapabilitySurface {
+        version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+        descriptors: vec![CapabilityDescriptorView {
+            capability_id: CapabilityId::new("demo.echo").unwrap(),
+            provider: None,
+            runtime: RuntimeKind::FirstParty,
+            safe_name: "Echo".to_string(),
+            safe_description: "Echo safe input".to_string(),
+        }],
+    };
+    let port = HostManagedLoopPromptPort::new(
+        host.context.clone(),
+        host.clone(),
+        host.milestone_sink.clone(),
+    )
+    .with_instruction_materialization_store(Arc::new(
+        InMemoryInstructionMaterializationStore::default(),
+    ))
+    .with_current_surface(surface.clone())
+    .with_safety_context(
+        InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
+            .unwrap(),
+    );
+
+    let bundle = port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: Some(surface.version),
+            checkpoint_state_ref: None,
+            max_messages: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(bundle.messages.iter().any(|message| {
+        message
+            .content_ref
+            .as_str()
+            .starts_with("msg:memory.memory.project.")
+    }));
+    assert!(bundle.messages.iter().any(|message| {
+        message
+            .content_ref
+            .as_str()
+            .starts_with("msg:safety.safety.prompt-write.")
+    }));
+    assert!(bundle.messages.iter().any(|message| {
+        message
+            .content_ref
+            .as_str()
+            .starts_with("msg:surface.surface-v1.")
+    }));
+    assert!(bundle.instruction_fingerprint.is_some());
     assert_eq!(host.effects(), vec!["context"]);
-    assert!(host.milestones().is_empty());
+    assert_eq!(host.milestone_kind_names(), vec!["prompt_bundle_built"]);
 }
 
 #[tokio::test]
@@ -828,7 +1134,7 @@ fn capability_surface_versions_are_public_safe_tokens() {
 async fn loop_prompt_bundle_public_serialization_hides_raw_content() {
     let host = Arc::new(
         RecordingAgentLoopHost::new(claimed_run_context().await)
-            .with_context_message_safe_summary("RAW_PROMPT_SENTINEL /host/path secret"),
+            .with_context_message_safe_summary("safe prompt summary"),
     );
     let port = HostManagedLoopPromptPort::new(
         host.context.clone(),
@@ -1537,6 +1843,7 @@ impl LoopPromptPort for RecordingAgentLoopHost {
                 })
                 .collect(),
             surface_version: request.surface_version,
+            instruction_fingerprint: None,
         };
         self.milestone_emitter()
             .prompt_bundle_built(

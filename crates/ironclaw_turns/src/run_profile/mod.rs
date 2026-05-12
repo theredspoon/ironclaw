@@ -10,6 +10,7 @@
 
 mod driver;
 mod host;
+mod instruction_bundle;
 mod memory_context;
 mod milestones;
 mod model;
@@ -41,6 +42,11 @@ pub use host::{
     LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
     ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode, UpdateAssistantDraft,
     VisibleCapabilityRequest, VisibleCapabilitySurface, validate_model_route_component_value,
+};
+pub use instruction_bundle::{
+    InMemoryInstructionMaterializationStore, InstructionBundle, InstructionBundleBuilder,
+    InstructionBundleFingerprint, InstructionBundleMaterializedMessage, InstructionBundleRequest,
+    InstructionMaterializationStore, InstructionSafetyContext,
 };
 pub use memory_context::{
     EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,
