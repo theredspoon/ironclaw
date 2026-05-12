@@ -1383,3 +1383,51 @@ fn lowercase_percent_escapes(value: &str) -> String {
     }
     output
 }
+
+#[cfg(test)]
+mod security_findings_poc {
+    //! Proof-of-concept tests for the security review of the runtime HTTP
+    //! egress credential injection path. Each test below is a failing
+    //! regression test for a finding from the 2026-05 review; the fix lands
+    //! alongside the assertion flip.
+    //!
+    //! Findings covered here:
+    //!
+    //! - **H1** — `RuntimeCredentialMaterialCacheEntry::value` is
+    //!   `Option<String>`. Once a `SecretMaterial` is leased, we copy its
+    //!   plaintext into a plain `String` and stash it in the cache `Vec` for
+    //!   the lifetime of the egress request. `String` has no `ZeroizeOnDrop`,
+    //!   so the plaintext sits on the heap and is freed-without-wipe at the
+    //!   end of the request, defeating the whole `SecretMaterial = SecretString`
+    //!   protection.
+
+    use super::{RuntimeCredentialMaterialCacheEntry, RuntimeCredentialMaterialKey};
+    use ironclaw_host_api::SecretHandle;
+
+    /// **Finding H1.** The credential material cache value must be a
+    /// zeroize-on-drop type. Today the field is `Option<String>` so the
+    /// plaintext copied out of `SecretMaterial` is freed without wiping.
+    ///
+    /// The fix is to store the leased material as `Option<SecretMaterial>`
+    /// (alias for `secrecy::SecretString`), which carries `ZeroizeOnDrop`
+    /// semantics. Once that change lands, the type name of the value field
+    /// will contain `SecretString` and this assertion passes.
+    #[test]
+    #[ignore = "PoC for finding H1 — fails today; remove #[ignore] together with the cache-type fix"]
+    fn h1_credential_material_cache_value_must_be_zeroizing() {
+        let entry = RuntimeCredentialMaterialCacheEntry {
+            key: RuntimeCredentialMaterialKey::SecretStoreLease {
+                handle: SecretHandle::new("h").unwrap(),
+            },
+            value: None,
+        };
+        let value_type = std::any::type_name_of_val(&entry.value);
+        assert!(
+            value_type.contains("SecretString") || value_type.contains("SecretMaterial"),
+            "H1: credential cache value type must be zeroize-on-drop \
+             (Option<SecretString>/Option<SecretMaterial>), got {value_type}. \
+             A plain String leaves plaintext on the heap for the duration of \
+             the egress request, defeating SecretString::ZeroizeOnDrop."
+        );
+    }
+}

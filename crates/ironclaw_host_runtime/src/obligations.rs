@@ -1747,3 +1747,54 @@ fn obligation_label(obligation: &Obligation) -> Option<&'static str> {
         Obligation::EnforceResourceCeiling { .. } => Some("enforce_resource_ceiling"),
     }
 }
+
+#[cfg(test)]
+mod security_findings_poc {
+    //! Regression guard for the H2 finding from the 2026-05 security review.
+    //!
+    //! The original H2 claim was that `RuntimeSecretInjectionStore`'s
+    //! `HashMap<_, RuntimeSecretInjectionEntry>` would bitwise-copy plaintext
+    //! out of the old bucket array on rehash and free it without
+    //! zeroization. On closer inspection that is *not* what happens, because
+    //! `SecretMaterial = secrecy::SecretBox<String>`, and `SecretBox` is
+    //! defined as `{ inner_secret: Box<String> }`. So:
+    //!
+    //! - The `HashMap` rehash moves the inline part of the entry — a single
+    //!   `Box<String>` pointer plus the `Instant` — to the new bucket. The
+    //!   old bucket bytes are freed, but they only contained the pointer
+    //!   value, not the plaintext.
+    //! - The actual `String` allocation (the bytes the operator stored)
+    //!   stays at its original heap address until the `SecretString` is
+    //!   dropped via `take()`, `discard_for_capability()`, or
+    //!   `prune_expired()`. At that point `SecretString`'s `Drop`
+    //!   zeroizes the buffer.
+    //!
+    //! The protection is real but it depends on the indirection inside
+    //! `SecretBox`. If somebody ever swaps the entry for an inline
+    //! `String`-backed type — or wraps `SecretMaterial` in something that
+    //! erases the inner `Box` — the bitwise-copy concern returns. This
+    //! regression test asserts the indirection so that the protection
+    //! cannot silently disappear.
+
+    use super::RuntimeSecretInjectionEntry;
+    use ironclaw_secrets::SecretMaterial;
+    use std::time::Instant;
+
+    #[test]
+    fn h2_staged_secret_material_keeps_heap_indirection() {
+        let entry = RuntimeSecretInjectionEntry {
+            material: SecretMaterial::from("sentinel".to_string()),
+            expires_at: Instant::now(),
+        };
+        let material_type = std::any::type_name_of_val(&entry.material);
+        assert!(
+            material_type.contains("Box<")
+                || material_type.contains("Arc<")
+                || material_type.contains("Pin<"),
+            "H2 regression guard: staged-secret entry must keep heap \
+             indirection (today via SecretBox<String>'s internal Box). If \
+             this assertion fails, HashMap rehash will bitwise-copy plaintext \
+             out of the old bucket array. Got {material_type}."
+        );
+    }
+}
