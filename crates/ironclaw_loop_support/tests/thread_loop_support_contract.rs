@@ -770,9 +770,9 @@ async fn transcript_port_emits_assistant_reply_finalized_milestone_without_reply
     assert!(!wire.contains("tool_input"));
 }
 
+#[traced_test]
 #[tokio::test]
-async fn transcript_port_retries_assistant_reply_finalized_milestone_after_transient_sink_failure()
-{
+async fn transcript_port_keeps_finalized_reply_successful_after_milestone_sink_failure() {
     let fixture = ThreadFixture::new().await;
     let milestone_sink = Arc::new(FailOnceMilestoneSink::default());
     let adapter = ThreadBackedLoopTranscriptPort::with_milestone_sink(
@@ -787,13 +787,17 @@ async fn transcript_port_retries_assistant_reply_finalized_milestone_after_trans
         },
     };
 
-    let first_error = adapter
+    let first_ref = adapter
         .finalize_assistant_message(request.clone())
         .await
-        .unwrap_err();
-    assert_eq!(first_error.kind, AgentLoopHostErrorKind::Unavailable);
+        .unwrap();
+    assert!(milestone_sink.milestones().is_empty());
+    assert!(logs_contain(
+        "loop assistant_reply_finalized milestone failed after finalized transcript write"
+    ));
 
     let message_ref = adapter.finalize_assistant_message(request).await.unwrap();
+    assert_eq!(first_ref, message_ref);
 
     let milestones = milestone_sink.milestones();
     assert_eq!(milestones.len(), 1);
@@ -1286,7 +1290,7 @@ async fn model_port_emits_model_milestones_without_prompt_or_output_payloads() {
 }
 
 #[tokio::test]
-async fn model_port_emits_only_started_milestone_when_gateway_fails() {
+async fn model_port_emits_started_and_failed_milestones_when_gateway_fails() {
     let fixture = ThreadFixture::new_with_user_content("RAW_PROMPT_TEXT_SENTINEL").await;
     let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
     let gateway = Arc::new(RecordingGateway::deny(
@@ -1316,11 +1320,17 @@ async fn model_port_emits_only_started_milestone_when_gateway_fails() {
 
     assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
     let milestones = milestone_sink.milestones();
-    assert_eq!(milestones.len(), 1);
+    assert_eq!(milestones.len(), 2);
     assert!(matches!(
         &milestones[0].kind,
         LoopHostMilestoneKind::ModelStarted {
             requested_model_profile_id: None
+        }
+    ));
+    assert!(matches!(
+        &milestones[1].kind,
+        LoopHostMilestoneKind::ModelFailed {
+            reason_kind: AgentLoopHostErrorKind::PolicyDenied
         }
     ));
     let wire = serde_json::to_string(&milestones).unwrap();
@@ -1334,6 +1344,47 @@ async fn model_port_emits_only_started_milestone_when_gateway_fails() {
     ] {
         assert!(!wire.contains(forbidden), "milestone leaked {forbidden}");
     }
+}
+
+#[traced_test]
+#[tokio::test]
+async fn model_port_logs_model_started_milestone_failure_without_losing_response() {
+    let fixture = ThreadFixture::new().await;
+    let milestone_sink = Arc::new(FailOnModelStartedMilestoneSink::default());
+    let gateway = Arc::new(RecordingGateway::reply(
+        "model response survives start milestone failure",
+    ));
+    let port = ThreadBackedLoopModelPort::with_milestone_sink(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway,
+        16,
+        milestone_sink.clone(),
+    );
+
+    let response = port
+        .stream_model(LoopModelRequest {
+            messages: vec![LoopModelMessage {
+                role: "user".to_string(),
+                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
+                    .unwrap(),
+            }],
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        response.output,
+        ParentLoopOutput::AssistantReply(AssistantReply { ref content })
+            if content == "model response survives start milestone failure"
+    ));
+    assert_eq!(milestone_sink.kind_names(), vec!["model_completed"]);
+    assert!(logs_contain(
+        "loop model_started milestone failed before model request"
+    ));
 }
 
 #[traced_test]
@@ -1836,6 +1887,39 @@ impl ironclaw_turns::run_profile::LoopHostMilestoneSink for FailOnceMilestoneSin
             ));
         }
         attempts.push(milestone);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FailOnModelStartedMilestoneSink {
+    published: Mutex<Vec<ironclaw_turns::run_profile::LoopHostMilestone>>,
+}
+
+impl FailOnModelStartedMilestoneSink {
+    fn kind_names(&self) -> Vec<&'static str> {
+        self.published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|milestone| milestone.kind.kind_name())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ironclaw_turns::run_profile::LoopHostMilestoneSink for FailOnModelStartedMilestoneSink {
+    async fn publish_loop_milestone(
+        &self,
+        milestone: ironclaw_turns::run_profile::LoopHostMilestone,
+    ) -> Result<(), ironclaw_turns::run_profile::AgentLoopHostError> {
+        if matches!(milestone.kind, LoopHostMilestoneKind::ModelStarted { .. }) {
+            return Err(ironclaw_turns::run_profile::AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "loop milestone sink unavailable",
+            ));
+        }
+        self.published.lock().unwrap().push(milestone);
         Ok(())
     }
 }
