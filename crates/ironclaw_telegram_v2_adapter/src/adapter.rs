@@ -2,15 +2,14 @@
 
 use async_trait::async_trait;
 use ironclaw_product_adapters::{
-    AdapterInstallationId, DeclaredEgressHost, EgressCredentialHandle, ProductAdapter,
-    ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId, ProductCapabilityFlag,
-    ProductInboundEnvelope, ProductOutboundEnvelope, ProductOutboundPayload, ProductSurfaceKind,
-    ProtocolAuthEvidence, ProtocolHttpEgress, ProtocolHttpEgressError, redaction::RedactedString,
+    AdapterInstallationId, AuthRequirement, DeclaredEgressHost, EgressCredentialHandle,
+    OutboundDeliverySink, ParsedProductInbound, ProductAdapter, ProductAdapterCapabilities,
+    ProductAdapterError, ProductAdapterId, ProductCapabilityFlag, ProductOutboundEnvelope,
+    ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind, ProtocolAuthEvidence,
+    ProtocolHttpEgress, ProtocolHttpEgressError,
 };
 
-use crate::payload::{
-    GroupTriggerPolicy, TELEGRAM_API_HOST, TelegramParsedInbound, parse_telegram_update,
-};
+use crate::payload::{GroupTriggerPolicy, TELEGRAM_API_HOST, parse_telegram_update};
 use crate::render::{render_final_reply, render_progress_typing};
 
 /// Configuration for a Telegram v2 adapter installation.
@@ -22,6 +21,11 @@ pub struct TelegramV2AdapterConfig {
     /// Credential handle (resolved by the host to the bot token at request
     /// time) used for egress to api.telegram.org.
     pub egress_credential_handle: EgressCredentialHandle,
+    /// Auth requirement the host enforces before invoking `parse_inbound`.
+    /// Telegram webhooks use a shared-secret header; the host verifies the
+    /// header and mints a `ProtocolAuthEvidence::Verified` claim before
+    /// any adapter-side parsing happens.
+    pub auth_requirement: AuthRequirement,
     /// If true, the adapter advertises `ExternalProgressPush` and renders
     /// typing indicators on outbound `Progress` envelopes. Default: false
     /// (#3266 progress-opt-in policy).
@@ -73,54 +77,54 @@ impl ProductAdapter for TelegramV2Adapter {
         &self.capabilities
     }
 
+    fn auth_requirement(&self) -> &AuthRequirement {
+        &self.config.auth_requirement
+    }
+
     fn parse_inbound(
         &self,
         raw_payload: &[u8],
-        auth_evidence: ProtocolAuthEvidence,
-    ) -> Result<Option<ProductInboundEnvelope>, ProductAdapterError> {
-        let parsed = parse_telegram_update(
+        auth_evidence: &ProtocolAuthEvidence,
+    ) -> Result<ParsedProductInbound, ProductAdapterError> {
+        parse_telegram_update(
             raw_payload,
             auth_evidence,
-            &self.config.adapter_id,
             &self.config.installation_id,
             &self.config.group_trigger_policy,
         )
         .map_err(|err| match err {
             crate::payload::PayloadParseError::UnauthenticatedPayload => {
                 ProductAdapterError::Authentication(
-                    ironclaw_product_adapters::ProtocolAuthFailure::Other {
-                        detail: RedactedString::new(
-                            "telegram parse_inbound called with unverified evidence",
-                        ),
-                    },
+                    ironclaw_product_adapters::ProtocolAuthFailure::Missing,
                 )
             }
             crate::payload::PayloadParseError::InvalidJson { reason } => {
-                ProductAdapterError::MalformedInboundPayload { reason }
+                ProductAdapterError::MalformedInboundPayload {
+                    reason: ironclaw_product_adapters::redaction::RedactedString::new(reason),
+                }
             }
             crate::payload::PayloadParseError::MissingUpdateId => {
                 ProductAdapterError::MalformedInboundPayload {
-                    reason: "telegram update missing update_id".into(),
+                    reason: ironclaw_product_adapters::redaction::RedactedString::new(
+                        "telegram update missing update_id",
+                    ),
                 }
             }
             crate::payload::PayloadParseError::InvalidExternalRef { kind, reason } => {
                 ProductAdapterError::InvalidIdentifier { kind, reason }
             }
-        })?;
-        match parsed {
-            TelegramParsedInbound::Envelope(envelope) => Ok(Some(*envelope)),
-            TelegramParsedInbound::NoOp => Ok(None),
-        }
+        })
     }
 
     async fn render_outbound(
         &self,
         envelope: ProductOutboundEnvelope,
         egress: &dyn ProtocolHttpEgress,
-    ) -> Result<(), ProductAdapterError> {
+        _delivery_sink: &dyn OutboundDeliverySink,
+    ) -> Result<ProductRenderOutcome, ProductAdapterError> {
         let request = match envelope.payload {
             ProductOutboundPayload::FinalReply(view) => render_final_reply(
-                &envelope.target,
+                &envelope.target.reply_target_binding_ref,
                 &view,
                 self.config.egress_credential_handle.clone(),
             )
@@ -134,16 +138,16 @@ impl ProductAdapter for TelegramV2Adapter {
                     // would not normally route a Progress envelope to a
                     // capability-ungated adapter, but this defends against a
                     // misrouted envelope reaching us.
-                    return Ok(());
+                    return Ok(ProductRenderOutcome::Deferred);
                 }
                 let Some(req) = render_progress_typing(
-                    &envelope.target,
+                    &envelope.target.reply_target_binding_ref,
                     &view,
                     self.config.egress_credential_handle.clone(),
                 )
                 .map_err(map_render_error)?
                 else {
-                    return Ok(());
+                    return Ok(ProductRenderOutcome::Deferred);
                 };
                 req
             }
@@ -151,30 +155,32 @@ impl ProductAdapter for TelegramV2Adapter {
                 // Deferred to #3094. The workflow renders a placeholder body
                 // via this branch in fake contract tests; real production
                 // flows do not produce gate envelopes for Telegram yet.
-                return Ok(());
+                return Ok(ProductRenderOutcome::Deferred);
             }
-            ProductOutboundPayload::ProjectionSnapshot(_)
-            | ProductOutboundPayload::ProjectionUpdate(_) => {
+            ProductOutboundPayload::ProjectionSnapshot { .. }
+            | ProductOutboundPayload::ProjectionUpdate { .. } => {
                 // Telegram never consumes projection subscriptions; the
                 // workflow should not route these to a Telegram installation.
-                // Return Ok to keep delivery best-effort.
-                return Ok(());
+                return Ok(ProductRenderOutcome::Deferred);
             }
         };
 
         let response = egress.send(request).await.map_err(map_egress_error)?;
-        if !(200..300).contains(&response.status) {
-            let reason = format!("telegram bot api returned status {}", response.status);
+        if !(200..300).contains(&response.status()) {
+            let reason = ironclaw_product_adapters::redaction::RedactedString::new(format!(
+                "telegram bot api returned status {}",
+                response.status()
+            ));
             // Group transient HTTP outcomes (5xx, 429) into the retryable
             // bucket so the host glue can re-deliver. 4xx (except 429) is
             // a deterministic policy-denied result and should NOT be
             // retried.
-            if response.status >= 500 || response.status == 429 {
+            if response.status() >= 500 || response.status() == 429 {
                 return Err(ProductAdapterError::WorkflowTransient { reason });
             }
             return Err(ProductAdapterError::EgressDenied { reason });
         }
-        Ok(())
+        Ok(ProductRenderOutcome::DeliveryRecorded)
     }
 }
 
@@ -197,18 +203,19 @@ fn map_render_error(err: crate::render::TelegramRenderError) -> ProductAdapterEr
 /// `WorkflowTransient` or a non-retryable `EgressDenied`. Network /
 /// timeout / leak-detector failures are treated as transient.
 fn map_egress_error(err: ProtocolHttpEgressError) -> ProductAdapterError {
+    let reason = ironclaw_product_adapters::redaction::RedactedString::new(err.to_string());
     match err {
         ProtocolHttpEgressError::Timeout
         | ProtocolHttpEgressError::Network(_)
-        | ProtocolHttpEgressError::LeakDetected => ProductAdapterError::WorkflowTransient {
-            reason: err.to_string(),
-        },
+        | ProtocolHttpEgressError::LeakDetected => {
+            ProductAdapterError::WorkflowTransient { reason }
+        }
         ProtocolHttpEgressError::UndeclaredHost { .. }
         | ProtocolHttpEgressError::UnknownCredentialHandle { .. }
         | ProtocolHttpEgressError::UnauthorizedCredentialHandle { .. }
-        | ProtocolHttpEgressError::PolicyDenied { .. } => ProductAdapterError::EgressDenied {
-            reason: err.to_string(),
-        },
+        | ProtocolHttpEgressError::PolicyDenied { .. } => {
+            ProductAdapterError::EgressDenied { reason }
+        }
     }
 }
 
@@ -228,8 +235,40 @@ mod tests {
             },
             egress_credential_handle: EgressCredentialHandle::new("telegram_bot_token")
                 .expect("valid"),
+            auth_requirement: AuthRequirement::SharedSecretHeader {
+                header_name: "X-Telegram-Bot-Api-Secret-Token".into(),
+            },
             progress_push_enabled: progress,
         }
+    }
+
+    fn test_outbound_target() -> ironclaw_product_adapters::ProductOutboundTarget {
+        let reply = crate::render::build_reply_target_binding(-100, Some(7), Some(42));
+        let conv = ironclaw_product_adapters::ExternalConversationRef::new(
+            None,
+            "-100",
+            None::<&str>,
+            None::<&str>,
+        )
+        .expect("valid");
+        ironclaw_product_adapters::ProductOutboundTarget::new(reply, conv, None)
+    }
+
+    fn test_outbound_target_no_topic_no_reply() -> ironclaw_product_adapters::ProductOutboundTarget
+    {
+        let reply = crate::render::build_reply_target_binding(-100, None, None);
+        let conv = ironclaw_product_adapters::ExternalConversationRef::new(
+            None,
+            "-100",
+            None::<&str>,
+            None::<&str>,
+        )
+        .expect("valid");
+        ironclaw_product_adapters::ProductOutboundTarget::new(reply, conv, None)
+    }
+
+    fn test_projection_cursor() -> ironclaw_product_adapters::ProjectionCursor {
+        ironclaw_product_adapters::ProjectionCursor::new("test-cursor").expect("valid")
     }
 
     #[test]
@@ -267,11 +306,11 @@ mod tests {
     #[test]
     fn parse_inbound_refuses_unverified_evidence() {
         let adapter = TelegramV2Adapter::new(config(false));
-        let unverified = ProtocolAuthEvidence::Failed {
-            failure: ironclaw_product_adapters::ProtocolAuthFailure::SharedSecretMismatch,
-        };
+        let unverified = ProtocolAuthEvidence::failed(
+            ironclaw_product_adapters::ProtocolAuthFailure::SharedSecretMismatch,
+        );
         let err = adapter
-            .parse_inbound(b"{\"update_id\":1}", unverified)
+            .parse_inbound(b"{\"update_id\":1}", &unverified)
             .expect_err("must fail");
         assert!(matches!(err, ProductAdapterError::Authentication(_)));
     }
@@ -281,11 +320,12 @@ mod tests {
         let adapter = TelegramV2Adapter::new(config(false));
         let egress = FakeProtocolHttpEgress::new(["api.telegram.org".to_string()]);
         egress.allow_credential_handle("telegram_bot_token");
+        let sink = ironclaw_product_adapters::FakeOutboundDeliverySink::new();
         let envelope = ProductOutboundEnvelope {
             adapter_id: adapter.adapter_id().clone(),
             installation_id: adapter.installation_id().clone(),
-            target: crate::render::build_reply_target_binding(-100, Some(7), Some(42)),
-            projection_cursor: None,
+            target: test_outbound_target(),
+            projection_cursor: test_projection_cursor(),
             payload: ProductOutboundPayload::FinalReply(
                 ironclaw_product_adapters::FinalReplyView {
                     turn_run_id: ironclaw_turns::TurnRunId::new(),
@@ -296,14 +336,14 @@ mod tests {
             delivery_attempt_id: uuid::Uuid::new_v4(),
         };
         adapter
-            .render_outbound(envelope, &egress)
+            .render_outbound(envelope, &egress, &sink)
             .await
             .expect("render ok");
         let calls = egress.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].host, "api.telegram.org");
-        assert_eq!(calls[0].method, "POST");
-        assert_eq!(calls[0].path, "/sendMessage");
+        assert_eq!(calls[0].host.as_str(), "api.telegram.org");
+        assert_eq!(calls[0].method.as_str(), "POST");
+        assert_eq!(calls[0].path.as_str(), "/sendMessage");
         assert_eq!(
             calls[0].credential_handle.as_deref(),
             Some("telegram_bot_token")
@@ -315,11 +355,12 @@ mod tests {
         let adapter = TelegramV2Adapter::new(config(false));
         let egress = FakeProtocolHttpEgress::new(["api.telegram.org".to_string()]);
         egress.allow_credential_handle("telegram_bot_token");
+        let sink = ironclaw_product_adapters::FakeOutboundDeliverySink::new();
         let envelope = ProductOutboundEnvelope {
             adapter_id: adapter.adapter_id().clone(),
             installation_id: adapter.installation_id().clone(),
-            target: crate::render::build_reply_target_binding(-100, None, None),
-            projection_cursor: None,
+            target: test_outbound_target_no_topic_no_reply(),
+            projection_cursor: test_projection_cursor(),
             payload: ProductOutboundPayload::Progress(
                 ironclaw_product_adapters::ProgressUpdateView {
                     turn_run_id: ironclaw_turns::TurnRunId::new(),
@@ -330,7 +371,7 @@ mod tests {
             delivery_attempt_id: uuid::Uuid::new_v4(),
         };
         adapter
-            .render_outbound(envelope, &egress)
+            .render_outbound(envelope, &egress, &sink)
             .await
             .expect("ok");
         // Progress is not advertised -> egress NOT called.
