@@ -4409,10 +4409,7 @@ name = "ironclaw_mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "ironclaw_dispatcher",
- "ironclaw_events",
  "ironclaw_extensions",
- "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_resources",
  "serde_json",
@@ -4576,7 +4573,35 @@ dependencies = [
  "clap_complete",
  "ironclaw_reborn",
  "ironclaw_reborn_config",
+ "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ironclaw_reborn_composition"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "deadpool-postgres",
+ "ironclaw_authorization",
+ "ironclaw_extensions",
+ "ironclaw_filesystem",
+ "ironclaw_host_api",
+ "ironclaw_host_runtime",
+ "ironclaw_network",
+ "ironclaw_processes",
+ "ironclaw_reborn_event_store",
+ "ironclaw_resources",
+ "ironclaw_run_state",
+ "ironclaw_secrets",
+ "ironclaw_trust",
+ "ironclaw_turns",
+ "libsql",
+ "secrecy",
+ "tempfile",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -4679,11 +4704,7 @@ dependencies = [
 name = "ironclaw_scripts"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "ironclaw_dispatcher",
- "ironclaw_events",
  "ironclaw_extensions",
- "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_resources",
  "rust_decimal_macros",

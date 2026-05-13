@@ -9,6 +9,7 @@ use crate::{
 };
 
 use super::{
+    instruction_bundle::InstructionBundleFingerprint,
     refs::{CheckpointSchemaId, LoopDriverId, ModelProfileId},
     snapshot::ResolvedRunProfile,
 };
@@ -806,6 +807,8 @@ pub struct LoopPromptBundle {
     pub bundle_ref: LoopPromptBundleRef,
     pub messages: Vec<LoopModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_fingerprint: Option<InstructionBundleFingerprint>,
 }
 
 /// Host boundary for building prompt bundles before model invocation.

@@ -10,6 +10,7 @@
 
 mod driver;
 mod host;
+mod instruction_bundle;
 mod memory_context;
 mod milestones;
 mod model;
@@ -19,6 +20,7 @@ mod refs;
 mod resolver;
 mod skill_context;
 mod snapshot;
+mod snippet_ref;
 
 pub use driver::{
     AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverResumeRequest,
@@ -41,6 +43,11 @@ pub use host::{
     ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode, UpdateAssistantDraft,
     VisibleCapabilityRequest, VisibleCapabilitySurface, sanitize_model_visible_text,
     validate_model_route_component_value,
+};
+pub use instruction_bundle::{
+    InMemoryInstructionMaterializationStore, InstructionBundle, InstructionBundleBuilder,
+    InstructionBundleFingerprint, InstructionBundleMaterializedMessage, InstructionBundleRequest,
+    InstructionMaterializationStore, InstructionSafetyContext,
 };
 pub use memory_context::{
     EmptyMemoryPromptContextService, MemoryPromptContextRequest, MemoryPromptContextService,
@@ -77,3 +84,4 @@ pub use skill_context::{
     skill_snippet_model_message_ref,
 };
 pub use snapshot::ResolvedRunProfile;
+pub use snippet_ref::memory_snippet_display_ref;
