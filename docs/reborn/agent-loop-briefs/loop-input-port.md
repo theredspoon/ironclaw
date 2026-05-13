@@ -248,10 +248,41 @@ The executor (master doc §8 step 2) filters by kind in the steering
 drain — only `UserMessage`, `FollowUp`, `Steering` are appended to
 state; the four control kinds are observed elsewhere (cancel via
 WS-13's cancellation port; capability surface via the per-iteration
-surface re-pin; gate resolution via the planner's recovery loop).
+surface re-pin; gate resolution via the blocked-run resumer in
+§3.3.5).
 
 The port does **not** filter. Stateless about loop policy keeps the
 adapter testable and keeps the policy decision in one place.
+
+### 3.3.5 `GateResolved` wakeup path for blocked runs
+
+`GateResolved` is not a steering message. A run that returned
+`LoopExit::Blocked` is no longer inside the executor's steering drain,
+so filtering the event out of step 2 is only correct if the host has a
+separate wakeup path for blocked runs. WS-11 defines that path:
+
+1. Approval/auth/resource subsystems enqueue
+   `LoopInput::GateResolved { gate_ref }` for the blocked run when
+   the gate clears.
+2. The same enqueue operation notifies a host-owned
+   `BlockedRunResumer` (name illustrative; the implementation can
+   live in the run scheduler / turn coordinator layer).
+3. `BlockedRunResumer` claims the blocked run, verifies the cleared
+   `gate_ref` matches `LoopExit::Blocked.gate_ref` / the latest
+   `BeforeBlock` checkpoint metadata, loads the checkpoint payload via
+   WS-10's `load_checkpoint_payload`, and calls `PlannedDriver::resume`.
+4. The `GateResolved` cursor is acked only after the resume claim is
+   durable. If resume fails before claim, the unacked input is
+   redelivered and the resumer retries. If resume starts and later
+   returns another `LoopExit::Blocked`, that new blocked exit owns the
+   next gate.
+
+This keeps the executor single-purpose: active runs poll inputs during
+iteration; blocked runs are re-entered by the host scheduler in
+response to a control input. `GateResolved` may still appear in a
+normal poll if a gate clears before the executor returns `Blocked`;
+the steering drain ignores it because the active capability path has
+already observed the capability outcome.
 
 ### 3.4 Idempotency contract
 
@@ -348,6 +379,12 @@ Integration tests (in `crates/ironclaw_reborn`, gated behind
   iteration emits assistant reply; second iteration's followup drain
   picks up a queued FollowUp; assert a second model call happens
   and the run exits `Completed` only after that drain returns empty.
+- `planned_driver_gate_resolved_resumes_blocked_run` — first run
+  returns `LoopExit::Blocked` with a `gate_ref` and `BeforeBlock`
+  checkpoint; enqueue `GateResolved { gate_ref }`; drive the
+  `BlockedRunResumer`; assert it loads the WS-10 checkpoint, calls
+  `PlannedDriver::resume`, acks the cursor after claiming resume, and
+  reaches `LoopExit::Completed` once the capability succeeds.
 - `planned_driver_drains_when_iteration_caps` — queue all 33 inputs;
   assert `LoopFailureKind::IterationLimit` exits cleanly, no panic
   on the unconsumed input cursor.

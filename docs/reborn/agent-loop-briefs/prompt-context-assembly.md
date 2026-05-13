@@ -1,10 +1,12 @@
 # WS-15 — Prompt Context Assembly: Identity-File Surface
 
 **Workstream:** WS-15 (follow-up; not in the skeleton WS-0..WS-8 set)
-**Crates touched:** `ironclaw_loop_support` + `ironclaw_reborn`
-(no `ironclaw_turns` change — the slot already exists)
+**Crates touched:** `ironclaw_turns` + `ironclaw_loop_support` +
+`ironclaw_reborn` + `src/workspace`
 **Depends on:** WS-8 (skeleton landed and green)
-**Parallel with:** WS-9..WS-14
+**Parallel with:** WS-9..WS-13. WS-14's live-default cutover is
+gated on this workstream because the default Reborn loop must retain
+the existing workspace identity prompt behavior.
 **Master doc:** [`../agent-loop-skeleton.md`](../agent-loop-skeleton.md) §11–§12
 
 ---
@@ -24,15 +26,17 @@ This brief adds a `HostIdentityContextSource` trait — analogous to the
 existing `HostSkillContextSource` in
 [`crates/ironclaw_loop_support/src/skill_context.rs`](../../../crates/ironclaw_loop_support/src/skill_context.rs) —
 and wires it through the context port so identity files actually reach
-the prompt.
+the prompt. It also ships the concrete workspace-backed source that
+reads the current identity files through `Workspace::read_primary()`.
 
-This brief does **not** change any contract types in `ironclaw_turns`.
-The `identity_messages` slot, `LoopContextMessage` shape, and
-`LoopPromptBundleRequest` are unchanged. The assembly order in
-`HostManagedLoopPromptPort` (in
-[`crates/ironclaw_turns/src/run_profile/prompt.rs`](../../../crates/ironclaw_turns/src/run_profile/prompt.rs))
-is already `identity_messages` → `instruction_snippets` → `messages`;
-populating the first slot is the only behavior change.
+This brief includes two additive contract changes in
+`ironclaw_turns`: `LoopContextMessage.message_ref` becomes optional
+for summary-only identity entries, and `LoopContextRequest` carries
+the requested `PromptMode`. The assembly order remains
+`identity_messages` → `instruction_snippets` → `messages`, but
+`HostManagedLoopPromptPort` must learn how to materialize
+`message_ref: None` entries instead of blindly copying
+`message.message_ref`.
 
 ## 2. Files
 
@@ -42,6 +46,10 @@ populating the first slot is the only behavior change.
   value type, `HostIdentityContextBuildError`, and
   `build_identity_messages(...)` helper. Mirrors `skill_context.rs`
   shape.
+- `src/workspace/reborn_identity_context.rs` (or equivalent
+  workspace-owned module) — concrete `WorkspaceIdentityContextSource`
+  backed by the existing workspace read APIs and
+  `ironclaw_memory::safety::DEFAULT_PROMPT_PROTECTED_PATHS`.
 
 ### MODIFIED
 - `crates/ironclaw_turns/src/run_profile/host.rs` —
@@ -61,8 +69,15 @@ populating the first slot is the only behavior change.
   - `ThreadBackedLoopContextPort` gains an
     `Option<Arc<dyn HostIdentityContextSource>>` field on construction.
   - `load_loop_context()` calls
-    `build_identity_messages(source, run_context)` when set; otherwise
-    `Vec::new()` (today's behavior).
+    `build_identity_messages(source, run_context, request.mode,
+    identity_budget)` when set; otherwise `Vec::new()` (today's
+    behavior).
+- `crates/ironclaw_turns/src/run_profile/prompt.rs` —
+  `HostManagedLoopPromptPort` handles identity messages whose
+  `message_ref` is `None` by creating stable summary-only model refs
+  from `safe_summary`, analogous to skill snippet refs. It must not
+  drop those entries and must not try to resolve a missing
+  `LoopMessageRef`.
 - `crates/ironclaw_reborn/src/text_loop_driver.rs` —
   - `TextOnlyModelReplyDriverConfig` gains
     `pub identity_source: Option<Arc<dyn HostIdentityContextSource>>`,
@@ -72,21 +87,17 @@ populating the first slot is the only behavior change.
 - `crates/ironclaw_reborn/src/planned_driver.rs` (this lands with WS-7
   / WS-15 together) — same pass-through. Identity source is hosted at
   driver-composition level, not inside the framework.
+- `src/workspace/mod.rs` — re-export or compose
+  `WorkspaceIdentityContextSource` from the workspace module so the
+  app composition root can pass it into the Reborn driver configs.
 
 ### NOT TOUCHED
 - `crates/ironclaw_turns/src/run_profile/host.rs` —
   `LoopContextBundle.identity_messages: Vec<LoopContextMessage>` slot
   is unchanged in shape (the inner `LoopContextMessage` gains
   the `Option<...>` field above, but the bundle itself is unaffected).
-- `crates/ironclaw_turns/src/run_profile/prompt.rs` —
-  `HostManagedLoopPromptPort` already concatenates
-  `identity_messages` first when assembling the model message list.
-  No code change.
-- The actual identity-file *producer* — where files are read from disk,
-  how the workspace store resolves them, how trust is decided. This
-  brief defines only the trait surface and the adapter wiring. A
-  concrete `WorkspaceIdentityContextSource` impl lands as a separate
-  PR scoped against `src/workspace/`.
+- Memory vector-search / `memory_snippets` population. WS-15 is only
+  the identity-file prompt surface.
 
 ## 3. Specification
 
@@ -158,10 +169,11 @@ pub struct HostIdentityContextCandidate {
     /// an Installed candidate's ref — the ref doesn't exist.
     pub message_ref: Option<LoopMessageRef>,
 
-    /// Short host-redacted summary for prompt-milestone telemetry.
-    /// Same role as `LoopContextSnippet.safe_summary`. Must not
-    /// contain raw file content.
-    // telemetry only — never injected into the model prompt; identity content flows through message_ref
+    /// Short host-redacted summary. For Trusted candidates this is
+    /// prompt-milestone telemetry only; prompt content flows through
+    /// `message_ref`. For Installed candidates this is the attenuated
+    /// model-visible text because `message_ref` is intentionally
+    /// absent. Must not contain raw file content.
     pub safe_summary: String,
 
     /// Trust level — drives the same Trusted-vs-Installed attenuation
@@ -266,8 +278,8 @@ pub async fn build_identity_messages(
         used += cost;
         // Trust attenuation by structural absence: Installed candidates
         // carry `message_ref: None`, so `LoopContextMessage.message_ref`
-        // is also None for them — the prompt port has no token to
-        // resolve and only `safe_summary` reaches the prompt prefix.
+        // is also None for them. The prompt port converts those entries
+        // into stable summary-only refs backed by `safe_summary`.
         // Trusted candidates carry `Some(ref)` which resolves to
         // verbatim file bytes.
         out.push(LoopContextMessage {
@@ -333,6 +345,30 @@ near line 153) split into two buckets:
 heartbeat-initiated runs only — see §4 for the run-kind gating in the
 concrete `WorkspaceIdentityContextSource` impl.
 
+### 3.3.6 Prompt assembly for summary-only identity entries
+
+`LoopContextMessage.message_ref: None` is valid only for
+Installed-trust identity entries. Prompt assembly must preserve those
+entries as leading system messages:
+
+- If `message_ref == Some(ref)`, `HostManagedLoopPromptPort` builds
+  `LoopModelMessage { role, content_ref: ref }` exactly as today.
+- If `message_ref == None`, `HostManagedLoopPromptPort` creates a
+  stable synthetic `LoopMessageRef` from
+  `(safe_summary, ordinal)` under an identity-summary prefix and emits
+  `LoopModelMessage { role: "system", content_ref }`.
+- The model-message resolver that already handles skill snippet refs
+  gains the matching identity-summary lookup and resolves the
+  synthetic ref to `safe_summary`. It must reject role mismatches and
+  fail closed if the source no longer produces the same summary for
+  that ordinal.
+
+This is a required code change in
+[`crates/ironclaw_turns/src/run_profile/prompt.rs`](../../../crates/ironclaw_turns/src/run_profile/prompt.rs)
+and the corresponding host-managed model resolver. A prompt port that
+blindly maps every context message with `content_ref:
+message.message_ref` is incomplete after this brief.
+
 ### 3.4 Adapter wiring
 
 ```rust
@@ -359,7 +395,7 @@ impl LoopContextPort for ThreadBackedLoopContextPort {
             Some(src) => build_identity_messages(
                 src.as_ref(),
                 &self.run_ctx,
-                self.prompt_mode_hint,        // see §3.5
+                request.mode,                 // added to LoopContextRequest
                 self.identity_budget,
             ).await?,
             None => Vec::new(),
@@ -444,14 +480,19 @@ is composed in at driver-build time and held by the host facade — it
 is not visible to strategies or the framework crate, consistent with
 the §9 "message projection stays host-side" rule from the master doc.
 
-## 4. Concrete WorkspaceIdentityContextSource (deferred to follow-up PR)
+## 4. Concrete `WorkspaceIdentityContextSource`
 
-The first concrete implementation will live in `src/workspace/` — out
-of scope for this brief but worth sketching so reviewers can see the
-intended landing point:
+The concrete implementation is in scope for WS-15 and lives in
+`src/workspace/`, where the existing workspace identity rules already
+belong:
 
-- Reads from `~/.ironclaw/projects/<user>/<project>/` (or the workspace
-  root path resolved by `LoopRunContext.scope`).
+- Reads through `Workspace::read_primary()` so identity files never
+  fall back to secondary read scopes. This preserves the existing
+  isolation rule documented in
+  [`src/workspace/README.md`](../../../src/workspace/README.md):
+  shared memory may span scopes, but `AGENTS.md`, `SOUL.md`,
+  `USER.md`, `IDENTITY.md`, `TOOLS.md`, and `BOOTSTRAP.md` are
+  primary-scope only.
 - Filenames pulled from
   `ironclaw_memory::safety::DEFAULT_PROMPT_PROTECTED_PATHS`.
 - Trust: identity files placed by the user (workspace root) →
@@ -467,6 +508,11 @@ intended landing point:
 - `applies_when`: most files use `Always`; `TOOLS.md` should use
   `OnCodeAct` (it's irrelevant in `TextOnly` mode where no tools are
   visible).
+
+The app composition root wires this source into both
+`TextOnlyModelReplyDriverConfig` and `PlannedDriverConfig`. WS-14's
+implicit-default cutover must use this concrete source, not a mock and
+not `None`.
 
 TOOLS.md is intended for *narrative tool guidance* (e.g. "prefer
 `shell` over `file_read` when…"), not for re-declaring the concrete
@@ -501,9 +547,28 @@ Unit tests (in `crates/ironclaw_loop_support`):
   identity source is called exactly once and both returned bundles
   are byte-equal. Guards the §3.4.5 per-run caching contract.
 
+Unit tests (in `crates/ironclaw_turns`):
+- `prompt::tests::identity_message_with_ref_maps_to_content_ref` —
+  existing behavior for Trusted entries stays intact.
+- `prompt::tests::summary_only_identity_message_maps_to_synthetic_ref`
+  — `message_ref: None` produces a leading system model message whose
+  synthetic ref resolves to `safe_summary`.
+
+Workspace tests (in `src/workspace`):
+- `workspace_identity_context_reads_primary_scope_only` — multi-scope
+  workspace with different `AGENTS.md` content in primary and
+  secondary scopes returns only the primary content.
+- `workspace_identity_context_uses_protected_path_canon` — source
+  iterates the same canonical protected-path list as
+  `ironclaw_memory::safety::DEFAULT_PROMPT_PROTECTED_PATHS`.
+- `workspace_identity_context_routes_heartbeat_as_volatile` —
+  `HEARTBEAT.md` is excluded from stable `identity_messages` and
+  appears only in the volatile instruction path for heartbeat runs.
+
 Integration test (in `crates/ironclaw_reborn`):
 - `text_loop_driver_with_identity` — drives a `TextOnlyModelReplyDriver`
-  with a fake identity source returning two candidates. Asserts:
+  with the concrete workspace identity source seeded with two identity
+  files. Asserts:
   - `prompt_bundle_built` milestone payload includes the identity
     filenames in its metadata block.
   - The model port receives a message list whose first two entries
@@ -515,14 +580,18 @@ Integration test (in `crates/ironclaw_reborn`):
 ## 6. Compatibility & rollout
 
 - No `ironclaw_turns` contract change beyond the
-  `LoopContextRequest.mode` field in §3.5. Additive, no migration.
+  `LoopContextRequest.mode` field in §3.5 and optional
+  `LoopContextMessage.message_ref` in §3.2. Additive, no migration,
+  but every prompt/model resolver that reads `LoopContextMessage` must
+  handle `None` before WS-15 can compile.
 - `Option<Arc<dyn HostIdentityContextSource>> = None` is the new
   default for both drivers — existing tests, smoke runs, and the
   skeleton WS-8 integration suite all continue to pass with empty
   `identity_messages`.
-- The concrete `WorkspaceIdentityContextSource` lands in a separate PR
-  scoped against `src/workspace/`. It can ship in the same release as
-  WS-15 or later.
+- The concrete `WorkspaceIdentityContextSource` ships in this
+  workstream. `identity_source = None` is acceptable for legacy tests
+  and explicit non-default profiles, but not for WS-14's live default
+  cutover.
 
 ## 7. Out of scope (for this brief)
 

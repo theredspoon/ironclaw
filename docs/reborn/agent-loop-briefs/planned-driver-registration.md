@@ -1,17 +1,19 @@
 # WS-14 — `PlannedDriver` Registration + Run-Profile Selection
 
 **Workstream:** WS-14 (follow-up; not in the skeleton WS-0..WS-8 set)
-**Crates touched:** `ironclaw_reborn` (sole owner per master doc §12)
+**Crates touched:** `ironclaw_reborn` + `ironclaw_turns`
 **Depends on:** WS-7 (`PlannedDriver` adapter), WS-8 (skeleton green),
-**and hard-gated on all five parallel follow-ups**: WS-9
+**and hard-gated on all six parallel follow-ups**: WS-9
 ([capability-host-wiring](capability-host-wiring.md)), WS-10
 ([checkpoint-store-and-resume](checkpoint-store-and-resume.md)),
 WS-11 ([loop-input-port](loop-input-port.md)), WS-12
 ([loop-progress-port](loop-progress-port.md)), WS-13
-([host-cancellation-accessor](host-cancellation-accessor.md))
-**Parallel with:** WS-15 ([prompt-context-assembly](prompt-context-assembly.md))
-only (`identity_messages = Vec::new()` is a valid empty surface for
-the smoke test)
+([host-cancellation-accessor](host-cancellation-accessor.md)), and
+WS-15 ([prompt-context-assembly](prompt-context-assembly.md)).
+**Parallel with:** none for live-default cutover. WS-14 can be built
+after WS-9..WS-13 for opt-in smoke coverage, but the implicit default
+profile MUST NOT move to `PlannedDriver` until WS-15's concrete
+workspace identity source is also wired.
 **Master doc:** [`../agent-loop-skeleton.md`](../agent-loop-skeleton.md) §11–§12
 
 ---
@@ -43,14 +45,24 @@ WS-14 closes the loop:
 4. **Profile resolver entry** — a new builtin profile
    `reborn-planned-default` that resolves to the new driver, with a
    sensible default capability-surface profile id.
-5. **Coexistence** — `TextOnlyModelReplyDriver` stays registered;
-   profiles opt in by name; no global switch.
+5. **Implicit default cutover** — the no-profile submission path
+   resolves to `reborn-planned-default` once the live-default gate is
+   satisfied. This is the step that makes the planned loop the default
+   Reborn loop; without it, this brief is only an opt-in registration.
+6. **Coexistence** — `TextOnlyModelReplyDriver` stays registered for
+   explicit legacy/profile-selected runs.
 
-This is the **first real end-to-end run through the framework**: the
-new driver is reachable via a submitted turn, the executor's
-canonical tick fires, the host adapters from WS-9 / WS-11 / WS-12 /
-WS-13 actually execute, and `LoopExit::Completed` carries a real
-assistant message ref.
+This is the **live default end-to-end cutover through the framework**:
+the normal submitted-turn path (no explicit `RunProfileRequest`) uses
+the planned driver, the executor's canonical tick fires, the host
+adapters from WS-9 / WS-10 / WS-11 / WS-12 / WS-13 actually execute,
+WS-15 populates identity-file context, and `LoopExit::Completed`
+carries a real assistant message ref.
+
+The opt-in `reborn-planned-default` smoke can land before the cutover,
+but the PR that claims "planned driver is now the default Reborn loop"
+must include the implicit-default resolver change and the WS-15
+identity source.
 
 ## 2. Files
 
@@ -84,6 +96,12 @@ assistant message ref.
   follow-up cannot register a new builtin from `ironclaw_reborn`
   without this small contract addition. Strictly additive; existing
   `default()` constructor stays unchanged.
+- `crates/ironclaw_turns/src/run_profile/resolver.rs` —
+  the resolver gains an explicit implicit-default selector, e.g.
+  `InMemoryRunProfileResolver::new_with_implicit_default(registry,
+  RunProfileId)` or an equivalent builder method. The no-profile
+  branch MUST read this selector instead of hardcoding
+  `interactive_default`.
 
 ### NOT TOUCHED
 - `crates/ironclaw_turns/src/run_profile/host.rs`,
@@ -284,20 +302,25 @@ pub fn register_default_planned_profile(
 }
 ```
 
-`InMemoryRunProfileResolver` is constructed from a registry via
-`InMemoryRunProfileResolver::new(registry)`; startup wiring (§3.6)
-builds the registry first, registers both the builtin profiles and
-the new `reborn-planned-default`, then wraps it in the resolver.
+`InMemoryRunProfileResolver` is constructed from a registry plus an
+explicit implicit-default profile id; startup wiring (§3.6) builds
+the registry first, registers both the builtin profiles and the new
+`reborn-planned-default`, then wraps it in the resolver with
+`reborn-planned-default` as the no-profile fallback.
 
 ### 3.5 Coexistence with `TextOnlyModelReplyDriver`
 
-The TextOnly driver stays registered. Two profiles co-exist:
+The TextOnly driver stays registered. Three resolution cases co-exist:
 
+- **Implicit no-profile request** — resolves to
+  `reborn-planned-default` after the live-default cutover. This is the
+  normal channel/gateway submission path when callers do not pass a
+  `RunProfileRequest`.
 - `interactive_default` (the existing builtin at
   [`crates/ironclaw_turns/src/run_profile/resolver.rs:210`](../../../crates/ironclaw_turns/src/run_profile/resolver.rs))
-  → `reborn:text-only-model-reply` v1, no checkpoint schema. Also
-  the implicit default when no profile is requested
-  ([`resolver.rs:85`](../../../crates/ironclaw_turns/src/run_profile/resolver.rs)).
+  → `reborn:text-only-model-reply` v1, no checkpoint schema. It stays
+  available only when explicitly requested by profile id; it is no
+  longer the implicit fallback once this live-default cutover lands.
 - `reborn-planned-default` (this brief) → `reborn:planned-default` v1,
   `reborn:default-loop-v1` v1.
 
@@ -305,11 +328,14 @@ The TextOnly driver stays registered. Two profiles co-exist:
 so the two keys are distinct even though both pin driver version 1.
 No collision risk.
 
-Migration policy is **explicit opt-in**: a profile chooses by name
-when submitting a turn (via `RunProfileRequest`). No automated
-shimming, no environment-flag switch. The brief lists which
-downstream profiles exist today and notes that *none* are migrated
-automatically — operators decide.
+Migration policy is split:
+
+- **Live default:** the resolver's no-profile branch changes to
+  `reborn-planned-default`. This is the mandatory production cutover
+  for the default Reborn loop.
+- **Named profiles:** callers that explicitly request another profile
+  still get that profile. No automated shimming or environment-flag
+  switch rewrites explicit requests.
 
 ### 3.6 Startup wiring
 
@@ -327,7 +353,10 @@ register_default_planned_driver(&mut driver_registry, planned_driver_config)?; /
 // Profile registry — start with the existing builtins, then add ours.
 let mut profile_registry = InMemoryRunProfileRegistry::with_builtin_profiles();
 register_default_planned_profile(&mut profile_registry)?;                     // NEW
-let resolver = InMemoryRunProfileResolver::new(profile_registry);
+let resolver = InMemoryRunProfileResolver::new_with_implicit_default(          // NEW
+    profile_registry,
+    RunProfileId::from_trusted_static(PLANNED_DEFAULT_PROFILE_ID),
+);
 
 let coordinator = TurnCoordinator::new(/* … */).with_resolver(resolver);
 let runner = TurnRunner::new(/* … */).with_registry(driver_registry);
@@ -341,11 +370,13 @@ from the parallel-follow-up adapters:
 - WS-11: `input_queue`
 - WS-12: `event_sink: Some(...)`
 - WS-13: `cancellation_factory`
-- WS-15 (optional): `identity_source`, `identity_budget`
+- WS-15: `identity_source`, `identity_budget`
 
-WS-14's hard-gate dependency on WS-9/10/11/12/13 (declared in the
-header) means the brief assumes all four config fields point at
-real adapters. WS-15 is optional; `identity_source = None` is fine.
+WS-14's live-default hard-gate dependency on WS-9/10/11/12/13/15
+(declared in the header) means the brief assumes all config fields
+point at real adapters. `identity_source = None` is allowed only for
+pre-cutover opt-in smoke tests; it is not valid for the PR that moves
+the implicit default profile.
 
 ## 4. Composition diagram
 
@@ -379,7 +410,10 @@ real adapters. WS-15 is optional; `identity_source = None` is fine.
        HostManagedLoopCheckpointPort
          (extended with load_checkpoint_payload, WS-10)
                   ▼
-             (skeleton ports for context/prompt/model/transcript stay)
+       ThreadBackedLoopContextPort + HostManagedLoopPromptPort
+         (extended with WorkspaceIdentityContextSource, WS-15)
+                  ▼
+             (model/transcript ports stay host-managed)
 ```
 
 ## 5. Verification
@@ -398,12 +432,19 @@ Unit tests (in `crates/ironclaw_reborn`):
 - `planned_driver_factory::tests::profile_resolves_to_planned_driver`
   — register the profile; resolve `RunProfileId("reborn-planned-default")`;
   assert resolved `driver_id == "reborn:planned-default"` v1.
+- `planned_driver_factory::tests::implicit_default_resolves_to_planned_driver`
+  — construct the resolver with no requested profile and assert the
+  resolved profile id is `reborn-planned-default`, not
+  `interactive_default`.
+- `planned_driver_factory::tests::explicit_text_only_profile_still_resolves_textonly`
+  — explicitly resolve `interactive_default` and assert it still maps
+  to `reborn:text-only-model-reply`.
 
 Integration tests (the **hard-gate merge criterion** for WS-14, in
 `crates/ironclaw_reborn/tests/planned_driver_e2e.rs`):
 
 - `planned_driver_real_host_smoke` — composes the **real** adapters
-  from all five parallel follow-ups (no mocks):
+  from all six follow-ups (no mocks):
   - WS-9: `HostRuntimeLoopCapabilityPort` over a test fixture
     `CapabilityDispatcher` that registers one allowed tool
     (`echo_payload`) returning a fixed result, plus
@@ -418,6 +459,8 @@ Integration tests (the **hard-gate merge criterion** for WS-14, in
     capturing milestones.
   - WS-13: `RunStateLoopCancellationPort` over a never-fired
     `RunCancellationHandle`.
+  - WS-15: concrete `WorkspaceIdentityContextSource` seeded with the
+    default identity files through the workspace primary scope.
   Submits a turn under `reborn-planned-default` whose model emits
   one capability call to `echo_payload` and then a reply.
   Asserts:
@@ -433,17 +476,24 @@ Integration tests (the **hard-gate merge criterion** for WS-14, in
   checkpoint resolves to a payload whose decoded
   `LoopExecutionState.iteration == 0` (cancellation happened before
   the iteration completed).
+- `planned_driver_live_default_smoke` — submits a turn without a
+  `RunProfileRequest`; asserts the resolved driver is
+  `reborn:planned-default`, the model receives leading identity
+  messages from WS-15's concrete workspace source, and the run exits
+  `LoopExit::Completed`.
 - `planned_driver_text_only_profile_still_resolves_textonly` —
   regression guard: registering both drivers does not affect the
   TextOnly profile's resolution.
 
-The two real-host smoke tests cannot compile or pass until WS-9 /
-WS-11 / WS-12 / WS-13 are all merged. That is the hard-gate.
+The real-host smoke tests cannot compile or pass until WS-9 / WS-10 /
+WS-11 / WS-12 / WS-13 / WS-15 are all merged. That is the
+live-default hard-gate.
 
 ## 6. Out of scope (for this brief)
 
-- **Migrating existing profiles** to the new driver. Each profile
-  picks its driver by name; operators decide when to flip.
+- **Rewriting explicit named profiles** to the new driver. Each named
+  profile still picks its driver by name; operators decide when to
+  flip those ids. The implicit no-profile default is in scope above.
 - **Driver kill-switch / rollout flags.** Registry membership is
   the toggle; deregister the planned driver to disable. No additional
   flag plumbing.
@@ -457,8 +507,8 @@ WS-11 / WS-12 / WS-13 are all merged. That is the hard-gate.
   and may ship under a new driver id.
 - **Schema migration from `reborn:default-loop-v1` → `v2`.** Strict
   schema match per WS-10 §6; v2 is a future PR.
-- **Smoke tests against WS-15** (`identity_messages` populated). The
-  WS-14 smoke runs with `identity_source = None`. Once WS-15 lands,
-  a separate WS-15 smoke covers identity-file injection.
+- **Running the live-default cutover without WS-15.** An opt-in
+  `reborn-planned-default` smoke may use `identity_source = None`;
+  the implicit-default cutover may not.
 - **Tracing / OpenTelemetry beyond `RuntimeEvent`.** WS-12 ships the
   loop progress surface; metric exporters are sink-side concerns.
