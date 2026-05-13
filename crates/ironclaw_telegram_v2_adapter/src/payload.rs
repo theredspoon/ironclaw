@@ -1,20 +1,23 @@
 //! Telegram Bot API payload normalization.
 //!
 //! Inputs are raw webhook update bytes. Outputs are
-//! [`TelegramParsedInbound`] values — either an
-//! [`Envelope`](TelegramParsedInbound::Envelope) wrapping a
-//! [`ProductInboundEnvelope`] the adapter can hand to the workflow
-//! facade, or [`NoOp`](TelegramParsedInbound::NoOp) when the update
-//! should produce a successful no-op acknowledgement (ambient group
-//! messages, channel posts, edited-message kinds we don't act on,
-//! missing `message.from` we can't actor-ref, etc.).
+//! [`ParsedProductInbound`] values — the host stamps trusted context
+//! ([`TrustedInboundContext::from_verified_evidence`]) and wraps the
+//! result in a [`ProductInboundEnvelope`] outside this crate.
+//!
+//! Ignored-but-authenticated updates (ambient group messages, channel
+//! posts, edited-message kinds we don't act on, messages without a
+//! `from` we can't actor-ref) return `ParsedProductInbound { payload:
+//! ProductInboundPayload::NoOp, .. }` with synthetic external refs for
+//! the slots we genuinely have no source for. This matches the
+//! `ironclaw_product_adapters` contract that says NoOps must be a
+//! parsed inbound with the explicit `NoOp` payload variant, NOT an
+//! out-of-band `None` path.
 
-use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_product_adapters::{
     AdapterInstallationId, ExternalActorRef, ExternalConversationRef, ExternalEventId,
-    InboundCommandPayload, ParsedProductInbound, ProductAdapterError, ProductAdapterId,
-    ProductAttachmentDescriptor, ProductAttachmentKind, ProductInboundEnvelope,
-    ProductInboundPayload, ProductTriggerReason, ProtocolAuthEvidence, TrustedInboundContext,
+    InboundCommandPayload, ParsedProductInbound, ProductAdapterError, ProductAttachmentDescriptor,
+    ProductAttachmentKind, ProductInboundPayload, ProductTriggerReason, ProtocolAuthEvidence,
     UserMessagePayload,
 };
 use serde::Deserialize;
@@ -44,17 +47,6 @@ pub struct GroupTriggerPolicy {
     pub recognized_commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TelegramParsedInbound {
-    /// Adapter produces an envelope and forwards to the workflow. Boxed
-    /// because the envelope is much larger than the `NoOp` variant.
-    Envelope(Box<ProductInboundEnvelope>),
-    /// Successful no-op (ambient group message, edited message we ignore,
-    /// channel post, ...). Webhook responds 200 OK without invoking the
-    /// workflow.
-    NoOp,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PayloadParseError {
     #[error("invalid Telegram update JSON: {reason}")]
@@ -70,21 +62,26 @@ pub enum PayloadParseError {
     UnauthenticatedPayload,
 }
 
-/// Parse a Telegram webhook payload into the `ProductInboundEnvelope` shape.
+/// Parse a Telegram webhook payload into a [`ParsedProductInbound`]. The
+/// host stamps trusted context outside this function and wraps the
+/// result in a `ProductInboundEnvelope` — that is the kernel/adapter
+/// trust boundary and must not be crossed inside the adapter itself.
+///
+/// Ignored-but-authenticated updates (no message, no `from`, ambient
+/// group chatter, etc.) return a parsed inbound with
+/// `payload = ProductInboundPayload::NoOp` and synthetic external refs
+/// for the slots that genuinely have no source. The webhook still
+/// acks 200 OK; the NoOp payload variant short-circuits inside the
+/// workflow facade.
 pub fn parse_telegram_update(
     raw_payload: &[u8],
-    auth_evidence: ProtocolAuthEvidence,
-    adapter_id: &ProductAdapterId,
+    auth_evidence: &ProtocolAuthEvidence,
     installation_id: &AdapterInstallationId,
     group_trigger_policy: &GroupTriggerPolicy,
-) -> Result<TelegramParsedInbound, PayloadParseError> {
-    // `ProtocolAuthEvidence` is a sealed struct (formerly an enum) — the
-    // host mints verified evidence via `host_verified`, components cannot
-    // fabricate one. Bare-bones verification check up front so a clearly
-    // unauthenticated payload gets the distinct `UnauthenticatedPayload`
-    // error before any parsing work; `TrustedInboundContext::from_verified_
-    // evidence` below would also reject it, but the explicit shape here
-    // preserves the existing diagnostic.
+) -> Result<ParsedProductInbound, PayloadParseError> {
+    // `ProtocolAuthEvidence` is a sealed struct (formerly an enum). The
+    // host mints verified evidence; components cannot fabricate one.
+    // Reject anything else up front.
     if !auth_evidence.is_verified() {
         return Err(PayloadParseError::UnauthenticatedPayload);
     }
@@ -98,53 +95,70 @@ pub fn parse_telegram_update(
         return Err(PayloadParseError::MissingUpdateId);
     }
 
+    let event_id = build_event_id(installation_id, update_id)?;
+
     // Choose the message variant. We act on `message` and explicitly drop
-    // `edited_message`, `channel_post`, and other update kinds in the first
-    // slice. They are NoOp acks.
-    let message = match update.message {
-        Some(m) => m,
-        None => return Ok(TelegramParsedInbound::NoOp),
+    // `edited_message`, `channel_post`, and other update kinds — they
+    // become `ProductInboundPayload::NoOp` parsed inbounds with
+    // synthetic refs.
+    let Some(message) = update.message else {
+        return noop_parsed_inbound(event_id);
     };
 
     // `message.from` is optional in the Telegram schema (anonymous group
-    // admins, channel-style updates that slipped through, etc.). Without
-    // a `from` we can't build an `ExternalActorRef`, so fail-soft to
-    // `NoOp` rather than returning a hard error that triggers webhook
-    // retries on an otherwise-parseable update.
+    // admins, channel-style updates that slipped through). Without it we
+    // can't build a real `ExternalActorRef`; return a synthetic-ref NoOp
+    // so the webhook acks 200 OK rather than triggering retries.
     if message.from.is_none() {
-        return Ok(TelegramParsedInbound::NoOp);
+        return noop_parsed_inbound(event_id);
     }
 
     let chat_kind = TelegramChatKind::from_str(message.chat.kind.as_str());
     let trigger_outcome = classify_trigger(&message, chat_kind, group_trigger_policy);
     let Some(trigger) = trigger_outcome else {
-        return Ok(TelegramParsedInbound::NoOp);
+        // Ambient group message / unsupported chat kind. We have the
+        // message context so the NoOp gets real refs.
+        let actor_ref = build_actor_ref(message.from.as_ref())?;
+        let conversation_ref = build_conversation_ref(&message)?;
+        return ParsedProductInbound::new(
+            event_id,
+            actor_ref,
+            conversation_ref,
+            ProductInboundPayload::NoOp,
+        )
+        .map_err(adapter_error_to_payload_error);
     };
 
-    let event_id = build_event_id(installation_id, update_id)?;
     let actor_ref = build_actor_ref(message.from.as_ref())?;
     let conversation_ref = build_conversation_ref(&message)?;
-    let received_at = telegram_date_to_utc(message.date);
-
     let payload = build_payload(message, trigger, group_trigger_policy)?;
 
-    // `ProductInboundEnvelope` fields are sealed; the host stamps the
-    // trusted context (adapter id, installation id, verified auth claim,
-    // received-at timestamp) onto a `ParsedProductInbound` via
-    // `from_trusted_parse`. Adapters cannot construct the envelope
-    // directly — that's the host trust boundary.
-    let parsed = ParsedProductInbound::new(event_id, actor_ref, conversation_ref, payload)
-        .map_err(adapter_error_to_payload_error)?;
-    let context = TrustedInboundContext::from_verified_evidence(
-        adapter_id.clone(),
-        installation_id.clone(),
-        received_at,
-        &auth_evidence,
-    )
-    .map_err(adapter_error_to_payload_error)?;
-    let envelope = ProductInboundEnvelope::from_trusted_parse(context, parsed)
-        .map_err(adapter_error_to_payload_error)?;
-    Ok(TelegramParsedInbound::Envelope(Box::new(envelope)))
+    ParsedProductInbound::new(event_id, actor_ref, conversation_ref, payload)
+        .map_err(adapter_error_to_payload_error)
+}
+
+/// Construct a `ParsedProductInbound { payload: NoOp, .. }` with
+/// synthetic external refs for adapter-side "I can't extract real
+/// context" cases (no `message` field, no `from` field). The synthetic
+/// actor/conversation kinds are deliberate sentinels so a workflow
+/// that mistakenly tries to route a NoOp produces a recognizable
+/// signal in logs.
+fn noop_parsed_inbound(
+    event_id: ExternalEventId,
+) -> Result<ParsedProductInbound, PayloadParseError> {
+    let actor = ExternalActorRef::new("telegram_system", "noop", None::<&str>).map_err(|err| {
+        PayloadParseError::InvalidExternalRef {
+            kind: "external_actor_ref",
+            reason: err.to_string(),
+        }
+    })?;
+    let conversation = ExternalConversationRef::new(None, "noop", None::<&str>, None::<&str>)
+        .map_err(|err| PayloadParseError::InvalidExternalRef {
+            kind: "external_conversation_ref",
+            reason: err.to_string(),
+        })?;
+    ParsedProductInbound::new(event_id, actor, conversation, ProductInboundPayload::NoOp)
+        .map_err(adapter_error_to_payload_error)
 }
 
 fn adapter_error_to_payload_error(err: ProductAdapterError) -> PayloadParseError {
@@ -662,10 +676,6 @@ fn make_attachment(
     )
 }
 
-fn telegram_date_to_utc(date: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(date, 0).single().unwrap_or_else(Utc::now)
-}
-
 // ---------------------------------------------------------------------------
 // Telegram payload deserialization shapes (only the fields we read).
 // ---------------------------------------------------------------------------
@@ -689,8 +699,6 @@ struct TelegramMessage {
     #[serde(default)]
     from: Option<TelegramUser>,
     chat: TelegramChat,
-    #[serde(default)]
-    date: i64,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -814,6 +822,7 @@ fn _suppress_unused_field_warnings(update: &TelegramUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_product_adapters::ProductAdapterId;
     use ironclaw_product_adapters::auth::mark_shared_secret_header_verified;
 
     fn evidence() -> ProtocolAuthEvidence {
@@ -823,6 +832,7 @@ mod tests {
         )
     }
 
+    #[allow(dead_code)]
     fn adapter_id() -> ProductAdapterId {
         ProductAdapterId::new("telegram_v2").expect("valid")
     }
@@ -847,7 +857,7 @@ mod tests {
         let evidence = ProtocolAuthEvidence::failed(
             ironclaw_product_adapters::ProtocolAuthFailure::SharedSecretMismatch,
         );
-        let err = parse_telegram_update(payload, evidence, &adapter_id(), &install_id(), &policy())
+        let err = parse_telegram_update(payload, &evidence, &install_id(), &policy())
             .expect_err("unauthenticated must error");
         assert!(matches!(err, PayloadParseError::UnauthenticatedPayload));
     }
@@ -874,12 +884,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::Command(cmd) => {
                 assert_eq!(cmd.command, "help");
                 assert_eq!(cmd.arguments, "");
@@ -917,12 +924,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::Command(cmd) => {
                 assert_eq!(cmd.command, "help");
                 assert_eq!(cmd.trigger, ProductTriggerReason::BotMention);
@@ -949,12 +953,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.trigger, ProductTriggerReason::DirectChat);
             }
@@ -992,9 +993,8 @@ mod tests {
                 "entities": [{"type": "bot_command", "offset": 0, "length": 5}]
             }
         }"#;
-        let err =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect_err("control-character arguments must be rejected");
+        let err = parse_telegram_update(payload, &evidence(), &install_id(), &policy())
+            .expect_err("control-character arguments must be rejected");
         match err {
             PayloadParseError::InvalidExternalRef { kind, reason } => {
                 assert_eq!(kind, "inbound_command_payload");
@@ -1037,14 +1037,8 @@ mod tests {
                 }}
             }}"#
         );
-        let err = parse_telegram_update(
-            payload.as_bytes(),
-            evidence(),
-            &adapter_id(),
-            &install_id(),
-            &policy(),
-        )
-        .expect_err("oversized arguments must be rejected");
+        let err = parse_telegram_update(payload.as_bytes(), &evidence(), &install_id(), &policy())
+            .expect_err("oversized arguments must be rejected");
         match err {
             PayloadParseError::InvalidExternalRef { kind, reason } => {
                 assert_eq!(kind, "inbound_command_payload");
@@ -1085,12 +1079,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope (caption mention must fire trigger), got NoOp");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.trigger, ProductTriggerReason::BotMention);
             }
@@ -1116,12 +1107,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope (caption command must fire trigger), got NoOp");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::Command(cmd) => {
                 assert_eq!(cmd.command, "help");
                 assert_eq!(cmd.trigger, ProductTriggerReason::BotCommand);
@@ -1147,11 +1135,10 @@ mod tests {
                 "text": "anonymous admin message"
             }
         }"#;
-        let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse must not hard-error on missing `from`");
+        let parsed = parse_telegram_update(payload, &evidence(), &install_id(), &policy())
+            .expect("parse must not hard-error on missing `from`");
         assert!(
-            matches!(parsed, TelegramParsedInbound::NoOp),
+            matches!(parsed.payload, ProductInboundPayload::NoOp),
             "missing `from` must fail-soft to NoOp, got {parsed:?}"
         );
     }
@@ -1169,27 +1156,16 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        assert_eq!(envelope.external_event_id.as_str(), "tg-install_alpha-100");
+        assert_eq!(envelope.external_actor_ref.id(), "777");
+        assert_eq!(envelope.external_conversation_ref.conversation_id(), "777");
         assert_eq!(
-            envelope.external_event_id().as_str(),
-            "tg-install_alpha-100"
-        );
-        assert_eq!(envelope.external_actor_ref().id(), "777");
-        assert_eq!(
-            envelope.external_conversation_ref().conversation_id(),
-            "777"
-        );
-        assert_eq!(
-            envelope
-                .external_conversation_ref()
-                .reply_target_message_id(),
+            envelope.external_conversation_ref.reply_target_message_id(),
             Some("11")
         );
-        match envelope.payload() {
+        match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.text, "hello");
                 assert_eq!(user.trigger, ProductTriggerReason::DirectChat);
@@ -1211,9 +1187,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
@@ -1230,12 +1205,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.trigger, ProductTriggerReason::BotMention);
                 assert_eq!(user.text, "please help");
@@ -1264,12 +1236,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.trigger, ProductTriggerReason::ReplyToBot);
             }
@@ -1291,12 +1260,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::Command(cmd) => {
                 assert_eq!(cmd.command, "help");
                 assert_eq!(cmd.arguments, "args here");
@@ -1321,9 +1287,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
@@ -1341,20 +1306,15 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
         assert_eq!(
-            envelope.external_conversation_ref().topic_id(),
+            envelope.external_conversation_ref.topic_id(),
             Some("7"),
             "topic must be carried in conversation key"
         );
         assert_eq!(
-            envelope
-                .external_conversation_ref()
-                .reply_target_message_id(),
+            envelope.external_conversation_ref.reply_target_message_id(),
             Some("50"),
             "reply target must come from message_id"
         );
@@ -1371,32 +1331,22 @@ mod tests {
                 "entities": [{"type": "mention", "offset": 0, "length": 13}]
             }
         }"#;
-        let parsed2 = parse_telegram_update(
-            payload2,
-            evidence(),
-            &adapter_id(),
-            &install_id(),
-            &policy(),
-        )
-        .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope2) = parsed2 else {
-            panic!("expected envelope");
-        };
+        let parsed2 =
+            parse_telegram_update(payload2, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope2 = parsed2;
         assert_eq!(
             envelope
-                .external_conversation_ref()
+                .external_conversation_ref
                 .conversation_fingerprint(),
             envelope2
-                .external_conversation_ref()
+                .external_conversation_ref
                 .conversation_fingerprint(),
         );
         // Reply targets differ.
         assert_ne!(
-            envelope
-                .external_conversation_ref()
-                .reply_target_message_id(),
+            envelope.external_conversation_ref.reply_target_message_id(),
             envelope2
-                .external_conversation_ref()
+                .external_conversation_ref
                 .reply_target_message_id(),
         );
     }
@@ -1418,12 +1368,9 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        let TelegramParsedInbound::Envelope(envelope) = parsed else {
-            panic!("expected envelope");
-        };
-        match envelope.payload() {
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        let envelope = parsed;
+        match envelope.payload {
             ProductInboundPayload::UserMessage(user) => {
                 assert_eq!(user.attachments.len(), 1);
                 assert_eq!(user.attachments[0].external_file_id, "BBBB");
@@ -1448,9 +1395,8 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
@@ -1466,17 +1412,15 @@ mod tests {
             }
         }"#;
         let parsed =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect("parse");
-        assert!(matches!(parsed, TelegramParsedInbound::NoOp));
+            parse_telegram_update(payload, &evidence(), &install_id(), &policy()).expect("parse");
+        assert!(matches!(parsed.payload, ProductInboundPayload::NoOp));
     }
 
     #[test]
     fn malformed_json_is_invalid_json_error() {
         let payload = b"this is not json";
-        let err =
-            parse_telegram_update(payload, evidence(), &adapter_id(), &install_id(), &policy())
-                .expect_err("malformed");
+        let err = parse_telegram_update(payload, &evidence(), &install_id(), &policy())
+            .expect_err("malformed");
         assert!(matches!(err, PayloadParseError::InvalidJson { .. }));
     }
 }
