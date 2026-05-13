@@ -9,8 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{
-    LoopDiagnosticRef, LoopGateRef, LoopMessageRef, LoopResultRef, RunProfileVersion,
-    TurnCheckpointId, TurnId, TurnRunId, TurnScope,
+    LoopDiagnosticRef, LoopGateRef, LoopMessageRef, LoopResultRef, RedactedCheckpointPayload,
+    RunProfileVersion, TurnCheckpointId, TurnId, TurnRunId, TurnScope,
 };
 
 use super::{
@@ -1389,6 +1389,21 @@ pub struct LoopCheckpointRequest {
     pub state_ref: LoopCheckpointStateRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadCheckpointPayloadRequest {
+    pub checkpoint_id: TurnCheckpointId,
+    pub expected_schema_id: CheckpointSchemaId,
+    pub expected_schema_version: RunProfileVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedCheckpointPayload {
+    pub kind: LoopCheckpointKind,
+    pub schema_id: CheckpointSchemaId,
+    pub schema_version: RunProfileVersion,
+    pub payload: RedactedCheckpointPayload,
+}
+
 /// Request to stage a checkpoint payload's raw bytes before calling
 /// [`LoopCheckpointPort::checkpoint`] with the resulting state ref.
 ///
@@ -1452,10 +1467,6 @@ pub trait LoopCheckpointPort: Send + Sync {
     /// The executor's `checkpoint(...)` helper (WS-6 §3.4) calls this method
     /// before invoking `LoopCheckpointPort::checkpoint(...)` so the metadata
     /// write references a payload that's already durably stored.
-    ///
-    /// Read-side `load_checkpoint_payload(...)` lives in WS-10 and will be
-    /// added to this same port. WS-0 intentionally does not pre-declare it
-    /// so the WS-10 signature can land without churn.
     async fn stage_checkpoint_payload(
         &self,
         _request: StageCheckpointPayloadRequest,
@@ -1464,6 +1475,16 @@ pub trait LoopCheckpointPort: Send + Sync {
             AgentLoopHostErrorKind::Unavailable,
             "stage_checkpoint_payload not implemented",
         ))
+    }
+
+    /// Load the redacted state payload behind a previously-written
+    /// checkpoint. Resume callers go through this host port so metadata
+    /// validation stays with the backend that owns checkpoint storage.
+    async fn load_checkpoint_payload(
+        &self,
+        _request: LoadCheckpointPayloadRequest,
+    ) -> Result<LoadedCheckpointPayload, AgentLoopHostError> {
+        Err(unsupported_host_method("load_checkpoint_payload"))
     }
 }
 
