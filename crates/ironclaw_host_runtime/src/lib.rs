@@ -59,8 +59,10 @@ pub use first_party::{
     FirstPartyCapabilityRequest, FirstPartyCapabilityResult,
 };
 pub use first_party_tools::{
-    BUILTIN_FIRST_PARTY_PROVIDER, BuiltinFirstPartyTools, ECHO_CAPABILITY_ID, JSON_CAPABILITY_ID,
-    TIME_CAPABILITY_ID, builtin_first_party_handlers, builtin_first_party_package,
+    APPLY_PATCH_CAPABILITY_ID, BUILTIN_FIRST_PARTY_PROVIDER, BuiltinFirstPartyTools,
+    ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID, JSON_CAPABILITY_ID,
+    LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, TIME_CAPABILITY_ID, WRITE_FILE_CAPABILITY_ID,
+    builtin_first_party_handlers, builtin_first_party_package,
 };
 pub use obligations::{
     BuiltinObligationHandler, BuiltinObligationServices, NetworkObligationPolicyStore,

@@ -1,14 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc, thread, time::Duration};
 
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
-    CapabilitySurfacePolicy, CapabilitySurfaceVersion, ECHO_CAPABILITY_ID, HostRuntime,
-    HostRuntimeServices, JSON_CAPABILITY_ID, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
-    RuntimeFailureKind, SurfaceKind, TIME_CAPABILITY_ID, VisibleCapabilityAccess,
-    VisibleCapabilityRequest, builtin_first_party_handlers, builtin_first_party_package,
+    APPLY_PATCH_CAPABILITY_ID, CapabilitySurfacePolicy, CapabilitySurfaceVersion,
+    ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID, HostRuntime, HostRuntimeServices,
+    JSON_CAPABILITY_ID, LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, RuntimeCapabilityOutcome,
+    RuntimeCapabilityRequest, RuntimeFailureKind, SurfaceKind, TIME_CAPABILITY_ID,
+    VisibleCapabilityAccess, VisibleCapabilityRequest, WRITE_FILE_CAPABILITY_ID,
+    builtin_first_party_handlers, builtin_first_party_package,
 };
 use ironclaw_resources::InMemoryResourceGovernor;
 use ironclaw_trust::{
@@ -28,13 +30,10 @@ async fn builtin_first_party_package_declares_expected_capabilities() {
         .iter()
         .map(|descriptor| descriptor.id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        ids,
-        vec![ECHO_CAPABILITY_ID, TIME_CAPABILITY_ID, JSON_CAPABILITY_ID]
-    );
+    assert_eq!(ids, all_builtin_capability_ids().to_vec());
 
     let handlers = builtin_first_party_handlers().unwrap();
-    for id in [ECHO_CAPABILITY_ID, TIME_CAPABILITY_ID, JSON_CAPABILITY_ID] {
+    for id in all_builtin_capability_ids() {
         assert!(handlers.contains_handler(&capability_id(id)));
     }
 }
@@ -43,7 +42,7 @@ async fn builtin_first_party_package_declares_expected_capabilities() {
 async fn builtin_first_party_surface_lists_allowed_tools_in_registry_order() {
     let runtime = runtime();
     let request = VisibleCapabilityRequest::new(
-        execution_context([ECHO_CAPABILITY_ID, TIME_CAPABILITY_ID, JSON_CAPABILITY_ID]),
+        execution_context(all_builtin_capability_ids()),
         SurfaceKind::new("agent_loop").unwrap(),
     )
     .with_policy(CapabilitySurfacePolicy::allow_all())
@@ -56,10 +55,7 @@ async fn builtin_first_party_surface_lists_allowed_tools_in_registry_order() {
         .iter()
         .map(|capability| capability.descriptor.id.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(
-        ids,
-        vec![ECHO_CAPABILITY_ID, TIME_CAPABILITY_ID, JSON_CAPABILITY_ID]
-    );
+    assert_eq!(ids, all_builtin_capability_ids().to_vec());
     assert!(
         surface
             .capabilities
@@ -254,6 +250,579 @@ async fn builtin_json_rejects_v1_tool_output_stash_refs_without_leaking_input() 
 }
 
 #[tokio::test]
+async fn builtin_coding_tools_match_v1_read_write_list_glob_and_grep_shapes() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(temp.path().join("README.md"), "alpha\nbeta\n").unwrap();
+    std::fs::write(
+        temp.path().join("src/lib.rs"),
+        "pub fn sample() {\n    // needle\n}\n",
+    )
+    .unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts.clone());
+
+    let read = invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/README.md", "offset": 2, "limit": 1}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["content"], json!("     2│ beta"));
+    assert_eq!(read["total_lines"], json!(2));
+    assert_eq!(read["lines_shown"], json!(1));
+    assert_eq!(read["truncated_by_default"], json!(false));
+
+    let wrote = invoke_with_context(
+        &runtime,
+        WRITE_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/generated/deep.txt", "content": "created\n"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrote["bytes_written"], json!(8));
+    assert_eq!(wrote["success"], json!(true));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("generated/deep.txt")).unwrap(),
+        "created\n"
+    );
+
+    let listed = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace", "recursive": true, "max_depth": 1}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed["count"], json!(5));
+    assert_eq!(listed["truncated"], json!(false));
+    assert_eq!(
+        listed["entries"],
+        json!([
+            "generated/",
+            "src/",
+            "README.md (11B)",
+            "generated/deep.txt (8B)",
+            "src/lib.rs (34B)"
+        ])
+    );
+
+    let globbed = invoke_with_context(
+        &runtime,
+        GLOB_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "**/*.rs", "max_results": 5}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(globbed["files"], json!(["src/lib.rs"]));
+    assert_eq!(globbed["count"], json!(1));
+    assert_eq!(globbed["truncated"], json!(false));
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "NEEDLE", "case_insensitive": true}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(grepped["files"], json!(["src/lib.rs"]));
+    assert_eq!(grepped["count"], json!(1));
+    assert_eq!(grepped["truncated"], json!(false));
+}
+
+#[tokio::test]
+async fn builtin_coding_paths_are_relative_to_requested_root_and_zero_values_match_v1() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src/nested")).unwrap();
+    std::fs::write(temp.path().join("src/lib.rs"), "needle\n").unwrap();
+    std::fs::write(temp.path().join("src/nested/mod.rs"), "needle\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let read = invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/src/lib.rs", "offset": 0, "limit": 0}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["content"], json!(""));
+    assert_eq!(read["lines_shown"], json!(0));
+
+    let listed = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace/src", "recursive": true, "max_depth": 0}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed["entries"], json!(["nested/", "lib.rs (7B)"]));
+
+    let globbed_empty_page = invoke_with_context(
+        &runtime,
+        GLOB_CAPABILITY_ID,
+        json!({"path": "/workspace/src", "pattern": "*.rs", "max_results": 0}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(globbed_empty_page["files"], json!([]));
+    assert_eq!(globbed_empty_page["count"], json!(0));
+    assert_eq!(globbed_empty_page["truncated"], json!(true));
+
+    let globbed = invoke_with_context(
+        &runtime,
+        GLOB_CAPABILITY_ID,
+        json!({"path": "/workspace/src", "pattern": "*.rs"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(globbed["files"], json!(["lib.rs"]));
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace/src", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap();
+    let grep_files = grepped["files"].as_array().unwrap();
+    assert_eq!(grep_files.len(), 2);
+    assert!(
+        grep_files
+            .iter()
+            .any(|file| file.as_str() == Some("lib.rs"))
+    );
+    assert!(
+        grep_files
+            .iter()
+            .any(|file| file.as_str() == Some("nested/mod.rs"))
+    );
+}
+
+#[tokio::test]
+async fn builtin_coding_glob_and_grep_files_with_matches_sort_newest_first() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("old.rs"), "needle old\n").unwrap();
+    thread::sleep(Duration::from_millis(1_100));
+    std::fs::write(temp.path().join("new.rs"), "needle new\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let globbed = invoke_with_context(
+        &runtime,
+        GLOB_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "*.rs"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(globbed["files"], json!(["new.rs", "old.rs"]));
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(grepped["files"], json!(["new.rs", "old.rs"]));
+}
+
+#[tokio::test]
+async fn builtin_coding_blocks_sensitive_scoped_paths_like_v1() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join(".env"), "TOKEN=secret\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    for (capability, input) in [
+        (READ_FILE_CAPABILITY_ID, json!({"path": "/workspace/.env"})),
+        (
+            WRITE_FILE_CAPABILITY_ID,
+            json!({"path": "/workspace/.env", "content": "changed"}),
+        ),
+        (
+            APPLY_PATCH_CAPABILITY_ID,
+            json!({"path": "/workspace/.env", "old_string": "TOKEN", "new_string": "X"}),
+        ),
+    ] {
+        let error = invoke_with_context(&runtime, capability, input, context.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error, RuntimeFailureKind::Authorization);
+    }
+}
+
+#[tokio::test]
+async fn builtin_coding_grep_searches_single_file_paths_like_v1() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(temp.path().join("src/lib.rs"), "needle\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(
+        temp.path(),
+        MountPermissions {
+            read: true,
+            write: false,
+            delete: false,
+            list: false,
+            execute: false,
+        },
+    );
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace/src/lib.rs", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(grepped["files"], json!(["lib.rs"]));
+}
+
+#[tokio::test]
+async fn builtin_coding_grep_applies_filters_before_loading_large_files() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(temp.path().join("src/lib.rs"), "needle\n").unwrap();
+    std::fs::write(
+        temp.path().join("huge.txt"),
+        vec![b'x'; 10 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "needle", "glob": "**/*.rs"}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(grepped["files"], json!(["src/lib.rs"]));
+}
+
+#[tokio::test]
+async fn builtin_coding_write_allows_v1_sized_payloads_past_default_input_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+    let content = "x".repeat(2 * 1024 * 1024);
+
+    let wrote = invoke_with_context(
+        &runtime,
+        WRITE_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/large.txt", "content": content}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrote["bytes_written"], json!(2 * 1024 * 1024));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn builtin_coding_grep_skips_sensitive_files_and_symlink_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join(".env"), "TOKEN=secret\n").unwrap();
+    std::os::unix::fs::symlink(temp.path().join(".env"), temp.path().join("safe_link.rs")).unwrap();
+    std::fs::write(temp.path().join("visible.rs"), "TOKEN=visible\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "TOKEN", "output_mode": "content"}),
+        context,
+    )
+    .await
+    .unwrap();
+    let content = grepped["content"].as_str().unwrap();
+    assert!(content.contains("visible.rs"));
+    assert!(!content.contains("secret"));
+    assert!(!content.contains("safe_link"));
+}
+
+#[tokio::test]
+async fn builtin_coding_grep_requires_read_permission_but_glob_only_requires_list() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("src")).unwrap();
+    std::fs::write(
+        temp.path().join("src/secret.rs"),
+        "let token = \"secret\";\n",
+    )
+    .unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(
+        temp.path(),
+        MountPermissions {
+            read: false,
+            write: false,
+            delete: false,
+            list: true,
+            execute: false,
+        },
+    );
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let globbed = invoke_with_context(
+        &runtime,
+        GLOB_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "**/*.rs"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(globbed["files"], json!(["src/secret.rs"]));
+
+    let error = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "secret"}),
+        context,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, RuntimeFailureKind::Authorization);
+}
+
+#[tokio::test]
+async fn builtin_coding_list_and_glob_require_list_permission() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("README.md"), "alpha\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(
+        temp.path(),
+        MountPermissions {
+            read: true,
+            write: false,
+            delete: false,
+            list: false,
+            execute: false,
+        },
+    );
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let read = invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/README.md"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["content"], json!("     1│ alpha"));
+
+    for capability in [LIST_DIR_CAPABILITY_ID, GLOB_CAPABILITY_ID] {
+        let error = invoke_with_context(
+            &runtime,
+            capability,
+            json!({"path": "/workspace", "pattern": "**/*.md"}),
+            context.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, RuntimeFailureKind::Authorization);
+    }
+}
+
+#[tokio::test]
+async fn builtin_coding_list_truncates_like_v1_after_500_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..501 {
+        std::fs::write(temp.path().join(format!("file-{index:03}.txt")), "a").unwrap();
+    }
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let listed = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace"}),
+        execution_context_with_mounts(all_builtin_capability_ids(), mounts),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(listed["count"], json!(500));
+    assert_eq!(listed["truncated"], json!(true));
+    assert_eq!(listed["entries"].as_array().unwrap().len(), 500);
+}
+
+#[tokio::test]
+async fn builtin_coding_read_rejects_files_larger_than_v1_limit_before_loading_contents() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("big.txt"),
+        vec![b'x'; 10 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let error = invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/big.txt"}),
+        execution_context_with_mounts(all_builtin_capability_ids(), mounts),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::Resource);
+}
+
+#[tokio::test]
+async fn builtin_apply_patch_matches_v1_exact_unique_and_replace_all_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("code.rs"), "old\nold\nunique\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+
+    let duplicate = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
+        context.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(duplicate, RuntimeFailureKind::Backend);
+
+    let replaced = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({
+            "path": "/workspace/code.rs",
+            "old_string": "old",
+            "new_string": "new",
+            "replace_all": true
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced["success"], json!(true));
+    assert_eq!(replaced["replacements"], json!(2));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("code.rs")).unwrap(),
+        "new\nnew\nunique\n"
+    );
+
+    let no_op = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs", "old_string": "new", "new_string": "new"}),
+        context,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(no_op, RuntimeFailureKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn builtin_apply_patch_requires_full_fresh_read_like_v1() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("code.rs"), "old\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let unread = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
+        context.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(unread, RuntimeFailureKind::Backend);
+
+    invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs", "limit": 1}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let partial = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
+        context.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(partial, RuntimeFailureKind::Backend);
+}
+
+#[tokio::test]
+async fn builtin_coding_write_is_denied_by_read_only_mount() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("README.md"), "alpha\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let error = invoke_with_context(
+        &runtime,
+        WRITE_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/blocked.txt", "content": "nope"}),
+        execution_context_with_mounts(all_builtin_capability_ids(), mounts),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::Authorization);
+    assert!(!temp.path().join("blocked.txt").exists());
+}
+
+#[tokio::test]
 async fn builtin_missing_grant_denies_before_handler_dispatch() {
     let outcome = runtime()
         .invoke_capability(RuntimeCapabilityRequest::new(
@@ -273,9 +842,19 @@ async fn builtin_missing_grant_denies_before_handler_dispatch() {
 }
 
 async fn invoke(capability: &str, input: Value) -> Result<Value, RuntimeFailureKind> {
-    let outcome = runtime()
+    let runtime = runtime();
+    invoke_with_context(&runtime, capability, input, execution_context([capability])).await
+}
+
+async fn invoke_with_context<R: HostRuntime + ?Sized>(
+    runtime: &R,
+    capability: &str,
+    input: Value,
+    context: ExecutionContext,
+) -> Result<Value, RuntimeFailureKind> {
+    let outcome = runtime
         .invoke_capability(RuntimeCapabilityRequest::new(
-            execution_context([capability]),
+            context,
             capability_id(capability),
             ResourceEstimate::default(),
             input,
@@ -291,9 +870,13 @@ async fn invoke(capability: &str, input: Value) -> Result<Value, RuntimeFailureK
 }
 
 fn runtime() -> impl HostRuntime {
+    runtime_with_filesystem(LocalFilesystem::new())
+}
+
+fn runtime_with_filesystem(filesystem: LocalFilesystem) -> impl HostRuntime {
     HostRuntimeServices::new(
         Arc::new(registry()),
-        Arc::new(LocalFilesystem::new()),
+        Arc::new(filesystem),
         Arc::new(InMemoryResourceGovernor::new()),
         Arc::new(GrantAuthorizer::new()),
         ironclaw_processes::ProcessServices::in_memory(),
@@ -320,6 +903,37 @@ fn provider_id() -> ExtensionId {
     ExtensionId::new("builtin").unwrap()
 }
 
+fn all_builtin_capability_ids() -> [&'static str; 9] {
+    [
+        ECHO_CAPABILITY_ID,
+        TIME_CAPABILITY_ID,
+        JSON_CAPABILITY_ID,
+        READ_FILE_CAPABILITY_ID,
+        WRITE_FILE_CAPABILITY_ID,
+        LIST_DIR_CAPABILITY_ID,
+        GLOB_CAPABILITY_ID,
+        GREP_CAPABILITY_ID,
+        APPLY_PATCH_CAPABILITY_ID,
+    ]
+}
+
+fn mounted_filesystem(path: &Path, permissions: MountPermissions) -> (LocalFilesystem, MountView) {
+    let mut filesystem = LocalFilesystem::new();
+    filesystem
+        .mount_local(
+            VirtualPath::new("/projects/coding-pack").unwrap(),
+            HostPath::from_path_buf(path.to_path_buf()),
+        )
+        .unwrap();
+    let mounts = MountView::new(vec![MountGrant::new(
+        MountAlias::new("/workspace").unwrap(),
+        VirtualPath::new("/projects/coding-pack").unwrap(),
+        permissions,
+    )])
+    .unwrap();
+    (filesystem, mounts)
+}
+
 fn execution_context<const N: usize>(grants: [&str; N]) -> ExecutionContext {
     let capability_set = CapabilitySet {
         grants: grants.into_iter().map(dispatch_grant).collect(),
@@ -335,15 +949,40 @@ fn execution_context<const N: usize>(grants: [&str; N]) -> ExecutionContext {
     .unwrap()
 }
 
+fn execution_context_with_mounts<const N: usize>(
+    grants: [&str; N],
+    mounts: MountView,
+) -> ExecutionContext {
+    let capability_set = CapabilitySet {
+        grants: grants
+            .into_iter()
+            .map(|grant| dispatch_grant_with_mounts(grant, mounts.clone()))
+            .collect(),
+    };
+    ExecutionContext::local_default(
+        UserId::new("user").unwrap(),
+        ExtensionId::new("caller").unwrap(),
+        RuntimeKind::FirstParty,
+        TrustClass::FirstParty,
+        capability_set,
+        mounts,
+    )
+    .unwrap()
+}
+
 fn dispatch_grant(capability: &str) -> CapabilityGrant {
+    dispatch_grant_with_mounts(capability, MountView::default())
+}
+
+fn dispatch_grant_with_mounts(capability: &str, mounts: MountView) -> CapabilityGrant {
     CapabilityGrant {
         id: CapabilityGrantId::new(),
         capability: capability_id(capability),
         grantee: Principal::Extension(ExtensionId::new("caller").unwrap()),
         issued_by: Principal::HostRuntime,
         constraints: GrantConstraints {
-            allowed_effects: vec![EffectKind::DispatchCapability],
-            mounts: MountView::default(),
+            allowed_effects: builtin_effects(),
+            mounts,
             network: NetworkPolicy::default(),
             secrets: Vec::new(),
             resource_ceiling: None,
@@ -353,6 +992,14 @@ fn dispatch_grant(capability: &str) -> CapabilityGrant {
     }
 }
 
+fn builtin_effects() -> Vec<EffectKind> {
+    vec![
+        EffectKind::DispatchCapability,
+        EffectKind::ReadFilesystem,
+        EffectKind::WriteFilesystem,
+    ]
+}
+
 fn trust_policy() -> HostTrustPolicy {
     HostTrustPolicy::new(vec![Box::new(AdminConfig::with_entries(vec![
         AdminEntry::for_local_manifest(
@@ -360,7 +1007,7 @@ fn trust_policy() -> HostTrustPolicy {
             "/system/extensions/builtin/manifest.toml".to_string(),
             None,
             HostTrustAssignment::first_party(),
-            vec![EffectKind::DispatchCapability],
+            builtin_effects(),
             None,
         ),
     ]))])
@@ -375,7 +1022,7 @@ fn trust_decision() -> TrustDecision {
     TrustDecision {
         effective_trust: EffectiveTrustClass::user_trusted(),
         authority_ceiling: AuthorityCeiling {
-            allowed_effects: vec![EffectKind::DispatchCapability],
+            allowed_effects: builtin_effects(),
             max_resource_ceiling: None,
         },
         provenance: TrustProvenance::Default,

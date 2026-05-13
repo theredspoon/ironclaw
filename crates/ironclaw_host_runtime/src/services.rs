@@ -1429,7 +1429,10 @@ where
         if let Some(runtime) = &self.first_party_runtime {
             dispatcher = dispatcher.with_runtime_adapter_arc(
                 RuntimeKind::FirstParty,
-                Arc::new(FirstPartyRuntimeAdapter::from_registry(Arc::clone(runtime))),
+                Arc::new(FirstPartyRuntimeAdapter::from_registry(
+                    Arc::clone(runtime),
+                    Arc::clone(&self.filesystem) as Arc<dyn RootFilesystem>,
+                )),
             );
         }
         if let Some(runtime) = &self.wasm_runtime {
@@ -1763,11 +1766,18 @@ where
 #[derive(Clone)]
 struct FirstPartyRuntimeAdapter {
     registry: Arc<FirstPartyCapabilityRegistry>,
+    filesystem: Arc<dyn RootFilesystem>,
 }
 
 impl FirstPartyRuntimeAdapter {
-    pub fn from_registry(registry: Arc<FirstPartyCapabilityRegistry>) -> Self {
-        Self { registry }
+    pub fn from_registry(
+        registry: Arc<FirstPartyCapabilityRegistry>,
+        filesystem: Arc<dyn RootFilesystem>,
+    ) -> Self {
+        Self {
+            registry,
+            filesystem,
+        }
     }
 }
 
@@ -1811,6 +1821,7 @@ where
             scope: request.scope.clone(),
             estimate: request.estimate,
             mounts: request.mounts,
+            filesystem: Arc::clone(&self.filesystem),
             input: request.input,
         }))
         .catch_unwind()
