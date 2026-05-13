@@ -1,9 +1,9 @@
 // IronClaw Reborn ProductAdapter v2 WIT contract (issue #3285).
 //
 // This WIT file documents the constrained capability boundary the v2 host
-// runtime will expose to ProductAdapter WASM components. wasmtime component
-// bindgen is intentionally NOT wired up yet — the WIT below is the agreed
-// shape for the eventual component build.
+// runtime exposes to ProductAdapter WASM components. wasmtime component
+// bindgen is wired in `ironclaw_wasm_product_adapters`; production protocol
+// adapters can target this world as installable WASM components.
 //
 // Host-imposed invariants (enforced regardless of the component-model glue):
 //

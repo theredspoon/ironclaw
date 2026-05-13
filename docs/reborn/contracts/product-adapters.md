@@ -166,6 +166,6 @@ configured for the same installation; see
 | Egress policy enforcement | `[implemented slice]` |
 | `NativeProductAdapterRunner` | `[implemented slice]` |
 | Telegram v2 native adapter | `[implemented slice]` (`ironclaw_telegram_v2_adapter`) |
-| wasmtime component-model glue | `[contract exists]` (WIT in `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`) |
+| wasmtime component-model glue | `[implemented slice]` (`ProductAdapterComponentRuntime` loads `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`) |
 | Web / Slack / Discord / WhatsApp / Feishu / Signal v2 adapters | `[not implemented]` |
 | Production wiring of v2 webhook route | `[not implemented]` (default-off flag exists; route registration is a follow-up) |

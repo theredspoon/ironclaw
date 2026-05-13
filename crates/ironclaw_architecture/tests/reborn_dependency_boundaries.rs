@@ -330,6 +330,8 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
     //   * hex                 — HMAC signature encoding in the auth verifier.
     //   * tracing             — structured logging for hardened error paths
     //                           added in the zmanian review.
+    //   * serde_json          — validates temporary JSON-shim WIT payloads.
+    //   * wasmtime            — component-model loader, linker, store, and limiter.
     // Every addition is justified by a concrete call site in src/. Adding a
     // dep here without a matching call site is a contract violation — and
     // adding workflow/runtime crates beyond this list still requires
@@ -341,11 +343,13 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
         "hmac",
         "http",
         "ironclaw_product_adapters",
+        "serde_json",
         "sha2",
         "subtle",
         "thiserror",
         "tokio",
         "tracing",
+        "wasmtime",
     ];
     assert_eq!(
         deps, expected,
