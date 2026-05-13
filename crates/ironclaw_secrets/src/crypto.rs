@@ -144,18 +144,25 @@ impl std::fmt::Debug for SecretsCrypto {
 /// Build domain-separated, length-prefixed AAD bytes.
 ///
 /// Each call writes the domain tag followed by every part as
-/// `(u32-be length || bytes)`. Length prefixes keep the encoding unambiguous
+/// `(u64-be length || bytes)`. Length prefixes keep the encoding unambiguous
 /// even when parts contain arbitrary bytes (delimiters in part contents
 /// cannot be confused with the framing), and the domain tag prevents
 /// cross-shape replay (a credential-account ciphertext cannot be replayed as
-/// a secret-record ciphertext, etc.).
+/// a secret-record ciphertext, etc.). The length is encoded as `u64` so the
+/// conversion from `usize` is infallible on all supported platforms (where
+/// `usize` is at most 64 bits) and cannot panic on attacker-influenced part
+/// lengths such as user-chosen secret names.
 pub(crate) fn build_aad(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-    let capacity = domain.len() + parts.iter().map(|part| 4 + part.len()).sum::<usize>();
+    const LENGTH_PREFIX_BYTES: usize = size_of::<u64>();
+    let capacity = domain.len()
+        + parts
+            .iter()
+            .map(|part| LENGTH_PREFIX_BYTES + part.len())
+            .sum::<usize>();
     let mut aad = Vec::with_capacity(capacity);
     aad.extend_from_slice(domain);
     for part in parts {
-        let length =
-            u32::try_from(part.len()).expect("AAD part length must fit in u32 for framing"); // safety: AAD parts are bounded identifiers (UUIDs, scope names, account names) — orders of magnitude below u32::MAX
+        let length = part.len() as u64;
         aad.extend_from_slice(&length.to_be_bytes());
         aad.extend_from_slice(part);
     }
