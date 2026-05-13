@@ -318,7 +318,8 @@ pub mod v2;
 
 pub use v2::{
     CapabilityDeclV2, CapabilityVisibility, ExtensionManifestV2, ExtensionRuntimeV2,
-    MANIFEST_SCHEMA_VERSION, ManifestSource, ManifestV2Error, RESERVED_HOST_BUNDLED_ID_PREFIX,
+    MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ManifestSource, ManifestV2Error,
+    RESERVED_HOST_BUNDLED_ID_PREFIX,
 };
 
 pub use lifecycle::{

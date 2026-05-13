@@ -61,7 +61,7 @@ fn parses_minimum_valid_v2_manifest_for_installed_third_party_extension() {
     assert_eq!(manifest.id, ExtensionId::new("acme-tools").unwrap());
     assert_eq!(manifest.source, ManifestSource::InstalledLocal);
     assert_eq!(manifest.requested_trust, RequestedTrustClass::ThirdParty);
-    assert_eq!(manifest.trust, TrustClass::UserTrusted);
+    assert_eq!(manifest.descriptor_trust_default, TrustClass::UserTrusted);
     assert_eq!(manifest.runtime.kind(), RuntimeKind::Wasm);
     assert_eq!(manifest.capabilities.len(), 1);
     let cap = &manifest.capabilities[0];
@@ -212,6 +212,11 @@ required_host_ports = [
         manifest.requested_trust,
         RequestedTrustClass::FirstPartyRequested
     );
+    // Lock in the v2 contract: `descriptor_trust_default` is a safe
+    // pre-policy default. Privileged requests *intentionally* surface as
+    // Sandbox here even for HostBundled — effective trust must come from a
+    // host trust-policy evaluation, never from this field.
+    assert_eq!(manifest.descriptor_trust_default, TrustClass::Sandbox);
     assert!(matches!(
         manifest.runtime,
         ExtensionRuntimeV2::FirstParty { .. }
@@ -348,8 +353,14 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
             .unwrap_err();
         assert!(
-            matches!(err, ManifestV2Error::Contract(_)),
-            "{bad_ref:?} should be rejected via contract error, got {err:?}"
+            matches!(
+                err,
+                ManifestV2Error::InvalidSchemaRef {
+                    field: "input_schema_ref",
+                    ..
+                }
+            ),
+            "{bad_ref:?} should be rejected via InvalidSchemaRef, got {err:?}"
         );
     }
 }
@@ -411,7 +422,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
     let manifest =
         ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap();
     assert_eq!(manifest.requested_trust, RequestedTrustClass::Untrusted);
-    assert_eq!(manifest.trust, TrustClass::Sandbox);
+    assert_eq!(manifest.descriptor_trust_default, TrustClass::Sandbox);
 }
 
 #[test]
@@ -692,4 +703,163 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         matches!(err, ManifestV2Error::DuplicateCapability { .. }),
         "{err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue-driven coverage (zmanian review, slice 2a).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn host_bundled_accepts_non_reserved_id() {
+    // Spec: the `ironclaw.` prefix is reserved *for* HostBundled. It is not
+    // *required* of HostBundled. A host-bundled extension may legitimately
+    // ship under any id; lock that in so the reserved-prefix rule does not
+    // accidentally become a "must use" rule downstream.
+    let toml = third_party_wasm_manifest("memory-native", "memory-native.echo");
+    let manifest =
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap();
+    assert_eq!(manifest.source, ManifestSource::HostBundled);
+    assert_eq!(manifest.id, ExtensionId::new("memory-native").unwrap());
+}
+
+#[test]
+fn parses_multi_capability_manifest_with_distinct_implements() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "Acme"
+version = "0.1.0"
+description = "two capabilities"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/acme.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+implements = ["acme.echo.v1"]
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+
+[[capabilities]]
+id = "acme-tools.reverse"
+implements = ["acme.reverse.v1", "acme.string_ops.v1"]
+description = "reverse a string"
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/acme/reverse.input.v1.json"
+output_schema_ref = "schemas/acme/reverse.output.v1.json"
+prompt_doc_ref = "prompt/acme/reverse.md"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let manifest =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap();
+    assert_eq!(manifest.capabilities.len(), 2);
+    assert_eq!(
+        manifest.capabilities[0].implements,
+        vec![CapabilityProfileId::new("acme.echo.v1").unwrap()]
+    );
+    assert_eq!(
+        manifest.capabilities[1].implements,
+        vec![
+            CapabilityProfileId::new("acme.reverse.v1").unwrap(),
+            CapabilityProfileId::new("acme.string_ops.v1").unwrap(),
+        ]
+    );
+}
+
+#[test]
+fn rejects_manifest_exceeding_max_size() {
+    use ironclaw_extensions::{MAX_MANIFEST_BYTES, ManifestV2Error};
+    // Construct an input strictly larger than MAX_MANIFEST_BYTES *before*
+    // reaching the TOML parser. The check must fail closed without parsing.
+    let mut huge = String::with_capacity(MAX_MANIFEST_BYTES + 1024);
+    huge.push_str("# pad\n");
+    while huge.len() <= MAX_MANIFEST_BYTES {
+        huge.push_str("# filler line to defeat short-circuit eval\n");
+    }
+    let err =
+        ExtensionManifestV2::parse(&huge, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(
+        matches!(err, ManifestV2Error::ManifestTooLarge { bytes, max } if bytes == huge.len() && max == MAX_MANIFEST_BYTES),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_effect_in_capability() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "Acme"
+version = "0.1.0"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/acme.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+effects = ["read_filesystem", "read_filesystem"]
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(
+        matches!(err, ManifestV2Error::DuplicateEffect { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn schema_ref_errors_carry_field_context() {
+    // Absolute schema refs are rejected by CapabilityProfileSchemaRef::new.
+    // The parser must wrap the underlying error with the offending field name
+    // so hand-edited manifests get an actionable error.
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "Acme"
+version = "0.1.0"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/acme.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "/abs/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    match err {
+        ManifestV2Error::InvalidSchemaRef { field, .. } => {
+            assert_eq!(field, "input_schema_ref");
+        }
+        other => panic!("expected InvalidSchemaRef, got {other:?}"),
+    }
 }

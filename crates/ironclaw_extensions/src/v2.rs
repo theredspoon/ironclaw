@@ -18,8 +18,24 @@
 //!
 //! This module does **not** dispatch capabilities, load WASM modules, evaluate
 //! trust policy, or grant authority. It is contract vocabulary only.
+//!
+//! ## Whitespace and field shape
+//!
+//! `name`, `version`, and `description` are rejected when empty or
+//! whitespace-only, but the *exact* bytes from the TOML are preserved on the
+//! validated manifest (no `trim`). `version` is treated as opaque,
+//! registry-defined vocabulary — v2 does **not** require semver; downstream
+//! consumers that need ordered comparison must parse it themselves.
+//!
+//! ## Serialization
+//!
+//! v2 deliberately ships `Deserialize`-only types. `ExtensionManifestV2` has
+//! no `Serialize` impl: this module is a parser/validator contract, not a
+//! registry write path. If a future diagnostic / registry tool needs round
+//! tripping it should add a deliberate serialization layer with its own
+//! schema.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use ironclaw_host_api::{
     CapabilityId, CapabilityProfileId, CapabilityProfileSchemaRef, EffectKind, ExtensionId,
@@ -34,6 +50,13 @@ pub const MANIFEST_SCHEMA_VERSION: &str = "reborn.extension_manifest.v2";
 
 /// Reserved extension-ID prefix for host-bundled extensions.
 pub const RESERVED_HOST_BUNDLED_ID_PREFIX: &str = "ironclaw.";
+
+/// Upper bound on raw manifest TOML input size.
+///
+/// Loaders feed installed manifests of ≤ a few KB; this cap exists to fail
+/// closed before `toml::from_str` parses and allocates a pathological input.
+/// Tune cautiously — raising this also raises peak loader memory.
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
 /// Loader-supplied source for a manifest. Never read from TOML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,8 +165,22 @@ pub struct ExtensionManifestV2 {
     pub version: String,
     pub description: String,
     pub source: ManifestSource,
+    /// Raw, loader-supplied trust *request*. Untrusted vocabulary.
     pub requested_trust: RequestedTrustClass,
-    pub trust: TrustClass,
+    /// Default `TrustClass` that downstream code may use **only when no host
+    /// trust policy has run yet**.
+    ///
+    /// Mapping:
+    /// - `ThirdParty` → `UserTrusted`
+    /// - `Untrusted` / `FirstPartyRequested` / `SystemRequested` → `Sandbox`
+    ///
+    /// FirstParty/System requests intentionally map to `Sandbox` here even
+    /// for `ManifestSource::HostBundled`: this field is a safe pre-policy
+    /// default, **not** the effective trust class. Effective privileged trust
+    /// only ever comes from `ironclaw_trust::TrustPolicy::evaluate` on a
+    /// `TrustPolicyInput`. Consumers that need effective trust **must** run
+    /// the policy; they must not read this field as authoritative.
+    pub descriptor_trust_default: TrustClass,
     pub runtime: ExtensionRuntimeV2,
     pub capabilities: Vec<CapabilityDeclV2>,
 }
@@ -195,6 +232,19 @@ pub enum ManifestV2Error {
         id: CapabilityId,
         expected: ExtensionId,
     },
+    #[error("manifest exceeds maximum size: {bytes} > {max} bytes")]
+    ManifestTooLarge { bytes: usize, max: usize },
+    #[error("capability {capability} declares duplicate effect {effect:?}")]
+    DuplicateEffect {
+        capability: CapabilityId,
+        effect: EffectKind,
+    },
+    #[error("capability {capability} field '{field}' is invalid: {reason}")]
+    InvalidSchemaRef {
+        capability: CapabilityId,
+        field: &'static str,
+        reason: String,
+    },
     #[error("capability {capability} declares duplicate required host port '{port}'")]
     DuplicateRequiredHostPort {
         capability: CapabilityId,
@@ -220,6 +270,14 @@ impl ExtensionManifestV2 {
         source: ManifestSource,
         host_port_catalog: &HostPortCatalog,
     ) -> Result<Self, ManifestV2Error> {
+        // Fail closed on pathological inputs *before* invoking the TOML parser.
+        // `toml::from_str` will otherwise read and allocate the full input.
+        if input.len() > MAX_MANIFEST_BYTES {
+            return Err(ManifestV2Error::ManifestTooLarge {
+                bytes: input.len(),
+                max: MAX_MANIFEST_BYTES,
+            });
+        }
         let raw: RawManifestV2 = toml::from_str(input).map_err(|error| ManifestV2Error::Parse {
             reason: error.to_string(),
         })?;
@@ -239,15 +297,9 @@ impl ExtensionManifestV2 {
             });
         }
 
-        let id = ExtensionId::new(raw.id)?;
-        if !source.allows_first_party() && id.as_str().starts_with(RESERVED_HOST_BUNDLED_ID_PREFIX)
-        {
-            return Err(ManifestV2Error::ReservedIdForInstalledSource {
-                id,
-                prefix: RESERVED_HOST_BUNDLED_ID_PREFIX,
-            });
-        }
-
+        // Cheap empty-string checks first — surface them before the more
+        // structured id / runtime / capability errors so hand-edited manifests
+        // get the most actionable message.
         if raw.name.trim().is_empty() {
             return Err(ManifestV2Error::Invalid {
                 reason: "name must not be empty".to_string(),
@@ -269,6 +321,15 @@ impl ExtensionManifestV2 {
             });
         }
 
+        let id = ExtensionId::new(raw.id)?;
+        if !source.allows_first_party() && id.as_str().starts_with(RESERVED_HOST_BUNDLED_ID_PREFIX)
+        {
+            return Err(ManifestV2Error::ReservedIdForInstalledSource {
+                id,
+                prefix: RESERVED_HOST_BUNDLED_ID_PREFIX,
+            });
+        }
+
         let requested_trust = raw.trust;
         if !source.allows_first_party()
             && matches!(
@@ -281,7 +342,7 @@ impl ExtensionManifestV2 {
                 requested: requested_trust,
             });
         }
-        let trust = requested_trust_to_descriptor_trust(requested_trust);
+        let descriptor_trust_default = requested_trust_to_descriptor_trust(requested_trust);
 
         let runtime = raw.runtime.into_runtime()?;
         if !source.allows_first_party() && !runtime.installed_allows() {
@@ -309,7 +370,7 @@ impl ExtensionManifestV2 {
             description: raw.description,
             source,
             requested_trust,
-            trust,
+            descriptor_trust_default,
             runtime,
             capabilities,
         })
@@ -343,6 +404,20 @@ impl CapabilityDeclV2 {
             });
         }
 
+        // Reject duplicate effects — declaring the same `EffectKind` twice in
+        // one capability is always a manifest bug, never load-bearing, and
+        // letting it through would defeat consistency with the dedup applied
+        // to `implements` and `required_host_ports`.
+        let mut effects_seen: HashSet<EffectKind> = HashSet::new();
+        for effect in &raw.effects {
+            if !effects_seen.insert(*effect) {
+                return Err(ManifestV2Error::DuplicateEffect {
+                    capability: id,
+                    effect: *effect,
+                });
+            }
+        }
+
         let mut implements_seen = BTreeSet::new();
         let mut implements = Vec::with_capacity(raw.implements.len());
         for profile in raw.implements {
@@ -356,11 +431,33 @@ impl CapabilityDeclV2 {
             implements.push(profile);
         }
 
-        let input_schema_ref = CapabilityProfileSchemaRef::new(raw.input_schema_ref)?;
-        let output_schema_ref = CapabilityProfileSchemaRef::new(raw.output_schema_ref)?;
+        let input_schema_ref =
+            CapabilityProfileSchemaRef::new(raw.input_schema_ref).map_err(|err| {
+                ManifestV2Error::InvalidSchemaRef {
+                    capability: id.clone(),
+                    field: "input_schema_ref",
+                    reason: err.to_string(),
+                }
+            })?;
+        let output_schema_ref =
+            CapabilityProfileSchemaRef::new(raw.output_schema_ref).map_err(|err| {
+                ManifestV2Error::InvalidSchemaRef {
+                    capability: id.clone(),
+                    field: "output_schema_ref",
+                    reason: err.to_string(),
+                }
+            })?;
         let prompt_doc_ref = raw
             .prompt_doc_ref
-            .map(CapabilityProfileSchemaRef::new)
+            .map(|value| {
+                CapabilityProfileSchemaRef::new(value).map_err(|err| {
+                    ManifestV2Error::InvalidSchemaRef {
+                        capability: id.clone(),
+                        field: "prompt_doc_ref",
+                        reason: err.to_string(),
+                    }
+                })
+            })
             .transpose()?;
 
         if matches!(raw.visibility, CapabilityVisibility::Model) && prompt_doc_ref.is_none() {
@@ -522,7 +619,7 @@ fn requested_trust_to_descriptor_trust(requested: RequestedTrustClass) -> TrustC
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawManifestV2 {
+struct RawManifestV2 {
     schema_version: String,
     id: String,
     name: String,
@@ -663,7 +760,7 @@ impl RawRuntimeV2 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RawCapabilityV2 {
+struct RawCapabilityV2 {
     id: String,
     #[serde(default)]
     implements: Vec<String>,
