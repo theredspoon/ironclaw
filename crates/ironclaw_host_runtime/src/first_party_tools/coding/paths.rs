@@ -1,5 +1,6 @@
 use ironclaw_filesystem::{FileStat, FilesystemError, FilesystemOperation};
 use ironclaw_host_api::{RuntimeDispatchErrorKind, ScopedPath, VirtualPath};
+use ironclaw_safety::sensitive_paths::is_sensitive_path_str;
 use serde_json::Value;
 
 use crate::{FirstPartyCapabilityError, FirstPartyCapabilityRequest};
@@ -184,55 +185,7 @@ pub(super) fn scoped_child_path(root: &ScopedPath, relative: &str) -> String {
 }
 
 pub(super) fn is_sensitive_scoped_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    let filename = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    if filename == ".env" || filename.starts_with(".env.") {
-        let remainder = filename.strip_prefix(".env").unwrap_or("");
-        if !matches!(remainder, ".example" | ".template" | ".sample" | ".dist") {
-            return true;
-        }
-    }
-    if matches!(
-        filename,
-        "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa" | "authorized_keys" | "known_hosts"
-    ) {
-        return true;
-    }
-    let safe_suffix = filename.ends_with(".dist");
-    if !safe_suffix
-        && [".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"]
-            .iter()
-            .any(|suffix| filename.ends_with(suffix))
-    {
-        return true;
-    }
-    let with_slash = format!("{normalized}/");
-    [
-        "/.ssh/",
-        "/.aws/",
-        "/.netrc",
-        "/.pgpass",
-        "/.npmrc",
-        "/.pypirc",
-        "/.docker/",
-        "/.kube/",
-        "/.git-credentials",
-        "/.gcloud/",
-        "/.config/gcloud/",
-        "/.gnupg/",
-        "/.vault-token",
-        "/.ironclaw/secrets/",
-        "/.config/gh/hosts.yml",
-        "/etc/shadow",
-        "/etc/gshadow",
-        "/.terraform.d/credentials.tfrc.json",
-        "/.azure/",
-        "/.bash_history",
-        "/.zsh_history",
-        "/.histfile",
-    ]
-    .iter()
-    .any(|pattern| normalized.contains(pattern) || with_slash.contains(pattern))
+    is_sensitive_path_str(path)
 }
 
 pub(super) fn filesystem_error(error: FilesystemError) -> FirstPartyCapabilityError {
