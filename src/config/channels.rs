@@ -495,12 +495,23 @@ pub fn validate_telegram_v1_v2_exclusivity(
     channels: &ChannelsConfig,
     persisted_active_wasm_channels: Option<&HashSet<String>>,
 ) -> Result<(), ConfigError> {
+    // Canonicalize via `ExtensionName` so the same membership test runs
+    // here that startup activation runs in `ExtensionManager`. Without
+    // this, non-canonical inputs like ` telegram ` or `tele-gram` slip
+    // past the validator while still normalizing to `telegram` at
+    // activation time, letting v1 and v2 stand up for the same
+    // installation (Copilot review on PR #3356).
+    fn is_telegram_after_canonicalize(name: &str) -> bool {
+        ironclaw_common::ExtensionName::new(name)
+            .map(|n| n.as_str() == "telegram")
+            .unwrap_or(false)
+    }
     let v1_telegram_configured = channels
         .configured_wasm_channels
         .iter()
-        .any(|c| c == "telegram");
-    let v1_telegram_persisted =
-        persisted_active_wasm_channels.is_some_and(|active| active.iter().any(|c| c == "telegram"));
+        .any(|c| is_telegram_after_canonicalize(c));
+    let v1_telegram_persisted = persisted_active_wasm_channels
+        .is_some_and(|active| active.iter().any(|c| is_telegram_after_canonicalize(c)));
     let v1_active =
         channels.wasm_channels_enabled && (v1_telegram_configured || v1_telegram_persisted);
     let v2_active = channels.reborn_telegram_v2_enabled;
@@ -631,6 +642,41 @@ mod telegram_v2_tests {
         let persisted = persisted_with(&["telegram"]);
         validate_telegram_v1_v2_exclusivity(&cfg, Some(&persisted))
             .expect("wasm channels disabled — persisted list is dormant");
+    }
+
+    #[test]
+    fn non_canonical_telegram_name_in_configured_list_still_blocks_v2() {
+        // Copilot review on PR #3356: startup activation canonicalizes
+        // channel names via `ExtensionName` (trims whitespace, folds
+        // hyphens). The validator must apply the same canonicalization
+        // before testing membership, otherwise non-canonical inputs
+        // like ` telegram ` would pass the env-level check but still
+        // activate as `telegram` and conflict with v2.
+        let mut cfg = channels_cfg(false, true);
+        cfg.wasm_channels_enabled = true;
+        cfg.configured_wasm_channels = vec![" telegram ".to_string()];
+        let err = validate_telegram_v1_v2_exclusivity(&cfg, None)
+            .expect_err("whitespace-padded telegram must canonicalize and block");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED")
+        );
+    }
+
+    #[test]
+    fn non_canonical_telegram_name_in_persisted_set_still_blocks_v2() {
+        let mut cfg = channels_cfg(false, true);
+        cfg.wasm_channels_enabled = true;
+        cfg.configured_wasm_channels = Vec::new();
+        // Hypothetical hyphenated alias that canonicalizes to "telegram".
+        // `tele-gram` would actually canonicalize to `tele_gram`, but
+        // a future legacy alias might collide; pin the canonicalization
+        // contract by feeding a leading/trailing-whitespace variant.
+        let persisted = persisted_with(&[" telegram"]);
+        let err = validate_telegram_v1_v2_exclusivity(&cfg, Some(&persisted))
+            .expect_err("non-canonical persisted telegram must block");
+        assert!(
+            matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "REBORN_TELEGRAM_V2_ENABLED")
+        );
     }
 
     #[test]
