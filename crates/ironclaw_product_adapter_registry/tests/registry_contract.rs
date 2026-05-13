@@ -116,13 +116,26 @@ async fn explicit_activation_makes_installation_enabled() {
 async fn credential_binding_must_reference_declared_manifest_handle() {
     let store = InMemoryProductAdapterRegistryStore::default();
     store.upsert_manifest(manifest()).await.unwrap();
-    let mut invalid = installation(ProductAdapterActivationState::Installed);
-    invalid
-        .set_credential_bindings(vec![ProductAdapterCredentialBinding::new(
+    // Construction is the only public bindings-mutation path now —
+    // `set_credential_bindings` is crate-private so external callers cannot
+    // bypass the store's manifest re-validation by patching bindings on a
+    // get_installation snapshot. The invalid installation is built up front
+    // and upserted; the store rejects it on cross-manifest validation.
+    let invalid = ProductAdapterInstallation::new(
+        installation_id("acme-telegram-prod"),
+        adapter_id(),
+        ProductAdapterActivationState::Installed,
+        ProductAdapterManifestRef::new(
+            adapter_id(),
+            Some(ManifestHash::new("sha256:abc123").unwrap()),
+        ),
+        vec![ProductAdapterCredentialBinding::new(
             credential("slack_bot_token"),
             secret("slack_bot_token"),
-        )])
-        .unwrap();
+        )],
+        Utc::now(),
+    )
+    .unwrap();
 
     let err = store.upsert_installation(invalid).await.unwrap_err();
     assert!(matches!(
@@ -132,12 +145,20 @@ async fn credential_binding_must_reference_declared_manifest_handle() {
 }
 
 #[test]
-fn rejected_duplicate_credential_update_preserves_previous_bindings() {
-    let mut installation = installation(ProductAdapterActivationState::Installed);
-    let original = installation.credential_bindings().to_vec();
-
-    let err = installation
-        .set_credential_bindings(vec![
+fn duplicate_credential_bindings_rejected_at_construction() {
+    // With `set_credential_bindings` sealed to `pub(crate)`, the only public
+    // path that admits binding lists is `ProductAdapterInstallation::new`.
+    // The uniqueness invariant must trip there — there is no partial-update
+    // path left for an external caller to corrupt state through.
+    let err = ProductAdapterInstallation::new(
+        installation_id("acme-telegram-prod"),
+        adapter_id(),
+        ProductAdapterActivationState::Installed,
+        ProductAdapterManifestRef::new(
+            adapter_id(),
+            Some(ManifestHash::new("sha256:abc123").unwrap()),
+        ),
+        vec![
             ProductAdapterCredentialBinding::new(
                 credential("telegram_bot_token"),
                 secret("telegram_bot_token"),
@@ -146,14 +167,15 @@ fn rejected_duplicate_credential_update_preserves_previous_bindings() {
                 credential("telegram_bot_token"),
                 secret("telegram_bot_token_shadow"),
             ),
-        ])
-        .unwrap_err();
+        ],
+        Utc::now(),
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
         RegistryError::DuplicateCredentialBinding { .. }
     ));
-    assert_eq!(installation.credential_bindings(), original);
 }
 
 fn manifest_without_credential() -> ProductAdapterManifest {
@@ -260,6 +282,91 @@ async fn egress_pairs_are_preserved_exactly() {
                 Some("slack_bot_token".to_string())
             )
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct-deserialize bypass guards (security/correctness review fix 1).
+// `ProductAdapterManifest` / `ProductAdapterInstallation` no longer derive
+// `Deserialize`; their manual impls route through validating constructors so
+// cross-field invariants hold even for values reconstructed from a persisted
+// serialized blob.
+// ---------------------------------------------------------------------------
+
+const MANIFEST_JSON_DUPLICATE_CREDENTIALS: &str = r#"{
+    "adapter_id": "telegram-v2",
+    "version": "0.1.0",
+    "surface_kind": "external_channel",
+    "component_ref": "file://adapters/telegram-v2.wasm",
+    "capabilities": {"flags": ["inbound_messages"]},
+    "auth_requirement": {"bearer_token": null},
+    "declared_egress": [],
+    "required_credentials": ["telegram_bot_token", "telegram_bot_token"],
+    "manifest_hash": null
+}"#;
+
+#[test]
+fn manifest_deserialize_rejects_duplicate_credentials() {
+    let err = serde_json::from_str::<ProductAdapterManifest>(MANIFEST_JSON_DUPLICATE_CREDENTIALS)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("duplicate credential handle"),
+        "expected DuplicateCredentialHandle propagation, got: {err}"
+    );
+}
+
+const INSTALLATION_JSON_DUPLICATE_BINDINGS: &str = r#"{
+    "installation_id": "acme-telegram-prod",
+    "adapter_id": "telegram-v2",
+    "activation_state": "installed",
+    "manifest_ref": {
+        "adapter_id": "telegram-v2",
+        "manifest_hash": "sha256:abc123"
+    },
+    "credential_bindings": [
+        {"credential_handle": "telegram_bot_token", "secret_handle": "telegram_bot_token"},
+        {"credential_handle": "telegram_bot_token", "secret_handle": "telegram_bot_token_shadow"}
+    ],
+    "health": {"status": "healthy", "checked_at": null, "message": null},
+    "updated_at": "2026-05-13T20:00:00Z"
+}"#;
+
+#[test]
+fn installation_deserialize_rejects_duplicate_bindings() {
+    let err =
+        serde_json::from_str::<ProductAdapterInstallation>(INSTALLATION_JSON_DUPLICATE_BINDINGS)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        err.contains("duplicate credential binding"),
+        "expected DuplicateCredentialBinding propagation, got: {err}"
+    );
+}
+
+const INSTALLATION_JSON_MANIFEST_ADAPTER_MISMATCH: &str = r#"{
+    "installation_id": "acme-telegram-prod",
+    "adapter_id": "telegram-v2",
+    "activation_state": "installed",
+    "manifest_ref": {
+        "adapter_id": "slack-v2",
+        "manifest_hash": "sha256:abc123"
+    },
+    "credential_bindings": [],
+    "health": {"status": "healthy", "checked_at": null, "message": null},
+    "updated_at": "2026-05-13T20:00:00Z"
+}"#;
+
+#[test]
+fn installation_deserialize_rejects_manifest_adapter_mismatch() {
+    let err = serde_json::from_str::<ProductAdapterInstallation>(
+        INSTALLATION_JSON_MANIFEST_ADAPTER_MISMATCH,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("does not match manifest adapter"),
+        "expected ManifestAdapterMismatch propagation, got: {err}"
     );
 }
 

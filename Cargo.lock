@@ -4504,6 +4504,7 @@ dependencies = [
  "ironclaw_product_adapters",
  "semver",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",

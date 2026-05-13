@@ -146,13 +146,14 @@ impl ProductAdapterManifestDocument {
             .into_iter()
             .map(|target| DeclaredEgressTarget::new(target.host, target.credential_handle))
             .collect();
+        let auth_requirement = self.auth.into_auth_requirement()?;
         ProductAdapterManifest::new(
             self.adapter_id,
             self.version,
             self.surface_kind,
             self.component_ref,
             ProductAdapterCapabilities::new(self.capabilities.flags),
-            self.auth.into_auth_requirement(),
+            auth_requirement,
             declared_egress,
             required_credentials,
             self.manifest_hash,
@@ -192,20 +193,30 @@ pub enum ProductAdapterManifestAuthDocument {
 }
 
 impl ProductAdapterManifestAuthDocument {
-    fn into_auth_requirement(self) -> AuthRequirement {
+    fn into_auth_requirement(self) -> Result<AuthRequirement, RegistryError> {
         match self {
             Self::RequestSignature {
                 header_name,
                 timestamp_header_name,
-            } => AuthRequirement::RequestSignature {
-                header_name,
-                timestamp_header_name,
-            },
-            Self::SharedSecretHeader { header_name } => {
-                AuthRequirement::SharedSecretHeader { header_name }
+            } => {
+                validate_http_token("auth.header_name", &header_name)?;
+                if let Some(timestamp_header) = timestamp_header_name.as_deref() {
+                    validate_http_token("auth.timestamp_header_name", timestamp_header)?;
+                }
+                Ok(AuthRequirement::RequestSignature {
+                    header_name,
+                    timestamp_header_name,
+                })
             }
-            Self::SessionCookie { name } => AuthRequirement::SessionCookie { name },
-            Self::BearerToken => AuthRequirement::BearerToken,
+            Self::SharedSecretHeader { header_name } => {
+                validate_http_token("auth.header_name", &header_name)?;
+                Ok(AuthRequirement::SharedSecretHeader { header_name })
+            }
+            Self::SessionCookie { name } => {
+                validate_cookie_name("auth.name", &name)?;
+                Ok(AuthRequirement::SessionCookie { name })
+            }
+            Self::BearerToken => Ok(AuthRequirement::BearerToken),
         }
     }
 }
@@ -229,7 +240,14 @@ pub struct ProductAdapterManifestEgressDocument {
     credential_handle: Option<EgressCredentialHandle>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Validated product-adapter manifest.
+///
+/// Construction always routes through [`ProductAdapterManifest::new`] or the
+/// manual [`Deserialize`] impl below, so cross-field invariants
+/// ([`Self::validate`]) are guaranteed for every value in scope — including
+/// values reconstructed from a persisted serialized form. The `#[derive]`
+/// intentionally excludes `Deserialize` to prevent direct-bypass paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProductAdapterManifest {
     adapter_id: ProductAdapterId,
     version: Version,
@@ -307,6 +325,7 @@ impl ProductAdapterManifest {
     }
 
     fn validate(&self) -> Result<(), RegistryError> {
+        validate_auth_requirement(&self.auth_requirement)?;
         let mut required = BTreeSet::new();
         for handle in &self.required_credentials {
             if !required.insert(handle.clone()) {
@@ -331,6 +350,40 @@ impl ProductAdapterManifest {
             }
         }
         Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProductAdapterManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            adapter_id: ProductAdapterId,
+            version: Version,
+            surface_kind: ProductSurfaceKind,
+            component_ref: ProductAdapterComponentRef,
+            capabilities: ProductAdapterCapabilities,
+            auth_requirement: AuthRequirement,
+            declared_egress: Vec<DeclaredEgressTarget>,
+            required_credentials: Vec<EgressCredentialHandle>,
+            manifest_hash: Option<ManifestHash>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        ProductAdapterManifest::new(
+            wire.adapter_id,
+            wire.version,
+            wire.surface_kind,
+            wire.component_ref,
+            wire.capabilities,
+            wire.auth_requirement,
+            wire.declared_egress,
+            wire.required_credentials,
+            wire.manifest_hash,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -406,7 +459,14 @@ impl ProductAdapterHealthSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Validated installation snapshot.
+///
+/// Construction always routes through [`ProductAdapterInstallation::new`] or
+/// the manual [`Deserialize`] impl below. The derive intentionally excludes
+/// `Deserialize` so cross-field invariants (manifest-ref ↔ adapter-id parity,
+/// duplicate-binding rejection) are guaranteed even for values reconstructed
+/// from a persisted serialized form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProductAdapterInstallation {
     installation_id: AdapterInstallationId,
     adapter_id: ProductAdapterId,
@@ -473,15 +533,6 @@ impl ProductAdapterInstallation {
         self.updated_at
     }
 
-    pub fn set_credential_bindings(
-        &mut self,
-        credential_bindings: Vec<ProductAdapterCredentialBinding>,
-    ) -> Result<(), RegistryError> {
-        validate_bindings_unique(&credential_bindings)?;
-        self.credential_bindings = credential_bindings;
-        Ok(())
-    }
-
     fn set_activation_state(&mut self, state: ProductAdapterActivationState) {
         self.activation_state = state;
         self.updated_at = Utc::now();
@@ -494,6 +545,44 @@ impl ProductAdapterInstallation {
 
     fn validate_bindings_unique(&self) -> Result<(), RegistryError> {
         validate_bindings_unique(&self.credential_bindings)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProductAdapterInstallation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            installation_id: AdapterInstallationId,
+            adapter_id: ProductAdapterId,
+            activation_state: ProductAdapterActivationState,
+            manifest_ref: ProductAdapterManifestRef,
+            credential_bindings: Vec<ProductAdapterCredentialBinding>,
+            health: ProductAdapterHealthSnapshot,
+            updated_at: DateTime<Utc>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        if wire.manifest_ref.adapter_id() != &wire.adapter_id {
+            return Err(serde::de::Error::custom(
+                RegistryError::ManifestAdapterMismatch {
+                    adapter_id: wire.adapter_id.clone(),
+                    manifest_adapter_id: wire.manifest_ref.adapter_id().clone(),
+                },
+            ));
+        }
+        validate_bindings_unique(&wire.credential_bindings).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            installation_id: wire.installation_id,
+            adapter_id: wire.adapter_id,
+            activation_state: wire.activation_state,
+            manifest_ref: wire.manifest_ref,
+            credential_bindings: wire.credential_bindings,
+            health: wire.health,
+            updated_at: wire.updated_at,
+        })
     }
 }
 
@@ -709,11 +798,7 @@ fn reject_inline_secret_material_value(
         toml::Value::Table(table) => {
             for (key, value) in table {
                 let child_path = format!("{path}.{key}");
-                let lower = key.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "secret" | "secret_value" | "token" | "raw_token" | "api_key" | "password"
-                ) {
+                if is_secret_key_name(key) {
                     return Err(RegistryError::InlineSecretMaterial { field: child_path });
                 }
                 reject_inline_secret_material_value(&child_path, value)?;
@@ -736,17 +821,80 @@ fn reject_inline_secret_material_value(
     Ok(())
 }
 
+/// Best-effort tripwire matching table-key names that historically carry raw
+/// secret material. Keys are normalised to lowercase and `-` -> `_` so both
+/// `client-secret` and `Client_Secret` collapse to the same canonical token.
+fn is_secret_key_name(key: &str) -> bool {
+    let normalised: String = key
+        .chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    matches!(
+        normalised.as_str(),
+        "secret"
+            | "secrets"
+            | "secret_value"
+            | "client_secret"
+            | "webhook_secret"
+            | "token"
+            | "raw_token"
+            | "access_token"
+            | "refresh_token"
+            | "bearer_token"
+            | "oauth_token"
+            | "auth_token"
+            | "id_token"
+            | "api_key"
+            | "apikey"
+            | "api_secret"
+            | "private_key"
+            | "password"
+            | "passphrase"
+    )
+}
+
+/// Best-effort string-shape tripwire for inline secret material. False
+/// positives are acceptable: a hand-authored manifest can rename the field;
+/// false negatives must not silently leak a real credential past the registry
+/// boundary. The threat model is operator-authored TOML, not adversarial
+/// input.
 fn looks_like_inline_secret(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     if lower.starts_with("sha256:") {
         return false;
     }
-    if lower.starts_with("sk-")
-        || lower.starts_with("xoxb-")
-        || lower.starts_with("ghp_")
-        || lower.starts_with("akia")
-        || lower.contains("begin private key")
-    {
+    // Vendor-specific credential prefixes.
+    const PREFIXES: &[&str] = &[
+        "sk-",   // OpenAI / Anthropic
+        "xoxb-", // Slack bot
+        "xoxa-", // Slack legacy
+        "xoxp-", // Slack user
+        "xoxs-", // Slack session
+        "xoxe-", // Slack ephemeral
+        "ghp_",  // GitHub personal access token
+        "gho_",  // GitHub OAuth
+        "ghu_",  // GitHub user-to-server
+        "ghs_",  // GitHub server-to-server
+        "ghr_",  // GitHub refresh
+        "akia",  // AWS access key (case-insensitive after lowercase)
+        "asia",  // AWS short-term access key
+    ];
+    if PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+    if lower.contains("begin private key") || lower.contains("begin rsa private key") {
+        return true;
+    }
+    // JWTs almost always start with the base64'd JSON header `{"alg":...`,
+    // which encodes to `eyJ`. Require enough length to dampen false positives
+    // from unrelated values that happen to share the prefix.
+    if value.len() >= 30 && value.starts_with("eyJ") && value.contains('.') {
         return true;
     }
     if has_uri_userinfo(value) {
@@ -858,4 +1006,63 @@ fn validate_nonempty_noncontrol(field: &'static str, value: &str) -> Result<(), 
         });
     }
     Ok(())
+}
+
+fn validate_auth_requirement(requirement: &AuthRequirement) -> Result<(), RegistryError> {
+    match requirement {
+        AuthRequirement::RequestSignature {
+            header_name,
+            timestamp_header_name,
+        } => {
+            validate_http_token("auth.header_name", header_name)?;
+            if let Some(timestamp_header) = timestamp_header_name.as_deref() {
+                validate_http_token("auth.timestamp_header_name", timestamp_header)?;
+            }
+        }
+        AuthRequirement::SharedSecretHeader { header_name } => {
+            validate_http_token("auth.header_name", header_name)?;
+        }
+        AuthRequirement::SessionCookie { name } => {
+            validate_cookie_name("auth.name", name)?;
+        }
+        AuthRequirement::BearerToken => {}
+    }
+    Ok(())
+}
+
+/// RFC 7230 §3.2.6 `token` = 1*tchar. Used to syntactically guard HTTP header
+/// names against CRLF/whitespace/separator injection when adapter manifests
+/// declare which header to read auth evidence from.
+fn validate_http_token(field: &'static str, value: &str) -> Result<(), RegistryError> {
+    if value.is_empty() {
+        return Err(RegistryError::InvalidValue {
+            field,
+            reason: "must not be empty".to_string(),
+        });
+    }
+    for c in value.chars() {
+        if !is_http_tchar(c) {
+            return Err(RegistryError::InvalidValue {
+                field,
+                reason: format!(
+                    "must be an RFC 7230 token (no CTL, whitespace, or separators); got {value:?}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_http_tchar(c: char) -> bool {
+    matches!(
+        c,
+        '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+    ) || c.is_ascii_alphanumeric()
+}
+
+/// RFC 6265 `cookie-name` is an HTTP `token`. Reuse the same predicate so a
+/// declared cookie name can't smuggle CRLF, `=`, or `;` into downstream
+/// `Set-Cookie`/`Cookie` interpolation.
+fn validate_cookie_name(field: &'static str, value: &str) -> Result<(), RegistryError> {
+    validate_http_token(field, value)
 }
