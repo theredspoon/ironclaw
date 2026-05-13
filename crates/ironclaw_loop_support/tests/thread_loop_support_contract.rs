@@ -1307,6 +1307,45 @@ async fn model_port_resolves_explicit_refs_that_fall_outside_context_window() {
 }
 
 #[tokio::test]
+async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
+    let fixture = ThreadFixture::new().await;
+    let tool_result_ref = LoopMessageRef::new("msg:11111111-1111-1111-1111-111111111111").unwrap();
+    let thread_service = Arc::new(StaticContextThreadService::new(ContextMessage {
+        message_id: Some(ThreadMessageId::parse("11111111-1111-1111-1111-111111111111").unwrap()),
+        summary_id: None,
+        sequence: 1,
+        kind: MessageKind::ToolResultReference,
+        content: "tool result content".to_string(),
+    }));
+    let context_port = Arc::new(ThreadBackedLoopContextPort::new(
+        thread_service,
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        16,
+    ));
+    let prompt_port = HostManagedLoopPromptPort::new(
+        fixture.run_context.clone(),
+        context_port,
+        Arc::new(InMemoryLoopHostMilestoneSink::default()),
+    );
+
+    let prompt_bundle = prompt_port
+        .build_prompt_bundle(ironclaw_turns::run_profile::LoopPromptBundleRequest {
+            mode: ironclaw_turns::run_profile::PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(prompt_bundle.messages.len(), 1);
+    assert_eq!(prompt_bundle.messages[0].role, "tool_result_reference");
+    assert_eq!(prompt_bundle.messages[0].content_ref, tool_result_ref);
+}
+
+#[tokio::test]
 async fn model_port_round_trips_tool_result_reference_context_as_system_model_input() {
     let fixture = ThreadFixture::new().await;
     let tool_result_ref = LoopMessageRef::new("msg:11111111-1111-1111-1111-111111111111").unwrap();
