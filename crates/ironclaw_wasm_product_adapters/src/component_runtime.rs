@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
-    EgressCredentialHandle, ProductAdapterCapabilities, ProductAdapterId, ProtocolAuthEvidence,
+    EgressCredentialHandle, EgressHeader, EgressMethod, EgressPath, EgressRequest,
+    ParsedProductInbound, ProductAdapterCapabilities, ProductAdapterId, ProtocolAuthEvidence,
 };
 use ironclaw_wasm_sandbox_core::{
     SandboxError, add_minimal_wasi_to_linker, component_engine,
@@ -173,7 +174,7 @@ impl ProductAdapterComponentRuntime {
             Ok(Err(message)) => return Err(execution_failed(message, &store)),
             Err(error) => return Err(execution_failed(error.to_string(), &store)),
         };
-        ensure_json("parsed-inbound.parsed-json", &response.parsed_json)?;
+        ensure_parsed_inbound_json(&response.parsed_json)?;
         Ok(ParsedInboundResult {
             parsed_json: response.parsed_json,
             logs: store.data().logs.clone(),
@@ -333,6 +334,15 @@ fn ensure_json(field: &'static str, json: &str) -> Result<(), RuntimeError> {
         })
 }
 
+fn ensure_parsed_inbound_json(json: &str) -> Result<(), RuntimeError> {
+    serde_json::from_str::<ParsedProductInbound>(json)
+        .map(|_| ())
+        .map_err(|error| RuntimeError::InvalidJson {
+            field: "parsed-inbound.parsed-json",
+            message: error.to_string(),
+        })
+}
+
 fn validate_rendered_egress_request(
     prepared: &PreparedProductAdapterComponent,
     json: &str,
@@ -346,14 +356,11 @@ fn validate_rendered_egress_request(
         field,
         message: "must be a JSON object".to_string(),
     })?;
-    let index = object
-        .get("egress_target_index")
-        .or_else(|| object.get("egress-target-index"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| RuntimeError::InvalidJson {
-            field,
-            message: "must include numeric egress_target_index".to_string(),
-        })?;
+    let index = required_u64_field(
+        object,
+        field,
+        &["egress_target_index", "egress-target-index"],
+    )?;
     let index = usize::try_from(index).map_err(|_| RuntimeError::InvalidJson {
         field,
         message: "egress_target_index is too large".to_string(),
@@ -375,7 +382,91 @@ fn validate_rendered_egress_request(
         .map_err(|error| RuntimeError::InvalidJson {
             field,
             message: error.to_string(),
+        })?;
+
+    let method = EgressMethod::new(required_string_field(object, field, "method")?)
+        .map_err(|error| invalid_json(field, error.to_string()))?;
+    let path = EgressPath::new(required_string_field(object, field, "path")?)
+        .map_err(|error| invalid_json(field, error.to_string()))?;
+    let mut request = EgressRequest::new(target.host.clone(), method, path)
+        .with_credential_handle(target.credential_handle.clone());
+    for header in required_array_field(object, field, "headers")? {
+        let header = header
+            .as_object()
+            .ok_or_else(|| RuntimeError::InvalidJson {
+                field,
+                message: "headers entries must be JSON objects".to_string(),
+            })?;
+        let name = required_string_field(header, field, "name")?;
+        let value = required_string_field(header, field, "value")?;
+        request = request.with_header(
+            EgressHeader::new(name, value)
+                .map_err(|error| invalid_json(field, error.to_string()))?,
+        );
+    }
+    let body = required_array_field(object, field, "body")?
+        .iter()
+        .map(|byte| {
+            let byte = byte.as_u64().ok_or_else(|| RuntimeError::InvalidJson {
+                field,
+                message: "body entries must be bytes".to_string(),
+            })?;
+            u8::try_from(byte).map_err(|_| RuntimeError::InvalidJson {
+                field,
+                message: "body entries must be bytes".to_string(),
+            })
         })
+        .collect::<Result<Vec<_>, _>>()?;
+    let _validated_request = request.with_body(body);
+    Ok(())
+}
+
+fn required_u64_field(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+    names: &[&str],
+) -> Result<u64, RuntimeError> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| RuntimeError::InvalidJson {
+            field,
+            message: format!("must include numeric {}", names[0]),
+        })
+}
+
+fn required_string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+    name: &'static str,
+) -> Result<String, RuntimeError> {
+    object
+        .get(name)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| RuntimeError::InvalidJson {
+            field,
+            message: format!("must include string {name}"),
+        })
+}
+
+fn required_array_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &'static str,
+    name: &'static str,
+) -> Result<&'a Vec<Value>, RuntimeError> {
+    object
+        .get(name)
+        .and_then(Value::as_array)
+        .ok_or_else(|| RuntimeError::InvalidJson {
+            field,
+            message: format!("must include array {name}"),
+        })
+}
+
+fn invalid_json(field: &'static str, message: String) -> RuntimeError {
+    RuntimeError::InvalidJson { field, message }
 }
 
 fn configure_store(

@@ -8,13 +8,13 @@ use wit_parser::Resolve;
 const FIXTURE_ADAPTER_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
-  (global $heap (mut i32) (i32.const 4096))
+  (global $heap (mut i32) (i32.const 8192))
   (data (i32.const 1024) "fixture_adapter")
   (data (i32.const 1056) "install_1")
   (data (i32.const 1088) "{\22flags\22:[]}")
-  (data (i32.const 1120) "{\22payload\22:\22parsed\22}")
-  (data (i32.const 1152) "{\22egress_target_index\22:0}")
-  (data (i32.const 1184) "api.example.com")
+  (data (i32.const 2048) "{\22external_event_id\22:\22evt1\22,\22external_actor_ref\22:{\22kind\22:\22user\22,\22id\22:\22u1\22,\22display_name\22:null},\22external_conversation_ref\22:{\22space_id\22:null,\22conversation_id\22:\22c1\22,\22topic_id\22:null,\22reply_target_message_id\22:null},\22payload\22:\22no_op\22}")
+  (data (i32.const 3072) "{\22egress_target_index\22:0,\22method\22:\22POST\22,\22path\22:\22/send\22,\22headers\22:[],\22body\22:[]}")
+  (data (i32.const 4096) "api.example.com")
 
   (func $manifest (result i32)
     ;; adapter-id
@@ -39,23 +39,23 @@ const FIXTURE_ADAPTER_WAT: &str = r#"
     i32.const 12
     i32.store
     ;; declared-egress-targets: [ { host: "api.example.com", credential-handle: none } ]
-    i32.const 1216
-    i32.const 1184
+    i32.const 5120
+    i32.const 4096
     i32.store
-    i32.const 1220
+    i32.const 5124
     i32.const 15
     i32.store
-    i32.const 1224
+    i32.const 5128
     i32.const 0
     i32.store
-    i32.const 1228
+    i32.const 5132
     i32.const 0
     i32.store
-    i32.const 1232
+    i32.const 5136
     i32.const 0
     i32.store
     i32.const 40
-    i32.const 1216
+    i32.const 5120
     i32.store
     i32.const 44
     i32.const 1
@@ -75,10 +75,10 @@ const FIXTURE_ADAPTER_WAT: &str = r#"
     i32.const 0
     i32.store
     i32.const 132
-    i32.const 1120
+    i32.const 2048
     i32.store
     i32.const 136
-    i32.const 20
+    i32.const 229
     i32.store
     i32.const 128)
 
@@ -88,10 +88,10 @@ const FIXTURE_ADAPTER_WAT: &str = r#"
     i32.const 0
     i32.store
     i32.const 148
-    i32.const 1152
+    i32.const 3072
     i32.store
     i32.const 152
-    i32.const 25
+    i32.const 79
     i32.store
     i32.const 144)
 
@@ -176,12 +176,105 @@ fn calls_parse_and_render_exports() {
     let parsed = runtime
         .parse_inbound(&prepared, br#"{"hello":true}"#, &evidence)
         .expect("parse");
-    assert_eq!(parsed.parsed_json, r#"{"payload":"parsed"}"#);
+    assert!(parsed.parsed_json.contains(r#""external_event_id":"evt1""#));
 
     let rendered = runtime
         .render_outbound(&prepared, r#"{"payload":"out"}"#)
         .expect("render");
-    assert_eq!(rendered.egress_request_json, r#"{"egress_target_index":0}"#);
+    assert_eq!(
+        rendered.egress_request_json,
+        r#"{"egress_target_index":0,"method":"POST","path":"/send","headers":[],"body":[]}"#
+    );
+}
+
+#[test]
+fn parse_rejects_json_that_is_not_parsed_product_inbound() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let invalid_parse_wat = FIXTURE_ADAPTER_WAT
+        .replace(
+            "{\\22external_event_id\\22:\\22evt1\\22,\\22external_actor_ref\\22:{\\22kind\\22:\\22user\\22,\\22id\\22:\\22u1\\22,\\22display_name\\22:null},\\22external_conversation_ref\\22:{\\22space_id\\22:null,\\22conversation_id\\22:\\22c1\\22,\\22topic_id\\22:null,\\22reply_target_message_id\\22:null},\\22payload\\22:\\22no_op\\22}",
+            "{\\22payload\\22:\\22parsed\\22}",
+        )
+        .replace(
+            "    i32.const 136\n    i32.const 229\n    i32.store\n",
+            "    i32.const 136\n    i32.const 20\n    i32.store\n",
+        );
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(&invalid_parse_wat))
+        .expect("prepare");
+    let evidence = mark_bearer_token_verified("alice");
+
+    let err = runtime
+        .parse_inbound(&prepared, br#"{\"hello\":true}"#, &evidence)
+        .expect_err("invalid parsed inbound DTO");
+
+    assert!(
+        matches!(err, RuntimeError::InvalidJson { field, .. }
+            if field == "parsed-inbound.parsed-json"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn render_rejects_missing_typed_egress_fields() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let missing_fields_wat = FIXTURE_ADAPTER_WAT
+        .replace(
+            "{\\22egress_target_index\\22:0,\\22method\\22:\\22POST\\22,\\22path\\22:\\22/send\\22,\\22headers\\22:[],\\22body\\22:[]}",
+            "{\\22egress_target_index\\22:0}",
+        )
+        .replace(
+            "    i32.const 152\n    i32.const 79\n    i32.store\n",
+            "    i32.const 152\n    i32.const 25\n    i32.store\n",
+        );
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(&missing_fields_wat))
+        .expect("prepare");
+
+    let err = runtime
+        .render_outbound(&prepared, r#"{"payload":"out"}"#)
+        .expect_err("missing typed egress fields");
+
+    assert!(
+        matches!(err, RuntimeError::InvalidJson { field, ref message }
+            if field == "outbound-render.egress-request-json"
+                && message.contains("method")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn render_rejects_host_managed_headers() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let forbidden_header_wat = FIXTURE_ADAPTER_WAT
+        .replace(
+            "{\\22egress_target_index\\22:0,\\22method\\22:\\22POST\\22,\\22path\\22:\\22/send\\22,\\22headers\\22:[],\\22body\\22:[]}",
+            "{\\22egress_target_index\\22:0,\\22method\\22:\\22POST\\22,\\22path\\22:\\22/send\\22,\\22headers\\22:[{\\22name\\22:\\22Authorization\\22,\\22value\\22:\\22secret\\22}],\\22body\\22:[]}",
+        )
+        .replace(
+            "    i32.const 152\n    i32.const 79\n    i32.store\n",
+            "    i32.const 152\n    i32.const 120\n    i32.store\n",
+        );
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(&forbidden_header_wat))
+        .expect("prepare");
+
+    let err = runtime
+        .render_outbound(&prepared, r#"{"payload":"out"}"#)
+        .expect_err("host managed header");
+
+    assert!(
+        matches!(err, RuntimeError::InvalidJson { field, ref message }
+            if field == "outbound-render.egress-request-json"
+                && message.contains("header is managed by the host")),
+        "{err:?}"
+    );
 }
 
 #[test]
