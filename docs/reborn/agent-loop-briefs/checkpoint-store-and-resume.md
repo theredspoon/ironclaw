@@ -39,7 +39,9 @@ WS-10 closes that gap in three layers, in line with the §12 ownership rule:
    constructor reserved by WS-0
    ([`state-and-checkpoints.md`](state-and-checkpoints.md) §3),
    and passes the resulting state to
-   `CanonicalAgentLoopExecutor::execute_with_initial`.
+   `CanonicalAgentLoopExecutor::execute_family(family, host, initial_state)`
+   (the same entry point used by the run path; resume only differs in how
+   `initial_state` is sourced).
 
 WS-10 does **not** pick a persistent backend. `CheckpointStateStore` is
 already an abstract trait; concrete PostgreSQL / libSQL adapters live in
@@ -291,11 +293,7 @@ deliberately does not bundle it.
 ```rust
 //! crates/ironclaw_reborn/src/planned_driver.rs (delta; WS-7 owns the rest)
 
-impl<P, E> AgentLoopDriver for PlannedDriver<P, E>
-where
-    P: AgentLoopPlanner,
-    E: AgentLoopExecutor,
-{
+impl AgentLoopDriver for PlannedDriver {
     async fn resume(
         &self,
         claim: ResumedRunClaim,
@@ -319,7 +317,7 @@ where
         ))?;
 
         let exit = self.executor
-            .execute_with_initial(&self.planner, &host, initial)
+            .execute_family(self.family.as_ref(), &host, initial)
             .await?;
         Ok(exit)
     }
@@ -332,10 +330,11 @@ Two notes:
   runner-side claim (already populated when `TurnRunState` transitioned
   through `BeforeBlock` or `Final` — see `TurnRunState::CancelRequested`
   flow in `crates/ironclaw_turns/src/runner.rs:137`).
-- `CanonicalAgentLoopExecutor::execute_with_initial(initial: LoopExecutionState)`
-  is the variant WS-6 already defines via `LoopExecutionState::initial`
-  vs `::from_checkpoint_payload` branching; this brief does not add a
-  new executor method.
+- `CanonicalAgentLoopExecutor::execute_family(family, host, initial_state)`
+  is the single executor entry point per WS-6 (post-LoopFamily-amendment).
+  Resume uses `LoopExecutionState::from_checkpoint_payload` to source
+  `initial_state` and then calls the same `execute_family` method that
+  fresh runs use; no separate executor method exists.
 
 ### 3.5 Failure semantics
 
@@ -367,11 +366,7 @@ that existing impl — no new dependencies, no new wiring.
 ```rust
 //! crates/ironclaw_reborn/src/planned_driver.rs (resume delta; WS-7 owns the rest)
 
-impl<P, E> AgentLoopDriver for PlannedDriver<P, E>
-where
-    P: AgentLoopPlanner,
-    E: AgentLoopExecutor,
-{
+impl AgentLoopDriver for PlannedDriver {
     async fn resume(
         &self,
         claim: ResumedRunClaim,
@@ -395,7 +390,7 @@ where
         ))?;
 
         self.executor
-            .execute_with_initial(&self.planner, &host, initial)
+            .execute_family(self.family.as_ref(), &host, initial)
             .await
             .map_err(Into::into)
     }

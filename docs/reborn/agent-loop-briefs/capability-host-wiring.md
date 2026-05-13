@@ -446,7 +446,7 @@ pub struct PlannedDriverConfig {
     pub surface_resolver: Arc<dyn CapabilitySurfaceProfileResolver>,
 }
 
-impl<P, E> PlannedDriver<P, E> {
+impl PlannedDriver {
     async fn build_capability_port(
         &self,
         run_context: &LoopRunContext,
@@ -509,6 +509,60 @@ Integration tests (in `crates/ironclaw_reborn`, gated behind
   model emits the same disallowed call three iterations in a row;
   loop exits `Failed { reason_kind: NoProgressDetected }` per master
   doc §10.
+
+### 5.1 Composition-seam architecture test (PR #3523 follow-up)
+
+Per the hooks-as-middleware design recorded in PR #3523-comment-4435808547 (skeleton-side follow-up (a)), this brief adds a lightweight architecture test in `ironclaw_loop_support` that proves no crate other than `ironclaw_loop_support` constructs `HostRuntimeLoopCapabilityPort` directly. That gives the future hooks composition seam (which sits as middleware around `HostRuntimeLoopCapabilityPort` in this same crate) a free composition-bypass check: any code path that bypasses the middleware by reaching the raw capability port outside `ironclaw_loop_support` is caught by the test.
+
+```rust
+// crates/ironclaw_loop_support/tests/host_capability_port_composition.rs (NEW)
+//
+// Grep-based architecture test: walks the workspace source tree (excluding
+// this crate and `tests/`/`target/`) and asserts that no `.rs` file constructs
+// `HostRuntimeLoopCapabilityPort::new(...)` or matches it as a literal type
+// name. The constructor is `pub` (it has to be — `ironclaw_reborn` composes
+// it through its host-factory function) but the convention is that ONLY
+// `ironclaw_loop_support` constructs raw instances. Downstream crates wrap
+// it through the host factory.
+//
+// When the hooks middleware lands (PR #3524 / #3523), this test gains a
+// second pattern asserting hook composition wraps every raw construction.
+
+#[test]
+fn no_external_construction_of_host_runtime_capability_port() {
+    let workspace_root = std::env::var("CARGO_WORKSPACE_DIR")
+        .unwrap_or_else(|_| "..".to_string());
+    let mut offenders = Vec::new();
+    for entry in walkdir::WalkDir::new(&workspace_root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().map_or(false, |x| x == "rs"))
+    {
+        let path = entry.path();
+        // Skip this crate and any tests/ directories
+        if path.components().any(|c| {
+            c.as_os_str() == "ironclaw_loop_support"
+                || c.as_os_str() == "tests"
+                || c.as_os_str() == "target"
+        }) {
+            continue;
+        }
+        let src = std::fs::read_to_string(path).unwrap_or_default();
+        if src.contains("HostRuntimeLoopCapabilityPort::new(")
+            || src.contains("HostRuntimeLoopCapabilityPort {")
+        {
+            offenders.push(path.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "external construction of HostRuntimeLoopCapabilityPort detected: {offenders:?}\n\
+         only ironclaw_loop_support's host factory should construct this port directly",
+    );
+}
+```
+
+The test is cheap to maintain — it adds one `walkdir` dev-dependency and one test file. If/when `ironclaw_reborn` adopts the hook middleware, the test extends to assert that every construction path also wraps through `HookedCapabilityPort` (defined in `ironclaw_hooks`).
 
 ## 6. Out of scope (for this brief)
 

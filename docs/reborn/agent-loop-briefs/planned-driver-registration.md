@@ -33,9 +33,10 @@ WS-14 closes the loop:
 
 1. **Stable `LoopDriverId` constants** for the default planned driver
    and the v1 checkpoint schema id reserved by WS-0.
-2. **Factory** `default_planned_driver()` that composes
-   `PlannedDriver<DefaultPlanner, CanonicalAgentLoopExecutor>` from a
-   fully-wired `PlannedDriverConfig`.
+2. **Factory** `default_planned_driver()` that composes a
+   non-generic `PlannedDriver` (holding `families::default()` resolved
+   via `Arc<LoopFamilyRegistry>` plus `Arc<CanonicalAgentLoopExecutor>`)
+   from a fully-wired `PlannedDriverConfig`.
 3. **Registration helper** `register_default_planned_driver(registry,
    config)` that calls `DriverRegistry::register_driver` with the
    right `DriverRequirements` flags.
@@ -63,9 +64,9 @@ assistant message ref.
 ### MODIFIED
 - `crates/ironclaw_reborn/src/lib.rs` — module declaration +
   re-export of the constants.
-- `crates/ironclaw_reborn/src/planned_driver.rs` (WS-7 file) — small
-  type alias `pub type DefaultPlannedDriver = PlannedDriver<DefaultPlanner,
-  CanonicalAgentLoopExecutor>;` for the factory's return type.
+- `crates/ironclaw_reborn/src/planned_driver.rs` (WS-7 file) — no
+  type alias needed; `PlannedDriver` is non-generic. The factory
+  returns `PlannedDriver` directly.
 - Wherever `InMemoryRunProfileResolver` seeds its builtin profiles
   (per the resolver layout near
   [`resolver.rs:115`](../../../crates/ironclaw_turns/src/run_profile/resolver.rs))
@@ -149,17 +150,24 @@ use ironclaw_agent_loop::{
 use ironclaw_turns::run_profile::{
     AgentLoopDriverDescriptor, CheckpointSchemaIdOptional, RunProfileVersionOptional,
 };
-use crate::planned_driver::{DefaultPlannedDriver, PlannedDriver, PlannedDriverConfig};
+use crate::planned_driver::{PlannedDriver, PlannedDriverConfig};
+use ironclaw_agent_loop::family::{LoopFamilyId, LoopFamilyRegistry};
 
 pub struct DefaultPlannedDriverBuild {
     pub driver: Arc<dyn ironclaw_turns::run_profile::AgentLoopDriver>,
     pub descriptor: AgentLoopDriverDescriptor,
 }
 
-pub fn default_planned_driver(config: PlannedDriverConfig) -> DefaultPlannedDriverBuild {
-    let planner = DefaultPlanner::default();
-    let executor = CanonicalAgentLoopExecutor::default();
-    let driver = PlannedDriver::new(planner, executor, config);
+pub fn default_planned_driver(
+    config: PlannedDriverConfig,
+    family_registry: Arc<LoopFamilyRegistry>,
+) -> DefaultPlannedDriverBuild {
+    let family = family_registry
+        .get(&LoopFamilyId::DEFAULT)
+        .expect("LoopFamilyRegistry::builtin always binds DEFAULT");
+    let executor = Arc::new(CanonicalAgentLoopExecutor::default());
+    let driver = PlannedDriver::from_family(family, executor, PLANNED_DRIVER_DEFAULT_VERSION)
+        .expect("default family + framework checkpoint schema validate");
 
     let descriptor = AgentLoopDriverDescriptor::from_trusted_static_with_checkpoint(
         planned_driver_default_id(),
@@ -439,12 +447,14 @@ WS-11 / WS-12 / WS-13 are all merged. That is the hard-gate.
 - **Driver kill-switch / rollout flags.** Registry membership is
   the toggle; deregister the planned driver to disable. No additional
   flag plumbing.
-- **Loop-family planners** (`coding_planner()`, `routine_planner(...)`)
-  — master doc §11/§12 explicitly defers; WS-14 ships
-  `DefaultPlanner::default()` only.
-- **Versioning `DefaultPlanner` separately from the driver.**
-  `PlannerId` lands in the checkpoint payload (WS-0 §3.2), not in the
-  registry key. A new planner shape ships under a new driver id.
+- **Loop-family planners** (`coding`, `routine`, …) — master doc
+  §11/§12 / §12.5 explicitly defers; WS-14 ships `families::default()`
+  only, resolved via the `LoopFamilyRegistry` (WS-3.5).
+- **Versioning the family separately from the driver.** `LoopFamily.version`
+  (`ComponentIdentity`) lands in the checkpoint payload metadata (WS-0
+  §3.2), not in the registry key. A new family shape (or a strategy
+  composition change inside an existing family) bumps `ComponentIdentity.digest`
+  and may ship under a new driver id.
 - **Schema migration from `reborn:default-loop-v1` → `v2`.** Strict
   schema match per WS-10 §6; v2 is a future PR.
 - **Smoke tests against WS-15** (`identity_messages` populated). The

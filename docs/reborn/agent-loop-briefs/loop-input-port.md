@@ -293,7 +293,7 @@ pub struct PlannedDriverConfig {
     pub input_queue: Arc<dyn HostInputQueue>,
 }
 
-impl<P, E> PlannedDriver<P, E> {
+impl PlannedDriver {
     async fn build_input_port(
         &self,
         run_context: &LoopRunContext,

@@ -388,7 +388,7 @@ pub trait RunCancellationFactory: Send + Sync {
     ) -> Result<RunCancellationHandle, AgentLoopHostError>;
 }
 
-impl<P, E> PlannedDriver<P, E> {
+impl PlannedDriver {
     async fn build_cancellation_port(
         &self,
         run_context: &LoopRunContext,

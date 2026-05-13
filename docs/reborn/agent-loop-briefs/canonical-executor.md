@@ -15,7 +15,9 @@ Land the loop body — the canonical tick that drives every planner.
 - `CanonicalAgentLoopExecutor` struct — the one canonical implementation, body matching master doc §8.
 - `AgentLoopExecutorError` — sanitized error type returned alongside `LoopExit` in error paths.
 
-The executor takes a `&dyn AgentLoopPlanner`, an `&dyn AgentLoopDriverHost` (host facade from `ironclaw_turns`), and an initial `LoopExecutionState`. It runs the canonical tick, applies strategy outcomes, populates the executor-observed state fields, takes checkpoints at the four boundary kinds, and returns a `LoopExit` (defined in `ironclaw_turns`).
+The executor's public entry point is `execute_family(family: &LoopFamily, host: &dyn AgentLoopDriverHost, initial_state: LoopExecutionState) -> Result<LoopExit, _>`. It runs the canonical tick, applies strategy outcomes (consulted via the crate-private `AgentLoopPlannerInternal` extension trait — see WS-4), populates the executor-observed state fields, takes checkpoints at the four boundary kinds, and returns a `LoopExit` (defined in `ironclaw_turns`).
+
+Internally the executor extracts `family.planner()` (crate-private accessor) and consults strategies through `AgentLoopPlannerInternal`. Neither is visible outside `ironclaw_agent_loop`; this is the sealed-strategy invariant from master doc §9.
 
 The executor never calls into the runner-facing `AgentLoopDriver` trait. That bridge belongs to WS-7.
 
@@ -41,12 +43,17 @@ use ironclaw_turns::{
     run_profile::AgentLoopDriverHost,
 };
 
-use crate::{planner::AgentLoopPlanner, state::LoopExecutionState};
+use crate::{family::LoopFamily, state::LoopExecutionState};
 
-/// Drives the canonical loop tick by consulting a planner's strategies and
+/// Drives the canonical loop tick by consulting a family's planner strategies
+/// (via the crate-private `AgentLoopPlannerInternal` extension trait) and
 /// invoking host ports. The trait exists so future variants (instrumented,
-/// replay, fault-injecting test) can slot in without touching planners or
+/// replay, fault-injecting test) can slot in without touching families or
 /// the driver adapter.
+///
+/// `execute_family` is the public entry point. The executor reaches strategies
+/// via `family.planner()` (crate-private) — downstream crates hold opaque
+/// `Arc<LoopFamily>` values and cannot see strategies through this trait.
 ///
 /// Implementations MUST honor the contract in master doc §8:
 /// - checkpoint at the four boundary kinds (BeforeModel, BeforeSideEffect,
@@ -56,9 +63,9 @@ use crate::{planner::AgentLoopPlanner, state::LoopExecutionState};
 ///   no `&mut LoopExecutionState` across strategy calls).
 #[async_trait]
 pub trait AgentLoopExecutor: Send + Sync {
-    async fn execute(
+    async fn execute_family(
         &self,
-        planner: &dyn AgentLoopPlanner,
+        family: &LoopFamily,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
         initial_state: LoopExecutionState,
     ) -> Result<LoopExit, AgentLoopExecutorError>;
@@ -93,7 +100,8 @@ use async_trait::async_trait;
 
 use crate::{
     executor::{AgentLoopExecutor, AgentLoopExecutorError, HostStage},
-    planner::AgentLoopPlanner,
+    family::LoopFamily,
+    planner::AgentLoopPlannerInternal,    // crate-private; gives strategy accessors
     state::{CheckpointKind, CheckpointMarker, LoopExecutionState},
     strategies::{CapabilityCallSummary, GateOutcome, RecoveryOutcome, StopOutcome, StopKind},
 };
@@ -104,12 +112,15 @@ pub struct CanonicalAgentLoopExecutor;
 
 #[async_trait]
 impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
-    async fn execute(
+    async fn execute_family(
         &self,
-        planner: &dyn AgentLoopPlanner,
+        family: &LoopFamily,
         host: &(dyn ironclaw_turns::run_profile::AgentLoopDriverHost + Send + Sync),
         mut state: LoopExecutionState,
     ) -> Result<ironclaw_turns::LoopExit, AgentLoopExecutorError> {
+        // Crate-private accessor: pull the planner out of the opaque family.
+        // Downstream callers cannot do this.
+        let planner = family.planner();
         loop {
             // 0. Iteration cap check at the TOP of the loop, BEFORE the body.
             // This way a resumed executor with state.iteration == limit exits
@@ -177,22 +188,22 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                     let stop = planner.stop().should_stop_after_turn(&state, &summary).await;
 
                     match stop {
-                        StopOutcome::Stop { control, kind: StopKind::GracefulStop } => {
-                            state.control_state = control;
+                        StopOutcome::Stop { stop, kind: StopKind::GracefulStop } => {
+                            state.stop_state = stop;
                             state = self.checkpoint(host, state, CheckpointKind::Final).await?;
                             return Ok(/* LoopExit::Completed { GracefulStop, reply_message_refs: … } */);
                         }
-                        StopOutcome::Stop { control, kind: StopKind::NoProgressDetected } => {
-                            state.control_state = control;
+                        StopOutcome::Stop { stop, kind: StopKind::NoProgressDetected } => {
+                            state.stop_state = stop;
                             state = self.checkpoint(host, state, CheckpointKind::Final).await?;
                             return Ok(/* LoopExit::Failed { NoProgressDetected, … } */);
                         }
-                        StopOutcome::Stop { control, kind: StopKind::Aborted(failure_kind) } => {
-                            state.control_state = control;
+                        StopOutcome::Stop { stop, kind: StopKind::Aborted(failure_kind) } => {
+                            state.stop_state = stop;
                             return Ok(/* LoopExit::Failed { failure_kind, … } */);
                         }
-                        StopOutcome::Continue { control } => {
-                            state.control_state = control;
+                        StopOutcome::Continue { stop } => {
+                            state.stop_state = stop;
                             // Continue path: drain followup if planner wants;
                             // either way, every exit here is Completed and the
                             // reply ref is already in state.assistant_refs.
@@ -236,22 +247,22 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                     };
                     let stop = planner.stop().should_stop_after_turn(&state, &summary).await;
                     match stop {
-                        StopOutcome::Stop { control, kind: StopKind::GracefulStop } => {
-                            state.control_state = control;
+                        StopOutcome::Stop { stop, kind: StopKind::GracefulStop } => {
+                            state.stop_state = stop;
                             state = self.checkpoint(host, state, CheckpointKind::Final).await?;
                             return Ok(/* LoopExit::Completed { GracefulStop, … } */);
                         }
-                        StopOutcome::Stop { control, kind: StopKind::NoProgressDetected } => {
-                            state.control_state = control;
+                        StopOutcome::Stop { stop, kind: StopKind::NoProgressDetected } => {
+                            state.stop_state = stop;
                             state = self.checkpoint(host, state, CheckpointKind::Final).await?;
                             return Ok(/* LoopExit::Failed { NoProgressDetected, … } */);
                         }
-                        StopOutcome::Stop { control, kind: StopKind::Aborted(failure_kind) } => {
-                            state.control_state = control;
+                        StopOutcome::Stop { stop, kind: StopKind::Aborted(failure_kind) } => {
+                            state.stop_state = stop;
                             return Ok(/* LoopExit::Failed { failure_kind, … } */);
                         }
-                        StopOutcome::Continue { control } => {
-                            state.control_state = control;
+                        StopOutcome::Continue { stop } => {
+                            state.stop_state = stop;
                             // Continue: fall through to iteration counter
                         }
                     }
@@ -273,15 +284,16 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
 impl CanonicalAgentLoopExecutor {
     async fn execute_capability_batch(
         &self,
-        planner: &dyn AgentLoopPlanner,
+        planner: &dyn AgentLoopPlannerInternal,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
         mut state: LoopExecutionState,
         surface: &VisibleCapabilitySurface,    // for `summary_of(...)` concurrency hints
         calls: Vec<CapabilityCall>,
     ) -> Result<LoopExecutionState, AgentLoopExecutorError> {
-        // Reset per-batch counters in control_state.
-        state.control_state.last_batch_total = calls.len() as u32;
-        state.control_state.terminate_hints_in_last_batch = 0;
+        // Reset per-batch counters in stop_state (the stop strategy reads
+        // these to decide terminate-hint stops).
+        state.stop_state.last_batch_total = calls.len() as u32;
+        state.stop_state.terminate_hints_in_last_batch = 0;
 
         // Snapshot the result-refs index BEFORE the batch. Only refs pushed
         // by THIS batch are included in the post-batch TurnSummary.
@@ -323,7 +335,7 @@ impl CanonicalAgentLoopExecutor {
                 CapabilityOutcome::Completed(result) => {
                     state.result_refs.push(result.ref_.clone());
                     if result.terminate_hint {
-                        state.control_state.terminate_hints_in_last_batch += 1;
+                        state.stop_state.terminate_hints_in_last_batch += 1;
                     }
                 }
                 CapabilityOutcome::ApprovalRequired(g)
@@ -332,17 +344,17 @@ impl CanonicalAgentLoopExecutor {
                     let gate_summary = project_gate(&outcome, &g);
                     let gate_outcome = planner.gate().handle(&state, &gate_summary).await;
                     match gate_outcome {
-                        GateOutcome::Block { control } => {
-                            state.control_state = control;
+                        GateOutcome::Block { gate } => {
+                            state.gate_state = gate;
                             state.last_gate = Some(g.gate_ref);
                             state = self.checkpoint(host, state, CheckpointKind::BeforeBlock).await?;
                             return Ok(/* propagate via early-return wrapper to top-level Blocked */);
                         }
-                        GateOutcome::SkipAndContinue { control } => {
-                            state.control_state = control;
+                        GateOutcome::SkipAndContinue { gate } => {
+                            state.gate_state = gate;
                         }
-                        GateOutcome::Abort { control, failure_kind } => {
-                            state.control_state = control;
+                        GateOutcome::Abort { gate, failure_kind } => {
+                            state.gate_state = gate;
                             return Ok(/* propagate via early-return wrapper to top-level Failed */);
                         }
                     }
@@ -415,7 +427,7 @@ impl CanonicalAgentLoopExecutor {
                                     CapabilityOutcome::Completed(result) => {
                                         state.result_refs.push(result.ref_.clone());
                                         if result.terminate_hint {
-                                            state.control_state.terminate_hints_in_last_batch += 1;
+                                            state.stop_state.terminate_hints_in_last_batch += 1;
                                         }
                                         break;  // resolved — leave inner retry loop
                                     }
@@ -589,7 +601,7 @@ impl CanonicalAgentLoopExecutor {
 The host facade should expose a way to observe cancellation between strategy calls (a method on `AgentLoopDriverHost` returning a current-cancel-state, or an `AbortSignal`-shaped accessor). The executor checks it at the top of every iteration. If the existing host API does not yet expose this, this brief documents the requirement and either:
 
 - (a) adds the missing accessor to `AgentLoopDriverHost` (small, additive change in `ironclaw_turns`); or
-- (b) uses a tokio `CancellationToken` passed through `AgentLoopExecutor::execute` as an additional parameter.
+- (b) uses a tokio `CancellationToken` passed through `AgentLoopExecutor::execute_family` as an additional parameter.
 
 Pick (a) if the host already has cancellation plumbing; (b) otherwise.
 
@@ -597,7 +609,7 @@ Pick (a) if the host already has cancellation plumbing; (b) otherwise.
 
 1. Checkpoint with whatever `CheckpointKind` is appropriate for the current step (`BeforeModel` / `BeforeSideEffect` / `BeforeBlock`).
 2. Build a `LoopExit::Cancelled(LoopCancelled { reason_kind: HostInterrupt | HostCancellation, checkpoint_id: …, interrupted_message_refs: state.assistant_refs.clone(), exit_id: … })` (variant defined in `crates/ironclaw_turns/src/loop_exit.rs:400`).
-3. Return `Ok(LoopExit::Cancelled(...))` directly from `execute()`.
+3. Return `Ok(LoopExit::Cancelled(...))` directly from `execute_family()`.
 
 `AgentLoopExecutorError::Cancelled` is **only** for the truly-unrecoverable case where the executor cannot even produce a `LoopExit::Cancelled` (e.g. the cancellation checkpoint write itself failed and we have no valid checkpoint id to embed). WS-7 maps that residual case to `AgentLoopDriverError::Failed { reason_kind: "interrupted_unexpectedly" }`, not to `Unavailable`. Normal cancellation never visits the error mapping path.
 
@@ -620,7 +632,7 @@ The retry path in §3.3 calls `host.invoke_capability(CapabilityInvocation::from
 - [ ] `cargo check -p ironclaw_agent_loop` passes
 - [ ] `cargo clippy --all --benches --tests --examples --all-features` zero warnings
 - [ ] Trait surface test: `fn _check(_: &dyn AgentLoopExecutor) {}`
-- [ ] Smoke test: with a `MockHost` that returns a Reply on first call, `CanonicalAgentLoopExecutor::execute(DefaultPlanner::default(), &host, initial_state)` returns `LoopExit::Completed` with `assistant_refs.len() == 1`. Final checkpoint observed in mock recorder.
+- [ ] Smoke test: with a `MockHost` that returns a Reply on first call, `CanonicalAgentLoopExecutor::execute_family(&families::default(), &host, initial_state)` returns `LoopExit::Completed` with `assistant_refs.len() == 1`. Final checkpoint observed in mock recorder.
 - [ ] Smoke test: with a `MockHost` whose first model call returns `CapabilityCalls` and whose second returns Reply, executor takes `BeforeModel`, `BeforeSideEffect`, `BeforeModel`, `Final` checkpoints in order; returns `Completed`.
 - [ ] **Stop-after-batch smoke test:** with a `MockHost` whose batch returns one outcome with `terminate_hint: true`, executor calls `should_stop_after_turn` with `TurnEndKind::AfterCapabilityBatch` after the batch and returns `LoopExit::Completed { GracefulStop }` *without* a follow-up model call.
 - [ ] Smoke test: with a `MockHost` whose model call returns `CapabilityCalls` whose only outcome is `ApprovalRequired`, executor takes `BeforeModel`, `BeforeSideEffect`, `BeforeBlock` checkpoints; returns `LoopExit::Blocked` with `gate_ref` set.
@@ -630,7 +642,7 @@ The retry path in §3.3 calls `host.invoke_capability(CapabilityInvocation::from
 - [ ] **Cancellation smoke test:** with a `MockHost` whose cancellation accessor flips to `true` between turns, executor returns `Ok(LoopExit::Cancelled(...))` (not `Err`); checkpoint recorded with appropriate `CheckpointKind` and `interrupted_message_refs` populated from `state.assistant_refs`.
 - [ ] No `unwrap()` / `expect()` outside test code (per `error-handling.md`)
 - [ ] No raw provider/secret/host-path/tool-input strings ever appear in `state` or returned errors
-- [ ] Doc comments on `CanonicalAgentLoopExecutor::execute` cite master doc §8
+- [ ] Doc comments on `CanonicalAgentLoopExecutor::execute_family` cite master doc §8
 
 ## 5. Out of scope
 

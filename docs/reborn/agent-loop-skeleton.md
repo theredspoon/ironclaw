@@ -31,7 +31,7 @@ The skeleton fixes that by separating three concerns that the current driver con
 |---|---|---|
 | **Loop strategy** ("what should this loop family do at each decision point?") | `AgentLoopPlanner` (composition of nine strategies) | `ironclaw_agent_loop` |
 | **Loop mechanics** ("the canonical tick") | `AgentLoopExecutor` | `ironclaw_agent_loop` |
-| **Runner adapter** ("turn the framework into something the runner can call") | `PlannedDriver<P, E>: AgentLoopDriver` | `ironclaw_reborn` |
+| **Runner adapter** ("turn the framework into something the runner can call") | `PlannedDriver: AgentLoopDriver` (non-generic; holds `Arc<LoopFamily>`) | `ironclaw_reborn` |
 
 Each loop family then becomes "pick nine strategies" — usually overriding two or three from the defaults — instead of writing a new driver.
 
@@ -46,14 +46,18 @@ TurnRunner                     claims a run, builds the host facade,
       ↓
 AgentLoopDriver  (trait)       runner-facing boundary  ← lives in ironclaw_turns
       ↓
-PlannedDriver<P, E>            adapter implementing AgentLoopDriver
-                               over (planner: P, executor: E)         ← lives in ironclaw_reborn
+PlannedDriver                  non-generic adapter implementing AgentLoopDriver;
+                               holds Arc<LoopFamily> + Arc<CanonicalAgentLoopExecutor>
+                                                                       ← lives in ironclaw_reborn
       ↓
-AgentLoopExecutor              canonical loop tick                    ──┐
-      ↓                                                                  │
-AgentLoopPlanner               composition of nine strategies            ├── lives in ironclaw_agent_loop
-      ↓                                                                  │
-nine Strategy traits           one decision per trait                    │
+AgentLoopExecutor              canonical loop tick (entry: execute_family) ──┐
+      ↓                                                                       │
+LoopFamily                     Builtin, sealed; opaque to ironclaw_reborn     ├── lives in ironclaw_agent_loop
+      ↓                                                                       │
+AgentLoopPlanner               composition of nine strategies (pub trait,     │
+                               sealed; strategy access via pub(crate) trait)  │
+      ↓                                                                       │
+nine Strategy traits           pub(crate) — one decision per trait            │
       ↓                                                                  │
 AgentLoopDriverHost            host ports the executor calls           ──┘ ← trait lives in ironclaw_turns
       ↓                          (model, prompt, capability, transcript,
@@ -74,16 +78,20 @@ ironclaw_turns                              (unchanged surface; one new variant)
     host.rs                    AgentLoopDriverHost, LoopRunContext,                (existing)
                                all LoopXxxPort traits, LoopModelRouteSnapshot
     refs.rs                    LoopMessageRef / LoopResultRef / etc.               (existing)
-  src/loop_exit.rs             LoopExit + variants                                 (gains LoopFailureKind::NoProgressDetected)
+  src/loop_exit.rs             LoopExit + variants                                 (gains LoopFailureKind::NoProgressDetected + ::PolicyDenied)
   src/runner.rs                TurnRunner interfaces                               (existing)
   src/coordinator.rs           TurnCoordinator                                     (existing)
 
 ironclaw_agent_loop                         NEW — owns "what a loop is"
   src/lib.rs
+  src/family.rs                LoopFamilyId, ComponentIdentity, LoopFamily,
+                               LoopFamilyRegistry (Builtin-only, sealed)
+  src/families/mod.rs          families::default() factory; future families add here
   src/state.rs                 LoopExecutionState (immutable) + per-strategy slots
+                               (StopStrategyState, GateStrategyState, …)
                                + BoundedRing<T, N> + CapabilityCallSignature
-  src/strategies/
-    mod.rs                     exports
+  src/strategies/              ← all traits below are pub(crate); strategies are
+    mod.rs                       Builtin-only, never part of the public surface
     context.rs                 ContextStrategy trait + DefaultContextStrategy
     capability.rs              CapabilityStrategy trait + DefaultCapabilityStrategy
     model.rs                   ModelStrategy trait + DefaultModelStrategy
@@ -93,20 +101,56 @@ ironclaw_agent_loop                         NEW — owns "what a loop is"
     stop.rs                    StopConditionStrategy trait + StopOutcome + DefaultStopConditionStrategy
     drain.rs                   InputDrainStrategy trait + DefaultInputDrainStrategy
     budget.rs                  BudgetStrategy trait + DefaultBudgetStrategy
-  src/planner.rs               AgentLoopPlanner facade trait
+  src/planner.rs               AgentLoopPlanner pub trait (sealed) +
+                               pub(crate) AgentLoopPlannerInternal extension trait
   src/executor.rs              AgentLoopExecutor trait + canonical-tick contract
+                               (entry point: execute_family(&LoopFamily, …))
   src/canonical_executor.rs    CanonicalAgentLoopExecutor (default impl)
-  src/default_planner.rs       DefaultPlanner with nine Default* slots; impl Default
+  src/default_planner.rs       DefaultPlanner with nine Default* slots;
+                               pub(crate) compose_default + with_* mutators
 
 ironclaw_reborn                             (tighter — runtime integration)
   src/text_loop_driver.rs      TextOnlyModelReplyDriver (existing, unchanged)
-  src/planned_driver.rs        NEW — PlannedDriver<P, E> implements AgentLoopDriver
+  src/planned_driver.rs        NEW — PlannedDriver (non-generic) implements AgentLoopDriver
+  src/app_loop_family.rs       NEW — build_loop_family_registry() composition root
   src/turn_runner.rs           registers PlannedDriver instances by id            (existing)
   src/driver_registry.rs       (existing)
   src/loop_exit_applier.rs     (existing)
 ```
 
-Each follow-up loop family ships as one factory function in `ironclaw_agent_loop/src/families/<name>.rs`, e.g. `coding_planner()` returning a `DefaultPlanner` with select strategies swapped. The skeleton ships none of these; only `DefaultPlanner::default()`. A family graduates to its own crate only when it pulls heavyweight external deps (tree-sitter, ripgrep, etc.).
+Each follow-up loop family ships as one factory function in `ironclaw_agent_loop/src/families/<name>.rs`, e.g. `coding()` returning a `LoopFamily` with select strategies swapped via `DefaultPlanner::compose_default().with_*(...)` (all `pub(crate)`). The skeleton ships none of these; only `families::default()`. A family graduates to its own crate only when it pulls heavyweight external deps (tree-sitter, ripgrep, etc.).
+
+## 4.5 Loop family resolution
+
+`LoopFamily` is the **top-layer abstraction**. The chain from a submitted run to the canonical executor is:
+
+```text
+RunProfile          ← user-grantable, audited
+  loop_family_id: LoopFamilyId
+       │
+       ▼ resolved via Arc<LoopFamilyRegistry>::get(...)
+LoopFamily          ← Builtin-only, sealed; opaque to downstream crates
+  id: LoopFamilyId
+  version: ComponentIdentity
+  planner: Arc<dyn AgentLoopPlanner>   ← pub(crate) accessor
+       │
+       ▼ pub(crate) AgentLoopPlannerInternal extension trait
+nine Strategy slots ← pub(crate); never visible outside ironclaw_agent_loop
+       │
+       ▼
+CanonicalAgentLoopExecutor::execute_family(family, host, state)
+```
+
+Properties:
+
+- **Profiles refer to families by `LoopFamilyId`, never by strategy composition.** A profile carries `loop_family_id: LoopFamilyId` (e.g. `"default"`); resolution maps to `Arc<LoopFamily>` via the registry. Profiles cannot enumerate strategies, override individual slots, or inject custom impls.
+- **`LoopFamilyRegistry` is a Guice-style singleton.** Built once at app startup by `ironclaw_reborn::app_loop_family::build_loop_family_registry()` (the only composition root that knows which families exist), shared via `Arc<LoopFamilyRegistry>`, immutable thereafter. There is no public `register()` method; the registry is "wired by `builtin()` composition" only.
+- **Strategy traits are `pub(crate)` in `ironclaw_agent_loop`.** Extensions (Trusted or Installed) cannot implement strategies. Customization lives at the hooks layer (§9 and PR #3523-comment-4435808547) — middleware around host ports, not strategy slots in the executor.
+- **`PlannedDriver` is non-generic.** It holds `Arc<LoopFamily> + Arc<CanonicalAgentLoopExecutor>` and adapts them to `AgentLoopDriver`. The strategy seal means tests use real families from the registry (or `LoopFamilyRegistry::with_families` under `cfg(feature = "test-support")`), not synthetic planners.
+
+This collapses several open questions at once: the trust-class problem (strategies are Builtin by type), the combinatorial-explosion problem (profiles get a family, not nine independent knobs), the version-drift problem (`LoopFamilyId + ComponentIdentity` pins replayable state with one primitive — see §11 — used in checkpoint payload metadata).
+
+The full registry shape lives in [`agent-loop-briefs/loop-family-registry.md`](agent-loop-briefs/loop-family-registry.md) (WS-3.5).
 
 ## 5. Mutability layers
 
@@ -128,9 +172,13 @@ The loop:
 
 There is no `state.set_completed()`-style API on the loop side. The loop returns `LoopExit`; `LoopExitApplier` (in `ironclaw_reborn`) validates the refs in the exit and applies the durable transition. This is what makes evidence validation possible.
 
+**Family-specific durable state lives in workspace, not in `LoopExecutionState`.** Mission progress (milestones reached), plan-tree branches (for planning families), scheduled-poll cursors (for routine families), and any other family-specific durable data flows through layer 4 (host-managed) — exposed to the loop by a family-specific `HostXxxContextSource` trait composed into `LoopPromptPort`, analogous to WS-15's `HostIdentityContextSource` and the existing `HostSkillContextSource`. Strategy slots in layer 2 stay small and executor-focused (`StopStrategyState`, `GateStrategyState`, `RecoveryStrategyState`, etc.). This is what lets the framework absorb family diversity without growing the `LoopExecutionState` schema per family.
+
 ## 6. The nine strategies
 
 Each strategy is one small Rust trait with one or two methods. Default impls model pi-mono behavior. A loop family typically swaps two or three of them; the rest stay default.
+
+**Strategy traits are `pub(crate)` inside `ironclaw_agent_loop`.** Loop families are the public surface (`Arc<LoopFamily>` flows out of `LoopFamilyRegistry`); strategy traits are an implementation detail that family factories compose. Extensions cannot implement strategies — see §9 for the trust model and PR #3523-comment-4435808547 for the hooks-as-middleware extension surface.
 
 | Strategy | Decision it owns | Returns | Default behavior |
 |---|---|---|---|
@@ -138,9 +186,9 @@ Each strategy is one small Rust trait with one or two methods. Default impls mod
 | `CapabilityStrategy` | Which capabilities are visible this iteration | `CapabilityFilter` | All allowed; expect provider-tool encoding |
 | `ModelStrategy` | Which model preference to ask the host for | `ModelPreference` | Primary route only |
 | `BatchPolicyStrategy` | Sequential vs parallel for a capability batch | `BatchPolicy` | Parallel for read-only; sequential for writes |
-| `GateHandlingStrategy` | On Approval/Auth/Resource gate: block/skip/abort | `GateOutcome` (mutates `control_state`) | Always block (checkpoint + return `LoopExit::Blocked`) |
+| `GateHandlingStrategy` | On Approval/Auth/Resource gate: block/skip/abort | `GateOutcome` (mutates `gate_state`) | Always block (checkpoint + return `LoopExit::Blocked`) |
 | `RecoveryStrategy` | On capability/model error: retry/skip/abort | `RecoveryOutcome` (mutates `recovery_state`) | Retry transient model errors 2× with backoff |
-| `StopConditionStrategy` | Should we stop after this completed turn? | `StopOutcome` (mutates `control_state`) | Stop on terminate-hint; no-progress detection (see §10) |
+| `StopConditionStrategy` | Should we stop after this completed turn? | `StopOutcome` (mutates `stop_state`) | Stop on terminate-hint; no-progress detection (see §10) |
 | `InputDrainStrategy` | When to drain steering / followup queues | `(drain_steering: bool, drain_followup: bool)` | Steering before each model call; followup only when otherwise stopping |
 | `BudgetStrategy` | Iteration / wall-clock limits | `IterationLimit` (+ `Option<Duration>`) | 32 iterations, no wall-clock cap |
 
@@ -170,12 +218,16 @@ pub struct LoopExecutionState {
     pub recent_call_signatures: BoundedRing<CapabilityCallSignature, 8>,
     pub recent_failure_kinds:   BoundedRing<LoopFailureKind, 8>,
 
-    // strategy slots (one per strategy that needs persistent state)
+    // strategy slots — one per strategy that mutates state. Stop and Gate
+    // each own their own slot (no shared `control_state`) so a family's
+    // future growth in either dimension can't mix concerns through a shared
+    // struct.
     pub context_state:    ContextStrategyState,
     pub capability_state: CapabilityStrategyState,
     pub model_state:      ModelStrategyState,    // current fallback chain index (skeleton: always 0)
     pub recovery_state:   RecoveryStrategyState, // attempt counters
-    pub control_state:    ControlStrategyState,  // milestones, terminate-hints seen, gate fingerprints
+    pub stop_state:       StopStrategyState,     // turns-completed, terminate-hint counters
+    pub gate_state:       GateStrategyState,     // gate fingerprints / per-kind counters (empty in skeleton)
 }
 ```
 
@@ -250,19 +302,19 @@ loop:
       summary = TurnSummary { kind: ReplyOnly, assistant_message_ref: Some(reply_ref) }
       stop = planner.stop().should_stop_after_turn(&state, &summary)
       match stop:
-        Stop { control, GracefulStop }:
-          state.control_state = control
+        Stop { stop, GracefulStop }:
+          state.stop_state = stop
           checkpoint(Final, &state)
           return LoopExit::Completed { reply_message_refs: state.assistant_refs.clone(), ... }
-        Stop { control, NoProgressDetected }:
-          state.control_state = control
+        Stop { stop, NoProgressDetected }:
+          state.stop_state = stop
           checkpoint(Final, &state)
           return LoopExit::Failed { reason_kind: NoProgressDetected, ... }
-        Stop { control, Aborted(fk) }:
-          state.control_state = control
+        Stop { stop, Aborted(fk) }:
+          state.stop_state = stop
           return LoopExit::Failed { reason_kind: fk, ... }
-        Continue { control }:
-          state.control_state = control
+        Continue { stop }:
+          state.stop_state = stop
           // Followup drain: even on Continue→Completed, the reply ref is
           // already finalized and in state.assistant_refs.
           if planner.drain().drain_followup(&state):
@@ -331,7 +383,7 @@ loop:
         Stop { GracefulStop }:    checkpoint(Final, &state); return LoopExit::Completed { ... }
         Stop { NoProgressDetected }: checkpoint(Final, &state); return LoopExit::Failed { NoProgressDetected, ... }
         Stop { Aborted(fk) }:     return LoopExit::Failed { reason_kind: fk, ... }
-        Continue { control }:     state.control_state = control  // fall through
+        Continue { stop }:        state.stop_state = stop  // fall through
 
   state.iteration += 1   // increment for next iteration's top-of-loop budget check
 ```
@@ -356,6 +408,8 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 - **Naming convention: `Default*` for default impls.** No "pi" in identifiers.
 - **Term: `Strategy`** for sub-components of the planner facade.
 - **`AgentLoopDriver` trait is the boundary** between `ironclaw_reborn` and the framework. The framework crate does not depend on `AgentLoopDriver`.
+- **Strategies are Builtin-only (sealed at the type level).** Strategy traits are `pub(crate)` in `ironclaw_agent_loop`; `AgentLoopPlanner` is `pub` but uses the sealed-trait pattern (only types in `ironclaw_agent_loop` can implement). Extensions plug into the loop via **hooks**, which fire as middleware around host port impls composed in `ironclaw_loop_support`. Strategies decide loop-control policy; hooks intercept side-effecting port calls. They communicate only via existing `Loop*Port` DTOs and never see each other directly. The full design (with four worked scenarios) is in PR #3523-comment-4435808547.
+- **Loop families are bound through `LoopFamilyRegistry`,** constructed once at app startup by `ironclaw_reborn::app_loop_family::build_loop_family_registry()` and shared via `Arc<LoopFamilyRegistry>` plumbed into `TurnRunner`. There is no public `register()` method — the registry's contents are fixed at the composition root's compile time. See [`agent-loop-briefs/loop-family-registry.md`](agent-loop-briefs/loop-family-registry.md) (WS-3.5).
 
 ## 10. Production-safe escape
 
@@ -369,7 +423,9 @@ The `Default*` strategies provide three independent stuck-loop safety nets, laye
 
 The "iterations" count is critical: a single iteration containing three identical calls in one batch counts as **one** observation, not three. The executor enforces this by deduplicating signature pushes within each iteration (see WS-0 §3.4 "per-iteration push semantics"). Retries of the same call within an iteration also do not re-push. This prevents a single fan-out batch from spuriously tripping the detector while still catching genuine cross-iteration loops.
 
-The `LoopFailureKind::NoProgressDetected` variant is added in `ironclaw_turns::loop_exit` under WS-0.
+The `LoopFailureKind::NoProgressDetected` variant is added in `ironclaw_turns::loop_exit` under WS-0. So is `LoopFailureKind::PolicyDenied` — emitted when a `CapabilityOutcome::Denied` (including hook-induced denials from the middleware composition seam) reaches the recovery path with no further retry. Distinct from `CapabilityProtocolError` so the no-progress detector counts repeated denials without conflating them with transport faults.
+
+**All three safety nets are enforced by Builtin code** (iteration cap by the executor itself; retry budget by `DefaultRecoveryStrategy`; no-progress by `DefaultStopConditionStrategy`). Because strategies are sealed (§9), the retry budget and no-progress detection sit in audited code that extensions cannot replace. The iteration cap is the additional structural defense — the only one that survives even if a future audit of `DefaultRecoveryStrategy` or `DefaultStopConditionStrategy` finds a bug. Cancellation can therefore stay cooperative (observed between strategy calls) without needing preemptive `tokio::select!` boundaries at every strategy call site.
 
 Loop families that legitimately repeat (e.g. routines polling the same capability on schedule) opt out by swapping `StopConditionStrategy` for one that ignores the signature ring.
 
@@ -388,8 +444,8 @@ The skeleton (WS-0..WS-8) ships the framework crate, traits, default strategies,
 - **Not a `prepareNextTurn`-style mid-run model swap** beyond the (deferred) fallback chain mechanism (`ModelRouteChain`).
 - **Not a `MessageProjectionStrategy`.** Host owns projection.
 - **Not a `NudgeStrategy`.** Inline messages flow through `ContextStrategy`.
-- **Not loop-family factories.** Skeleton ships `DefaultPlanner::default()` only.
-- **Not an `AgentLoopPlannerDescriptor` separate type.** `PlannerId` newtype in checkpoint payload metadata is enough; richer descriptors live on the driver side via `AgentLoopDriverDescriptor`.
+- **Not loop-family factories beyond `default_family`.** Skeleton ships `families::default()` resolved through `LoopFamilyRegistry`. Hypothetical `routine`, `mission`, `coding`, `planning` families are stress-tested for trait-shape fit in §12.5 but ship only when there's a concrete consumer.
+- **`LoopFamily` IS the top-layer abstraction.** It carries `id: LoopFamilyId`, `version: ComponentIdentity`, and an opaque planner (`Arc<dyn AgentLoopPlanner>`, sealed). `LoopFamilyId + ComponentIdentity` replaces the previously-proposed `PlannerId` newtype in checkpoint payload metadata; the same primitive is reused across replay validation, profile resolution, and future hook/skill snapshot identities (one `ComponentIdentity` shape, not four). Richer driver-side descriptors still live on `AgentLoopDriverDescriptor`, but the framework's stable identity is `LoopFamily`.
 
 ## 12. Follow-up workstreams for end-to-end execution
 
@@ -416,37 +472,61 @@ These workstreams convert the skeleton from "framework that compiles and tests a
 
 This rule disambiguates the "loop_support + reborn" hedges in the table above: each row's primary owner is `loop_support` for the impl, with the `reborn` portion limited to wiring the impl into `AgentLoopDriverHost` composition / registry registration.
 
-**Deferred-not-required:** `ModelRouteChain` (master doc §9), loop-family planners (`coding_planner()`, `routine_planner(...)`, etc.), and migration of `TextOnlyModelReplyDriver` are useful but not on the E2E critical path. Ship them when there's a concrete consumer.
+**Deferred-not-required:** `ModelRouteChain` (master doc §9), loop-family factories beyond `families::default()`, and migration of `TextOnlyModelReplyDriver` are useful but not on the E2E critical path. Ship them when there's a concrete consumer.
+
+## 12.5 Loop families: anticipated and their strategy overrides
+
+The framework is intentionally broad-scope — it serves multiple loop families through strategy variation, not just text-tool-use. To validate that the nine-strategy axis can actually express anticipated family diversity (without requiring a different executor per family), the table below enumerates the families we anticipate and the strategies each would override.
+
+**Only `default_family` ships in the skeleton.** Every other row is hypothetical, included to stress-test the trait shapes against family diversity before WS-1/2/3 seal them. If any anticipated family would require a strategy slot that the current trait shape can't express, that's a gap to fix in this skeleton — not in a downstream PR.
+
+| Family | Status | Strategies it would override | Where durable family-specific state lives | Stress-test result |
+|---|---|---|---|---|
+| `default_family` | **Ships in skeleton** | (none — uses every `Default*Strategy`) | n/a (text-tool-use baseline carries no durable family state) | ✓ baseline |
+| `routine_family` | Hypothetical | `StopConditionStrategy` → `IgnoreRepetitionStop` (routines re-issue the same calls intentionally); `CapabilityStrategy` → fixed pre-curated `CapabilityFilter`; `InputDrainStrategy` → poll-on-schedule (drain when `state.iteration % interval == 0`) | Scheduled-poll cursors live in workspace; surfaced through a hypothetical `HostRoutineContextSource` (analogous to WS-15) | ✓ trait shapes accommodate. Indefinite runtime is a scheduler concern (re-invoke), not a loop concern (`BudgetStrategy::iteration_limit: u32` is fine; each routine invocation is finite) |
+| `mission_family` | Hypothetical | `GateHandlingStrategy` → aggressive `Block` on every approval gate; `BudgetStrategy::wall_clock_limit` → `None`; `ContextStrategy` → load mission plan + completed milestones | Mission progress / milestones in workspace; surfaced through a hypothetical `HostMissionContextSource` | ✓ trait shapes accommodate. Mission state flows through prompt content, not strategy slots; `LoopExit::Blocked` + checkpoint resume handles multi-day pauses natively |
+| `coding_family` | Hypothetical | `CapabilityStrategy` → filter to coding tools; `BudgetStrategy::iteration_limit` → higher (e.g. 100); `BatchPolicyStrategy` → sequential (file edits are causally dependent) | n/a — model carries plan state through transcript; no separate durable state | ✓ trait shapes accommodate. Coding is mostly a capability-surface choice, not a loop-strategy choice |
+| `planning_family` | Hypothetical | `BatchPolicyStrategy` → sequential always; `BudgetStrategy::iteration_limit` → high; `ContextStrategy` → load "branches explored so far" | Plan tree / search state in workspace; surfaced through a hypothetical `HostPlanTreeContextSource` | ✓ trait shapes accommodate. "Backtracking" is model-driven (re-issue tool calls for an earlier branch); framework does not need a special backtrack primitive |
+
+Two specific design notes that fall out of this exercise:
+
+1. **`ControlStrategyState` is split into `StopStrategyState` + `GateStrategyState`** in WS-0, so future families can grow either independently without mixing concerns through a shared struct (e.g. a routine family that grows `StopStrategyState` with scheduled-poll bookkeeping does not perturb gate-handler invariants used by mission families).
+2. **`HostXxxContextSource` is the universal pattern for family-specific durable context** (per §5). Each anticipated family above gets its own `HostXxxContextSource` trait that the host composes into `LoopPromptPort`; the strategy doesn't carry the state, the prompt does. This is the same shape WS-15 uses for identity files and the existing `HostSkillContextSource` uses for skills.
+
+If a future family genuinely requires a strategy shape outside this enumeration, the skeleton's trait shapes (especially `RecoveryOutcome` and `StopOutcome`) need to be revisited before the family lands — not as a downstream amendment.
 
 Briefs for these follow-ups will land under [`agent-loop-briefs/`](agent-loop-briefs/) with filenames matching their workstream titles. They are intentionally not pre-written here — each should be scoped against the actual code state at the time it's picked up, not the skeleton's snapshot.
 
 ## 13. Workstream map
 
-Nine implementation briefs live in [`agent-loop-briefs/`](agent-loop-briefs/). Briefs run in parallel within a layer; dependency edges shown.
+Ten implementation briefs live in [`agent-loop-briefs/`](agent-loop-briefs/). Briefs run in parallel within a layer; dependency edges shown.
 
 | ID | Brief | Crate(s) | Depends on |
 |----|-------|----------|------------|
-| WS-0 | [`state-and-checkpoints.md`](agent-loop-briefs/state-and-checkpoints.md) — `LoopExecutionState`, slots, `BoundedRing`, `CapabilityCallSignature`, checkpoint payload schema, `LoopFailureKind::NoProgressDetected` | `ironclaw_agent_loop` + `ironclaw_turns` | — |
-| WS-1 | [`strategy-traits-alpha.md`](agent-loop-briefs/strategy-traits-alpha.md) — `ContextStrategy`, `CapabilityStrategy`, `ModelStrategy` | `ironclaw_agent_loop` | WS-0 |
-| WS-2 | [`strategy-traits-beta.md`](agent-loop-briefs/strategy-traits-beta.md) — `BatchPolicyStrategy`, `GateHandlingStrategy`, `RecoveryStrategy` | `ironclaw_agent_loop` | WS-0 |
-| WS-3 | [`strategy-traits-gamma.md`](agent-loop-briefs/strategy-traits-gamma.md) — `StopConditionStrategy`, `InputDrainStrategy`, `BudgetStrategy` | `ironclaw_agent_loop` | WS-0 |
-| WS-4 | [`planner-facade.md`](agent-loop-briefs/planner-facade.md) — `AgentLoopPlanner` + `DefaultPlanner` skeleton | `ironclaw_agent_loop` | WS-1, WS-2, WS-3 |
+| WS-0 | [`state-and-checkpoints.md`](agent-loop-briefs/state-and-checkpoints.md) — `LoopExecutionState`, slots (`StopStrategyState`, `GateStrategyState`, …), `BoundedRing`, `CapabilityCallSignature`, checkpoint payload schema, `LoopFailureKind::NoProgressDetected` + `::PolicyDenied` | `ironclaw_agent_loop` + `ironclaw_turns` | — |
+| WS-1 | [`strategy-traits-alpha.md`](agent-loop-briefs/strategy-traits-alpha.md) — `ContextStrategy`, `CapabilityStrategy`, `ModelStrategy` (all `pub(crate)`) | `ironclaw_agent_loop` | WS-0 |
+| WS-2 | [`strategy-traits-beta.md`](agent-loop-briefs/strategy-traits-beta.md) — `BatchPolicyStrategy`, `GateHandlingStrategy`, `RecoveryStrategy` (all `pub(crate)`) | `ironclaw_agent_loop` | WS-0 |
+| WS-3 | [`strategy-traits-gamma.md`](agent-loop-briefs/strategy-traits-gamma.md) — `StopConditionStrategy`, `InputDrainStrategy`, `BudgetStrategy` (all `pub(crate)`) | `ironclaw_agent_loop` | WS-0 |
+| WS-3.5 | [`loop-family-registry.md`](agent-loop-briefs/loop-family-registry.md) — `LoopFamilyId`, `ComponentIdentity`, `LoopFamily`, `LoopFamilyRegistry`, `families::default()`, composition root in `ironclaw_reborn` | `ironclaw_agent_loop` + `ironclaw_reborn` | WS-0 |
+| WS-4 | [`planner-facade.md`](agent-loop-briefs/planner-facade.md) — `AgentLoopPlanner` (sealed `pub` trait) + `AgentLoopPlannerInternal` (`pub(crate)`) + `DefaultPlanner` with `pub(crate) compose_default` | `ironclaw_agent_loop` | WS-1, WS-2, WS-3 |
 | WS-5 | [`default-strategies.md`](agent-loop-briefs/default-strategies.md) — nine `Default*Strategy` impls | `ironclaw_agent_loop` | WS-1, WS-2, WS-3 |
-| WS-6 | [`canonical-executor.md`](agent-loop-briefs/canonical-executor.md) — `AgentLoopExecutor` + `CanonicalAgentLoopExecutor` | `ironclaw_agent_loop` | WS-4, WS-5 |
-| WS-7 | [`planned-driver-adapter.md`](agent-loop-briefs/planned-driver-adapter.md) — `PlannedDriver<P, E>` adapter + registry wiring | `ironclaw_reborn` | WS-6 |
+| WS-6 | [`canonical-executor.md`](agent-loop-briefs/canonical-executor.md) — `AgentLoopExecutor` + `CanonicalAgentLoopExecutor::execute_family(&LoopFamily, …)` | `ironclaw_agent_loop` | WS-4, WS-5, WS-3.5 |
+| WS-7 | [`planned-driver-adapter.md`](agent-loop-briefs/planned-driver-adapter.md) — non-generic `PlannedDriver` adapter (holds `Arc<LoopFamily>`); `from_family` + `from_registry` constructors | `ironclaw_reborn` | WS-6 |
 | WS-8 | [`e2e-integration-tests.md`](agent-loop-briefs/e2e-integration-tests.md) — feature-gated `test_support` module + cross-crate integration suite (happy paths, safety nets, strategy intersections, state lifecycle, reborn-side driver e2e) | `ironclaw_agent_loop` + `ironclaw_reborn` | WS-7 |
 
-Realistic parallelism: WS-0 ships first; then WS-1/2/3 land in parallel; then WS-4/5 in parallel; then WS-6; then WS-7; then WS-8 closes the suite. WS-8 is the proof-of-life — `cargo test --workspace --features ironclaw_agent_loop/test-support` only goes green when every prior workstream is correctly composed.
+Realistic parallelism: WS-0 ships first; then WS-1/2/3 and WS-3.5 land in parallel; then WS-4/5 in parallel; then WS-6; then WS-7; then WS-8 closes the suite. WS-8 is the proof-of-life — `cargo test --workspace --features ironclaw_agent_loop/test-support` only goes green when every prior workstream is correctly composed.
 
 ## 14. Glossary
 
-- **Driver** — runner-facing trait `AgentLoopDriver` (`ironclaw_turns`). Single job: the contract `TurnRunner` calls. Implementations either bake a whole loop (legacy `TextOnlyModelReplyDriver`) or adapt the framework (`PlannedDriver`).
-- **Planner** — `AgentLoopPlanner`, the composition of nine strategies that defines a loop family.
-- **Executor** — `AgentLoopExecutor`, the canonical tick body.
-- **Strategy** — one swappable decision-procedure consulted by the executor at a specific point in the tick.
-- **State** — `LoopExecutionState`, value-immutable, rebound per tick.
+- **Driver** — runner-facing trait `AgentLoopDriver` (`ironclaw_turns`). Single job: the contract `TurnRunner` calls. Implementations either bake a whole loop (legacy `TextOnlyModelReplyDriver`) or adapt the framework (`PlannedDriver`, non-generic).
+- **Planner** — `AgentLoopPlanner` (`pub`, sealed). Composition of nine strategies that defines a loop family. Strategy access lives on the `pub(crate)` extension trait `AgentLoopPlannerInternal`; extensions can hold `&dyn AgentLoopPlanner` but cannot reach into strategies.
+- **Executor** — `AgentLoopExecutor`, the canonical tick body. Public entry point is `execute_family(&LoopFamily, host, state)`.
+- **Strategy** — one swappable decision-procedure consulted by the executor at a specific point in the tick. All nine strategy traits are `pub(crate)` in `ironclaw_agent_loop`; only Builtin code can implement them. Extensions plug into the loop via hooks (PR #3523-comment-4435808547), not strategies.
+- **State** — `LoopExecutionState`, value-immutable, rebound per tick. Strategy slots include `StopStrategyState` and `GateStrategyState` separately (no shared `control_state`).
 - **Run context** — `LoopRunContext`, immutable for the entire claimed run.
-- **Loop family** — a particular composition of strategies, packaged as a factory function. Skeleton ships only `DefaultPlanner::default()`.
+- **Loop family** — `LoopFamily` (Builtin, sealed). Carries `id: LoopFamilyId`, `version: ComponentIdentity`, and an opaque planner. Constructed only by `families::*` factories. Resolved from `LoopFamilyRegistry` by id. Skeleton ships only `families::default()`.
+- **Loop family registry** — `LoopFamilyRegistry`, Guice-style singleton built once at app startup by `ironclaw_reborn::app_loop_family::build_loop_family_registry()`. No public `register()`; contents fixed at composition-root compile time.
+- **Component identity** — `ComponentIdentity { id: &'static str, digest: ComponentDigest }`, content-addressed versioning primitive. One shape used across loop family versioning, checkpoint payload metadata, and future hook / skill-snapshot / model-route component identities.
 
 ## 15. Credits
 

@@ -160,10 +160,11 @@ pub enum IdentityApplicability {
 }
 ```
 
-Loop-family-scoped applicability (e.g. an `OnFamilyId(...)` variant) is
-deliberately omitted: the skeleton ships only `DefaultPlanner::default()`
-and `LoopFamilyId` is not a defined type. When loop families graduate to
-their own crates (master doc §4), this enum can grow a family-scoped
+Loop-family-scoped applicability (e.g. an `OnFamilyId(LoopFamilyId)` variant) is
+deliberately omitted from this brief: the skeleton ships only
+`families::default()` (WS-3.5), so the variant would have nothing to scope
+against. `LoopFamilyId` IS a defined type as of WS-3.5; once a second family
+ships and per-family identity scoping becomes useful, this enum can grow the
 variant in a strictly additive change.
 
 `IdentityFileName` is a newtype per `.claude/rules/types.md` —

@@ -11,11 +11,11 @@
 
 Bridge the framework crate (`ironclaw_agent_loop`) to the runner-facing `AgentLoopDriver` trait (`ironclaw_turns`). One small struct + one trait impl in `ironclaw_reborn`.
 
-- `PlannedDriver<P, E>` struct — generic over planner and executor.
-- `impl AgentLoopDriver for PlannedDriver<P, E>` — wires `run` and `resume` through to the executor.
+- `PlannedDriver` struct — **non-generic**. Holds `Arc<LoopFamily>` (opaque to this crate; produced by WS-3.5's registry) and `Arc<CanonicalAgentLoopExecutor>`. No `<P, E>` type parameters.
+- `impl AgentLoopDriver for PlannedDriver` — wires `run` and `resume` through to the executor.
 - Sanitized error mapping from `AgentLoopExecutorError` to `AgentLoopDriverError`.
-- Driver descriptor produced from the planner's `PlannerId` (with a stable version policy).
-- Optional: a registry-side helper that constructs a `PlannedDriver<DefaultPlanner, CanonicalAgentLoopExecutor>` and registers it under a known `LoopDriverId` for end-to-end smoke tests once the framework is exercised.
+- Driver descriptor produced from the family's `LoopFamilyId` and `ComponentIdentity` (the framework's reserved checkpoint schema is `CHECKPOINT_SCHEMA_ID` from WS-0).
+- Constructor `PlannedDriver::from_family(family, executor)` — the canonical path. `TurnRunner` resolves a family from `Arc<LoopFamilyRegistry>` (WS-3.5) then constructs the driver. No direct planner injection exists.
 
 ## 2. Files
 
@@ -42,8 +42,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ironclaw_agent_loop::{
+    canonical_executor::CanonicalAgentLoopExecutor,
     executor::{AgentLoopExecutor, AgentLoopExecutorError, HostStage},
-    planner::AgentLoopPlanner,
+    family::{LoopFamily, LoopFamilyId, LoopFamilyRegistry},
     state::{CHECKPOINT_SCHEMA_ID, LoopExecutionState},
 };
 use ironclaw_turns::{
@@ -54,47 +55,68 @@ use ironclaw_turns::{
     },
 };
 
-/// Adapter that turns a framework planner + executor into an
+/// Adapter that turns a framework `LoopFamily` + canonical executor into an
 /// `AgentLoopDriver` the `TurnRunnerWorker` can register and call.
+///
+/// **Non-generic.** The framework offers one canonical executor and exposes
+/// loop families as opaque `Arc<LoopFamily>` values; there is no surface for
+/// a downstream caller to inject a custom planner or executor. Test surface
+/// (when needed) is "real `LoopFamily` from `LoopFamilyRegistry::with_families`
+/// + `MockHost`", not "synthetic planner + `MockHost`". Strategy-level
+/// granularity in tests lives inside `ironclaw_agent_loop` where strategies
+/// are visible.
 ///
 /// The framework crate (`ironclaw_agent_loop`) does not know about
 /// `AgentLoopDriver`; this struct is the only bridge.
-///
-/// `P` is typically `DefaultPlanner` (or a loop-family planner that wraps
-/// it). `E` is typically `CanonicalAgentLoopExecutor`.
-pub struct PlannedDriver<P: AgentLoopPlanner, E: AgentLoopExecutor> {
+pub struct PlannedDriver {
     descriptor: AgentLoopDriverDescriptor,
-    planner: Arc<P>,
-    executor: Arc<E>,
+    family: Arc<LoopFamily>,
+    executor: Arc<CanonicalAgentLoopExecutor>,
 }
 
-impl<P: AgentLoopPlanner, E: AgentLoopExecutor> PlannedDriver<P, E> {
-    /// Constructs a planned driver. The descriptor is built from the planner's
-    /// PlannerId with the supplied version + the framework's reserved
-    /// checkpoint schema id (CHECKPOINT_SCHEMA_ID from WS-0).
-    pub fn new(
-        planner: Arc<P>,
-        executor: Arc<E>,
+impl PlannedDriver {
+    /// Constructs a planned driver from a resolved `LoopFamily`. The
+    /// descriptor is built from the family's `LoopFamilyId` + the framework's
+    /// reserved checkpoint schema (`CHECKPOINT_SCHEMA_ID` from WS-0). The
+    /// driver version is supplied by the caller and rolls only when the
+    /// runner-side wire shape changes.
+    ///
+    /// Canonical construction path: `TurnRunner` resolves a family from
+    /// `Arc<LoopFamilyRegistry>` (WS-3.5) and calls this constructor.
+    pub fn from_family(
+        family: Arc<LoopFamily>,
+        executor: Arc<CanonicalAgentLoopExecutor>,
         version: RunProfileVersion,
     ) -> Result<Self, AgentLoopDriverError> {
         let descriptor = AgentLoopDriverDescriptor::new(
-            planner.id().as_str(),
+            family.id().to_string().as_str(),
             version,
         )
         .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?
         .with_checkpoint_schema(CHECKPOINT_SCHEMA_ID, version)
         .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?;
 
-        Ok(Self { descriptor, planner, executor })
+        Ok(Self { descriptor, family, executor })
+    }
+
+    /// Convenience: resolve a family by id from the registry then construct
+    /// the driver. Returns an `AgentLoopDriverError::InvalidRequest` if the
+    /// id is unbound.
+    pub fn from_registry(
+        registry: &LoopFamilyRegistry,
+        id: &LoopFamilyId,
+        executor: Arc<CanonicalAgentLoopExecutor>,
+        version: RunProfileVersion,
+    ) -> Result<Self, AgentLoopDriverError> {
+        let family = registry.get(id).ok_or_else(|| AgentLoopDriverError::InvalidRequest {
+            reason: format!("unknown loop family: {id}"),
+        })?;
+        Self::from_family(family, executor, version)
     }
 }
 
 #[async_trait]
-impl<P, E> AgentLoopDriver for PlannedDriver<P, E>
-where
-    P: AgentLoopPlanner + 'static,
-    E: AgentLoopExecutor + 'static,
-{
+impl AgentLoopDriver for PlannedDriver {
     fn descriptor(&self) -> AgentLoopDriverDescriptor { self.descriptor.clone() }
 
     async fn run(
@@ -104,8 +126,12 @@ where
     ) -> Result<LoopExit, AgentLoopDriverError> {
         validate_run_request(&request, &self.descriptor)?;
         let initial = LoopExecutionState::initial();
+        // The executor consumes `&LoopFamily` directly. The
+        // `pub(crate) fn planner()` accessor on `LoopFamily` is invisible
+        // outside `ironclaw_agent_loop`, so `PlannedDriver` cannot reach
+        // into strategies — it can only hand the family to the executor.
         self.executor
-            .execute(self.planner.as_ref(), host, initial)
+            .execute_family(self.family.as_ref(), host, initial)
             .await
             .map_err(map_executor_error)
     }
@@ -127,12 +153,14 @@ where
                 reason_kind: format!("checkpoint_rejected:{e}"),
             })?;
         self.executor
-            .execute(self.planner.as_ref(), host, resumed)
+            .execute_family(self.family.as_ref(), host, resumed)
             .await
             .map_err(map_executor_error)
     }
 }
 ```
+
+The `CanonicalAgentLoopExecutor::execute_family(&LoopFamily, ...)` signature is owned by WS-6 (canonical executor). WS-6's `execute` was originally specified to take `&dyn AgentLoopPlanner`; with the LoopFamily-cluster amendments, the executor's public entry point becomes `execute_family(&LoopFamily, ...)`. Inside the framework crate, the executor uses `family.planner()` (crate-private) and `AgentLoopPlannerInternal` (crate-private) to consult strategies. WS-6's brief is updated to match.
 
 ### 3.2 Request validation
 
@@ -227,31 +255,39 @@ The doc comment must call out that `AgentLoopDriverError` strings never carry ra
 
 ### 3.4 Optional registry wiring
 
-If this brief includes registry wiring (recommended for end-to-end smoke testability), it adds a small constructor used by app startup:
+If this brief includes registry wiring (recommended for end-to-end smoke testability), it adds a small helper used by app startup:
 
 ```rust
-/// Builds a default planned driver: DefaultPlanner + CanonicalAgentLoopExecutor.
-/// Intended for registration in the driver registry alongside the existing
-/// TextOnlyModelReplyDriver.
-pub fn default_planned_driver() -> Result<PlannedDriver<
-    ironclaw_agent_loop::default_planner::DefaultPlanner,
-    ironclaw_agent_loop::canonical_executor::CanonicalAgentLoopExecutor,
->, AgentLoopDriverError> {
-    let planner = Arc::new(ironclaw_agent_loop::default_planner::DefaultPlanner::default());
-    let executor = Arc::new(ironclaw_agent_loop::canonical_executor::CanonicalAgentLoopExecutor::default());
-    PlannedDriver::new(planner, executor, RunProfileVersion::new(1))
+/// Builds a default planned driver from a resolved `LoopFamily` and the
+/// canonical executor. Intended for registration in the driver registry
+/// alongside the existing `TextOnlyModelReplyDriver`.
+pub fn default_planned_driver(
+    family_registry: &LoopFamilyRegistry,
+    executor: Arc<CanonicalAgentLoopExecutor>,
+) -> Result<PlannedDriver, AgentLoopDriverError> {
+    PlannedDriver::from_registry(
+        family_registry,
+        &LoopFamilyId::DEFAULT,
+        executor,
+        RunProfileVersion::new(1),
+    )
 }
 ```
 
-Registration in `driver_registry.rs` mirrors the existing pattern for `TextOnlyModelReplyDriver`. This is optional for the skeleton — wiring lands when there's a real use case (typically the first follow-up loop-family PR).
+`LoopFamilyRegistry` is constructed once at app startup by
+`ironclaw_reborn::app_loop_family::build_loop_family_registry()` (WS-3.5).
+Registration in `driver_registry.rs` mirrors the existing pattern for
+`TextOnlyModelReplyDriver`. This is optional for the skeleton — wiring lands
+when there's a real use case (typically the first follow-up loop-family PR).
 
 ## 4. Acceptance criteria
 
 - [ ] `cargo check -p ironclaw_reborn` passes
 - [ ] `cargo clippy --all --benches --tests --examples --all-features` zero warnings
 - [ ] Existing `TextOnlyModelReplyDriver` unchanged; its tests still pass: `cargo test -p ironclaw_reborn -- text_loop_driver`
-- [ ] Trait conformance: `fn _check<P: AgentLoopPlanner + 'static, E: AgentLoopExecutor + 'static>(_: &PlannedDriver<P, E>) where PlannedDriver<P, E>: AgentLoopDriver {}`
-- [ ] Round-trip test: `PlannedDriver::new(DefaultPlanner::default(), CanonicalAgentLoopExecutor::default(), v1)` succeeds; descriptor's `id` is `"reborn:default-loop"`; descriptor's `checkpoint_schema_id` is `CHECKPOINT_SCHEMA_ID`
+- [ ] Trait conformance: `fn _check(_: &PlannedDriver) where PlannedDriver: AgentLoopDriver {}` (no generics)
+- [ ] Round-trip test: `PlannedDriver::from_registry(&registry, &LoopFamilyId::DEFAULT, executor, v1)` succeeds against `LoopFamilyRegistry::with_families(vec![Arc::new(families::default())])`; descriptor's `id` is `"default"`; descriptor's `checkpoint_schema_id` is `CHECKPOINT_SCHEMA_ID`
+- [ ] Resolution failure: `PlannedDriver::from_registry(&empty_registry, &LoopFamilyId("nope"), …)` returns `Err(InvalidRequest { reason: "unknown loop family: nope" })`
 - [ ] Error-mapping tests:
   - `map_executor_error(HostUnavailable { stage: Model })` → `Unavailable { reason: "Model: unavailable" }`
   - `map_executor_error(CheckpointFailed { stage: BeforeModel })` → `Failed { reason_kind: "checkpoint_rejected:BeforeModel" }`
@@ -283,10 +319,12 @@ Suggested content:
   `ironclaw_turns` for the `AgentLoopDriver` trait + descriptor + `LoopExit`.
   Does NOT re-export framework types — consumers import them from
   `ironclaw_agent_loop` directly.
-- `PlannedDriver<P, E>` is the canonical adapter. Loop families register concrete
-  `PlannedDriver` instances under stable `LoopDriverId`s in `DriverRegistry`.
-  The framework crate has no knowledge of `AgentLoopDriver` — bridge logic
-  lives only here.
+- `PlannedDriver` (non-generic) is the canonical adapter. Loop families
+  are opaque `Arc<LoopFamily>` values resolved from `LoopFamilyRegistry`
+  (WS-3.5); the driver wraps them. The framework crate has no knowledge
+  of `AgentLoopDriver` — bridge logic lives only here. The strategy seal
+  means downstream test code constructs real families from the registry,
+  not synthetic planners.
 - Request validation in `PlannedDriver` is **descriptor-assignment only**.
   Turn/run ID matching and resolved-profile matching belong to `TurnRunner`,
   not the driver adapter. Do not duplicate runner-level checks here.

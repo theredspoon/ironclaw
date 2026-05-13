@@ -10,7 +10,7 @@
 
 ## 1. Scope
 
-Implement the nine `Default*Strategy` types. Each is a concrete struct whose `Default` impl produces the all-pi-mono behavior the framework documents as the reference baseline. These are what `DefaultPlanner::default()` (WS-4) wires up.
+Implement the nine `Default*Strategy` types. Each is a concrete struct whose `Default` impl produces the all-pi-mono behavior the framework documents as the reference baseline. These are what `DefaultPlanner::compose_default()` (WS-4, `pub(crate)`) wires up; the family factory `families::default()` (WS-3.5) is the only public path to the resulting `LoopFamily`.
 
 The strategies must, *together*, deliver the production-safe escape from master doc §10:
 
@@ -31,7 +31,7 @@ The strategies must, *together*, deliver the production-safe escape from master 
 - `crates/ironclaw_agent_loop/src/strategies/drain.rs` — add `DefaultInputDrainStrategy`
 - `crates/ironclaw_agent_loop/src/strategies/budget.rs` — add `DefaultBudgetStrategy`
 
-If `DefaultRecoveryStrategy` needs richer per-error counters than the WS-0 skeleton `RecoveryStrategyState { attempts: u32 }`, this brief grows that slot type. Same applies to `ControlStrategyState` for `DefaultStopConditionStrategy`. Document any growth in `state.rs` doc-comments.
+If `DefaultRecoveryStrategy` needs richer per-error counters than the WS-0 skeleton `RecoveryStrategyState { attempts: u32 }`, this brief grows that slot type. Same applies to `StopStrategyState` for `DefaultStopConditionStrategy` and `GateStrategyState` for `DefaultGateHandlingStrategy` (each stop/gate strategy now owns its own slot — no shared `control_state`). Document any growth in `state.rs` doc-comments.
 
 ## 3. Specification
 
@@ -127,7 +127,7 @@ impl GateHandlingStrategy for DefaultGateHandlingStrategy {
     async fn handle(&self, state: &LoopExecutionState, _gate: &GateSummary) -> GateOutcome {
         // Default behavior is always to block. Loop families that want
         // skip-and-continue or abort semantics swap this strategy.
-        GateOutcome::Block { control: state.control_state.clone() }
+        GateOutcome::Block { gate: state.gate_state.clone() }
     }
 }
 ```
@@ -228,33 +228,33 @@ impl StopConditionStrategy for DefaultStopConditionStrategy {
         state: &LoopExecutionState,
         just_completed: &TurnSummary,
     ) -> StopOutcome {
-        let next = ControlStrategyState {
-            turns_completed: state.control_state.turns_completed + 1,
-            ..state.control_state.clone()
+        let next = StopStrategyState {
+            turns_completed: state.stop_state.turns_completed + 1,
+            ..state.stop_state.clone()
         };
 
         // (a) terminate hint: every result in the just-completed batch said terminate.
         if just_completed.kind == TurnEndKind::AfterCapabilityBatch
-            && state.control_state.last_batch_total > 0
-            && state.control_state.terminate_hints_in_last_batch
-                == state.control_state.last_batch_total
+            && state.stop_state.last_batch_total > 0
+            && state.stop_state.terminate_hints_in_last_batch
+                == state.stop_state.last_batch_total
         {
-            return StopOutcome::Stop { control: next, kind: StopKind::GracefulStop };
+            return StopOutcome::Stop { stop: next, kind: StopKind::GracefulStop };
         }
 
         // (b) repetition: same call signature ≥ threshold in the last window iterations.
         if state.recent_call_signatures.most_common_count_in(self.repetition_window)
             >= self.repetition_threshold
         {
-            return StopOutcome::Stop { control: next, kind: StopKind::NoProgressDetected };
+            return StopOutcome::Stop { stop: next, kind: StopKind::NoProgressDetected };
         }
 
         // (c) failure run-length: same failure kind ≥ threshold in a row.
         if state.recent_failure_kinds.same_run_length() >= self.failure_run_threshold {
-            return StopOutcome::Stop { control: next, kind: StopKind::NoProgressDetected };
+            return StopOutcome::Stop { stop: next, kind: StopKind::NoProgressDetected };
         }
 
-        StopOutcome::Continue { control: next }
+        StopOutcome::Continue { stop: next }
     }
 }
 ```
@@ -316,7 +316,7 @@ impl BudgetStrategy for DefaultBudgetStrategy {
 ## 5. Out of scope
 
 - Any non-default strategy (loop-family-specific) — those land per follow-up loop-family PR
-- Wiring `DefaultPlanner::default()` to instantiate these — WS-4
+- Wiring `DefaultPlanner::compose_default()` to instantiate these — WS-4 (`pub(crate)`); the public path is `families::default()` in WS-3.5
 - The executor that calls these strategies — WS-6
 - Backoff respect at the executor (this brief defines the alteration; WS-6 honors it)
 

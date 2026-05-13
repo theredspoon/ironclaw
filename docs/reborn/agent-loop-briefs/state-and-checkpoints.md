@@ -16,7 +16,8 @@ Land the foundation everything else stands on:
 - `BoundedRing<T, N>` and `CapabilityCallSignature` helper types.
 - The checkpoint payload schema id `reborn:default-loop-v1` (reserved string constant; producer wiring deferred).
 - `CheckpointMarker` aggregate held in state.
-- One new variant on `LoopFailureKind` in `ironclaw_turns::loop_exit`: `NoProgressDetected`.
+- Two new variants on `LoopFailureKind` in `ironclaw_turns::loop_exit`: `NoProgressDetected` and `PolicyDenied` (the latter for hook/policy-induced denials per PR #3523-comment-4435808547 follow-up).
+- Per-strategy state slots: `ContextStrategyState`, `CapabilityStrategyState`, `ModelStrategyState`, `RecoveryStrategyState`, **`StopStrategyState`**, **`GateStrategyState`**. Stop and Gate each own their own slot — there is no shared `ControlStrategyState`.
 
 The per-strategy state slot *types* (`ContextStrategyState`, `RecoveryStrategyState`, etc.) land here as empty unit structs (or with whatever skeleton fields are obviously needed: `RecoveryStrategyState { attempts: u32 }`, `ModelStrategyState { fallback_index: u32 }`). Strategy traits and outcome enums that read or update them land in WS-1/2/3.
 
@@ -81,12 +82,16 @@ pub struct LoopExecutionState {
     pub recent_call_signatures: BoundedRing<CapabilityCallSignature, 8>,
     pub recent_failure_kinds: BoundedRing<LoopFailureKind, 8>,
 
-    // strategy slots
+    // strategy slots — one per strategy that mutates state. Stop and Gate
+    // each own their own slot (no shared `control_state`) so a family's
+    // future growth in either dimension can't accidentally mix concerns
+    // through a shared struct.
     pub context_state: ContextStrategyState,
     pub capability_state: CapabilityStrategyState,
     pub model_state: ModelStrategyState,
     pub recovery_state: RecoveryStrategyState,
-    pub control_state: ControlStrategyState,
+    pub stop_state: StopStrategyState,
+    pub gate_state: GateStrategyState,
 }
 
 impl LoopExecutionState {
@@ -231,8 +236,12 @@ pub struct RecoveryStrategyState {
     pub attempts: u32,
 }
 
+/// Persistent state owned by `StopConditionStrategy`. Split from a previously
+/// shared `ControlStrategyState` so Stop and Gate evolve independently — a
+/// future family's growth in stop-condition state cannot perturb gate-handler
+/// invariants and vice versa.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ControlStrategyState {
+pub struct StopStrategyState {
     /// Number of completed turns the StopConditionStrategy has observed.
     pub turns_completed: u32,
     /// Count of `terminate: true` hints seen in the most recent capability batch.
@@ -241,6 +250,15 @@ pub struct ControlStrategyState {
     /// Total number of results in the most recent capability batch (denominator
     /// for "all results said terminate").
     pub last_batch_total: u32,
+}
+
+/// Persistent state owned by `GateHandlingStrategy`. Empty in the skeleton;
+/// future families may track gate fingerprints (for resume correlation),
+/// per-gate-kind counters, or other gate-relevant bookkeeping here without
+/// touching Stop-strategy state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GateStrategyState {
+    // skeleton: empty. WS-2 may extend when DefaultGateHandlingStrategy needs it.
 }
 ```
 
@@ -265,6 +283,14 @@ pub enum LoopFailureKind {
     /// NEW (WS-0): emitted by DefaultStopConditionStrategy when repetition or
     /// repeated-same-error escapes fire. See agent-loop-skeleton.md §10.
     NoProgressDetected,
+    /// NEW (WS-0): emitted when a `CapabilityOutcome::Denied` reaches the
+    /// recovery path with no further retry possible. Distinct from
+    /// `CapabilityProtocolError` so the no-progress detector can count
+    /// repeated denials without conflating them with transport faults.
+    /// Hook-induced denials (via the middleware composition seam — see
+    /// PR #3523-comment-4435808547 scenario A) accumulate through this
+    /// variant. See agent-loop-skeleton.md §9, §10.
+    PolicyDenied,
 }
 ```
 
@@ -297,7 +323,8 @@ pub enum CheckpointPayloadError {
   - [ ] `LoopExecutionState::initial()` produces value-equal results across calls
   - [ ] `LoopExecutionState` round-trips through `serde_json` (serialize → deserialize → equal)
   - [ ] `LoopExecutionState::from_checkpoint_payload` rejects mismatched schema ids with `SchemaMismatch`
-- [ ] `cargo test -p ironclaw_turns` — existing tests pass; new test asserts `LoopFailureKind::NoProgressDetected` serializes as `"no_progress_detected"`
+- [ ] `cargo test -p ironclaw_turns` — existing tests pass; new tests assert `LoopFailureKind::NoProgressDetected` serializes as `"no_progress_detected"` and `LoopFailureKind::PolicyDenied` serializes as `"policy_denied"`
+- [ ] `StopStrategyState::default()` and `GateStrategyState::default()` round-trip through `serde_json`; no `control_state` field appears on `LoopExecutionState` (grep test)
 - [ ] No `unwrap()` / `expect()` / `unwrap_or_default()` on Result types in production code (per `error-handling.md`)
 - [ ] No raw provider/secret/host-path strings appear in any state field, error message, or doc
 

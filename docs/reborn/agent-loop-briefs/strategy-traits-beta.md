@@ -13,7 +13,7 @@
 Land three strategies that govern how the executor handles capability calls and their failures:
 
 - `BatchPolicyStrategy` — pure policy, returns sequential vs parallel execution mode.
-- `GateHandlingStrategy` — mutates `control_state`; returns `GateOutcome` enum.
+- `GateHandlingStrategy` — mutates `gate_state`; returns `GateOutcome` enum.
 - `RecoveryStrategy` — mutates `recovery_state`; returns `RecoveryOutcome` enum.
 
 The first is sync (it touches no async surface). The other two are async (they may consult host state in future loop families).
@@ -86,12 +86,12 @@ The exact source of `ConcurrencyHint` (capability descriptor field, host call-ti
 use async_trait::async_trait;
 use ironclaw_turns::LoopFailureKind;
 
-use crate::state::{ControlStrategyState, LoopExecutionState};
+use crate::state::{GateStrategyState, LoopExecutionState};
 
 /// Decides what to do when a capability invocation comes back with a
 /// gate (Approval, Auth, or Resource).
 ///
-/// Mutates `control_state` (e.g. record gate fingerprints for resume).
+/// Mutates `gate_state` (e.g. record gate fingerprints for resume).
 /// Async because future strategies may consult host state for grant-history
 /// or auth-flow lookups.
 #[async_trait]
@@ -116,7 +116,7 @@ pub enum GateKind {
     Resource,
 }
 
-/// Strategy decision for a gate, plus the new control_state slot value.
+/// Strategy decision for a gate, plus the new gate_state slot value.
 ///
 /// Variants:
 /// - `Block` — the executor checkpoints (BeforeBlock) and returns
@@ -127,9 +127,9 @@ pub enum GateKind {
 /// - `Abort` — return `LoopExit::Failed { reason_kind: failure_kind }`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GateOutcome {
-    Block { control: ControlStrategyState },
-    SkipAndContinue { control: ControlStrategyState },
-    Abort { control: ControlStrategyState, failure_kind: LoopFailureKind },
+    Block { gate: GateStrategyState },
+    SkipAndContinue { gate: GateStrategyState },
+    Abort { gate: GateStrategyState, failure_kind: LoopFailureKind },
 }
 ```
 

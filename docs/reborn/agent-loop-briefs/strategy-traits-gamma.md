@@ -12,7 +12,7 @@
 
 Land the three loop-control strategies:
 
-- `StopConditionStrategy` — async, mutates `control_state`, returns `StopOutcome`. The home of pi's `shouldStopAfterTurn` plus the production-safe no-progress detection (master doc §10).
+- `StopConditionStrategy` — async, mutates `stop_state`, returns `StopOutcome`. The home of pi's `shouldStopAfterTurn` plus the production-safe no-progress detection (master doc §10).
 - `InputDrainStrategy` — async, pure-policy (no mutation). Decides when to drain steering / followup queues from the host.
 - `BudgetStrategy` — sync, pure-policy. Returns iteration limit and optional wall-clock cap.
 
@@ -38,11 +38,11 @@ Trait stubs and one outcome enum (`StopOutcome`) only. `Default*` impls land in 
 use async_trait::async_trait;
 use ironclaw_turns::{LoopFailureKind, LoopMessageRef, LoopResultRef};
 
-use crate::state::{ControlStrategyState, LoopExecutionState};
+use crate::state::{LoopExecutionState, StopStrategyState};
 
 /// Decides whether the loop should stop after the current turn finishes.
 ///
-/// Mutates `control_state` (turns-completed counter, terminate-hint counters,
+/// Mutates `stop_state` (turns-completed counter, terminate-hint counters,
 /// etc.). Async because future strategies may consult host state for
 /// milestone tracking.
 ///
@@ -91,7 +91,7 @@ pub enum TurnEndKind {
     AfterCapabilityBatch,
 }
 
-/// Strategy decision plus the new control_state slot value.
+/// Strategy decision plus the new stop_state slot value.
 ///
 /// `Stop` carries a `StopKind` distinguishing graceful completion from a
 /// safety-net escape (no-progress, etc.). The executor maps `StopKind` to
@@ -99,12 +99,12 @@ pub enum TurnEndKind {
 ///
 /// Consumers (the executor) **pattern-match on the variants directly**; this
 /// type intentionally does not expose accessor methods like `.kind()` or
-/// `.control_state()`. Any pseudocode showing such accessors is shorthand —
+/// `.stop_state()`. Any pseudocode showing such accessors is shorthand —
 /// the implementation uses `match` arms.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopOutcome {
-    Continue { control: ControlStrategyState },
-    Stop { control: ControlStrategyState, kind: StopKind },
+    Continue { stop: StopStrategyState },
+    Stop { stop: StopStrategyState, kind: StopKind },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
