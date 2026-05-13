@@ -596,9 +596,15 @@ impl ProductAdapterRegistryStore for InMemoryProductAdapterRegistryStore {
 
     async fn upsert_manifest(&self, manifest: ProductAdapterManifest) -> Result<(), RegistryError> {
         manifest.validate()?;
-        self.inner
-            .write()
-            .await
+        let mut inner = self.inner.write().await;
+        // Cross-write invariant: every stored installation must remain valid
+        // against its registered manifest. Re-validate before replacing.
+        for installation in inner.installations.values() {
+            if installation.adapter_id() == manifest.adapter_id() {
+                validate_installation_against_one_manifest(&manifest, installation)?;
+            }
+        }
+        inner
             .manifests
             .insert(manifest.adapter_id().clone(), manifest);
         Ok(())
@@ -658,12 +664,22 @@ impl ProductAdapterRegistryStore for InMemoryProductAdapterRegistryStore {
         state: ProductAdapterActivationState,
     ) -> Result<(), RegistryError> {
         let mut inner = self.inner.write().await;
+        let installation = inner.installations.get(installation_id).ok_or_else(|| {
+            RegistryError::InstallationNotFound {
+                installation_id: installation_id.clone(),
+            }
+        })?;
+        // Cross-write invariant: enabling an installation must re-check it
+        // against the current manifest. Disabling/marking installed is
+        // always allowed so operators can quarantine misconfigured state.
+        if state == ProductAdapterActivationState::Enabled {
+            validate_installation_against_manifest(&inner.manifests, installation)?;
+        }
+        // Re-borrow mutably now that the validation borrow has been released.
         let installation = inner
             .installations
             .get_mut(installation_id)
-            .ok_or_else(|| RegistryError::InstallationNotFound {
-                installation_id: installation_id.clone(),
-            })?;
+            .expect("installation was just looked up under the same write lock");
         installation.set_activation_state(state);
         Ok(())
     }
@@ -725,11 +741,11 @@ fn looks_like_inline_secret(value: &str) -> bool {
     if lower.starts_with("sha256:") {
         return false;
     }
-    if value.starts_with("sk-")
-        || value.starts_with("xoxb-")
-        || value.starts_with("ghp_")
-        || value.starts_with("AKIA")
-        || value.contains("BEGIN PRIVATE KEY")
+    if lower.starts_with("sk-")
+        || lower.starts_with("xoxb-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("akia")
+        || lower.contains("begin private key")
     {
         return true;
     }
@@ -783,21 +799,38 @@ fn validate_installation_against_manifest(
             .ok_or_else(|| RegistryError::UnknownManifest {
                 adapter_id: installation.adapter_id().clone(),
             })?;
+    validate_installation_against_one_manifest(manifest, installation)
+}
 
+fn validate_installation_against_one_manifest(
+    manifest: &ProductAdapterManifest,
+    installation: &ProductAdapterInstallation,
+) -> Result<(), RegistryError> {
     if manifest.adapter_id() != installation.manifest_ref().adapter_id() {
         return Err(RegistryError::ManifestAdapterMismatch {
             adapter_id: installation.adapter_id().clone(),
             manifest_adapter_id: installation.manifest_ref().adapter_id().clone(),
         });
     }
-    if let (Some(registered), Some(referenced)) = (
+    // Manifest hash pinning is symmetric: if either side carries a hash,
+    // both must carry the same hash. Otherwise an installation pinned to a
+    // specific manifest revision could silently bind to an unstamped
+    // manifest, defeating the only revision pin we have.
+    match (
         manifest.manifest_hash(),
         installation.manifest_ref().manifest_hash(),
-    ) && registered != referenced
-    {
-        return Err(RegistryError::ManifestHashMismatch {
-            adapter_id: installation.adapter_id().clone(),
-        });
+    ) {
+        (Some(registered), Some(referenced)) if registered != referenced => {
+            return Err(RegistryError::ManifestHashMismatch {
+                adapter_id: installation.adapter_id().clone(),
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(RegistryError::ManifestHashMismatch {
+                adapter_id: installation.adapter_id().clone(),
+            });
+        }
+        _ => {}
     }
 
     let declared: BTreeSet<_> = manifest.required_credentials().iter().cloned().collect();

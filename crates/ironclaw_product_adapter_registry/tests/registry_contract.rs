@@ -156,6 +156,40 @@ fn rejected_duplicate_credential_update_preserves_previous_bindings() {
     assert_eq!(installation.credential_bindings(), original);
 }
 
+fn manifest_without_credential() -> ProductAdapterManifest {
+    ProductAdapterManifest::new(
+        adapter_id(),
+        semver::Version::new(0, 1, 1),
+        ProductSurfaceKind::ExternalChannel,
+        ProductAdapterComponentRef::new("file://adapters/telegram-v2.wasm").unwrap(),
+        ProductAdapterCapabilities::external_channel_default(),
+        AuthRequirement::BearerToken,
+        Vec::new(),
+        Vec::new(),
+        Some(ManifestHash::new("sha256:abc123").unwrap()),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn upsert_manifest_rejects_when_existing_installation_binding_revoked() {
+    let store = InMemoryProductAdapterRegistryStore::default();
+    store.upsert_manifest(manifest()).await.unwrap();
+    store
+        .upsert_installation(installation(ProductAdapterActivationState::Enabled))
+        .await
+        .unwrap();
+
+    let err = store
+        .upsert_manifest(manifest_without_credential())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        RegistryError::UndeclaredCredentialHandle { .. }
+    ));
+}
+
 #[tokio::test]
 async fn manifest_hash_mismatch_is_rejected() {
     let store = InMemoryProductAdapterRegistryStore::default();

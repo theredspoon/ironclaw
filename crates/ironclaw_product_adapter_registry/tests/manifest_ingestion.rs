@@ -95,6 +95,33 @@ secret_value = "123456789:AABBccDDeeFFgg"
 }
 
 #[test]
+fn rejects_uppercase_provider_secret_prefixes() {
+    for value in ["SK-ABCDEF", "XOXB-ABCDEF", "GHP_ABCDEFG"] {
+        let raw = format!(
+            r#"
+api_version = "ironclaw.product_adapter_manifest/v1"
+kind = "ProductAdapterManifest"
+adapter_id = "bad-adapter"
+version = "0.1.0"
+surface_kind = "external_channel"
+component_ref = "{value}"
+
+[auth]
+kind = "bearer_token"
+
+[capabilities]
+flags = ["inbound_messages"]
+"#
+        );
+        let err = ProductAdapterManifestDocument::from_toml(&raw).unwrap_err();
+        assert!(
+            matches!(err, RegistryError::InlineSecretMaterial { .. }),
+            "{value} should be rejected",
+        );
+    }
+}
+
+#[test]
 fn rejects_secret_like_values_in_allowed_fields() {
     let raw = r#"
 api_version = "ironclaw.product_adapter_manifest/v1"
