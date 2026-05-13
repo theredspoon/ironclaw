@@ -22,7 +22,10 @@ pub mod adapter;
 pub mod payload;
 pub mod render;
 
-pub use adapter::{TelegramV2Adapter, TelegramV2AdapterConfig, telegram_declared_egress_hosts};
+pub use adapter::{
+    TelegramV2Adapter, TelegramV2AdapterConfig, telegram_declared_egress_hosts,
+    telegram_default_capabilities,
+};
 pub use payload::{
     GroupTriggerPolicy, PayloadParseError, TELEGRAM_API_HOST, TELEGRAM_FILE_API_HOST,
     TELEGRAM_USER_ACTOR_KIND, parse_telegram_update,

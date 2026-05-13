@@ -48,7 +48,7 @@ pub struct TelegramV2Adapter {
 
 impl TelegramV2Adapter {
     pub fn new(config: TelegramV2AdapterConfig) -> Self {
-        let mut capabilities = ProductAdapterCapabilities::external_channel_default();
+        let mut capabilities = telegram_default_capabilities();
         if config.progress_push_enabled {
             capabilities = capabilities.with(ProductCapabilityFlag::ExternalProgressPush);
         }
@@ -66,6 +66,13 @@ impl TelegramV2Adapter {
     pub fn config(&self) -> &TelegramV2AdapterConfig {
         &self.config
     }
+}
+
+/// Capabilities a Telegram v2 adapter advertises by default, before any
+/// per-config opt-ins (e.g. `ExternalProgressPush` via
+/// [`TelegramV2AdapterConfig::progress_push_enabled`], #3266) are applied.
+pub fn telegram_default_capabilities() -> ProductAdapterCapabilities {
+    ProductAdapterCapabilities::external_channel_default()
 }
 
 /// Egress hosts that any Telegram v2 installation may target.
