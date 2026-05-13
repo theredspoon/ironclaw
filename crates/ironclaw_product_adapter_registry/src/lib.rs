@@ -765,10 +765,12 @@ impl ProductAdapterRegistryStore for InMemoryProductAdapterRegistryStore {
             validate_installation_against_manifest(&inner.manifests, installation)?;
         }
         // Re-borrow mutably now that the validation borrow has been released.
+        // The same write lock guards both the prior immutable lookup and this
+        // mutable re-borrow, so the entry is guaranteed to still be present.
         let installation = inner
             .installations
             .get_mut(installation_id)
-            .expect("installation was just looked up under the same write lock");
+            .expect("installation was just looked up under the same write lock"); // safety: held under the same RwLock write guard as the prior lookup
         installation.set_activation_state(state);
         Ok(())
     }
@@ -809,12 +811,10 @@ fn reject_inline_secret_material_value(
                 reject_inline_secret_material_value(&format!("{path}[{index}]"), value)?;
             }
         }
-        toml::Value::String(value) => {
-            if looks_like_inline_secret(value) {
-                return Err(RegistryError::InlineSecretMaterial {
-                    field: path.to_string(),
-                });
-            }
+        toml::Value::String(value) if looks_like_inline_secret(value) => {
+            return Err(RegistryError::InlineSecretMaterial {
+                field: path.to_string(),
+            });
         }
         _ => {}
     }
