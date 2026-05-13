@@ -28,6 +28,6 @@ pub use adapter::{
 };
 pub use payload::{
     GroupTriggerPolicy, PayloadParseError, TELEGRAM_API_HOST, TELEGRAM_FILE_API_HOST,
-    TELEGRAM_USER_ACTOR_KIND, TelegramParsedInbound, parse_telegram_update,
+    TELEGRAM_USER_ACTOR_KIND, parse_telegram_update,
 };
 pub use render::{TelegramRenderError, render_final_reply, render_progress_typing};

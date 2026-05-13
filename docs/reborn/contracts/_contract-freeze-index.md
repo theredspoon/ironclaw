@@ -91,6 +91,7 @@ If a task needs to change one of those answers, it is not implementation work; i
 - [`migration-compatibility.md`](migration-compatibility.md)
 - [`product-adapters.md`](product-adapters.md) (issue #3269 first-slice)
 - [`telegram-v2.md`](telegram-v2.md) (issue #3285 first-slice)
+- [`trust-boundary-hardening.md`](trust-boundary-hardening.md)
 
 ---
 
