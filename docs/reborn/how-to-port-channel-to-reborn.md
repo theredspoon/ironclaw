@@ -182,7 +182,7 @@ impl ProductAdapter for MyAdapter {
 }
 ```
 
-The production component ABI is still being formalized. Until then, keep native core logic clean enough to wrap behind a component without pulling host internals across the boundary.
+A ProductAdapter WIT contract already exists at `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`. It currently uses JSON-shim fields for Rust DTOs while the DTOs evolve. Keep native core logic clean enough to wrap behind that component boundary without pulling host internals across it.
 
 ## Path C: port a legacy WASM channel
 
@@ -311,8 +311,8 @@ For native host surfaces:
 
 This guide can be used now for planning and native-core work, but the full production WASM ProductAdapter path still depends on follow-up work:
 
-- ProductAdapter component ABI/WIT world for external protocol adapters.
-- Reborn WASM ProductAdapter host runtime that loads components and exposes egress/secrets/delivery/logging capabilities.
+- ProductAdapter WIT exists at `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`, but wasmtime component bindings/loader are not wired yet.
+- Reborn WASM ProductAdapter host runtime that loads components and exposes egress/secrets/delivery/logging capabilities beyond the current native runner.
 - Component-level ProductAdapter contract test harness.
 - Production Reborn route/deployment documentation for selecting v1 or Reborn for a given external webhook.
 - Final Telegram v2 component wrapper. Current Telegram v2 work is a native tracer bullet, not the final production component boundary.
@@ -325,6 +325,7 @@ This guide can be used now for planning and native-core work, but the full produ
 - `crates/ironclaw_product_adapters/src/inbound.rs`
 - `crates/ironclaw_product_adapters/src/outbound.rs`
 - `crates/ironclaw_product_adapters/src/egress.rs`
+- `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`
 - `docs/reborn/contracts/wasm.md`
 - `src/channels/mod.rs`
 - `channels-src/telegram/` as a v1 WASM reference only
