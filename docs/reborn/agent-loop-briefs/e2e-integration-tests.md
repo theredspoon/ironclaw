@@ -226,6 +226,7 @@ Each row below is one `#[tokio::test]` function. Cross-references (e.g. "executo
 | `from_checkpoint_payload_validates_schema` | Hand-crafted payload with wrong schema id | `Err(CheckpointPayloadError::SchemaMismatch)` |
 | `resume_continues_from_before_block` | Run 1: trigger `ApprovalRequired` → `LoopExit::Blocked` with checkpoint id; Run 2: `from_checkpoint_payload` then re-execute against scripted host that completes the gate | Assistant ref present; final exit `Completed`; checkpoint sequence on resume starts mid-loop |
 | `recent_call_signatures_survive_serialization` | State with 5 entries in `recent_call_signatures` | Round-trip preserves entries and order |
+| `args_hash_jcs_stable` | `CapabilityCallSignature::from_call("name", args)` over JCS-equivalent inputs: pretty-printed vs minified, key-reordered at top level, key-reordered at nested depth 2 | All inputs produce identical `ArgsHash`. Hand-crafted NaN-bearing `serde_json::Value::Number` returns `Err` (does not panic). *Locks the WS-0 §3.4a JCS-canonicalization contract; cross-model replay correctness depends on this.* |
 
 ### 4.5 `planned_driver_e2e.rs` in `ironclaw_reborn` (~6 tests)
 

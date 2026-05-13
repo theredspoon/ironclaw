@@ -189,10 +189,60 @@ pub struct ArgsHash(pub u64);
 
 impl CapabilityCallSignature {
     /// Builds a signature from a capability name and JSON args.
-    /// Args are canonicalized (sort object keys, normalize numbers) before hashing.
+    /// Args are JCS-canonicalized (RFC 8785) before hashing — see §3.4a.
     pub fn from_call(name: CapabilityName, args: &serde_json::Value) -> Self;
 }
 ```
+
+### 3.4a Canonicalization for `ArgsHash` (JCS RFC 8785)
+
+`CapabilityCallSignature::from_call` hashes args using a canonical JSON byte
+sequence so that the same logical args always produce the same `ArgsHash`,
+regardless of how the upstream model provider serializes the JSON. **The
+canonicalization scheme is [JCS RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785)** — the formal IETF spec for JSON canonicalization.
+
+**Implementation:** the [`jcs`](https://crates.io/crates/jcs) crate. Add as a
+dependency in `crates/ironclaw_agent_loop/Cargo.toml`:
+
+```toml
+[dependencies]
+jcs = "0.x"   # pin a maintained release at PR time
+```
+
+**Rules implementers must honor** (spelled out so reading RFC 8785 isn't required):
+
+1. **Sort object keys by UTF-16 code-unit order.** Not byte order, not
+   lexicographic ASCII order. The `jcs` crate does this correctly; rolling
+   a hand impl is a hazard.
+2. **Reject `NaN` and `±Infinity`.** Neither is valid JSON. If one of these
+   reaches `from_call`, it's a host-port bug upstream (some provider's tool
+   call serializer emitted invalid JSON that `serde_json::Value` happened to
+   accept). The implementation MUST return an error from `from_call` rather
+   than fabricating a hash that no other implementation could reproduce.
+3. **Preserve number representation.** Don't normalize `1.0` to `1` or vice
+   versa. `serde_json::Value::Number` already distinguishes integers from
+   floats; JCS canonicalization respects that distinction.
+4. **Minimal whitespace.** No padding between tokens.
+
+**Cross-model compatibility:** for typical tool-call args (strings, integers,
+nested objects without floats), JCS output is byte-identical to the Hermes /
+Forge sorted-keys-minimal-whitespace convention used in the open-weights
+tool-calling ecosystem (Llama 3.1+, Qwen, DeepSeek, Mistral via `<tool_call>`
+ChatML). Replay across model swaps (Claude ↔ Hermes 3 ↔ Llama-tool-call
+format) hashes identically for typical args. The float-representation edge
+case (rule 3 above) is the only divergence point with Hermes-minimal, and
+production tool args essentially never carry floats.
+
+**`ArgsHash` algorithm choice:** the `args_hash: ArgsHash(u64)` field uses a
+64-bit hash over the JCS-canonicalized bytes. Implementer can pick `blake3`
+truncated to 64 bits, `xxhash3_64`, or another stable 64-bit non-cryptographic
+hash. The choice is fixed per release (changing the hash function across
+releases invalidates all in-flight checkpoint `recent_call_signatures` —
+treat as a checkpoint-schema break and bump `CHECKPOINT_SCHEMA_ID` accordingly).
+
+WS-8's integration suite (see [`e2e-integration-tests.md`](e2e-integration-tests.md))
+includes one test asserting `ArgsHash` stability across JCS-equivalent JSON
+inputs (pretty-printed, minified, key-reordered).
 
 #### Per-iteration push semantics for `recent_call_signatures`
 
@@ -319,7 +369,8 @@ pub enum CheckpointPayloadError {
   - [ ] `BoundedRing::push` rolls over at capacity
   - [ ] `BoundedRing::most_common_count_in` returns correct counts at window < len, window == len, window > len
   - [ ] `BoundedRing::same_run_length` returns 0 for empty, 1 for distinct trailing items, N for trailing run of N
-  - [ ] `CapabilityCallSignature::from_call` is stable under JSON key reordering
+  - [ ] `CapabilityCallSignature::from_call` is **JCS-stable** (RFC 8785) — produces the same `ArgsHash` for any two `serde_json::Value` instances that are JCS-equivalent (reordered object keys, equivalent whitespace, equivalent number representation). Cover at minimum: key reordering, pretty-printed vs minified inputs, nested objects with shuffled keys at multiple depths
+  - [ ] `CapabilityCallSignature::from_call` returns an error (does not panic, does not silently hash) on `serde_json::Value::Number` instances that are NaN or Infinity (per §3.4a rule 2)
   - [ ] `LoopExecutionState::initial()` produces value-equal results across calls
   - [ ] `LoopExecutionState` round-trips through `serde_json` (serialize → deserialize → equal)
   - [ ] `LoopExecutionState::from_checkpoint_payload` rejects mismatched schema ids with `SchemaMismatch`

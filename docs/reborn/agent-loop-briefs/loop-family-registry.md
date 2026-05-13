@@ -96,6 +96,20 @@ impl ComponentIdentity {
 }
 ```
 
+#### Migration / propagation
+
+`ComponentIdentity` is the canonical primitive for component versioning **across the system**, not just for loop families. Per master doc §9, other version-carrying components migrate to this shape in their own owning PRs. This brief sets the target; the migrations themselves are out of scope here.
+
+| Component | Today | Migration target | Migration cost | Owning PR |
+|---|---|---|---|---|
+| **Loop family** | `ComponentIdentity` (just landed in this brief) | already in target shape | — | this PR |
+| **Checkpoint payload metadata** | references `ComponentIdentity` via the family's `version()` accessor | already in target shape | — | WS-0 + WS-10 |
+| **Hooks** (`(HookId, hook_version)` tuple per [PR #3523 design](https://github.com/nearai/ironclaw/issues/3523)) | `(HookId, u32)` tuple — monotonic counter | `ComponentIdentity { id, digest }` — content-addressed | Content-hash the hook implementation at registration time. Hook PR adopts `ComponentIdentity` for its identity field. | #3524 PR |
+| **Skill snapshot** (per [#3470](https://github.com/nearai/ironclaw/issues/3470)) | SHA-256 over length-prefixed snapshot bytes | `ComponentIdentity { id: skill_name, digest: existing_sha256 (truncated to 32 bytes — already 32 bytes for sha-256 raw) }` | Rename / re-wrap existing digest in the canonical struct. No recomputation needed; the SHA-256 already content-addresses the snapshot. | #3470 follow-up |
+| **Model route** | `auth_version: String`, `config_version: String` on `LoopModelRouteSnapshot` ([`crates/ironclaw_turns/src/run_profile/host.rs:362`](../../../crates/ironclaw_turns/src/run_profile/host.rs)) — String identities, NOT content hashes | `auth: ComponentIdentity`, `config: ComponentIdentity` | Non-trivial: compute digests at version-mint time (content-hash the resolved route config / auth blob) and emit alongside the existing strings for one release before dropping the strings. | #3462 follow-up |
+
+**This PR (#3544) does not migrate any of the existing fields.** The target shape is committed in the spec so the future #3470 / #3462 / #3524 PRs have a known migration destination; each migration ships in its own PR. The content-addressed-only requirement (master doc §9) means model-route migration is the most involved — current `String` identities need to be replaced by content digests, not just re-wrapped.
+
 ### 3.3 `LoopFamily`
 
 ```rust
