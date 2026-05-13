@@ -68,12 +68,12 @@ use ironclaw_turns::{
         AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind,
         CapabilityDeniedReasonKind, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
         CapabilitySurfaceVersion, FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink,
-        LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
-        LoopCheckpointStateRef, LoopContextRequest, LoopDriverId, LoopDriverNoteKind,
-        LoopHostMilestone, LoopInputCursor, LoopInputCursorToken, LoopInputPort, LoopModelPort,
-        LoopModelRequest, LoopModelRouteSnapshot, LoopProgressEvent, LoopPromptBundleRequest,
-        LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode, SkillVisibility,
-        VisibleCapabilityRequest,
+        InstructionSafetyContext, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
+        LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextRequest, LoopDriverId,
+        LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor, LoopInputCursorToken,
+        LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelRouteSnapshot, LoopProgressEvent,
+        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode,
+        SkillVisibility, VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
@@ -334,6 +334,52 @@ async fn text_only_model_reply_driver_rejects_profiles_not_assigned_to_driver() 
     assert!(fixture.gateway.requests().is_empty());
     assert!(fixture.milestones().is_empty());
     assert_driver_error_hides_raw_payloads(&error);
+}
+
+#[tokio::test]
+async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
+    let fixture = HostFixture::new("thread-host-safety-context", "hello safety").await;
+    let host = fixture
+        .factory()
+        .with_safety_context(
+            InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
+                .unwrap(),
+        )
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+
+    let prompt_bundle = host_dyn
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+    host_dyn
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "prompt write safety enforced")
+    );
 }
 
 #[tokio::test]

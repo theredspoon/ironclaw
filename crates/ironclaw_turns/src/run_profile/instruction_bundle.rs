@@ -198,6 +198,7 @@ impl InstructionBundleBuilder {
         let mut materialized_messages = Vec::new();
         let mut skill_context = Vec::new();
         let mut requires_materialization_store = false;
+        let mut synthetic_refs = SyntheticMessageRefRegistry::default();
         let mut fingerprint = Sha256::new();
 
         feed_field(
@@ -260,7 +261,12 @@ impl InstructionBundleBuilder {
                 skill_ordinal += 1;
             } else {
                 requires_materialization_store = true;
-                let content_ref = snippet_message_ref("instruction", &snippet, messages.len())?;
+                let content_ref = snippet_message_ref(
+                    "instruction",
+                    &snippet,
+                    messages.len(),
+                    &mut synthetic_refs,
+                )?;
                 push_snippet_message(
                     &mut messages,
                     &mut materialized_messages,
@@ -278,7 +284,8 @@ impl InstructionBundleBuilder {
         }
         memory_snippets.sort_by(compare_snippet_refs);
         for (ordinal, snippet) in memory_snippets.into_iter().enumerate() {
-            let content_ref = snippet_message_ref("memory", &snippet, ordinal)?;
+            let content_ref =
+                snippet_message_ref("memory", &snippet, ordinal, &mut synthetic_refs)?;
             push_snippet_message(
                 &mut messages,
                 &mut materialized_messages,
@@ -296,6 +303,7 @@ impl InstructionBundleBuilder {
                 &mut materialized_messages,
                 &mut fingerprint,
                 safety_context,
+                &mut synthetic_refs,
             )?;
         }
 
@@ -309,6 +317,7 @@ impl InstructionBundleBuilder {
                 &mut materialized_messages,
                 &mut fingerprint,
                 surface,
+                &mut synthetic_refs,
             )?;
         }
 
@@ -401,12 +410,14 @@ fn push_safety_context(
     materialized_messages: &mut Vec<InstructionBundleMaterializedMessage>,
     fingerprint: &mut Sha256,
     safety_context: InstructionSafetyContext,
+    synthetic_refs: &mut SyntheticMessageRefRegistry,
 ) -> Result<(), AgentLoopHostError> {
     let content_ref = synthetic_message_ref(
         "safety",
         &safety_context.policy_ref,
         &safety_context.safe_summary,
         0,
+        synthetic_refs,
     )?;
     feed_field(fingerprint, b"section", b"safety");
     feed_field(fingerprint, b"ref", content_ref.as_str().as_bytes());
@@ -433,6 +444,7 @@ fn push_visible_surface(
     materialized_messages: &mut Vec<InstructionBundleMaterializedMessage>,
     fingerprint: &mut Sha256,
     mut surface: VisibleCapabilitySurface,
+    synthetic_refs: &mut SyntheticMessageRefRegistry,
 ) -> Result<(), AgentLoopHostError> {
     surface
         .descriptors
@@ -447,7 +459,13 @@ fn push_visible_surface(
         summary.push('|');
         summary.push_str(&descriptor.safe_description);
     }
-    let content_ref = synthetic_message_ref("surface", surface.version.as_str(), &summary, 0)?;
+    let content_ref = synthetic_message_ref(
+        "surface",
+        surface.version.as_str(),
+        &summary,
+        0,
+        synthetic_refs,
+    )?;
     feed_field(fingerprint, b"section", b"surface");
     feed_field(fingerprint, b"ref", content_ref.as_str().as_bytes());
     feed_field(fingerprint, b"version", surface.version.as_str().as_bytes());
@@ -491,12 +509,14 @@ fn snippet_message_ref(
     section: &'static str,
     snippet: &LoopContextSnippet,
     ordinal: usize,
+    synthetic_refs: &mut SyntheticMessageRefRegistry,
 ) -> Result<LoopMessageRef, AgentLoopHostError> {
     synthetic_message_ref(
         section,
         &snippet.snippet_ref,
         &snippet.safe_summary,
         ordinal,
+        synthetic_refs,
     )
 }
 
@@ -505,15 +525,78 @@ fn synthetic_message_ref(
     source_ref: &str,
     safe_summary: &str,
     ordinal: usize,
+    synthetic_refs: &mut SyntheticMessageRefRegistry,
 ) -> Result<LoopMessageRef, AgentLoopHostError> {
     let slug = sanitize_ref_suffix(source_ref);
     let hash = stable_ref_hash(section, source_ref, safe_summary, ordinal);
-    LoopMessageRef::new(format!("msg:{section}.{slug}.{ordinal}.{hash:016x}")).map_err(|_| {
-        AgentLoopHostError::new(
-            AgentLoopHostErrorKind::Internal,
-            "instruction bundle message reference could not be represented",
-        )
-    })
+    let content_ref = LoopMessageRef::new(format!("msg:{section}.{slug}.{ordinal}.{hash:016x}"))
+        .map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "instruction bundle message reference could not be represented",
+            )
+        })?;
+    synthetic_refs.record(
+        content_ref,
+        SyntheticMessageRefInput::new(section, source_ref, safe_summary, ordinal),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticMessageRefInput {
+    section: &'static str,
+    source_ref: String,
+    safe_summary: String,
+    ordinal: usize,
+}
+
+impl SyntheticMessageRefInput {
+    fn new(
+        section: &'static str,
+        source_ref: impl Into<String>,
+        safe_summary: impl Into<String>,
+        ordinal: usize,
+    ) -> Self {
+        Self {
+            section,
+            source_ref: source_ref.into(),
+            safe_summary: safe_summary.into(),
+            ordinal,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SyntheticMessageRefRegistry {
+    inputs_by_ref: HashMap<String, SyntheticMessageRefInput>,
+}
+
+impl SyntheticMessageRefRegistry {
+    fn record(
+        &mut self,
+        content_ref: LoopMessageRef,
+        input: SyntheticMessageRefInput,
+    ) -> Result<LoopMessageRef, AgentLoopHostError> {
+        let key = content_ref.as_str().to_string();
+        if let Some(existing) = self.inputs_by_ref.get(&key) {
+            if existing != &input {
+                tracing::debug!(
+                    content_ref = %content_ref.as_str(),
+                    existing_section = existing.section,
+                    new_section = input.section,
+                    new_ordinal = input.ordinal,
+                    "instruction bundle synthetic message ref collision detected"
+                );
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Internal,
+                    "instruction bundle message reference collision detected",
+                ));
+            }
+        } else {
+            self.inputs_by_ref.insert(key, input);
+        }
+        Ok(content_ref)
+    }
 }
 
 fn compare_instruction_snippets(
@@ -548,7 +631,10 @@ fn instruction_rank(snippet_ref: &str) -> u8 {
 }
 
 fn validate_model_role(role: &str) -> Result<(), AgentLoopHostError> {
-    if matches!(role, "system" | "user" | "assistant" | "tool") {
+    if matches!(
+        role,
+        "system" | "user" | "assistant" | "tool" | "tool_result_reference"
+    ) {
         return Ok(());
     }
     Err(AgentLoopHostError::new(
@@ -577,7 +663,7 @@ fn validate_model_safe_text(
     value: String,
     label: &'static str,
 ) -> Result<String, AgentLoopHostError> {
-    if value.is_empty() || value.len() > 4096 || value.chars().any(|ch| ch == '\0') {
+    if value.is_empty() || value.len() > 4096 {
         return Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::PolicyDenied,
             format!("{label} is not model-safe"),
@@ -598,23 +684,39 @@ fn validate_model_safe_text(
 
 fn reject_sensitive_text(value: &str, label: &'static str) -> Result<(), AgentLoopHostError> {
     let lower = value.to_ascii_lowercase();
-    for forbidden in [
+    for forbidden_path in [
         "/users/",
         "/home/",
         "/private/",
-        "/tmp/",
+        "/tmp/", // safety: model-safety denylist literal, not a filesystem temp path.
         "/var/",
         "/etc/",
+    ] {
+        if lower.contains(forbidden_path) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::PolicyDenied,
+                format!("{label} contains non-model-safe content"),
+            ));
+        }
+    }
+    for forbidden_phrase in [
         "access token",
         "api key",
         "api_key",
+        "api secret",
         "authorization",
-        "bearer ",
+        "bearer",
+        "client secret",
         "invalid api key",
         "password",
         "passwd",
+        "secret key",
+        "secret-key",
+        "secret token",
+        "secret_token",
+        "shared secret",
     ] {
-        if lower.contains(forbidden) {
+        if contains_token_phrase(&lower, forbidden_phrase) {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::PolicyDenied,
                 format!("{label} contains non-model-safe content"),
@@ -631,6 +733,35 @@ fn reject_sensitive_text(value: &str, label: &'static str) -> Result<(), AgentLo
         ));
     }
     Ok(())
+}
+
+fn contains_token_phrase(value: &str, phrase: &str) -> bool {
+    value.match_indices(phrase).any(|(start, matched)| {
+        let end = start + matched.len();
+        is_token_boundary(char_before(value, start)) && is_token_boundary(char_at(value, end))
+    })
+}
+
+fn char_before(value: &str, byte_index: usize) -> Option<char> {
+    value
+        .char_indices()
+        .take_while(|(index, _)| *index < byte_index)
+        .last()
+        .map(|(_, character)| character)
+}
+
+fn char_at(value: &str, byte_index: usize) -> Option<char> {
+    value
+        .char_indices()
+        .find(|(index, _)| *index == byte_index)
+        .map(|(_, character)| character)
+}
+
+fn is_token_boundary(character: Option<char>) -> bool {
+    match character {
+        Some(character) => !character.is_ascii_alphanumeric() && character != '_',
+        None => true,
+    }
 }
 
 fn sanitize_ref_suffix(value: &str) -> String {
@@ -679,4 +810,30 @@ fn feed_field(digest: &mut Sha256, label: &[u8], value: &[u8]) {
     digest.update(label);
     digest.update((value.len() as u64).to_le_bytes());
     digest.update(value);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_ref_registry_rejects_mismatched_duplicate_refs() {
+        let mut registry = SyntheticMessageRefRegistry::default();
+        let content_ref = LoopMessageRef::new("msg:instruction.source.0.deadbeefdeadbeef").unwrap();
+
+        registry
+            .record(
+                content_ref.clone(),
+                SyntheticMessageRefInput::new("instruction", "source-a", "summary-a", 0),
+            )
+            .unwrap();
+        let error = registry
+            .record(
+                content_ref,
+                SyntheticMessageRefInput::new("instruction", "source-b", "summary-b", 0),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::Internal);
+    }
 }

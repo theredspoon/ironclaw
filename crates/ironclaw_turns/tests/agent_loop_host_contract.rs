@@ -456,6 +456,86 @@ async fn instruction_bundle_builder_allows_safe_domain_terms_in_summaries() {
 }
 
 #[tokio::test]
+async fn instruction_bundle_builder_allows_terms_inside_larger_words() {
+    let context = claimed_run_context().await;
+    let builder = InstructionBundleBuilder::new(context);
+
+    builder
+        .build(InstructionBundleRequest {
+            context_bundle: LoopContextBundle {
+                identity_messages: Vec::new(),
+                messages: Vec::new(),
+                instruction_snippets: vec![LoopContextSnippet {
+                    snippet_ref: "instruction:system".to_string(),
+                    safe_summary: "Explain preauthorization sync behavior".to_string(),
+                    metadata: None,
+                }],
+                memory_snippets: Vec::new(),
+            },
+            visible_surface: None,
+            safety_context: None,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn instruction_bundle_builder_rejects_secret_credential_phrases() {
+    let context = claimed_run_context().await;
+    let builder = InstructionBundleBuilder::new(context);
+
+    let error = builder
+        .build(InstructionBundleRequest {
+            context_bundle: LoopContextBundle {
+                identity_messages: Vec::new(),
+                messages: Vec::new(),
+                instruction_snippets: vec![LoopContextSnippet {
+                    snippet_ref: "instruction:system".to_string(),
+                    safe_summary: "client secret should not appear in prompt context".to_string(),
+                    metadata: None,
+                }],
+                memory_snippets: Vec::new(),
+            },
+            visible_surface: None,
+            safety_context: None,
+        })
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+}
+
+#[tokio::test]
+async fn instruction_bundle_builder_allows_tool_result_reference_context_messages() {
+    let host = Arc::new(
+        RecordingAgentLoopHost::new(claimed_run_context().await).with_context_tail_message(
+            "tool_result_reference",
+            "msg:tool-result-reference",
+            "tool result reference safe summary",
+        ),
+    );
+    let port = HostManagedLoopPromptPort::new(
+        host.context.clone(),
+        host.clone(),
+        host.milestone_sink.clone(),
+    );
+
+    let bundle = port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+
+    assert!(bundle.messages.iter().any(|message| {
+        message.role == "tool_result_reference"
+            && message.content_ref.as_str() == "msg:tool-result-reference"
+    }));
+}
+
+#[tokio::test]
 async fn instruction_bundle_serialization_hides_materialized_content() {
     let context = claimed_run_context().await;
     let bundle = InstructionBundleBuilder::new(context)

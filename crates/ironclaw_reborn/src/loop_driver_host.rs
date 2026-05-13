@@ -30,12 +30,12 @@ use ironclaw_turns::{
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityFailure,
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
-        HostManagedLoopPromptPort,
-        InMemoryInstructionMaterializationStore, InstructionMaterializationStore,
-        LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
-        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest,
-        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
+        HostManagedLoopPromptPort, InMemoryInstructionMaterializationStore,
+        InstructionMaterializationStore, InstructionSafetyContext, LoopCapabilityPort,
+        LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextPort,
+        LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch,
+        LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelResponse,
+        LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
         LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
         LoopTranscriptPort, ProcessHandleSummary, UpdateAssistantDraft, VisibleCapabilityRequest,
         VisibleCapabilitySurface,
@@ -928,6 +928,7 @@ where
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     config: TextOnlyLoopHostConfig,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    safety_context: Option<InstructionSafetyContext>,
 }
 
 impl<S, G> RebornLoopDriverHostFactory<S, G>
@@ -954,11 +955,17 @@ where
             milestone_sink,
             config,
             skill_context_source: None,
+            safety_context: None,
         }
     }
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
         self.skill_context_source = Some(source);
+        self
+    }
+
+    pub fn with_safety_context(mut self, safety_context: InstructionSafetyContext) -> Self {
+        self.safety_context = Some(safety_context);
         self
     }
 
@@ -1012,16 +1019,18 @@ where
                 reason: error.safe_summary,
             })?;
         let surface_state_for_prompt = Arc::clone(&surface_state);
-        let prompt: Arc<dyn LoopPromptPort> = Arc::new(
-            HostManagedLoopPromptPort::new(
-                run_context.clone(),
-                Arc::clone(&context),
-                Arc::clone(&self.milestone_sink),
-            )
-            .with_default_message_limit(max_messages)
-            .with_current_surface_lookup(move || surface_state_for_prompt.current())
-            .with_instruction_materialization_store(Arc::clone(&instruction_materialization_store)),
-        );
+        let mut prompt_port = HostManagedLoopPromptPort::new(
+            run_context.clone(),
+            Arc::clone(&context),
+            Arc::clone(&self.milestone_sink),
+        )
+        .with_default_message_limit(max_messages)
+        .with_current_surface_lookup(move || surface_state_for_prompt.current())
+        .with_instruction_materialization_store(Arc::clone(&instruction_materialization_store));
+        if let Some(safety_context) = self.safety_context.clone() {
+            prompt_port = prompt_port.with_safety_context(safety_context);
+        }
+        let prompt: Arc<dyn LoopPromptPort> = Arc::new(prompt_port);
         let input: Arc<dyn LoopInputPort> =
             Arc::new(NoExtraLoopInputPort::new(run_context.clone()));
         let mut model_adapter = ThreadBackedLoopModelPort::with_milestone_sink(
