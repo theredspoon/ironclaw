@@ -122,11 +122,14 @@ impl ExtensionRuntimeV2 {
     }
 
     /// Runtimes that an installed (non-bundled) manifest may declare.
+    ///
+    /// Exhaustive match — adding a new `ExtensionRuntimeV2` variant must force
+    /// an explicit decision here rather than silently defaulting to `false`.
     fn installed_allows(&self) -> bool {
-        matches!(
-            self,
-            Self::Wasm { .. } | Self::Mcp { .. } | Self::Script { .. }
-        )
+        match self {
+            Self::Wasm { .. } | Self::Mcp { .. } | Self::Script { .. } => true,
+            Self::FirstParty { .. } | Self::System { .. } => false,
+        }
     }
 }
 
@@ -320,8 +323,14 @@ impl CapabilityDeclV2 {
         host_port_catalog: &HostPortCatalog,
     ) -> Result<Self, ManifestV2Error> {
         let id = CapabilityId::new(raw.id)?;
-        let expected_prefix = format!("{}.", extension_id.as_str());
-        if !id.as_str().starts_with(&expected_prefix) {
+        // Provider-prefix check without an intermediate `format!` allocation:
+        // capability id must be `<extension_id>.<...>` (the dot is required so
+        // `foo.bar` cannot squat `foo`'s namespace via `foobar.baz`).
+        let prefixed = id
+            .as_str()
+            .strip_prefix(extension_id.as_str())
+            .is_some_and(|rest| rest.starts_with('.'));
+        if !prefixed {
             return Err(ManifestV2Error::CapabilityIdNotPrefixed {
                 id,
                 expected: extension_id.clone(),
