@@ -68,11 +68,12 @@ use ironclaw_turns::{
         AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind,
         CapabilityDeniedReasonKind, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
         CapabilitySurfaceVersion, FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink,
-        LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
-        LoopCheckpointStateRef, LoopContextRequest, LoopDriverId, LoopDriverNoteKind,
-        LoopHostMilestone, LoopInputCursor, LoopInputCursorToken, LoopInputPort, LoopModelRequest,
-        LoopModelRouteSnapshot, LoopProgressEvent, LoopPromptBundleRequest, LoopPromptPort,
-        LoopRunContext, ParentLoopOutput, PromptMode, SkillVisibility, VisibleCapabilityRequest,
+        InstructionSafetyContext, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
+        LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextRequest, LoopDriverId,
+        LoopDriverNoteKind, LoopHostMilestone, LoopInputCursor, LoopInputCursorToken,
+        LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelRouteSnapshot, LoopProgressEvent,
+        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, ParentLoopOutput, PromptMode,
+        SkillVisibility, VisibleCapabilityRequest,
     },
     runner::ClaimedTurnRun,
 };
@@ -119,6 +120,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
         .await
         .unwrap();
     assert_eq!(prompt_bundle.messages.len(), 1);
+    assert!(prompt_bundle.instruction_fingerprint.is_some());
 
     let model_response = host_dyn
         .stream_model(LoopModelRequest {
@@ -332,6 +334,52 @@ async fn text_only_model_reply_driver_rejects_profiles_not_assigned_to_driver() 
     assert!(fixture.gateway.requests().is_empty());
     assert!(fixture.milestones().is_empty());
     assert_driver_error_hides_raw_payloads(&error);
+}
+
+#[tokio::test]
+async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
+    let fixture = HostFixture::new("thread-host-safety-context", "hello safety").await;
+    let host = fixture
+        .factory()
+        .with_safety_context(
+            InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
+                .unwrap(),
+        )
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+
+    let prompt_bundle = host_dyn
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+    host_dyn
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "prompt write safety enforced")
+    );
 }
 
 #[tokio::test]
@@ -1530,6 +1578,60 @@ async fn text_only_host_skill_context_does_not_expand_capability_surface() {
         outcome.outcomes.as_slice(),
         [CapabilityOutcome::Denied(denied)] if denied.reason_kind == CapabilityDeniedReasonKind::EmptySurface
     ));
+}
+
+#[tokio::test]
+async fn text_only_host_prompt_bundle_includes_surface_metadata_and_still_streams_model() {
+    let fixture = HostFixture::new("thread-host-surface-prompt", "hello").await;
+    let capability_id = CapabilityId::new("demo.echo").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(capability_id.as_str()),
+    ])));
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime,
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        Arc::new(InMemoryCapabilityIo::default()),
+        Arc::new(InMemoryCapabilityIo::default()),
+    );
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+        )
+        .await
+        .unwrap();
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let prompt_bundle = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: Some(surface.version.clone()),
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .unwrap();
+
+    assert!(prompt_bundle.instruction_fingerprint.is_some());
+    assert_eq!(prompt_bundle.surface_version, Some(surface.version.clone()));
+    assert_eq!(prompt_bundle.messages.len(), 2);
+
+    host.stream_model(LoopModelRequest {
+        messages: prompt_bundle.messages,
+        surface_version: Some(surface.version),
+        model_preference: None,
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

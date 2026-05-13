@@ -32,11 +32,12 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityInvocation, CapabilityOutcome,
-        CapabilitySurfaceVersion, FinalizeAssistantMessage, LoopContextBundle, LoopContextMessage,
-        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputCursor, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
-        LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
-        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        CapabilitySurfaceVersion, FinalizeAssistantMessage, InstructionMaterializationStore,
+        LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest,
+        LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputCursor, LoopModelMessage,
+        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopRunContext, LoopRunInfoPort,
+        LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, UpdateAssistantDraft,
+        VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -457,6 +458,7 @@ where
     max_messages: usize,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    instruction_materialization_store: Option<Arc<dyn InstructionMaterializationStore>>,
 }
 
 impl<S, G> ThreadBackedLoopModelPort<S, G>
@@ -479,6 +481,7 @@ where
             max_messages,
             milestone_sink: None,
             skill_context_source: None,
+            instruction_materialization_store: None,
         }
     }
 
@@ -498,11 +501,20 @@ where
             max_messages,
             milestone_sink: Some(milestone_sink),
             skill_context_source: None,
+            instruction_materialization_store: None,
         }
     }
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
         self.skill_context_source = Some(source);
+        self
+    }
+
+    pub fn with_instruction_materialization_store(
+        mut self,
+        store: Arc<dyn InstructionMaterializationStore>,
+    ) -> Self {
+        self.instruction_materialization_store = Some(store);
         self
     }
 }
@@ -649,9 +661,21 @@ where
         }
 
         let mut messages_by_ref = context_messages_by_ref(context.messages);
-        let needs_history_lookup = requested_messages
-            .iter()
-            .any(|message| !messages_by_ref.contains_key(message.content_ref.as_str()));
+        let mut needs_history_lookup = false;
+        for message in &requested_messages {
+            if messages_by_ref.contains_key(message.content_ref.as_str()) {
+                continue;
+            }
+            if let Some(materialization_store) = self.instruction_materialization_store.as_ref()
+                && materialization_store
+                    .get_materialized_message(&self.run_context, &message.content_ref)?
+                    .is_some()
+            {
+                continue;
+            }
+            needs_history_lookup = true;
+            break;
+        }
         let snippet_messages_by_ref = if requested_messages
             .iter()
             .any(|message| skill_context::is_snippet_model_message_ref(&message.content_ref))
@@ -675,6 +699,26 @@ where
         let mut resolved = Vec::with_capacity(requested_messages.len());
         for message in requested_messages {
             let requested_role = HostManagedModelMessageRole::from_loop_role(&message.role)?;
+            if let Some(materialization_store) = self.instruction_materialization_store.as_ref()
+                && let Some(materialized) = materialization_store
+                    .get_materialized_message(&self.run_context, &message.content_ref)?
+            {
+                let materialized_role =
+                    HostManagedModelMessageRole::from_loop_role(&materialized.role)?;
+                if requested_role != materialized_role {
+                    return Err(AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::InvalidInvocation,
+                        "model message role does not match materialized instruction context",
+                    ));
+                }
+                resolved.push(HostManagedModelMessage {
+                    role: materialized_role,
+                    content: materialized.safe_content,
+                    content_ref: message.content_ref,
+                });
+                continue;
+            }
+
             if let Some(snippet_message) = snippet_messages_by_ref.get(message.content_ref.as_str())
             {
                 if requested_role != snippet_message.role {
