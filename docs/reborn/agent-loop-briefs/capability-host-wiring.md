@@ -206,6 +206,69 @@ The exact `CapabilityDispatcher` method names are owned by
 at PR time. Adapter only translates types and surfaces; no policy
 logic.
 
+### 3.2a `EffectKind → ConcurrencyHint` mapping
+
+`HostRuntimeLoopCapabilityPort::visible_capabilities` derives the
+per-descriptor `concurrency_hint` from `CapabilityDescriptor.effects`
+(in `ironclaw_capabilities::EffectKind` per
+`crates/ironclaw_host_api/src/capability.rs:19-33`). The mapping
+table — conservative by default — is enumerated below so the
+derivation logic is unambiguous at implementation time. The general
+rule is "anything that mutates external state or has causal ordering
+implications → `Exclusive`; pure read with no side effects →
+`SafeForParallel`."
+
+| `EffectKind` | `ConcurrencyHint` | Rationale |
+|---|---|---|
+| `ReadFilesystem` | `SafeForParallel` | Pure read; OS handles concurrent reads safely |
+| `WriteFilesystem` | `Exclusive` | Multiple writes to same path race |
+| `DeleteFilesystem` | `Exclusive` | Mutates filesystem state |
+| `Network` | `Exclusive` | Conservative: a POST or stateful protocol carries causal order; classifying every network call as parallel-safe risks subtle ordering bugs. Future refinement could split `NetworkRead` from `NetworkWrite`. |
+| `UseSecret` | `SafeForParallel` | Read-only secret access; concurrent secret reads are safe (the secret store itself handles concurrency) |
+| `ExecuteCode` | `Exclusive` | Process execution mutates external state by default |
+| `SpawnProcess` | `Exclusive` | Spawning races on OS process tables and resource limits |
+| `DispatchCapability` | `Exclusive` | Recursive call into another capability — depth-unknown; conservative classification prevents unbounded parallel fan-out |
+| `ModifyExtension` | `Exclusive` | Mutates extension registry state |
+| `ModifyApproval` | `Exclusive` | Mutates approval state |
+| `ModifyBudget` | `Exclusive` | Mutates budget counters |
+| `ExternalWrite` | `Exclusive` | Generic external-mutation effect |
+| `Financial` | `Exclusive` | Financial side-effects must be sequential per audit |
+
+Derivation logic:
+
+```rust
+fn concurrency_hint_from_effects(effects: &[EffectKind]) -> ConcurrencyHint {
+    if effects.iter().any(|e| matches!(e,
+        EffectKind::ReadFilesystem | EffectKind::UseSecret
+    )) && !effects.iter().any(|e| !matches!(e,
+        EffectKind::ReadFilesystem | EffectKind::UseSecret
+    )) {
+        // Only safe-for-parallel effects present
+        ConcurrencyHint::SafeForParallel
+    } else if effects.is_empty() {
+        // No declared effects → pure function → safe
+        ConcurrencyHint::SafeForParallel
+    } else {
+        // Any exclusive effect present → exclusive
+        ConcurrencyHint::Exclusive
+    }
+}
+```
+
+A capability with **no** declared effects (`effects: vec![]`) is
+treated as `SafeForParallel` — a pure function with no side effects
+is genuinely parallel-safe. Capability authors should declare effects
+honestly; a misdeclared "pure" function that secretly writes state is
+an extension bug, not a hint-derivation bug.
+
+If a future capability needs a hint that differs from the
+effect-derived default (e.g., a network call that's specifically
+declared parallel-safe by the author), the right path is to add an
+optional explicit override field on `CapabilityDescriptor` in a
+follow-up PR — but the skeleton derives conservatively from `effects`
+alone. Addresses PR #3544 Opus review §c gap (G1 in the review
+follow-up).
+
 ### 3.3 `CapabilitySurfaceProfileFilter` decorator
 
 ```rust

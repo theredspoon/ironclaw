@@ -88,13 +88,13 @@ impl PlannedDriver {
         executor: Arc<CanonicalAgentLoopExecutor>,
         version: RunProfileVersion,
     ) -> Result<Self, AgentLoopDriverError> {
-        let descriptor = AgentLoopDriverDescriptor::new(
-            family.id().to_string().as_str(),
-            version,
-        )
-        .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?
-        .with_checkpoint_schema(CHECKPOINT_SCHEMA_ID, version)
-        .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?;
+        // LoopFamilyId(pub &'static str) — the inner str is &'static,
+        // borrowing directly is safe and avoids the E0716 temporary-drop
+        // hazard of `.to_string().as_str()`.
+        let descriptor = AgentLoopDriverDescriptor::new(family.id().0, version)
+            .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?
+            .with_checkpoint_schema(CHECKPOINT_SCHEMA_ID, version)
+            .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?;
 
         Ok(Self { descriptor, family, executor })
     }
@@ -142,13 +142,24 @@ impl AgentLoopDriver for PlannedDriver {
         host: &(dyn AgentLoopDriverHost + Send + Sync),
     ) -> Result<LoopExit, AgentLoopDriverError> {
         validate_resume_request(&request, &self.descriptor)?;
-        let payload = host
-            .load_checkpoint_payload(/* request.checkpoint_id */)
+        // Use the canonical WS-10 load-side request/response shape — see
+        // `checkpoint-store-and-resume.md` §3.1.
+        let loaded = host
+            .load_checkpoint_payload(LoadCheckpointPayloadRequest {
+                checkpoint_id: request.checkpoint_id,
+                expected_schema_id: request.resolved_run_profile.loop_driver
+                    .checkpoint_schema_id.clone(),
+                expected_schema_version: request.resolved_run_profile.loop_driver
+                    .checkpoint_schema_version,
+            })
             .await
             .map_err(|_| AgentLoopDriverError::Unavailable {
                 reason: "checkpoint:unavailable".to_string(),
             })?;
-        let resumed = LoopExecutionState::from_checkpoint_payload(&payload)
+        let resumed = LoopExecutionState::from_checkpoint_payload(
+                loaded.payload.as_bytes(),
+                loaded.kind,
+            )
             .map_err(|e| AgentLoopDriverError::Failed {
                 reason_kind: format!("checkpoint_rejected:{e}"),
             })?;

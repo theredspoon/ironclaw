@@ -46,7 +46,7 @@ WS-13 adds the missing per-run accessor:
    runtime flips when it observes `CancelRequested`.
 3. **Executor wiring (no new code in WS-13, just a pointer)** —
    `CanonicalAgentLoopExecutor` already has the
-   `observe_cancellation_then_checkpoint_and_exit_if_set()` helper
+   `checkpoint_and_exit_if_cancelled()` helper
    from WS-6. This brief documents the exact call it MUST make and
    the exit semantics.
 
@@ -80,7 +80,7 @@ Crate ownership (per master doc §12 follow-up rule):
   - Blanket `impl AgentLoopDriverHost for T` at line 1170 mirrors
     the supertrait list.
 - `crates/ironclaw_agent_loop/src/canonical_executor.rs` (WS-6 file)
-  — the `observe_cancellation_then_checkpoint_and_exit_if_set` helper
+  — the `checkpoint_and_exit_if_cancelled` helper
   inlines the new port call (§3.3). Pure rewiring of an existing
   placeholder; no logic shift.
 - `crates/ironclaw_loop_support/src/lib.rs` — module declaration +
@@ -207,7 +207,7 @@ test code does not need to spell out the impl.
 ```rust
 //! crates/ironclaw_agent_loop/src/canonical_executor.rs (delta)
 
-async fn observe_cancellation_then_checkpoint_and_exit_if_set(
+async fn checkpoint_and_exit_if_cancelled(
     state: &mut LoopExecutionState,
     host: &(dyn AgentLoopDriverHost + Send + Sync),
 ) -> Option<Result<LoopExit, AgentLoopExecutorError>> {

@@ -63,20 +63,11 @@ pub enum BatchPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapabilityCallSummary {
     pub name: ironclaw_turns::run_profile::CapabilityName,
-    pub concurrency_hint: ConcurrencyHint,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConcurrencyHint {
-    /// Read-only or otherwise safe to run alongside others in this batch.
-    SafeForParallel,
-    /// Must run alone (filesystem write, shell, exclusive resource).
-    Exclusive,
+    pub concurrency_hint: ironclaw_turns::run_profile::ConcurrencyHint,
 }
 ```
 
-The exact source of `ConcurrencyHint` (capability descriptor field, host call-time annotation, etc.) is the responsibility of the executor wiring in WS-6 — WS-2 only defines the loop-side projection.
+`ConcurrencyHint` is defined in **`ironclaw_turns::run_profile`** (in `host.rs` alongside the descriptor types) — NOT in this crate. `ironclaw_agent_loop` depends on `ironclaw_turns`, not the reverse, so a type that's read as a field on `CapabilityDescriptorView` (per WS-0) must live in `ironclaw_turns`. Variants: `SafeForParallel` and `Exclusive`. Derivation from `CapabilityDescriptor.effects` happens at the adapter boundary in WS-9 (see WS-9 §3.2a for the per-`EffectKind` mapping). WS-2 only consumes the type for the strategy projection.
 
 ### 3.2 `GateHandlingStrategy`
 
@@ -238,7 +229,7 @@ pub enum RetryAlteration {
 - [ ] `cargo check -p ironclaw_agent_loop` passes with the three new modules wired into `strategies/mod.rs`
 - [ ] `cargo clippy --all --benches --tests --examples --all-features` zero warnings
 - [ ] Unit tests per file:
-  - [ ] `batch.rs` — `BatchPolicy` and `ConcurrencyHint` round-trip through `serde_json` with snake_case
+  - [ ] `batch.rs` — `BatchPolicy` round-trips through `serde_json` with snake_case; `ironclaw_turns::run_profile::ConcurrencyHint` round-trip test lives in `ironclaw_turns` (WS-0 owns it; this brief only consumes the type)
   - [ ] `gate.rs` — `GateOutcome` round-trips; object-safety check `fn _check(_: &dyn GateHandlingStrategy) {}`
   - [ ] `recovery.rs` — `RecoveryOutcome` round-trips; both `RetryAlteration::ShrinkContext` and `Backoff` round-trip; object-safety check
   - [ ] one test per outcome enum confirms that `Retry`/`SkipResult`/`Abort` carry the new strategy slot value (the field is named correctly and is the right type)

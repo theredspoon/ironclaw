@@ -36,10 +36,10 @@ The per-strategy state slot *types* (`ContextStrategyState`, `RecoveryStrategySt
 - `crates/ironclaw_turns/src/loop_exit.rs` — add `LoopFailureKind::NoProgressDetected` + `LoopFailureKind::PolicyDenied` variants (see §3.6)
 - `crates/ironclaw_turns/src/run_profile/host.rs`:
   - Extend `LoopPromptBundleRequest` with `inline_messages: Vec<LoopInlineMessage>` (default empty).
-  - Extend `LoopCheckpointPort` trait with `load_checkpoint_payload(checkpoint_id: TurnCheckpointId) -> Vec<u8>` method (default impl can return `Err(AgentLoopHostError::Unavailable)` until WS-10 wires a real backing store; existing `TextOnlyModelReplyDriver` is unaffected because it never calls resume).
-  - **NEW (PR #3544 serrrfirat #3):** Add `stage_checkpoint_payload(StageCheckpointPayloadRequest { schema_id, payload }) -> LoopCheckpointStateRef` method on `AgentLoopDriverHost` (NOT on `LoopCheckpointPort` — the staging port is separate from the metadata port). Concrete impl in `ironclaw_loop_support` wraps the existing `CheckpointStateStore::put_checkpoint_state`. The executor's `checkpoint(...)` helper (WS-6 §3.4) calls this to obtain a validated `state_ref` before invoking `LoopCheckpointPort::checkpoint(LoopCheckpointRequest { kind, state_ref })`. Two-step write keeps byte storage and metadata-write responsibilities cleanly split.
+  - **Read-side `load_checkpoint_payload` is owned by WS-10**, not WS-0. WS-0 does NOT pre-declare a stub signature here — that would drift from WS-10's actual `(LoadCheckpointPayloadRequest { checkpoint_id, expected_schema_id, expected_schema_version }) -> LoadedCheckpointPayload` shape. WS-10 is the source of truth; see [`checkpoint-store-and-resume.md`](checkpoint-store-and-resume.md) §3.1.
+  - **NEW (PR #3544 serrrfirat #3):** Add `stage_checkpoint_payload(StageCheckpointPayloadRequest { schema_id, payload }) -> LoopCheckpointStateRef` method on **`LoopCheckpointPort`** (alongside the write-side `checkpoint(...)` already there). `AgentLoopDriverHost` is a method-less marker trait with a blanket impl over its port supertraits — methods cannot live directly on it; they must live on a port that the host implements. Concrete impl in `ironclaw_loop_support` wraps the existing `CheckpointStateStore::put_checkpoint_state`. The executor's `checkpoint(...)` helper (WS-6 §3.4) calls `host.stage_checkpoint_payload(...)` (resolves through `LoopCheckpointPort` via `AgentLoopDriverHost`'s deref-through-supertrait blanket impl) to obtain a validated `state_ref` before invoking `LoopCheckpointPort::checkpoint(LoopCheckpointRequest { kind, state_ref })`. Two-step write keeps byte storage and metadata-write responsibilities cleanly split. **Sibling note**: WS-10 adds the read-side `load_checkpoint_payload(...)` to the same port — both write-stage and read-load live on `LoopCheckpointPort`.
   - **NEW (PR #3544 serrrfirat #1):** Make `LoopContextMessage.message_ref` `Option<LoopMessageRef>` (was required `LoopMessageRef`). `None` means "summary-only entry; prompt port MUST NOT resolve content — use `safe_summary` verbatim instead." Mirrors the `SkillTrustLevel::Installed` carrying `prompt_content: None` pattern. Nine existing call-sites in `crates/ironclaw_*/src` update to wrap writes in `Some(...)` and pattern-match on reads. See [`prompt-context-assembly.md`](prompt-context-assembly.md) §3.2 for the upstream invariant this enforces.
-  - **NEW (PR #3544 serrrfirat #7):** Add `concurrency_hint: ConcurrencyHint` field to `CapabilityDescriptorView`. `ConcurrencyHint` is defined in WS-2 (`strategy-traits-beta.md` §3.1) with variants `SafeForParallel` and `Exclusive`. The hint is derived at the adapter boundary in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`) from the underlying `CapabilityDescriptor.effects` Vec — presence of any write/spawn/exclusive effect → `Exclusive`; otherwise → `SafeForParallel`. Lower-layer `CapabilityDescriptor` is NOT modified; `effects` remains the source of truth and the hint is a computed projection. Resolves the missing-method bug in WS-6 §3.3b's `summary_of(...)` call site.
+  - **NEW (PR #3544 serrrfirat #7):** Define `ConcurrencyHint` enum **in `ironclaw_turns`** (in `host.rs` alongside the descriptor types — NOT in `ironclaw_agent_loop` per `ironclaw_turns`'s no-downward-dependency rule). Variants: `SafeForParallel` and `Exclusive`. Add `concurrency_hint: ConcurrencyHint` field to `CapabilityDescriptorView`. WS-2 imports `ConcurrencyHint` from `ironclaw_turns` rather than defining its own. The hint is derived at the adapter boundary in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`) from the underlying `CapabilityDescriptor.effects` Vec — see WS-9 §3.2a for the per-`EffectKind` mapping table. Lower-layer `CapabilityDescriptor` is NOT modified; `effects` remains the source of truth and the hint is a computed projection. Resolves the missing-method bug in WS-6 §3.3b's `summary_of(...)` call site. **Existing struct-literal constructors of `CapabilityDescriptorView`** (in `crates/ironclaw_loop_support/src/`, in `crates/ironclaw_turns/tests/agent_loop_host_contract.rs`, and in any other call site) update in the same PR — this is a breaking field-add, not a true additive change.
 - `crates/ironclaw_turns/CLAUDE.md` — append amendment paragraph (see §6 below)
 - `Cargo.toml` (workspace) — add `crates/ironclaw_agent_loop` to members
 - `crates/ironclaw_agent_loop/src/state.rs` re-exports `LoopFailureKind` from `ironclaw_turns` for ergonomics
@@ -103,10 +103,16 @@ impl LoopExecutionState {
     /// Builds the initial state at the start of a fresh run.
     pub fn initial() -> Self { /* default everything to zero / empty */ }
 
-    /// Rehydrates state from a checkpoint payload. Schema validation lives
-    /// here (verify schema_id matches CHECKPOINT_SCHEMA_ID).
+    /// Rehydrates state from a checkpoint payload's bytes. The bytes come
+    /// from `LoopCheckpointPort::load_checkpoint_payload(...)` (defined in
+    /// WS-10) — checkpoint storage is byte-oriented, not `Value`-oriented.
+    /// Schema validation lives here (verify schema_id matches
+    /// `CHECKPOINT_SCHEMA_ID`); the `kind` arg is the
+    /// `CheckpointKind` recorded in the loaded payload metadata, used
+    /// to authenticate the boundary the checkpoint was taken at.
     pub fn from_checkpoint_payload(
-        payload: &serde_json::Value,
+        payload: &[u8],
+        kind: CheckpointKind,
     ) -> Result<Self, CheckpointPayloadError>;
 }
 ```

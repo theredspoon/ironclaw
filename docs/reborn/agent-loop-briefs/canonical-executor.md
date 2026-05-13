@@ -715,12 +715,13 @@ The host facade exposes a way to observe cancellation between strategy calls —
 | 3 | Pre-`context().plan_context_request` | between drain and context |
 | 4 | Pre-`capability().filter` (after `build_prompt_bundle` returns) | between context-build and capability-surface |
 | 5 | Pre-`model().preference` (after `BeforeModel` checkpoint) | between checkpoint and model-pref |
-| 6 | Pre-`stop().should_stop_after_turn` (Reply path) | between reply-finalize and stop |
-| 7 | Pre-`stop().should_stop_after_turn` (CapabilityCalls path) | between batch-completion and stop |
-| 8 | Inside the capability-batch loop, before each `gate().handle` | between successive outcome arms |
-| 9 | Inside the inner retry loop, before each `recovery().on_capability_error` | between retry attempts |
+| 6 | Pre-`stop().should_stop_after_turn` (model-response branch arm) | fires on either Reply or CapabilityCalls path — exactly one path per iteration; the boundary sits at the branch point |
+| 7 | Inside the capability-batch loop, before each `gate().handle` | between successive outcome arms |
+| 8 | Inside the inner retry loop, before each `recovery().on_capability_error` | between retry attempts |
 
-Eight sites. Per master doc §10, strategies are sealed Builtin code that returns promptly; **cooperative cancellation at these awaited boundaries is sufficient without preemptive `tokio::select!` wrapping**. The boundary list IS the contract — adding a new strategy call to the executor MUST add a matching CANCEL_BOUNDARY. WS-8's integration suite includes a cancellation-fires-at-each-boundary test covering all eight sites. Addresses PR #3544 serrrfirat #6.
+Eight sites. Per master doc §10, strategies are sealed Builtin code that returns promptly; **cooperative cancellation at these awaited boundaries is sufficient without preemptive `tokio::select!` wrapping**. The boundary list IS the contract — adding a new strategy call to the executor MUST add a matching `CANCEL_BOUNDARY`. WS-8's integration suite includes a cancellation-fires-at-each-boundary test covering all eight sites. Addresses PR #3544 serrrfirat #6.
+
+The boundary helper has one canonical name across all briefs: **`checkpoint_and_exit_if_cancelled`** (used by WS-6 as the consumer). Master doc §8 pseudocode and WS-13's `LoopCancellationPort` brief use the same name.
 
 If the existing host API does not yet expose a cancellation accessor, this brief documents the requirement and either:
 
@@ -736,6 +737,26 @@ Pick (a) if the host already has cancellation plumbing; (b) otherwise.
 3. Return `Ok(LoopExit::Cancelled(...))` directly from `execute_family()`.
 
 `AgentLoopExecutorError::Cancelled` is **only** for the truly-unrecoverable case where the executor cannot even produce a `LoopExit::Cancelled` (e.g. the cancellation checkpoint write itself failed and we have no valid checkpoint id to embed). WS-7 maps that residual case to `AgentLoopDriverError::Failed { reason_kind: "interrupted_unexpectedly" }`, not to `Unavailable`. Normal cancellation never visits the error mapping path.
+
+### 3.5a Strategy-decision observability
+
+Strategies make consequential decisions (retry/skip/abort, stop/continue, drain-now/wait). Operators investigating a misbehaving run need to see which strategy decided what. `LoopProgressPort` (WS-12) covers **executor** milestones; strategy outcomes are not enumerated as `LoopProgressEvent` variants in the skeleton.
+
+Skeleton-stage observability: the executor emits `tracing::debug!` at every strategy call site, naming the strategy, its inputs (refs and state slot values only — never raw content), and its outcome. Example:
+
+```rust
+let stop = planner.stop().should_stop_after_turn(&state, &summary).await;
+tracing::debug!(
+    target: "ironclaw_agent_loop::executor",
+    family_id = %family.id(),
+    iteration = state.iteration,
+    summary_kind = ?summary.kind,
+    outcome = ?stop,
+    "StopConditionStrategy::should_stop_after_turn",
+);
+```
+
+Durable strategy-decision telemetry — a typed event log separate from `LoopProgressEvent` milestones — is deferred. When a production debugging need materializes (someone files a "why did the loop abort?" ticket that `tracing::debug!` doesn't answer), a follow-up workstream introduces `StrategyDecisionEvent` variants on `LoopProgressPort`. Until then, `tracing` is sufficient and avoids over-designing the observability surface. Addresses PR #3544 follow-up review (Opus reviewer Agent 3 §c gap).
 
 ### 3.6 Host single-call invocation API
 
