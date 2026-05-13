@@ -402,6 +402,8 @@ fn configure_store(
 
 fn create_linker(engine: &Engine) -> Result<Linker<StoreData>, RuntimeError> {
     let mut linker = Linker::new(engine);
+    wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        .map_err(|error| RuntimeError::LinkerConfiguration(error.to_string()))?;
     bindings::ProductAdapterComponent::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
         &mut linker,
         |state: &mut StoreData| state,

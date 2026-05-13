@@ -331,7 +331,8 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
     //   * tracing             — structured logging for hardened error paths
     //                           added in the zmanian review.
     //   * serde_json          — validates temporary JSON-shim WIT payloads.
-    //   * wasmtime            — component-model loader, linker, store, and limiter.
+    //   * wasmtime, wasmtime-wasi — component-model loader, linker, store,
+    //                              limiter, and v1-style minimal WASI p2.
     // Every addition is justified by a concrete call site in src/. Adding a
     // dep here without a matching call site is a contract violation — and
     // adding workflow/runtime crates beyond this list still requires
@@ -350,11 +351,49 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
         "tokio",
         "tracing",
         "wasmtime",
+        "wasmtime-wasi",
     ];
     assert_eq!(
         deps, expected,
         "ironclaw_wasm_product_adapters should stay thin host glue; add runtime/workflow dependencies only when a call-site proves they are required"
     );
+}
+
+#[test]
+fn wasm_product_adapter_runtime_uses_v1_style_minimal_wasi() {
+    let root = workspace_root().join("crates/ironclaw_wasm_product_adapters");
+    let store = std::fs::read_to_string(root.join("src/store.rs"))
+        .expect("ProductAdapter WASM store must be readable");
+    let runtime = std::fs::read_to_string(root.join("src/component_runtime.rs"))
+        .expect("ProductAdapter WASM runtime must be readable");
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+        .expect("ProductAdapter WASM manifest must be readable");
+
+    assert!(
+        manifest.contains("wasmtime-wasi"),
+        "ProductAdapter components should keep v1-style wasm32-wasip2 compatibility via wasmtime-wasi"
+    );
+    assert!(
+        runtime.contains("wasmtime_wasi::p2::add_to_linker_sync"),
+        "ProductAdapter component linker should register WASI p2 like v1 tools/channels"
+    );
+    assert!(
+        store.contains("WasiCtxBuilder::new().build()"),
+        "ProductAdapter WASI context should use the v1 minimal default: no env, args, preopens, or inherited network"
+    );
+    for forbidden in [
+        "inherit_env",
+        "inherit_stdio",
+        "preopened_dir",
+        "inherit_network",
+        "allow_ip_name_lookup(true)",
+        "socket_addr_check(|_, _| Box::pin(async { true }))",
+    ] {
+        assert!(
+            !store.contains(forbidden) && !runtime.contains(forbidden),
+            "ProductAdapter minimal WASI must not enable `{forbidden}`; HTTP egress stays host-mediated"
+        );
+    }
 }
 
 #[test]

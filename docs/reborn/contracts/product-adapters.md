@@ -136,6 +136,10 @@ to avoid timing oracles.
 - `method`, `path`, `headers`, `body`
 - `credential_handle: Option<EgressCredentialHandle>`
 
+Component runtime uses v1-style minimal WASI p2 for wasm32-wasip2 guest compatibility:
+clock/random are available, but env, args, stdio, preopened directories, and
+network are not inherited. Protocol HTTP still flows only through `http-egress`.
+
 The host:
 
 1. Validates the host against the adapter manifest's declared list.

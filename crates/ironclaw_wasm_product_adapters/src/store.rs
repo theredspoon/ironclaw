@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
 use crate::bindings;
 use crate::config::{MAX_LOG_MESSAGE_BYTES, MAX_LOGS_PER_EXECUTION};
 use crate::limiter::WasmResourceLimiter;
@@ -21,6 +23,8 @@ pub struct ComponentLogRecord {
 
 pub(crate) struct StoreData {
     pub(crate) limiter: WasmResourceLimiter,
+    wasi: WasiCtx,
+    table: ResourceTable,
     pub(crate) logs: Vec<ComponentLogRecord>,
     deadline: Option<Instant>,
 }
@@ -29,6 +33,8 @@ impl StoreData {
     pub(crate) fn new(memory_limit: u64, timeout: Duration) -> Self {
         Self {
             limiter: WasmResourceLimiter::new(memory_limit),
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
             logs: Vec::new(),
             deadline: Instant::now().checked_add(timeout),
         }
@@ -37,6 +43,15 @@ impl StoreData {
     pub(crate) fn deadline_exceeded(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
+impl WasiView for StoreData {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 

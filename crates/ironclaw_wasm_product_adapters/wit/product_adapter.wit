@@ -28,8 +28,11 @@
 // - Response bodies returned to WASM via `http-egress` are scanned for
 //   leak-pattern matches by the host before the WASM instance can observe
 //   them. Raw response headers remain host-only and are not exposed here.
-// - `log` and `now-millis` are the only general-purpose host imports. WASM
-//   gets no filesystem, no env, no random, no raw clock outside `now-millis`.
+// - `log`, `now-millis`, and v1-style minimal WASI p2 are the only
+//   general-purpose host imports. Minimal WASI keeps wasm32-wasip2 guest
+//   compatibility and permits clock/random, but the host provides no env,
+//   args, stdio, preopened directories, or network access. HTTP egress still
+//   flows only through `http-egress`.
 //
 // TEMPORARY: JSON-string payload shim
 // ===================================
