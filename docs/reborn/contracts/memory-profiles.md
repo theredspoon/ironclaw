@@ -32,6 +32,10 @@ schemas/memory/document-write.output.v1.json
 
 `HostPortCatalog` is a validation catalog for known `HostPortId` contract names. It is not a runtime implementation registry, dependency injection container, or adapter factory. Concrete storage, audit, embedding, and network adapters stay in host/runtime service crates.
 
+## Deferred
+
+- `memory.semantic_search.v1` — issue #3537 lists this profile, but it depends on a host-mediated embedding/vector port that does not exist yet. It is intentionally omitted from this zero-behavior prep slice; it must be added before semantic search ships, either as its own profile with a host-mediated embedding port or kept behind a separate optional feature/fallback.
+
 ## Non-goals
 
 - no production manifest v2 parser changes;

@@ -101,20 +101,21 @@ pub enum CapabilityProfileConformanceFindingKind {
 }
 
 /// One structural profile conformance finding.
+///
+/// `subject` holds the identifier the finding is about. For
+/// [`CapabilityProfileConformanceFindingKind::ProfileIdMismatch`] this is the
+/// profile id; for every other variant it is the operation id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CapabilityProfileConformanceFinding {
     kind: CapabilityProfileConformanceFindingKind,
-    operation_id: String,
+    subject: String,
 }
 
 impl CapabilityProfileConformanceFinding {
-    pub fn new(
-        kind: CapabilityProfileConformanceFindingKind,
-        operation_id: impl Into<String>,
-    ) -> Self {
+    pub fn new(kind: CapabilityProfileConformanceFindingKind, subject: impl Into<String>) -> Self {
         Self {
             kind,
-            operation_id: operation_id.into(),
+            subject: subject.into(),
         }
     }
 
@@ -122,8 +123,8 @@ impl CapabilityProfileConformanceFinding {
         self.kind
     }
 
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
+    pub fn subject(&self) -> &str {
+        &self.subject
     }
 }
 

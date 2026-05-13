@@ -37,7 +37,15 @@ fn validate_dotted_host_port_id(value: &str) -> Result<(), HostApiError> {
             "must start with 'host.'",
         ));
     }
-    for segment in value.split('.') {
+    let segments: Vec<&str> = value.split('.').collect();
+    if segments.len() < 3 {
+        return Err(HostApiError::invalid_id(
+            "host_port",
+            value,
+            "must have at least host, domain, and service segments",
+        ));
+    }
+    for segment in &segments {
         if segment.is_empty() {
             return Err(HostApiError::invalid_id(
                 "host_port",
@@ -45,12 +53,11 @@ fn validate_dotted_host_port_id(value: &str) -> Result<(), HostApiError> {
                 "empty dot segments are not allowed",
             ));
         }
-        let first = segment.as_bytes()[0];
-        if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        if !segment.as_bytes()[0].is_ascii_lowercase() {
             return Err(HostApiError::invalid_id(
                 "host_port",
                 value,
-                "segments must start with lowercase ASCII letter or digit",
+                "segments must start with a lowercase ASCII letter",
             ));
         }
         if segment.bytes().any(|byte| !valid_segment_char(byte)) {
@@ -111,6 +118,7 @@ impl<'de> Deserialize<'de> for HostPortId {
 
 /// One host port granted into a scoped invocation view.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostPortGrant {
     pub id: HostPortId,
 }
@@ -126,6 +134,7 @@ impl HostPortGrant {
 /// A catalog entry names a contract that manifest validation may reference. It
 /// does not create, own, or dispatch a concrete host-port implementation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostPortCatalogEntry {
     pub id: HostPortId,
 }
@@ -140,20 +149,21 @@ impl HostPortCatalogEntry {
 ///
 /// The catalog is validation vocabulary only. Runtime service crates decide how
 /// to construct concrete scoped adapters after authorization and obligation
-/// handling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// handling. Entries are kept sorted by id so equality and serialization are
+/// order-independent across construction sites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostPortCatalog {
     entries: Vec<HostPortCatalogEntry>,
 }
 
 impl HostPortCatalog {
-    pub fn new(entries: Vec<HostPortCatalogEntry>) -> Result<Self, HostApiError> {
-        let mut seen = BTreeSet::new();
-        for entry in &entries {
-            if !seen.insert(entry.id.clone()) {
+    pub fn new(mut entries: Vec<HostPortCatalogEntry>) -> Result<Self, HostApiError> {
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        for window in entries.windows(2) {
+            if window[0].id == window[1].id {
                 return Err(HostApiError::invariant(format!(
                     "duplicate host port catalog entry {}",
-                    entry.id
+                    window[0].id
                 )));
             }
         }
@@ -171,19 +181,42 @@ impl HostPortCatalog {
     }
 
     pub fn contains(&self, id: &HostPortId) -> bool {
-        self.entries.iter().any(|entry| &entry.id == id)
+        self.entries
+            .binary_search_by(|entry| entry.id.cmp(id))
+            .is_ok()
+    }
+
+    /// Return every required port that is not present in the catalog, in input
+    /// order, with duplicates removed.
+    pub fn missing_required<'a, I>(&self, required: I) -> Vec<HostPortId>
+    where
+        I: IntoIterator<Item = &'a HostPortId>,
+    {
+        let mut missing: Vec<HostPortId> = Vec::new();
+        for id in required {
+            if !self.contains(id) && !missing.iter().any(|existing| existing == id) {
+                missing.push(id.clone());
+            }
+        }
+        missing
     }
 
     pub fn validate_required<'a, I>(&self, required: I) -> Result<(), HostApiError>
     where
         I: IntoIterator<Item = &'a HostPortId>,
     {
-        for id in required {
-            if !self.contains(id) {
-                return Err(HostApiError::invariant(format!("unknown host port {id}")));
-            }
+        let missing = self.missing_required(required);
+        if missing.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let names = missing
+            .iter()
+            .map(HostPortId::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(HostApiError::invariant(format!(
+            "unknown host ports {names}"
+        )))
     }
 }
 
@@ -193,10 +226,40 @@ impl Default for HostPortCatalog {
     }
 }
 
+impl<'de> Deserialize<'de> for HostPortCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Helper {
+            entries: Vec<HostPortCatalogEntry>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        HostPortCatalog::new(helper.entries).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Scoped set of host ports available to an invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HostPortView {
     grants: Vec<HostPortGrant>,
+}
+
+impl<'de> Deserialize<'de> for HostPortView {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Helper {
+            grants: Vec<HostPortGrant>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        HostPortView::new(helper.grants).map_err(serde::de::Error::custom)
+    }
 }
 
 impl HostPortView {

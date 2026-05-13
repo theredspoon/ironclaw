@@ -795,6 +795,9 @@ fn host_port_ids_are_host_namespaced_and_serializable() {
         "Host.storage",
         "host/storage",
         "host.storage\ntransaction",
+        "host.x",
+        "host.1.foo",
+        "host.storage.1tier",
     ] {
         assert!(
             HostPortId::new(invalid).is_err(),
@@ -856,8 +859,23 @@ fn host_port_catalog_validates_required_ports_without_creating_implementations()
     assert_eq!(
         missing,
         HostApiError::InvariantViolation {
-            reason: "unknown host port host.network.http".to_string()
+            reason: "unknown host ports host.network.http".to_string()
         }
+    );
+
+    let inspector = HostPortId::new("host.network.inspector").unwrap();
+    let aggregated = catalog
+        .validate_required([&network, &inspector, &network])
+        .unwrap_err();
+    assert_eq!(
+        aggregated,
+        HostApiError::InvariantViolation {
+            reason: "unknown host ports host.network.http, host.network.inspector".to_string()
+        }
+    );
+    assert_eq!(
+        catalog.missing_required([&network, &inspector, &network]),
+        vec![network.clone(), inspector.clone()]
     );
 
     assert!(
@@ -889,6 +907,8 @@ fn capability_profile_ids_are_versioned_portable_contract_names() {
         "memory/context_retrieval/v1",
         "memory..context_retrieval.v1",
         "memory.context_retrieval.v1\n",
+        "1memory.context_retrieval.v1",
+        "memory.2context_retrieval.v1",
     ] {
         assert!(
             CapabilityProfileId::new(invalid).is_err(),
@@ -914,7 +934,10 @@ fn capability_profile_contract_rejects_empty_or_duplicate_operations() {
     let contract = CapabilityProfileContract::new(profile_id.clone(), vec![operation.clone()])
         .expect("single-operation profile is valid");
     assert_eq!(contract.id(), &profile_id);
-    assert_eq!(contract.required_operations(), &[operation.clone()]);
+    assert_eq!(
+        contract.required_operations(),
+        std::slice::from_ref(&operation)
+    );
 
     assert!(
         CapabilityProfileContract::new(profile_id.clone(), Vec::new()).is_err(),
@@ -946,6 +969,12 @@ fn capability_profile_schema_refs_are_relative_repository_paths() {
         "https://example.com/schema.json",
         "file:///tmp/schema.json",
         "schemas/memory/context.json\n",
+        "data:text/plain,evil",
+        "mailto:foo",
+        "javascript:alert(1)",
+        "schemas/memory/with:colon.json",
+        "c:/win/schema.json",
+        "schemas/memory/contains space.json",
     ] {
         assert!(
             CapabilityProfileSchemaRef::new(invalid).is_err(),

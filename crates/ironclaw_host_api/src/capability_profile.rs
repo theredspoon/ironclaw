@@ -5,8 +5,6 @@
 //! provider-prefixed capabilities implement these operations, but this module
 //! only defines the neutral contract vocabulary.
 
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
 
 use crate::HostApiError;
@@ -42,12 +40,11 @@ fn validate_versioned_dotted_id(kind: &'static str, value: &str) -> Result<(), H
                 "empty dot segments are not allowed",
             ));
         }
-        let first = segment.as_bytes()[0];
-        if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        if !segment.as_bytes()[0].is_ascii_lowercase() {
             return Err(HostApiError::invalid_id(
                 kind,
                 value,
-                "segments must start with lowercase ASCII letter or digit",
+                "segments must start with a lowercase ASCII letter",
             ));
         }
         if segment.bytes().any(|byte| !valid_segment_char(byte)) {
@@ -89,9 +86,6 @@ fn validate_schema_ref(value: &str) -> Result<(), HostApiError> {
     if value.starts_with('/') {
         return Err(HostApiError::invalid_path(value, "must be relative"));
     }
-    if value.contains("://") {
-        return Err(HostApiError::invalid_path(value, "URLs are not allowed"));
-    }
     if value.contains('\\') {
         return Err(HostApiError::invalid_path(
             value,
@@ -103,6 +97,14 @@ fn validate_schema_ref(value: &str) -> Result<(), HostApiError> {
             value,
             "NUL/control characters are not allowed",
         ));
+    }
+    for ch in value.chars() {
+        if !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '/')) {
+            return Err(HostApiError::invalid_path(
+                value,
+                "only ASCII alphanumerics, '.', '_', '-', and '/' are allowed",
+            ));
+        }
     }
     for segment in value.split('/') {
         if segment.is_empty() || segment == "." || segment == ".." {
@@ -213,6 +215,7 @@ impl<'de> Deserialize<'de> for CapabilityProfileSchemaRef {
 
 /// One required operation for a host-defined capability profile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityProfileOperationContract {
     id: CapabilityProfileOperationId,
     input_schema_ref: CapabilityProfileSchemaRef,
@@ -246,28 +249,48 @@ impl CapabilityProfileOperationContract {
 }
 
 /// Host-defined portability contract that extensions may claim to implement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Required operations are kept sorted by id so equality and serialization are
+/// order-independent across construction sites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CapabilityProfileContract {
     id: CapabilityProfileId,
     required_operations: Vec<CapabilityProfileOperationContract>,
 }
 
+impl<'de> Deserialize<'de> for CapabilityProfileContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Helper {
+            id: CapabilityProfileId,
+            required_operations: Vec<CapabilityProfileOperationContract>,
+        }
+        let helper = Helper::deserialize(deserializer)?;
+        CapabilityProfileContract::new(helper.id, helper.required_operations)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 impl CapabilityProfileContract {
     pub fn new(
         id: CapabilityProfileId,
-        required_operations: Vec<CapabilityProfileOperationContract>,
+        mut required_operations: Vec<CapabilityProfileOperationContract>,
     ) -> Result<Self, HostApiError> {
         if required_operations.is_empty() {
             return Err(HostApiError::invariant(
                 "capability profile must require at least one operation",
             ));
         }
-        let mut seen = BTreeSet::new();
-        for operation in &required_operations {
-            if !seen.insert(operation.id.clone()) {
+        required_operations.sort_by(|a, b| a.id.cmp(&b.id));
+        for window in required_operations.windows(2) {
+            if window[0].id == window[1].id {
                 return Err(HostApiError::invariant(format!(
                     "duplicate capability profile operation {}",
-                    operation.id
+                    window[0].id
                 )));
             }
         }
