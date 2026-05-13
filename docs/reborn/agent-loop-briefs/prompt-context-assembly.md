@@ -396,7 +396,7 @@ prefix flips. Required behavior:
   silently produces wrong identity content for subsequent iterations
   with a different mode. Caching candidates (which are mode-independent)
   preserves the cache's purpose (avoid disk re-reads) without freezing
-  the mode-dependent filter. This addresses PR #3544 serrrfirat #2.
+  the mode-dependent filter.
 - For **volatile** files (HEARTBEAT.md), the source MUST be
   re-invoked each call; the volatile bucket is appended to
   `instruction_snippets` per §3.3.5 rather than cached as part of the

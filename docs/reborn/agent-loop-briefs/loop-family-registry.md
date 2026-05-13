@@ -10,7 +10,7 @@
 
 ## 1. Scope
 
-Land the top-layer abstraction that profile resolution targets: `LoopFamily` as a first-class, Builtin-only, opaque bundle of (`LoopFamilyId`, `ComponentIdentity`, planner). The registry is a Guice-style singleton constructed once at startup; `Arc<LoopFamilyRegistry>` is plumbed into `TurnRunner`. Strategy traits stay sealed inside `ironclaw_agent_loop` — extensions never compose strategies; they extend via hooks (see master doc §9 and PR #3523-comment-4435808547).
+Land the top-layer abstraction that profile resolution targets: `LoopFamily` as a first-class, Builtin-only, opaque bundle of (`LoopFamilyId`, `ComponentIdentity`, planner). The registry is a Guice-style singleton constructed once at startup; `Arc<LoopFamilyRegistry>` is plumbed into `TurnRunner`. Strategy traits stay sealed inside `ironclaw_agent_loop` — extensions never compose strategies; they extend via hooks (see master doc §9 and §9.1).
 
 This brief establishes:
 
@@ -70,7 +70,7 @@ impl std::fmt::Display for LoopFamilyId {
 /// or any other component whose version is load-bearing for replay.
 ///
 /// One primitive across the system per zmanian's "four conventions" critique
-/// (PR #3544 review). Used today by `LoopFamily.version`; future hook /
+/// Used today by `LoopFamily.version`; future hook /
 /// skill-snapshot / model-route components should adopt the same shape.
 ///
 /// `id` is human-readable and stable; `digest` content-hashes the underlying

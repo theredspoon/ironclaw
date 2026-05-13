@@ -118,7 +118,9 @@ ironclaw_reborn                             (tighter — runtime integration)
   src/loop_exit_applier.rs     (existing)
 ```
 
-Each follow-up loop family ships as one factory function in `ironclaw_agent_loop/src/families/<name>.rs`, e.g. `coding()` returning a `LoopFamily` with select strategies swapped via `DefaultPlanner::compose_default().with_*(...)` (all `pub(crate)`). The skeleton ships none of these; only `families::default()`. A family graduates to its own crate only when it pulls heavyweight external deps (tree-sitter, ripgrep, etc.).
+Each follow-up loop family ships as one factory function in `ironclaw_agent_loop/src/families/<name>.rs`, e.g. `coding()` returning a `LoopFamily` with select strategies swapped via `DefaultPlanner::compose_default().with_*(...)` (all `pub(crate)`). The skeleton ships none of these; only `families::default()`.
+
+**Families live in `ironclaw_agent_loop` permanently.** The strategy traits are `pub(crate)` and the strategy-composition seal is by design — there is intentionally no escape hatch (`pub(in family-factory)` visibility, feature-gated re-exports, plugin loaders) that would let a family live in an external crate. If a family needs heavyweight external deps (tree-sitter, ripgrep, ML model bindings, etc.), the heavyweight deps are pulled into `ironclaw_agent_loop` itself as feature-gated optional dependencies — not into a sibling crate that imports strategies. The cost (one crate accumulates external deps) is borne so the sealed-strategy invariant remains structurally unbreakable. Extensions plug into the loop via hooks (§9.1), never via families. This locks the "strategies are Builtin-only" claim from §9 at the build-system level.
 
 ## 4.5 Loop family resolution
 
@@ -145,7 +147,7 @@ Properties:
 
 - **Profiles refer to families by `LoopFamilyId`, never by strategy composition.** A profile carries `loop_family_id: LoopFamilyId` (e.g. `"default"`); resolution maps to `Arc<LoopFamily>` via the registry. Profiles cannot enumerate strategies, override individual slots, or inject custom impls.
 - **`LoopFamilyRegistry` is a Guice-style singleton.** Built once at app startup by `ironclaw_reborn::app_loop_family::build_loop_family_registry()` (the only composition root that knows which families exist), shared via `Arc<LoopFamilyRegistry>`, immutable thereafter. There is no public `register()` method; the registry is "wired by `builtin()` composition" only.
-- **Strategy traits are `pub(crate)` in `ironclaw_agent_loop`.** Extensions (Trusted or Installed) cannot implement strategies. Customization lives at the hooks layer (§9 and PR #3523-comment-4435808547) — middleware around host ports, not strategy slots in the executor.
+- **Strategy traits are `pub(crate)` in `ironclaw_agent_loop`.** Extensions (Trusted or Installed) cannot implement strategies. Customization lives at the hooks layer (§9.1) — middleware around host ports, not strategy slots in the executor.
 - **`PlannedDriver` is non-generic.** It holds `Arc<LoopFamily> + Arc<CanonicalAgentLoopExecutor>` and adapts them to `AgentLoopDriver`. The strategy seal means tests use real families from the registry (or `LoopFamilyRegistry::with_families` under `cfg(feature = "test-support")`), not synthetic planners.
 
 This collapses several open questions at once: the trust-class problem (strategies are Builtin by type), the combinatorial-explosion problem (profiles get a family, not nine independent knobs), the version-drift problem (`LoopFamilyId + ComponentIdentity` pins replayable state with one primitive — see §11 — used in checkpoint payload metadata).
@@ -178,7 +180,7 @@ There is no `state.set_completed()`-style API on the loop side. The loop returns
 
 Each strategy is one small Rust trait with one or two methods. Default impls model pi-mono behavior. A loop family typically swaps two or three of them; the rest stay default.
 
-**Strategy traits are `pub(crate)` inside `ironclaw_agent_loop`.** Loop families are the public surface (`Arc<LoopFamily>` flows out of `LoopFamilyRegistry`); strategy traits are an implementation detail that family factories compose. Extensions cannot implement strategies — see §9 for the trust model and PR #3523-comment-4435808547 for the hooks-as-middleware extension surface.
+**Strategy traits are `pub(crate)` inside `ironclaw_agent_loop`.** Loop families are the public surface (`Arc<LoopFamily>` flows out of `LoopFamilyRegistry`); strategy traits are an implementation detail that family factories compose. Extensions cannot implement strategies — see §9 for the trust model and §9.1 for the hooks-as-middleware extension surface.
 
 | Strategy | Decision it owns | Returns | Default behavior |
 |---|---|---|---|
@@ -297,7 +299,7 @@ loop:
   model_pref = planner.model().preference(&state)
   model_resp = loop:
     // Wrap stream_model in a recovery loop. on_model_error is consulted
-    // on failure (PR #3544 serrrfirat #4); skeleton rejects
+    // on failure; skeleton rejects
     // RetryAlteration::AdvanceFallback until ModelRouteChain lands (§9).
     match host.stream_model(LoopModelRequest { messages: bundle.messages,
                                               surface_version: surface.version,
@@ -417,7 +419,7 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 ## 9. Cross-cutting decisions (locked)
 
 - **Checkpoint discipline is executor-owned.** Four kinds: `BeforeModel`, `BeforeSideEffect`, `BeforeBlock`, optionally `Final`. Strategies cannot trigger checkpoints; they only return state slots.
-- **Cancellation observed between strategy calls.** Strategies never see the signal directly. The canonical executor consults `LoopCancellationPort` at **eight explicit awaited boundaries** per tick (top of iteration + before each of the seven subsequent strategy-call sites — the model-response branch counts once because the Reply path and CapabilityCalls path are mutually-exclusive); the list is enumerated in WS-6 §3.5 (PR #3544 serrrfirat #6). The boundary helper name is `checkpoint_and_exit_if_cancelled` across all briefs. Adding a new strategy call to the executor MUST add a matching cancel-boundary check.
+- **Cancellation observed between strategy calls.** Strategies never see the signal directly. The canonical executor consults `LoopCancellationPort` at **eight explicit awaited boundaries** per tick (top of iteration + before each of the seven subsequent strategy-call sites — the model-response branch counts once because the Reply path and CapabilityCalls path are mutually-exclusive); the list is enumerated in WS-6 §3.5. The boundary helper name is `checkpoint_and_exit_if_cancelled` across all briefs. Adding a new strategy call to the executor MUST add a matching cancel-boundary check.
 - **Visible surface version pinned per iteration** before `plan_model_request`, held in `LoopExecutionState.surface_version`. On stale-surface outcome, executor reloads + retries that iteration; counts against `BudgetStrategy.iteration_limit(&state)`.
 - **Error sanitization at the host boundary.** Strategies receive `CapabilityErrorSummary` / `ModelErrorSummary` (already redacted by the host). Raw provider errors never reach planner code. Honors [`error-handling.md`](../../.claude/rules/error-handling.md) channel-edge rule.
 - **Fallback chain is intended but deferred.** Skeleton keeps the existing `Option<LoopModelRouteSnapshot>` on `LoopRunContext` and reserves `model_state.fallback_index: u32` (always 0 in skeleton). When a future `RecoveryStrategy` needs to switch models, that PR adds `ModelRouteChain` to `host.rs` and migrates the storage layer call sites. Until then, `RecoveryOutcome::Retry { alter }` cannot include a model-route swap — only context/prompt-shape alterations.
@@ -428,12 +430,132 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 - **Naming convention: `Default*` for default impls.** No "pi" in identifiers.
 - **Term: `Strategy`** for sub-components of the planner facade.
 - **`AgentLoopDriver` trait is the boundary** between `ironclaw_reborn` and the framework. The framework crate does not depend on `AgentLoopDriver`.
-- **Strategies are Builtin-only (sealed at the type level).** Strategy traits are `pub(crate)` in `ironclaw_agent_loop`; `AgentLoopPlanner` is `pub` but uses the sealed-trait pattern (only types in `ironclaw_agent_loop` can implement). Extensions plug into the loop via **hooks**, which fire as middleware around host port impls composed in `ironclaw_loop_support`. Strategies decide loop-control policy; hooks intercept side-effecting port calls. They communicate only via existing `Loop*Port` DTOs and never see each other directly. The full design (with four worked scenarios) is in PR #3523-comment-4435808547.
+- **Strategies are Builtin-only (sealed at the type level).** Strategy traits are `pub(crate)` in `ironclaw_agent_loop`; `AgentLoopPlanner` is `pub` but uses the sealed-trait pattern (only types in `ironclaw_agent_loop` can implement). Extensions plug into the loop via **hooks**, which fire as middleware around host port impls composed in `ironclaw_loop_support`. Strategies decide loop-control policy; hooks intercept side-effecting port calls. They communicate only via existing `Loop*Port` DTOs and never see each other directly. The full design is in §9.1 below.
 - **Loop families are bound through `LoopFamilyRegistry`,** constructed once at app startup by `ironclaw_reborn::app_loop_family::build_loop_family_registry()` and shared via `Arc<LoopFamilyRegistry>` plumbed into `TurnRunner`. There is no public `register()` method — the registry's contents are fixed at the composition root's compile time. See [`agent-loop-briefs/loop-family-registry.md`](agent-loop-briefs/loop-family-registry.md) (WS-3.5).
-- **`LoopExit` validation is structurally enforced at the framework→reborn→turns boundary.** `AgentLoopDriver::run` / `resume` returns a raw `LoopExit`. Only `LoopExitApplier::validate(exit, LoopExitValidationPolicy)` — sealed per PR #3460, the policy type cannot be constructed by untrusted code — produces the `LoopExitValidationDecision` that flows into `TurnRunTransitionPort::apply_validated_loop_exit` via `ApplyValidatedLoopExitRequest`. The runner's transition port accepts the validated request, not a raw `LoopExit`. There is no path for an unvalidated exit to reach durable state. This mirrors the #3460 seal pattern for policies and is the agent-loop-framework analog of zmanian's "witness type" ask in PR #3544 review.
+- **`LoopExit` validation is structurally enforced at the framework→reborn→turns boundary.** `AgentLoopDriver::run` / `resume` returns a raw `LoopExit`. Only `LoopExitApplier::validate(exit, LoopExitValidationPolicy)` — sealed per PR #3460, the policy type cannot be constructed by untrusted code — produces the `LoopExitValidationDecision` that flows into `TurnRunTransitionPort::apply_validated_loop_exit` via `ApplyValidatedLoopExitRequest`. The runner's transition port accepts the validated request, not a raw `LoopExit`. There is no path for an unvalidated exit to reach durable state. This mirrors the #3460 seal pattern for policies, applied at the agent-loop-framework boundary.
 - **`ComponentIdentity` is the one identity primitive across the system.** `ComponentIdentity { id: &'static str, digest: ComponentDigest }` (defined in `ironclaw_agent_loop::family` per WS-3.5) is used consistently across loop families (this PR), checkpoint payload metadata (WS-0), hooks (#3524 future), skill snapshots (#3470 future), and model routes (#3462 future). **Content-addressed only — monotonic counters are insufficient** (they false-drift when bumped without changes and false-agree when changes ship without a bump; both are silent replay-correctness bugs). The existing `LoopModelRouteSnapshot.auth_version: String` and `config_version: String` at `crates/ironclaw_turns/src/run_profile/host.rs:362` are String identities, not content hashes; they migrate to `ComponentIdentity` alongside the model-route work in #3462 — **not in this PR**. Per [`.claude/rules/types.md`](../../.claude/rules/types.md), identity-shaped values use newtypes; `ComponentIdentity` is the canonical one for component-versioning. See [`agent-loop-briefs/loop-family-registry.md`](agent-loop-briefs/loop-family-registry.md) §3.2's "Migration / propagation" subsection for the per-component migration paths.
 - **JSON canonicalization for hashing follows JCS RFC 8785.** Any digest-over-JSON content in the framework — `CapabilityCallSignature::ArgsHash` is the primary case — uses [JCS RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785) canonicalization. Implementation reference: the `jcs` crate (added to `ironclaw_agent_loop`'s dependencies when WS-0 ships code). Rules: object keys sorted by UTF-16 code-unit order, NaN/Infinity rejected (not valid JSON), number representation preserved (no `1.0 → 1` normalization), minimal whitespace. **Cross-model compatibility:** for typical tool-call args (strings, integers, nested objects without floats), JCS output is byte-identical to the Hermes/Forge sorted-keys-minimal-whitespace convention used in the open-weights tool-calling ecosystem (Llama 3.1+, Qwen, DeepSeek, Mistral via `<tool_call>` ChatML). Replay across model swaps (Claude ↔ Hermes 3 ↔ Llama-tool-call format) hashes identically for typical args; divergence is limited to the float-representation edge case which production tool args essentially never hit. See [`agent-loop-briefs/state-and-checkpoints.md`](agent-loop-briefs/state-and-checkpoints.md) §3.4a for the canonicalization rules in implementation form.
-- **Denial telemetry surfaces through `LoopProgressPort` milestones, not the action log.** Profile-surface denials and hook denials never reach `CapabilityHost`, so they do not produce `ActionRecord` entries. Until WS-12 (`LoopProgressPort` wiring) lands, denials accumulate only in the in-memory `state.recent_failure_kinds` ring as `LoopFailureKind::PolicyDenied`. **WS-12 introduces `CapabilityBatchCompleted { denied_count: u32 }`** ([`agent-loop-briefs/loop-progress-port.md`](agent-loop-briefs/loop-progress-port.md)) which gives durable redacted denial-count telemetry without crossing into action-log territory. Per-call denial evidence (beyond counts) is out of scope for the skeleton — add a dedicated `ProfileDenialObserved` variant in a follow-up only when a real consumer demands it. Addresses PR #3544 serrrfirat #5.
+- **Denial telemetry surfaces through `LoopProgressPort` milestones, not the action log.** Profile-surface denials and hook denials never reach `CapabilityHost`, so they do not produce `ActionRecord` entries. Until WS-12 (`LoopProgressPort` wiring) lands, denials accumulate only in the in-memory `state.recent_failure_kinds` ring as `LoopFailureKind::PolicyDenied`. **WS-12 introduces `CapabilityBatchCompleted { denied_count: u32 }`** ([`agent-loop-briefs/loop-progress-port.md`](agent-loop-briefs/loop-progress-port.md)) which gives durable redacted denial-count telemetry without crossing into action-log territory. Per-call denial evidence (beyond counts) is out of scope for the skeleton — add a dedicated `ProfileDenialObserved` variant in a follow-up only when a real consumer demands it.
+
+### 9.1 Strategies vs hooks: the extension contract
+
+Strategies and hooks are two distinct extension surfaces with non-overlapping responsibilities. The agent-loop crate (`ironclaw_agent_loop`) owns strategies; the hooks crate (`ironclaw_hooks`, future per issue #3523 / #3524) owns hooks; they communicate only via the existing `Loop*Port` DTOs and never see each other directly. `ironclaw_agent_loop` has no dependency on `ironclaw_hooks` and never will.
+
+|   | Strategies | Hooks |
+|---|---|---|
+| **Job** | Decide loop-control policy: what to ask the model, what to filter, when to stop, how to recover | Gate / mutate / observe / react to port calls the executor makes |
+| **Crate** | `ironclaw_agent_loop` (Builtin-only, sealed) | `ironclaw_hooks` (Builtin / Trusted / Installed tiers) |
+| **Where it sits** | Inside the executor — composed via the planner facade's nine slots | Around host ports — composed via `ironclaw_loop_support` host factory as middleware |
+| **Sees** | `&LoopExecutionState` (refs only), strategy slots, `TurnSummary` | `LoopXxxPortRequest` / `LoopXxxPortResponse` DTOs (already redacted) |
+| **Returns** | `StopOutcome`, `RecoveryOutcome`, `CapabilityFilter`, `LoopPromptBundleRequest`, … | `HookDecision::{Allow, Deny, Mutate, Pause}` mapped to existing port outcomes |
+| **Mutates** | Its own state slot (immutable swap into next-tick state) | Nothing in loop state — only the request/response in flight |
+| **Failure mode** | Strategy bug ⇒ executor exits with `LoopExit::Failed` | Gate/mutator fails closed; observer/effect fails isolated |
+
+Strategies are **not** hooks. They are swappable policy slots inside the planner facade — they cannot intercept port calls, mutate prompts, or deny capabilities. They only decide what the executor asks for next. That separation is what keeps the strategy surface small (~9 traits) and what makes the hook middleware viable as a separate, additive layer.
+
+#### Layer cake
+
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│  CanonicalAgentLoopExecutor          (ironclaw_agent_loop)      │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  Planner facade = 9 strategy slots                       │   │
+│  │   Context  Capability  Model  Batch  Gate                │   │
+│  │   Recovery Stop        Drain  Budget                     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                       │ calls via                               │
+│                       ▼                                         │
+│  AgentLoopDriverHost trait surface  (ironclaw_turns)            │
+│   host.build_prompt_bundle()  host.stream_model()               │
+│   host.invoke_capability()    host.finalize_assistant_message() │
+└─────────────────────────────────────────────────────────────────┘
+                        │
+                        ▼  (middleware chain — composed in loop_support)
+┌─────────────────────────────────────────────────────────────────┐
+│  HookedCapabilityPort  ──►  HookedPromptPort  ──►  …            │
+│   ▲ runs gate / mutator / observer hooks per port      HOOKS    │
+└─────────────────────────────────────────────────────────────────┘
+                        │
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Real Loop*Port impls  (HostRuntimeLoopCapabilityPort,          │
+│  HostIdentityContextSource, real LlmProvider, …)                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Two clean boundaries:
+
+1. **The executor only knows the trait** `AgentLoopDriverHost` — middleware can wrap freely without the executor noticing.
+2. **Hooks wrap the trait impl, never the executor** — the strategy seal stays intact regardless of how rich the hooks layer grows.
+
+#### Four worked scenarios
+
+**A — Hook denies a capability the model asked for.**
+
+```text
+Model returns CapabilityCalls[shell("rm -rf /")]
+Executor: invoke_capability(call)
+  HookedCapabilityPort: BEFORE_CAPABILITY hooks run
+    safety hook ──► Deny("destructive root path")
+  Returns CapabilityOutcome::Denied { reason }
+Executor: matches Denied arm
+  push LoopFailureKind::PolicyDenied  ──►  RecoveryStrategy.on_capability_error()
+  RecoveryOutcome::SkipResult (default)
+```
+
+The strategy layer never knew a hook was involved — it only saw `Denied`. The existing `Denied` arm handles them.
+
+**B — Hook mutates context (additive snippet).**
+
+```text
+ContextStrategy returns LoopPromptBundleRequest{ sections: [...] }
+Executor: host.build_prompt_bundle(req)
+  HookedPromptPort: BEFORE_PROMPT mutator hook runs
+    context_envelope hook ──► append LoopContextSnippet {
+      trust = Untrusted, body = "..."
+    }
+  Real port assembles bundle including the patch
+Executor: host.stream_model(bundle)
+  Model sees the snippet, but trust-labeled and bounded.
+```
+
+Strategy never authored the snippet; hook never saw the strategy. Patches stay additive and trust-labeled per the hook design's Phase 3 contract.
+
+**C — Hook pauses (gate).**
+
+```text
+Hook returns Pause::ApprovalRequired { refs }
+HookedCapabilityPort maps to CapabilityOutcome::ApprovalRequired { ... }
+Executor: matches Approval arm ──► GateHandlingStrategy
+  GateOutcome::Block ──► checkpoint(BeforeBlock) ──► LoopExit::Blocked
+Resume later: same machinery as a real authority gate. No new pause path.
+```
+
+Hook-induced pause is **indistinguishable from authority-induced pause** from the executor's perspective. Both produce `ApprovalRequired`, both flow through `GateHandlingStrategy`, both checkpoint at `BeforeBlock`, both resume via the existing turn input flow.
+
+**D — Event-triggered hook (post-fact).**
+
+```text
+Loop already finalized turn ──► durable event written
+ironclaw_hooks event dispatcher consumes event cursor
+Effect hook enqueues a follow-up routine via normal capability dispatch
+Loop is unaware. No retroactive denial possible.
+```
+
+Post-fact hooks are fully outside the executor — no skeleton change required for the hook substrate to plug in later.
+
+#### What the skeleton already provides for hooks
+
+The skeleton is forward-compatible with the hooks design today because:
+
+- Executor only calls `AgentLoopDriverHost` traits — middleware can wrap freely.
+- The `Denied` and `SpawnedProcess` arms exist on the capability outcome match — without these, hook-deny would hit an unreachable arm.
+- Gate outcomes already route through `GateHandlingStrategy` — pause-from-hook reuses pause-from-authority machinery.
+- `RecoveryStrategy::on_capability_error` is the natural funnel for `Denied` reasons — hook denials feed into the same retry-budget / abort logic as any other denial.
+- Checkpoint discipline is executor-owned — hooks cannot trigger checkpoints, which is the right invariant per the "hooks cannot grant authority" rule.
+- Loop state is value-immutable — hooks can't mutate executor state even by accident, because they don't see `LoopExecutionState` at all.
+
+The only thing the skeleton **doesn't** do is wrap the host ports with middleware. That's exactly the seam the future hooks PR (`ironclaw_hooks` crate per #3524) defines.
 
 ## 10. Production-safe escape
 
@@ -453,7 +575,7 @@ The `LoopFailureKind::NoProgressDetected` variant is added in `ironclaw_turns::l
 
 **Retry budgets are bounded within a single iteration, not across resumes.** The retry loop inside `execute_capability_batch` (master doc §8) mutates `state.recovery_state.attempts` in place between attempts. The four checkpoint kinds (`BeforeModel`, `BeforeSideEffect`, `BeforeBlock`, `Final`) sit at iteration boundaries — retries happen *between* checkpoints. A crash mid-retry resumes from the `BeforeSideEffect` checkpoint with `recovery_state.attempts = 0`; the retry budget resets. This is intentional — adding an `AfterRetryAttempt` checkpoint kind would produce checkpoint storms under retry pressure, and the **iteration cap (the structural net) still bounds total retries across resumes**: each resume costs one iteration toward `BudgetStrategy::iteration_limit`. A pathological "infinite retries across infinite resumes" loop terminates with `LoopExit::Failed { IterationLimit }` after `iteration_limit` iterations regardless. Strategies that need stronger per-call retry durability than this can model retry attempts via `recent_failure_kinds` (which IS checkpointed) at the cost of the bucketing limitation described in WS-2's recovery brief.
 
-**Checkpoint schema migration: in-flight `Blocked` runs are NOT silently resumed against a changed digest.** When a `LoopFamily`'s `ComponentIdentity.digest` changes (any strategy composition change in the family factory, or any code change inside a strategy that affects its content hash), in-flight `Blocked` runs whose checkpoint was produced by the prior digest cannot be safely resumed — the saved state may reference internal layouts or invariants the new code no longer honors. The resume path returns `LoopExit::Failed { reason_kind: CheckpointUnavailable }`; the run is terminated and users can re-submit. The framework **never** silently resumes against the new digest — that would be the silent-failure pattern the safety nets exist to prevent. This behavior is identical to `CHECKPOINT_SCHEMA_ID` mismatch detection (per WS-10 §3.5); the `ComponentIdentity.digest` is treated as part of the schema for resume-eligibility purposes. Operators deploying a strategy change should expect a small number of in-flight blocked runs to fail with `CheckpointUnavailable` and plan accordingly (e.g., quiesce blocked runs before a rolling deploy, or accept the cost). Addresses PR #3544 Opus review §c gap (G4).
+**Checkpoint schema migration: in-flight `Blocked` runs are NOT silently resumed against a changed digest.** When a `LoopFamily`'s `ComponentIdentity.digest` changes (any strategy composition change in the family factory, or any code change inside a strategy that affects its content hash), in-flight `Blocked` runs whose checkpoint was produced by the prior digest cannot be safely resumed — the saved state may reference internal layouts or invariants the new code no longer honors. The resume path returns `LoopExit::Failed { reason_kind: CheckpointUnavailable }`; the run is terminated and users can re-submit. The framework **never** silently resumes against the new digest — that would be the silent-failure pattern the safety nets exist to prevent. This behavior is identical to `CHECKPOINT_SCHEMA_ID` mismatch detection (per WS-10 §3.5); the `ComponentIdentity.digest` is treated as part of the schema for resume-eligibility purposes. Operators deploying a strategy change should expect a small number of in-flight blocked runs to fail with `CheckpointUnavailable` and plan accordingly (e.g., quiesce blocked runs before a rolling deploy, or accept the cost).
 
 Loop families that legitimately repeat (e.g. routines polling the same capability on schedule) opt out by swapping `StopConditionStrategy` for one that ignores the signature ring.
 
@@ -549,7 +671,7 @@ Realistic parallelism: WS-0 ships first; then WS-1/2/3 and WS-3.5 land in parall
 - **Driver** — runner-facing trait `AgentLoopDriver` (`ironclaw_turns`). Single job: the contract `TurnRunner` calls. Implementations either bake a whole loop (legacy `TextOnlyModelReplyDriver`) or adapt the framework (`PlannedDriver`, non-generic).
 - **Planner** — `AgentLoopPlanner` (`pub`, sealed). Composition of nine strategies that defines a loop family. Strategy access lives on the `pub(crate)` extension trait `AgentLoopPlannerInternal`; extensions can hold `&dyn AgentLoopPlanner` but cannot reach into strategies.
 - **Executor** — `AgentLoopExecutor`, the canonical tick body. Public entry point is `execute_family(&LoopFamily, host, state)`.
-- **Strategy** — one swappable decision-procedure consulted by the executor at a specific point in the tick. All nine strategy traits are `pub(crate)` in `ironclaw_agent_loop`; only Builtin code can implement them. Extensions plug into the loop via hooks (PR #3523-comment-4435808547), not strategies.
+- **Strategy** — one swappable decision-procedure consulted by the executor at a specific point in the tick. All nine strategy traits are `pub(crate)` in `ironclaw_agent_loop`; only Builtin code can implement them. Extensions plug into the loop via hooks (§9.1), not strategies.
 - **State** — `LoopExecutionState`, value-immutable, rebound per tick. Strategy slots include `StopStrategyState` and `GateStrategyState` separately (no shared `control_state`).
 - **Run context** — `LoopRunContext`, immutable for the entire claimed run.
 - **Loop family** — `LoopFamily` (Builtin, sealed). Carries `id: LoopFamilyId`, `version: ComponentIdentity`, and an opaque planner. Constructed only by `families::*` factories. Resolved from `LoopFamilyRegistry` by id. Skeleton ships only `families::default()`.
@@ -559,3 +681,5 @@ Realistic parallelism: WS-0 ships first; then WS-1/2/3 and WS-3.5 land in parall
 ## 15. Credits
 
 The default loop mechanics — single async function, `Reply | CapabilityCalls` parent protocol, steering/follow-up queue ergonomics — are modeled on the [pi-mono](https://github.com/badlogic/pi-mono) `packages/agent` loop. Reborn's framework absorbs pi's hooks into typed ports (`LoopPromptPort`, `LoopCapabilityPort`, `LoopInputPort`) and adds production-grade safety nets (no-progress detection, retry budgets, gate suspension, evidence-validated `LoopExit`) that pi-mono's local-developer model doesn't need.
+
+**Review history.** Several sections of this spec — §4.5 (LoopFamily resolution), §6 (sealed strategies note), §9 / §9.1 (sealed strategies + hooks-as-middleware contract + checkpoint schema migration), §10 (denial telemetry, retry-budget durability, checkpoint-schema-on-resume), §12.5 (anticipated families) — were refined in response to review feedback on the spec's first round (PR #3544). Substantive review threads from serrrfirat (correctness seams + simplicity), zmanian (structural gaps + strategy↔hook coordination), and an Opus subagent review pass (cross-doc consistency + implementation feasibility) shaped the current shape. Worked decisions live inline in the relevant sections; this spec is meant to be read standalone without consulting PR threads.

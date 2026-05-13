@@ -172,8 +172,8 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
             // 4. Checkpoint BeforeModel
             state = self.checkpoint(host, state, CheckpointKind::BeforeModel).await?;
 
-            // 5. Stream model. On error, route through RecoveryStrategy
-            // (PR #3544 serrrfirat #4) — `on_model_error` is not dead code;
+            // 5. Stream model. On error, route through RecoveryStrategy —
+            // `on_model_error` is not dead code;
             // it gets a real call site here. The host port returns a
             // sanitized `ModelErrorSummary` (per WS-2 §3.3) and the
             // recovery strategy decides Retry/SkipResult/Abort. Skeleton
@@ -638,7 +638,7 @@ fn summary_of(call: &CapabilityCall, surface: &VisibleCapabilitySurface) -> Capa
 
 The concurrency hint comes from the visible-capability descriptor returned by `LoopCapabilityPort::visible_capabilities` earlier in the iteration. Unknown capabilities (not present in the surface — the model invented or hallucinated a name) are treated as `Exclusive` for safety; the host will reject the call at `invoke_capability_batch` time anyway, but the conservative hint prevents the loop from speculatively parallelizing alongside unknown calls.
 
-**Where `concurrency_hint` lives:** `CapabilityDescriptorView` (in `ironclaw_turns::run_profile::host`) gains a `concurrency_hint: ConcurrencyHint` field — additive contract change introduced by WS-0 (see [`state-and-checkpoints.md`](state-and-checkpoints.md) §2 EXTEND list). The hint is **derived at the adapter boundary** in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`) from the underlying `CapabilityDescriptor.effects` Vec: presence of any write/spawn/exclusive effect → `Exclusive`; otherwise → `SafeForParallel`. Lower-layer `CapabilityDescriptor` is NOT modified — `effects` is already the source of truth, and computing the hint at the view-layer adapter keeps the inference in one place. Tool authors don't have to remember to declare a hint correctly; they declare effects (which they already do), and the system infers conservatively. Addresses PR #3544 serrrfirat #7.
+**Where `concurrency_hint` lives:** `CapabilityDescriptorView` (in `ironclaw_turns::run_profile::host`) gains a `concurrency_hint: ConcurrencyHint` field — additive contract change introduced by WS-0 (see [`state-and-checkpoints.md`](state-and-checkpoints.md) §2 EXTEND list). The hint is **derived at the adapter boundary** in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`) from the underlying `CapabilityDescriptor.effects` Vec: presence of any write/spawn/exclusive effect → `Exclusive`; otherwise → `SafeForParallel`. Lower-layer `CapabilityDescriptor` is NOT modified — `effects` is already the source of truth, and computing the hint at the view-layer adapter keeps the inference in one place. Tool authors don't have to remember to declare a hint correctly; they declare effects (which they already do), and the system infers conservatively.
 
 ### 3.4 Checkpoint helper
 
@@ -701,8 +701,6 @@ per master doc §12 crate-ownership rule; concrete impl wraps the existing
 `CheckpointStateStore::put_checkpoint_state` in `ironclaw_loop_support`).
 WS-10's `load_checkpoint_payload` is its read-side dual.
 
-Addresses PR #3544 serrrfirat #3 (write-side payload-vs-state-ref flow
-ambiguity).
 
 ### 3.5 Cancellation observation
 
@@ -719,7 +717,7 @@ The host facade exposes a way to observe cancellation between strategy calls —
 | 7 | Inside the capability-batch loop, before each `gate().handle` | between successive outcome arms |
 | 8 | Inside the inner retry loop, before each `recovery().on_capability_error` | between retry attempts |
 
-Eight sites. Per master doc §10, strategies are sealed Builtin code that returns promptly; **cooperative cancellation at these awaited boundaries is sufficient without preemptive `tokio::select!` wrapping**. The boundary list IS the contract — adding a new strategy call to the executor MUST add a matching `CANCEL_BOUNDARY`. WS-8's integration suite includes a cancellation-fires-at-each-boundary test covering all eight sites. Addresses PR #3544 serrrfirat #6.
+Eight sites. Per master doc §10, strategies are sealed Builtin code that returns promptly; **cooperative cancellation at these awaited boundaries is sufficient without preemptive `tokio::select!` wrapping**. The boundary list IS the contract — adding a new strategy call to the executor MUST add a matching `CANCEL_BOUNDARY`. WS-8's integration suite includes a cancellation-fires-at-each-boundary test covering all eight sites.
 
 The boundary helper has one canonical name across all briefs: **`checkpoint_and_exit_if_cancelled`** (used by WS-6 as the consumer). Master doc §8 pseudocode and WS-13's `LoopCancellationPort` brief use the same name.
 
@@ -756,7 +754,7 @@ tracing::debug!(
 );
 ```
 
-Durable strategy-decision telemetry — a typed event log separate from `LoopProgressEvent` milestones — is deferred. When a production debugging need materializes (someone files a "why did the loop abort?" ticket that `tracing::debug!` doesn't answer), a follow-up workstream introduces `StrategyDecisionEvent` variants on `LoopProgressPort`. Until then, `tracing` is sufficient and avoids over-designing the observability surface. Addresses PR #3544 follow-up review (Opus reviewer Agent 3 §c gap).
+Durable strategy-decision telemetry — a typed event log separate from `LoopProgressEvent` milestones — is deferred. When a production debugging need materializes (someone files a "why did the loop abort?" ticket that `tracing::debug!` doesn't answer), a follow-up workstream introduces `StrategyDecisionEvent` variants on `LoopProgressPort`. Until then, `tracing` is sufficient and avoids over-designing the observability surface.
 
 ### 3.6 Host single-call invocation API
 

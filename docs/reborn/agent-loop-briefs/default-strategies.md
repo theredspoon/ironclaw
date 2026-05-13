@@ -312,7 +312,7 @@ impl BudgetStrategy for DefaultBudgetStrategy {
   - [ ] `DefaultModelStrategy.preference` returns `Primary` when `fallback_index == 0`, `Fallback { index: 2 }` when `fallback_index == 2`
   - [ ] `DefaultBatchPolicyStrategy.policy` returns `Sequential` when any call has `Exclusive` hint, `Parallel` otherwise; empty batch returns `Parallel`
   - [ ] `DefaultGateHandlingStrategy.handle` always returns `Block` for any kind
-  - [ ] `DefaultRecoveryStrategy` aborts on `Permanent`/`InputInvalid` immediately; **skips on `PolicyDenied`** (returns `SkipResult` per PR #3544 serrrfirat #5a — denied calls are dropped from the batch and the model is free to try another tool; no-progress detector catches stuck-on-denied loops); retries `Transient`/`Unavailable`/`Internal` up to `max_attempts_per_class` then aborts; backoff increases with attempt
+  - [ ] `DefaultRecoveryStrategy` aborts on `Permanent`/`InputInvalid` immediately; **skips on `PolicyDenied`** (returns `SkipResult` — denied calls are dropped from the batch and the model is free to try another tool; no-progress detector catches stuck-on-denied loops); retries `Transient`/`Unavailable`/`Internal` up to `max_attempts_per_class` then aborts; backoff increases with attempt
   - [ ] `DefaultStopConditionStrategy`:
     - all-results-terminate-hint case → `Stop { GracefulStop }`
     - same call signature pushed 3× into ring → `Stop { NoProgressDetected }`

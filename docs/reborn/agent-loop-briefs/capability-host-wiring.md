@@ -266,8 +266,7 @@ effect-derived default (e.g., a network call that's specifically
 declared parallel-safe by the author), the right path is to add an
 optional explicit override field on `CapabilityDescriptor` in a
 follow-up PR — but the skeleton derives conservatively from `effects`
-alone. Addresses PR #3544 Opus review §c gap (G1 in the review
-follow-up).
+alone.
 
 ### 3.3 `CapabilitySurfaceProfileFilter` decorator
 
@@ -575,7 +574,7 @@ Integration tests (in `crates/ironclaw_reborn`, gated behind
 
 ### 5.1 Composition-seam architecture test (PR #3523 follow-up)
 
-Per the hooks-as-middleware design recorded in PR #3523-comment-4435808547 (skeleton-side follow-up (a)), this brief adds a lightweight architecture test in `ironclaw_loop_support` that proves no crate other than `ironclaw_loop_support` constructs `HostRuntimeLoopCapabilityPort` directly. That gives the future hooks composition seam (which sits as middleware around `HostRuntimeLoopCapabilityPort` in this same crate) a free composition-bypass check: any code path that bypasses the middleware by reaching the raw capability port outside `ironclaw_loop_support` is caught by the test.
+Per the hooks-as-middleware design in master doc §9.1, this brief adds a lightweight architecture test in `ironclaw_loop_support` that proves no crate other than `ironclaw_loop_support` constructs `HostRuntimeLoopCapabilityPort` directly. That gives the future hooks composition seam (which sits as middleware around `HostRuntimeLoopCapabilityPort` in this same crate) a free composition-bypass check: any code path that bypasses the middleware by reaching the raw capability port outside `ironclaw_loop_support` is caught by the test.
 
 ```rust
 // crates/ironclaw_loop_support/tests/host_capability_port_composition.rs (NEW)
