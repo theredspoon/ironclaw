@@ -38,6 +38,7 @@ use thiserror::Error;
 
 use crate::LoopMessageRef;
 
+use super::snippet_ref::stable_skill_snippet_display_hash;
 use super::{
     AgentLoopHostError, AgentLoopHostErrorKind, LoopContextSnippet, LoopContextSnippetMetadata,
 };
@@ -130,8 +131,6 @@ impl SkillTrustLevel {
 const EMPTY_SNAPSHOT_VERSION: &str = "empty";
 const DEFAULT_MAX_SKILL_SNIPPET_BYTES: usize = 8 * 1024;
 const DEFAULT_MAX_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x00000100000001B3;
 
 /// Byte budgets for model-visible skill context produced by [`SkillContextService`].
 ///
@@ -407,7 +406,8 @@ pub fn skill_snippet_model_message_ref(
     ordinal: usize,
 ) -> Result<LoopMessageRef, AgentLoopHostError> {
     let slug = sanitize_ref_suffix(snippet_ref);
-    let hash = stable_snippet_ref_hash(snippet_ref, safe_summary, ordinal);
+    let ordinal = ordinal.to_string();
+    let hash = stable_skill_snippet_display_hash([snippet_ref, safe_summary, &ordinal]);
     LoopMessageRef::new(format!("msg:snippet.{slug}.{ordinal}.{hash:016x}")).map_err(|_| {
         AgentLoopHostError::new(
             AgentLoopHostErrorKind::Internal,
@@ -418,6 +418,21 @@ pub fn skill_snippet_model_message_ref(
 
 pub fn is_skill_snippet_model_message_ref(content_ref: &LoopMessageRef) -> bool {
     content_ref.as_str().starts_with("msg:snippet.")
+}
+
+#[cfg(test)]
+mod snippet_ref_tests {
+    use super::*;
+
+    #[test]
+    fn skill_snippet_model_message_ref_preserves_existing_hash() {
+        let content_ref =
+            skill_snippet_model_message_ref("skill:alpha", "summary", 0).expect("valid ref");
+        assert_eq!(
+            content_ref.as_str(),
+            "msg:snippet.skill.alpha.0.6e54cb74d742607c"
+        );
+    }
 }
 
 fn sanitize_ref_suffix(value: &str) -> String {
@@ -437,23 +452,6 @@ fn sanitize_ref_suffix(value: &str) -> String {
         "context".to_string()
     } else {
         suffix.to_string()
-    }
-}
-
-fn stable_snippet_ref_hash(snippet_ref: &str, safe_summary: &str, ordinal: usize) -> u64 {
-    let mut hash = FNV_OFFSET;
-    feed_hash(&mut hash, snippet_ref.as_bytes());
-    feed_hash(&mut hash, &[0xFF]);
-    feed_hash(&mut hash, safe_summary.as_bytes());
-    feed_hash(&mut hash, &[0xFF]);
-    feed_hash(&mut hash, ordinal.to_string().as_bytes());
-    hash
-}
-
-fn feed_hash(hash: &mut u64, bytes: &[u8]) {
-    for &byte in bytes {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(FNV_PRIME);
     }
 }
 
