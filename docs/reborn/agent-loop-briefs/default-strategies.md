@@ -74,8 +74,8 @@ pub struct DefaultCapabilityStrategy;
 
 #[async_trait]
 impl CapabilityStrategy for DefaultCapabilityStrategy {
-    async fn filter(&self, _state: &LoopExecutionState) -> CapabilityFilter {
-        CapabilityFilter::All  // host applies its own scope/grant filters
+    async fn filter(&self, _state: &LoopExecutionState) -> VisibleCapabilityFilter {
+        VisibleCapabilityFilter::All  // host applies its own scope/grant filters
     }
 }
 ```
@@ -308,7 +308,7 @@ impl BudgetStrategy for DefaultBudgetStrategy {
 - [ ] `cargo clippy --all --benches --tests --examples --all-features` zero warnings
 - [ ] Unit tests per strategy:
   - [ ] `DefaultContextStrategy::default().max_messages == 16`; `plan_context_request` returns `PromptMode::TextOnly` with `max_messages: Some(16)`, no inline messages
-  - [ ] `DefaultCapabilityStrategy.filter(...)` always returns `CapabilityFilter::All`
+  - [ ] `DefaultCapabilityStrategy.filter(...)` always returns `VisibleCapabilityFilter::All`
   - [ ] `DefaultModelStrategy.preference` returns `Primary` when `fallback_index == 0`, `Fallback { index: 2 }` when `fallback_index == 2`
   - [ ] `DefaultBatchPolicyStrategy.policy` returns `Sequential` when any call has `Exclusive` hint, `Parallel` otherwise; empty batch returns `Parallel`
   - [ ] `DefaultGateHandlingStrategy.handle` always returns `Block` for any kind

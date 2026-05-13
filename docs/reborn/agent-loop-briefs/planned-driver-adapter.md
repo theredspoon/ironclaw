@@ -14,8 +14,8 @@ Bridge the framework crate (`ironclaw_agent_loop`) to the runner-facing `AgentLo
 - `PlannedDriver` struct — **non-generic**. Holds `Arc<LoopFamily>` (opaque to this crate; produced by WS-3.5's registry) and `Arc<CanonicalAgentLoopExecutor>`. No `<P, E>` type parameters.
 - `impl AgentLoopDriver for PlannedDriver` — wires `run` and `resume` through to the executor.
 - Sanitized error mapping from `AgentLoopExecutorError` to `AgentLoopDriverError`.
-- Driver descriptor produced from the family's `LoopFamilyId` and `ComponentIdentity` (the framework's reserved checkpoint schema is `CHECKPOINT_SCHEMA_ID` from WS-0).
-- Constructor `PlannedDriver::from_family(family, executor)` — the canonical path. `TurnRunner` resolves a family from `Arc<LoopFamilyRegistry>` (WS-3.5) then constructs the driver. No direct planner injection exists.
+- Driver descriptor produced from the registry/profile `LoopDriverId`; the checkpoint payload separately records the family's `LoopFamilyId` and `ComponentIdentity` for resume compatibility (the framework's reserved checkpoint schema is `CHECKPOINT_SCHEMA_ID` from WS-0).
+- Constructor `PlannedDriver::from_family(driver_id, family, executor)` — the canonical path. `TurnRunner` resolves a family from `Arc<LoopFamilyRegistry>` (WS-3.5) then constructs the driver under the registry/profile driver id. No direct planner injection exists.
 
 ## 2. Files
 
@@ -51,7 +51,7 @@ use ironclaw_turns::{
     LoopExit, RunProfileVersion,
     run_profile::{
         AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverHost,
-        AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest,
+        AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, LoopDriverId,
     },
 };
 
@@ -84,14 +84,16 @@ impl PlannedDriver {
     /// Canonical construction path: `TurnRunner` resolves a family from
     /// `Arc<LoopFamilyRegistry>` (WS-3.5) and calls this constructor.
     pub fn from_family(
+        driver_id: LoopDriverId,
         family: Arc<LoopFamily>,
         executor: Arc<CanonicalAgentLoopExecutor>,
         version: RunProfileVersion,
     ) -> Result<Self, AgentLoopDriverError> {
-        // LoopFamilyId(pub &'static str) — the inner str is &'static,
-        // borrowing directly is safe and avoids the E0716 temporary-drop
-        // hazard of `.to_string().as_str()`.
-        let descriptor = AgentLoopDriverDescriptor::new(family.id().0, version)
+        // Driver id is a registry/profile identity, not the family id.
+        // The default registration passes "reborn:planned-default"; the
+        // checkpoint payload separately records LoopFamilyId + ComponentIdentity
+        // for resume compatibility.
+        let descriptor = AgentLoopDriverDescriptor::new(driver_id.as_str(), version)
             .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?
             .with_checkpoint_schema(CHECKPOINT_SCHEMA_ID, version)
             .map_err(|reason| AgentLoopDriverError::InvalidRequest { reason })?;
@@ -103,6 +105,7 @@ impl PlannedDriver {
     /// the driver. Returns an `AgentLoopDriverError::InvalidRequest` if the
     /// id is unbound.
     pub fn from_registry(
+        driver_id: LoopDriverId,
         registry: &LoopFamilyRegistry,
         id: &LoopFamilyId,
         executor: Arc<CanonicalAgentLoopExecutor>,
@@ -111,7 +114,7 @@ impl PlannedDriver {
         let family = registry.get(id).ok_or_else(|| AgentLoopDriverError::InvalidRequest {
             reason: format!("unknown loop family: {id}"),
         })?;
-        Self::from_family(family, executor, version)
+        Self::from_family(driver_id, family, executor, version)
     }
 }
 
@@ -125,7 +128,7 @@ impl AgentLoopDriver for PlannedDriver {
         host: &(dyn AgentLoopDriverHost + Send + Sync),
     ) -> Result<LoopExit, AgentLoopDriverError> {
         validate_run_request(&request, &self.descriptor)?;
-        let initial = LoopExecutionState::initial();
+        let initial = LoopExecutionState::initial(&request.run_context);
         // The executor consumes `&LoopFamily` directly. The
         // `pub(crate) fn planner()` accessor on `LoopFamily` is invisible
         // outside `ironclaw_agent_loop`, so `PlannedDriver` cannot reach
@@ -277,6 +280,7 @@ pub fn default_planned_driver(
     executor: Arc<CanonicalAgentLoopExecutor>,
 ) -> Result<PlannedDriver, AgentLoopDriverError> {
     PlannedDriver::from_registry(
+        LoopDriverId::from_trusted_static("reborn:planned-default"),
         family_registry,
         &LoopFamilyId::DEFAULT,
         executor,
@@ -297,8 +301,8 @@ when there's a real use case (typically the first follow-up loop-family PR).
 - [ ] `cargo clippy --all --benches --tests --examples --all-features` zero warnings
 - [ ] Existing `TextOnlyModelReplyDriver` unchanged; its tests still pass: `cargo test -p ironclaw_reborn -- text_loop_driver`
 - [ ] Trait conformance: `fn _check(_: &PlannedDriver) where PlannedDriver: AgentLoopDriver {}` (no generics)
-- [ ] Round-trip test: `PlannedDriver::from_registry(&registry, &LoopFamilyId::DEFAULT, executor, v1)` succeeds against `LoopFamilyRegistry::with_families(vec![Arc::new(families::default())])`; descriptor's `id` is `"default"`; descriptor's `checkpoint_schema_id` is `CHECKPOINT_SCHEMA_ID`
-- [ ] Resolution failure: `PlannedDriver::from_registry(&empty_registry, &LoopFamilyId("nope"), …)` returns `Err(InvalidRequest { reason: "unknown loop family: nope" })`
+- [ ] Round-trip test: `PlannedDriver::from_registry(LoopDriverId::from_trusted_static("reborn:planned-default"), &registry, &LoopFamilyId::DEFAULT, executor, v1)` succeeds against `LoopFamilyRegistry::with_families(vec![Arc::new(families::default())])`; descriptor's `id` is `"reborn:planned-default"`; descriptor's `checkpoint_schema_id` is `CHECKPOINT_SCHEMA_ID`; checkpoint metadata separately records `LoopFamilyId::DEFAULT`
+- [ ] Resolution failure: `PlannedDriver::from_registry(LoopDriverId::from_trusted_static("reborn:planned-default"), &empty_registry, &LoopFamilyId("nope"), …)` returns `Err(InvalidRequest { reason: "unknown loop family: nope" })`
 - [ ] Error-mapping tests:
   - `map_executor_error(HostUnavailable { stage: Model })` → `Unavailable { reason: "Model: unavailable" }`
   - `map_executor_error(CheckpointFailed { stage: BeforeModel })` → `Failed { reason_kind: "checkpoint_rejected:BeforeModel" }`

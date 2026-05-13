@@ -42,6 +42,7 @@ use async_trait::async_trait;
 use ironclaw_turns::run_profile::LoopPromptBundleRequest;
 
 use crate::state::LoopExecutionState;
+use ironclaw_turns::run_profile::VisibleCapabilityFilter;
 
 /// Decides what context the host should materialize for the next model call.
 ///
@@ -84,7 +85,7 @@ use crate::state::LoopExecutionState;
 /// only narrow, never expand.
 #[async_trait]
 pub trait CapabilityStrategy: Send + Sync {
-    async fn filter(&self, state: &LoopExecutionState) -> CapabilityFilter;
+    async fn filter(&self, state: &LoopExecutionState) -> VisibleCapabilityFilter;
 }
 
 /// Strategy-side narrowing of the visible capability surface.
@@ -92,7 +93,7 @@ pub trait CapabilityStrategy: Send + Sync {
 /// Variants are mutually exclusive. The host always applies its own
 /// scope/grant/auth filters on top — this filter only narrows.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum CapabilityFilter {
+pub enum VisibleCapabilityFilter {
     /// Allow everything the host would otherwise expose.
     All,
     /// Only the capabilities whose names appear in the set.
@@ -101,10 +102,15 @@ pub enum CapabilityFilter {
     Deny(Vec<ironclaw_turns::run_profile::CapabilityName>),
 }
 
-impl Default for CapabilityFilter {
-    fn default() -> Self { CapabilityFilter::All }
+impl Default for VisibleCapabilityFilter {
+    fn default() -> Self { VisibleCapabilityFilter::All }
 }
 ```
+
+`VisibleCapabilityFilter` lives in `ironclaw_turns`, not in
+`ironclaw_agent_loop`, because it is carried over the contract-level
+`VisibleCapabilityRequest`. The strategy crate imports the contract type;
+the contract crate never depends upward on strategies.
 
 If `CapabilityName` does not yet exist as a typed newtype in `ironclaw_turns`, this brief uses whatever name-shape the existing capability descriptor surface uses. Adding a new newtype is *not* in scope for WS-1; track in a follow-up if needed.
 
@@ -156,7 +162,7 @@ The `state.model_state.fallback_index` (defined in WS-0) feeds the typical defau
 - [ ] `cargo clippy --all --benches --tests --examples --all-features` zero warnings
 - [ ] Unit tests per file:
   - [ ] `context.rs` — has at least a doctest or compile-time test asserting `dyn ContextStrategy` is object-safe (`fn _check(_: &dyn ContextStrategy) {}`)
-  - [ ] `capability.rs` — `CapabilityFilter::default()` returns `All`; `serde_json` round-trip preserves variants
+- [ ] `capability.rs` — `VisibleCapabilityFilter::default()` returns `All`; `serde_json` round-trip preserves variants
   - [ ] `model.rs` — `ModelPreference::default()` returns `Primary`; `serde` snake-case round-trip
 - [ ] After WS-0 added `LoopPromptBundleRequest.inline_messages`: the existing `TextOnlyModelReplyDriver` still compiles and its tests pass unchanged (it never populates the field)
 

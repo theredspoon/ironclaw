@@ -223,15 +223,20 @@ pub fn default() -> LoopFamily {
         LoopFamilyId::DEFAULT,
         ComponentIdentity::new(
             "default",
-            // Digest derivation: blake3 over the canonicalized strategy
-            // composition fingerprint. Concrete derivation is the implementer's
-            // call at PR time — what matters is determinism and content-
-            // addressing. A static placeholder is acceptable for the
-            // skeleton; bump it on every strategy change.
-            ComponentDigest([0; 32]),
+            default_family_digest(),
         ),
         planner,
     )
+}
+
+fn default_family_digest() -> ComponentDigest {
+    // blake3 over the canonicalized strategy composition fingerprint:
+    // family id, strategy type identities, strategy config bytes, and the
+    // CHECKPOINT_SCHEMA_ID/version. This must be deterministic before any
+    // resume-compatible driver registration. A static zero digest is
+    // forbidden because it silently resumes old checkpoints under new planner
+    // semantics.
+    ComponentDigest::from_blake3(DEFAULT_FAMILY_FINGERPRINT_BYTES)
 }
 ```
 

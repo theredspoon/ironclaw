@@ -185,7 +185,7 @@ Each strategy is one small Rust trait with one or two methods. Default impls mod
 | Strategy | Decision it owns | Returns | Default behavior |
 |---|---|---|---|
 | `ContextStrategy` | What prompt mode + sections + optional inline messages to request | `LoopPromptBundleRequest` | `PromptMode::TextOnly`, all standard sections, no inline message, max 16 messages |
-| `CapabilityStrategy` | Which capabilities are visible this iteration | `CapabilityFilter` | All allowed; expect provider-tool encoding |
+| `CapabilityStrategy` | Which capabilities are visible this iteration | `VisibleCapabilityFilter` | All allowed; expect provider-tool encoding |
 | `ModelStrategy` | Which model preference to ask the host for | `ModelPreference` | Primary route only |
 | `BatchPolicyStrategy` | Sequential vs parallel for a capability batch | `BatchPolicy` | Parallel for read-only; sequential for writes |
 | `GateHandlingStrategy` | On Approval/Auth/Resource gate: block/skip/abort | `GateOutcome` (mutates `gate_state`) | Always block (checkpoint + return `LoopExit::Blocked`) |
@@ -200,7 +200,7 @@ Inline messages — the role pi's nudge mechanism plays — are produced by `Con
 
 **What `ContextStrategy` does not own:** the actual file-to-prompt assembly (loading `AGENTS.md`, `SOUL.md`, `USER.md`, etc., merging with SKILL.md content and the transcript, projecting to the model's message format) stays in the host's `LoopPromptPort` per §9. `ContextStrategy` only picks the *request shape*; the host materializes the bundle. Identity-file content reaches `LoopContextBundle.identity_messages` via the `HostIdentityContextSource` trait introduced in WS-15 ([`agent-loop-briefs/prompt-context-assembly.md`](agent-loop-briefs/prompt-context-assembly.md)) (host-side trait owned by `ironclaw_loop_support`; see §12 for the crate-ownership rule); SKILL.md content reaches `instruction_snippets` via the existing `HostSkillContextSource`; transcript reaches `messages` via the thread service. Strategies cannot influence which files are loaded — only which `PromptMode` and standard-section selectors are requested.
 
-Profile-scoped capability access (which tools the model sees) is similarly split: `CapabilityStrategy` picks a `CapabilityFilter` over the *already-resolved* surface; the per-run surface itself is materialized from `ResolvedRunProfile.capability_surface_profile_id` by WS-9's host-side resolver ([`agent-loop-briefs/capability-host-wiring.md`](agent-loop-briefs/capability-host-wiring.md)) — `CapabilitySurfaceProfileResolver` (host-side trait owned by `ironclaw_loop_support` per §12) — and frozen for the run.
+Profile-scoped capability access (which tools the model sees) is similarly split: `CapabilityStrategy` picks a `VisibleCapabilityFilter` over the *already-resolved* surface; the per-run surface itself is materialized from `ResolvedRunProfile.capability_surface_profile_id` by WS-9's host-side resolver ([`agent-loop-briefs/capability-host-wiring.md`](agent-loop-briefs/capability-host-wiring.md)) — `CapabilitySurfaceProfileResolver` (host-side trait owned by `ironclaw_loop_support` per §12) — and frozen for the run.
 
 ## 7. State model
 
@@ -274,26 +274,27 @@ loop:
   checkpoint_and_exit_if_cancelled()
 
   // 2. Steering drain. LoopInputPort surface is poll_inputs(after, limit) +
-  //    ack_inputs(cursor). Filter to user-facing kinds only — control kinds
-  //    (Cancel, Interrupt, GateResolved, CapabilitySurfaceChanged) are NOT
-  //    consumed here.
+  //    ack_inputs(exact_tokens). Partition to user-facing kinds only, stop at
+  //    the first control input, and never ack "through" a cursor.
   // CANCEL before drain.drain_steering
   if planner.drain().drain_steering(&state):
     pending = host.poll_inputs(state.input_cursor, MAX_PER_DRAIN)
-    (steering_msgs, last_consumed) = filter_steering_kinds(pending)
+    (steering_msgs, last_consumed, exact_ack_tokens) = partition_steering_kinds(pending)
     if !steering_msgs.is_empty():
       state.append_inputs(steering_msgs)
-      host.ack_inputs(last_consumed)
       state.input_cursor = last_consumed
+      pending_input_acks.extend(exact_ack_tokens)
 
   // CANCEL before context.plan_context_request
   ctx_req   = planner.context().plan_context_request(&state)
   bundle    = host.build_prompt_bundle(ctx_req)
   // CANCEL before capability.filter
-  surface   = host.visible_capabilities(planner.capability().filter(&state))
+  surface_filter = planner.capability().filter(&state)
+  surface   = host.visible_capabilities(VisibleCapabilityRequest { filter: surface_filter })
   state.surface_version = Some(surface.version)
 
   checkpoint(BeforeModel, &state)  // staged via host.stage_checkpoint_payload → state_ref → port.checkpoint(kind, state_ref)
+  host.ack_inputs(pending_input_acks.take())  // only after cursor is durable
 
   // CANCEL before model.preference
   model_pref = planner.model().preference(&state)
@@ -369,11 +370,9 @@ loop:
             // also deny at any time. Treat as a non-recoverable failure for
             // THIS call; consult Recovery to skip-and-continue or abort batch.
           SpawnedProcess(handle):
-            // Long-running async process. Checkpoint + return Blocked; resume
-            // when the process emits its completion event via LoopInputPort.
-            state.last_gate = Some(handle.gate_ref())
-            checkpoint(BeforeBlock, &state)
-            return LoopExit::Blocked { kind: ResourceWaitingForProcess, ... }
+            // Process-wait is intentionally out of skeleton scope. Current
+            // contracts have no ProcessWaiting blocked kind or resume input.
+            return LoopExit::Failed { UnsupportedProcessWait, ... }
           Failed(err):
             // Push failure kind ONCE per call (not per retry attempt) —
             // otherwise three retries of one call would falsely satisfy
@@ -447,7 +446,7 @@ Strategies and hooks are two distinct extension surfaces with non-overlapping re
 | **Crate** | `ironclaw_agent_loop` (Builtin-only, sealed) | `ironclaw_hooks` (Builtin / Trusted / Installed tiers) |
 | **Where it sits** | Inside the executor — composed via the planner facade's nine slots | Around host ports — composed via `ironclaw_loop_support` host factory as middleware |
 | **Sees** | `&LoopExecutionState` (refs only), strategy slots, `TurnSummary` | `LoopXxxPortRequest` / `LoopXxxPortResponse` DTOs (already redacted) |
-| **Returns** | `StopOutcome`, `RecoveryOutcome`, `CapabilityFilter`, `LoopPromptBundleRequest`, … | `HookDecision::{Allow, Deny, Mutate, Pause}` mapped to existing port outcomes |
+| **Returns** | `StopOutcome`, `RecoveryOutcome`, `VisibleCapabilityFilter`, `LoopPromptBundleRequest`, … | `HookDecision::{Allow, Deny, Mutate, Pause}` mapped to existing port outcomes |
 | **Mutates** | Its own state slot (immutable swap into next-tick state) | Nothing in loop state — only the request/response in flight |
 | **Failure mode** | Strategy bug ⇒ executor exits with `LoopExit::Failed` | Gate/mutator fails closed; observer/effect fails isolated |
 
@@ -549,7 +548,9 @@ Post-fact hooks are fully outside the executor — no skeleton change required f
 The skeleton is forward-compatible with the hooks design today because:
 
 - Executor only calls `AgentLoopDriverHost` traits — middleware can wrap freely.
-- The `Denied` and `SpawnedProcess` arms exist on the capability outcome match — without these, hook-deny would hit an unreachable arm.
+- The `Denied` arm exists on the capability outcome match — without it,
+  hook-deny would hit an unreachable arm. `SpawnedProcess` is recognized
+  only to fail closed until an explicit process-wait contract exists.
 - Gate outcomes already route through `GateHandlingStrategy` — pause-from-hook reuses pause-from-authority machinery.
 - `RecoveryStrategy::on_capability_error` is the natural funnel for `Denied` reasons — hook denials feed into the same retry-budget / abort logic as any other denial.
 - Checkpoint discipline is executor-owned — hooks cannot trigger checkpoints, which is the right invariant per the "hooks cannot grant authority" rule.
@@ -577,6 +578,15 @@ The `LoopFailureKind::NoProgressDetected` variant is added in `ironclaw_turns::l
 
 **Checkpoint schema migration: in-flight `Blocked` runs are NOT silently resumed against a changed digest.** When a `LoopFamily`'s `ComponentIdentity.digest` changes (any strategy composition change in the family factory, or any code change inside a strategy that affects its content hash), in-flight `Blocked` runs whose checkpoint was produced by the prior digest cannot be safely resumed — the saved state may reference internal layouts or invariants the new code no longer honors. The resume path returns `LoopExit::Failed { reason_kind: CheckpointUnavailable }`; the run is terminated and users can re-submit. The framework **never** silently resumes against the new digest — that would be the silent-failure pattern the safety nets exist to prevent. This behavior is identical to `CHECKPOINT_SCHEMA_ID` mismatch detection (per WS-10 §3.5); the `ComponentIdentity.digest` is treated as part of the schema for resume-eligibility purposes. Operators deploying a strategy change should expect a small number of in-flight blocked runs to fail with `CheckpointUnavailable` and plan accordingly (e.g., quiesce blocked runs before a rolling deploy, or accept the cost).
 
+**Stable identity context is checkpoint-pinned.** WS-15's process-local
+identity cache is only a read-through optimization. The stable identity
+candidate snapshot/digest is persisted in run or checkpoint metadata
+before a run can block/resume. Resume reloads that pinned snapshot; if
+it is missing or the digest mismatches, the driver returns
+`LoopExit::Failed { reason_kind: CheckpointUnavailable }` instead of
+rebuilding identity from current workspace files and silently changing
+the prompt prefix.
+
 Loop families that legitimately repeat (e.g. routines polling the same capability on schedule) opt out by swapping `StopConditionStrategy` for one that ignores the signature ring.
 
 ## 11. What this skeleton is not
@@ -603,9 +613,9 @@ These workstreams convert the skeleton from "framework that compiles and tests a
 
 | ID | Title | Crates | Brief | Unblocks |
 |----|-------|--------|-------|----------|
-| WS-9 | LoopCapabilityPort wired to host runtime, with profile-scoped surface | `ironclaw_loop_support` + `ironclaw_reborn` | [`capability-host-wiring.md`](agent-loop-briefs/capability-host-wiring.md) | Replace `EmptyLoopCapabilityPort` with `HostRuntimeLoopCapabilityPort` wrapping `CapabilityHost` (auth + approvals + audit at action time). Add `CapabilitySurfaceProfileFilter` decorator that materializes a `CapabilityAllowSet` snapshot from `ResolvedRunProfile.capability_surface_profile_id` via a host-owned `CapabilitySurfaceProfileResolver`, frozen per run (§5 layer-1). Capability calls actually execute; the model sees only the profile's allowed surface. |
+| WS-9 | LoopCapabilityPort wired to host runtime, with profile-scoped surface | `ironclaw_turns` + `ironclaw_loop_support` + `ironclaw_reborn` | [`capability-host-wiring.md`](agent-loop-briefs/capability-host-wiring.md) | Replace `EmptyLoopCapabilityPort` with `HostRuntimeLoopCapabilityPort` wrapping `CapabilityHost` (auth + approvals + audit at action time). Add `VisibleCapabilityRequest.filter` as the strategy-filter wire path. Add `CapabilitySurfaceProfileFilter` decorator that materializes a `CapabilityAllowSet` snapshot from `ResolvedRunProfile.capability_surface_profile_id` via a host-owned `CapabilitySurfaceProfileResolver`, frozen per run (§5 layer-1). Capability calls actually execute; the model sees only the strategy-narrowed profile surface. |
 | WS-10 | Checkpoint store + resume path | `ironclaw_turns` (trait extension) + `ironclaw_reborn` | [`checkpoint-store-and-resume.md`](agent-loop-briefs/checkpoint-store-and-resume.md) | Add `load_checkpoint_payload(LoadCheckpointPayloadRequest) -> LoadedCheckpointPayload` to `LoopCheckpointPort`. Extend the existing `HostManagedLoopCheckpointPort` (in `ironclaw_reborn`) with the read path over its already-composed `CheckpointStateStore` + `LoopCheckpointStore`; no new adapter. Wire `PlannedDriver::resume` against the load path. Resume from `Blocked` actually works. |
-| WS-11 | LoopInputPort implementation | `ironclaw_loop_support` (+ host-runtime queue PR) | [`loop-input-port.md`](agent-loop-briefs/loop-input-port.md) | Define a neutral `HostInputQueue` trait and `HostQueueLoopInputPort` adapter implementing `poll_inputs` + `ack_inputs`. Steering messages reach the model mid-loop; followup messages restart the loop after a natural stop. Concrete queue substrate is a host-runtime PR. |
+| WS-11 | LoopInputPort implementation | `ironclaw_turns` + `ironclaw_loop_support` (+ host-runtime queue PR) | [`loop-input-port.md`](agent-loop-briefs/loop-input-port.md) | Define a neutral `HostInputQueue` trait and `HostQueueLoopInputPort` adapter implementing `poll_inputs` + exact-token `ack_inputs`. Steering messages reach the model mid-loop; followup messages restart the loop after a natural stop; control inputs cannot be consumed by cursor-through acks. Concrete queue substrate is a host-runtime PR. |
 | WS-12 | LoopProgressPort wiring | `ironclaw_turns` (additive variants) + `ironclaw_reborn` | [`loop-progress-port.md`](agent-loop-briefs/loop-progress-port.md) | Adds additive `LoopProgressEvent` variants (`IterationStarted`, `PromptBundleBuilt`, `CapabilityBatchStarted/Completed`, `GateBlocked`, `CheckpointWritten`) and matching `LoopHostMilestoneEmitter` methods. Extends the existing `HostManagedLoopProgressPort` match (in `loop_driver_host.rs`) and `DurableLoopHostMilestoneSink::runtime_event_for_milestone` (in `milestone_events.rs`) so executor milestones reach the engine event substrate via the canonical milestone-sink fanout. |
 | WS-13 | Cancellation accessor on AgentLoopDriverHost | `ironclaw_turns` (trait extension) + `ironclaw_loop_support` | [`host-cancellation-accessor.md`](agent-loop-briefs/host-cancellation-accessor.md) | Add `LoopCancellationPort` (one sync method, idempotent reads) to the `AgentLoopDriverHost` supertrait list; ship `RunStateLoopCancellationPort` backed by a host-runtime-owned `RunCancellationHandle`. Locks the WS-6 §3.5 placeholder. |
 | WS-14 | PlannedDriver registration + run-profile selection | `ironclaw_reborn` + `ironclaw_turns` | [`planned-driver-registration.md`](agent-loop-briefs/planned-driver-registration.md) | Register `default_planned_driver()` in `DriverRegistry` under `reborn:planned-default` v1 with checkpoint schema `reborn:default-loop-v1` v1; add the `reborn-planned-default` profile to the resolver; cut over the resolver's implicit no-profile default to `reborn-planned-default`. **Live-default hard-gated on WS-9/10/11/12/13/15** — merge criterion is a real-host smoke test composing all adapters with no mocks. First default-path end-to-end run through the new framework. |
@@ -633,7 +643,7 @@ The framework is intentionally broad-scope — it serves multiple loop families 
 | Family | Status | Strategies it would override | Where durable family-specific state lives | Stress-test result |
 |---|---|---|---|---|
 | `default_family` | **Ships in skeleton** | (none — uses every `Default*Strategy`) | n/a (text-tool-use baseline carries no durable family state) | ✓ baseline |
-| `routine_family` | Hypothetical | `StopConditionStrategy` → `IgnoreRepetitionStop` (routines re-issue the same calls intentionally); `CapabilityStrategy` → fixed pre-curated `CapabilityFilter`; `InputDrainStrategy` → poll-on-schedule (drain when `state.iteration % interval == 0`) | Scheduled-poll cursors live in workspace; surfaced through a hypothetical `HostRoutineContextSource` (analogous to WS-15) | ✓ trait shapes accommodate. Indefinite runtime is a scheduler concern (re-invoke), not a loop concern (`BudgetStrategy::iteration_limit: u32` is fine; each routine invocation is finite) |
+| `routine_family` | Hypothetical | `StopConditionStrategy` → `IgnoreRepetitionStop` (routines re-issue the same calls intentionally); `CapabilityStrategy` → fixed pre-curated `VisibleCapabilityFilter`; `InputDrainStrategy` → poll-on-schedule (drain when `state.iteration % interval == 0`) | Scheduled-poll cursors live in workspace; surfaced through a hypothetical `HostRoutineContextSource` (analogous to WS-15) | ✓ trait shapes accommodate. Indefinite runtime is a scheduler concern (re-invoke), not a loop concern (`BudgetStrategy::iteration_limit: u32` is fine; each routine invocation is finite) |
 | `mission_family` | Hypothetical | `GateHandlingStrategy` → aggressive `Block` on every approval gate; `BudgetStrategy::wall_clock_limit` → `None`; `ContextStrategy` → load mission plan + completed milestones | Mission progress / milestones in workspace; surfaced through a hypothetical `HostMissionContextSource` | ✓ trait shapes accommodate. Mission state flows through prompt content, not strategy slots; `LoopExit::Blocked` + checkpoint resume handles multi-day pauses natively |
 | `coding_family` | Hypothetical | `CapabilityStrategy` → filter to coding tools; `BudgetStrategy::iteration_limit` → higher (e.g. 100); `BatchPolicyStrategy` → sequential (file edits are causally dependent) | n/a — model carries plan state through transcript; no separate durable state | ✓ trait shapes accommodate. Coding is mostly a capability-surface choice, not a loop-strategy choice |
 | `planning_family` | Hypothetical | `BatchPolicyStrategy` → sequential always; `BudgetStrategy::iteration_limit` → high; `ContextStrategy` → load "branches explored so far" | Plan tree / search state in workspace; surfaced through a hypothetical `HostPlanTreeContextSource` | ✓ trait shapes accommodate. "Backtracking" is model-driven (re-issue tool calls for an earlier branch); framework does not need a special backtrack primitive |

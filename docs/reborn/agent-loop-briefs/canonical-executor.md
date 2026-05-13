@@ -164,7 +164,9 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
             // CANCEL_BOUNDARY after build_prompt_bundle, before capability().filter
             let surface_filter = planner.capability().filter(&state).await;
             let surface = host
-                .visible_capabilities(/* applies surface_filter */)
+                .visible_capabilities(VisibleCapabilityRequest {
+                    filter: surface_filter,
+                })
                 .await
                 .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Capability })?;
             state.surface_version = Some(surface.version);
@@ -440,15 +442,13 @@ impl CanonicalAgentLoopExecutor {
                     }
                 }
                 CapabilityOutcome::SpawnedProcess(handle) => {
-                    // The host has spawned a long-running process whose
-                    // completion will arrive asynchronously via LoopInputPort
-                    // (`CapabilitySurfaceChanged` or `GateResolved` kinds).
-                    // The loop checkpoints and surfaces a Blocked exit so
-                    // TurnRunner can park the run; resume picks up when the
-                    // process emits its completion event.
-                    state.last_gate = Some(handle.gate_ref());
-                    state = self.checkpoint(host, state, CheckpointKind::BeforeBlock).await?;
-                    return Ok(/* propagate Blocked { kind: ResourceWaitingForProcess, … } */);
+                    // The skeleton does not define a process-wait protocol.
+                    // Current LoopBlockedKind has approval/auth/resource gates,
+                    // not ProcessWaiting, and ProcessHandleSummary has no
+                    // gate_ref/resume input contract. Do not invent one here:
+                    // spawned process waiting is rejected until the process
+                    // contract lands an explicit wait evidence + resume input.
+                    return Ok(/* propagate Failed { UnsupportedProcessWait } */);
                 }
                 CapabilityOutcome::Failed(err) => {
                     // Push the originating failure kind ONCE per call (not once
@@ -541,17 +541,18 @@ The early-return-via-wrapper pattern (where `execute_capability_batch` needs to 
 ```rust
 impl CanonicalAgentLoopExecutor {
     /// Drain the steering queue once. Calls `LoopInputPort::poll_inputs(after,
-    /// limit)` followed by `ack_inputs(cursor)` if any user-facing messages
-    /// came back. Updates `state.input_cursor` on success.
+    /// limit)`, partitions the returned envelopes, and records exact ack tokens
+    /// for the user-facing messages that were appended. The tokens are acked
+    /// only after the next checkpoint persists the advanced cursor.
     ///
     /// IMPORTANT: `LoopInputPort` carries multiple kinds — `UserMessage`,
     /// `Cancel`, `Interrupt`, `GateResolved`, `CapabilitySurfaceChanged`, etc.
-    /// This drain ONLY consumes user-facing message kinds for the steering
-    /// channel; control events (Cancel, Interrupt, GateResolved,
-    /// CapabilitySurfaceChanged) are NOT consumed here — they're handled by
-    /// dedicated executor paths (cancellation observation in §3.5; surface
-    /// version invalidation by re-checking `state.surface_version` next tick).
-    /// `ack_inputs` is called only with the cursor of consumed messages.
+    /// This drain ONLY consumes the contiguous user-facing prefix for the
+    /// steering channel. A control event before the next steering message wins:
+    /// return to the control path without moving `state.input_cursor` or acking
+    /// the later steering message. This avoids the old unsafe
+    /// `ack_through(cursor)` shape where `[Cancel, UserMessage]` either lost
+    /// the cancel or redelivered the user message forever.
     async fn drain_steering_into(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
@@ -561,13 +562,11 @@ impl CanonicalAgentLoopExecutor {
             .poll_inputs(state.input_cursor.clone(), MAX_PER_DRAIN)
             .await
             .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
-        let (steering_msgs, last_consumed_cursor) =
-            partition_steering_kinds(&batch);  // filters to UserMessage; tracks furthest cursor consumed
+        let DrainPartition { messages: steering_msgs, last_cursor, ack_tokens } =
+            partition_steering_kinds(&batch)?;  // stops at first control input
         if !steering_msgs.is_empty() {
-            host.ack_inputs(last_consumed_cursor.clone())
-                .await
-                .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
-            state.input_cursor = last_consumed_cursor;
+            state.input_cursor = last_cursor;
+            state.pending_input_acks.extend(ack_tokens);
             // Append steering_msgs into transcript-bound state — concrete shape
             // depends on how messages flow into the next prompt bundle (host-owned
             // projection per master doc §6).
@@ -591,14 +590,13 @@ impl CanonicalAgentLoopExecutor {
             .poll_inputs(state.input_cursor.clone(), MAX_PER_DRAIN)
             .await
             .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
-        let (followup_msgs, last_consumed_cursor) = partition_steering_kinds(&batch);
+        let DrainPartition { messages: followup_msgs, last_cursor, ack_tokens } =
+            partition_followup_kinds(&batch)?;
         if followup_msgs.is_empty() {
             return Ok((state, false));
         }
-        host.ack_inputs(last_consumed_cursor.clone())
-            .await
-            .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
-        state.input_cursor = last_consumed_cursor;
+        state.input_cursor = last_cursor;
+        state.pending_input_acks.extend(ack_tokens);
         Ok((state, true))
     }
 
@@ -690,10 +688,26 @@ impl CanonicalAgentLoopExecutor {
             .map_err(|_| AgentLoopExecutorError::CheckpointFailed { stage: kind })?;
 
         state.last_checkpoint = Some(CheckpointMarker { kind, iteration_at_checkpoint: state.iteration });
+        let pending_acks = std::mem::take(&mut state.pending_input_acks);
+        if !pending_acks.is_empty() {
+            host.ack_inputs(pending_acks)
+                .await
+                .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
+        }
         Ok(state)
     }
 }
 ```
+
+The pseudocode names `state.pending_input_acks` for locality; the real
+implementation should carry it as executor-local scratch
+(`PendingInputAcks` threaded beside `LoopExecutionState`), not as a
+serialized checkpoint field. The durable fact is the advanced
+`state.input_cursor` written by `checkpoint(...)`; acking after that
+checkpoint is a storage reclamation step. A crash before checkpoint
+redelivers the input from the old cursor. A crash after checkpoint but
+before ack resumes from the advanced cursor and therefore does not
+re-append the already-checkpointed message.
 
 `stage_checkpoint_payload` is a small additive method on
 `AgentLoopDriverHost` introduced by this brief (lives in `ironclaw_turns`

@@ -1,10 +1,9 @@
 # WS-9 — `LoopCapabilityPort` Wired to Host Runtime (with Profile-Scoped Surface)
 
 **Workstream:** WS-9 (follow-up; not in the skeleton WS-0..WS-8 set)
-**Crates touched:** `ironclaw_loop_support` + `ironclaw_reborn`
-(no `ironclaw_turns` change — `LoopCapabilityPort` already exists;
-`ResolvedRunProfile.capability_surface_profile_id` already names the
-surface)
+**Crates touched:** `ironclaw_turns` + `ironclaw_loop_support` +
+`ironclaw_reborn` (`LoopCapabilityPort` already exists, but
+`VisibleCapabilityRequest` grows the strategy filter field)
 **Depends on:** WS-7 (`PlannedDriver` adapter), WS-8 (skeleton green)
 **Parallel with:** WS-10..WS-15
 **Master doc:** [`../agent-loop-skeleton.md`](../agent-loop-skeleton.md) §11–§12
@@ -44,17 +43,18 @@ Crate ownership (per master doc §12 follow-up rule):
   `crates/ironclaw_reborn/tests/loop_driver_host.rs` is the template).
 - **Composition wiring** — `ironclaw_reborn` (composes the two in
   `planned_driver.rs` host setup).
-- **Contract crate** — `ironclaw_turns` is **untouched**. The fields
-  on `ResolvedRunProfile.capability_surface_profile_id` and the
-  `LoopCapabilityPort` trait are already sufficient.
+- **Contract crate** — `ironclaw_turns` owns the wire filter:
+  `VisibleCapabilityRequest { filter: VisibleCapabilityFilter }`.
+  `ResolvedRunProfile.capability_surface_profile_id` still names the
+  profile-owned surface; the strategy filter can only narrow it.
 
 ## 2. Files
 
 ### NEW
 - `crates/ironclaw_loop_support/src/capability_port.rs` —
   `HostRuntimeLoopCapabilityPort`, real impl wrapping `CapabilityHost`
-  via the neutral `CapabilityDispatcher` trait surface that
-  `ironclaw_capabilities` already exposes.
+  (or a host-owned facade above it). This port must not call
+  `CapabilityDispatcher` directly.
 - `crates/ironclaw_loop_support/src/capability_surface_filter.rs` —
   `CapabilitySurfaceProfileFilter` decorator implementing
   `LoopCapabilityPort`. Owns the `CapabilityAllowSet` snapshot.
@@ -68,14 +68,14 @@ Crate ownership (per master doc §12 follow-up rule):
   re-exports.
 - `crates/ironclaw_reborn/src/planned_driver.rs` (lands in WS-7) —
   host composition takes a `Arc<dyn CapabilitySurfaceProfileResolver>`
-  and a runtime `Arc<dyn CapabilityDispatcher>`; wraps the two ports
-  in the order shown in §1.
+  and a runtime `Arc<dyn CapabilityHost>` (or facade); wraps the two
+  ports in the order shown in §1.
 
 ### NOT TOUCHED
-- `crates/ironclaw_turns/**` — the contract crate stays clean. Its
-  CLAUDE.md guardrails ("Do not depend on or re-export raw
-  `CapabilityHost`, dispatcher, …") prohibit putting a concrete
-  allowset type on `ResolvedRunProfile`.
+- `crates/ironclaw_turns/**` must not depend on concrete
+  `CapabilityHost`, dispatcher, or runtime allowset types. The only
+  turns-side change is the neutral `VisibleCapabilityFilter` enum and
+  request field.
 - `crates/ironclaw_capabilities/**` — `CapabilityHost`'s own surface
   is unchanged; we consume it.
 - `crates/ironclaw_reborn/tests/loop_driver_host.rs` — the test
@@ -84,6 +84,37 @@ Crate ownership (per master doc §12 follow-up rule):
   driver composes; tests can switch to importing it once they exist.
 
 ## 3. Specification
+
+### 3.0 Contract request filter
+
+```rust
+//! crates/ironclaw_turns/src/run_profile/host.rs
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VisibleCapabilityRequest {
+    pub filter: VisibleCapabilityFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibleCapabilityFilter {
+    All,
+    AllowOnly(Vec<CapabilityName>),
+    Deny(Vec<CapabilityName>),
+}
+
+impl Default for VisibleCapabilityFilter {
+    fn default() -> Self { Self::All }
+}
+```
+
+This is the wire path for `CapabilityStrategy::filter`. Without this
+field a non-default loop family can compute a narrower surface but the
+executor has no way to send it to the host, so the model still sees the
+full profile surface. Host-side filtering order is fixed:
+`CapabilityHost` auth/grant/approval filtering →
+`VisibleCapabilityFilter` (family can only narrow) →
+`CapabilitySurfaceProfileFilter` allowset.
 
 ### 3.1 `CapabilityAllowSet` value type
 
@@ -161,7 +192,7 @@ decorator, not in the contract.
 //! crates/ironclaw_loop_support/src/capability_port.rs
 
 use async_trait::async_trait;
-use ironclaw_capabilities::CapabilityDispatcher;     // neutral trait
+use ironclaw_capabilities::CapabilityHost;
 use ironclaw_turns::run_profile::{
     AgentLoopHostError, CapabilityBatchInvocation, CapabilityBatchOutcome,
     CapabilityInvocation, CapabilityOutcome, LoopCapabilityPort,
@@ -170,7 +201,7 @@ use ironclaw_turns::run_profile::{
 use std::sync::Arc;
 
 pub struct HostRuntimeLoopCapabilityPort {
-    dispatcher: Arc<dyn CapabilityDispatcher>,
+    capability_host: Arc<dyn CapabilityHost>,
 }
 
 #[async_trait]
@@ -179,32 +210,35 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
         &self,
         request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
-        // dispatcher.enumerate() returns its own descriptor type;
-        // adapter maps to CapabilityDescriptorView. Surface version
-        // is the dispatcher's current registration fingerprint.
-        Ok(self.dispatcher.enumerate_surface(request).await?)
+        // CapabilityHost returns its own descriptor type after applying
+        // host-owned authorization, approval, lease, audit, and obligation
+        // boundaries. The adapter maps to CapabilityDescriptorView. Surface
+        // version is the host-visible registration/grant fingerprint.
+        Ok(self.capability_host.visible_surface(request).await?)
     }
 
     async fn invoke_capability(
         &self,
         request: CapabilityInvocation,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
-        Ok(self.dispatcher.invoke_json(request).await?)
+        Ok(self.capability_host.invoke_json(request).await?)
     }
 
     async fn invoke_capability_batch(
         &self,
         request: CapabilityBatchInvocation,
     ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
-        Ok(self.dispatcher.invoke_batch(request).await?)
+        Ok(self.capability_host.invoke_batch(request).await?)
     }
 }
 ```
 
-The exact `CapabilityDispatcher` method names are owned by
+The exact `CapabilityHost` method names are owned by
 `ironclaw_capabilities` — implementer should match the current names
 at PR time. Adapter only translates types and surfaces; no policy
-logic.
+logic. Direct dispatcher invocation from this port is forbidden because
+the turns contract requires every model-triggered effect to pass through
+`CapabilityHost` for grants, approvals, leases, audit, and obligations.
 
 ### 3.2a `EffectKind → ConcurrencyHint` mapping
 
@@ -277,8 +311,8 @@ use async_trait::async_trait;
 use ironclaw_turns::run_profile::{
     AgentLoopHostError, CapabilityBatchInvocation, CapabilityBatchOutcome,
     CapabilityDenied, CapabilityDeniedReasonKind, CapabilityInvocation,
-    CapabilityOutcome, LoopCapabilityPort, VisibleCapabilityRequest,
-    VisibleCapabilitySurface,
+    CapabilityOutcome, LoopCapabilityPort, LoopProgressPort,
+    VisibleCapabilityRequest, VisibleCapabilitySurface,
 };
 use std::sync::Arc;
 use crate::capability_allow_set::CapabilityAllowSet;
@@ -286,6 +320,7 @@ use crate::capability_allow_set::CapabilityAllowSet;
 pub struct CapabilitySurfaceProfileFilter {
     inner: Arc<dyn LoopCapabilityPort>,
     allow_set: Arc<CapabilityAllowSet>,
+    progress: Arc<dyn LoopProgressPort>,
 }
 
 #[async_trait]
@@ -294,7 +329,9 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
         &self,
         request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        let filter = request.filter.clone();
         let mut surface = self.inner.visible_capabilities(request).await?;
+        apply_strategy_filter(&mut surface, &filter);
         if let CapabilityAllowSet::Allowlist(_) = self.allow_set.as_ref() {
             surface.descriptors.retain(|d| self.allow_set.permits(&d.capability_id));
             // surface.version is NOT re-derived from the filtered list —
@@ -308,6 +345,9 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
         request: CapabilityInvocation,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
         if !self.allow_set.permits(&request.capability_id) {
+            self.progress
+                .record_capability_denied(request.capability_id.clone(), surface_profile_denied_kind())
+                .await?;
             return Ok(CapabilityOutcome::Denied(CapabilityDenied {
                 reason_kind: surface_profile_denied_kind(),
                 safe_summary: "capability not in run-profile surface".into(),
@@ -490,12 +530,15 @@ same call class in a row trip `NoProgressDetected` and exit cleanly.
 
 Audit (`ActionRecord`), approval gates, resource leases, obligations,
 and process spawning all live below `CapabilityHost` and are exercised
-by `HostRuntimeLoopCapabilityPort` invocation passthrough. The filter
-does **not** record its own audit entries for denials at this layer
-— a profile-filter denial means the call never reaches `CapabilityHost`
-and is therefore not auditable as a real attempted invocation. If
-profile-deny audit is needed in future, surface it through
-`LoopProgressPort` milestones (WS-12) rather than the action log.
+by `HostRuntimeLoopCapabilityPort` invocation passthrough. Profile-filter
+denials happen before `CapabilityHost`, so they do **not** create a tool
+action record, but they still need durable redacted telemetry:
+`CapabilitySurfaceProfileFilter` emits a WS-12 progress milestone
+(`CapabilityDenied { reason: SurfaceProfileDenied, capability_id }`)
+before returning `CapabilityOutcome::Denied`. Caller-level tests must
+prove two facts together: denied/unapproved calls never reach the inner
+dispatcher, and the denial/approval evidence is still recorded through
+the host-owned telemetry path.
 
 ## 4. Composition in `PlannedDriver`
 
@@ -504,7 +547,8 @@ profile-deny audit is needed in future, surface it through
 
 pub struct PlannedDriverConfig {
     // ... existing fields ...
-    pub capability_dispatcher: Arc<dyn CapabilityDispatcher>,
+    pub capability_host: Arc<dyn CapabilityHost>,
+    pub progress_port: Arc<dyn LoopProgressPort>,
     pub surface_resolver: Arc<dyn CapabilitySurfaceProfileResolver>,
 }
 
@@ -521,9 +565,13 @@ impl PlannedDriver {
                 ))?
         );
         let inner = Arc::new(HostRuntimeLoopCapabilityPort::new(
-            self.config.capability_dispatcher.clone(),
+            self.config.capability_host.clone(),
         )) as Arc<dyn LoopCapabilityPort>;
-        Ok(Arc::new(CapabilitySurfaceProfileFilter::new(inner, allow_set)))
+        Ok(Arc::new(CapabilitySurfaceProfileFilter::new(
+            inner,
+            allow_set,
+            self.config.progress_port.clone(),
+        )))
     }
 }
 ```
@@ -539,9 +587,18 @@ Unit tests (in `crates/ironclaw_loop_support`):
 - `capability_allow_set::tests::allowlist_permits_listed`.
 - `capability_surface_filter::tests::visible_capabilities_filters_descriptors`
   — inner returns 5 descriptors, allowlist of 2, surface returns 2.
+- `capability_surface_filter::tests::strategy_filter_narrows_visible_surface`
+  — request filter `AllowOnly(["memory_read"])` plus profile allowset of
+  three capabilities returns only `memory_read`.
 - `capability_surface_filter::tests::invoke_denied_when_not_in_allowlist`
   — inner port spy receives zero invocations; outcome is `Denied`
   with `surface_profile_denied` reason.
+- `capability_surface_filter::tests::profile_denial_records_redacted_progress`
+  — denied call records the WS-12 denial milestone and still sends zero
+  calls to the inner `CapabilityHost`.
+- `host_runtime_capability_port::tests::unapproved_call_never_reaches_dispatcher`
+  — host facade returns `ApprovalRequired`; dispatcher spy remains
+  untouched while approval telemetry is recorded.
 - `capability_surface_filter::tests::batch_partitions_correctly` —
   mixed batch: 2 allowed + 1 denied; inner receives only the 2
   allowed; final outcomes ordering matches the input ordering with

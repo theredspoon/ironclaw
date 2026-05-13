@@ -60,7 +60,7 @@ The per-strategy state slot *types* (`ContextStrategyState`, `RecoveryStrategySt
 
 use ironclaw_turns::{
     LoopFailureKind, LoopGateRef, LoopMessageRef, LoopResultRef,
-    run_profile::{LoopInputCursor, VisibleSurfaceVersion},
+    run_profile::{LoopInputCursor, LoopRunContext, VisibleSurfaceVersion},
 };
 
 /// Immutable execution state threaded through the loop.
@@ -101,7 +101,12 @@ pub struct LoopExecutionState {
 
 impl LoopExecutionState {
     /// Builds the initial state at the start of a fresh run.
-    pub fn initial() -> Self { /* default everything to zero / empty */ }
+    pub fn initial(run_context: &LoopRunContext) -> Self {
+        Self {
+            input_cursor: LoopInputCursor::origin_for_run(run_context),
+            /* default everything else to zero / empty */
+        }
+    }
 
     /// Rehydrates state from a checkpoint payload's bytes. The bytes come
     /// from `LoopCheckpointPort::load_checkpoint_payload(...)` (defined in
@@ -382,7 +387,9 @@ pub enum CheckpointPayloadError {
   - [ ] `BoundedRing::same_run_length` returns 0 for empty, 1 for distinct trailing items, N for trailing run of N
   - [ ] `CapabilityCallSignature::from_call` is **JCS-stable** (RFC 8785) — produces the same `ArgsHash` for any two `serde_json::Value` instances that are JCS-equivalent (reordered object keys, equivalent whitespace, equivalent number representation). Cover at minimum: key reordering, pretty-printed vs minified inputs, nested objects with shuffled keys at multiple depths
   - [ ] `CapabilityCallSignature::from_call` returns an error (does not panic, does not silently hash) on `serde_json::Value::Number` instances that are NaN or Infinity (per §3.4a rule 2)
-  - [ ] `LoopExecutionState::initial()` produces value-equal results across calls
+  - [ ] `LoopExecutionState::initial(&run_context)` seeds
+    `input_cursor == LoopInputCursor::origin_for_run(&run_context)` and
+    produces value-equal results across calls for the same context
   - [ ] `LoopExecutionState` round-trips through `serde_json` (serialize → deserialize → equal)
   - [ ] `LoopExecutionState::from_checkpoint_payload` rejects mismatched schema ids with `SchemaMismatch`
 - [ ] `cargo test -p ironclaw_turns` — existing tests pass; new tests assert `LoopFailureKind::NoProgressDetected` serializes as `"no_progress_detected"` and `LoopFailureKind::PolicyDenied` serializes as `"policy_denied"`

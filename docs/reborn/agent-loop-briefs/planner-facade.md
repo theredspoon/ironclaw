@@ -137,7 +137,7 @@ impl DefaultPlanner {
     pub(crate) fn compose_default() -> Self {
         Self {
             id: LoopFamilyId::DEFAULT,
-            version: ComponentIdentity::new("default", ComponentDigest([0; 32])),
+            version: ComponentIdentity::new("default", families::default_family_digest()),
             context: Arc::new(DefaultContextStrategy::default()),
             capability: Arc::new(DefaultCapabilityStrategy::default()),
             model: Arc::new(DefaultModelStrategy::default()),

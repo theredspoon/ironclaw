@@ -405,8 +405,21 @@ impl PlannedDriver {
 
 `RunCancellationFactory` lives in `ironclaw_loop_support`. The host
 runtime's implementation taps the existing two-phase cancellation
-observer in `TurnCoordinator` and wires the flip into a per-run
-record of `RunCancellationHandle`s.
+observer in `TurnCoordinator` and wires the flip into a per-run record
+of `RunCancellationHandle`s. Construction is a three-step race-safe
+protocol:
+
+1. Read durable run state before returning the handle. If the run is
+   already `CancelRequested`, seed the handle as fired.
+2. Register/subscribe the handle with the host-runtime cancellation
+   broadcaster for future flips.
+3. Re-read durable run state after registration and fire the handle if
+   cancellation landed between steps 1 and 2.
+
+A fresh clear handle for an already-cancelled run is invalid: resume
+could continue into prompt/model/tool side effects after durable
+cancellation. The implementation must close the late-subscriber race
+with the recheck above.
 
 ## 5. Verification
 
@@ -426,6 +439,12 @@ Unit tests (in `crates/ironclaw_loop_support`):
   concurrent test: thread A flips, thread B busy-loops on
   `observe_cancellation`. When B sees `Some`, the signal payload
   must be readable. Guards the atomic-then-lock memory ordering.
+- `cancellation_port::tests::factory_seeds_prefired_cancel_state` —
+  durable run state is already `CancelRequested` before
+  `handle_for_run`; returned handle observes cancellation immediately.
+- `cancellation_port::tests::factory_rechecks_after_subscription` —
+  cancellation flips between initial durable read and broadcaster
+  registration; returned handle still observes cancellation.
 - `cancellation_port::tests::always_alive_port_returns_none` —
   trivial coverage of the test stub.
 

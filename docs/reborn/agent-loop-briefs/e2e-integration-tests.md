@@ -172,7 +172,9 @@ impl CheckpointRecorder {
 ```rust
 pub struct LoopExecutionStateBuilder { state: LoopExecutionState }
 impl LoopExecutionStateBuilder {
-    pub fn new() -> Self { Self { state: LoopExecutionState::initial() } }
+    pub fn new(run_context: &LoopRunContext) -> Self {
+        Self { state: LoopExecutionState::initial(run_context) }
+    }
     pub fn iteration(mut self, i: u32) -> Self;
     pub fn push_call_signature(mut self, sig: CapabilityCallSignature) -> Self;  // for repetition tests
     pub fn push_failure_kind(mut self, kind: LoopFailureKind) -> Self;            // for run-length tests
@@ -236,12 +238,13 @@ Pulls fixtures from `ironclaw_agent_loop::test_support` via dev-dependencies wit
 
 | Test | Setup | Asserts |
 |---|---|---|
-| `default_planned_driver_smoke` | `default_planned_driver()` + scripted MockHost (`reply_only`) | `driver.run(req, &host)` returns `Ok(LoopExit::Completed)`; descriptor id is `"reborn:default-loop"` |
+| `default_planned_driver_smoke` | `default_planned_driver()` + scripted MockHost (`reply_only`) | `driver.run(req, &host)` returns `Ok(LoopExit::Completed)`; descriptor id is `"reborn:planned-default"` |
 | `planned_driver_resume_round_trip` | Run to `Blocked`; reload checkpoint; resume to `Completed` | Two-phase exit; assistant ref present at end |
 | `planned_driver_executor_error_maps_to_unavailable` | Mock host returns failure on `stream_model` (HostUnavailable) | `Err(AgentLoopDriverError::Unavailable { reason: "Model: unavailable" })`; debug output contains no raw provider strings, no host paths, no secret-shaped strings |
 | `planned_driver_cancellation_returns_cancelled_exit` | Mock host's cancellation accessor flips to `true` between turns | `driver.run(...)` returns **`Ok(LoopExit::Cancelled(...))`** (not `Err`); `reason_kind` is `HostInterrupt` or `HostCancellation`; `interrupted_message_refs` populated; checkpoint id present. *Locks Issue 2 fix: cancellation is a successful exit, not an error.* |
 | `planned_driver_cancellation_checkpoint_failure_maps_to_failed_interrupted` | Mock host cancels AND fails the cancellation checkpoint write | `Err(AgentLoopDriverError::Failed { reason_kind: "interrupted_unexpectedly" })`. *Locks Issue 2 fix: residual `Cancelled` executor error maps to `Failed { interrupted_unexpectedly }`, NOT `Unavailable`.* |
 | `planned_driver_no_raw_payloads_in_error` | Mock host returns a sanitized error containing strings like `"sk-fake"`, `"/host/path"` | Returned `AgentLoopDriverError`'s `Debug` output does NOT contain those strings (mirror existing `text_loop_driver` test pattern) |
+| `planned_driver_non_default_filter_narrows_visible_surface` | Custom family strategy returns `VisibleCapabilityFilter::AllowOnly(["memory_read"])`; host profile exposes `memory_read`, `memory_write`, `http` | Model request sees only `memory_read`; the host request captured `VisibleCapabilityRequest.filter`, proving the strategy filter crosses the wire. |
 
 ## 5. Acceptance criteria
 

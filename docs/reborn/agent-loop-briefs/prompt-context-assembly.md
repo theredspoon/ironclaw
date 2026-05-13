@@ -419,12 +419,17 @@ wasteful and opens a race window where a file changes mid-run and the
 prefix flips. Required behavior:
 
 - For **stable** files (per §3.3.5), `ThreadBackedLoopContextPort`
-  MUST cache the raw `Vec<HostIdentityContextCandidate>` for the run
-  on first `load_loop_context()` call and reuse it on subsequent calls.
-  Recommended representation: `Arc<OnceLock<Vec<HostIdentityContextCandidate>>>`
-  keyed off `LoopRunContext.run_id`. **Per-call filtering MUST happen
-  after cache retrieval** — `build_identity_messages` re-applies
-  `applies_when` against the request's `PromptMode` on every call.
+  MUST pin the raw `Vec<HostIdentityContextCandidate>` for the run on
+  first `load_loop_context()` call and reuse that pinned snapshot on
+  subsequent calls, including resume after process restart. The pin is
+  durable: store either the snapshot bytes or a `StableIdentitySnapshotRef`
+  plus digest in run/checkpoint metadata before any blocking checkpoint
+  can resume through this driver. A process-local
+  `Arc<OnceLock<Vec<HostIdentityContextCandidate>>>` is only a
+  read-through cache for that durable snapshot, not the source of truth.
+  **Per-call filtering MUST happen after snapshot retrieval** —
+  `build_identity_messages` re-applies `applies_when` against the
+  request's `PromptMode` on every call.
   *Why not cache the filtered `Vec<LoopContextMessage>`:* `PromptMode`
   can change between iterations (a `PlannedDriver`'s `ContextStrategy`
   may switch from `TextOnly` to `CodeAct` or vice versa per turn).
@@ -440,6 +445,13 @@ prefix flips. Required behavior:
 - Implementations MUST NOT install file watchers in v1 — file
   changes mid-run are explicitly out of scope under the master doc §5
   layer-1 immutability rule.
+- On resume, the host reloads the pinned snapshot by ref/digest. If the
+  snapshot is missing or its digest does not match the checkpoint/run
+  metadata, resume fails closed with `LoopExit::Failed {
+  reason_kind: CheckpointUnavailable }` rather than rebuilding identity
+  from current workspace files. If a future migration wants to accept
+  identity drift, it needs an explicit migration policy and audit event;
+  silent drift is forbidden.
 
 ### 3.5 Mode plumbing note
 
@@ -546,6 +558,14 @@ Unit tests (in `crates/ironclaw_loop_support`):
   invoke `load_loop_context()` twice on the same port; the mock
   identity source is called exactly once and both returned bundles
   are byte-equal. Guards the §3.4.5 per-run caching contract.
+- `lib::tests::context_port_resume_uses_pinned_identity_snapshot` —
+  seed a durable stable-identity snapshot, restart the port with a
+  source that now returns different file bytes, and assert the resumed
+  prompt uses the pinned snapshot.
+- `lib::tests::context_port_resume_rejects_identity_digest_drift` —
+  checkpoint metadata points at a snapshot whose digest no longer
+  matches; assert resume maps to `CheckpointUnavailable` instead of
+  rebuilding from current workspace files.
 
 Unit tests (in `crates/ironclaw_turns`):
 - `prompt::tests::identity_message_with_ref_maps_to_content_ref` —
@@ -592,6 +612,10 @@ Integration test (in `crates/ironclaw_reborn`):
   workstream. `identity_source = None` is acceptable for legacy tests
   and explicit non-default profiles, but not for WS-14's live default
   cutover.
+- Stable identity snapshots are part of resume compatibility. Operators
+  may edit `AGENTS.md`/`TOOLS.md` while a run is blocked, but the resumed
+  attempt keeps the checkpoint-pinned snapshot or fails closed if that
+  snapshot cannot be loaded.
 
 ## 7. Out of scope (for this brief)
 

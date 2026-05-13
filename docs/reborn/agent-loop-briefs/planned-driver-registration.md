@@ -184,7 +184,12 @@ pub fn default_planned_driver(
         .get(&LoopFamilyId::DEFAULT)
         .expect("LoopFamilyRegistry::builtin always binds DEFAULT");
     let executor = Arc::new(CanonicalAgentLoopExecutor::default());
-    let driver = PlannedDriver::from_family(family, executor, PLANNED_DRIVER_DEFAULT_VERSION)
+    let driver = PlannedDriver::from_family(
+        planned_driver_default_id(),
+        family,
+        executor,
+        PLANNED_DRIVER_DEFAULT_VERSION,
+    )
         .expect("default family + framework checkpoint schema validate");
 
     let descriptor = AgentLoopDriverDescriptor::from_trusted_static_with_checkpoint(
@@ -365,10 +370,10 @@ let runner = TurnRunner::new(/* … */).with_registry(driver_registry);
 `planned_driver_config: PlannedDriverConfig` is composed at startup
 from the parallel-follow-up adapters:
 
-- WS-9: `capability_dispatcher`, `surface_resolver`
+- WS-9: `capability_host`, `surface_resolver`
 - WS-10: `checkpoint_state_store`, `checkpoint_metadata_store`
 - WS-11: `input_queue`
-- WS-12: `event_sink: Some(...)`
+- WS-12: `event_sink: Some(...)`, `progress_port`
 - WS-13: `cancellation_factory`
 - WS-15: `identity_source`, `identity_budget`
 
