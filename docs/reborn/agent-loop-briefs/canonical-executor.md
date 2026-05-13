@@ -408,6 +408,16 @@ impl CanonicalAgentLoopExecutor {
                     // Inner retry loop: planner.recovery() can return Retry
                     // until its own budget says Abort. Each Retry re-issues the
                     // failed call via the existing single-call API (§3.6).
+                    //
+                    // Durability note (master doc §10): retry attempts mutate
+                    // `state.recovery_state.attempts` in place between
+                    // checkpoints. The four checkpoint kinds fire at iteration
+                    // boundaries, NOT between retry attempts. A crash mid-retry
+                    // resumes from the BeforeSideEffect checkpoint with
+                    // recovery_state.attempts == 0; the retry budget effectively
+                    // resets. This is intentional — the iteration cap (the
+                    // structural net) still bounds total retries across
+                    // resumes because each resume costs one iteration.
                     let mut current_failure = err;
                     loop {
                         let summary = sanitize(&current_failure);
