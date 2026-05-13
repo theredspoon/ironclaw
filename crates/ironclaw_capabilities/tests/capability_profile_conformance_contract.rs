@@ -93,6 +93,38 @@ fn capability_profile_conformance_accepts_matching_claims() {
     assert!(report.findings().is_empty());
 }
 
+#[test]
+fn capability_profile_conformance_reports_profile_id_mismatch_with_profile_subject() {
+    let contract = context_retrieval_contract();
+    let mismatched_profile = CapabilityProfileId::new("memory.document_store.v1").unwrap();
+    let claim = CapabilityProfileClaim::new(
+        CapabilityId::new("ironclaw.memory.native.context.retrieve").unwrap(),
+        mismatched_profile.clone(),
+        vec![
+            CapabilityProfileClaimedOperation::new(
+                CapabilityProfileOperationId::new("memory.context.retrieve.v1").unwrap(),
+                "schemas/memory/context-retrieve.input.v1.json",
+                "schemas/memory/context-retrieve.output.v1.json",
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+
+    let report = CapabilityProfileConformanceReport::evaluate(&contract, &claim);
+
+    assert!(!report.is_conformant());
+    let first = report
+        .findings()
+        .first()
+        .expect("profile_id mismatch must produce a finding");
+    assert_eq!(
+        first.kind(),
+        CapabilityProfileConformanceFindingKind::ProfileIdMismatch,
+    );
+    assert_eq!(first.subject(), mismatched_profile.as_str());
+}
+
 fn context_retrieval_contract() -> CapabilityProfileContract {
     CapabilityProfileContract::new(
         CapabilityProfileId::new("memory.context_retrieval.v1").unwrap(),

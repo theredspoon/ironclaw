@@ -120,12 +120,16 @@ impl<'de> Deserialize<'de> for HostPortId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostPortGrant {
-    pub id: HostPortId,
+    id: HostPortId,
 }
 
 impl HostPortGrant {
     pub fn new(id: HostPortId) -> Self {
         Self { id }
+    }
+
+    pub fn id(&self) -> &HostPortId {
+        &self.id
     }
 }
 
@@ -136,12 +140,16 @@ impl HostPortGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostPortCatalogEntry {
-    pub id: HostPortId,
+    id: HostPortId,
 }
 
 impl HostPortCatalogEntry {
     pub fn new(id: HostPortId) -> Self {
         Self { id }
+    }
+
+    pub fn id(&self) -> &HostPortId {
+        &self.id
     }
 }
 

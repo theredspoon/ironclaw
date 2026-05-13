@@ -839,6 +839,147 @@ fn host_port_view_rejects_duplicate_ports_and_answers_membership() {
 }
 
 #[test]
+fn host_port_catalog_equality_is_order_independent() {
+    let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    let audit = HostPortId::new("host.events.audit").unwrap();
+
+    let a = HostPortCatalog::new(vec![
+        HostPortCatalogEntry::new(storage.clone()),
+        HostPortCatalogEntry::new(audit.clone()),
+    ])
+    .unwrap();
+    let b = HostPortCatalog::new(vec![
+        HostPortCatalogEntry::new(audit),
+        HostPortCatalogEntry::new(storage),
+    ])
+    .unwrap();
+
+    assert_eq!(a, b);
+    assert_eq!(
+        serde_json::to_value(&a).unwrap(),
+        serde_json::to_value(&b).unwrap(),
+    );
+}
+
+#[test]
+fn capability_profile_contract_equality_is_order_independent() {
+    let profile_id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
+    let op1 = CapabilityProfileOperationContract::new(
+        CapabilityProfileOperationId::new("memory.context.retrieve.v1").unwrap(),
+        "schemas/memory/context-retrieve.input.v1.json",
+        "schemas/memory/context-retrieve.output.v1.json",
+    )
+    .unwrap();
+    let op2 = CapabilityProfileOperationContract::new(
+        CapabilityProfileOperationId::new("memory.context.touch.v1").unwrap(),
+        "schemas/memory/context-touch.input.v1.json",
+        "schemas/memory/context-touch.output.v1.json",
+    )
+    .unwrap();
+
+    let a =
+        CapabilityProfileContract::new(profile_id.clone(), vec![op1.clone(), op2.clone()]).unwrap();
+    let b = CapabilityProfileContract::new(profile_id, vec![op2, op1]).unwrap();
+
+    assert_eq!(a, b);
+    assert_eq!(
+        serde_json::to_value(&a).unwrap(),
+        serde_json::to_value(&b).unwrap(),
+    );
+}
+
+#[test]
+fn host_api_contract_types_reject_unknown_fields_on_deserialize() {
+    let storage = "host.storage.sql_transaction.first_party";
+    let op_id = "memory.context.retrieve.v1";
+    let profile_id = "memory.context_retrieval.v1";
+    let in_ref = "schemas/memory/context-retrieve.input.v1.json";
+    let out_ref = "schemas/memory/context-retrieve.output.v1.json";
+
+    // Happy paths still parse.
+    assert!(serde_json::from_value::<HostPortGrant>(json!({ "id": storage })).is_ok());
+    assert!(serde_json::from_value::<HostPortCatalogEntry>(json!({ "id": storage })).is_ok());
+    assert!(
+        serde_json::from_value::<HostPortCatalog>(json!({ "entries": [{ "id": storage }] }))
+            .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<HostPortView>(json!({ "grants": [{ "id": storage }] })).is_ok()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileOperationContract>(json!({
+            "id": op_id,
+            "input_schema_ref": in_ref,
+            "output_schema_ref": out_ref,
+        }))
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileContract>(json!({
+            "id": profile_id,
+            "required_operations": [{
+                "id": op_id,
+                "input_schema_ref": in_ref,
+                "output_schema_ref": out_ref,
+            }],
+        }))
+        .is_ok()
+    );
+
+    // Unknown fields must fail closed at the wire boundary.
+    assert!(serde_json::from_value::<HostPortGrant>(json!({ "id": storage, "oops": 1 })).is_err());
+    assert!(
+        serde_json::from_value::<HostPortCatalogEntry>(json!({ "id": storage, "oops": 1 }))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortCatalog>(json!({
+            "entries": [{ "id": storage }],
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortCatalog>(
+            json!({ "entries": [{ "id": storage, "oops": 1 }] })
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortView>(json!({
+            "grants": [{ "id": storage }],
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortView>(json!({ "grants": [{ "id": storage, "oops": 1 }] }))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileOperationContract>(json!({
+            "id": op_id,
+            "input_schema_ref": in_ref,
+            "output_schema_ref": out_ref,
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileContract>(json!({
+            "id": profile_id,
+            "required_operations": [{
+                "id": op_id,
+                "input_schema_ref": in_ref,
+                "output_schema_ref": out_ref,
+            }],
+            "oops": 1,
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn host_port_catalog_validates_required_ports_without_creating_implementations() {
     let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
     let audit = HostPortId::new("host.events.audit").unwrap();
