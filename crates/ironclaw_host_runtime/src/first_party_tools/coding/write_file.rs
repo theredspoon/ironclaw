@@ -12,7 +12,7 @@ use super::{
         create_parent_dir, filesystem_error, is_workspace_path, resolve_required_path,
         stat_optional,
     },
-    state::{SharedCodingReadState, read_scope_key},
+    state::{SharedCodingReadState, content_hash, read_scope_key},
 };
 
 pub(super) async fn write_file(
@@ -42,10 +42,11 @@ pub(super) async fn write_file(
         .await
         .map_err(filesystem_error)?;
     if let Some(stat) = stat_optional(request, &resolved.virtual_path).await? {
-        read_state.write().await.update_mtime(
+        read_state.write().await.update_after_write(
             &read_scope_key(request),
             resolved.virtual_path.as_str(),
             stat.modified,
+            content_hash(content.as_bytes()),
         );
     }
     Ok(json!({

@@ -8,7 +8,7 @@ use super::{
     config::{DEFAULT_LINE_LIMIT, MAX_READ_SIZE},
     inputs::optional_usize,
     paths::{filesystem_error, resolve_required_path},
-    state::{SharedCodingReadState, read_scope_key},
+    state::{SharedCodingReadState, content_hash, read_scope_key},
     text::{decode_text, reject_binary_probe},
 };
 
@@ -65,6 +65,7 @@ pub(super) async fn read_file(
         read_scope_key(request),
         resolved.virtual_path.as_str().to_string(),
         stat.modified,
+        content_hash(&bytes),
         partial,
     );
 

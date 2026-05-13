@@ -1,5 +1,6 @@
 use std::{
     cmp::Reverse,
+    collections::BTreeSet,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -129,8 +130,8 @@ pub(super) async fn grep(
                 return Ok(true);
             };
             if regex.is_match(&content) {
-                let line_matches = line_matches(&content, &regex, before_context, after_context);
-                let count = line_matches.iter().filter(|line| line.is_match).count();
+                let (line_matches, count) =
+                    line_matches(&content, &regex, before_context, after_context, multiline);
                 search_results.push(GrepFileResult {
                     relative: relative.to_string(),
                     modified,
@@ -364,10 +365,15 @@ fn line_matches(
     regex: &regex::Regex,
     before_context: usize,
     after_context: usize,
-) -> Vec<GrepLine> {
+    multiline: bool,
+) -> (Vec<GrepLine>, usize) {
+    if multiline {
+        return multiline_matches(content, regex, before_context, after_context);
+    }
+
     let lines = content.lines().collect::<Vec<_>>();
-    let mut include = std::collections::BTreeSet::new();
-    let mut matched = std::collections::BTreeSet::new();
+    let mut include = BTreeSet::new();
+    let mut matched = BTreeSet::new();
     for (index, line) in lines.iter().enumerate() {
         if regex.is_match(line) {
             matched.insert(index);
@@ -378,12 +384,74 @@ fn line_matches(
             }
         }
     }
-    include
+    let count = matched.len();
+    let lines = include
         .into_iter()
         .map(|index| GrepLine {
             number: index + 1,
             text: lines[index].to_string(),
             is_match: matched.contains(&index) || (before_context == 0 && after_context == 0),
         })
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    (lines, count)
+}
+
+fn multiline_matches(
+    content: &str,
+    regex: &regex::Regex,
+    before_context: usize,
+    after_context: usize,
+) -> (Vec<GrepLine>, usize) {
+    let indexed = indexed_lines(content);
+    let mut include = BTreeSet::new();
+    let mut matched = BTreeSet::new();
+    let mut count = 0usize;
+
+    for item in regex.find_iter(content) {
+        count += 1;
+        for (index, (_text, start, end)) in indexed.iter().enumerate() {
+            if spans_overlap(item.start(), item.end(), *start, *end) {
+                matched.insert(index);
+                let context_start = index.saturating_sub(before_context);
+                let context_end = (index + after_context + 1).min(indexed.len());
+                for line_index in context_start..context_end {
+                    include.insert(line_index);
+                }
+            }
+        }
+    }
+
+    let lines = include
+        .into_iter()
+        .map(|index| GrepLine {
+            number: index + 1,
+            text: indexed[index].0.clone(),
+            is_match: matched.contains(&index) || (before_context == 0 && after_context == 0),
+        })
+        .collect::<Vec<_>>();
+    (lines, count)
+}
+
+fn indexed_lines(content: &str) -> Vec<(String, usize, usize)> {
+    let mut output = Vec::new();
+    let mut start = 0usize;
+    for segment in content.split_inclusive('\n') {
+        let end = start + segment.len();
+        let text = segment.trim_end_matches('\n').to_string();
+        output.push((text, start, end));
+        start = end;
+    }
+    if output.is_empty() && content.is_empty() {
+        output.push((String::new(), 0, 0));
+    } else if start < content.len() {
+        output.push((content[start..].to_string(), start, content.len()));
+    }
+    output
+}
+
+fn spans_overlap(match_start: usize, match_end: usize, line_start: usize, line_end: usize) -> bool {
+    if match_start == match_end {
+        return match_start >= line_start && match_start <= line_end;
+    }
+    match_start < line_end && match_end > line_start
 }

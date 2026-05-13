@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use tokio::sync::RwLock;
 
@@ -30,6 +26,7 @@ pub(super) struct CodingReadScopeKey {
 #[derive(Debug, Clone)]
 struct CodingReadEntry {
     modified: Option<SystemTime>,
+    content_hash: String,
     partial: bool,
 }
 
@@ -39,46 +36,53 @@ impl CodingReadState {
         scope: CodingReadScopeKey,
         path: String,
         modified: Option<SystemTime>,
+        content_hash: String,
         partial: bool,
     ) {
-        self.entries
-            .insert((scope, path), CodingReadEntry { modified, partial });
+        self.entries.insert(
+            (scope, path),
+            CodingReadEntry {
+                modified,
+                content_hash,
+                partial,
+            },
+        );
     }
 
     pub(super) fn check_before_edit(
         &self,
         scope: &CodingReadScopeKey,
         path: &str,
-        current_modified: Option<SystemTime>,
+        current_content_hash: &str,
     ) -> Result<(), FirstPartyCapabilityError> {
         let key = (scope.clone(), path.to_string());
         let Some(entry) = self.entries.get(&key) else {
             return Err(guest_error());
         };
-        if entry.partial {
-            return Err(guest_error());
-        }
-        if let (Some(current), Some(previous)) = (current_modified, entry.modified)
-            && let Ok(delta) = current.duration_since(previous)
-            && delta > Duration::from_secs(1)
-        {
+        if entry.partial || entry.content_hash != current_content_hash {
             return Err(guest_error());
         }
         Ok(())
     }
 
-    pub(super) fn update_mtime(
+    pub(super) fn update_after_write(
         &mut self,
         scope: &CodingReadScopeKey,
         path: &str,
         modified: Option<SystemTime>,
+        content_hash: String,
     ) {
         let key = (scope.clone(), path.to_string());
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.modified = modified;
+            entry.content_hash = content_hash;
             entry.partial = false;
         }
     }
+}
+
+pub(super) fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 pub(super) fn read_scope_key(request: &FirstPartyCapabilityRequest) -> CodingReadScopeKey {

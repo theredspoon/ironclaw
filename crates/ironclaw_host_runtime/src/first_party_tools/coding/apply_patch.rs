@@ -12,7 +12,7 @@ use super::{
         filesystem_error, is_workspace_path, operation_allowed, resolve_required_path,
         stat_optional,
     },
-    state::{SharedCodingReadState, read_scope_key},
+    state::{SharedCodingReadState, content_hash, read_scope_key},
     text::{count_matches, decode_text, encode_text, reject_binary_probe, replace_content},
     types::MatchMethod,
 };
@@ -51,11 +51,6 @@ pub(super) async fn apply_patch(
             RuntimeDispatchErrorKind::FilesystemDenied,
         ));
     }
-    read_state.read().await.check_before_edit(
-        &read_scope_key(request),
-        resolved.virtual_path.as_str(),
-        stat.modified,
-    )?;
     if stat.file_type != FileType::File || stat.len > MAX_PATCH_SIZE {
         return Err(FirstPartyCapabilityError::new(
             RuntimeDispatchErrorKind::Resource,
@@ -66,6 +61,12 @@ pub(super) async fn apply_patch(
         .read_file(&resolved.virtual_path)
         .await
         .map_err(filesystem_error)?;
+    let current_hash = content_hash(&bytes);
+    read_state.read().await.check_before_edit(
+        &read_scope_key(request),
+        resolved.virtual_path.as_str(),
+        &current_hash,
+    )?;
     reject_binary_probe(&bytes)?;
     let (content, encoding, line_ending) = decode_text(&bytes)?;
     let (match_count, match_method) = count_matches(&content, old_string);
@@ -85,10 +86,11 @@ pub(super) async fn apply_patch(
         .await
         .map_err(filesystem_error)?;
     if let Some(stat) = stat_optional(request, &resolved.virtual_path).await? {
-        read_state.write().await.update_mtime(
+        read_state.write().await.update_after_write(
             &read_scope_key(request),
             resolved.virtual_path.as_str(),
             stat.modified,
+            content_hash(&output),
         );
     }
     let mut result = json!({

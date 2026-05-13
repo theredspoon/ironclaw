@@ -75,6 +75,9 @@ async fn collect_list_entries(
                     .stat(&entry.path)
                     .await
                     .map_err(filesystem_error)?;
+                if is_sensitive || stat.sensitive {
+                    continue;
+                }
                 format!("{} ({})", relative, format_size(stat.len))
             };
             output.push(ListEntry { display, is_dir });

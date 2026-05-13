@@ -471,6 +471,21 @@ async fn builtin_coding_blocks_sensitive_scoped_paths_like_v1() {
             .unwrap_err();
         assert_eq!(error, RuntimeFailureKind::Authorization);
     }
+
+    let listed = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace"}),
+        context,
+    )
+    .await
+    .unwrap();
+    let entries = listed["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.as_str() != Some(".env (13B)"))
+    );
 }
 
 #[tokio::test]
@@ -530,6 +545,49 @@ async fn builtin_coding_grep_applies_filters_before_loading_large_files() {
 }
 
 #[tokio::test]
+async fn builtin_coding_grep_multiline_reports_matched_lines_and_count() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("doc.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let content = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({
+            "path": "/workspace",
+            "pattern": "alpha\\nbeta",
+            "output_mode": "content",
+            "multiline": true
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let output = content["content"].as_str().unwrap();
+    assert!(output.contains("doc.txt:1:alpha"));
+    assert!(output.contains("doc.txt:2:beta"));
+
+    let counts = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({
+            "path": "/workspace",
+            "pattern": "alpha\\nbeta",
+            "output_mode": "count",
+            "multiline": true
+        }),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts["total"], json!(1));
+    assert_eq!(counts["counts"], json!([{ "file": "doc.txt", "count": 1 }]));
+}
+
+#[tokio::test]
 async fn builtin_coding_write_allows_v1_sized_payloads_past_default_input_cap() {
     let temp = tempfile::tempdir().unwrap();
     let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
@@ -564,7 +622,7 @@ async fn builtin_coding_grep_skips_sensitive_files_and_symlink_targets() {
         &runtime,
         GREP_CAPABILITY_ID,
         json!({"path": "/workspace", "pattern": "TOKEN", "output_mode": "content"}),
-        context,
+        context.clone(),
     )
     .await
     .unwrap();
@@ -572,6 +630,26 @@ async fn builtin_coding_grep_skips_sensitive_files_and_symlink_targets() {
     assert!(content.contains("visible.rs"));
     assert!(!content.contains("secret"));
     assert!(!content.contains("safe_link"));
+
+    let listed = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace"}),
+        context,
+    )
+    .await
+    .unwrap();
+    let entries = listed["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.as_str().unwrap_or_default().contains(".env"))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.as_str().unwrap_or_default().contains("safe_link"))
+    );
 }
 
 #[tokio::test]
@@ -800,6 +878,36 @@ async fn builtin_apply_patch_requires_full_fresh_read_like_v1() {
     .await
     .unwrap_err();
     assert_eq!(partial, RuntimeFailureKind::Backend);
+}
+
+#[tokio::test]
+async fn builtin_apply_patch_rejects_same_second_content_changes_after_read() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("code.rs"), "old\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    invoke_with_context(
+        &runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    std::fs::write(temp.path().join("code.rs"), "old\nchanged\n").unwrap();
+
+    let stale = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
+        context,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stale, RuntimeFailureKind::Backend);
 }
 
 #[tokio::test]
