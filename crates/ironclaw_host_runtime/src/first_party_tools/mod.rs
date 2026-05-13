@@ -91,6 +91,7 @@ pub fn builtin_first_party_handlers() -> Result<FirstPartyCapabilityRegistry, Ho
 #[derive(Debug, Default)]
 pub struct BuiltinFirstPartyTools {
     coding_read_state: coding::SharedCodingReadState,
+    coding_edit_locks: coding::SharedCodingEditLocks,
 }
 
 #[async_trait]
@@ -111,7 +112,7 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
             | GLOB_CAPABILITY_ID
             | GREP_CAPABILITY_ID
             | APPLY_PATCH_CAPABILITY_ID => {
-                coding::dispatch(&request, &self.coding_read_state).await?
+                coding::dispatch(&request, &self.coding_read_state, &self.coding_edit_locks).await?
             }
             _ => {
                 return Err(FirstPartyCapabilityError::new(

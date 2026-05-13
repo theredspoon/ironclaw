@@ -12,7 +12,7 @@ use super::{
         filesystem_error, is_workspace_path, operation_allowed, resolve_required_path,
         stat_optional,
     },
-    state::{SharedCodingReadState, content_hash, read_scope_key},
+    state::{SharedCodingEditLocks, SharedCodingReadState, content_hash, read_scope_key},
     text::{count_matches, decode_text, encode_text, reject_binary_probe, replace_content},
     types::MatchMethod,
 };
@@ -20,6 +20,7 @@ use super::{
 pub(super) async fn apply_patch(
     request: &FirstPartyCapabilityRequest,
     read_state: &SharedCodingReadState,
+    edit_locks: &SharedCodingEditLocks,
 ) -> Result<Value, FirstPartyCapabilityError> {
     let path_str = required_str(&request.input, "path")?;
     if is_workspace_path(path_str) {
@@ -41,6 +42,10 @@ pub(super) async fn apply_patch(
         .get("replace_all")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let scope = read_scope_key(request);
+    let _edit_guard = edit_locks
+        .lock_edit(&scope, resolved.virtual_path.as_str())
+        .await;
     let stat = request
         .filesystem
         .stat(&resolved.virtual_path)
@@ -63,7 +68,7 @@ pub(super) async fn apply_patch(
         .map_err(filesystem_error)?;
     let current_hash = content_hash(&bytes);
     read_state.read().await.check_before_edit(
-        &read_scope_key(request),
+        &scope,
         resolved.virtual_path.as_str(),
         &current_hash,
     )?;
@@ -87,7 +92,7 @@ pub(super) async fn apply_patch(
         .map_err(filesystem_error)?;
     if let Some(stat) = stat_optional(request, &resolved.virtual_path).await? {
         read_state.write().await.update_after_write(
-            &read_scope_key(request),
+            &scope,
             resolved.virtual_path.as_str(),
             stat.modified,
             content_hash(&output),

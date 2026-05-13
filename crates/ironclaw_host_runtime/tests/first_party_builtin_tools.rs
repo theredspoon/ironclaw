@@ -548,6 +548,69 @@ async fn builtin_coding_blocks_sensitive_resolved_libsql_paths() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn builtin_coding_apply_patch_serializes_concurrent_edits_on_same_path() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("code.rs"), "A\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = std::sync::Arc::new(runtime_with_filesystem(filesystem));
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    // Prime read-before-edit state so both patches start from a valid cached hash.
+    invoke_with_context(
+        &*runtime,
+        READ_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/code.rs"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+
+    let runtime_a = runtime.clone();
+    let ctx_a = context.clone();
+    let runtime_b = runtime.clone();
+    let ctx_b = context.clone();
+    let task_a = tokio::spawn(async move {
+        invoke_with_context(
+            &*runtime_a,
+            APPLY_PATCH_CAPABILITY_ID,
+            json!({"path": "/workspace/code.rs", "old_string": "A", "new_string": "X"}),
+            ctx_a,
+        )
+        .await
+    });
+    let task_b = tokio::spawn(async move {
+        invoke_with_context(
+            &*runtime_b,
+            APPLY_PATCH_CAPABILITY_ID,
+            json!({"path": "/workspace/code.rs", "old_string": "A", "new_string": "Y"}),
+            ctx_b,
+        )
+        .await
+    });
+    let result_a = task_a.await.unwrap();
+    let result_b = task_b.await.unwrap();
+
+    // Serialization guarantee: the second patch reads the post-write file and
+    // its cached hash (taken before either write) no longer matches, so
+    // exactly one apply_patch must succeed. Without the per-path edit lock,
+    // both calls can pass `check_before_edit` concurrently and silently lose
+    // an update.
+    let outcomes = [result_a.is_ok(), result_b.is_ok()];
+    assert_eq!(
+        outcomes.iter().filter(|ok| **ok).count(),
+        1,
+        "expected exactly one concurrent apply_patch to succeed, got {:?}",
+        outcomes
+    );
+    let final_content = std::fs::read_to_string(temp.path().join("code.rs")).unwrap();
+    assert!(
+        final_content == "X\n" || final_content == "Y\n",
+        "unexpected final content {final_content:?}"
+    );
+}
+
 #[tokio::test]
 async fn builtin_coding_blocks_relative_workspace_protected_paths() {
     let temp = tempfile::tempdir().unwrap();

@@ -32,7 +32,7 @@ pub const GLOB_CAPABILITY_ID: &str = "builtin.glob";
 pub const GREP_CAPABILITY_ID: &str = "builtin.grep";
 pub const APPLY_PATCH_CAPABILITY_ID: &str = "builtin.apply_patch";
 
-pub(super) use state::SharedCodingReadState;
+pub(super) use state::{SharedCodingEditLocks, SharedCodingReadState};
 
 pub(super) fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
     Ok(vec![
@@ -157,14 +157,17 @@ fn manifest(
 pub(super) async fn dispatch(
     request: &FirstPartyCapabilityRequest,
     read_state: &SharedCodingReadState,
+    edit_locks: &SharedCodingEditLocks,
 ) -> Result<Value, FirstPartyCapabilityError> {
     match request.capability_id.as_str() {
         READ_FILE_CAPABILITY_ID => read_file::read_file(request, read_state).await,
-        WRITE_FILE_CAPABILITY_ID => write_file::write_file(request, read_state).await,
+        WRITE_FILE_CAPABILITY_ID => write_file::write_file(request, read_state, edit_locks).await,
         LIST_DIR_CAPABILITY_ID => list_dir::list_dir(request).await,
         GLOB_CAPABILITY_ID => glob::glob(request).await,
         GREP_CAPABILITY_ID => grep::grep(request).await,
-        APPLY_PATCH_CAPABILITY_ID => apply_patch::apply_patch(request, read_state).await,
+        APPLY_PATCH_CAPABILITY_ID => {
+            apply_patch::apply_patch(request, read_state, edit_locks).await
+        }
         _ => Err(FirstPartyCapabilityError::new(
             RuntimeDispatchErrorKind::UndeclaredCapability,
         )),
