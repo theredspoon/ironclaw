@@ -13,9 +13,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_host_api::SecretHandle;
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, DeclaredEgressTarget, EgressCredentialHandle,
-    ProductAdapterCapabilities, ProductAdapterHealth, ProductAdapterId, ProductSurfaceKind,
-    RedactedString,
+    AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
+    EgressCredentialHandle, ProductAdapterCapabilities, ProductAdapterHealth, ProductAdapterId,
+    ProductCapabilityFlag, ProductSurfaceKind, RedactedString,
 };
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -95,6 +95,138 @@ impl ProductAdapterManifestRef {
     pub fn manifest_hash(&self) -> Option<&ManifestHash> {
         self.manifest_hash.as_ref()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductAdapterManifestDocument {
+    api_version: String,
+    kind: String,
+    adapter_id: ProductAdapterId,
+    version: Version,
+    surface_kind: ProductSurfaceKind,
+    component_ref: ProductAdapterComponentRef,
+    manifest_hash: Option<ManifestHash>,
+    auth: ProductAdapterManifestAuthDocument,
+    capabilities: ProductAdapterManifestCapabilitiesDocument,
+    #[serde(default)]
+    required_credentials: Vec<ProductAdapterManifestCredentialDocument>,
+    #[serde(default)]
+    egress: Vec<ProductAdapterManifestEgressDocument>,
+}
+
+impl ProductAdapterManifestDocument {
+    pub const API_VERSION: &'static str = "ironclaw.product_adapter_manifest/v1";
+    pub const KIND: &'static str = "ProductAdapterManifest";
+
+    pub fn from_toml(raw: &str) -> Result<Self, RegistryError> {
+        let value: toml::Value =
+            toml::from_str(raw).map_err(|error| RegistryError::ManifestParse {
+                reason: error.to_string(),
+            })?;
+        reject_inline_secret_material_value("$", &value)?;
+        let document: Self =
+            value
+                .try_into()
+                .map_err(|error: toml::de::Error| RegistryError::ManifestParse {
+                    reason: error.to_string(),
+                })?;
+        document.validate_header()?;
+        Ok(document)
+    }
+
+    pub fn into_manifest(self) -> Result<ProductAdapterManifest, RegistryError> {
+        let required_credentials: Vec<_> = self
+            .required_credentials
+            .into_iter()
+            .map(|credential| credential.handle)
+            .collect();
+        let declared_egress: Vec<_> = self
+            .egress
+            .into_iter()
+            .map(|target| DeclaredEgressTarget::new(target.host, target.credential_handle))
+            .collect();
+        ProductAdapterManifest::new(
+            self.adapter_id,
+            self.version,
+            self.surface_kind,
+            self.component_ref,
+            ProductAdapterCapabilities::new(self.capabilities.flags),
+            self.auth.into_auth_requirement(),
+            declared_egress,
+            required_credentials,
+            self.manifest_hash,
+        )
+    }
+
+    fn validate_header(&self) -> Result<(), RegistryError> {
+        if self.api_version != Self::API_VERSION {
+            return Err(RegistryError::UnsupportedManifestVersion {
+                api_version: self.api_version.clone(),
+            });
+        }
+        if self.kind != Self::KIND {
+            return Err(RegistryError::InvalidValue {
+                field: "kind",
+                reason: format!("must be {}", Self::KIND),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProductAdapterManifestAuthDocument {
+    RequestSignature {
+        header_name: String,
+        timestamp_header_name: Option<String>,
+    },
+    SharedSecretHeader {
+        header_name: String,
+    },
+    SessionCookie {
+        name: String,
+    },
+    BearerToken,
+}
+
+impl ProductAdapterManifestAuthDocument {
+    fn into_auth_requirement(self) -> AuthRequirement {
+        match self {
+            Self::RequestSignature {
+                header_name,
+                timestamp_header_name,
+            } => AuthRequirement::RequestSignature {
+                header_name,
+                timestamp_header_name,
+            },
+            Self::SharedSecretHeader { header_name } => {
+                AuthRequirement::SharedSecretHeader { header_name }
+            }
+            Self::SessionCookie { name } => AuthRequirement::SessionCookie { name },
+            Self::BearerToken => AuthRequirement::BearerToken,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductAdapterManifestCapabilitiesDocument {
+    flags: Vec<ProductCapabilityFlag>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductAdapterManifestCredentialDocument {
+    handle: EgressCredentialHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductAdapterManifestEgressDocument {
+    host: DeclaredEgressHost,
+    credential_handle: Option<EgressCredentialHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +318,13 @@ impl ProductAdapterManifest {
 
         let mut pairs = BTreeSet::new();
         for target in &self.declared_egress {
+            if let Some(handle) = target.credential_handle.as_ref()
+                && !required.contains(handle)
+            {
+                return Err(RegistryError::UndeclaredEgressCredentialHandle {
+                    handle: handle.clone(),
+                });
+            }
             let pair = (target.host.clone(), target.credential_handle.clone());
             if !pairs.insert(pair) {
                 return Err(RegistryError::DuplicateEgressTarget);
@@ -368,6 +507,14 @@ pub enum RegistryError {
     DuplicateCredentialBinding { handle: EgressCredentialHandle },
     #[error("duplicate egress target")]
     DuplicateEgressTarget,
+    #[error("egress references undeclared credential handle {handle}")]
+    UndeclaredEgressCredentialHandle { handle: EgressCredentialHandle },
+    #[error("product adapter manifest parse failed: {reason}")]
+    ManifestParse { reason: String },
+    #[error("unsupported product adapter manifest api_version {api_version}")]
+    UnsupportedManifestVersion { api_version: String },
+    #[error("inline secret material is not allowed in manifest field {field}")]
+    InlineSecretMaterial { field: String },
     #[error("installation references unknown adapter manifest {adapter_id}")]
     UnknownManifest { adapter_id: ProductAdapterId },
     #[error("installation binds undeclared credential handle {handle}")]
@@ -536,6 +683,80 @@ impl ProductAdapterRegistryStore for InMemoryProductAdapterRegistryStore {
         installation.set_health(health);
         Ok(())
     }
+}
+
+fn reject_inline_secret_material_value(
+    path: &str,
+    value: &toml::Value,
+) -> Result<(), RegistryError> {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                let child_path = format!("{path}.{key}");
+                let lower = key.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "secret" | "secret_value" | "token" | "raw_token" | "api_key" | "password"
+                ) {
+                    return Err(RegistryError::InlineSecretMaterial { field: child_path });
+                }
+                reject_inline_secret_material_value(&child_path, value)?;
+            }
+        }
+        toml::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                reject_inline_secret_material_value(&format!("{path}[{index}]"), value)?;
+            }
+        }
+        toml::Value::String(value) => {
+            if looks_like_inline_secret(value) {
+                return Err(RegistryError::InlineSecretMaterial {
+                    field: path.to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn looks_like_inline_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("sha256:") {
+        return false;
+    }
+    if value.starts_with("sk-")
+        || value.starts_with("xoxb-")
+        || value.starts_with("ghp_")
+        || value.starts_with("AKIA")
+        || value.contains("BEGIN PRIVATE KEY")
+    {
+        return true;
+    }
+    if has_uri_userinfo(value) {
+        return true;
+    }
+    looks_like_telegram_token(value)
+}
+
+fn has_uri_userinfo(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    authority.contains('@')
+}
+
+fn looks_like_telegram_token(value: &str) -> bool {
+    let Some((prefix, suffix)) = value.split_once(':') else {
+        return false;
+    };
+    prefix.len() >= 6
+        && prefix.chars().all(|c| c.is_ascii_digit())
+        && suffix.len() >= 10
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn validate_bindings_unique(
