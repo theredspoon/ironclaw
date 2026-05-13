@@ -4574,6 +4574,7 @@ dependencies = [
  "clap_complete",
  "ironclaw_reborn",
  "ironclaw_reborn_config",
+ "serde_json",
  "tempfile",
 ]
 
