@@ -385,6 +385,275 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
 }
 
 #[test]
+fn default_trust_is_untrusted_when_field_is_omitted() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "x"
+version = "0.1"
+description = "x"
+
+[runtime]
+kind = "wasm"
+module = "wasm/echo.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let manifest =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap();
+    assert_eq!(manifest.requested_trust, RequestedTrustClass::Untrusted);
+    assert_eq!(manifest.trust, TrustClass::Sandbox);
+}
+
+#[test]
+fn rejects_empty_top_level_name_version_or_description() {
+    for (field, value) in [("name", ""), ("version", ""), ("description", "")] {
+        let toml = format!(
+            r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "{name}"
+version = "{version}"
+description = "{description}"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/echo.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+            schema = MANIFEST_SCHEMA_VERSION,
+            name = if field == "name" { value } else { "x" },
+            version = if field == "version" { value } else { "0.1" },
+            description = if field == "description" { value } else { "x" },
+        );
+        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
+            .unwrap_err();
+        assert!(
+            matches!(err, ManifestV2Error::Invalid { .. }),
+            "{field}={value:?} should be rejected, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_wasm_module_with_host_or_url_or_traversal_paths() {
+    for bad in [
+        "",
+        " ",
+        "/abs/path.wasm",
+        "../escape.wasm",
+        "foo/../bar.wasm",
+        "https://evil.example.com/x.wasm",
+        "file:///tmp/x.wasm",
+        "C:\\windows.wasm",
+        "c:/win.wasm",
+        "has space.wasm",
+        "wasm/./echo.wasm",
+    ] {
+        let toml = format!(
+            r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "x"
+version = "0.1"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "{bad}"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+            schema = MANIFEST_SCHEMA_VERSION,
+            bad = bad.replace('\\', "\\\\"),
+        );
+        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
+            .unwrap_err();
+        assert!(
+            matches!(err, ManifestV2Error::InvalidWasmModuleRef { .. }),
+            "wasm module {bad:?} should be rejected, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn mcp_runtime_enforces_transport_and_shape() {
+    let cap_block = r#"
+[[capabilities]]
+id = "acme-mcp.search"
+description = "search"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/search.input.v1.json"
+output_schema_ref = "schemas/acme/search.output.v1.json"
+"#;
+    let header = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-mcp"
+name = "x"
+version = "0.1"
+description = "x"
+trust = "third_party"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+
+    // accepts: stdio with command, http with absolute https url
+    for runtime in [
+        "[runtime]\nkind = \"mcp\"\ntransport = \"stdio\"\ncommand = \"server\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"http\"\nurl = \"https://example.com/mcp\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"sse\"\nurl = \"https://example.com/mcp\"\n",
+    ] {
+        let toml = format!("{header}\n{runtime}\n{cap_block}");
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
+            .unwrap_or_else(|err| panic!("valid mcp runtime rejected: {err:?}\n{runtime}"));
+    }
+
+    // rejects: stdio with url; http without url; http with command; unknown transport; ftp url.
+    for runtime in [
+        "[runtime]\nkind = \"mcp\"\ntransport = \"stdio\"\nurl = \"https://x.com\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"stdio\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"http\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"http\"\ncommand = \"x\"\nurl = \"https://x.com\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"telnet\"\nurl = \"telnet://x.com\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"http\"\nurl = \"ftp://example.com\"\n",
+        "[runtime]\nkind = \"mcp\"\ntransport = \"\"\n",
+    ] {
+        let toml = format!("{header}\n{runtime}\n{cap_block}");
+        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
+            .unwrap_err();
+        assert!(
+            matches!(err, ManifestV2Error::InvalidMcpRuntime { .. }),
+            "runtime should be rejected:\n{runtime}\n got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_duplicate_required_host_ports_in_one_capability() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "x"
+version = "0.1"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/echo.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+required_host_ports = ["host.events.audit", "host.events.audit"]
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(
+        matches!(err, ManifestV2Error::DuplicateRequiredHostPort { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_implements_in_one_capability() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "x"
+version = "0.1"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/echo.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+implements = ["memory.context_retrieval.v1", "memory.context_retrieval.v1"]
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(
+        matches!(err, ManifestV2Error::DuplicateImplementedProfile { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn capability_rejects_unknown_fields_on_deserialize() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "x"
+version = "0.1"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/echo.wasm"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+sneaky = true
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(matches!(err, ManifestV2Error::Parse { .. }), "{err:?}");
+}
+
+#[test]
 fn rejects_duplicate_capability_ids() {
     let toml = format!(
         r#"

@@ -192,6 +192,20 @@ pub enum ManifestV2Error {
         id: CapabilityId,
         expected: ExtensionId,
     },
+    #[error("capability {capability} declares duplicate required host port '{port}'")]
+    DuplicateRequiredHostPort {
+        capability: CapabilityId,
+        port: HostPortId,
+    },
+    #[error("capability {capability} implements profile '{profile}' more than once")]
+    DuplicateImplementedProfile {
+        capability: CapabilityId,
+        profile: CapabilityProfileId,
+    },
+    #[error("invalid wasm module ref '{value}': {reason}")]
+    InvalidWasmModuleRef { value: String, reason: String },
+    #[error("invalid mcp runtime: {reason}")]
+    InvalidMcpRuntime { reason: String },
 }
 
 impl ExtensionManifestV2 {
@@ -210,7 +224,7 @@ impl ExtensionManifestV2 {
     }
 
     /// Construct a manifest from an already-deserialized raw representation.
-    pub fn from_raw(
+    fn from_raw(
         raw: RawManifestV2,
         source: ManifestSource,
         host_port_catalog: &HostPortCatalog,
@@ -239,6 +253,11 @@ impl ExtensionManifestV2 {
         if raw.version.trim().is_empty() {
             return Err(ManifestV2Error::Invalid {
                 reason: "version must not be empty".to_string(),
+            });
+        }
+        if raw.description.trim().is_empty() {
+            return Err(ManifestV2Error::Invalid {
+                reason: "description must not be empty".to_string(),
             });
         }
         if raw.capabilities.is_empty() {
@@ -315,11 +334,18 @@ impl CapabilityDeclV2 {
             });
         }
 
-        let implements = raw
-            .implements
-            .into_iter()
-            .map(CapabilityProfileId::new)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut implements_seen = BTreeSet::new();
+        let mut implements = Vec::with_capacity(raw.implements.len());
+        for profile in raw.implements {
+            let profile = CapabilityProfileId::new(profile)?;
+            if !implements_seen.insert(profile.clone()) {
+                return Err(ManifestV2Error::DuplicateImplementedProfile {
+                    capability: id,
+                    profile,
+                });
+            }
+            implements.push(profile);
+        }
 
         let input_schema_ref = CapabilityProfileSchemaRef::new(raw.input_schema_ref)?;
         let output_schema_ref = CapabilityProfileSchemaRef::new(raw.output_schema_ref)?;
@@ -332,18 +358,23 @@ impl CapabilityDeclV2 {
             return Err(ManifestV2Error::MissingPromptDocRef { capability: id });
         }
 
-        let required_host_ports = raw
-            .required_host_ports
-            .into_iter()
-            .map(HostPortId::new)
-            .collect::<Result<Vec<_>, _>>()?;
-        for port in &required_host_ports {
-            if !host_port_catalog.contains(port) {
-                return Err(ManifestV2Error::UnknownHostPort {
+        let mut required_host_ports_seen = BTreeSet::new();
+        let mut required_host_ports = Vec::with_capacity(raw.required_host_ports.len());
+        for port in raw.required_host_ports {
+            let port = HostPortId::new(port)?;
+            if !required_host_ports_seen.insert(port.clone()) {
+                return Err(ManifestV2Error::DuplicateRequiredHostPort {
                     capability: id.clone(),
-                    port: port.clone(),
+                    port,
                 });
             }
+            if !host_port_catalog.contains(&port) {
+                return Err(ManifestV2Error::UnknownHostPort {
+                    capability: id.clone(),
+                    port,
+                });
+            }
+            required_host_ports.push(port);
         }
 
         Ok(Self {
@@ -360,6 +391,113 @@ impl CapabilityDeclV2 {
             resource_profile: raw.resource_profile,
         })
     }
+}
+
+fn validate_wasm_module_ref(value: &str) -> Result<(), ManifestV2Error> {
+    let raise = |reason: &str| ManifestV2Error::InvalidWasmModuleRef {
+        value: value.to_string(),
+        reason: reason.to_string(),
+    };
+    if value.is_empty() {
+        return Err(raise("must not be empty"));
+    }
+    if value.chars().any(|ch| ch == ' ' || ch.is_control()) {
+        return Err(raise("NUL/control characters and spaces are not allowed"));
+    }
+    if value.contains("://") {
+        return Err(raise("URLs are not extension asset paths"));
+    }
+    if value.starts_with('/') {
+        return Err(raise("must be relative"));
+    }
+    if value.contains('\\') {
+        return Err(raise("host path separators are not allowed"));
+    }
+    let bytes = value.as_bytes();
+    let looks_windows = (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || (bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/'));
+    if looks_windows {
+        return Err(raise("host path separators are not allowed"));
+    }
+    for segment in value.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(raise("empty or dot path segments are not allowed"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_runtime_shape(
+    transport: &str,
+    command: Option<&str>,
+    url: Option<&str>,
+) -> Result<(), ManifestV2Error> {
+    if transport.trim().is_empty() {
+        return Err(ManifestV2Error::InvalidMcpRuntime {
+            reason: "transport must not be empty".to_string(),
+        });
+    }
+    if let Some(command) = command
+        && command.trim().is_empty()
+    {
+        return Err(ManifestV2Error::InvalidMcpRuntime {
+            reason: "command must not be empty".to_string(),
+        });
+    }
+    if let Some(url) = url
+        && url.trim().is_empty()
+    {
+        return Err(ManifestV2Error::InvalidMcpRuntime {
+            reason: "url must not be empty".to_string(),
+        });
+    }
+    match transport {
+        "stdio" => {
+            if url.is_some() {
+                return Err(ManifestV2Error::InvalidMcpRuntime {
+                    reason: "stdio transport must not specify url".to_string(),
+                });
+            }
+            if command.is_none() {
+                return Err(ManifestV2Error::InvalidMcpRuntime {
+                    reason: "stdio transport requires command".to_string(),
+                });
+            }
+        }
+        "http" | "sse" => {
+            if command.is_some() {
+                return Err(ManifestV2Error::InvalidMcpRuntime {
+                    reason: format!("{transport} transport must not specify command"),
+                });
+            }
+            let Some(url) = url else {
+                return Err(ManifestV2Error::InvalidMcpRuntime {
+                    reason: format!("{transport} transport requires url"),
+                });
+            };
+            validate_mcp_http_url(transport, url)?;
+        }
+        other => {
+            return Err(ManifestV2Error::InvalidMcpRuntime {
+                reason: format!(
+                    "transport '{other}' is not supported; expected stdio, http, or sse"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_mcp_http_url(transport: &str, value: &str) -> Result<(), ManifestV2Error> {
+    let parsed = url::Url::parse(value).map_err(|_| ManifestV2Error::InvalidMcpRuntime {
+        reason: format!("{transport} transport url must be an absolute http(s) URL"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ManifestV2Error::InvalidMcpRuntime {
+            reason: format!("{transport} transport url must use http or https"),
+        });
+    }
+    Ok(())
 }
 
 fn requested_trust_to_descriptor_trust(requested: RequestedTrustClass) -> TrustClass {
@@ -446,11 +584,7 @@ impl RawRuntimeV2 {
     fn into_runtime(self) -> Result<ExtensionRuntimeV2, ManifestV2Error> {
         match self {
             Self::Wasm { module } => {
-                if module.trim().is_empty() {
-                    return Err(ManifestV2Error::Invalid {
-                        reason: "wasm runtime module must not be empty".to_string(),
-                    });
-                }
+                validate_wasm_module_ref(&module)?;
                 Ok(ExtensionRuntimeV2::Wasm { module })
             }
             Self::Script {
@@ -490,11 +624,7 @@ impl RawRuntimeV2 {
                 args,
                 url,
             } => {
-                if transport.trim().is_empty() {
-                    return Err(ManifestV2Error::Invalid {
-                        reason: "mcp transport must not be empty".to_string(),
-                    });
-                }
+                validate_mcp_runtime_shape(&transport, command.as_deref(), url.as_deref())?;
                 Ok(ExtensionRuntimeV2::Mcp {
                     transport,
                     command,
