@@ -173,7 +173,8 @@ pub(super) fn type_filter_matches(path: &str, type_filter: &str) -> bool {
 }
 
 pub(super) fn is_workspace_path(path: &str) -> bool {
-    let normalized = path.trim_start_matches('/');
+    let scoped = scoped_path_input(path);
+    let normalized = scoped.trim_start_matches('/');
     let relative = normalized.strip_prefix("workspace/").unwrap_or(normalized);
     (!relative.contains('/') && WORKSPACE_FILES.contains(&relative))
         || relative.starts_with("daily/")

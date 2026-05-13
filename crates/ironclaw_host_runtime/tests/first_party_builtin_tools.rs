@@ -549,6 +549,63 @@ async fn builtin_coding_blocks_sensitive_resolved_libsql_paths() {
 }
 
 #[tokio::test]
+async fn builtin_coding_blocks_relative_workspace_protected_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("daily")).unwrap();
+    std::fs::create_dir_all(temp.path().join("context")).unwrap();
+    std::fs::write(temp.path().join("README.md"), "keep\n").unwrap();
+    std::fs::write(temp.path().join("daily/note.md"), "keep\n").unwrap();
+    std::fs::write(temp.path().join("context/session.md"), "keep\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    for (tool_path, host_path) in [
+        ("./README.md", "README.md"),
+        ("./daily/note.md", "daily/note.md"),
+        ("./context/session.md", "context/session.md"),
+    ] {
+        let write_error = invoke_with_context(
+            &runtime,
+            WRITE_FILE_CAPABILITY_ID,
+            json!({"path": tool_path, "content": "changed\n"}),
+            context.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(write_error, RuntimeFailureKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(host_path)).unwrap(),
+            "keep\n"
+        );
+
+        invoke_with_context(
+            &runtime,
+            READ_FILE_CAPABILITY_ID,
+            json!({"path": tool_path}),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+
+        let patch_error = invoke_with_context(
+            &runtime,
+            APPLY_PATCH_CAPABILITY_ID,
+            json!({"path": tool_path, "old_string": "keep", "new_string": "changed"}),
+            context.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(patch_error, RuntimeFailureKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(host_path)).unwrap(),
+            "keep\n"
+        );
+    }
+}
+
+#[tokio::test]
 async fn builtin_coding_grep_searches_single_file_paths_like_v1() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("src")).unwrap();
