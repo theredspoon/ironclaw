@@ -156,10 +156,19 @@ impl RecoveryStrategy for DefaultRecoveryStrategy {
         let kind = capability_error_to_failure_kind(err.class);
 
         match err.class {
-            // Permanent / policy / input — no retry.
+            // PolicyDenied — skip the denied call and let the model try
+            // something else. A denial means "this tool isn't authorized
+            // for this run" (profile filter, hook deny, runtime auth gap);
+            // aborting the whole turn on the first denial is harsh. The
+            // no-progress safety net (master doc §10) still catches a
+            // stuck model repeatedly issuing denied calls. Families that
+            // want stricter behavior override DefaultRecoveryStrategy.
+            CapabilityErrorClass::PolicyDenied => {
+                RecoveryOutcome::SkipResult { recovery: next }
+            }
+            // Permanent / input — no retry, no graceful skip; abort.
             CapabilityErrorClass::Permanent
-            | CapabilityErrorClass::InputInvalid
-            | CapabilityErrorClass::PolicyDenied => {
+            | CapabilityErrorClass::InputInvalid => {
                 RecoveryOutcome::Abort { recovery: next, failure_kind: kind }
             }
             // Transient / unavailable / internal — bounded retry.

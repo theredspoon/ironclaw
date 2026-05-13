@@ -264,13 +264,18 @@ loop:
   if state.iteration >= planner.budget().iteration_limit(&state):
     return LoopExit::Failed { reason_kind: IterationLimit, ... }
 
-  // 1. Cancellation observation — checkpoint + Ok(LoopExit::Cancelled(...)) if fired.
+  // 1. Cancellation observation (top of iteration) — checkpoint + Ok(LoopExit::Cancelled(...)) if fired.
+  //
+  //    Cancellation is observed at this site AND at 7 additional `// CANCEL`
+  //    sites below — one before each awaited strategy call. WS-6 §3.5 lists
+  //    all eight boundaries explicitly; the markers here are abbreviated.
   observe_cancellation_then_checkpoint_and_exit_if_set()
 
   // 2. Steering drain. LoopInputPort surface is poll_inputs(after, limit) +
   //    ack_inputs(cursor). Filter to user-facing kinds only — control kinds
   //    (Cancel, Interrupt, GateResolved, CapabilitySurfaceChanged) are NOT
   //    consumed here.
+  // CANCEL before drain.drain_steering
   if planner.drain().drain_steering(&state):
     pending = host.poll_inputs(state.input_cursor, MAX_PER_DRAIN)
     (steering_msgs, last_consumed) = filter_steering_kinds(pending)
@@ -279,17 +284,32 @@ loop:
       host.ack_inputs(last_consumed)
       state.input_cursor = last_consumed
 
+  // CANCEL before context.plan_context_request
   ctx_req   = planner.context().plan_context_request(&state)
   bundle    = host.build_prompt_bundle(ctx_req)
+  // CANCEL before capability.filter
   surface   = host.visible_capabilities(planner.capability().filter(&state))
   state.surface_version = Some(surface.version)
 
-  checkpoint(BeforeModel, &state)
+  checkpoint(BeforeModel, &state)  // staged via host.stage_checkpoint_payload → state_ref → port.checkpoint(kind, state_ref)
 
+  // CANCEL before model.preference
   model_pref = planner.model().preference(&state)
-  model_resp = host.stream_model(LoopModelRequest { messages: bundle.messages,
-                                                   surface_version: surface.version,
-                                                   model_preference: Some(model_pref) })
+  model_resp = loop:
+    // Wrap stream_model in a recovery loop. on_model_error is consulted
+    // on failure (PR #3544 serrrfirat #4); skeleton rejects
+    // RetryAlteration::AdvanceFallback until ModelRouteChain lands (§9).
+    match host.stream_model(LoopModelRequest { messages: bundle.messages,
+                                              surface_version: surface.version,
+                                              model_preference: Some(model_pref) }):
+      Ok(resp): break resp
+      Err(err):
+        recovery = planner.recovery().on_model_error(&state, &sanitize_model_error(&err))
+        match recovery:
+          Retry { recovery, alter }: state.recovery_state = recovery; honor_alteration(alter); continue
+          SkipResult { .. }: return PlannerContract { "SkipResult on model error" }
+          Abort { recovery, fk }: state.recovery_state = recovery
+                                   return LoopExit::Failed { reason_kind: fk, ... }
 
   match model_resp.output:
     ParentLoopOutput::AssistantReply(reply):
@@ -397,7 +417,7 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 ## 9. Cross-cutting decisions (locked)
 
 - **Checkpoint discipline is executor-owned.** Four kinds: `BeforeModel`, `BeforeSideEffect`, `BeforeBlock`, optionally `Final`. Strategies cannot trigger checkpoints; they only return state slots.
-- **Cancellation observed between strategy calls.** Strategies never see the signal directly.
+- **Cancellation observed between strategy calls.** Strategies never see the signal directly. The canonical executor consults `LoopCancellationPort` at **eight explicit awaited boundaries** per tick (top of iteration + before each of the seven subsequent strategy calls); the list is enumerated in WS-6 §3.5 (PR #3544 serrrfirat #6). Adding a new strategy call to the executor MUST add a matching cancel-boundary check.
 - **Visible surface version pinned per iteration** before `plan_model_request`, held in `LoopExecutionState.surface_version`. On stale-surface outcome, executor reloads + retries that iteration; counts against `BudgetStrategy.iteration_limit(&state)`.
 - **Error sanitization at the host boundary.** Strategies receive `CapabilityErrorSummary` / `ModelErrorSummary` (already redacted by the host). Raw provider errors never reach planner code. Honors [`error-handling.md`](../../.claude/rules/error-handling.md) channel-edge rule.
 - **Fallback chain is intended but deferred.** Skeleton keeps the existing `Option<LoopModelRouteSnapshot>` on `LoopRunContext` and reserves `model_state.fallback_index: u32` (always 0 in skeleton). When a future `RecoveryStrategy` needs to switch models, that PR adds `ModelRouteChain` to `host.rs` and migrates the storage layer call sites. Until then, `RecoveryOutcome::Retry { alter }` cannot include a model-route swap — only context/prompt-shape alterations.
@@ -413,6 +433,7 @@ Three properties the canonical executor must guarantee, regardless of strategy c
 - **`LoopExit` validation is structurally enforced at the framework→reborn→turns boundary.** `AgentLoopDriver::run` / `resume` returns a raw `LoopExit`. Only `LoopExitApplier::validate(exit, LoopExitValidationPolicy)` — sealed per PR #3460, the policy type cannot be constructed by untrusted code — produces the `LoopExitValidationDecision` that flows into `TurnRunTransitionPort::apply_validated_loop_exit` via `ApplyValidatedLoopExitRequest`. The runner's transition port accepts the validated request, not a raw `LoopExit`. There is no path for an unvalidated exit to reach durable state. This mirrors the #3460 seal pattern for policies and is the agent-loop-framework analog of zmanian's "witness type" ask in PR #3544 review.
 - **`ComponentIdentity` is the one identity primitive across the system.** `ComponentIdentity { id: &'static str, digest: ComponentDigest }` (defined in `ironclaw_agent_loop::family` per WS-3.5) is used consistently across loop families (this PR), checkpoint payload metadata (WS-0), hooks (#3524 future), skill snapshots (#3470 future), and model routes (#3462 future). **Content-addressed only — monotonic counters are insufficient** (they false-drift when bumped without changes and false-agree when changes ship without a bump; both are silent replay-correctness bugs). The existing `LoopModelRouteSnapshot.auth_version: String` and `config_version: String` at `crates/ironclaw_turns/src/run_profile/host.rs:362` are String identities, not content hashes; they migrate to `ComponentIdentity` alongside the model-route work in #3462 — **not in this PR**. Per [`.claude/rules/types.md`](../../.claude/rules/types.md), identity-shaped values use newtypes; `ComponentIdentity` is the canonical one for component-versioning. See [`agent-loop-briefs/loop-family-registry.md`](agent-loop-briefs/loop-family-registry.md) §3.2's "Migration / propagation" subsection for the per-component migration paths.
 - **JSON canonicalization for hashing follows JCS RFC 8785.** Any digest-over-JSON content in the framework — `CapabilityCallSignature::ArgsHash` is the primary case — uses [JCS RFC 8785](https://datatracker.ietf.org/doc/html/rfc8785) canonicalization. Implementation reference: the `jcs` crate (added to `ironclaw_agent_loop`'s dependencies when WS-0 ships code). Rules: object keys sorted by UTF-16 code-unit order, NaN/Infinity rejected (not valid JSON), number representation preserved (no `1.0 → 1` normalization), minimal whitespace. **Cross-model compatibility:** for typical tool-call args (strings, integers, nested objects without floats), JCS output is byte-identical to the Hermes/Forge sorted-keys-minimal-whitespace convention used in the open-weights tool-calling ecosystem (Llama 3.1+, Qwen, DeepSeek, Mistral via `<tool_call>` ChatML). Replay across model swaps (Claude ↔ Hermes 3 ↔ Llama-tool-call format) hashes identically for typical args; divergence is limited to the float-representation edge case which production tool args essentially never hit. See [`agent-loop-briefs/state-and-checkpoints.md`](agent-loop-briefs/state-and-checkpoints.md) §3.4a for the canonicalization rules in implementation form.
+- **Denial telemetry surfaces through `LoopProgressPort` milestones, not the action log.** Profile-surface denials and hook denials never reach `CapabilityHost`, so they do not produce `ActionRecord` entries. Until WS-12 (`LoopProgressPort` wiring) lands, denials accumulate only in the in-memory `state.recent_failure_kinds` ring as `LoopFailureKind::PolicyDenied`. **WS-12 introduces `CapabilityBatchCompleted { denied_count: u32 }`** ([`agent-loop-briefs/loop-progress-port.md`](agent-loop-briefs/loop-progress-port.md)) which gives durable redacted denial-count telemetry without crossing into action-log territory. Per-call denial evidence (beyond counts) is out of scope for the skeleton — add a dedicated `ProfileDenialObserved` variant in a follow-up only when a real consumer demands it. Addresses PR #3544 serrrfirat #5.
 
 ## 10. Production-safe escape
 

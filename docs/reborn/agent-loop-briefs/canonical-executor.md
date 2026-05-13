@@ -131,14 +131,29 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                 return Ok(/* LoopExit::Failed { IterationLimit, … } */);
             }
 
-            // 1. Cancellation observation
+            // 1. Cancellation observation (top of iteration).
+            //
+            // Per master doc §9, cancellation is observed BETWEEN EVERY
+            // strategy call — not just at top of iteration. This pseudocode
+            // shows the top-of-iteration site explicitly; the explicit
+            // call sites between subsequent strategy calls are marked
+            // `// CANCEL_BOUNDARY` below. WS-13's `LoopCancellationPort`
+            // is the sync accessor consulted at each boundary (per §3.5).
+            // Production-safe rationale (master doc §10): strategies are
+            // sealed Builtin code that returns promptly; cooperative
+            // checks at strategy-call boundaries are sufficient without
+            // preemptive `tokio::select!` wrapping.
             state = self.checkpoint_and_exit_if_cancelled(host, state).await?;
 
+            // CANCEL_BOUNDARY before drain_steering — check elided in this
+            // pseudocode for readability; implementer MUST call
+            // `checkpoint_and_exit_if_cancelled` here.
             // 2. Steering drain (per planner.drain())
             if planner.drain().drain_steering(&state).await {
                 state = self.drain_steering_into(host, state).await?;
             }
 
+            // CANCEL_BOUNDARY before plan_context_request
             // 3. Context + visible surface
             let ctx_req = planner.context().plan_context_request(&state).await;
             let bundle = host
@@ -146,6 +161,7 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                 .await
                 .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Prompt })?;
 
+            // CANCEL_BOUNDARY after build_prompt_bundle, before capability().filter
             let surface_filter = planner.capability().filter(&state).await;
             let surface = host
                 .visible_capabilities(/* applies surface_filter */)
@@ -156,12 +172,48 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
             // 4. Checkpoint BeforeModel
             state = self.checkpoint(host, state, CheckpointKind::BeforeModel).await?;
 
-            // 5. Stream model
+            // 5. Stream model. On error, route through RecoveryStrategy
+            // (PR #3544 serrrfirat #4) — `on_model_error` is not dead code;
+            // it gets a real call site here. The host port returns a
+            // sanitized `ModelErrorSummary` (per WS-2 §3.3) and the
+            // recovery strategy decides Retry/SkipResult/Abort. Skeleton
+            // executor rejects `RetryAlteration::AdvanceFallback` as
+            // `PlannerContract` (deferred until `ModelRouteChain` lands;
+            // master doc §9). Bounded retry; the iteration cap is the
+            // structural backstop if recovery never aborts.
+            // CANCEL_BOUNDARY before model().preference (checkpoint BeforeModel just landed)
             let model_pref = planner.model().preference(&state).await;
-            let model_resp = host
-                .stream_model(/* construct LoopModelRequest from bundle + surface + model_pref */)
-                .await
-                .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Model })?;
+            let model_resp = loop {
+                let attempt = host
+                    .stream_model(/* construct LoopModelRequest from bundle + surface + model_pref */)
+                    .await;
+                match attempt {
+                    Ok(resp) => break resp,
+                    Err(host_err) => {
+                        let summary = sanitize_model_error(&host_err);
+                        let recovery = planner.recovery()
+                            .on_model_error(&state, &summary).await;
+                        match recovery {
+                            RecoveryOutcome::Retry { recovery, alter } => {
+                                state.recovery_state = recovery;
+                                self.honor_alteration(&alter)?;  // rejects AdvanceFallback
+                                continue;  // loop back to stream_model
+                            }
+                            RecoveryOutcome::SkipResult { recovery: _ } => {
+                                // Skip on model error is meaningless — there's no
+                                // result to skip. Treat as PlannerContract.
+                                return Err(AgentLoopExecutorError::PlannerContract {
+                                    detail: "SkipResult on model error",
+                                });
+                            }
+                            RecoveryOutcome::Abort { recovery, failure_kind } => {
+                                state.recovery_state = recovery;
+                                return Ok(/* propagate LoopExit::Failed { failure_kind } */);
+                            }
+                        }
+                    }
+                }
+            };
 
             // 6. Branch on model output
             match model_resp.output {
@@ -185,6 +237,7 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                         assistant_message_ref: Some(reply_ref),
                         batch_result_refs: Vec::new(),
                     };
+                    // CANCEL_BOUNDARY before stop().should_stop_after_turn (Reply path)
                     let stop = planner.stop().should_stop_after_turn(&state, &summary).await;
 
                     match stop {
@@ -585,7 +638,21 @@ fn summary_of(call: &CapabilityCall, surface: &VisibleCapabilitySurface) -> Capa
 
 The concurrency hint comes from the visible-capability descriptor returned by `LoopCapabilityPort::visible_capabilities` earlier in the iteration. Unknown capabilities (not present in the surface — the model invented or hallucinated a name) are treated as `Exclusive` for safety; the host will reject the call at `invoke_capability_batch` time anyway, but the conservative hint prevents the loop from speculatively parallelizing alongside unknown calls.
 
+**Where `concurrency_hint` lives:** `CapabilityDescriptorView` (in `ironclaw_turns::run_profile::host`) gains a `concurrency_hint: ConcurrencyHint` field — additive contract change introduced by WS-0 (see [`state-and-checkpoints.md`](state-and-checkpoints.md) §2 EXTEND list). The hint is **derived at the adapter boundary** in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`) from the underlying `CapabilityDescriptor.effects` Vec: presence of any write/spawn/exclusive effect → `Exclusive`; otherwise → `SafeForParallel`. Lower-layer `CapabilityDescriptor` is NOT modified — `effects` is already the source of truth, and computing the hint at the view-layer adapter keeps the inference in one place. Tool authors don't have to remember to declare a hint correctly; they declare effects (which they already do), and the system infers conservatively. Addresses PR #3544 serrrfirat #7.
+
 ### 3.4 Checkpoint helper
+
+The checkpoint flow is **two-step**: the executor serializes state to bytes,
+stages those bytes via a storage-layer port to receive a validated
+`LoopCheckpointStateRef`, then hands the metadata-write port only the
+**ref**. The metadata port (`LoopCheckpointPort::checkpoint`) never sees
+raw payload bytes; it receives an opaque token + the checkpoint kind +
+the schema id.
+
+This split lets the metadata write be small and side-effect-free at the
+contract layer (the metadata is mostly the ref pointer), while the actual
+byte storage layer can be backed by any blob substrate (PostgreSQL, S3,
+local filesystem) without changing the contract.
 
 ```rust
 impl CanonicalAgentLoopExecutor {
@@ -595,20 +662,67 @@ impl CanonicalAgentLoopExecutor {
         mut state: LoopExecutionState,
         kind: CheckpointKind,
     ) -> Result<LoopExecutionState, AgentLoopExecutorError> {
-        // Serialize state into checkpoint payload (schema id from WS-0)
-        let payload = serialize_checkpoint(&state);
-        host.save_checkpoint(/* request with kind + payload + schema id */)
+        // Step 1: executor serializes state into bytes (schema id from WS-0).
+        // Use a JCS-canonicalized payload so the bytes are reproducible
+        // across runs and the content digest in checkpoint metadata is
+        // stable (see master doc §9 canonicalization bullet).
+        let payload = serialize_checkpoint(&state, CHECKPOINT_SCHEMA_ID);
+
+        // Step 2: stage the bytes via the storage layer. Returns an
+        // opaque, validated `LoopCheckpointStateRef` of form
+        // `"checkpoint:{run_id}:{token}"` (defined in
+        // `ironclaw_turns::run_profile::host` line 210).
+        // `stage_checkpoint_payload` is owned by the host facade — it
+        // wraps the underlying `CheckpointStateStore::put_checkpoint_state`.
+        let state_ref = host
+            .stage_checkpoint_payload(StageCheckpointPayloadRequest {
+                schema_id: CHECKPOINT_SCHEMA_ID,
+                payload,
+            })
             .await
             .map_err(|_| AgentLoopExecutorError::CheckpointFailed { stage: kind })?;
+
+        // Step 3: write the metadata via the existing
+        // `LoopCheckpointPort::checkpoint(kind, state_ref)` contract.
+        // The port never sees the raw bytes — only the validated ref.
+        host.checkpoint(LoopCheckpointRequest { kind, state_ref })
+            .await
+            .map_err(|_| AgentLoopExecutorError::CheckpointFailed { stage: kind })?;
+
         state.last_checkpoint = Some(CheckpointMarker { kind, iteration_at_checkpoint: state.iteration });
         Ok(state)
     }
 }
 ```
 
+`stage_checkpoint_payload` is a small additive method on
+`AgentLoopDriverHost` introduced by this brief (lives in `ironclaw_turns`
+per master doc §12 crate-ownership rule; concrete impl wraps the existing
+`CheckpointStateStore::put_checkpoint_state` in `ironclaw_loop_support`).
+WS-10's `load_checkpoint_payload` is its read-side dual.
+
+Addresses PR #3544 serrrfirat #3 (write-side payload-vs-state-ref flow
+ambiguity).
+
 ### 3.5 Cancellation observation
 
-The host facade should expose a way to observe cancellation between strategy calls (a method on `AgentLoopDriverHost` returning a current-cancel-state, or an `AbortSignal`-shaped accessor). The executor checks it at the top of every iteration. If the existing host API does not yet expose this, this brief documents the requirement and either:
+The host facade exposes a way to observe cancellation between strategy calls — a sync method on `AgentLoopDriverHost` (or the `LoopCancellationPort` defined in WS-13) returning a current-cancel-state. The executor MUST call it at **every awaited boundary in the canonical tick**, not just at top-of-iteration. The explicit awaited boundaries (cross-referenced as `CANCEL_BOUNDARY` markers in §3.2 above):
+
+| # | Site | Before strategy call |
+|---|---|---|
+| 1 | Top of iteration | first thing in each tick |
+| 2 | Pre-`drain().drain_steering` | between iteration prelude and drain |
+| 3 | Pre-`context().plan_context_request` | between drain and context |
+| 4 | Pre-`capability().filter` (after `build_prompt_bundle` returns) | between context-build and capability-surface |
+| 5 | Pre-`model().preference` (after `BeforeModel` checkpoint) | between checkpoint and model-pref |
+| 6 | Pre-`stop().should_stop_after_turn` (Reply path) | between reply-finalize and stop |
+| 7 | Pre-`stop().should_stop_after_turn` (CapabilityCalls path) | between batch-completion and stop |
+| 8 | Inside the capability-batch loop, before each `gate().handle` | between successive outcome arms |
+| 9 | Inside the inner retry loop, before each `recovery().on_capability_error` | between retry attempts |
+
+Eight sites. Per master doc §10, strategies are sealed Builtin code that returns promptly; **cooperative cancellation at these awaited boundaries is sufficient without preemptive `tokio::select!` wrapping**. The boundary list IS the contract — adding a new strategy call to the executor MUST add a matching CANCEL_BOUNDARY. WS-8's integration suite includes a cancellation-fires-at-each-boundary test covering all eight sites. Addresses PR #3544 serrrfirat #6.
+
+If the existing host API does not yet expose a cancellation accessor, this brief documents the requirement and either:
 
 - (a) adds the missing accessor to `AgentLoopDriverHost` (small, additive change in `ironclaw_turns`); or
 - (b) uses a tokio `CancellationToken` passed through `AgentLoopExecutor::execute_family` as an additional parameter.

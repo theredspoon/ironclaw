@@ -44,6 +44,18 @@ populating the first slot is the only behavior change.
   shape.
 
 ### MODIFIED
+- `crates/ironclaw_turns/src/run_profile/host.rs` —
+  `LoopContextMessage.message_ref` becomes
+  `Option<LoopMessageRef>` (additive contract change in turns).
+  `None` means "this entry is summary-only — the prompt port MUST NOT
+  attempt to resolve content; use `safe_summary` verbatim instead."
+  Mirrors the skill pattern: `SkillTrustLevel::Installed` carries
+  `prompt_content: None`. Call-site updates: the existing nine
+  consumers wrap their writes in `Some(...)` and pattern-match on
+  reads. See §3.2's `IdentityTrustLevel` invariant for the
+  Installed-trust attenuation enforced via this field. Counts as
+  an additive `ironclaw_turns` contract extension per master doc
+  §12 crate-ownership rule.
 - `crates/ironclaw_loop_support/src/lib.rs` —
   - Add `pub mod identity_context;` and re-exports.
   - `ThreadBackedLoopContextPort` gains an
@@ -63,8 +75,9 @@ populating the first slot is the only behavior change.
 
 ### NOT TOUCHED
 - `crates/ironclaw_turns/src/run_profile/host.rs` —
-  `LoopContextBundle` already has the slot; we do not change the
-  contract.
+  `LoopContextBundle.identity_messages: Vec<LoopContextMessage>` slot
+  is unchanged in shape (the inner `LoopContextMessage` gains
+  the `Option<...>` field above, but the bundle itself is unaffected).
 - `crates/ironclaw_turns/src/run_profile/prompt.rs` —
   `HostManagedLoopPromptPort` already concatenates
   `identity_messages` first when assembling the model message list.
@@ -128,7 +141,22 @@ pub struct HostIdentityContextCandidate {
     /// raw string through `LoopContextMessage.safe_summary` — the
     /// ironclaw_turns crate's "no raw prompt content in contracts"
     /// rule prohibits it.
-    pub message_ref: LoopMessageRef,
+    ///
+    /// **Trust-attenuation invariant** (mirrors the skill pattern in
+    /// `SkillContextService` — `Installed` skills carry
+    /// `prompt_content: None`):
+    /// - `Trusted` trust level: `message_ref` MUST be `Some(...)` —
+    ///   content resolves to verbatim file bytes
+    /// - `Installed` trust level: `message_ref` MUST be `None` —
+    ///   only the `safe_summary` reaches the prompt; the candidate
+    ///   structurally cannot leak content
+    ///
+    /// The invariant is enforced at candidate construction (see
+    /// `HostIdentityContextCandidate::new_trusted` /
+    /// `new_installed_summary_only` constructors below) so a
+    /// downstream bug in `build_identity_messages` cannot resolve
+    /// an Installed candidate's ref — the ref doesn't exist.
+    pub message_ref: Option<LoopMessageRef>,
 
     /// Short host-redacted summary for prompt-milestone telemetry.
     /// Same role as `LoopContextSnippet.safe_summary`. Must not
@@ -157,6 +185,45 @@ pub enum IdentityApplicability {
     Always,
     OnTextOnly,
     OnCodeAct,
+}
+
+impl HostIdentityContextCandidate {
+    /// Constructs a Trusted candidate — content is resolvable via the
+    /// supplied `message_ref`. Verbatim file bytes reach the model at
+    /// stream-build time.
+    pub fn new_trusted(
+        name: IdentityFileName,
+        message_ref: LoopMessageRef,
+        safe_summary: String,
+        applies_when: IdentityApplicability,
+    ) -> Self {
+        Self {
+            name,
+            message_ref: Some(message_ref),
+            safe_summary,
+            trust_level: IdentityTrustLevel::Trusted,
+            applies_when,
+        }
+    }
+
+    /// Constructs an Installed candidate — summary-only, no content
+    /// ref. The structural absence of `message_ref` makes it impossible
+    /// for `build_identity_messages` to resolve verbatim content for
+    /// this candidate. Mirrors `SkillTrustLevel::Installed` carrying
+    /// `prompt_content: None` in `SkillContextService`.
+    pub fn new_installed_summary_only(
+        name: IdentityFileName,
+        safe_summary: String,
+        applies_when: IdentityApplicability,
+    ) -> Self {
+        Self {
+            name,
+            message_ref: None,
+            safe_summary,
+            trust_level: IdentityTrustLevel::Installed,
+            applies_when,
+        }
+    }
 }
 ```
 
@@ -197,6 +264,12 @@ pub async fn build_identity_messages(
             break;
         }
         used += cost;
+        // Trust attenuation by structural absence: Installed candidates
+        // carry `message_ref: None`, so `LoopContextMessage.message_ref`
+        // is also None for them — the prompt port has no token to
+        // resolve and only `safe_summary` reaches the prompt prefix.
+        // Trusted candidates carry `Some(ref)` which resolves to
+        // verbatim file bytes.
         out.push(LoopContextMessage {
             message_ref: c.message_ref,
             role: "system".to_string(),
@@ -310,10 +383,20 @@ wasteful and opens a race window where a file changes mid-run and the
 prefix flips. Required behavior:
 
 - For **stable** files (per §3.3.5), `ThreadBackedLoopContextPort`
-  MUST cache the resolved `Vec<LoopContextMessage>` for the run on
-  first `load_loop_context()` call and reuse it on subsequent calls.
-  Recommended representation: `Arc<OnceLock<Vec<LoopContextMessage>>>`
-  keyed off `LoopRunContext.run_id`.
+  MUST cache the raw `Vec<HostIdentityContextCandidate>` for the run
+  on first `load_loop_context()` call and reuse it on subsequent calls.
+  Recommended representation: `Arc<OnceLock<Vec<HostIdentityContextCandidate>>>`
+  keyed off `LoopRunContext.run_id`. **Per-call filtering MUST happen
+  after cache retrieval** — `build_identity_messages` re-applies
+  `applies_when` against the request's `PromptMode` on every call.
+  *Why not cache the filtered `Vec<LoopContextMessage>`:* `PromptMode`
+  can change between iterations (a `PlannedDriver`'s `ContextStrategy`
+  may switch from `TextOnly` to `CodeAct` or vice versa per turn).
+  Caching the filtered result locks in the first iteration's mode and
+  silently produces wrong identity content for subsequent iterations
+  with a different mode. Caching candidates (which are mode-independent)
+  preserves the cache's purpose (avoid disk re-reads) without freezing
+  the mode-dependent filter. This addresses PR #3544 serrrfirat #2.
 - For **volatile** files (HEARTBEAT.md), the source MUST be
   re-invoked each call; the volatile bucket is appended to
   `instruction_snippets` per §3.3.5 rather than cached as part of the
