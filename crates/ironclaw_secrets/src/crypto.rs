@@ -70,18 +70,20 @@ impl SecretsCrypto {
     /// `(encrypted_value, key_salt)` between rows — the swapped ciphertext
     /// was authenticated under a different `aad` and decryption fails with
     /// `SecretError::DecryptionFailed`.
-    pub fn encrypt(
-        &self,
-        plaintext: &[u8],
-        aad: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
+    pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
         let salt = Self::generate_salt();
         let derived_key = self.derive_key(&salt)?;
         let cipher = Aes256Gcm::new_from_slice(&derived_key)
             .map_err(|error| SecretError::EncryptionFailed(error.to_string()))?;
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
         let ciphertext = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
             .map_err(|error| SecretError::EncryptionFailed(error.to_string()))?;
         let mut encrypted = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
         encrypted.extend_from_slice(&nonce);
@@ -110,7 +112,13 @@ impl SecretsCrypto {
         let (nonce_bytes, ciphertext) = encrypted_value.split_at(NONCE_SIZE);
         let nonce = Nonce::from_slice(nonce_bytes);
         let plaintext = cipher
-            .decrypt(nonce, Payload { msg: ciphertext, aad })
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .map_err(|error| SecretError::DecryptionFailed(error.to_string()))?;
         DecryptedSecret::from_bytes(plaintext)
     }
@@ -147,7 +155,7 @@ pub(crate) fn build_aad(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     aad.extend_from_slice(domain);
     for part in parts {
         let length =
-            u32::try_from(part.len()).expect("AAD part length must fit in u32 for framing");
+            u32::try_from(part.len()).expect("AAD part length must fit in u32 for framing"); // safety: AAD parts are bounded identifiers (UUIDs, scope names, account names) — orders of magnitude below u32::MAX
         aad.extend_from_slice(&length.to_be_bytes());
         aad.extend_from_slice(part);
     }

@@ -27,8 +27,8 @@ use crate::{
     CredentialSessionStore, DecryptedSecret, Secret, SecretConsumeResult, SecretError, SecretRef,
     SecretsCrypto, SecretsStore,
     crypto::{
-        AAD_DOMAIN_CREDENTIAL_ACCOUNT, AAD_DOMAIN_CREDENTIAL_SESSION, build_aad,
-        secret_record_aad, secret_store_key_check_aad,
+        AAD_DOMAIN_CREDENTIAL_ACCOUNT, AAD_DOMAIN_CREDENTIAL_SESSION, build_aad, secret_record_aad,
+        secret_store_key_check_aad,
     },
 };
 
@@ -2134,7 +2134,6 @@ fn credential_session_aad(scope: &ResourceScope, session_id: CredentialSessionId
         ],
     )
 }
-
 
 fn credential_crypto_error(error: crate::SecretError) -> CredentialBrokerError {
     match error {
