@@ -776,6 +776,149 @@ fn audit_envelope_serializes_redacted_summary_shape() {
     assert!(json.get("host_path").is_none());
 }
 
+#[test]
+fn host_port_ids_are_host_namespaced_and_serializable() {
+    let id = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    assert_eq!(id.as_str(), "host.storage.sql_transaction.first_party");
+    assert_eq!(serde_json::to_value(&id).unwrap(), json!(id.as_str()));
+    assert_eq!(
+        serde_json::from_value::<HostPortId>(json!(id.as_str())).unwrap(),
+        id
+    );
+
+    for invalid in [
+        "",
+        "storage.sql_transaction",
+        "host",
+        "host.",
+        "host..storage",
+        "Host.storage",
+        "host/storage",
+        "host.storage\ntransaction",
+    ] {
+        assert!(
+            HostPortId::new(invalid).is_err(),
+            "{invalid:?} should be rejected"
+        );
+        assert!(
+            serde_json::from_value::<HostPortId>(json!(invalid)).is_err(),
+            "{invalid:?} should also be rejected when deserialized"
+        );
+    }
+}
+
+#[test]
+fn host_port_view_rejects_duplicate_ports_and_answers_membership() {
+    let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    let audit = HostPortId::new("host.events.audit").unwrap();
+    let network = HostPortId::new("host.network.http").unwrap();
+
+    let view = HostPortView::new(vec![
+        HostPortGrant::new(storage.clone()),
+        HostPortGrant::new(audit.clone()),
+    ])
+    .unwrap();
+
+    assert!(view.allows(&storage));
+    assert!(view.allows(&audit));
+    assert!(!view.allows(&network));
+    assert!(view.allows_all([&storage, &audit]));
+    assert!(!view.allows_all([&storage, &network]));
+
+    assert!(
+        HostPortView::new(vec![
+            HostPortGrant::new(storage.clone()),
+            HostPortGrant::new(storage),
+        ])
+        .is_err(),
+        "duplicate host port grants must fail closed"
+    );
+}
+
+#[test]
+fn capability_profile_ids_are_versioned_portable_contract_names() {
+    let id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
+    assert_eq!(id.as_str(), "memory.context_retrieval.v1");
+    assert_eq!(serde_json::to_value(&id).unwrap(), json!(id.as_str()));
+    assert_eq!(
+        serde_json::from_value::<CapabilityProfileId>(json!(id.as_str())).unwrap(),
+        id
+    );
+
+    for invalid in [
+        "",
+        "memory",
+        "memory.context_retrieval",
+        "memory.context_retrieval.version1",
+        "Memory.context_retrieval.v1",
+        "memory/context_retrieval/v1",
+        "memory..context_retrieval.v1",
+        "memory.context_retrieval.v1\n",
+    ] {
+        assert!(
+            CapabilityProfileId::new(invalid).is_err(),
+            "{invalid:?} should be rejected"
+        );
+        assert!(
+            serde_json::from_value::<CapabilityProfileId>(json!(invalid)).is_err(),
+            "{invalid:?} should also be rejected when deserialized"
+        );
+    }
+}
+
+#[test]
+fn capability_profile_contract_rejects_empty_or_duplicate_operations() {
+    let profile_id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
+    let operation = CapabilityProfileOperationContract::new(
+        CapabilityProfileOperationId::new("memory.context.retrieve.v1").unwrap(),
+        "schemas/memory/context-retrieve.input.v1.json",
+        "schemas/memory/context-retrieve.output.v1.json",
+    )
+    .unwrap();
+
+    let contract = CapabilityProfileContract::new(profile_id.clone(), vec![operation.clone()])
+        .expect("single-operation profile is valid");
+    assert_eq!(contract.id(), &profile_id);
+    assert_eq!(contract.required_operations(), &[operation.clone()]);
+
+    assert!(
+        CapabilityProfileContract::new(profile_id.clone(), Vec::new()).is_err(),
+        "profiles without required operations should fail closed"
+    );
+    assert!(
+        CapabilityProfileContract::new(profile_id, vec![operation.clone(), operation]).is_err(),
+        "duplicate profile operation contracts should fail closed"
+    );
+}
+
+#[test]
+fn capability_profile_schema_refs_are_relative_repository_paths() {
+    for valid in [
+        "schemas/memory/context-retrieve.input.v1.json",
+        "schemas/echo.output.v1.json",
+    ] {
+        assert!(
+            CapabilityProfileSchemaRef::new(valid).is_ok(),
+            "{valid:?} should be accepted"
+        );
+    }
+
+    for invalid in [
+        "",
+        "/schemas/memory/context.json",
+        "../schemas/memory/context.json",
+        "schemas/../context.json",
+        "https://example.com/schema.json",
+        "file:///tmp/schema.json",
+        "schemas/memory/context.json\n",
+    ] {
+        assert!(
+            CapabilityProfileSchemaRef::new(invalid).is_err(),
+            "{invalid:?} should be rejected"
+        );
+    }
+}
+
 fn sample_context_with_agent(agent: Option<&str>) -> ExecutionContext {
     let mut ctx = sample_context();
     let agent_id = agent.map(|id| AgentId::new(id).unwrap());

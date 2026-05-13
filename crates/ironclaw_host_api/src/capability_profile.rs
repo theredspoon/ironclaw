@@ -1,0 +1,287 @@
+//! Host-defined capability profile contracts.
+//!
+//! Capability profiles are portable, host-defined contracts such as
+//! `memory.context_retrieval.v1`. Extensions may later claim that their
+//! provider-prefixed capabilities implement these operations, but this module
+//! only defines the neutral contract vocabulary.
+
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use crate::HostApiError;
+
+fn valid_segment_char(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+}
+
+fn validate_versioned_dotted_id(kind: &'static str, value: &str) -> Result<(), HostApiError> {
+    if value.is_empty() {
+        return Err(HostApiError::invalid_id(kind, value, "must not be empty"));
+    }
+    if value.len() > 128 {
+        return Err(HostApiError::invalid_id(
+            kind,
+            value,
+            "must be at most 128 bytes",
+        ));
+    }
+    let segments = value.split('.').collect::<Vec<_>>();
+    if segments.len() < 3 {
+        return Err(HostApiError::invalid_id(
+            kind,
+            value,
+            "must have at least domain, name, and version segments",
+        ));
+    }
+    for segment in &segments {
+        if segment.is_empty() {
+            return Err(HostApiError::invalid_id(
+                kind,
+                value,
+                "empty dot segments are not allowed",
+            ));
+        }
+        let first = segment.as_bytes()[0];
+        if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+            return Err(HostApiError::invalid_id(
+                kind,
+                value,
+                "segments must start with lowercase ASCII letter or digit",
+            ));
+        }
+        if segment.bytes().any(|byte| !valid_segment_char(byte)) {
+            return Err(HostApiError::invalid_id(
+                kind,
+                value,
+                "only lowercase ASCII letters, digits, '_', '-', and '.' are allowed",
+            ));
+        }
+    }
+    let version = segments[segments.len() - 1];
+    let Some(rest) = version.strip_prefix('v') else {
+        return Err(HostApiError::invalid_id(
+            kind,
+            value,
+            "last segment must be a version like v1",
+        ));
+    };
+    if rest.is_empty() || rest.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return Err(HostApiError::invalid_id(
+            kind,
+            value,
+            "last segment must be a version like v1",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_ref(value: &str) -> Result<(), HostApiError> {
+    if value.is_empty() {
+        return Err(HostApiError::invalid_path(value, "must not be empty"));
+    }
+    if value.len() > 512 {
+        return Err(HostApiError::invalid_path(
+            value,
+            "must be at most 512 bytes",
+        ));
+    }
+    if value.starts_with('/') {
+        return Err(HostApiError::invalid_path(value, "must be relative"));
+    }
+    if value.contains("://") {
+        return Err(HostApiError::invalid_path(value, "URLs are not allowed"));
+    }
+    if value.contains('\\') {
+        return Err(HostApiError::invalid_path(
+            value,
+            "backslashes are not allowed",
+        ));
+    }
+    if value.chars().any(|ch| ch == '\0' || ch.is_control()) {
+        return Err(HostApiError::invalid_path(
+            value,
+            "NUL/control characters are not allowed",
+        ));
+    }
+    for segment in value.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(HostApiError::invalid_path(
+                value,
+                "empty and dot path segments are not allowed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+macro_rules! string_contract_id {
+    ($name:ident, $kind:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, HostApiError> {
+                let value = value.into();
+                validate_versioned_dotted_id($kind, &value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+string_contract_id!(CapabilityProfileId, "capability_profile");
+string_contract_id!(CapabilityProfileOperationId, "capability_profile_operation");
+
+/// Relative schema reference used by a host-defined profile operation contract.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CapabilityProfileSchemaRef(String);
+
+impl CapabilityProfileSchemaRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, HostApiError> {
+        let value = value.into();
+        validate_schema_ref(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CapabilityProfileSchemaRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for CapabilityProfileSchemaRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityProfileSchemaRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One required operation for a host-defined capability profile.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CapabilityProfileOperationContract {
+    id: CapabilityProfileOperationId,
+    input_schema_ref: CapabilityProfileSchemaRef,
+    output_schema_ref: CapabilityProfileSchemaRef,
+}
+
+impl CapabilityProfileOperationContract {
+    pub fn new(
+        id: CapabilityProfileOperationId,
+        input_schema_ref: impl Into<String>,
+        output_schema_ref: impl Into<String>,
+    ) -> Result<Self, HostApiError> {
+        Ok(Self {
+            id,
+            input_schema_ref: CapabilityProfileSchemaRef::new(input_schema_ref)?,
+            output_schema_ref: CapabilityProfileSchemaRef::new(output_schema_ref)?,
+        })
+    }
+
+    pub fn id(&self) -> &CapabilityProfileOperationId {
+        &self.id
+    }
+
+    pub fn input_schema_ref(&self) -> &CapabilityProfileSchemaRef {
+        &self.input_schema_ref
+    }
+
+    pub fn output_schema_ref(&self) -> &CapabilityProfileSchemaRef {
+        &self.output_schema_ref
+    }
+}
+
+/// Host-defined portability contract that extensions may claim to implement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityProfileContract {
+    id: CapabilityProfileId,
+    required_operations: Vec<CapabilityProfileOperationContract>,
+}
+
+impl CapabilityProfileContract {
+    pub fn new(
+        id: CapabilityProfileId,
+        required_operations: Vec<CapabilityProfileOperationContract>,
+    ) -> Result<Self, HostApiError> {
+        if required_operations.is_empty() {
+            return Err(HostApiError::invariant(
+                "capability profile must require at least one operation",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for operation in &required_operations {
+            if !seen.insert(operation.id.clone()) {
+                return Err(HostApiError::invariant(format!(
+                    "duplicate capability profile operation {}",
+                    operation.id
+                )));
+            }
+        }
+        Ok(Self {
+            id,
+            required_operations,
+        })
+    }
+
+    pub fn id(&self) -> &CapabilityProfileId {
+        &self.id
+    }
+
+    pub fn required_operations(&self) -> &[CapabilityProfileOperationContract] {
+        &self.required_operations
+    }
+}
