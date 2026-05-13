@@ -65,7 +65,7 @@ use ironclaw_turns::{
     SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnError, TurnLeaseToken, TurnRunId,
     TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
-        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind,
+        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply,
         CapabilityDeniedReasonKind, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
         CapabilitySurfaceVersion, FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink,
         LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
@@ -352,6 +352,44 @@ async fn text_only_model_reply_driver_runs_prompt_model_transcript_path() {
     );
     assert_public_milestones_hide_raw_payloads(&fixture.milestones());
     assert_driver_public_outputs_hide_raw_payloads(&completed);
+}
+
+#[tokio::test]
+async fn text_only_model_reply_driver_preserves_non_secret_marker_reply_text() {
+    let mut fixture = HostFixture::new("thread-driver-marker-reply", "hello config").await;
+    fixture.gateway.set_response(Ok(HostManagedModelResponse {
+        safe_text_deltas: vec!["Use OPENAI_API_KEY in the environment".to_string()],
+        output: ParentLoopOutput::AssistantReply(AssistantReply {
+            content: "Use OPENAI_API_KEY in the environment".to_string(),
+        }),
+    }));
+    let driver = TextOnlyModelReplyDriver::default();
+    assign_driver_to_fixture(&mut fixture, driver.descriptor());
+    let host = fixture.build_host().await;
+
+    driver
+        .run(driver_request(&fixture.context), &host)
+        .await
+        .unwrap();
+
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    let assistant = history
+        .messages
+        .iter()
+        .find(|message| message.kind == MessageKind::Assistant)
+        .expect("driver must persist assistant reply through transcript port");
+    assert_eq!(assistant.status, MessageStatus::Finalized);
+    assert_eq!(
+        assistant.content.as_deref(),
+        Some("Use OPENAI_API_KEY in the environment")
+    );
 }
 
 #[tokio::test]

@@ -568,7 +568,7 @@ where
                     safe_text_delta: sanitize_model_visible_text(safe_text_delta),
                 })
                 .collect(),
-            output: sanitize_parent_loop_output(gateway_response.output),
+            output: gateway_response.output,
             effective_model_profile_id: model_profile_id,
         })
     }
@@ -806,9 +806,9 @@ pub struct HostManagedModelResponse {
 
 impl HostManagedModelResponse {
     pub fn assistant_reply(content: impl Into<String>) -> Self {
-        let content = sanitize_model_visible_text(content);
+        let content = content.into();
         Self {
-            safe_text_deltas: vec![content.clone()],
+            safe_text_deltas: vec![sanitize_model_visible_text(content.clone())],
             output: ParentLoopOutput::AssistantReply(AssistantReply { content }),
         }
     }
@@ -1063,17 +1063,6 @@ fn model_gateway_error(error: HostManagedModelError) -> AgentLoopHostError {
         safe_model_summary(error.kind).to_string()
     };
     AgentLoopHostError::new(model_error_kind(error.kind), safe_summary)
-}
-
-fn sanitize_parent_loop_output(output: ParentLoopOutput) -> ParentLoopOutput {
-    match output {
-        ParentLoopOutput::AssistantReply(AssistantReply { content }) => {
-            ParentLoopOutput::AssistantReply(AssistantReply {
-                content: sanitize_model_visible_text(content),
-            })
-        }
-        ParentLoopOutput::CapabilityCalls(calls) => ParentLoopOutput::CapabilityCalls(calls),
-    }
 }
 
 fn model_error_kind(kind: HostManagedModelErrorKind) -> AgentLoopHostErrorKind {

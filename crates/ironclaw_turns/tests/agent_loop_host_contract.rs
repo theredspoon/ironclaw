@@ -2158,7 +2158,7 @@ async fn post_accounting_failure_after_gateway_failure_fails_closed() {
     let port = HostManagedLoopModelPort::with_accountant(
         context.clone(),
         gateway.clone(),
-        milestone_sink,
+        milestone_sink.clone(),
         accountant.clone(),
     );
 
@@ -2173,6 +2173,14 @@ async fn post_accounting_failure_after_gateway_failure_fails_closed() {
     assert!(accountant.was_post_called());
     assert!(accountant.post_saw_failure());
     assert_eq!(gateway.requests().len(), 1);
+    assert_eq!(
+        milestone_sink
+            .milestones()
+            .iter()
+            .map(|milestone| milestone.kind.kind_name())
+            .collect::<Vec<_>>(),
+        vec!["model_started", "model_failed"]
+    );
 }
 
 /// Budget-exceeded pre-call rejection prevents gateway call.

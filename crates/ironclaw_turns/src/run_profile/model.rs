@@ -7,9 +7,8 @@ use thiserror::Error;
 use crate::LoopDiagnosticRef;
 
 use super::host::{
-    AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, LoopModelPort, LoopModelRequest,
-    LoopModelResponse, LoopRunContext, LoopSafeSummary, ParentLoopOutput,
-    sanitize_model_visible_text,
+    AgentLoopHostError, AgentLoopHostErrorKind, LoopModelPort, LoopModelRequest, LoopModelResponse,
+    LoopRunContext, LoopSafeSummary, sanitize_model_visible_text,
 };
 use super::milestones::{LoopHostMilestoneEmitter, LoopHostMilestoneSink};
 
@@ -286,7 +285,15 @@ where
             .post_model_call(&self.context, &request, outcome)
             .await
         {
-            return Err(post_error.into_host_error());
+            let host_error = post_error.into_host_error();
+            if let Err(milestone_error) = self.milestones.model_failed(host_error.kind).await {
+                tracing::debug!(
+                    kind = ?milestone_error.kind,
+                    diagnostic_ref = ?milestone_error.diagnostic_ref,
+                    "loop model_failed milestone failed after post-model accounting error"
+                );
+            }
+            return Err(host_error);
         }
 
         let response = match gateway_result {
@@ -323,9 +330,6 @@ fn sanitize_model_response(mut response: LoopModelResponse) -> LoopModelResponse
     for chunk in &mut response.chunks {
         chunk.safe_text_delta =
             sanitize_model_visible_text(std::mem::take(&mut chunk.safe_text_delta));
-    }
-    if let ParentLoopOutput::AssistantReply(AssistantReply { content }) = &mut response.output {
-        *content = sanitize_model_visible_text(std::mem::take(content));
     }
     response
 }
