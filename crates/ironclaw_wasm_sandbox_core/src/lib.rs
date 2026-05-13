@@ -199,7 +199,7 @@ pub fn component_engine(thread_name: impl Into<String>) -> Result<Engine, Sandbo
     configure_component_engine(&mut config);
     let engine = Engine::new(&config)
         .map_err(|error| SandboxError::EngineCreationFailed(error.to_string()))?;
-    spawn_epoch_ticker(engine.clone(), thread_name)?;
+    spawn_epoch_ticker(&engine, thread_name)?;
     Ok(engine)
 }
 
@@ -211,16 +211,29 @@ pub fn configure_component_engine(config: &mut Config) {
     config.debug_info(false);
 }
 
+/// Spawn the per-engine epoch ticker.
+///
+/// The ticker holds a `Weak<Engine>` reference rather than a strong clone so
+/// that, once every owned `Engine` clone has been dropped by the host, the
+/// ticker observes `upgrade() == None`, exits, and the thread joins. Without
+/// this, every `component_engine` call would leak both a thread and an
+/// `Engine` clone for the lifetime of the process — a real problem for tests
+/// and for long-running hosts that rebuild runtimes (config reloads,
+/// per-installation runtimes, etc.).
 pub fn spawn_epoch_ticker(
-    engine: Engine,
+    engine: &Engine,
     thread_name: impl Into<String>,
 ) -> Result<(), SandboxError> {
+    let weak = engine.weak();
     std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {
             loop {
                 std::thread::sleep(EPOCH_TICK_INTERVAL);
-                engine.increment_epoch();
+                match weak.upgrade() {
+                    Some(engine) => engine.increment_epoch(),
+                    None => break,
+                }
             }
         })
         .map(|_| ())
@@ -283,5 +296,45 @@ mod tests {
         assert_eq!(limiter.instances(), 10);
         assert_eq!(limiter.tables(), 10);
         assert_eq!(limiter.memories(), 10);
+    }
+
+    /// Regression: the epoch ticker thread must observe `Weak::upgrade() ==
+    /// None` and exit after every `Engine` clone is dropped. Without this,
+    /// each `component_engine` call would permanently leak a thread + an
+    /// `Engine` clone, which is visible immediately in test runs and matters
+    /// even more in long-running hosts that rebuild runtimes on config
+    /// reload or per-installation.
+    #[test]
+    fn epoch_ticker_exits_when_engine_is_dropped() {
+        use super::{EPOCH_TICK_INTERVAL, component_engine};
+        use std::thread;
+        use std::time::Duration;
+
+        let engine =
+            component_engine("sandbox-core-ticker-drop-test").expect("engine should construct");
+        // Take a weak handle so we can observe when every owned `Engine`
+        // clone has been dropped. We piggy-back on wasmtime's own
+        // `Engine::weak()` for this.
+        let engine_weak = engine.weak();
+        // Drop the caller's strong reference. If the ticker is still
+        // holding a clone (the pre-fix bug), `upgrade()` will keep
+        // succeeding forever.
+        drop(engine);
+
+        // The ticker wakes at most once per EPOCH_TICK_INTERVAL. Give it a
+        // few intervals of slack for scheduler jitter before declaring the
+        // shutdown broken.
+        let mut released = false;
+        for _ in 0..10 {
+            thread::sleep(EPOCH_TICK_INTERVAL + Duration::from_millis(100));
+            if engine_weak.upgrade().is_none() {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "epoch ticker still holding an Engine clone after >10 tick intervals; the Weak<Engine> shutdown path is broken"
+        );
     }
 }

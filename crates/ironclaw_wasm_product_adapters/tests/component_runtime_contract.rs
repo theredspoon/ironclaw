@@ -181,10 +181,13 @@ fn calls_parse_and_render_exports() {
     let rendered = runtime
         .render_outbound(&prepared, r#"{"payload":"out"}"#)
         .expect("render");
-    assert_eq!(
-        rendered.egress_request_json,
-        r#"{"egress_target_index":0,"method":"POST","path":"/send","headers":[],"body":[]}"#
-    );
+    let request = &rendered.egress_request;
+    assert_eq!(request.host().as_str(), "api.example.com");
+    assert_eq!(request.method().as_str(), "POST");
+    assert_eq!(request.path().as_str(), "/send");
+    assert!(request.headers().is_empty());
+    assert!(request.body().is_empty());
+    assert!(request.credential_handle().is_none());
 }
 
 #[test]
@@ -328,6 +331,39 @@ fn component_without_product_adapter_exports_is_rejected() {
         .expect_err("missing exports");
     assert!(
         matches!(err, RuntimeError::InstantiationFailed(_)),
+        "{err:?}"
+    );
+}
+
+/// JSON above the host's own size ceiling is rejected before any serde
+/// allocation. The WASM memory cap bounds component-returned strings; this
+/// host-side ceiling protects the host from operators who raise that cap.
+///
+/// We exercise the same `ensure_json_within_host_budget` helper through the
+/// `render_outbound` host-input path (the outbound envelope flows through
+/// `ensure_json` before the component is invoked).
+#[test]
+fn render_rejects_oversized_host_envelope_before_serde() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(FIXTURE_ADAPTER_WAT))
+        .expect("prepare");
+
+    // 2 MiB envelope — well above MAX_COMPONENT_JSON_BYTES (1 MiB). Valid
+    // JSON shape so the rejection has to come from the size check, not from
+    // serde structural validation.
+    let filler = "a".repeat(2 * 1024 * 1024);
+    let oversized = format!(r#"{{"payload":"{filler}"}}"#);
+
+    let err = runtime
+        .render_outbound(&prepared, &oversized)
+        .expect_err("oversized envelope must be rejected");
+    assert!(
+        matches!(err, RuntimeError::InvalidJson { field, ref message }
+            if field == "outbound-envelope.outbound-json"
+                && message.contains("host limit")),
         "{err:?}"
     );
 }

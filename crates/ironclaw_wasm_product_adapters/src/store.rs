@@ -89,6 +89,12 @@ impl bindings::near::product_adapter::product_adapter_host::Host for StoreData {
     }
 
     fn now_millis(&mut self) -> u64 {
+        // Wall-clock UTC milliseconds since the Unix epoch. NOT monotonic:
+        // NTP corrections, leap-second smearing, and operator clock changes
+        // can push this value backwards. Adapter authors MUST NOT build
+        // TTLs, idempotency windows, or token-validity comparisons on the
+        // assumption that successive calls are non-decreasing; use the
+        // values for logging/timestamps only.
         chrono::Utc::now().timestamp_millis().max(0) as u64
     }
 

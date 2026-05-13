@@ -5,6 +5,18 @@ use ironclaw_product_adapters::{
     EgressCredentialHandle, EgressHeader, EgressMethod, EgressPath, EgressRequest,
     ParsedProductInbound, ProductAdapterCapabilities, ProductAdapterId, ProtocolAuthEvidence,
 };
+
+/// Maximum size of a component-returned JSON document the host will
+/// deserialize. Bounded above the largest manifest/parsed-inbound payload we
+/// expect in practice while staying well under the default WASM memory cap so
+/// that operators raising `memory_bytes` for richer adapters do not silently
+/// expand the host-side serde allocation in lockstep.
+///
+/// The WASM memory cap is the upper bound on what the component can return;
+/// this constant is the *host*'s own ceiling before any serde parsing happens,
+/// so we fail fast with `InvalidJson { message: "... exceeds N bytes" }`
+/// instead of letting a multi-megabyte serde graph land in host memory.
+pub(crate) const MAX_COMPONENT_JSON_BYTES: usize = 1024 * 1024;
 use ironclaw_wasm_sandbox_core::{
     SandboxError, add_minimal_wasi_to_linker, component_engine,
     configure_store as configure_sandbox_store, elapsed_millis,
@@ -106,9 +118,19 @@ pub struct ParsedInboundResult {
     pub logs: Vec<ComponentLogRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Outcome of a successful `render-outbound` call.
+///
+/// `egress_request` is the host's validated, typed `EgressRequest` — the host
+/// reconstructs it from the component-supplied JSON shim using the *same*
+/// constructors (`EgressMethod::new`, `EgressPath::new`, `EgressHeader::new`,
+/// `EgressRequest::with_body`) that the production HTTP egress path will
+/// use. Callers MUST use this typed value when actually sending the request;
+/// the raw component JSON is intentionally not exposed so that the only path
+/// from a WASM component to the network goes through the host-side
+/// validators.
+#[derive(Debug, Clone)]
 pub struct RenderOutboundResult {
-    pub egress_request_json: String,
+    pub egress_request: EgressRequest,
     pub logs: Vec<ComponentLogRecord>,
 }
 
@@ -200,9 +222,10 @@ impl ProductAdapterComponentRuntime {
             Ok(Err(message)) => return Err(execution_failed(message, &store)),
             Err(error) => return Err(execution_failed(error.to_string(), &store)),
         };
-        validate_rendered_egress_request(prepared, &response.egress_request_json)?;
+        let egress_request =
+            validate_rendered_egress_request(prepared, &response.egress_request_json)?;
         Ok(RenderOutboundResult {
-            egress_request_json: response.egress_request_json,
+            egress_request,
             logs: store.data().logs.clone(),
         })
     }
@@ -215,10 +238,13 @@ impl ProductAdapterComponentRuntime {
         let started = Instant::now();
         let (mut store, instance) = self.instantiate(component, limits)?;
         let adapter = instance.near_product_adapter_product_adapter();
-        let manifest = adapter
-            .call_manifest(&mut store)
-            .map_err(|error| execution_failed(error.to_string(), &store))?;
+        let manifest = adapter.call_manifest(&mut store);
+        // Check the timeout BEFORE inspecting the call result so an
+        // epoch-trap surfaces as a clean "deadline exceeded" error rather
+        // than the raw wasmtime trap text — matches `parse_inbound` and
+        // `render_outbound` ordering.
         ensure_execution_not_timed_out(&store, started)?;
+        let manifest = manifest.map_err(|error| execution_failed(error.to_string(), &store))?;
         component_manifest_from_wit(manifest)
     }
 
@@ -317,15 +343,18 @@ fn required_field(name: &'static str, value: Option<String>) -> Result<String, R
 }
 
 fn ensure_capabilities_json(json: &str) -> Result<(), RuntimeError> {
+    let field = "adapter-manifest.capabilities-json";
+    ensure_json_within_host_budget(field, json)?;
     serde_json::from_str::<ProductAdapterCapabilities>(json)
         .map(|_| ())
         .map_err(|error| RuntimeError::InvalidJson {
-            field: "adapter-manifest.capabilities-json",
+            field,
             message: error.to_string(),
         })
 }
 
 fn ensure_json(field: &'static str, json: &str) -> Result<(), RuntimeError> {
+    ensure_json_within_host_budget(field, json)?;
     serde_json::from_str::<Value>(json)
         .map(|_| ())
         .map_err(|error| RuntimeError::InvalidJson {
@@ -335,19 +364,41 @@ fn ensure_json(field: &'static str, json: &str) -> Result<(), RuntimeError> {
 }
 
 fn ensure_parsed_inbound_json(json: &str) -> Result<(), RuntimeError> {
+    let field = "parsed-inbound.parsed-json";
+    ensure_json_within_host_budget(field, json)?;
     serde_json::from_str::<ParsedProductInbound>(json)
         .map(|_| ())
         .map_err(|error| RuntimeError::InvalidJson {
-            field: "parsed-inbound.parsed-json",
+            field,
             message: error.to_string(),
         })
+}
+
+/// Reject component-returned JSON above the host's own ceiling before letting
+/// serde walk it. The WASM memory cap is the upper bound on what a component
+/// can produce; this is the host's own ceiling so a future operator who
+/// raises the WASM memory limit does not silently raise the host-side serde
+/// allocation in lockstep.
+fn ensure_json_within_host_budget(field: &'static str, json: &str) -> Result<(), RuntimeError> {
+    if json.len() > MAX_COMPONENT_JSON_BYTES {
+        return Err(RuntimeError::InvalidJson {
+            field,
+            message: format!(
+                "component-returned JSON is {} bytes; host limit is {} bytes",
+                json.len(),
+                MAX_COMPONENT_JSON_BYTES,
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_rendered_egress_request(
     prepared: &PreparedProductAdapterComponent,
     json: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<EgressRequest, RuntimeError> {
     let field = "outbound-render.egress-request-json";
+    ensure_json_within_host_budget(field, json)?;
     let value = serde_json::from_str::<Value>(json).map_err(|error| RuntimeError::InvalidJson {
         field,
         message: error.to_string(),
@@ -373,6 +424,13 @@ fn validate_rendered_egress_request(
             field,
             message: format!("egress_target_index {index} is not declared in adapter manifest"),
         })?;
+    // Defense-in-depth: this check is structurally a no-op today (the policy
+    // is built from the same `declared_egress_targets` slice we just indexed
+    // into, so the pair is always present) but the symmetry locks the
+    // invariant for future readers and any future divergence between
+    // `manifest` and `egress_policy`. Removing it would also remove the
+    // single proof in this file that the pair authorized for egress is
+    // exactly the pair declared in the manifest.
     prepared
         .egress_policy
         .check(EgressPolicyTarget {
@@ -417,8 +475,7 @@ fn validate_rendered_egress_request(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let _validated_request = request.with_body(body);
-    Ok(())
+    Ok(request.with_body(body))
 }
 
 fn required_u64_field(

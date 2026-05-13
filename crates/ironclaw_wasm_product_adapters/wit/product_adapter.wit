@@ -60,6 +60,11 @@ interface product-adapter-host {
     enum log-level { trace, debug, info, warn, error }
 
     log: func(level: log-level, message: string);
+    /// Wall-clock UTC milliseconds since the Unix epoch. NOT monotonic:
+    /// the host returns whatever the system clock reports, which may step
+    /// backwards on NTP correction or operator clock changes. Components
+    /// must use this value for logging/timestamping only — not for TTL or
+    /// idempotency comparisons.
     now-millis: func() -> u64;
 
     record egress-headers {
