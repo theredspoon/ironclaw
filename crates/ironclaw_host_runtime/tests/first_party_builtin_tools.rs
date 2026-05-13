@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, thread, time::Duration};
 
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
-use ironclaw_filesystem::LocalFilesystem;
+#[cfg(feature = "libsql")]
+use ironclaw_filesystem::LibSqlRootFilesystem;
+use ironclaw_filesystem::{LocalFilesystem, RootFilesystem};
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     APPLY_PATCH_CAPABILITY_ID, CapabilitySurfacePolicy, CapabilitySurfaceVersion,
@@ -292,6 +294,20 @@ async fn builtin_coding_tools_match_v1_read_write_list_glob_and_grep_shapes() {
         "created\n"
     );
 
+    let wrote_subdir_readme = invoke_with_context(
+        &runtime,
+        WRITE_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/generated/README.md", "content": "ok\n"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(wrote_subdir_readme["success"], json!(true));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("generated/README.md")).unwrap(),
+        "ok\n"
+    );
+
     let listed = invoke_with_context(
         &runtime,
         LIST_DIR_CAPABILITY_ID,
@@ -300,7 +316,7 @@ async fn builtin_coding_tools_match_v1_read_write_list_glob_and_grep_shapes() {
     )
     .await
     .unwrap();
-    assert_eq!(listed["count"], json!(5));
+    assert_eq!(listed["count"], json!(6));
     assert_eq!(listed["truncated"], json!(false));
     assert_eq!(
         listed["entries"],
@@ -308,6 +324,7 @@ async fn builtin_coding_tools_match_v1_read_write_list_glob_and_grep_shapes() {
             "generated/",
             "src/",
             "README.md (11B)",
+            "generated/README.md (3B)",
             "generated/deep.txt (8B)",
             "src/lib.rs (34B)"
         ])
@@ -486,6 +503,49 @@ async fn builtin_coding_blocks_sensitive_scoped_paths_like_v1() {
             .iter()
             .all(|entry| entry.as_str() != Some(".env (13B)"))
     );
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn builtin_coding_blocks_sensitive_resolved_libsql_paths() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("filesystem.db");
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let filesystem = LibSqlRootFilesystem::new(db);
+    filesystem.run_migrations().await.unwrap();
+    filesystem
+        .create_dir_all(&VirtualPath::new("/projects/p").unwrap())
+        .await
+        .unwrap();
+    filesystem
+        .write_file(
+            &VirtualPath::new("/projects/p/.env").unwrap(),
+            b"TOKEN=secret\n",
+        )
+        .await
+        .unwrap();
+
+    let mounts = MountView::new(vec![MountGrant::new(
+        MountAlias::new("/workspace").unwrap(),
+        VirtualPath::new("/projects/p/.env").unwrap(),
+        MountPermissions::read_only(),
+    )])
+    .unwrap();
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    for (capability, input) in [
+        (READ_FILE_CAPABILITY_ID, json!({"path": "/workspace"})),
+        (
+            GREP_CAPABILITY_ID,
+            json!({"path": "/workspace", "pattern": "TOKEN"}),
+        ),
+    ] {
+        let error = invoke_with_context(&runtime, capability, input, context.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error, RuntimeFailureKind::Authorization);
+    }
 }
 
 #[tokio::test]
@@ -981,7 +1041,10 @@ fn runtime() -> impl HostRuntime {
     runtime_with_filesystem(LocalFilesystem::new())
 }
 
-fn runtime_with_filesystem(filesystem: LocalFilesystem) -> impl HostRuntime {
+fn runtime_with_filesystem<F>(filesystem: F) -> impl HostRuntime
+where
+    F: RootFilesystem + 'static,
+{
     HostRuntimeServices::new(
         Arc::new(registry()),
         Arc::new(filesystem),

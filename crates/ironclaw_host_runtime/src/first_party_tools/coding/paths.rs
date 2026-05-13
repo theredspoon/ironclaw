@@ -49,6 +49,11 @@ fn resolve_path(
     let (virtual_path, grant) = mounts
         .resolve_with_grant(&scoped_path)
         .map_err(|_| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::FilesystemDenied))?;
+    if is_sensitive_resolved_path(&virtual_path) {
+        return Err(FirstPartyCapabilityError::new(
+            RuntimeDispatchErrorKind::FilesystemDenied,
+        ));
+    }
     if !operation_allowed(&grant.permissions, operation) {
         return Err(FirstPartyCapabilityError::new(
             RuntimeDispatchErrorKind::FilesystemDenied,
@@ -170,8 +175,7 @@ pub(super) fn type_filter_matches(path: &str, type_filter: &str) -> bool {
 pub(super) fn is_workspace_path(path: &str) -> bool {
     let normalized = path.trim_start_matches('/');
     let relative = normalized.strip_prefix("workspace/").unwrap_or(normalized);
-    let filename = relative.rsplit('/').next().unwrap_or(relative);
-    WORKSPACE_FILES.contains(&filename)
+    (!relative.contains('/') && WORKSPACE_FILES.contains(&relative))
         || relative.starts_with("daily/")
         || relative.starts_with("context/")
 }
@@ -186,6 +190,10 @@ pub(super) fn scoped_child_path(root: &ScopedPath, relative: &str) -> String {
 
 pub(super) fn is_sensitive_scoped_path(path: &str) -> bool {
     is_sensitive_path_str(path)
+}
+
+fn is_sensitive_resolved_path(path: &VirtualPath) -> bool {
+    is_sensitive_path_str(path.as_str())
 }
 
 pub(super) fn filesystem_error(error: FilesystemError) -> FirstPartyCapabilityError {

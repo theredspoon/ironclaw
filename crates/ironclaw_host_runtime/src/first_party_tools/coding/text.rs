@@ -248,7 +248,7 @@ fn map_normalized_char_to_original_byte(
         original_byte += line.len();
         if has_newline {
             if normalized_char_index == normalized_seen + 1 {
-                return Some(original_byte + 1);
+                return Some(original_byte);
             }
             normalized_seen += 1;
             original_byte += 1;
