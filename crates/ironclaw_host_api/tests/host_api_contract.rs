@@ -836,6 +836,41 @@ fn host_port_view_rejects_duplicate_ports_and_answers_membership() {
 }
 
 #[test]
+fn host_port_catalog_validates_required_ports_without_creating_implementations() {
+    let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    let audit = HostPortId::new("host.events.audit").unwrap();
+    let network = HostPortId::new("host.network.http").unwrap();
+
+    let catalog = HostPortCatalog::new(vec![
+        HostPortCatalogEntry::new(storage.clone()),
+        HostPortCatalogEntry::new(audit.clone()),
+    ])
+    .unwrap();
+
+    assert!(catalog.contains(&storage));
+    assert!(catalog.contains(&audit));
+    assert!(!catalog.contains(&network));
+    catalog.validate_required([&storage, &audit]).unwrap();
+
+    let missing = catalog.validate_required([&storage, &network]).unwrap_err();
+    assert_eq!(
+        missing,
+        HostApiError::InvariantViolation {
+            reason: "unknown host port host.network.http".to_string()
+        }
+    );
+
+    assert!(
+        HostPortCatalog::new(vec![
+            HostPortCatalogEntry::new(storage.clone()),
+            HostPortCatalogEntry::new(storage),
+        ])
+        .is_err(),
+        "duplicate host port catalog entries must fail closed"
+    );
+}
+
+#[test]
 fn capability_profile_ids_are_versioned_portable_contract_names() {
     let id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
     assert_eq!(id.as_str(), "memory.context_retrieval.v1");

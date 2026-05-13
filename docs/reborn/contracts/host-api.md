@@ -580,13 +580,14 @@ Rules:
 
 `CapabilityProfileId` names a host-defined portability contract such as `memory.context_retrieval.v1`. It is distinct from `RuntimeProfile`, which is deployment/runtime policy vocabulary. `CapabilityProfileContract` lists the required operation contracts and schema refs that an extension must satisfy before claiming that profile.
 
-`HostPortId` names a mediated host API surface such as `host.storage.sql_transaction.first_party` or `host.events.audit`. `HostPortView` is the scoped set of host ports prepared for one invocation after authorization and obligation handling. Concrete host-port implementations belong in host/runtime service crates; `ironclaw_host_api` only owns the serializable vocabulary and validation.
+`HostPortId` names a mediated host API surface such as `host.storage.sql_transaction.first_party` or `host.events.audit`. `HostPortCatalog` is the host-defined catalog of known host-port contract names used by manifest and claim validators. `HostPortView` is the scoped set of host ports prepared for one invocation after authorization and obligation handling. Concrete host-port implementations belong in host/runtime service crates; `ironclaw_host_api` only owns the serializable vocabulary and validation.
 
 Rules:
 
 - profile IDs and profile operation IDs are lowercase, versioned dotted names ending in `vN`;
 - profile schema refs are relative repository paths, never absolute paths, URLs, or traversal paths;
 - host-port IDs are lowercase `host.*` dotted names;
+- host-port catalogs reject duplicate entries and are not runtime implementation registries;
 - host-port views reject duplicate grants and do not grant authority by themselves.
 
 ---

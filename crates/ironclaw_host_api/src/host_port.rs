@@ -121,6 +121,78 @@ impl HostPortGrant {
     }
 }
 
+/// Host-defined catalog entry for one known host port.
+///
+/// A catalog entry names a contract that manifest validation may reference. It
+/// does not create, own, or dispatch a concrete host-port implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HostPortCatalogEntry {
+    pub id: HostPortId,
+}
+
+impl HostPortCatalogEntry {
+    pub fn new(id: HostPortId) -> Self {
+        Self { id }
+    }
+}
+
+/// Host-defined catalog of known host-port contract names.
+///
+/// The catalog is validation vocabulary only. Runtime service crates decide how
+/// to construct concrete scoped adapters after authorization and obligation
+/// handling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostPortCatalog {
+    entries: Vec<HostPortCatalogEntry>,
+}
+
+impl HostPortCatalog {
+    pub fn new(entries: Vec<HostPortCatalogEntry>) -> Result<Self, HostApiError> {
+        let mut seen = BTreeSet::new();
+        for entry in &entries {
+            if !seen.insert(entry.id.clone()) {
+                return Err(HostApiError::invariant(format!(
+                    "duplicate host port catalog entry {}",
+                    entry.id
+                )));
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn entries(&self) -> &[HostPortCatalogEntry] {
+        &self.entries
+    }
+
+    pub fn contains(&self, id: &HostPortId) -> bool {
+        self.entries.iter().any(|entry| &entry.id == id)
+    }
+
+    pub fn validate_required<'a, I>(&self, required: I) -> Result<(), HostApiError>
+    where
+        I: IntoIterator<Item = &'a HostPortId>,
+    {
+        for id in required {
+            if !self.contains(id) {
+                return Err(HostApiError::invariant(format!("unknown host port {id}")));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for HostPortCatalog {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 /// Scoped set of host ports available to an invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostPortView {

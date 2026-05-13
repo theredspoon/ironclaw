@@ -1,0 +1,200 @@
+//! Capability profile conformance scaffolding.
+//!
+//! This module compares host-defined profile contracts with extension-declared
+//! claims. It is zero-behavior prep: it does not execute capabilities, load
+//! manifests, or certify third-party providers.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use ironclaw_host_api::{
+    CapabilityId, CapabilityProfileContract, CapabilityProfileId, CapabilityProfileOperationId,
+    CapabilityProfileSchemaRef, HostApiError,
+};
+
+/// One operation an extension claims for a profile implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CapabilityProfileClaimedOperation {
+    id: CapabilityProfileOperationId,
+    input_schema_ref: CapabilityProfileSchemaRef,
+    output_schema_ref: CapabilityProfileSchemaRef,
+}
+
+impl CapabilityProfileClaimedOperation {
+    pub fn new(
+        id: CapabilityProfileOperationId,
+        input_schema_ref: impl Into<String>,
+        output_schema_ref: impl Into<String>,
+    ) -> Result<Self, HostApiError> {
+        Ok(Self {
+            id,
+            input_schema_ref: CapabilityProfileSchemaRef::new(input_schema_ref)?,
+            output_schema_ref: CapabilityProfileSchemaRef::new(output_schema_ref)?,
+        })
+    }
+
+    pub fn id(&self) -> &CapabilityProfileOperationId {
+        &self.id
+    }
+
+    pub fn input_schema_ref(&self) -> &CapabilityProfileSchemaRef {
+        &self.input_schema_ref
+    }
+
+    pub fn output_schema_ref(&self) -> &CapabilityProfileSchemaRef {
+        &self.output_schema_ref
+    }
+}
+
+/// Extension claim that one provider-prefixed capability implements a profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityProfileClaim {
+    capability_id: CapabilityId,
+    profile_id: CapabilityProfileId,
+    operations: Vec<CapabilityProfileClaimedOperation>,
+}
+
+impl CapabilityProfileClaim {
+    pub fn new(
+        capability_id: CapabilityId,
+        profile_id: CapabilityProfileId,
+        operations: Vec<CapabilityProfileClaimedOperation>,
+    ) -> Result<Self, HostApiError> {
+        let mut seen = BTreeSet::new();
+        for operation in &operations {
+            if !seen.insert(operation.id.clone()) {
+                return Err(HostApiError::InvariantViolation {
+                    reason: format!(
+                        "duplicate claimed capability profile operation {}",
+                        operation.id
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            capability_id,
+            profile_id,
+            operations,
+        })
+    }
+
+    pub fn capability_id(&self) -> &CapabilityId {
+        &self.capability_id
+    }
+
+    pub fn profile_id(&self) -> &CapabilityProfileId {
+        &self.profile_id
+    }
+
+    pub fn operations(&self) -> &[CapabilityProfileClaimedOperation] {
+        &self.operations
+    }
+}
+
+/// Finding kind from structural profile conformance checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CapabilityProfileConformanceFindingKind {
+    ProfileIdMismatch,
+    MissingRequiredOperation,
+    UnexpectedOperation,
+    InputSchemaRefMismatch,
+    OutputSchemaRefMismatch,
+}
+
+/// One structural profile conformance finding.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CapabilityProfileConformanceFinding {
+    kind: CapabilityProfileConformanceFindingKind,
+    operation_id: String,
+}
+
+impl CapabilityProfileConformanceFinding {
+    pub fn new(
+        kind: CapabilityProfileConformanceFindingKind,
+        operation_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            operation_id: operation_id.into(),
+        }
+    }
+
+    pub fn kind(&self) -> CapabilityProfileConformanceFindingKind {
+        self.kind
+    }
+
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+}
+
+/// Structural conformance report for one claim against one contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityProfileConformanceReport {
+    findings: Vec<CapabilityProfileConformanceFinding>,
+}
+
+impl CapabilityProfileConformanceReport {
+    pub fn evaluate(contract: &CapabilityProfileContract, claim: &CapabilityProfileClaim) -> Self {
+        let mut findings = Vec::new();
+
+        if contract.id() != claim.profile_id() {
+            findings.push(CapabilityProfileConformanceFinding::new(
+                CapabilityProfileConformanceFindingKind::ProfileIdMismatch,
+                claim.profile_id().as_str(),
+            ));
+        }
+
+        let claimed = claim
+            .operations()
+            .iter()
+            .map(|operation| (operation.id().clone(), operation))
+            .collect::<BTreeMap<_, _>>();
+        let required = contract
+            .required_operations()
+            .iter()
+            .map(|operation| (operation.id().clone(), operation))
+            .collect::<BTreeMap<_, _>>();
+
+        for (operation_id, required_operation) in &required {
+            let Some(claimed_operation) = claimed.get(operation_id) else {
+                findings.push(CapabilityProfileConformanceFinding::new(
+                    CapabilityProfileConformanceFindingKind::MissingRequiredOperation,
+                    operation_id.as_str(),
+                ));
+                continue;
+            };
+
+            if required_operation.input_schema_ref() != claimed_operation.input_schema_ref() {
+                findings.push(CapabilityProfileConformanceFinding::new(
+                    CapabilityProfileConformanceFindingKind::InputSchemaRefMismatch,
+                    operation_id.as_str(),
+                ));
+            }
+            if required_operation.output_schema_ref() != claimed_operation.output_schema_ref() {
+                findings.push(CapabilityProfileConformanceFinding::new(
+                    CapabilityProfileConformanceFindingKind::OutputSchemaRefMismatch,
+                    operation_id.as_str(),
+                ));
+            }
+        }
+
+        for operation_id in claimed.keys() {
+            if !required.contains_key(operation_id) {
+                findings.push(CapabilityProfileConformanceFinding::new(
+                    CapabilityProfileConformanceFindingKind::UnexpectedOperation,
+                    operation_id.as_str(),
+                ));
+            }
+        }
+
+        Self { findings }
+    }
+
+    pub fn is_conformant(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    pub fn findings(&self) -> &[CapabilityProfileConformanceFinding] {
+        &self.findings
+    }
+}
