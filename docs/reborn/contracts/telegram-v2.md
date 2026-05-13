@@ -126,7 +126,45 @@ fails closed when both are active.
 
 ## Test coverage (issue #3285 acceptance criteria)
 
+Coverage today lives in the crate's per-module `mod tests` blocks
+(`cargo test -p ironclaw_telegram_v2_adapter --lib`, 46 tests at the
+time of writing). The tests are not yet named `ac<N>_*`; they are
+organised by the source surface they exercise:
+
+- `payload::tests` (~24 tests) — `parse_telegram_update` shape:
+  private vs group routing, `/command` recognition (including media
+  captions and mention+command), recognized-vs-unknown command
+  classification, unauthenticated-payload fail-closed, malformed JSON,
+  missing `from`, topic-keyed conversation refs, photo attachment
+  descriptors, control-char and oversized-argument rejection through
+  the shared validator.
+- `render::tests` (~4 tests) — `parse_reply_target` round-trip,
+  malformed-target typed error, `sendMessage` shape with topic and
+  reply-to bindings, `sendChatAction` typing shape.
+- `adapter::tests` (~15 tests) — capability default vs progress
+  opt-in, declared egress host list + paired `(host, credential)`
+  egress target, `parse_inbound` refusing unverified evidence,
+  `render_outbound` install-scope guard (mismatched `adapter_id` /
+  `installation_id` fail closed with no egress and no delivery
+  record), and the full `DeliveryStatus` mapping for 2xx
+  `Delivered` / 5xx + 429 `FailedRetryable` / 401 + 403
+  `FailedUnauthorized` / other 4xx `FailedPermanent` / render-error
+  `FailedPermanent` / non-final-reply `Deferred`.
+- `payload::slice_tests` (~8 tests) — UTF-16 entity offset slicing
+  used by `text_entity_windows`.
+
+**Deferred:** the integration contract suite at
 `crates/ironclaw_telegram_v2_adapter/tests/product_adapter_telegram_contract.rs`
-covers all 16 acceptance bullets plus deterministic protocol smoke tests
-and redaction sentinels. See the test file's `ac<N>_*` names; each
-function references the exact AC bullet from the issue body.
+(referenced in earlier revisions of this doc with `ac<N>_*`
+acceptance-bullet test names) was removed pending a case-by-case
+port to the post-#3352 product-adapter API
+(`ProtocolAuthEvidence` enum→sealed-struct,
+`ProductInboundEnvelope` private fields, 4-arg `render_outbound`
+returning `ProductRenderOutcome`, `EgressRequest` builder API,
+paired `(host, credential)` egress policy, and
+`parse_inbound -> Result<ParsedProductInbound, _>`). The recorded
+Telegram payload fixtures under
+`crates/ironclaw_telegram_v2_adapter/tests/fixtures/*.json` are
+retained for that followup. Once the port lands, each restored test
+should carry an `ac<N>_*` name referencing the exact AC bullet from
+issue #3285.
