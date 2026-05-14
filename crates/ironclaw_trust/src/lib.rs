@@ -40,13 +40,14 @@ mod sources;
 #[cfg(test)]
 mod fixtures;
 
+pub use clock::Clock;
 pub use decision::{
     AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment, TrustDecision, TrustProvenance,
 };
 pub use error::TrustError;
-pub use invalidation::InvalidationBus;
+pub use invalidation::{InvalidationBus, TrustChange, TrustChangeListener};
 pub use policy::{HostTrustPolicy, TrustPolicy, TrustPolicyInput};
-pub use sources::{AdminConfig, AdminEntry, BundledEntry, BundledRegistry};
+pub use sources::{AdminConfig, AdminEntry, BundledEntry, BundledRegistry, PolicySource};
 
 #[cfg(test)]
 mod tests {

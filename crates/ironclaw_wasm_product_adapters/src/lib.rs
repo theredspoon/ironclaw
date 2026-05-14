@@ -37,7 +37,7 @@ mod egress_policy;
 mod runner;
 
 pub use auth_verifier::{
-    HmacWebhookAuth, SharedSecretHeaderAuth, VerificationOutcome, WebhookAuthVerifier,
+    Clock, HmacWebhookAuth, SharedSecretHeaderAuth, VerificationOutcome, WebhookAuthVerifier,
 };
 pub use egress_policy::{EgressPolicy, EgressPolicyError, EgressPolicyTarget};
 pub use runner::{
