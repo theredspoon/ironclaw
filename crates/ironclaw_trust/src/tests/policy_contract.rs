@@ -26,8 +26,7 @@ use crate::fixtures::{
     effective_first_party_for_test, effective_system_for_test,
 };
 use crate::invalidation::{
-    TrustChange, TrustChangeListener, authority_changed, grant_retention_eligible,
-    identity_changed,
+    TrustChange, TrustChangeListener, authority_changed, grant_retention_eligible, identity_changed,
 };
 use crate::sources::{LocalDevOverride, PolicySource};
 use crate::{

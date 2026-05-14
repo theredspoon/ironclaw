@@ -23,12 +23,12 @@ use std::sync::{OnceLock, mpsc};
 
 use fs2::FileExt;
 
+use ironclaw_host_api::ReservationStatus;
 use ironclaw_host_api::{
     AgentId, MissionId, ProjectId, ResourceEstimate, ResourceReservationId, ResourceScope,
     ResourceUsage, TenantId, ThreadId, UserId,
 };
 pub use ironclaw_host_api::{ResourceReceipt, ResourceReservation};
-use ironclaw_host_api::ReservationStatus;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
