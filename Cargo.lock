@@ -4495,6 +4495,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_product_adapter_registry"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ironclaw_host_api",
+ "ironclaw_product_adapters",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "ironclaw_product_adapters"
 version = "0.1.0"
 dependencies = [
