@@ -144,6 +144,48 @@ default_permission = "ask"
 parameters_schema = { type = "object" }
 ```
 
+### Manifest V2 host API contracts
+
+V2 keeps one extension identity and lets that extension implement one or more host API contracts. `host_api.id` is the only top-level contract/type discriminator; there is no separate manifest `kind`.
+
+```toml
+schema_version = "reborn.extension_manifest.v2"
+id = "telegram"
+name = "Telegram"
+version = "0.1.0"
+description = "Telegram product adapter and tools"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/telegram.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[[host_api]]
+id = "ironclaw.capability_provider/v1"
+section = "capability_provider.tools"
+
+[product_adapter.inbound]
+surface_kind = "telegram"
+
+[capability_provider.tools]
+capabilities = [{ id = "send_message", description = "Send Telegram message" }]
+```
+
+Rules:
+
+- `ironclaw_extensions` parses the envelope, validates host API refs, and dispatches to a composition-wired host API contract registry.
+- Domain contract handlers own section pattern validation, cardinality, typed section schema validation, and catalog/read-model projection.
+- Unknown `host_api.id` values fail closed.
+- Repeating the same `host_api.id` is allowed only when that contract declares multi-instance support.
+- Every `[[host_api]]` must reference an existing explicit `section` path.
+- Operational sections must be referenced by `[[host_api]]`; inert metadata may live under `[metadata.*]` or `[x.*]`.
+- Manifest validation is atomic: any invalid host API contract invalidates the extension manifest.
+- Runtime loading, handshakes, catalog publication, authority grants, and execution remain outside `ironclaw_extensions`.
+
 ---
 
 ## 5. Runtime declarations
