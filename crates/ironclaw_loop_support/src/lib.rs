@@ -9,6 +9,13 @@ use std::{
     sync::Arc,
 };
 
+mod skill_context;
+
+pub use skill_context::{
+    HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
+    build_skill_run_snapshot,
+};
+
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
@@ -25,11 +32,13 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityInvocation, CapabilityOutcome,
-        CapabilitySurfaceVersion, FinalizeAssistantMessage, LoopContextBundle, LoopContextMessage,
-        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputCursor, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
-        LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
+        CapabilitySurfaceVersion, FinalizeAssistantMessage, InstructionMaterializationStore,
+        LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest,
+        LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputCursor, LoopModelMessage,
+        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopRunContext, LoopRunInfoPort,
+        LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
         UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        sanitize_model_visible_text,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -46,6 +55,7 @@ where
     thread_scope: ThreadScope,
     run_context: LoopRunContext,
     max_messages: usize,
+    skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
 }
 
 impl<S> ThreadBackedLoopContextPort<S>
@@ -63,7 +73,13 @@ where
             thread_scope,
             run_context,
             max_messages,
+            skill_context_source: None,
         }
+    }
+
+    pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
+        self.skill_context_source = Some(source);
+        self
     }
 }
 
@@ -98,13 +114,21 @@ where
             .await
             .map_err(context_read_error)?;
 
+        let instruction_snippets = match self.skill_context_source.as_deref() {
+            Some(source) => {
+                skill_context::build_skill_instruction_snippets(source, &self.run_context).await?
+            }
+            None => Vec::new(),
+        };
+
         Ok(LoopContextBundle {
+            identity_messages: Vec::new(),
             messages: context
                 .messages
                 .into_iter()
                 .filter_map(context_message_to_loop_message)
                 .collect(),
-            instruction_snippets: Vec::new(),
+            instruction_snippets,
             memory_snippets: Vec::new(),
         })
     }
@@ -120,8 +144,8 @@ where
     thread_scope: ThreadScope,
     run_context: LoopRunContext,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
-    // Only successful milestone publications are recorded here: if publishing
-    // fails after the transcript write, an idempotent retry must try again.
+    // Only successful milestone publications are recorded here: if best-effort
+    // publishing fails after the transcript write, an idempotent retry can try again.
     emitted_assistant_reply_finalized_refs: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -289,9 +313,17 @@ where
 
         let milestones =
             LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
-        milestones
+        if let Err(error) = milestones
             .assistant_reply_finalized(message_ref.clone())
-            .await?;
+            .await
+        {
+            tracing::debug!(
+                kind = ?error.kind,
+                diagnostic_ref = ?error.diagnostic_ref,
+                "loop assistant_reply_finalized milestone failed after finalized transcript write"
+            );
+            return Ok(());
+        }
         emitted_refs.insert(message_ref.as_str().to_string());
         Ok(())
     }
@@ -426,6 +458,8 @@ where
     gateway: Arc<G>,
     max_messages: usize,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    instruction_materialization_store: Option<Arc<dyn InstructionMaterializationStore>>,
 }
 
 impl<S, G> ThreadBackedLoopModelPort<S, G>
@@ -447,6 +481,8 @@ where
             gateway,
             max_messages,
             milestone_sink: None,
+            skill_context_source: None,
+            instruction_materialization_store: None,
         }
     }
 
@@ -465,7 +501,22 @@ where
             gateway,
             max_messages,
             milestone_sink: Some(milestone_sink),
+            skill_context_source: None,
+            instruction_materialization_store: None,
         }
+    }
+
+    pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
+        self.skill_context_source = Some(source);
+        self
+    }
+
+    pub fn with_instruction_materialization_store(
+        mut self,
+        store: Arc<dyn InstructionMaterializationStore>,
+    ) -> Self {
+        self.instruction_materialization_store = Some(store);
+        self
     }
 }
 
@@ -498,18 +549,26 @@ where
                 .clone()
         });
         let resolved_messages = self.resolve_model_messages(request.messages).await?;
-        self.emit_model_started(requested_model_profile_id).await?;
-        let gateway_response = self
+        self.emit_model_started(requested_model_profile_id).await;
+        let gateway_response = match self
             .gateway
             .stream_model(HostManagedModelRequest {
                 model_profile_id: model_profile_id.clone(),
                 messages: resolved_messages,
                 surface_version: request.surface_version,
+                resolved_model_route: self.run_context.resolved_model_route.clone(),
                 run_id: self.run_context.run_id,
                 turn_id: self.run_context.turn_id,
             })
             .await
-            .map_err(model_gateway_error)?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let host_error = model_gateway_error(error);
+                self.emit_model_failed(host_error.kind).await;
+                return Err(host_error);
+            }
+        };
 
         self.emit_model_completed(model_profile_id.clone()).await;
 
@@ -517,7 +576,9 @@ where
             chunks: gateway_response
                 .safe_text_deltas
                 .into_iter()
-                .map(|safe_text_delta| ModelStreamChunk { safe_text_delta })
+                .map(|safe_text_delta| ModelStreamChunk {
+                    safe_text_delta: sanitize_model_visible_text(safe_text_delta),
+                })
                 .collect(),
             output: gateway_response.output,
             effective_model_profile_id: model_profile_id,
@@ -530,16 +591,18 @@ where
     S: SessionThreadService + ?Sized + Send + Sync,
     G: HostManagedModelGateway + ?Sized + Send + Sync,
 {
-    async fn emit_model_started(
-        &self,
-        requested_model_profile_id: Option<ModelProfileId>,
-    ) -> Result<(), AgentLoopHostError> {
+    async fn emit_model_started(&self, requested_model_profile_id: Option<ModelProfileId>) {
         if let Some(milestone_sink) = &self.milestone_sink {
             let milestones =
                 LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
-            milestones.model_started(requested_model_profile_id).await?;
+            if let Err(error) = milestones.model_started(requested_model_profile_id).await {
+                tracing::debug!(
+                    kind = ?error.kind,
+                    diagnostic_ref = ?error.diagnostic_ref,
+                    "loop model_started milestone failed before model request"
+                );
+            }
         }
-        Ok(())
     }
 
     async fn emit_model_completed(&self, effective_model_profile_id: ModelProfileId) {
@@ -551,6 +614,20 @@ where
                     kind = ?error.kind,
                     diagnostic_ref = ?error.diagnostic_ref,
                     "loop model_completed milestone failed after successful model response"
+                );
+            }
+        }
+    }
+
+    async fn emit_model_failed(&self, reason_kind: AgentLoopHostErrorKind) {
+        if let Some(milestone_sink) = &self.milestone_sink {
+            let milestones =
+                LoopHostMilestoneEmitter::new(self.run_context.clone(), Arc::clone(milestone_sink));
+            if let Err(error) = milestones.model_failed(reason_kind).await {
+                tracing::debug!(
+                    kind = ?error.kind,
+                    diagnostic_ref = ?error.diagnostic_ref,
+                    "loop model_failed milestone failed after model error"
                 );
             }
         }
@@ -587,9 +664,29 @@ where
         }
 
         let mut messages_by_ref = context_messages_by_ref(context.messages);
-        let needs_history_lookup = requested_messages
+        let mut needs_history_lookup = false;
+        for message in &requested_messages {
+            if messages_by_ref.contains_key(message.content_ref.as_str()) {
+                continue;
+            }
+            if let Some(materialization_store) = self.instruction_materialization_store.as_ref()
+                && materialization_store
+                    .get_materialized_message(&self.run_context, &message.content_ref)?
+                    .is_some()
+            {
+                continue;
+            }
+            needs_history_lookup = true;
+            break;
+        }
+        let snippet_messages_by_ref = if requested_messages
             .iter()
-            .any(|message| !messages_by_ref.contains_key(message.content_ref.as_str()));
+            .any(|message| skill_context::is_snippet_model_message_ref(&message.content_ref))
+        {
+            self.instruction_snippet_messages_by_ref().await?
+        } else {
+            HashMap::new()
+        };
         if needs_history_lookup {
             let history = self
                 .thread_service
@@ -604,6 +701,39 @@ where
         }
         let mut resolved = Vec::with_capacity(requested_messages.len());
         for message in requested_messages {
+            let requested_role = HostManagedModelMessageRole::from_loop_role(&message.role)?;
+            if let Some(materialization_store) = self.instruction_materialization_store.as_ref()
+                && let Some(materialized) = materialization_store
+                    .get_materialized_message(&self.run_context, &message.content_ref)?
+            {
+                let materialized_role =
+                    HostManagedModelMessageRole::from_loop_role(&materialized.role)?;
+                if requested_role != materialized_role {
+                    return Err(AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::InvalidInvocation,
+                        "model message role does not match materialized instruction context",
+                    ));
+                }
+                resolved.push(HostManagedModelMessage {
+                    role: materialized_role,
+                    content: materialized.safe_content,
+                    content_ref: message.content_ref,
+                });
+                continue;
+            }
+
+            if let Some(snippet_message) = snippet_messages_by_ref.get(message.content_ref.as_str())
+            {
+                if requested_role != snippet_message.role {
+                    return Err(AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::InvalidInvocation,
+                        "model message role does not match skill context snippet",
+                    ));
+                }
+                resolved.push(snippet_message.clone());
+                continue;
+            }
+
             let context_message = messages_by_ref
                 .get(message.content_ref.as_str())
                 .ok_or_else(|| {
@@ -612,7 +742,6 @@ where
                         "model message reference is unavailable",
                     )
                 })?;
-            let requested_role = HostManagedModelMessageRole::from_loop_role(&message.role)?;
             let durable_role = model_role_for_kind(context_message.kind);
             if requested_role != durable_role {
                 return Err(AgentLoopHostError::new(
@@ -627,6 +756,33 @@ where
             });
         }
         Ok(resolved)
+    }
+
+    async fn instruction_snippet_messages_by_ref(
+        &self,
+    ) -> Result<HashMap<String, HostManagedModelMessage>, AgentLoopHostError> {
+        let Some(source) = self.skill_context_source.as_deref() else {
+            return Ok(HashMap::new());
+        };
+        let snippets =
+            skill_context::build_skill_instruction_snippets(source, &self.run_context).await?;
+        let mut messages = HashMap::with_capacity(snippets.len());
+        for (ordinal, snippet) in snippets.into_iter().enumerate() {
+            let content_ref = skill_context::snippet_model_message_ref(
+                &snippet.snippet_ref,
+                &snippet.safe_summary,
+                ordinal,
+            )?;
+            messages.insert(
+                content_ref.as_str().to_string(),
+                HostManagedModelMessage {
+                    role: HostManagedModelMessageRole::System,
+                    content: snippet.safe_summary,
+                    content_ref,
+                },
+            );
+        }
+        Ok(messages)
     }
 }
 
@@ -645,9 +801,17 @@ pub struct HostManagedModelRequest {
     pub model_profile_id: ModelProfileId,
     pub messages: Vec<HostManagedModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<HostManagedModelRouteSnapshot>,
     pub run_id: TurnRunId,
     pub turn_id: TurnId,
 }
+
+/// Boundary alias for the route snapshot carried from turn/run state into
+/// host-managed model requests. This intentionally preserves the turn-owned
+/// wire shape across the loop-support boundary instead of defining a duplicate
+/// snapshot DTO here.
+pub type HostManagedModelRouteSnapshot = ironclaw_turns::run_profile::LoopModelRouteSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManagedModelMessage {
@@ -688,7 +852,7 @@ impl HostManagedModelResponse {
     pub fn assistant_reply(content: impl Into<String>) -> Self {
         let content = content.into();
         Self {
-            safe_text_deltas: vec![content.clone()],
+            safe_text_deltas: vec![sanitize_model_visible_text(content.clone())],
             output: ParentLoopOutput::AssistantReply(AssistantReply { content }),
         }
     }
@@ -699,7 +863,10 @@ impl HostManagedModelResponse {
 pub enum HostManagedModelErrorKind {
     InvalidRequest,
     PolicyDenied,
+    ConfigurationError,
     BudgetExceeded,
+    /// Provider credentials are missing, expired, or otherwise unavailable.
+    CredentialUnavailable,
     Unavailable,
     Cancelled,
 }
@@ -934,14 +1101,23 @@ fn transcript_write_error(_error: SessionThreadError) -> AgentLoopHostError {
 }
 
 fn model_gateway_error(error: HostManagedModelError) -> AgentLoopHostError {
-    AgentLoopHostError::new(model_error_kind(error.kind), error.safe_summary)
+    let safe_summary = if LoopSafeSummary::new(error.safe_summary.clone()).is_ok() {
+        error.safe_summary
+    } else {
+        safe_model_summary(error.kind).to_string()
+    };
+    AgentLoopHostError::new(model_error_kind(error.kind), safe_summary)
 }
 
 fn model_error_kind(kind: HostManagedModelErrorKind) -> AgentLoopHostErrorKind {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => AgentLoopHostErrorKind::InvalidInvocation,
         HostManagedModelErrorKind::PolicyDenied => AgentLoopHostErrorKind::PolicyDenied,
+        HostManagedModelErrorKind::ConfigurationError => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::BudgetExceeded => AgentLoopHostErrorKind::BudgetExceeded,
+        HostManagedModelErrorKind::CredentialUnavailable => {
+            AgentLoopHostErrorKind::CredentialUnavailable
+        }
         HostManagedModelErrorKind::Unavailable => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::Cancelled => AgentLoopHostErrorKind::Cancelled,
     }
@@ -951,7 +1127,9 @@ fn safe_model_summary(kind: HostManagedModelErrorKind) -> &'static str {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => "model request is invalid",
         HostManagedModelErrorKind::PolicyDenied => "model profile is not permitted",
+        HostManagedModelErrorKind::ConfigurationError => "model route configuration is invalid",
         HostManagedModelErrorKind::BudgetExceeded => "model request exceeded its budget",
+        HostManagedModelErrorKind::CredentialUnavailable => "model credentials are unavailable",
         HostManagedModelErrorKind::Unavailable => "model service is unavailable",
         HostManagedModelErrorKind::Cancelled => "model request was cancelled",
     }

@@ -9,9 +9,22 @@ use crate::{
 };
 
 use super::{
+    instruction_bundle::InstructionBundleFingerprint,
     refs::{CheckpointSchemaId, LoopDriverId, ModelProfileId},
     snapshot::ResolvedRunProfile,
 };
+
+const FORBIDDEN_MODEL_ROUTE_MARKERS: &[&str] = &[
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "passwd",
+    "secret",
+];
+
+const FORBIDDEN_EXACT_MODEL_ROUTE_MARKERS: &[&str] = &["bearer"];
 
 fn validate_bounded_loop_string(
     value: String,
@@ -209,6 +222,10 @@ bounded_loop_ref!(
 bounded_loop_ref!(LoopProcessRef, "loop process ref", "process:", 256);
 
 impl LoopCheckpointStateRef {
+    pub(crate) fn legacy_unknown() -> Self {
+        Self("checkpoint:unknown".to_string())
+    }
+
     pub fn for_run(context: &LoopRunContext, token: impl Into<String>) -> Result<Self, String> {
         let token = validate_loop_opaque_token(token.into(), "loop checkpoint state token", 96)?;
         Self::new(format!("checkpoint:{}:{token}", context.run_id))
@@ -339,12 +356,125 @@ fn origin_input_cursor_token() -> LoopInputCursorToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopModelRouteSnapshot {
+    pub provider_id: String,
+    pub model_id: String,
+    pub config_version: String,
+    pub auth_version: String,
+}
+
+impl LoopModelRouteSnapshot {
+    pub fn new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        config_version: impl Into<String>,
+        auth_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            config_version: config_version.into(),
+            auth_version: auth_version.into(),
+        }
+    }
+
+    pub fn try_new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        config_version: impl Into<String>,
+        auth_version: impl Into<String>,
+    ) -> Result<Self, String> {
+        let snapshot = Self::new(provider_id, model_id, config_version, auth_version);
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_model_route_component_value("provider_id", &self.provider_id, 128, |character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })?;
+        validate_model_route_component_value("model_id", &self.model_id, 256, |character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':' | '/')
+        })?;
+        validate_model_route_component_value(
+            "config_version",
+            &self.config_version,
+            128,
+            |character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+            },
+        )?;
+        validate_model_route_component_value(
+            "auth_version",
+            &self.auth_version,
+            128,
+            |character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// Validate a persisted provider/model route component with the same redaction
+/// marker policy used by host-owned loop snapshots and Reborn route keys.
+pub fn validate_model_route_component_value(
+    label: &'static str,
+    value: &str,
+    max_bytes: usize,
+    allowed: impl Fn(char) -> bool,
+) -> Result<(), String> {
+    validate_bounded_loop_string(value.to_string(), label, max_bytes)?;
+    if value.trim() != value {
+        return Err(format!("{label} must not contain surrounding whitespace"));
+    }
+    if !value.chars().all(allowed) {
+        return Err(format!("{label} contains unsupported characters"));
+    }
+    reject_sensitive_model_route_markers(label, value)?;
+    Ok(())
+}
+
+fn reject_sensitive_model_route_markers(label: &'static str, value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    for token in model_route_marker_tokens(&lower) {
+        if FORBIDDEN_EXACT_MODEL_ROUTE_MARKERS.contains(&token)
+            || FORBIDDEN_MODEL_ROUTE_MARKERS
+                .iter()
+                .any(|forbidden| token_contains_sensitive_marker(token, forbidden))
+            || token.starts_with("sk-")
+        {
+            return Err(format!("{label} contains a forbidden marker"));
+        }
+    }
+    Ok(())
+}
+
+fn model_route_marker_tokens(value: &str) -> impl Iterator<Item = &str> {
+    value
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '-' && character != '_'
+        })
+        .filter(|token| !token.is_empty())
+}
+
+fn token_contains_sensitive_marker(token: &str, marker: &str) -> bool {
+    let normalized = token.replace('-', "_");
+    normalized == marker
+        || normalized.starts_with(&format!("{marker}_"))
+        || normalized.ends_with(&format!("_{marker}"))
+        || normalized.contains(&format!("_{marker}_"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopRunContext {
     pub scope: TurnScope,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub run_id: TurnRunId,
     pub resolved_run_profile: ResolvedRunProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model_route: Option<LoopModelRouteSnapshot>,
     pub loop_driver_id: LoopDriverId,
     pub loop_driver_version: RunProfileVersion,
     pub checkpoint_schema_id: CheckpointSchemaId,
@@ -359,17 +489,27 @@ impl LoopRunContext {
         resolved_run_profile: ResolvedRunProfile,
     ) -> Self {
         let thread_id = scope.thread_id.clone();
+        let loop_driver_id = resolved_run_profile.loop_driver.id.clone();
+        let loop_driver_version = resolved_run_profile.loop_driver.version;
+        let checkpoint_schema_id = resolved_run_profile.checkpoint_schema_id.clone();
+        let checkpoint_schema_version = resolved_run_profile.checkpoint_schema_version;
         Self {
             scope,
             thread_id,
             turn_id,
             run_id,
-            loop_driver_id: resolved_run_profile.loop_driver.id.clone(),
-            loop_driver_version: resolved_run_profile.loop_driver.version,
-            checkpoint_schema_id: resolved_run_profile.checkpoint_schema_id.clone(),
-            checkpoint_schema_version: resolved_run_profile.checkpoint_schema_version,
             resolved_run_profile,
+            resolved_model_route: None,
+            loop_driver_id,
+            loop_driver_version,
+            checkpoint_schema_id,
+            checkpoint_schema_version,
         }
+    }
+
+    pub fn with_resolved_model_route(mut self, snapshot: LoopModelRouteSnapshot) -> Self {
+        self.resolved_model_route = Some(snapshot);
+        self
     }
 }
 
@@ -377,6 +517,10 @@ impl LoopRunContext {
 #[serde(rename_all = "snake_case")]
 pub enum AgentLoopHostErrorKind {
     Unauthorized,
+    /// Host-owned credential acquisition failed for the requested provider/model.
+    /// The error summary must stay sanitized and must not expose secret material,
+    /// token refresh details, or backend-specific credential-store errors.
+    CredentialUnavailable,
     ScopeMismatch,
     StaleSurface,
     InvalidInvocation,
@@ -393,6 +537,7 @@ impl AgentLoopHostErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
+            Self::CredentialUnavailable => "credential_unavailable",
             Self::ScopeMismatch => "scope_mismatch",
             Self::StaleSurface => "stale_surface",
             Self::InvalidInvocation => "invalid_invocation",
@@ -442,6 +587,8 @@ pub struct LoopContextRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopContextBundle {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_messages: Vec<LoopContextMessage>,
     pub messages: Vec<LoopContextMessage>,
     pub instruction_snippets: Vec<LoopContextSnippet>,
     pub memory_snippets: Vec<LoopContextSnippet>,
@@ -455,9 +602,20 @@ pub struct LoopContextMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopContextSnippetMetadata {
+    pub source_name: String,
+    pub trust_level: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopContextSnippet {
     pub snippet_ref: String,
     pub safe_summary: String,
+    /// Safe metadata for prompt milestones. Skill snippet producers using the
+    /// `skill:` ref namespace must populate this so telemetry can record active
+    /// skill name/trust without leaking prompt content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<LoopContextSnippetMetadata>,
 }
 
 #[async_trait]
@@ -649,6 +807,8 @@ pub struct LoopPromptBundle {
     pub bundle_ref: LoopPromptBundleRef,
     pub messages: Vec<LoopModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_fingerprint: Option<InstructionBundleFingerprint>,
 }
 
 /// Host boundary for building prompt bundles before model invocation.
@@ -674,6 +834,49 @@ pub struct LoopModelResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelStreamChunk {
     pub safe_text_delta: String,
+}
+
+/// Redact credential-looking tokens before model deltas cross public/loggable
+/// loop surfaces.
+pub fn sanitize_model_visible_text(value: impl Into<String>) -> String {
+    let value = value.into();
+    let mut sanitized = String::with_capacity(value.len());
+    let mut token = String::new();
+
+    for character in value.chars() {
+        if character.is_whitespace() {
+            flush_sanitized_model_token(&mut sanitized, &mut token);
+            sanitized.push(character);
+        } else {
+            token.push(character);
+        }
+    }
+    flush_sanitized_model_token(&mut sanitized, &mut token);
+
+    sanitized
+}
+
+fn flush_sanitized_model_token(sanitized: &mut String, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    if model_token_needs_redaction(token) {
+        sanitized.push_str("[redacted]");
+    } else {
+        sanitized.push_str(token);
+    }
+    token.clear();
+}
+
+fn model_token_needs_redaction(token: &str) -> bool {
+    let normalized = token
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .to_ascii_lowercase();
+    normalized.starts_with("sk-")
+        || normalized.contains("api_key")
+        || normalized.contains("access_token")
+        || normalized.contains("raw_credential_sentinel")
+        || normalized.contains("raw_provider_secret")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

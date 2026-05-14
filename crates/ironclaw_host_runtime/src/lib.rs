@@ -45,6 +45,8 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
 mod first_party;
+mod first_party_tools;
+pub mod memory_context;
 mod obligations;
 mod planner;
 mod production;
@@ -55,6 +57,10 @@ mod turn_scheduler;
 pub use first_party::{
     FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
     FirstPartyCapabilityRequest, FirstPartyCapabilityResult,
+};
+pub use first_party_tools::{
+    BUILTIN_FIRST_PARTY_PROVIDER, BuiltinFirstPartyTools, ECHO_CAPABILITY_ID, JSON_CAPABILITY_ID,
+    TIME_CAPABILITY_ID, builtin_first_party_handlers, builtin_first_party_package,
 };
 pub use obligations::{
     BuiltinObligationHandler, BuiltinObligationServices, NetworkObligationPolicyStore,
@@ -467,9 +473,19 @@ pub struct RuntimeCapabilityFailure {
     pub message: Option<String>,
 }
 
+/// Explicit fallback for outcome categories that the loop adapter cannot handle
+/// yet. New first-class outcome variants should be added to
+/// [`RuntimeCapabilityOutcome`] and exhaustively mapped by consumers instead of
+/// being hidden behind wildcard matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCapabilityUnknown {
+    pub capability_id: CapabilityId,
+    pub kind: String,
+    pub message: Option<String>,
+}
+
 /// Outcomes returned by capability invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum RuntimeCapabilityOutcome {
     Completed(Box<RuntimeCapabilityCompleted>),
     ApprovalRequired(RuntimeApprovalGate),
@@ -477,6 +493,7 @@ pub enum RuntimeCapabilityOutcome {
     ResourceBlocked(RuntimeResourceGate),
     SpawnedProcess(RuntimeProcessHandle),
     Failed(RuntimeCapabilityFailure),
+    Unknown(RuntimeCapabilityUnknown),
 }
 
 impl RuntimeCapabilityOutcome {
@@ -488,13 +505,13 @@ impl RuntimeCapabilityOutcome {
             Self::ResourceBlocked(_) => "resource_blocked",
             Self::SpawnedProcess(_) => "spawned_process",
             Self::Failed(_) => "failed",
+            Self::Unknown(_) => "unknown",
         }
     }
 }
 
 /// Stable reasons for capability suspension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum RuntimeBlockedReason {
     ApprovalRequired,
     AuthRequired,
@@ -670,7 +687,6 @@ pub trait HostRuntime: Send + Sync {
 
 /// Sanitized host runtime infrastructure/contract errors.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum HostRuntimeError {
     #[error("invalid host runtime request: {reason}")]
     InvalidRequest { reason: String },
