@@ -32,14 +32,14 @@ pub(crate) fn validate_dotted_id(
             "must be at most 128 bytes",
         ));
     }
-    if let PrefixRule::Required(required_prefix) = prefix {
-        if !value.starts_with(required_prefix) {
-            return Err(HostApiError::invalid_id(
-                kind,
-                value,
-                format!("must start with '{required_prefix}'"),
-            ));
-        }
+    if let PrefixRule::Required(required_prefix) = prefix
+        && !value.starts_with(required_prefix)
+    {
+        return Err(HostApiError::invalid_id(
+            kind,
+            value,
+            format!("must start with '{required_prefix}'"),
+        ));
     }
 
     let segments = value.split('.').collect::<Vec<_>>();
