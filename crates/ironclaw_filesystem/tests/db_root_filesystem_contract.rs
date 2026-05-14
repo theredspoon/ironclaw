@@ -5,7 +5,10 @@ use ironclaw_filesystem::RootFilesystem;
 #[cfg(feature = "postgres")]
 use ironclaw_filesystem::PostgresRootFilesystem;
 #[cfg(feature = "libsql")]
-use ironclaw_filesystem::{FileType, FilesystemError, FilesystemOperation, LibSqlRootFilesystem};
+use ironclaw_filesystem::{
+    CasExpectation, Entry, FileType, FilesystemError, FilesystemOperation, IndexKey, IndexValue,
+    LibSqlRootFilesystem, RecordKind,
+};
 #[cfg(feature = "libsql")]
 use ironclaw_host_api::VirtualPath;
 
@@ -239,6 +242,103 @@ impl std::ops::Deref for TestLibSqlRootFilesystem {
     fn deref(&self) -> &Self::Target {
         &self.filesystem
     }
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_native_put_get_round_trip_with_record_metadata() {
+    let filesystem = libsql_root().await;
+    let path = VirtualPath::new("/secrets/leases/L1").unwrap();
+
+    let kind = RecordKind::new("credential_lease").unwrap();
+    let scope_key = IndexKey::new("scope").unwrap();
+    let status_key = IndexKey::new("status").unwrap();
+    let entry = Entry::record(kind.clone(), &serde_json::json!({"hidden": true}))
+        .unwrap()
+        .with_indexed(scope_key.clone(), IndexValue::Text("acme".into()))
+        .with_indexed(status_key.clone(), IndexValue::Text("active".into()));
+
+    let version1 = filesystem
+        .put(&path, entry, CasExpectation::Absent)
+        .await
+        .unwrap();
+    assert_eq!(version1.get(), 1);
+
+    let got = filesystem
+        .get(&path)
+        .await
+        .unwrap()
+        .expect("entry should be present");
+    assert_eq!(got.version, version1);
+    assert_eq!(got.entry.kind.as_ref(), Some(&kind));
+    assert_eq!(got.entry.indexed.len(), 2);
+    assert!(got.entry.indexed.contains_key(&scope_key));
+    assert!(got.entry.indexed.contains_key(&status_key));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_native_put_cas_absent_rejects_existing_path() {
+    let filesystem = libsql_root().await;
+    let path = VirtualPath::new("/secrets/leases/L2").unwrap();
+    filesystem
+        .put(&path, Entry::bytes(vec![1]), CasExpectation::Absent)
+        .await
+        .unwrap();
+    let err = filesystem
+        .put(&path, Entry::bytes(vec![2]), CasExpectation::Absent)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FilesystemError::VersionMismatch { .. }));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_native_put_cas_version_advances_and_rejects_stale() {
+    let filesystem = libsql_root().await;
+    let path = VirtualPath::new("/secrets/leases/L3").unwrap();
+    let v1 = filesystem
+        .put(&path, Entry::bytes(vec![1]), CasExpectation::Absent)
+        .await
+        .unwrap();
+    let v2 = filesystem
+        .put(&path, Entry::bytes(vec![2]), CasExpectation::Version(v1))
+        .await
+        .unwrap();
+    assert!(v2 > v1);
+    // Stale version rejected.
+    let err = filesystem
+        .put(&path, Entry::bytes(vec![3]), CasExpectation::Version(v1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FilesystemError::VersionMismatch { .. }));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_native_put_cas_any_increments_existing_version() {
+    let filesystem = libsql_root().await;
+    let path = VirtualPath::new("/secrets/leases/L4").unwrap();
+    let v1 = filesystem
+        .put(&path, Entry::bytes(vec![1]), CasExpectation::Absent)
+        .await
+        .unwrap();
+    let v2 = filesystem
+        .put(&path, Entry::bytes(vec![2]), CasExpectation::Any)
+        .await
+        .unwrap();
+    assert_eq!(v2.get(), v1.get() + 1);
+    let got = filesystem.get(&path).await.unwrap().unwrap();
+    assert_eq!(got.version, v2);
+    assert_eq!(got.entry.body, vec![2]);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_get_returns_none_for_missing_path() {
+    let filesystem = libsql_root().await;
+    let path = VirtualPath::new("/secrets/leases/missing").unwrap();
+    assert!(filesystem.get(&path).await.unwrap().is_none());
 }
 
 #[cfg(feature = "libsql")]

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,7 +9,11 @@ use crate::db::{
     is_not_found, libsql_db_error, not_found, system_time_from_unix_seconds, valid_engine_path,
     virtual_path_prefixes,
 };
-use crate::{DirEntry, FileStat, FileType, FilesystemError, FilesystemOperation, RootFilesystem};
+use crate::{
+    BackendCapabilities, CasExpectation, ContentType, DirEntry, Entry, FileStat, FileType,
+    FilesystemError, FilesystemOperation, IndexCapability, IndexKey, IndexValue, RecordKind,
+    RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
+};
 
 #[cfg(feature = "libsql")]
 /// libSQL-backed [`RootFilesystem`] storing file contents by virtual path.
@@ -34,6 +39,7 @@ impl LibSqlRootFilesystem {
                 )
             })?;
         ensure_libsql_root_is_dir_column(&conn).await?;
+        ensure_libsql_records_columns(&conn).await?;
         Ok(())
     }
 
@@ -58,6 +64,221 @@ impl LibSqlRootFilesystem {
 #[cfg(feature = "libsql")]
 #[async_trait]
 impl RootFilesystem for LibSqlRootFilesystem {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            read: true,
+            write: true,
+            append: true,
+            list: true,
+            stat: true,
+            delete: true,
+            // Native put/get/delete with version-aware CAS lands in this PR.
+            records: true,
+            // Query/ensure_index/append/tail still default to Unsupported.
+            // Land in a follow-up port once consumer migrations need them.
+            query: false,
+            index: IndexCapability {
+                exact: false,
+                prefix: false,
+                fts: false,
+                vector: false,
+            },
+            txn: TxnCapability::Cas,
+            events: false,
+            indexed: false,
+            embedded: false,
+        }
+    }
+
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        // Reject writes that would clobber a directory or a path that has
+        // children (mirrors `write_file` semantics so legacy and new ops
+        // stay consistent).
+        if matches!(
+            self.exact_entry(path).await?,
+            Some((_, FileType::Directory, _))
+        ) || self.has_child_entry(path).await?
+        {
+            return Err(directory_write_error(path.clone()));
+        }
+        let indexed_json =
+            serde_json::to_string(&entry.indexed).map_err(|error| FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::WriteFile,
+                reason: format!("failed to serialize indexed projection: {error}"),
+            })?;
+        let kind_str = entry.kind.as_ref().map(|k| k.as_str().to_string());
+        let content_type_str = entry.content_type.as_str().to_string();
+        let body = entry.body;
+
+        match cas {
+            CasExpectation::Absent => {
+                let conn = self.connect().await?;
+                let rows = conn
+                    .execute(
+                        r#"
+                        INSERT INTO root_filesystem_entries
+                            (path, contents, is_dir, content_type, kind, indexed, version, updated_at)
+                        VALUES (?1, ?2, 0, ?3, ?4, ?5, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                        ON CONFLICT (path) DO NOTHING
+                        "#,
+                        libsql::params![
+                            path.as_str(),
+                            libsql::Value::Blob(body),
+                            content_type_str,
+                            kind_str,
+                            indexed_json,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        libsql_db_error(path.clone(), FilesystemOperation::WriteFile, error)
+                    })?;
+                if rows == 0 {
+                    let found = self.current_version(path).await?;
+                    return Err(FilesystemError::VersionMismatch {
+                        path: path.clone(),
+                        expected: None,
+                        found,
+                    });
+                }
+                Ok(RecordVersion::from_backend(1))
+            }
+            CasExpectation::Version(expected) => {
+                let conn = self.connect().await?;
+                let expected_raw = expected.get() as i64;
+                let rows = conn
+                    .execute(
+                        r#"
+                        UPDATE root_filesystem_entries
+                        SET contents = ?1,
+                            content_type = ?2,
+                            kind = ?3,
+                            indexed = ?4,
+                            version = version + 1,
+                            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        WHERE path = ?5 AND is_dir = 0 AND version = ?6
+                        "#,
+                        libsql::params![
+                            libsql::Value::Blob(body),
+                            content_type_str,
+                            kind_str,
+                            indexed_json,
+                            path.as_str(),
+                            expected_raw,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        libsql_db_error(path.clone(), FilesystemOperation::WriteFile, error)
+                    })?;
+                if rows == 0 {
+                    let found = self.current_version(path).await?;
+                    return Err(FilesystemError::VersionMismatch {
+                        path: path.clone(),
+                        expected: Some(expected),
+                        found,
+                    });
+                }
+                Ok(expected.next())
+            }
+            CasExpectation::Any => {
+                let conn = self.connect().await?;
+                let rows = conn
+                    .execute(
+                        r#"
+                        INSERT INTO root_filesystem_entries
+                            (path, contents, is_dir, content_type, kind, indexed, version, updated_at)
+                        VALUES (?1, ?2, 0, ?3, ?4, ?5, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                        ON CONFLICT (path) DO UPDATE SET
+                            contents = excluded.contents,
+                            content_type = excluded.content_type,
+                            kind = excluded.kind,
+                            indexed = excluded.indexed,
+                            version = root_filesystem_entries.version + 1,
+                            updated_at = excluded.updated_at
+                        WHERE root_filesystem_entries.is_dir = 0
+                        "#,
+                        libsql::params![
+                            path.as_str(),
+                            libsql::Value::Blob(body),
+                            content_type_str,
+                            kind_str,
+                            indexed_json,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        libsql_db_error(path.clone(), FilesystemOperation::WriteFile, error)
+                    })?;
+                if rows == 0 {
+                    return Err(directory_write_error(path.clone()));
+                }
+                let version =
+                    self.current_version(path)
+                        .await?
+                        .ok_or_else(|| FilesystemError::Backend {
+                            path: path.clone(),
+                            operation: FilesystemOperation::WriteFile,
+                            reason: "put succeeded but version lookup found no row".to_string(),
+                        })?;
+                Ok(version)
+            }
+        }
+    }
+
+    async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT contents, is_dir, content_type, kind, indexed, version
+                FROM root_filesystem_entries
+                WHERE path = ?1
+                "#,
+                libsql::params![path.as_str()],
+            )
+            .await
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?
+        else {
+            return Ok(None);
+        };
+        let is_dir: i64 = row
+            .get(1)
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        if is_dir != 0 {
+            // Directories are not addressable as Entries.
+            return Ok(None);
+        }
+        let body: Vec<u8> = row
+            .get(0)
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let content_type_raw: String = row
+            .get(2)
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let kind_raw: Option<String> = row.get(3).ok();
+        let indexed_raw: String = row
+            .get(4)
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let version_raw: i64 = row
+            .get(5)
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let entry = build_entry(path, body, content_type_raw, kind_raw, indexed_raw)?;
+        Ok(Some(VersionedEntry {
+            entry,
+            version: RecordVersion::from_backend(version_raw.max(0) as u64),
+        }))
+    }
+
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
         let conn = self.connect().await?;
         let mut rows = conn
@@ -401,6 +622,133 @@ impl LibSqlRootFilesystem {
             .map_err(|error| libsql_db_error(parent.clone(), FilesystemOperation::Stat, error))?
             .is_some())
     }
+
+    async fn current_version(
+        &self,
+        path: &VirtualPath,
+    ) -> Result<Option<RecordVersion>, FilesystemError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT version FROM root_filesystem_entries WHERE path = ?1 AND is_dir = 0",
+                libsql::params![path.as_str()],
+            )
+            .await
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?
+        else {
+            return Ok(None);
+        };
+        let version: i64 = row
+            .get(0)
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        Ok(Some(RecordVersion::from_backend(version.max(0) as u64)))
+    }
+}
+
+#[cfg(feature = "libsql")]
+fn build_entry(
+    path: &VirtualPath,
+    body: Vec<u8>,
+    content_type_raw: String,
+    kind_raw: Option<String>,
+    indexed_raw: String,
+) -> Result<Entry, FilesystemError> {
+    let content_type = ContentType::new(content_type_raw).map_err(FilesystemError::Contract)?;
+    let kind = kind_raw
+        .map(RecordKind::new)
+        .transpose()
+        .map_err(FilesystemError::Contract)?;
+    let indexed: BTreeMap<IndexKey, IndexValue> = if indexed_raw.is_empty() {
+        BTreeMap::new()
+    } else {
+        serde_json::from_str(&indexed_raw).map_err(|error| FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::ReadFile,
+            reason: format!("failed to parse indexed projection: {error}"),
+        })?
+    };
+    Ok(Entry {
+        body,
+        content_type,
+        kind,
+        indexed,
+    })
+}
+
+#[cfg(feature = "libsql")]
+async fn ensure_libsql_records_columns(conn: &libsql::Connection) -> Result<(), FilesystemError> {
+    add_column_if_missing(
+        conn,
+        "content_type",
+        "ALTER TABLE root_filesystem_entries ADD COLUMN content_type TEXT NOT NULL DEFAULT 'application/octet-stream'",
+    )
+    .await?;
+    add_column_if_missing(
+        conn,
+        "kind",
+        "ALTER TABLE root_filesystem_entries ADD COLUMN kind TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        conn,
+        "indexed",
+        "ALTER TABLE root_filesystem_entries ADD COLUMN indexed TEXT NOT NULL DEFAULT '{}'",
+    )
+    .await?;
+    add_column_if_missing(
+        conn,
+        "version",
+        "ALTER TABLE root_filesystem_entries ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    Ok(())
+}
+
+#[cfg(feature = "libsql")]
+async fn add_column_if_missing(
+    conn: &libsql::Connection,
+    column: &str,
+    ddl: &str,
+) -> Result<(), FilesystemError> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM pragma_table_info('root_filesystem_entries') WHERE name = ?1",
+            libsql::params![column],
+        )
+        .await
+        .map_err(|error| {
+            libsql_db_error(
+                valid_engine_path(),
+                FilesystemOperation::CreateDirAll,
+                error,
+            )
+        })?;
+    if rows
+        .next()
+        .await
+        .map_err(|error| {
+            libsql_db_error(
+                valid_engine_path(),
+                FilesystemOperation::CreateDirAll,
+                error,
+            )
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
+    conn.execute(ddl, ()).await.map_err(|error| {
+        libsql_db_error(
+            valid_engine_path(),
+            FilesystemOperation::CreateDirAll,
+            error,
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(feature = "libsql")]

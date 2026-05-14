@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use ironclaw_host_api::VirtualPath;
 
@@ -6,7 +8,11 @@ use crate::db::{
     directory_write_error, is_not_found, not_found, system_time_from_unix_seconds,
     valid_engine_path, virtual_path_prefixes,
 };
-use crate::{DirEntry, FileStat, FileType, FilesystemError, FilesystemOperation, RootFilesystem};
+use crate::{
+    BackendCapabilities, CasExpectation, ContentType, DirEntry, Entry, FileStat, FileType,
+    FilesystemError, FilesystemOperation, IndexCapability, IndexKey, IndexValue, RecordKind,
+    RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
+};
 
 #[cfg(feature = "postgres")]
 /// PostgreSQL-backed [`RootFilesystem`] storing file contents by virtual path.
@@ -49,6 +55,193 @@ impl PostgresRootFilesystem {
 #[cfg(feature = "postgres")]
 #[async_trait]
 impl RootFilesystem for PostgresRootFilesystem {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            read: true,
+            write: true,
+            append: true,
+            list: true,
+            stat: true,
+            delete: true,
+            records: true,
+            query: false,
+            index: IndexCapability {
+                exact: false,
+                prefix: false,
+                fts: false,
+                vector: false,
+            },
+            txn: TxnCapability::Cas,
+            events: false,
+            indexed: false,
+            embedded: false,
+        }
+    }
+
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        let client = self.client().await?;
+        if matches!(
+            self.exact_entry_with_client(&client, path).await?,
+            Some((_, FileType::Directory, _))
+        ) || self.has_child_entry_with_client(&client, path).await?
+        {
+            return Err(directory_write_error(path.clone()));
+        }
+        let indexed_json =
+            serde_json::to_value(&entry.indexed).map_err(|error| FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::WriteFile,
+                reason: format!("failed to serialize indexed projection: {error}"),
+            })?;
+        let kind_str = entry.kind.as_ref().map(|k| k.as_str().to_string());
+        let content_type_str = entry.content_type.as_str().to_string();
+        let body = entry.body;
+        let path_str = path.as_str();
+
+        match cas {
+            CasExpectation::Absent => {
+                let rows = client
+                    .execute(
+                        r#"
+                        INSERT INTO root_filesystem_entries
+                            (path, contents, is_dir, content_type, kind, indexed, version)
+                        VALUES ($1, $2, FALSE, $3, $4, $5, 1)
+                        ON CONFLICT (path) DO NOTHING
+                        "#,
+                        &[
+                            &path_str,
+                            &body,
+                            &content_type_str,
+                            &kind_str,
+                            &indexed_json,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        db_error(path.clone(), FilesystemOperation::WriteFile, error)
+                    })?;
+                if rows == 0 {
+                    let found = self.current_version_with_client(&client, path).await?;
+                    return Err(FilesystemError::VersionMismatch {
+                        path: path.clone(),
+                        expected: None,
+                        found,
+                    });
+                }
+                Ok(RecordVersion::from_backend(1))
+            }
+            CasExpectation::Version(expected) => {
+                let expected_raw = expected.get() as i64;
+                let rows = client
+                    .execute(
+                        r#"
+                        UPDATE root_filesystem_entries
+                        SET contents = $1,
+                            content_type = $2,
+                            kind = $3,
+                            indexed = $4,
+                            version = version + 1,
+                            updated_at = NOW()
+                        WHERE path = $5 AND is_dir = FALSE AND version = $6
+                        "#,
+                        &[
+                            &body,
+                            &content_type_str,
+                            &kind_str,
+                            &indexed_json,
+                            &path_str,
+                            &expected_raw,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        db_error(path.clone(), FilesystemOperation::WriteFile, error)
+                    })?;
+                if rows == 0 {
+                    let found = self.current_version_with_client(&client, path).await?;
+                    return Err(FilesystemError::VersionMismatch {
+                        path: path.clone(),
+                        expected: Some(expected),
+                        found,
+                    });
+                }
+                Ok(expected.next())
+            }
+            CasExpectation::Any => {
+                let row = client
+                    .query_opt(
+                        r#"
+                        INSERT INTO root_filesystem_entries
+                            (path, contents, is_dir, content_type, kind, indexed, version)
+                        VALUES ($1, $2, FALSE, $3, $4, $5, 1)
+                        ON CONFLICT (path) DO UPDATE SET
+                            contents = EXCLUDED.contents,
+                            content_type = EXCLUDED.content_type,
+                            kind = EXCLUDED.kind,
+                            indexed = EXCLUDED.indexed,
+                            version = root_filesystem_entries.version + 1,
+                            updated_at = NOW()
+                        WHERE root_filesystem_entries.is_dir = FALSE
+                        RETURNING version
+                        "#,
+                        &[
+                            &path_str,
+                            &body,
+                            &content_type_str,
+                            &kind_str,
+                            &indexed_json,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| {
+                        db_error(path.clone(), FilesystemOperation::WriteFile, error)
+                    })?;
+                let Some(row) = row else {
+                    return Err(directory_write_error(path.clone()));
+                };
+                let version: i64 = row.get("version");
+                Ok(RecordVersion::from_backend(version.max(0) as u64))
+            }
+        }
+    }
+
+    async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT contents, is_dir, content_type, kind, indexed, version
+                FROM root_filesystem_entries
+                WHERE path = $1
+                "#,
+                &[&path.as_str()],
+            )
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let is_dir: bool = row.get("is_dir");
+        if is_dir {
+            return Ok(None);
+        }
+        let body: Vec<u8> = row.get("contents");
+        let content_type_raw: String = row.get("content_type");
+        let kind_raw: Option<String> = row.get("kind");
+        let indexed_value: serde_json::Value = row.get("indexed");
+        let version_raw: i64 = row.get("version");
+        let entry = build_entry(path, body, content_type_raw, kind_raw, indexed_value)?;
+        Ok(Some(VersionedEntry {
+            entry,
+            version: RecordVersion::from_backend(version_raw.max(0) as u64),
+        }))
+    }
+
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
         let client = self.client().await?;
         let row = client
@@ -314,6 +507,54 @@ impl PostgresRootFilesystem {
             .map_err(|error| db_error(parent.clone(), FilesystemOperation::Stat, error))?;
         Ok(row.is_some())
     }
+
+    async fn current_version_with_client(
+        &self,
+        client: &tokio_postgres::Client,
+        path: &VirtualPath,
+    ) -> Result<Option<RecordVersion>, FilesystemError> {
+        let row = client
+            .query_opt(
+                "SELECT version FROM root_filesystem_entries WHERE path = $1 AND is_dir = FALSE",
+                &[&path.as_str()],
+            )
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
+        Ok(row.map(|row| {
+            let version: i64 = row.get("version");
+            RecordVersion::from_backend(version.max(0) as u64)
+        }))
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn build_entry(
+    path: &VirtualPath,
+    body: Vec<u8>,
+    content_type_raw: String,
+    kind_raw: Option<String>,
+    indexed_value: serde_json::Value,
+) -> Result<Entry, FilesystemError> {
+    let content_type = ContentType::new(content_type_raw).map_err(FilesystemError::Contract)?;
+    let kind = kind_raw
+        .map(RecordKind::new)
+        .transpose()
+        .map_err(FilesystemError::Contract)?;
+    let indexed: BTreeMap<IndexKey, IndexValue> = if indexed_value.is_null() {
+        BTreeMap::new()
+    } else {
+        serde_json::from_value(indexed_value).map_err(|error| FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::ReadFile,
+            reason: format!("failed to parse indexed projection: {error}"),
+        })?
+    };
+    Ok(Entry {
+        body,
+        content_type,
+        kind,
+        indexed,
+    })
 }
 
 #[cfg(feature = "postgres")]
@@ -321,4 +562,6 @@ const POSTGRES_ROOT_FILESYSTEM_SCHEMA: &str = concat!(
     include_str!("../../../migrations/V26__root_filesystem_entries.sql"),
     "\n",
     include_str!("../../../migrations/V27__root_filesystem_entries_directories.sql"),
+    "\n",
+    include_str!("../../../migrations/V28__root_filesystem_records.sql"),
 );
