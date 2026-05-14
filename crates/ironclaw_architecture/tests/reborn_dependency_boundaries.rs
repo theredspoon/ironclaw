@@ -146,6 +146,12 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
     let services =
         std::fs::read_to_string(root.join("crates/ironclaw_host_runtime/src/services.rs"))
             .expect("host runtime services.rs must be readable");
+    let obligations =
+        std::fs::read_to_string(root.join("crates/ironclaw_host_runtime/src/obligations.rs"))
+            .expect("host runtime obligations.rs must be readable");
+    let host_runtime_contract =
+        std::fs::read_to_string(root.join("docs/reborn/contracts/host-runtime.md"))
+            .expect("host runtime contract must be readable");
     let scripts = std::fs::read_to_string(root.join("crates/ironclaw_scripts/src/lib.rs"))
         .expect("script runtime lib.rs must be readable");
     let scripts_manifest = std::fs::read_to_string(root.join("crates/ironclaw_scripts/Cargo.toml"))
@@ -168,6 +174,36 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
         );
     }
 
+    let obligations_pub_use = extract_pub_use_block(&lib, "pub use obligations::{");
+    let forbidden_obligation_exports = [
+        "NetworkObligationPolicyStore",
+        "RuntimeSecretInjectionStore",
+        "RuntimeSecretInjectionStoreError",
+    ];
+    for export in forbidden_obligation_exports {
+        assert!(
+            !obligations_pub_use.contains(export),
+            "ironclaw_host_runtime must not re-export lower substrate handoff store `{export}`; upper Reborn code should enter through HostRuntimeServices::host_runtime / Arc<dyn HostRuntime>"
+        );
+    }
+
+    let forbidden_lib_accessors = [
+        "pub use obligations::NetworkObligationPolicyStore",
+        "pub use obligations::RuntimeSecretInjectionStore",
+        "pub use obligations::RuntimeSecretInjectionStoreError",
+        "pub use obligations::*",
+        "pub fn with_secret_injection_store(",
+        "pub fn with_network_policy_store(",
+        "pub fn network(&self) -> &N",
+        "pub fn secrets(&self) -> &S",
+    ];
+    for pattern in forbidden_lib_accessors {
+        assert!(
+            !lib.contains(pattern),
+            "HostHttpEgressService must not expose lower substrate escape hatch `{pattern}`; keep raw network/secret/policy handoff wiring private to host-runtime composition"
+        );
+    }
+
     let forbidden_public_services = [
         "pub fn registry(",
         "pub fn filesystem(",
@@ -179,6 +215,9 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
         "pub fn runtime_dispatcher(",
         "pub fn runtime_dispatcher_arc(",
         "pub fn capability_host",
+        "pub fn secret_injection_store(",
+        "pub fn network_policy_store(",
+        "pub fn with_host_http_egress<N, SecretBackend>",
         "pub struct RuntimeDispatchProcessExecutor",
         "pub struct ScriptRuntimeAdapter",
         "pub struct McpRuntimeAdapter",
@@ -188,6 +227,39 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
         assert!(
             !services.contains(pattern),
             "HostRuntimeServices must not expose lower substrate escape hatch `{pattern}`; keep dispatcher/capability/process handles private to the host-runtime crate"
+        );
+    }
+
+    let forbidden_obligation_accessors = [
+        "pub struct RuntimeSecretInjectionStore",
+        "pub enum RuntimeSecretInjectionStoreError",
+        "pub struct NetworkObligationPolicyStore",
+        "pub fn insert(",
+        "pub fn take(",
+        "pub fn discard_for_capability(",
+        "pub fn with_handoff_stores(",
+        "pub fn with_network_policy_store(",
+        "pub fn with_secret_injection_store(",
+        "pub fn network_policy_store(&self)",
+        "pub fn secret_injection_store(&self)",
+        "pub fn staged_network_policy_present_for_diagnostics(",
+        "pub fn staged_secret_present_for_diagnostics(",
+    ];
+    for pattern in forbidden_obligation_accessors {
+        assert!(
+            !obligations.contains(pattern),
+            "BuiltinObligationServices and lower handoff stores must not expose lower substrate escape hatch `{pattern}`; keep secret/network handoff stores private to host-runtime composition"
+        );
+    }
+
+    for required_phrase in [
+        "try_with_host_http_egress",
+        "low-level host-runtime/test harness escape hatches",
+        "upper Reborn crates must not use them",
+    ] {
+        assert!(
+            host_runtime_contract.contains(required_phrase),
+            "host-runtime contract should document `{required_phrase}` so raw handoff store seams are not mistaken for upper Reborn APIs"
         );
     }
 
@@ -223,6 +295,17 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
         !mcp_manifest.contains("ironclaw_dispatcher"),
         "ironclaw_mcp must not depend on ironclaw_dispatcher; MCP dispatcher adapters are host-runtime-private composition"
     );
+}
+
+fn extract_pub_use_block<'a>(contents: &'a str, start_marker: &str) -> &'a str {
+    let Some(start) = contents.find(start_marker) else {
+        return "";
+    };
+    let after_start = &contents[start..];
+    let Some(end) = after_start.find("};") else {
+        return after_start;
+    };
+    &after_start[..end]
 }
 
 #[test]
@@ -690,6 +773,45 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_network",
                 "ironclaw_engine",
                 "ironclaw_gateway",
+            ],
+        },
+        BoundaryRule {
+            // Registry is a contracts-only Reborn crate. Runtime/dispatcher/engine
+            // crates would invert ownership, secrets crates could expose raw
+            // material instead of opaque handles, and v1 WASM/channel crates
+            // would bypass the Reborn registry boundary.
+            crate_name: "ironclaw_product_adapter_registry",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_authorization",
+                "ironclaw_approvals",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_runtime",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                "ironclaw_product_workflow",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_threads",
+                "ironclaw_tui",
+                "ironclaw_wasm",
+                "ironclaw_wasm_product_adapters",
             ],
         },
         BoundaryRule {
@@ -1302,22 +1424,8 @@ fn assert_no_normal_workspace_deps<'a>(
         // The landing plan introduces Reborn crates in grouped PRs. Boundary
         // rules become active as soon as their crate is present in the
         // workspace, while absent future crates are ignored in earlier slices.
-        //
-        // Fail closed when the crate directory is on disk but missing from
-        // `cargo metadata` — that combination means the crate exists but
-        // was never registered as a workspace member, so its forbidden
-        // edges would otherwise silently pass without ever being checked.
-        let crate_manifest = workspace_root()
-            .join("crates")
-            .join(crate_name)
-            .join("Cargo.toml");
-        assert!(
-            !crate_manifest.exists(),
-            "{crate_name} has a Cargo.toml at {} but is not in `cargo metadata` output; \
-             add it to the root `Cargo.toml` `workspace.members` so the boundary rule \
-             actually runs against its dependencies",
-            crate_manifest.display()
-        );
+        // `reborn_boundary_rules_active_crates_are_workspace_members` covers
+        // present-on-disk crates that are missing from `cargo metadata`.
         return;
     };
     for forbidden in forbidden {
