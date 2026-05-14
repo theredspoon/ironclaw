@@ -16,18 +16,23 @@
 // - Ignored-but-authenticated events are represented in the parsed DTO as the
 //   contract's no-op payload variant. They are not represented by an absent
 //   parse result.
-// - `http-egress` is the only network capability. Components declare a fixed
-//   list of egress TARGETS via `declared-egress-targets`, where each target
-//   is the paired `(host, optional credential_handle)` shape the host's
-//   `EgressPolicy` enforces. The host rejects requests to any undeclared
-//   pair — including the cross-pair leak case (a credential declared for a
-//   different host) and the unauthenticated-bypass case (a bare request to
-//   a host declared only with credentialed pairs). Credential handles are
-//   opaque ids; the host resolves and applies the underlying secret
-//   material at request time.
-// - Response bodies returned to WASM via `http-egress` are scanned for
-//   leak-pattern matches by the host before the WASM instance can observe
-//   them. Raw response headers remain host-only and are not exposed here.
+// - `http-egress` is the only network capability this WIT world reserves for
+//   components. This PR slice is intentionally parse/render-only: the host
+//   import fails closed until a follow-up injects the production
+//   host-runtime egress service. Components still declare a fixed list of
+//   egress TARGETS via `declared-egress-targets`, where each target is the
+//   paired `(host, optional credential_handle)` shape the host's
+//   `EgressPolicy` enforces for rendered requests.
+// - Once production component egress is wired, the host will reject requests
+//   to undeclared pairs — including the cross-pair leak case (a credential
+//   declared for a different host) and the unauthenticated-bypass case (a
+//   bare request to a host declared only with credentialed pairs). Credential
+//   handles are opaque ids; the host resolves and applies the underlying
+//   secret material at request time.
+// - Response bodies returned to WASM via future `http-egress` wiring must be
+//   scanned for leak-pattern matches by the host before the WASM instance can
+//   observe them. Raw response headers remain host-only and are not exposed
+//   here.
 // - `log`, `now-millis`, and v1-style minimal WASI p2 are the only
 //   general-purpose host imports. Minimal WASI keeps wasm32-wasip2 guest
 //   compatibility and permits clock/random, but the host provides no env,
@@ -190,9 +195,11 @@ interface product-adapter {
         evidence: auth-evidence,
     ) -> result<parsed-inbound, string>;
 
-    /// Render an outbound envelope into an HTTP egress request that the host
-    /// will execute via `http-egress`. The host re-validates the egress
-    /// request against the manifest before sending.
+    /// Render an outbound envelope into an HTTP egress request. In this
+    /// parse/render-only slice, the Rust host returns the validated typed
+    /// request to trusted host code; production `http-egress` execution from
+    /// inside WASM is deferred to follow-up host-runtime wiring. The host
+    /// re-validates the egress request against the manifest before any send.
     render-outbound: func(
         envelope: outbound-envelope,
     ) -> result<outbound-render, string>;

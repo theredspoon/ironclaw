@@ -191,6 +191,44 @@ fn calls_parse_and_render_exports() {
 }
 
 #[test]
+fn prepared_component_is_safe_to_share_across_host_calls() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<ironclaw_wasm_product_adapters::PreparedProductAdapterComponent>();
+}
+
+#[test]
+fn parse_caps_component_logs_at_runtime_boundary() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let log_spam_wat = FIXTURE_ADAPTER_WAT
+        .replacen(
+            "(module\n",
+            "(module\n  (import \"near:product-adapter/product-adapter-host@0.1.0\" \"log\" (func $host_log (param i32 i32 i32)))\n",
+            1,
+        )
+        .replace(
+            "  (func $parse_inbound (param $raw_ptr i32) (param $raw_len i32) (param $evidence_ptr i32) (param $evidence_len i32) (result i32)\n    ;; ok(parsed-inbound { parsed-json })\n    i32.const 128",
+            "  (func $parse_inbound (param $raw_ptr i32) (param $raw_len i32) (param $evidence_ptr i32) (param $evidence_len i32) (result i32)\n    (local $i i32)\n    (loop $emit\n      i32.const 2\n      i32.const 1024\n      i32.const 15\n      call $host_log\n      local.get $i\n      i32.const 1\n      i32.add\n      local.tee $i\n      i32.const 1001\n      i32.lt_u\n      br_if $emit)\n    ;; ok(parsed-inbound { parsed-json })\n    i32.const 128",
+        );
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(&log_spam_wat))
+        .expect("prepare");
+    let evidence = mark_bearer_token_verified("alice");
+
+    let parsed = runtime
+        .parse_inbound(&prepared, br#"{"hello":true}"#, &evidence)
+        .expect("parse");
+
+    assert_eq!(parsed.logs.len(), 1_000);
+    assert_eq!(
+        parsed.logs.last().expect("last retained log").message,
+        "fixture_adapter"
+    );
+}
+
+#[test]
 fn parse_rejects_json_that_is_not_parsed_product_inbound() {
     let runtime =
         ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
@@ -221,6 +259,30 @@ fn parse_rejects_json_that_is_not_parsed_product_inbound() {
 }
 
 #[test]
+fn render_rejects_fuel_exhaustion_with_usable_error() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let looping_render_wat = FIXTURE_ADAPTER_WAT.replace(
+        "  (func $render_outbound (param $outbound_ptr i32) (param $outbound_len i32) (result i32)\n    ;; ok(outbound-render { egress-request-json })\n    i32.const 144\n    i32.const 0\n    i32.store\n    i32.const 148\n    i32.const 3072\n    i32.store\n    i32.const 152\n    i32.const 79\n    i32.store\n    i32.const 144)",
+        "  (func $render_outbound (param $outbound_ptr i32) (param $outbound_len i32) (result i32)\n    (loop $spin br $spin)\n    unreachable)",
+    );
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(&looping_render_wat))
+        .expect("prepare");
+
+    let err = runtime
+        .render_outbound(&prepared, r#"{"payload":"out"}"#)
+        .expect_err("fuel exhaustion must fail render");
+
+    assert!(
+        matches!(err, RuntimeError::ExecutionFailed { ref message, .. }
+            if message.to_ascii_lowercase().contains("fuel")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn render_rejects_missing_typed_egress_fields() {
     let runtime =
         ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
@@ -246,6 +308,31 @@ fn render_rejects_missing_typed_egress_fields() {
         matches!(err, RuntimeError::InvalidJson { field, ref message }
             if field == "outbound-render.egress-request-json"
                 && message.contains("method")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn render_rejects_kebab_case_egress_target_index_json() {
+    let runtime =
+        ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
+            .expect("runtime");
+    let kebab_case_index_wat = FIXTURE_ADAPTER_WAT.replace(
+        "{\\22egress_target_index\\22:0,\\22method\\22:\\22POST\\22,\\22path\\22:\\22/send\\22,\\22headers\\22:[],\\22body\\22:[]}",
+        "{\\22egress-target-index\\22:0,\\22method\\22:\\22POST\\22,\\22path\\22:\\22/send\\22,\\22headers\\22:[],\\22body\\22:[]}",
+    );
+    let prepared = runtime
+        .prepare("fixture", &product_adapter_component(&kebab_case_index_wat))
+        .expect("prepare");
+
+    let err = runtime
+        .render_outbound(&prepared, r#"{"payload":"out"}"#)
+        .expect_err("kebab-case JSON shim field must be rejected");
+
+    assert!(
+        matches!(err, RuntimeError::InvalidJson { field, ref message }
+            if field == "outbound-render.egress-request-json"
+                && message.contains("egress_target_index")),
         "{err:?}"
     );
 }

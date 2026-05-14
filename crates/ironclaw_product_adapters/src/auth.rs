@@ -360,6 +360,8 @@ mod tests {
         let evidence = ProtocolAuthEvidence::host_verified(AuthRequirement::BearerToken, "alice");
         let json = serde_json::to_string(&evidence).expect("serialize");
         assert!(json.contains("\"verified\""));
+        assert!(!json.contains("seal"));
+        assert!(!json.contains("HostAuthSeal"));
         let parsed: Result<ProtocolAuthEvidence, _> = serde_json::from_str(&json);
         assert!(parsed.is_err());
     }
