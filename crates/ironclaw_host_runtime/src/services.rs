@@ -411,7 +411,7 @@ where
         ));
         Self {
             registry,
-            trust_policy: Arc::new(HostTrustPolicy::empty()),
+            trust_policy: Arc::new(HostTrustPolicy::fail_closed()),
             trust_policy_configured: false,
             filesystem,
             governor,
@@ -665,7 +665,7 @@ where
 
     /// Attaches the host-owned trust policy used by the produced
     /// [`DefaultHostRuntime`]. Without this, the service graph keeps the
-    /// default empty policy and capability dispatch fails closed.
+    /// default fail-closed policy and capability dispatch is denied.
     pub fn with_trust_policy<T>(mut self, trust_policy: Arc<T>) -> Self
     where
         T: TrustPolicy + 'static,
