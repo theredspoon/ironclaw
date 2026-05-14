@@ -7,70 +7,20 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::HostApiError;
-
-fn valid_segment_char(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-}
+use crate::{
+    HostApiError,
+    dotted_id::{PrefixRule, VersionRule, validate_dotted_id},
+};
 
 fn validate_versioned_dotted_id(kind: &'static str, value: &str) -> Result<(), HostApiError> {
-    if value.is_empty() {
-        return Err(HostApiError::invalid_id(kind, value, "must not be empty"));
-    }
-    if value.len() > 128 {
-        return Err(HostApiError::invalid_id(
-            kind,
-            value,
-            "must be at most 128 bytes",
-        ));
-    }
-    let segments = value.split('.').collect::<Vec<_>>();
-    if segments.len() < 3 {
-        return Err(HostApiError::invalid_id(
-            kind,
-            value,
-            "must have at least domain, name, and version segments",
-        ));
-    }
-    for segment in &segments {
-        if segment.is_empty() {
-            return Err(HostApiError::invalid_id(
-                kind,
-                value,
-                "empty dot segments are not allowed",
-            ));
-        }
-        if !segment.as_bytes()[0].is_ascii_lowercase() {
-            return Err(HostApiError::invalid_id(
-                kind,
-                value,
-                "segments must start with a lowercase ASCII letter",
-            ));
-        }
-        if segment.bytes().any(|byte| !valid_segment_char(byte)) {
-            return Err(HostApiError::invalid_id(
-                kind,
-                value,
-                "only lowercase ASCII letters, digits, '_', '-', and '.' are allowed",
-            ));
-        }
-    }
-    let version = segments[segments.len() - 1];
-    let Some(rest) = version.strip_prefix('v') else {
-        return Err(HostApiError::invalid_id(
-            kind,
-            value,
-            "last segment must be a version like v1",
-        ));
-    };
-    if rest.is_empty() || rest.bytes().any(|byte| !byte.is_ascii_digit()) {
-        return Err(HostApiError::invalid_id(
-            kind,
-            value,
-            "last segment must be a version like v1",
-        ));
-    }
-    Ok(())
+    validate_dotted_id(
+        kind,
+        value,
+        3,
+        "must have at least domain, name, and version segments",
+        PrefixRule::Any,
+        VersionRule::Versioned,
+    )
 }
 
 fn validate_schema_ref(value: &str) -> Result<(), HostApiError> {

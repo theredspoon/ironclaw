@@ -1,6 +1,7 @@
 use ironclaw_capabilities::{
     CapabilityProfileClaim, CapabilityProfileClaimedOperation, CapabilityProfileConformanceFinding,
     CapabilityProfileConformanceFindingKind, CapabilityProfileConformanceReport,
+    evaluate_profile_conformance,
 };
 use ironclaw_host_api::{
     CapabilityId, CapabilityProfileContract, CapabilityProfileId,
@@ -87,10 +88,25 @@ fn capability_profile_conformance_accepts_matching_claims() {
     )
     .unwrap();
 
-    let report = CapabilityProfileConformanceReport::evaluate(&contract, &claim);
+    let report = evaluate_profile_conformance(&contract, &claim);
+    let claim_method_report = claim.evaluate_against(&contract);
 
     assert!(report.is_conformant());
     assert!(report.findings().is_empty());
+    assert_eq!(report, claim_method_report);
+}
+
+#[test]
+fn capability_profile_conformance_finding_renders_for_logs() {
+    let finding = CapabilityProfileConformanceFinding::new(
+        CapabilityProfileConformanceFindingKind::MissingRequiredOperation,
+        "memory.context.retrieve.v1",
+    );
+
+    assert_eq!(
+        finding.to_string(),
+        "missing required operation: memory.context.retrieve.v1"
+    );
 }
 
 #[test]

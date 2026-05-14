@@ -9,66 +9,20 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::HostApiError;
-
-fn valid_segment_char(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-}
+use crate::{
+    HostApiError,
+    dotted_id::{PrefixRule, VersionRule, validate_dotted_id},
+};
 
 fn validate_dotted_host_port_id(value: &str) -> Result<(), HostApiError> {
-    if value.is_empty() {
-        return Err(HostApiError::invalid_id(
-            "host_port",
-            value,
-            "must not be empty",
-        ));
-    }
-    if value.len() > 128 {
-        return Err(HostApiError::invalid_id(
-            "host_port",
-            value,
-            "must be at most 128 bytes",
-        ));
-    }
-    if !value.starts_with("host.") {
-        return Err(HostApiError::invalid_id(
-            "host_port",
-            value,
-            "must start with 'host.'",
-        ));
-    }
-    let segments: Vec<&str> = value.split('.').collect();
-    if segments.len() < 3 {
-        return Err(HostApiError::invalid_id(
-            "host_port",
-            value,
-            "must have at least host, domain, and service segments",
-        ));
-    }
-    for segment in &segments {
-        if segment.is_empty() {
-            return Err(HostApiError::invalid_id(
-                "host_port",
-                value,
-                "empty dot segments are not allowed",
-            ));
-        }
-        if !segment.as_bytes()[0].is_ascii_lowercase() {
-            return Err(HostApiError::invalid_id(
-                "host_port",
-                value,
-                "segments must start with a lowercase ASCII letter",
-            ));
-        }
-        if segment.bytes().any(|byte| !valid_segment_char(byte)) {
-            return Err(HostApiError::invalid_id(
-                "host_port",
-                value,
-                "only lowercase ASCII letters, digits, '_', '-', and '.' are allowed",
-            ));
-        }
-    }
-    Ok(())
+    validate_dotted_id(
+        "host_port",
+        value,
+        3,
+        "must have at least host, domain, and service segments",
+        PrefixRule::Required("host."),
+        VersionRule::Unversioned,
+    )
 }
 
 /// Stable identifier for a host-mediated API surface.
@@ -117,6 +71,10 @@ impl<'de> Deserialize<'de> for HostPortId {
 }
 
 /// One host port granted into a scoped invocation view.
+///
+/// This is intentionally a thin grant token. Future scoped or attenuated host-port
+/// grants should use a distinct wire type rather than overloading this catalog
+/// reference shape.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostPortGrant {
@@ -200,9 +158,10 @@ impl HostPortCatalog {
     where
         I: IntoIterator<Item = &'a HostPortId>,
     {
+        let mut seen = BTreeSet::new();
         let mut missing: Vec<HostPortId> = Vec::new();
         for id in required {
-            if !self.contains(id) && !missing.iter().any(|existing| existing == id) {
+            if !self.contains(id) && seen.insert(id.clone()) {
                 missing.push(id.clone());
             }
         }
@@ -271,13 +230,13 @@ impl<'de> Deserialize<'de> for HostPortView {
 }
 
 impl HostPortView {
-    pub fn new(grants: Vec<HostPortGrant>) -> Result<Self, HostApiError> {
-        let mut seen = BTreeSet::new();
-        for grant in &grants {
-            if !seen.insert(grant.id.clone()) {
+    pub fn new(mut grants: Vec<HostPortGrant>) -> Result<Self, HostApiError> {
+        grants.sort_by(|a, b| a.id.cmp(&b.id));
+        for window in grants.windows(2) {
+            if window[0].id == window[1].id {
                 return Err(HostApiError::invariant(format!(
                     "duplicate host port grant {}",
-                    grant.id
+                    window[0].id
                 )));
             }
         }
@@ -293,7 +252,9 @@ impl HostPortView {
     }
 
     pub fn allows(&self, id: &HostPortId) -> bool {
-        self.grants.iter().any(|grant| &grant.id == id)
+        self.grants
+            .binary_search_by(|grant| grant.id.cmp(id))
+            .is_ok()
     }
 
     pub fn allows_all<'a, I>(&self, required: I) -> bool

@@ -827,6 +827,8 @@ fn host_port_view_rejects_duplicate_ports_and_answers_membership() {
     assert!(!view.allows(&network));
     assert!(view.allows_all([&storage, &audit]));
     assert!(!view.allows_all([&storage, &network]));
+    assert_eq!(view.grants()[0].id(), &audit);
+    assert_eq!(view.grants()[1].id(), &storage);
 
     assert!(
         HostPortView::new(vec![

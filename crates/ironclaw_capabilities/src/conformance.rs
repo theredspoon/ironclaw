@@ -4,7 +4,10 @@
 //! claims. It is zero-behavior prep: it does not execute capabilities, load
 //! manifests, or certify third-party providers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use ironclaw_host_api::{
     CapabilityId, CapabilityProfileContract, CapabilityProfileId, CapabilityProfileOperationId,
@@ -88,6 +91,13 @@ impl CapabilityProfileClaim {
     pub fn operations(&self) -> &[CapabilityProfileClaimedOperation] {
         &self.operations
     }
+
+    pub fn evaluate_against(
+        &self,
+        contract: &CapabilityProfileContract,
+    ) -> CapabilityProfileConformanceReport {
+        evaluate_profile_conformance(contract, self)
+    }
 }
 
 /// Finding kind from structural profile conformance checks.
@@ -126,6 +136,35 @@ impl CapabilityProfileConformanceFinding {
     pub fn subject(&self) -> &str {
         &self.subject
     }
+}
+
+impl fmt::Display for CapabilityProfileConformanceFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self.kind {
+            CapabilityProfileConformanceFindingKind::ProfileIdMismatch => "profile id mismatch",
+            CapabilityProfileConformanceFindingKind::MissingRequiredOperation => {
+                "missing required operation"
+            }
+            CapabilityProfileConformanceFindingKind::UnexpectedOperation => "unexpected operation",
+            CapabilityProfileConformanceFindingKind::InputSchemaRefMismatch => {
+                "input schema ref mismatch"
+            }
+            CapabilityProfileConformanceFindingKind::OutputSchemaRefMismatch => {
+                "output schema ref mismatch"
+            }
+        };
+        write!(f, "{message}: {}", self.subject)
+    }
+}
+
+impl std::error::Error for CapabilityProfileConformanceFinding {}
+
+/// Evaluate structural conformance for one claim against one contract.
+pub fn evaluate_profile_conformance(
+    contract: &CapabilityProfileContract,
+    claim: &CapabilityProfileClaim,
+) -> CapabilityProfileConformanceReport {
+    CapabilityProfileConformanceReport::evaluate(contract, claim)
 }
 
 /// Structural conformance report for one claim against one contract.

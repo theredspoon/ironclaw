@@ -36,6 +36,7 @@ pub mod capability;
 pub mod capability_profile;
 pub mod decision;
 pub mod dispatch;
+mod dotted_id;
 pub mod error;
 pub mod host_port;
 pub mod http;

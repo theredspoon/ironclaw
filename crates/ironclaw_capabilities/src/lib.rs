@@ -14,6 +14,7 @@ mod requests;
 pub use conformance::{
     CapabilityProfileClaim, CapabilityProfileClaimedOperation, CapabilityProfileConformanceFinding,
     CapabilityProfileConformanceFindingKind, CapabilityProfileConformanceReport,
+    evaluate_profile_conformance,
 };
 pub use error::{CapabilityInvocationError, ResumeContextMismatchKind};
 pub use host::CapabilityHost;
