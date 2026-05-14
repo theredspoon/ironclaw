@@ -10,8 +10,8 @@ use crate::db::{
 };
 use crate::{
     BackendCapabilities, CasExpectation, ContentType, DirEntry, Entry, FileStat, FileType,
-    FilesystemError, FilesystemOperation, IndexCapability, IndexKey, IndexValue, RecordKind,
-    RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
+    FilesystemError, FilesystemOperation, Filter, IndexCapability, IndexKey, IndexKind, IndexSpec,
+    IndexValue, Page, RecordKind, RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
 };
 
 #[cfg(feature = "postgres")]
@@ -64,10 +64,10 @@ impl RootFilesystem for PostgresRootFilesystem {
             stat: true,
             delete: true,
             records: true,
-            query: false,
+            query: true,
             index: IndexCapability {
-                exact: false,
-                prefix: false,
+                exact: true,
+                prefix: true,
                 fts: false,
                 vector: false,
             },
@@ -240,6 +240,149 @@ impl RootFilesystem for PostgresRootFilesystem {
             entry,
             version: RecordVersion::from_backend(version_raw.max(0) as u64),
         }))
+    }
+
+    async fn ensure_index(
+        &self,
+        path: &VirtualPath,
+        spec: &IndexSpec,
+    ) -> Result<(), FilesystemError> {
+        let kind_str = match &spec.kind {
+            IndexKind::Exact => "exact".to_string(),
+            IndexKind::Prefix => "prefix".to_string(),
+            IndexKind::Fts | IndexKind::Vector { .. } => {
+                return Err(FilesystemError::Unsupported {
+                    path: path.clone(),
+                    operation: FilesystemOperation::EnsureIndex,
+                });
+            }
+        };
+        if spec.keys.is_empty() {
+            return Err(FilesystemError::IndexConflict {
+                path: path.clone(),
+                name: spec.name.clone(),
+                reason: "spec must declare at least one key".to_string(),
+            });
+        }
+        let keys_json = serde_json::to_value(
+            spec.keys
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::EnsureIndex,
+            reason: format!("failed to serialize index keys: {error}"),
+        })?;
+
+        let client = self.client().await?;
+        let existing = client
+            .query_opt(
+                "SELECT keys, kind FROM root_filesystem_index_specs WHERE prefix = $1 AND name = $2",
+                &[&path.as_str(), &spec.name.as_str()],
+            )
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
+        if let Some(row) = existing {
+            let existing_keys: serde_json::Value = row.get("keys");
+            let existing_kind: String = row.get("kind");
+            if existing_keys != keys_json || existing_kind != kind_str {
+                return Err(FilesystemError::IndexConflict {
+                    path: path.clone(),
+                    name: spec.name.clone(),
+                    reason: "spec already declared with different keys or kind".to_string(),
+                });
+            }
+            return Ok(());
+        }
+
+        client
+            .execute(
+                "INSERT INTO root_filesystem_index_specs (prefix, name, keys, kind) VALUES ($1, $2, $3, $4)",
+                &[
+                    &path.as_str(),
+                    &spec.name.as_str(),
+                    &keys_json,
+                    &kind_str,
+                ],
+            )
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
+
+        let index_name = sql_index_name(path.as_str(), spec.name.as_str());
+        let expressions: Vec<String> = spec
+            .keys
+            .iter()
+            .map(|k| format!("((indexed->>'{}'))", k.as_str()))
+            .collect();
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {index_name} ON root_filesystem_entries ({})",
+            expressions.join(", ")
+        );
+        client
+            .batch_execute(&ddl)
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
+        Ok(())
+    }
+
+    async fn query(
+        &self,
+        path: &VirtualPath,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        let path_str = path.as_str().to_string();
+        let prefix_pattern = escape_like_pattern(&format!("{}/%", path.as_str()));
+        params.push(Box::new(path_str));
+        params.push(Box::new(prefix_pattern));
+
+        let mut conditions = String::new();
+        translate_filter(path, filter, &mut conditions, &mut params)?;
+
+        let mut sql = String::from(
+            "SELECT path, contents, content_type, kind, indexed, version \
+             FROM root_filesystem_entries \
+             WHERE is_dir = FALSE AND (path = $1 OR path LIKE $2 ESCAPE '!')",
+        );
+        if !conditions.is_empty() {
+            sql.push_str(" AND ");
+            sql.push_str(&conditions);
+        }
+        sql.push_str(&format!(
+            " ORDER BY path LIMIT ${} OFFSET ${}",
+            params.len() + 1,
+            params.len() + 2
+        ));
+        params.push(Box::new(i64::from(page.limit.min(Page::MAX_LIMIT))));
+        params.push(Box::new(page.offset as i64));
+
+        let client = self.client().await?;
+        let params_ref: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref() as _).collect();
+        let rows = client
+            .query(sql.as_str(), &params_ref[..])
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::Query, error))?;
+        rows.into_iter()
+            .map(|row| {
+                let row_path: String = row.get("path");
+                let row_path = VirtualPath::new(row_path)?;
+                let body: Vec<u8> = row.get("contents");
+                let content_type_raw: String = row.get("content_type");
+                let kind_raw: Option<String> = row.get("kind");
+                let indexed_value: serde_json::Value = row.get("indexed");
+                let version_raw: i64 = row.get("version");
+                let entry =
+                    build_entry(&row_path, body, content_type_raw, kind_raw, indexed_value)?;
+                Ok(VersionedEntry {
+                    entry,
+                    version: RecordVersion::from_backend(version_raw.max(0) as u64),
+                })
+            })
+            .collect()
     }
 
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
@@ -546,6 +689,146 @@ impl PostgresRootFilesystem {
 }
 
 #[cfg(feature = "postgres")]
+fn sql_index_name(prefix: &str, name: &str) -> String {
+    let prefix_clean: String = prefix
+        .trim_matches('/')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let raw = format!("idx_rfs_{prefix_clean}_{name}");
+    if raw.len() > 62 {
+        let cutoff = raw
+            .char_indices()
+            .nth(62)
+            .map(|(i, _)| i)
+            .unwrap_or(raw.len());
+        raw[..cutoff].to_string()
+    } else {
+        raw
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn escape_like_pattern(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' if chars.peek().is_some() => out.push_str("!%"),
+            '_' => out.push_str("!_"),
+            '!' => out.push_str("!!"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Translate a [`Filter`] tree into a postgres WHERE-clause fragment.
+/// Bound parameters use `$N` placeholders sized from `params.len() + 1`.
+/// Returns once `out` has been appended.
+#[cfg(feature = "postgres")]
+fn translate_filter(
+    path: &VirtualPath,
+    filter: &Filter,
+    out: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) -> Result<(), FilesystemError> {
+    match filter {
+        Filter::All => Ok(()),
+        Filter::Eq { key, value } => {
+            let placeholder = bind_index_value(path, value, params)?;
+            out.push_str(&format!("(indexed->>'{}' = ${placeholder})", key.as_str()));
+            Ok(())
+        }
+        Filter::PrefixOn { key, value } => {
+            let IndexValue::Text(prefix_value) = value else {
+                return Err(FilesystemError::Unsupported {
+                    path: path.clone(),
+                    operation: FilesystemOperation::Query,
+                });
+            };
+            let escaped = escape_like_pattern(prefix_value);
+            params.push(Box::new(format!("{escaped}%")));
+            out.push_str(&format!(
+                "(indexed->>'{}' LIKE ${} ESCAPE '!')",
+                key.as_str(),
+                params.len()
+            ));
+            Ok(())
+        }
+        Filter::Range { key, lo, hi } => {
+            let lo_idx = bind_index_value(path, lo, params)?;
+            let hi_idx = bind_index_value(path, hi, params)?;
+            out.push_str(&format!(
+                "(indexed->>'{}' BETWEEN ${lo_idx} AND ${hi_idx})",
+                key.as_str()
+            ));
+            Ok(())
+        }
+        Filter::And(children) => translate_compound(path, children, " AND ", out, params),
+        Filter::Or(children) => translate_compound(path, children, " OR ", out, params),
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn translate_compound(
+    path: &VirtualPath,
+    children: &[Filter],
+    joiner: &str,
+    out: &mut String,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) -> Result<(), FilesystemError> {
+    if children.is_empty() {
+        return Ok(());
+    }
+    out.push('(');
+    let mut first = true;
+    for child in children {
+        let mut sub = String::new();
+        translate_filter(path, child, &mut sub, params)?;
+        if sub.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push_str(joiner);
+        }
+        out.push_str(&sub);
+        first = false;
+    }
+    out.push(')');
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+fn bind_index_value(
+    path: &VirtualPath,
+    value: &IndexValue,
+    params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
+) -> Result<usize, FilesystemError> {
+    // `indexed->>'key'` returns text regardless of the underlying JSON type,
+    // so we bind every supported variant as text. This keeps the index
+    // (which is also an expression on the text form) usable for all three
+    // variants without dialect branches.
+    let bound: Box<dyn tokio_postgres::types::ToSql + Sync + Send> = match value {
+        IndexValue::Text(s) => Box::new(s.clone()),
+        IndexValue::I64(n) => Box::new(n.to_string()),
+        IndexValue::Bool(b) => Box::new(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        IndexValue::Bytes(_) => {
+            return Err(FilesystemError::Unsupported {
+                path: path.clone(),
+                operation: FilesystemOperation::Query,
+            });
+        }
+    };
+    params.push(bound);
+    Ok(params.len())
+}
+
+#[cfg(feature = "postgres")]
 fn build_entry(
     path: &VirtualPath,
     body: Vec<u8>,
@@ -582,4 +865,6 @@ const POSTGRES_ROOT_FILESYSTEM_SCHEMA: &str = concat!(
     include_str!("../../../migrations/V27__root_filesystem_entries_directories.sql"),
     "\n",
     include_str!("../../../migrations/V28__root_filesystem_records.sql"),
+    "\n",
+    include_str!("../../../migrations/V29__root_filesystem_index_specs.sql"),
 );

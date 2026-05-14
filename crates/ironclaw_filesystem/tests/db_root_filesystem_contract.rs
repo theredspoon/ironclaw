@@ -6,8 +6,8 @@ use ironclaw_filesystem::RootFilesystem;
 use ironclaw_filesystem::PostgresRootFilesystem;
 #[cfg(feature = "libsql")]
 use ironclaw_filesystem::{
-    CasExpectation, Entry, FileType, FilesystemError, FilesystemOperation, IndexKey, IndexValue,
-    LibSqlRootFilesystem, RecordKind,
+    CasExpectation, Entry, FileType, FilesystemError, FilesystemOperation, Filter, IndexKey,
+    IndexKind, IndexName, IndexSpec, IndexValue, LibSqlRootFilesystem, Page, RecordKind,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_host_api::VirtualPath;
@@ -372,6 +372,206 @@ async fn libsql_write_file_after_put_resets_record_metadata_and_bumps_version() 
     assert!(got.entry.indexed.is_empty());
     assert_eq!(got.entry.body, b"opaque");
     assert!(got.version > v1);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_ensure_index_is_idempotent_and_conflict_aware() {
+    let filesystem = libsql_root().await;
+    let prefix = VirtualPath::new("/secrets/leases").unwrap();
+    let name = IndexName::new("by_scope_status").unwrap();
+    let keys = vec![
+        IndexKey::new("scope").unwrap(),
+        IndexKey::new("status").unwrap(),
+    ];
+    let spec_exact = IndexSpec::new(name.clone(), keys.clone(), IndexKind::Exact);
+    let spec_prefix = IndexSpec::new(name, keys, IndexKind::Prefix);
+
+    filesystem.ensure_index(&prefix, &spec_exact).await.unwrap();
+    // Re-declaring same spec is idempotent.
+    filesystem.ensure_index(&prefix, &spec_exact).await.unwrap();
+    // Declaring a different kind under the same name is a conflict.
+    let err = filesystem
+        .ensure_index(&prefix, &spec_prefix)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FilesystemError::IndexConflict { .. }));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_ensure_index_rejects_fts_and_vector_kinds() {
+    let filesystem = libsql_root().await;
+    let prefix = VirtualPath::new("/memory").unwrap();
+    let spec = IndexSpec::new(
+        IndexName::new("by_chunk").unwrap(),
+        vec![IndexKey::new("chunk_id").unwrap()],
+        IndexKind::Fts,
+    );
+    let err = filesystem.ensure_index(&prefix, &spec).await.unwrap_err();
+    assert!(matches!(err, FilesystemError::Unsupported { .. }));
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_query_filters_on_indexed_projection() {
+    let filesystem = libsql_root().await;
+    let kind = RecordKind::new("lease").unwrap();
+    let scope_key = IndexKey::new("scope").unwrap();
+    let status_key = IndexKey::new("status").unwrap();
+    let prefix = VirtualPath::new("/secrets/leases").unwrap();
+    let spec = IndexSpec::new(
+        IndexName::new("by_scope_status").unwrap(),
+        vec![scope_key.clone(), status_key.clone()],
+        IndexKind::Exact,
+    );
+    filesystem.ensure_index(&prefix, &spec).await.unwrap();
+
+    for (path, scope, status) in [
+        ("/secrets/leases/A", "acme", "active"),
+        ("/secrets/leases/B", "acme", "revoked"),
+        ("/secrets/leases/C", "globex", "active"),
+        ("/secrets/leases/D", "acme", "active"),
+    ] {
+        let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()))
+            .with_indexed(status_key.clone(), IndexValue::Text(status.into()));
+        filesystem
+            .put(
+                &VirtualPath::new(path).unwrap(),
+                entry,
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+
+    let results = filesystem
+        .query(
+            &prefix,
+            &Filter::And(vec![
+                Filter::Eq {
+                    key: scope_key,
+                    value: IndexValue::Text("acme".into()),
+                },
+                Filter::Eq {
+                    key: status_key,
+                    value: IndexValue::Text("active".into()),
+                },
+            ]),
+            Page::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    let mut paths: Vec<String> = results
+        .iter()
+        .map(|v| String::from_utf8_lossy(&v.entry.body).into_owned())
+        .collect();
+    paths.sort();
+    // Both matching rows have empty bodies; verify by re-reading the
+    // indexed projection on each result.
+    let acme_active_count = results
+        .iter()
+        .filter(|v| {
+            v.entry.indexed.get(&IndexKey::new("scope").unwrap())
+                == Some(&IndexValue::Text("acme".into()))
+                && v.entry.indexed.get(&IndexKey::new("status").unwrap())
+                    == Some(&IndexValue::Text("active".into()))
+        })
+        .count();
+    assert_eq!(acme_active_count, 2);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_query_prefix_filter_matches_text_prefix() {
+    let filesystem = libsql_root().await;
+    let kind = RecordKind::new("lease").unwrap();
+    let scope_key = IndexKey::new("scope").unwrap();
+    let prefix = VirtualPath::new("/secrets/leases").unwrap();
+
+    for (path, scope) in [
+        ("/secrets/leases/X", "tenant:acme/u/1"),
+        ("/secrets/leases/Y", "tenant:acme/u/2"),
+        ("/secrets/leases/Z", "tenant:globex/u/1"),
+    ] {
+        let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()));
+        filesystem
+            .put(
+                &VirtualPath::new(path).unwrap(),
+                entry,
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+
+    let results = filesystem
+        .query(
+            &prefix,
+            &Filter::PrefixOn {
+                key: scope_key,
+                value: IndexValue::Text("tenant:acme/".into()),
+            },
+            Page::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_query_paginates_results() {
+    let filesystem = libsql_root().await;
+    let kind = RecordKind::new("lease").unwrap();
+    let scope_key = IndexKey::new("scope").unwrap();
+    let prefix = VirtualPath::new("/secrets/leases").unwrap();
+
+    for i in 0..7 {
+        let entry = Entry::record(kind.clone(), &serde_json::json!({"i": i}))
+            .unwrap()
+            .with_indexed(scope_key.clone(), IndexValue::Text("acme".into()));
+        let path = VirtualPath::new(format!("/secrets/leases/page-{i:02}")).unwrap();
+        filesystem
+            .put(&path, entry, CasExpectation::Absent)
+            .await
+            .unwrap();
+    }
+
+    let first = filesystem
+        .query(
+            &prefix,
+            &Filter::Eq {
+                key: scope_key.clone(),
+                value: IndexValue::Text("acme".into()),
+            },
+            Page::new(0, 3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 3);
+
+    let second = filesystem
+        .query(
+            &prefix,
+            &Filter::Eq {
+                key: scope_key,
+                value: IndexValue::Text("acme".into()),
+            },
+            Page::new(3, 3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 3);
+    // Pages must not overlap (ordered by path).
+    for entry in &second {
+        assert!(!first.iter().any(|f| f.entry.body == entry.entry.body));
+    }
 }
 
 #[cfg(feature = "libsql")]

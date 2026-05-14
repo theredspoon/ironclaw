@@ -144,12 +144,18 @@ impl From<IndexKey> for String {
 /// Variants are intentionally narrow — backends translate to their native
 /// column type. New variants require coordinated backend updates and a wire
 /// migration; do not extend casually.
+///
+/// Serialization is untagged so SQL backends storing the indexed map as
+/// JSON can run native predicates against it (`indexed->>'scope' = 'acme'`
+/// in Postgres, `json_extract(indexed, '$.scope') = 'acme'` in libSQL).
+/// Bool is listed first so JSON booleans don't accidentally match `I64`,
+/// and `Bytes` is last because a JSON array could otherwise be mis-typed.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+#[serde(untagged)]
 pub enum IndexValue {
-    Text(String),
-    I64(i64),
     Bool(bool),
+    I64(i64),
+    Text(String),
     Bytes(Vec<u8>),
 }
 

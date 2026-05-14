@@ -11,8 +11,8 @@ use crate::db::{
 };
 use crate::{
     BackendCapabilities, CasExpectation, ContentType, DirEntry, Entry, FileStat, FileType,
-    FilesystemError, FilesystemOperation, IndexCapability, IndexKey, IndexValue, RecordKind,
-    RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
+    FilesystemError, FilesystemOperation, Filter, IndexCapability, IndexKey, IndexKind, IndexSpec,
+    IndexValue, Page, RecordKind, RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
 };
 
 #[cfg(feature = "libsql")]
@@ -40,6 +40,7 @@ impl LibSqlRootFilesystem {
             })?;
         ensure_libsql_root_is_dir_column(&conn).await?;
         ensure_libsql_records_columns(&conn).await?;
+        ensure_libsql_index_specs_table(&conn).await?;
         Ok(())
     }
 
@@ -72,14 +73,14 @@ impl RootFilesystem for LibSqlRootFilesystem {
             list: true,
             stat: true,
             delete: true,
-            // Native put/get/delete with version-aware CAS lands in this PR.
             records: true,
-            // Query/ensure_index/append/tail still default to Unsupported.
-            // Land in a follow-up port once consumer migrations need them.
-            query: false,
+            // Native query over indexed projection with Filter::Eq/PrefixOn/
+            // Range/And/Or; ensure_index materializes expression indexes on
+            // json_extract(indexed, '$.key').
+            query: true,
             index: IndexCapability {
-                exact: false,
-                prefix: false,
+                exact: true,
+                prefix: true,
                 fts: false,
                 vector: false,
             },
@@ -277,6 +278,172 @@ impl RootFilesystem for LibSqlRootFilesystem {
             entry,
             version: RecordVersion::from_backend(version_raw.max(0) as u64),
         }))
+    }
+
+    async fn ensure_index(
+        &self,
+        path: &VirtualPath,
+        spec: &IndexSpec,
+    ) -> Result<(), FilesystemError> {
+        // Only Exact and Prefix index kinds are supported on the SQL backends
+        // in this port. FTS / Vector live behind their own follow-up port.
+        let kind_str = match &spec.kind {
+            IndexKind::Exact => "exact".to_string(),
+            IndexKind::Prefix => "prefix".to_string(),
+            IndexKind::Fts | IndexKind::Vector { .. } => {
+                return Err(FilesystemError::Unsupported {
+                    path: path.clone(),
+                    operation: FilesystemOperation::EnsureIndex,
+                });
+            }
+        };
+        if spec.keys.is_empty() {
+            return Err(FilesystemError::IndexConflict {
+                path: path.clone(),
+                name: spec.name.clone(),
+                reason: "spec must declare at least one key".to_string(),
+            });
+        }
+        let keys_json = serde_json::to_string(
+            &spec
+                .keys
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::EnsureIndex,
+            reason: format!("failed to serialize index keys: {error}"),
+        })?;
+
+        let conn = self.connect().await?;
+        // Conflict check: idempotent if same spec already declared, else
+        // IndexConflict.
+        let mut rows = conn
+            .query(
+                "SELECT keys, kind FROM root_filesystem_index_specs WHERE prefix = ?1 AND name = ?2",
+                libsql::params![path.as_str(), spec.name.as_str()],
+            )
+            .await
+            .map_err(|error| {
+                libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+            })?;
+        if let Some(row) = rows.next().await.map_err(|error| {
+            libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+        })? {
+            let existing_keys: String = row.get(0).map_err(|error| {
+                libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+            })?;
+            let existing_kind: String = row.get(1).map_err(|error| {
+                libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+            })?;
+            if existing_keys != keys_json || existing_kind != kind_str {
+                return Err(FilesystemError::IndexConflict {
+                    path: path.clone(),
+                    name: spec.name.clone(),
+                    reason: "spec already declared with different keys or kind".to_string(),
+                });
+            }
+            return Ok(());
+        }
+        drop(rows);
+
+        // Record the spec then materialize a SQL expression index on the
+        // declared keys. The index is global on the table; queries route
+        // by path-prefix in the WHERE clause and the planner can still use
+        // this index for filter predicates.
+        conn.execute(
+            "INSERT INTO root_filesystem_index_specs (prefix, name, keys, kind) VALUES (?1, ?2, ?3, ?4)",
+            libsql::params![
+                path.as_str(),
+                spec.name.as_str(),
+                keys_json.clone(),
+                kind_str,
+            ],
+        )
+        .await
+        .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
+
+        let index_name = sql_index_name(path.as_str(), spec.name.as_str());
+        let expressions: Vec<String> = spec
+            .keys
+            .iter()
+            .map(|k| format!("json_extract(indexed, '$.{}')", k.as_str()))
+            .collect();
+        let ddl = format!(
+            "CREATE INDEX IF NOT EXISTS {index_name} ON root_filesystem_entries ({})",
+            expressions.join(", ")
+        );
+        conn.execute(&ddl, ()).await.map_err(|error| {
+            libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+        })?;
+        Ok(())
+    }
+
+    async fn query(
+        &self,
+        path: &VirtualPath,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        let mut params: Vec<libsql::Value> = vec![libsql::Value::Text(path.as_str().to_string())];
+        let prefix_pattern = format!("{}/%", path.as_str());
+        params.push(libsql::Value::Text(escape_like_pattern(&prefix_pattern)));
+
+        let mut conditions = String::new();
+        translate_filter(path, filter, &mut conditions, &mut params)?;
+
+        let mut sql = String::from(
+            "SELECT path, contents, content_type, kind, indexed, version \
+             FROM root_filesystem_entries \
+             WHERE is_dir = 0 AND (path = ?1 OR path LIKE ?2 ESCAPE '!')",
+        );
+        if !conditions.is_empty() {
+            sql.push_str(" AND ");
+            sql.push_str(&conditions);
+        }
+        sql.push_str(" ORDER BY path LIMIT ? OFFSET ?");
+        params.push(libsql::Value::Integer(
+            page.limit.min(crate::Page::MAX_LIMIT) as i64,
+        ));
+        params.push(libsql::Value::Integer(page.offset as i64));
+
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(&sql, params)
+            .await
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::Query, error))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::Query, error))?
+        {
+            let row_path: String = row.get(0).map_err(|error| {
+                libsql_db_error(path.clone(), FilesystemOperation::Query, error)
+            })?;
+            let row_path = VirtualPath::new(row_path)?;
+            let body: Vec<u8> = row.get(1).map_err(|error| {
+                libsql_db_error(row_path.clone(), FilesystemOperation::Query, error)
+            })?;
+            let content_type_raw: String = row.get(2).map_err(|error| {
+                libsql_db_error(row_path.clone(), FilesystemOperation::Query, error)
+            })?;
+            let kind_raw: Option<String> = row.get(3).ok();
+            let indexed_raw: String = row.get(4).map_err(|error| {
+                libsql_db_error(row_path.clone(), FilesystemOperation::Query, error)
+            })?;
+            let version_raw: i64 = row.get(5).map_err(|error| {
+                libsql_db_error(row_path.clone(), FilesystemOperation::Query, error)
+            })?;
+            let entry = build_entry(&row_path, body, content_type_raw, kind_raw, indexed_raw)?;
+            out.push(VersionedEntry {
+                entry,
+                version: RecordVersion::from_backend(version_raw.max(0) as u64),
+            });
+        }
+        Ok(out)
     }
 
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
@@ -733,6 +900,165 @@ async fn ensure_libsql_records_columns(conn: &libsql::Connection) -> Result<(), 
 }
 
 #[cfg(feature = "libsql")]
+async fn ensure_libsql_index_specs_table(conn: &libsql::Connection) -> Result<(), FilesystemError> {
+    conn.execute_batch(LIBSQL_INDEX_SPECS_SCHEMA)
+        .await
+        .map_err(|error| {
+            libsql_db_error(valid_engine_path(), FilesystemOperation::EnsureIndex, error)
+        })?;
+    Ok(())
+}
+
+/// Build a deterministic SQL index identifier from a mount prefix + spec name.
+///
+/// IndexKey/IndexName are validated to be simple identifiers (no path
+/// separators, whitespace, or control chars), so the prefix's slashes are
+/// the only non-identifier characters we need to replace. Length is bounded
+/// — Postgres caps at 63, SQLite is more permissive — so we truncate after
+/// sanitisation. Collisions across mounts are tolerable: distinct
+/// `(prefix, name)` pairs share an index when their sanitized forms match,
+/// and the index is still correct (the planner just sees a wider index).
+#[cfg(feature = "libsql")]
+fn sql_index_name(prefix: &str, name: &str) -> String {
+    let prefix_clean: String = prefix
+        .trim_matches('/')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let raw = format!("idx_rfs_{prefix_clean}_{name}");
+    // Identifier length budget chosen to satisfy Postgres' 63-char cap so
+    // libsql and postgres can share the same naming logic in future refactors.
+    if raw.len() > 62 {
+        let cutoff = raw
+            .char_indices()
+            .nth(62)
+            .map(|(i, _)| i)
+            .unwrap_or(raw.len());
+        raw[..cutoff].to_string()
+    } else {
+        raw
+    }
+}
+
+#[cfg(feature = "libsql")]
+fn escape_like_pattern(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' if chars.peek().is_some() => out.push_str("!%"),
+            '_' => out.push_str("!_"),
+            '!' => out.push_str("!!"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Translate a [`Filter`] tree into a libsql WHERE-clause fragment, appending
+/// bound parameters to `params` in left-to-right order. The fragment is
+/// wrapped in parentheses unless empty.
+#[cfg(feature = "libsql")]
+fn translate_filter(
+    path: &VirtualPath,
+    filter: &Filter,
+    out: &mut String,
+    params: &mut Vec<libsql::Value>,
+) -> Result<(), FilesystemError> {
+    match filter {
+        Filter::All => Ok(()),
+        Filter::Eq { key, value } => {
+            let placeholder = bind_index_value(path, value, params)?;
+            out.push_str(&format!(
+                "(json_extract(indexed, '$.{}') = ?{})",
+                key.as_str(),
+                placeholder
+            ));
+            Ok(())
+        }
+        Filter::PrefixOn { key, value } => {
+            let IndexValue::Text(prefix_value) = value else {
+                return Err(FilesystemError::Unsupported {
+                    path: path.clone(),
+                    operation: FilesystemOperation::Query,
+                });
+            };
+            let escaped = escape_like_pattern(prefix_value);
+            params.push(libsql::Value::Text(format!("{escaped}%")));
+            out.push_str(&format!(
+                "(json_extract(indexed, '$.{}') LIKE ?{} ESCAPE '!')",
+                key.as_str(),
+                params.len()
+            ));
+            Ok(())
+        }
+        Filter::Range { key, lo, hi } => {
+            let lo_idx = bind_index_value(path, lo, params)?;
+            let hi_idx = bind_index_value(path, hi, params)?;
+            out.push_str(&format!(
+                "(json_extract(indexed, '$.{}') BETWEEN ?{} AND ?{})",
+                key.as_str(),
+                lo_idx,
+                hi_idx
+            ));
+            Ok(())
+        }
+        Filter::And(children) => translate_compound(path, children, " AND ", out, params),
+        Filter::Or(children) => translate_compound(path, children, " OR ", out, params),
+    }
+}
+
+#[cfg(feature = "libsql")]
+fn translate_compound(
+    path: &VirtualPath,
+    children: &[Filter],
+    joiner: &str,
+    out: &mut String,
+    params: &mut Vec<libsql::Value>,
+) -> Result<(), FilesystemError> {
+    if children.is_empty() {
+        return Ok(());
+    }
+    out.push('(');
+    let mut first = true;
+    for child in children {
+        let mut sub = String::new();
+        translate_filter(path, child, &mut sub, params)?;
+        if sub.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push_str(joiner);
+        }
+        out.push_str(&sub);
+        first = false;
+    }
+    out.push(')');
+    Ok(())
+}
+
+#[cfg(feature = "libsql")]
+fn bind_index_value(
+    path: &VirtualPath,
+    value: &IndexValue,
+    params: &mut Vec<libsql::Value>,
+) -> Result<usize, FilesystemError> {
+    let bound = match value {
+        IndexValue::Text(s) => libsql::Value::Text(s.clone()),
+        IndexValue::I64(n) => libsql::Value::Integer(*n),
+        IndexValue::Bool(b) => libsql::Value::Integer(i64::from(*b)),
+        IndexValue::Bytes(_) => {
+            return Err(FilesystemError::Unsupported {
+                path: path.clone(),
+                operation: FilesystemOperation::Query,
+            });
+        }
+    };
+    params.push(bound);
+    Ok(params.len())
+}
+
+#[cfg(feature = "libsql")]
 async fn add_column_if_missing(
     conn: &libsql::Connection,
     column: &str,
@@ -786,4 +1112,15 @@ CREATE TABLE IF NOT EXISTS root_filesystem_entries (
 );
 -- The PRIMARY KEY on `path` already provides a unique index for equality
 -- lookups, so no separate index is created.
+"#;
+
+#[cfg(feature = "libsql")]
+const LIBSQL_INDEX_SPECS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS root_filesystem_index_specs (
+    prefix TEXT NOT NULL,
+    name TEXT NOT NULL,
+    keys TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    PRIMARY KEY (prefix, name)
+);
 "#;
