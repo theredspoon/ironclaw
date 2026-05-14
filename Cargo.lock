@@ -4542,6 +4542,7 @@ dependencies = [
  "ironclaw_threads",
  "ironclaw_turns",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
