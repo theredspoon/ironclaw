@@ -8,7 +8,7 @@ use ironclaw_reborn::{
         RebornConfiguredRunProfile, RebornLoopComponentGraphReadiness,
         RebornLoopProductionComponent, RebornLoopProductionInputs, RebornLoopProductionIssueKind,
         RebornLoopProductionStatus, RebornLoopReadinessMode, text_only_driver_requirements,
-        validate_reborn_loop_production_readiness,
+        tool_capable_driver_requirements, validate_reborn_loop_production_readiness,
     },
 };
 use ironclaw_turns::{
@@ -165,7 +165,7 @@ fn production_readiness_rejects_tool_profile_without_surface_service() {
                 "tool_checkpoint",
                 1,
             ))),
-            text_only_driver_requirements(),
+            tool_capable_driver_requirements(),
             DriverKind::Production,
         )
         .expect("production tool driver registration succeeds");
@@ -361,7 +361,7 @@ fn optional_profile_unavailable_does_not_block_startup() {
         mode: RebornLoopReadinessMode::Production,
         driver_registry: &registry,
         component_graph: RebornLoopComponentGraphReadiness::production_verified(),
-        configured_profiles: vec![selected_profile(key), optional],
+        configured_profiles: vec![selected_profile(key), optional.clone()],
         active_runs: Vec::new(),
     });
 
@@ -371,6 +371,87 @@ fn optional_profile_unavailable_does_not_block_startup() {
         RebornLoopProductionComponent::LoopDriver,
         RebornLoopProductionIssueKind::Missing
     ));
+    assert!(report.has_warnings());
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.component == RebornLoopProductionComponent::LoopDriver
+                && issue.kind == RebornLoopProductionIssueKind::Missing
+        })
+        .expect("optional missing driver issue is reported");
+    assert_eq!(issue.profile_id.as_ref(), Some(&optional.profile_id));
+    assert_eq!(issue.profile_version, Some(optional.profile_version));
+    assert_eq!(
+        issue.driver_identity.as_ref(),
+        Some(&optional.driver_identity)
+    );
+}
+
+#[test]
+fn selected_driver_readiness_issues_include_profile_context() {
+    let registry = DriverRegistry::new();
+    let profile = selected_profile(missing_key("text_loop", 1, "text_checkpoint", 1));
+
+    let report = validate_reborn_loop_production_readiness(RebornLoopProductionInputs {
+        mode: RebornLoopReadinessMode::Production,
+        driver_registry: &registry,
+        component_graph: RebornLoopComponentGraphReadiness::production_verified(),
+        configured_profiles: vec![profile.clone()],
+        active_runs: Vec::new(),
+    });
+
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.component == RebornLoopProductionComponent::LoopDriver
+                && issue.kind == RebornLoopProductionIssueKind::Missing
+        })
+        .expect("selected missing driver issue is reported");
+    assert_eq!(issue.profile_id.as_ref(), Some(&profile.profile_id));
+    assert_eq!(issue.profile_version, Some(profile.profile_version));
+    assert_eq!(
+        issue.driver_identity.as_ref(),
+        Some(&profile.driver_identity)
+    );
+}
+
+#[test]
+fn missing_active_run_driver_has_distinct_issue_kind_and_context() {
+    let mut registry = DriverRegistry::new();
+    let key = register_driver(&mut registry, "text_loop", DriverKind::Production);
+    let active_run = RebornActiveRunIdentity::new(
+        "run-active-1",
+        TurnStatus::Running,
+        RunProfileId::new("interactive_default").expect("valid profile id"),
+        RunProfileVersion::new(1),
+        missing_key("missing_loop", 1, "text_checkpoint", 1),
+    );
+
+    let report = validate_reborn_loop_production_readiness(RebornLoopProductionInputs {
+        mode: RebornLoopReadinessMode::Production,
+        driver_registry: &registry,
+        component_graph: RebornLoopComponentGraphReadiness::production_verified(),
+        configured_profiles: vec![selected_profile(key)],
+        active_runs: vec![active_run.clone()],
+    });
+
+    let issue = report
+        .issues
+        .iter()
+        .find(|issue| {
+            issue.component == RebornLoopProductionComponent::LoopDriver
+                && issue.kind == RebornLoopProductionIssueKind::ActiveRunDriverUnregistered
+        })
+        .expect("active-run missing driver issue is reported");
+    assert_eq!(issue.subject, "active_run");
+    assert_eq!(issue.profile_id.as_ref(), Some(&active_run.profile_id));
+    assert_eq!(issue.profile_version, Some(active_run.profile_version));
+    assert_eq!(
+        issue.driver_identity.as_ref(),
+        Some(&active_run.driver_identity)
+    );
 }
 
 #[test]

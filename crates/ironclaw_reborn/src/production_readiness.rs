@@ -5,6 +5,12 @@
 //! upper Reborn loop graph: selected profile identities, registered loop
 //! drivers, host-loop ports, production safety class, and active-run drain
 //! protection.
+//!
+//! Startup composition is expected to construct `RebornLoopProductionInputs`,
+//! call `validate_reborn_loop_production_readiness`, gate production startup on
+//! `report.is_ready()`, and still surface `report.issues` / `has_warnings()` for
+//! operator diagnostics. The runtime gate is tracked separately from this pure
+//! reporting slice so readiness semantics can stabilize before startup wiring.
 
 use ironclaw_turns::{
     RunProfileId, RunProfileVersion, TurnStatus, run_profile::CheckpointSchemaId,
@@ -82,7 +88,7 @@ pub enum RebornComponentRequirement {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RebornLoopProductionComponent {
     RunProfile,
     LoopDriver,
@@ -100,7 +106,7 @@ pub enum RebornLoopProductionComponent {
     ProgressEvents,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RebornLoopProductionIssueKind {
     Missing,
     TestOnlyImplementation,
@@ -110,6 +116,7 @@ pub enum RebornLoopProductionIssueKind {
     UnsupportedRequirement,
     VersionMismatch,
     ActiveRunsRequireVersion,
+    ActiveRunDriverUnregistered,
     PolicyDenied,
 }
 
@@ -193,6 +200,10 @@ impl RebornLoopProductionReport {
 
     pub fn blocking_issues(&self) -> impl Iterator<Item = &RebornLoopProductionIssue> {
         self.issues.iter().filter(|issue| issue.blocks_ready)
+    }
+
+    pub fn has_warnings(&self) -> bool {
+        self.issues.iter().any(|issue| !issue.blocks_ready)
     }
 
     pub fn contains(
@@ -586,7 +597,13 @@ fn push_driver_readiness_issues(
         selected_profiles,
         persisted_runs,
     );
-    push_mapped_driver_issues(report, true, issues);
+    push_mapped_driver_issues(
+        report,
+        true,
+        &inputs.configured_profiles,
+        &inputs.active_runs,
+        issues,
+    );
 }
 
 fn push_optional_profile_issues(
@@ -605,12 +622,16 @@ fn push_optional_profile_issues(
         optional_profiles,
         std::iter::empty::<PersistedRunDriverIdentity>(),
     );
-    push_mapped_driver_issues(report, false, issues);
+    // Optional-profile validation never supplies persisted active runs, so
+    // MissingNonTerminalRunDriver is unreachable on this path.
+    push_mapped_driver_issues(report, false, &inputs.configured_profiles, &[], issues);
 }
 
 fn push_mapped_driver_issues(
     report: crate::driver_registry::DriverReadinessReport,
     keep_blocking: bool,
+    configured_profiles: &[RebornConfiguredRunProfile],
+    active_runs: &[RebornActiveRunIdentity],
     issues: &mut Vec<RebornLoopProductionIssue>,
 ) {
     for diagnostic in report.diagnostics {
@@ -621,7 +642,7 @@ fn push_mapped_driver_issues(
             ),
             DriverReadinessDiagnosticCode::MissingNonTerminalRunDriver => (
                 RebornLoopProductionComponent::LoopDriver,
-                RebornLoopProductionIssueKind::ActiveRunsRequireVersion,
+                RebornLoopProductionIssueKind::ActiveRunDriverUnregistered,
             ),
             DriverReadinessDiagnosticCode::ReferenceDriverNotProductionReady
             | DriverReadinessDiagnosticCode::ReferenceDriverAllowedForLocalDev => (
@@ -634,7 +655,7 @@ fn push_mapped_driver_issues(
             ),
         };
         let blocks_ready = keep_blocking && diagnostic.blocks_ready;
-        issues.push(RebornLoopProductionIssue {
+        let mut issue = RebornLoopProductionIssue {
             component,
             kind,
             subject: diagnostic.subject,
@@ -642,8 +663,35 @@ fn push_mapped_driver_issues(
             profile_version: None,
             driver_identity: diagnostic.driver_identity,
             blocks_ready,
-        });
+        };
+        if let Some(profile) = matching_configured_profile(&issue, configured_profiles) {
+            issue = issue.with_profile(profile);
+        } else if let Some(run) = matching_active_run(&issue, active_runs) {
+            issue = issue.with_active_run(run);
+        }
+        issues.push(issue);
     }
+}
+
+fn matching_configured_profile<'a>(
+    issue: &RebornLoopProductionIssue,
+    profiles: &'a [RebornConfiguredRunProfile],
+) -> Option<&'a RebornConfiguredRunProfile> {
+    profiles.iter().find(|profile| {
+        issue.subject == profile.profile_id.as_str()
+            && issue.driver_identity.as_ref() == Some(&profile.driver_identity)
+    })
+}
+
+fn matching_active_run<'a>(
+    issue: &RebornLoopProductionIssue,
+    active_runs: &'a [RebornActiveRunIdentity],
+) -> Option<&'a RebornActiveRunIdentity> {
+    issue.driver_identity.as_ref().and_then(|driver_identity| {
+        active_runs
+            .iter()
+            .find(|run| !run.status.is_terminal() && run.driver_identity == *driver_identity)
+    })
 }
 
 fn configured_driver_profile(profile: &RebornConfiguredRunProfile) -> ConfiguredRunProfile {
@@ -673,9 +721,9 @@ fn component_subject(component: RebornLoopProductionComponent) -> &'static str {
     }
 }
 
-/// Utility for text-only profiles: capability calls are supported by an
-/// explicit production-safe deny capability port, not by omitting the port.
-pub fn text_only_driver_requirements() -> DriverRequirements {
+/// Utility for profiles that need every host surface, including a real
+/// capability port.
+pub fn tool_capable_driver_requirements() -> DriverRequirements {
     DriverRequirements {
         model: RequirementLevel::Required,
         prompt: RequirementLevel::Required,
@@ -685,6 +733,12 @@ pub fn text_only_driver_requirements() -> DriverRequirements {
         capabilities: RequirementLevel::Required,
         progress_events: RequirementLevel::Required,
     }
+}
+
+/// Utility for text-only profiles: capability calls are supported by an
+/// explicit production-safe deny capability port, not by omitting the port.
+pub fn text_only_driver_requirements() -> DriverRequirements {
+    tool_capable_driver_requirements()
 }
 
 #[cfg(test)]
@@ -710,6 +764,8 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             false,
+            &[],
+            &[],
             &mut issues,
         );
 
