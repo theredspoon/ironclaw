@@ -1,33 +1,114 @@
 use async_trait::async_trait;
 use ironclaw_host_api::VirtualPath;
 
-use crate::{DirEntry, FileStat, FilesystemError, FilesystemOperation};
+use crate::backend::{EventRecord, StorageTxn};
+use crate::{
+    BackendCapabilities, CasExpectation, DirEntry, Entry, FileStat, FilesystemError,
+    FilesystemOperation, Filter, IndexSpec, Page, RecordVersion, SeqNo, VersionedEntry,
+};
 
-/// Trusted root filesystem interface over canonical virtual paths.
+/// Unified filesystem interface over canonical virtual paths.
+///
+/// Both individual storage backends (local files, Postgres, libSQL, HSM,
+/// in-memory) and the composite dispatcher
+/// ([`CompositeRootFilesystem`](crate::CompositeRootFilesystem)) implement this
+/// trait. There is intentionally only one trait — the dispatcher *is* a
+/// backend that routes by longest-prefix mount.
+///
+/// The trait surface is divided into:
+/// - **Capabilities/identity** — every backend declares what it can do.
+/// - **Unified entry plane** — [`put`](Self::put) / [`get`](Self::get) /
+///   [`delete`](Self::delete) / [`list_dir`](Self::list_dir) /
+///   [`query`](Self::query) / [`ensure_index`](Self::ensure_index) /
+///   [`stat`](Self::stat). Bytes files and structured records both flow
+///   through these methods as different inhabitants of [`Entry`].
+/// - **Atomicity** — [`begin`](Self::begin) for backends that natively
+///   support multi-key transactions. Stores must always work with CAS
+///   (`put` + `CasExpectation::Version`) as the floor.
+/// - **Event plane** — [`append`](Self::append) / [`tail`](Self::tail) for
+///   log-shaped mounts.
+/// - **Legacy bytes plane** — [`read_file`](Self::read_file) /
+///   [`write_file`](Self::write_file) / [`append_file`](Self::append_file) /
+///   [`list_dir_bytes`](Self::list_dir_bytes) / [`create_dir_all`](Self::create_dir_all).
+///   Kept during migration; default impls route legacy reads/writes through
+///   `put`/`get`. Removed after task 17 (`src/db/` dissolution) lands.
 #[async_trait]
 pub trait RootFilesystem: Send + Sync {
-    /// Reads a file by canonical virtual path without exposing backend host paths in errors.
-    async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError>;
+    // ─── Capabilities / identity ──────────────────────────────────────────
 
-    /// Writes bytes to a canonical virtual path while preserving backend containment.
-    async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError>;
-
-    /// Appends bytes to a canonical virtual path. Backends that do not support append must fail closed before side effects.
-    async fn append_file(&self, path: &VirtualPath, _bytes: &[u8]) -> Result<(), FilesystemError> {
-        Err(FilesystemError::Backend {
-            path: path.clone(),
-            operation: FilesystemOperation::AppendFile,
-            reason: "append_file is not supported by this backend".to_string(),
-        })
+    /// Capabilities advertised by this backend. Mount-time validation in
+    /// [`CompositeRootFilesystem::mount`](crate::CompositeRootFilesystem::mount)
+    /// uses this to refuse backends that cannot serve the indexes a consumer
+    /// has declared.
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
     }
 
-    /// Lists direct children of a canonical virtual directory; callers must handle pagination/backends in future implementations without bypassing scope.
+    // ─── Unified entry plane ──────────────────────────────────────────────
+
+    /// Write an [`Entry`] at `path` with a compare-and-swap precondition.
+    /// Returns the new [`RecordVersion`].
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        _entry: Entry,
+        _cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        unsupported(path, FilesystemOperation::WriteFile)
+    }
+
+    /// Read the entry at `path`, returning `None` if no entry is present.
+    async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        // Default: assume bytes-only legacy backend. Fetch via `read_file`,
+        // wrap in an opaque-file Entry, version 0 (legacy backends do not
+        // track versions). This default is removed when the backend gains a
+        // native `put`/`get` implementation (see task 5).
+        match self.read_file(path).await {
+            Ok(body) => Ok(Some(VersionedEntry {
+                entry: Entry::bytes(body),
+                version: RecordVersion::from_backend(0),
+            })),
+            Err(FilesystemError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Lists direct children of a canonical virtual directory.
+    ///
+    /// Lightweight: returns path + type, no payload, no pagination. Use
+    /// [`query`](Self::query) when you need pagination, filtering, or the
+    /// materialized entry bodies.
     async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError>;
+
+    /// Filtered query over `prefix`. Returns the materialized entries
+    /// matching `filter`. Backends without `query` capability return
+    /// [`FilesystemError::Unsupported`].
+    async fn query(
+        &self,
+        path: &VirtualPath,
+        _filter: &Filter,
+        _page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        unsupported(path, FilesystemOperation::Query)
+    }
+
+    /// Declare an index on a mount prefix. Idempotent: re-declaring the same
+    /// spec is a no-op; declaring a conflicting spec returns
+    /// [`FilesystemError::IndexConflict`].
+    async fn ensure_index(
+        &self,
+        path: &VirtualPath,
+        _spec: &IndexSpec,
+    ) -> Result<(), FilesystemError> {
+        unsupported(path, FilesystemOperation::EnsureIndex)
+    }
 
     /// Returns metadata for a canonical virtual path without revealing raw host paths.
     async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError>;
 
-    /// Deletes an existing canonical virtual file or directory. Missing paths return [`FilesystemError::NotFound`]; backends that do not support delete must fail closed before side effects.
+    /// Deletes an existing canonical virtual file or directory. Missing paths
+    /// return [`FilesystemError::NotFound`]; backends that do not support
+    /// delete must fail closed before side effects.
     async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
         Err(FilesystemError::Backend {
             path: path.clone(),
@@ -36,7 +117,82 @@ pub trait RootFilesystem: Send + Sync {
         })
     }
 
-    /// Creates a canonical virtual directory and any missing parents. Backends that do not support directories must fail closed before side effects.
+    // ─── Atomicity ────────────────────────────────────────────────────────
+
+    /// Begin a multi-key transaction scoped to `prefix`. Backends with only
+    /// CAS support return [`FilesystemError::Unsupported`]; consumers must
+    /// always have a CAS-only path.
+    async fn begin(&self, path: &VirtualPath) -> Result<Box<dyn StorageTxn>, FilesystemError> {
+        unsupported(path, FilesystemOperation::BeginTxn)
+    }
+
+    // ─── Event plane (append/tail) ────────────────────────────────────────
+
+    /// Append `payload` to the event log at `path`, returning the assigned
+    /// monotonic [`SeqNo`]. Distinct from [`append_file`](Self::append_file),
+    /// which is the legacy byte-append on a regular file.
+    async fn append(
+        &self,
+        path: &VirtualPath,
+        _payload: Vec<u8>,
+    ) -> Result<SeqNo, FilesystemError> {
+        unsupported(path, FilesystemOperation::Tail)
+    }
+
+    /// Read events at `path` starting at `from` (exclusive). Returns at most
+    /// one page of records; consumers loop with the latest seq to drain the
+    /// log. Streaming support will replace this Vec return shape in a later
+    /// pass; the unstable signature is intentional.
+    async fn tail(
+        &self,
+        path: &VirtualPath,
+        _from: SeqNo,
+    ) -> Result<Vec<EventRecord>, FilesystemError> {
+        unsupported(path, FilesystemOperation::Tail)
+    }
+
+    // ─── Legacy bytes plane (transitional) ────────────────────────────────
+
+    /// Reads a file by canonical virtual path without exposing backend host paths in errors.
+    ///
+    /// Legacy entry point — new code should call [`get`](Self::get). Default
+    /// impl routes through `get` and extracts the body; backends that have a
+    /// faster native byte read may override.
+    async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
+        match self.get(path).await? {
+            Some(entry) => Ok(entry.entry.body),
+            None => Err(FilesystemError::NotFound {
+                path: path.clone(),
+                operation: FilesystemOperation::ReadFile,
+            }),
+        }
+    }
+
+    /// Writes bytes to a canonical virtual path while preserving backend containment.
+    ///
+    /// Legacy entry point — new code should call [`put`](Self::put). Default
+    /// impl routes through `put` with `CasExpectation::Any`.
+    async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.put(path, Entry::bytes(bytes.to_vec()), CasExpectation::Any)
+            .await
+            .map(|_| ())
+    }
+
+    /// Appends bytes to a canonical virtual path. Distinct from
+    /// [`append`](Self::append), which is the event-plane sequence operation.
+    /// Backends that do not support byte-append must fail closed before side
+    /// effects.
+    async fn append_file(&self, path: &VirtualPath, _bytes: &[u8]) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::AppendFile,
+            reason: "append_file is not supported by this backend".to_string(),
+        })
+    }
+
+    /// Creates a canonical virtual directory and any missing parents.
+    /// Backends that do not support directories must fail closed before side
+    /// effects.
     async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
         Err(FilesystemError::Backend {
             path: path.clone(),
@@ -44,4 +200,14 @@ pub trait RootFilesystem: Send + Sync {
             reason: "create_dir_all is not supported by this backend".to_string(),
         })
     }
+}
+
+fn unsupported<T>(
+    path: &VirtualPath,
+    operation: FilesystemOperation,
+) -> Result<T, FilesystemError> {
+    Err(FilesystemError::Unsupported {
+        path: path.clone(),
+        operation,
+    })
 }

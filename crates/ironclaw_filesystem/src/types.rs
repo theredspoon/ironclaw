@@ -1,9 +1,20 @@
 use std::time::SystemTime;
 
 use ironclaw_host_api::{HostApiError, ScopedPath, VirtualPath};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::index::IndexName;
+use crate::record::RecordVersion;
+
 /// Filesystem operation used for permission checks and audit/error reporting.
+///
+/// The legacy byte-plane variants (`ReadFile`, `WriteFile`, …) describe the
+/// *intent* of an operation against the underlying [`MountPermissions`]
+/// surface and are reused by the unified `put`/`get` ops as their permission
+/// witness — `put` is a write, `get` is a read. The newer variants
+/// (`Query`, `EnsureIndex`, `BeginTxn`, `Tail`) describe operations that have
+/// no analogue in the legacy enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesystemOperation {
     MountLocal,
@@ -14,6 +25,10 @@ pub enum FilesystemOperation {
     Stat,
     Delete,
     CreateDirAll,
+    Query,
+    EnsureIndex,
+    BeginTxn,
+    Tail,
 }
 
 impl std::fmt::Display for FilesystemOperation {
@@ -27,6 +42,10 @@ impl std::fmt::Display for FilesystemOperation {
             Self::Stat => "stat",
             Self::Delete => "delete",
             Self::CreateDirAll => "create_dir_all",
+            Self::Query => "query",
+            Self::EnsureIndex => "ensure_index",
+            Self::BeginTxn => "begin_txn",
+            Self::Tail => "tail",
         })
     }
 }
@@ -37,6 +56,7 @@ impl std::fmt::Display for FilesystemOperation {
 /// paths. Backend implementations may log lower-level errors separately, but
 /// user-facing errors should preserve host path confidentiality.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FilesystemError {
     #[error(transparent)]
     Contract(#[from] HostApiError),
@@ -62,6 +82,32 @@ pub enum FilesystemError {
     Backend {
         path: VirtualPath,
         operation: FilesystemOperation,
+        reason: String,
+    },
+    /// Compare-and-swap precondition failed: the existing record's version did
+    /// not match the caller's expectation. Stores typically retry by reading
+    /// the current version and re-applying the transformation.
+    #[error("version mismatch at {path}: expected {expected:?}, found {found:?}")]
+    VersionMismatch {
+        path: VirtualPath,
+        expected: Option<RecordVersion>,
+        found: Option<RecordVersion>,
+    },
+    /// Mounted backend does not implement the requested operation. Capability
+    /// checks at mount time should catch most cases; this remains for
+    /// runtime-conditional capabilities (e.g. a Postgres mount built against a
+    /// server without `pgvector` rejecting `IndexKind::Vector`).
+    #[error("operation {operation} is not supported by the mount at {path}")]
+    Unsupported {
+        path: VirtualPath,
+        operation: FilesystemOperation,
+    },
+    /// Declaring an index conflicted with an existing definition (e.g. the
+    /// same name already exists with a different `keys` ordering or `kind`).
+    #[error("index conflict for {name} at {path}: {reason}")]
+    IndexConflict {
+        path: VirtualPath,
+        name: IndexName,
         reason: String,
     },
 }
@@ -169,15 +215,72 @@ pub enum IndexPolicy {
     BackendDefined,
 }
 
+/// Index kinds a backend can materialize when it serves the record plane.
+///
+/// A backend that cannot serve a requested kind fails [`ensure_index`](
+/// crate::StorageBackend::ensure_index) closed with
+/// [`FilesystemError::Unsupported`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IndexCapability {
+    pub exact: bool,
+    pub prefix: bool,
+    pub fts: bool,
+    pub vector: bool,
+}
+
+impl IndexCapability {
+    /// Convenience constructor for backends that serve everything the byte
+    /// plane needs (most SQL backends).
+    pub const fn sql_typical() -> Self {
+        Self {
+            exact: true,
+            prefix: true,
+            fts: false,
+            vector: false,
+        }
+    }
+}
+
+/// Transaction semantics offered by a backend.
+///
+/// Stores must work with `Cas` as the floor; richer backends opt into
+/// `MultiKey` for stronger guarantees, but consumers never *depend* on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxnCapability {
+    #[default]
+    None,
+    /// Compare-and-swap on individual records (see
+    /// [`CasExpectation`](crate::CasExpectation)).
+    Cas,
+    /// Backend implements [`StorageTxn`](crate::StorageTxn) for atomic
+    /// multi-key updates within a single mount.
+    MultiKey,
+}
+
 /// Capabilities advertised by a mounted backend for diagnostics and routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Mount-time validation refuses a backend whose capabilities cannot satisfy
+/// the index/record/transaction needs declared by the consumer that will be
+/// constructed against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct BackendCapabilities {
+    // Bytes plane.
     pub read: bool,
     pub write: bool,
     pub append: bool,
     pub list: bool,
     pub stat: bool,
     pub delete: bool,
+    // Record plane.
+    pub records: bool,
+    pub query: bool,
+    pub index: IndexCapability,
+    pub txn: TxnCapability,
+    // Event plane (append/tail).
+    pub events: bool,
+    // Legacy flags retained for existing catalog consumers.
     pub indexed: bool,
     pub embedded: bool,
 }

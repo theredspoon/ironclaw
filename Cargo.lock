@@ -4285,6 +4285,8 @@ dependencies = [
  "ironclaw_host_api",
  "ironclaw_safety",
  "libsql",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

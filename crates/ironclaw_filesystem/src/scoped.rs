@@ -2,9 +2,18 @@ use std::sync::Arc;
 
 use ironclaw_host_api::{MountPermissions, MountView, ScopedPath, VirtualPath};
 
-use crate::{DirEntry, FileStat, FilesystemError, FilesystemOperation, RootFilesystem};
+use crate::backend::{EventRecord, StorageTxn};
+use crate::{
+    CasExpectation, DirEntry, Entry, FileStat, FilesystemError, FilesystemOperation, Filter,
+    IndexSpec, Page, RecordVersion, RootFilesystem, SeqNo, VersionedEntry,
+};
 
 /// Invocation-scoped filesystem view over [`ScopedPath`] values.
+///
+/// Higher-level stores (SecretStore, ProcessStore, …) accept a
+/// `ScopedFilesystem` bound to a path prefix and call the unified
+/// `put`/`get`/`query`/etc. ops through it. Permission checks happen here
+/// against the caller's [`MountView`] before any backend dispatch.
 #[derive(Debug, Clone)]
 pub struct ScopedFilesystem<F> {
     root: Arc<F>,
@@ -22,6 +31,82 @@ where
     pub fn mounts(&self) -> &MountView {
         &self.mounts
     }
+
+    // ─── Unified entry plane ──────────────────────────────────────────────
+
+    /// Write an [`Entry`] at `path` with a CAS precondition.
+    pub async fn put(
+        &self,
+        path: &ScopedPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        let virtual_path = self.resolve_with_permission(path, FilesystemOperation::WriteFile)?;
+        self.root.put(&virtual_path, entry, cas).await
+    }
+
+    /// Read the entry at `path`, returning `None` if absent.
+    pub async fn get(&self, path: &ScopedPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        let virtual_path = self.resolve_with_permission(path, FilesystemOperation::ReadFile)?;
+        self.root.get(&virtual_path).await
+    }
+
+    /// Filtered query over `prefix`.
+    pub async fn query(
+        &self,
+        prefix: &ScopedPath,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        let virtual_path = self.resolve_with_permission(prefix, FilesystemOperation::Query)?;
+        self.root.query(&virtual_path, filter, page).await
+    }
+
+    /// Declare an index on the mount under `prefix`.
+    pub async fn ensure_index(
+        &self,
+        prefix: &ScopedPath,
+        spec: &IndexSpec,
+    ) -> Result<(), FilesystemError> {
+        let virtual_path =
+            self.resolve_with_permission(prefix, FilesystemOperation::EnsureIndex)?;
+        self.root.ensure_index(&virtual_path, spec).await
+    }
+
+    /// Begin a multi-key transaction (capability-gated).
+    pub async fn begin(&self, prefix: &ScopedPath) -> Result<Box<dyn StorageTxn>, FilesystemError> {
+        let virtual_path = self.resolve_with_permission(prefix, FilesystemOperation::BeginTxn)?;
+        self.root.begin(&virtual_path).await
+    }
+
+    // ─── Event/tail plane ─────────────────────────────────────────────────
+
+    /// Append `payload` to the event log at `path`, returning the SeqNo.
+    pub async fn append(
+        &self,
+        path: &ScopedPath,
+        payload: Vec<u8>,
+    ) -> Result<SeqNo, FilesystemError> {
+        // Append on the event plane is a write — permission mirrors AppendFile.
+        let virtual_path = self.resolve_with_permission(path, FilesystemOperation::AppendFile)?;
+        self.root.append(&virtual_path, payload).await
+    }
+
+    /// Read events at `path` starting just after `from`.
+    pub async fn tail(
+        &self,
+        path: &ScopedPath,
+        from: SeqNo,
+    ) -> Result<Vec<EventRecord>, FilesystemError> {
+        let virtual_path = self.resolve_with_permission(path, FilesystemOperation::Tail)?;
+        self.root.tail(&virtual_path, from).await
+    }
+
+    // ─── Legacy bytes-plane methods (transitional) ────────────────────────
+    //
+    // These remain for the migration window. New code should prefer the
+    // unified ops above. They will be removed once consumers migrate
+    // (task 17).
 
     pub async fn read_file(&self, path: &ScopedPath) -> Result<Vec<u8>, FilesystemError> {
         let virtual_path = self.resolve_with_permission(path, FilesystemOperation::ReadFile)?;
@@ -62,6 +147,40 @@ where
         self.root.create_dir_all(&virtual_path).await
     }
 
+    // ─── Convenience helpers for byte-only callers ────────────────────────
+
+    /// Read the body bytes at `path`. Convenience wrapper over [`get`] that
+    /// errors if the path has no entry.
+    pub async fn read_bytes(&self, path: &ScopedPath) -> Result<Vec<u8>, FilesystemError> {
+        match self.get(path).await? {
+            Some(versioned) => Ok(versioned.entry.body),
+            None => {
+                // Need the virtual path for the error message; resolve once
+                // more — the permission check already passed.
+                let virtual_path =
+                    self.resolve_with_permission(path, FilesystemOperation::ReadFile)?;
+                Err(FilesystemError::NotFound {
+                    path: virtual_path,
+                    operation: FilesystemOperation::ReadFile,
+                })
+            }
+        }
+    }
+
+    /// Write `body` as an opaque-file entry at `path` (no CAS precondition).
+    /// Convenience wrapper over [`put`].
+    pub async fn write_bytes(
+        &self,
+        path: &ScopedPath,
+        body: Vec<u8>,
+    ) -> Result<(), FilesystemError> {
+        self.put(path, Entry::bytes(body), CasExpectation::Any)
+            .await
+            .map(|_| ())
+    }
+
+    // ─── Internals ────────────────────────────────────────────────────────
+
     fn resolve_with_permission(
         &self,
         path: &ScopedPath,
@@ -92,5 +211,13 @@ fn operation_allowed(permissions: &MountPermissions, operation: FilesystemOperat
         FilesystemOperation::Delete => permissions.delete,
         FilesystemOperation::CreateDirAll => permissions.write,
         FilesystemOperation::MountLocal => false,
+        // Query enumerates records, so requires both read (to see contents) and
+        // list (to enumerate). Either alone is insufficient.
+        FilesystemOperation::Query => permissions.read && permissions.list,
+        // Index/transaction declarations mutate the mount's structural state.
+        FilesystemOperation::EnsureIndex => permissions.write,
+        FilesystemOperation::BeginTxn => permissions.write,
+        // Tail mirrors read on the byte plane (append is covered by AppendFile).
+        FilesystemOperation::Tail => permissions.read,
     }
 }

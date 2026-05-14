@@ -268,6 +268,7 @@ fn descriptor(
                 index_policy,
                 IndexPolicy::Vector | IndexPolicy::FullTextAndVector
             ),
+            ..Default::default()
         },
     }
 }

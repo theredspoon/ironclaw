@@ -3,9 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ironclaw_host_api::VirtualPath;
 
+use crate::backend::{EventRecord, StorageTxn};
 use crate::{
-    BackendCapabilities, BackendId, BackendKind, ContentKind, DirEntry, FileStat, FilesystemError,
-    IndexPolicy, RootFilesystem, StorageClass, path_prefix_matches,
+    BackendCapabilities, BackendId, BackendKind, CasExpectation, ContentKind, DirEntry, Entry,
+    FileStat, FilesystemError, Filter, IndexPolicy, IndexSpec, Page, RecordVersion, RootFilesystem,
+    SeqNo, StorageClass, VersionedEntry, path_prefix_matches,
 };
 
 /// Trusted catalog record for one virtual filesystem mount.
@@ -148,6 +150,77 @@ impl FilesystemCatalog for CompositeRootFilesystem {
 
 #[async_trait]
 impl RootFilesystem for CompositeRootFilesystem {
+    fn capabilities(&self) -> BackendCapabilities {
+        // The composite is a router, not a backend in its own right. Callers
+        // wanting per-path capabilities should consult [`describe_path`]
+        // through the [`FilesystemCatalog`] impl.
+        BackendCapabilities::default()
+    }
+
+    // ── Unified entry plane ──
+
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        self.matching_mount(path)?
+            .backend
+            .put(path, entry, cas)
+            .await
+    }
+
+    async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        self.matching_mount(path)?.backend.get(path).await
+    }
+
+    async fn query(
+        &self,
+        path: &VirtualPath,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        self.matching_mount(path)?
+            .backend
+            .query(path, filter, page)
+            .await
+    }
+
+    async fn ensure_index(
+        &self,
+        path: &VirtualPath,
+        spec: &IndexSpec,
+    ) -> Result<(), FilesystemError> {
+        self.matching_mount(path)?
+            .backend
+            .ensure_index(path, spec)
+            .await
+    }
+
+    async fn begin(&self, path: &VirtualPath) -> Result<Box<dyn StorageTxn>, FilesystemError> {
+        self.matching_mount(path)?.backend.begin(path).await
+    }
+
+    // ── Event plane ──
+
+    async fn append(&self, path: &VirtualPath, payload: Vec<u8>) -> Result<SeqNo, FilesystemError> {
+        self.matching_mount(path)?
+            .backend
+            .append(path, payload)
+            .await
+    }
+
+    async fn tail(
+        &self,
+        path: &VirtualPath,
+        from: SeqNo,
+    ) -> Result<Vec<EventRecord>, FilesystemError> {
+        self.matching_mount(path)?.backend.tail(path, from).await
+    }
+
+    // ── Legacy bytes plane ──
+
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
         self.matching_mount(path)?.backend.read_file(path).await
     }
