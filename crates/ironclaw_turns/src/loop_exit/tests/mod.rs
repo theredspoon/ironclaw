@@ -6,6 +6,102 @@ use crate::{
 use serde_json::json;
 
 #[test]
+fn validation_policy_named_constructors_keep_fail_closed_default_and_host_verified_evidence_explicit()
+ {
+    let default_policy = LoopExitValidationPolicy::recovery_required();
+    assert!(!default_policy.completion_refs_verified());
+    assert!(!default_policy.blocked_evidence_verified());
+    assert!(!default_policy.failure_evidence_verified());
+    assert!(!default_policy.host_cancellation_observed());
+    assert!(!default_policy.requires_final_checkpoint());
+    assert!(!default_policy.allows_no_reply_completion());
+    assert!(!default_policy.final_checkpoint_verified());
+    assert_eq!(
+        default_policy.invalid_handling(),
+        LoopExitInvalidHandling::RecoveryRequired
+    );
+
+    let trusted_policy = LoopExitValidationPolicy::fail_terminal()
+        .require_final_checkpoint()
+        .with_allow_no_reply_completion()
+        .with_host_verified_final_checkpoint()
+        .with_host_verified_completion_refs()
+        .with_host_verified_blocked_evidence()
+        .with_host_verified_failure_evidence()
+        .with_host_cancellation_observed();
+    assert!(trusted_policy.completion_refs_verified());
+    assert!(trusted_policy.blocked_evidence_verified());
+    assert!(trusted_policy.failure_evidence_verified());
+    assert!(trusted_policy.host_cancellation_observed());
+    assert!(trusted_policy.requires_final_checkpoint());
+    assert!(trusted_policy.allows_no_reply_completion());
+    assert!(trusted_policy.final_checkpoint_verified());
+    assert_eq!(
+        trusted_policy.invalid_handling(),
+        LoopExitInvalidHandling::FailTerminal
+    );
+}
+
+#[test]
+fn loop_exit_validation_policy_deserialization_cannot_mint_host_verified_evidence() {
+    for trusted_field in [
+        "allow_no_reply_completion",
+        "final_checkpoint_verified",
+        "host_cancellation_observed",
+        "completion_refs_verified",
+        "blocked_evidence_verified",
+        "failure_evidence_verified",
+    ] {
+        let mut forged = json!({
+            "require_final_checkpoint": false,
+            "allow_no_reply_completion": false,
+            "final_checkpoint_verified": false,
+            "host_cancellation_observed": false,
+            "invalid_handling": "recovery_required",
+            "completion_refs_verified": false,
+            "blocked_evidence_verified": false,
+            "failure_evidence_verified": false
+        });
+        forged[trusted_field] = json!(true);
+        assert!(
+            serde_json::from_value::<LoopExitValidationPolicy>(forged).is_err(),
+            "{trusted_field} should not be wire-mintable"
+        );
+    }
+
+    let forged_terminal = json!({
+        "require_final_checkpoint": false,
+        "allow_no_reply_completion": false,
+        "final_checkpoint_verified": false,
+        "host_cancellation_observed": false,
+        "invalid_handling": "fail_terminal",
+        "completion_refs_verified": false,
+        "blocked_evidence_verified": false,
+        "failure_evidence_verified": false
+    });
+    assert!(serde_json::from_value::<LoopExitValidationPolicy>(forged_terminal).is_err());
+
+    let strict_fail_closed = json!({
+        "require_final_checkpoint": true,
+        "allow_no_reply_completion": false,
+        "final_checkpoint_verified": false,
+        "host_cancellation_observed": false,
+        "invalid_handling": "recovery_required",
+        "completion_refs_verified": false,
+        "blocked_evidence_verified": false,
+        "failure_evidence_verified": false
+    });
+    let policy = serde_json::from_value::<LoopExitValidationPolicy>(strict_fail_closed).unwrap();
+    assert!(policy.requires_final_checkpoint());
+    assert!(!policy.allows_no_reply_completion());
+    assert!(!policy.completion_refs_verified());
+    assert_eq!(
+        policy.invalid_handling(),
+        LoopExitInvalidHandling::RecoveryRequired
+    );
+}
+
+#[test]
 fn completed_ask_user_exit_maps_to_trusted_completed_outcome_without_final_checkpoint() {
     let exit_id = exit_id("exit:completed");
     let decision = LoopExit::Completed(LoopCompleted {
