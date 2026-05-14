@@ -8,8 +8,8 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
 use ironclaw_product_workflow::{
     RebornResolveGateResponse, RebornServices, RebornServicesApi, RebornServicesErrorCode,
     RebornSubmitTurnResponse, RebornTimelineRequest, WebUiAuthenticatedCaller,
-    WebUiCancelRunRequest, WebUiInboundValidationCode, WebUiResolveGateRequest,
-    WebUiSendMessageRequest,
+    WebUiCancelRunRequest, WebUiCreateThreadRequest, WebUiInboundValidationCode,
+    WebUiResolveGateRequest, WebUiSendMessageRequest,
 };
 use ironclaw_threads::{InMemorySessionThreadService, MessageStatus, SessionThreadService};
 use ironclaw_turns::{
@@ -124,6 +124,32 @@ impl TurnCoordinator for FakeTurnCoordinator {
             event_cursor: EventCursor(17),
         })
     }
+}
+
+#[tokio::test]
+async fn duplicate_create_thread_replays_generated_thread_for_same_client_action() {
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    );
+    let request = || {
+        serde_json::from_value::<WebUiCreateThreadRequest>(json!({
+            "client_action_id": "create-duplicate"
+        }))
+        .expect("request")
+    };
+
+    let first = services
+        .create_thread(caller(), request())
+        .await
+        .expect("first create succeeds");
+    let replayed = services
+        .create_thread(caller(), request())
+        .await
+        .expect("duplicate create replays");
+
+    assert_eq!(first.thread.thread_id, replayed.thread.thread_id);
+    assert_eq!(first.thread.metadata_json, replayed.thread.metadata_json);
 }
 
 #[tokio::test]

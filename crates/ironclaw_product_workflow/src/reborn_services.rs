@@ -408,7 +408,8 @@ impl RebornServices {
         else {
             return Err(RebornServicesError::internal_invariant());
         };
-        let thread_id = requested_thread_id.unwrap_or_else(generated_thread_id);
+        let thread_id =
+            requested_thread_id.unwrap_or_else(|| generated_thread_id(&caller, &client_action_id));
         let scope = caller.turn_scope(thread_id.clone());
         let thread_scope = thread_scope_from_turn_scope(&scope, Some(caller.user_id.clone()))?;
         let thread = self
@@ -801,9 +802,32 @@ fn escape_json_string(value: &str) -> String {
         .collect()
 }
 
-fn generated_thread_id() -> ThreadId {
+fn generated_thread_id(
+    caller: &WebUiAuthenticatedCaller,
+    client_action_id: &ironclaw_turns::IdempotencyKey,
+) -> ThreadId {
+    let seed = format!(
+        "{}{}{}{}{}{}",
+        segment("surface", "webui-create-thread"),
+        segment("tenant", caller.tenant_id.as_str()),
+        segment("user", caller.user_id.as_str()),
+        segment(
+            "agent",
+            caller.agent_id.as_ref().map(AgentId::as_str).unwrap_or("")
+        ),
+        segment(
+            "project",
+            caller
+                .project_id
+                .as_ref()
+                .map(ironclaw_host_api::ProjectId::as_str)
+                .unwrap_or("")
+        ),
+        segment("action", client_action_id.as_str())
+    );
+    let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes());
     // UUID text contains no path separators/control characters and is accepted by ThreadId.
-    match ThreadId::new(Uuid::new_v4().to_string()) {
+    match ThreadId::new(id.to_string()) {
         Ok(thread_id) => thread_id,
         Err(error) => {
             debug_assert!(false, "generated UUID thread id should be valid: {error}");
