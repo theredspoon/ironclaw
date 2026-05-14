@@ -172,13 +172,24 @@ section = "capability_provider.tools"
 surface_kind = "telegram"
 
 [capability_provider.tools]
-capabilities = [{ id = "send_message", description = "Send Telegram message" }]
+
+[[capability_provider.tools.capabilities]]
+id = "telegram.send_message"
+description = "Send a Telegram message to a chat."
+effects = ["network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/telegram/send_message.input.v1.json"
+output_schema_ref = "schemas/telegram/send_message.output.v1.json"
+prompt_doc_ref = "prompts/telegram/send_message.md"
 ```
 
 Rules:
 
 - `ironclaw_extensions` parses the envelope, validates host API refs, and dispatches to a composition-wired host API contract registry.
 - Domain contract handlers own section pattern validation, cardinality, typed section schema validation, and catalog/read-model projection.
+- Model-visible capability-provider sections must carry enough cold metadata to project an LLM-facing tool descriptor: stable capability ID, human description, input schema ref, output schema ref, prompt docs ref, effects, permission default, and visibility.
+- The LLM consumes the projected hot capability surface, not the raw manifest section. Catalog publication resolves schema/doc refs into compact per-turn tool descriptors.
 - Unknown `host_api.id` values fail closed.
 - Repeating the same `host_api.id` is allowed only when that contract declares multi-instance support.
 - Every `[[host_api]]` must reference an existing explicit `section` path.

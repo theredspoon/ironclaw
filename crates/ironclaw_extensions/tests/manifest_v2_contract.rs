@@ -979,7 +979,16 @@ surface_kind = "telegram"
 auth = {{ kind = "request_signature", header_name = "x-telegram-signature" }}
 
 [capability_provider.tools]
-capabilities = [{{ id = "send_message", description = "Send Telegram message" }}]
+
+[[capability_provider.tools.capabilities]]
+id = "telegram.send_message"
+description = "Send a Telegram message to a chat."
+effects = ["network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/telegram/send_message.input.v1.json"
+output_schema_ref = "schemas/telegram/send_message.output.v1.json"
+prompt_doc_ref = "prompts/telegram/send_message.md"
 "#,
         schema = MANIFEST_SCHEMA_VERSION,
     )
