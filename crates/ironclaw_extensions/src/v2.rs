@@ -202,9 +202,10 @@ impl<'a> HostApiContractRegistry<'a> {
         contract: &'a dyn HostApiManifestContract,
     ) -> Result<(), ManifestV2Error> {
         let id = contract.id().clone();
-        if self.contracts.insert(id.clone(), contract).is_some() {
+        if self.contracts.contains_key(&id) {
             return Err(ManifestV2Error::DuplicateHostApiContractRegistration { id });
         }
+        self.contracts.insert(id, contract);
         Ok(())
     }
 
@@ -472,6 +473,11 @@ impl ExtensionManifestV2 {
                 reason: "host_api manifests require parse_with_host_api_contracts".to_string(),
             });
         }
+        if let Some(key) = document.sections.first_non_envelope_top_level_key() {
+            return Err(ManifestV2Error::Parse {
+                reason: format!("unknown top-level field {key:?}"),
+            });
+        }
         Self::from_raw(document.raw, source, host_port_catalog, &document.sections)
     }
 
@@ -726,18 +732,23 @@ fn validate_host_api_refs(
     raw_refs: Vec<RawHostApiRefV2>,
     sections: &ManifestSectionsV2,
 ) -> Result<Vec<HostApiRefV2>, ManifestV2Error> {
-    let mut seen_sections = BTreeSet::new();
+    let mut seen_sections: BTreeSet<ManifestSectionPath> = BTreeSet::new();
     let mut refs = Vec::with_capacity(raw_refs.len());
     for raw_ref in raw_refs {
         let host_api = HostApiRefV2 {
             id: HostApiId::new(raw_ref.id)?,
             section: ManifestSectionPath::new(raw_ref.section)?,
         };
-        if !seen_sections.insert(host_api.section.clone()) {
+        if seen_sections.iter().any(|seen| {
+            seen == &host_api.section
+                || seen.is_prefix_of(&host_api.section)
+                || host_api.section.is_prefix_of(seen)
+        }) {
             return Err(ManifestV2Error::DuplicateHostApiSection {
                 section: host_api.section,
             });
         }
+        seen_sections.insert(host_api.section.clone());
         sections.get(&host_api.section)?;
         refs.push(host_api);
     }
@@ -957,6 +968,13 @@ struct ManifestSectionsV2 {
 }
 
 impl ManifestSectionsV2 {
+    fn first_non_envelope_top_level_key(&self) -> Option<&str> {
+        self.table
+            .keys()
+            .find(|key| !is_envelope_key(key))
+            .map(String::as_str)
+    }
+
     fn get(&self, path: &ManifestSectionPath) -> Result<&toml::Value, ManifestV2Error> {
         let mut current = &self.table;
         let mut segments = path.segments().peekable();

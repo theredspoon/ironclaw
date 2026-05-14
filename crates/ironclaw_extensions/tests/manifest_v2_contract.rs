@@ -100,6 +100,19 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
 }
 
 #[test]
+fn rejects_unknown_top_level_tables_in_legacy_capability_manifests() {
+    let toml = third_party_wasm_manifest("acme-tools", "acme-tools.echo")
+        + r#"
+
+[surprise]
+enabled = true
+"#;
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(matches!(err, ManifestV2Error::Parse { .. }), "{err:?}");
+}
+
+#[test]
 fn rejects_first_party_trust_for_installed_source() {
     let toml = format!(
         r#"
@@ -1152,4 +1165,91 @@ output_schema_ref = "schemas/telegram/legacy.output.v1.json"
     )
     .unwrap_err();
     assert!(matches!(err, ManifestV2Error::Invalid { .. }), "{err:?}");
+}
+
+#[test]
+fn duplicate_contract_registration_does_not_replace_existing_contract() {
+    let product = Box::leak(Box::new(FakeHostApiContract::new(
+        "ironclaw.product_adapter/v1",
+        "product_adapter",
+        HostApiMultiplicity::Multiple,
+        "surface_kind",
+    )));
+    let replacement = Box::leak(Box::new(FakeHostApiContract::new(
+        "ironclaw.product_adapter/v1",
+        "product_adapter",
+        HostApiMultiplicity::Multiple,
+        "replacement_only",
+    )));
+    let capabilities = Box::leak(Box::new(FakeHostApiContract::new(
+        "ironclaw.capability_provider/v1",
+        "capability_provider",
+        HostApiMultiplicity::Single,
+        "capabilities",
+    )));
+    let mut registry = HostApiContractRegistry::new();
+    registry.register(product).unwrap();
+    let err = registry.register(replacement).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ManifestV2Error::DuplicateHostApiContractRegistration { .. }
+        ),
+        "{err:?}"
+    );
+    registry.register(capabilities).unwrap();
+
+    ExtensionManifestV2::parse_with_host_api_contracts(
+        &telegram_multi_host_api_manifest(),
+        ManifestSource::InstalledLocal,
+        &catalog(),
+        &registry,
+    )
+    .unwrap();
+}
+
+#[test]
+fn rejects_overlapping_host_api_section_ownership() {
+    let registry = host_api_registry();
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "telegram"
+name = "Telegram"
+version = "0.1.0"
+description = "Telegram product adapter and tools"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/telegram.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter]
+surface_kind = "telegram_root"
+
+[product_adapter.inbound]
+surface_kind = "telegram"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+
+    let err = ExtensionManifestV2::parse_with_host_api_contracts(
+        &toml,
+        ManifestSource::InstalledLocal,
+        &catalog(),
+        &registry,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, ManifestV2Error::DuplicateHostApiSection { .. }),
+        "{err:?}"
+    );
 }
