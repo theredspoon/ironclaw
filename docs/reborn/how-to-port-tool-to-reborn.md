@@ -188,7 +188,7 @@ Host runtime owns:
 | `description` | `[extension].description` if available, plus capability `description` |
 | `version` | `[extension].version` |
 | `wit_version` | build/compat note; component must match host `wit/tool.wit` |
-| `http.allowlist` | `effects += ["network"]`; porting report should list allowed targets for grants/host ports |
+effects should include "network"; the porting report should list allowed targets for grants/host ports
 | `http.credentials` | `effects += ["use_secret"]`; porting report should list secret handles and injection locations |
 | `http.rate_limit` / timeouts / max body sizes | resource profile and runtime/host-port policy inputs where supported |
 | `secrets.allowed_names` | `effects += ["use_secret"]`; host policy decides allowed handles |
