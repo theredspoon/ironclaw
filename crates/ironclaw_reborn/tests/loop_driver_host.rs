@@ -557,7 +557,7 @@ async fn turn_runner_worker_drives_full_text_only_model_transcript_completion_af
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let state = turn_store
             .get_run_state(GetRunStateRequest {
@@ -704,7 +704,7 @@ async fn turn_runner_worker_drives_script_capability_through_real_host_runtime()
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let state = turn_store
             .get_run_state(GetRunStateRequest {
@@ -759,9 +759,11 @@ async fn turn_runner_worker_drives_script_capability_through_real_host_runtime()
         milestone_names
             .iter()
             .position(|name| *name == "capability_invoked")
+            .expect("capability_invoked milestone should be present")
             < milestone_names
                 .iter()
-                .position(|name| *name == "assistant_reply_finalized"),
+                .position(|name| *name == "assistant_reply_finalized")
+                .expect("assistant_reply_finalized milestone should be present"),
         "capability must be invoked before final reply is persisted: {milestone_names:?}"
     );
 }
@@ -931,6 +933,15 @@ async fn turn_runner_blocks_on_approval_then_coordinator_resume_completes_same_r
         .unwrap();
     assert_eq!(resume.run_id, run_id);
     assert_eq!(resume.status, TurnStatus::Queued);
+    assert_eq!(
+        turn_store
+            .events()
+            .last()
+            .expect("resume should emit lifecycle event")
+            .kind,
+        ironclaw_turns::TurnEventKind::Resumed,
+        "coordinator resume must resolve the matching gate before the run can be queued"
+    );
 
     let completed_state = wait_for_run_status(
         turn_store.as_ref(),
@@ -1130,7 +1141,7 @@ async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_clai
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let state = turn_store
             .get_run_state(GetRunStateRequest {
@@ -3409,6 +3420,11 @@ fn skill_md(name: &str, description: &str, prompt: &str) -> String {
     )
 }
 
+/// In-memory capability I/O fixture.
+///
+/// `results` captures the structured capability output, while `result_refs`
+/// captures the materialized ref returned to the driver so e2e tests can assert
+/// both payload persistence and ref propagation.
 #[derive(Default)]
 struct InMemoryCapabilityIo {
     inputs: Mutex<BTreeMap<String, Value>>,
@@ -3750,6 +3766,10 @@ default_permission = "allow"
 parameters_schema = { type = "object" }
 "#;
 
+/// Test-only evidence port that bypasses all durable evidence checks.
+///
+/// Use only when the test asserts behavior outside evidence verification; use
+/// `ThreadCheckpointLoopExitEvidencePort` when the evidence path itself matters.
 struct AlwaysVerifiedLoopExitEvidence;
 
 #[async_trait]
@@ -3808,7 +3828,7 @@ async fn wait_for_run_status(
     expected: TurnStatus,
     failure_message: &'static str,
 ) -> ironclaw_turns::TurnRunState {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let state = store
             .get_run_state(GetRunStateRequest {

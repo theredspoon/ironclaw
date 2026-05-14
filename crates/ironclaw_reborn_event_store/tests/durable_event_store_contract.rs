@@ -526,6 +526,8 @@ async fn postgres_filtered_replay_detects_missing_trailing_filtered_row_as_repla
     }
     drop(stores);
 
+    // Test-only corruption fixture: intended for local Postgres URLs. Production
+    // store construction above rejects remote sslmode=disable before connecting.
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
         .await
         .expect("connect postgres for corruption fixture");

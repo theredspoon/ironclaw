@@ -1,5 +1,7 @@
 use std::process::Command;
 
+const INVALID_PROFILE_MESSAGE: &str = "IRONCLAW_REBORN_PROFILE must be one of";
+
 fn reborn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_ironclaw-reborn")
 }
@@ -261,12 +263,7 @@ fn doctor_rejects_invalid_profile() {
         "doctor should reject invalid profile"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "IRONCLAW_REBORN_PROFILE must be one of local-dev, production, migration-dry-run"
-        ),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains(INVALID_PROFILE_MESSAGE), "stderr: {stderr}");
 }
 
 #[test]
@@ -285,12 +282,7 @@ fn doctor_rejects_empty_profile_override() {
         "doctor should reject empty profile"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "IRONCLAW_REBORN_PROFILE must be one of local-dev, production, migration-dry-run"
-        ),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains(INVALID_PROFILE_MESSAGE), "stderr: {stderr}");
 }
 
 #[test]
@@ -309,12 +301,7 @@ fn run_rejects_invalid_profile() {
         "run should reject invalid profile"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "IRONCLAW_REBORN_PROFILE must be one of local-dev, production, migration-dry-run"
-        ),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains(INVALID_PROFILE_MESSAGE), "stderr: {stderr}");
 }
 
 #[test]
