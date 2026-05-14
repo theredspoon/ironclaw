@@ -10,28 +10,34 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{AgentId, ThreadId};
 use ironclaw_product_adapters::{
-    ProductAdapterError, ProductOutboundEnvelope, ProjectionCursor, ProjectionStream,
-    ProjectionSubscriptionRequest,
+    ProductAdapterError, ProjectionStream, ProjectionSubscriptionRequest,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, MessageContent, MessageStatus,
-    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
-    SessionThreadService, SummaryArtifact, ThreadHistoryRequest, ThreadMessageId,
-    ThreadMessageRecord, ThreadScope,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadService,
+    ThreadHistoryRequest, ThreadMessageId, ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, CancelRunResponse, EventCursor, GetRunStateRequest, ReplyTargetBindingRef,
-    ResumeTurnRequest, ResumeTurnResponse, SanitizedCancelReason, SourceBindingRef,
-    SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId,
-    TurnScope, TurnStatus,
+    AcceptedMessageRef, GetRunStateRequest, ReplyTargetBindingRef, ResumeTurnRequest,
+    SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor,
+    TurnCoordinator, TurnError, TurnRunId, TurnScope,
 };
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest, WebUiGateResolution,
     WebUiInboundCommand, WebUiInboundValidationCode, WebUiInboundValidationError,
     WebUiResolveGateRequest, WebUiSendMessageRequest,
+};
+
+mod error;
+mod types;
+
+pub use error::{RebornServicesError, RebornServicesErrorCode};
+pub use types::{
+    RebornCancelRunResponse, RebornCreateThreadResponse, RebornResolveGateResponse,
+    RebornResumeGateResponse, RebornStreamEventsRequest, RebornStreamEventsResponse,
+    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
 };
 
 /// Stable WebUI-facing facade surface for beta Reborn routes.
@@ -427,167 +433,6 @@ impl RebornServices {
             .await
             .map_err(map_thread_error)?;
         Ok(RebornCreateThreadResponse { thread })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornCreateThreadResponse {
-    pub thread: SessionThreadRecord,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum RebornSubmitTurnResponse {
-    Submitted {
-        thread_id: ThreadId,
-        accepted_message_ref: AcceptedMessageRef,
-        turn_id: String,
-        run_id: TurnRunId,
-        status: TurnStatus,
-        resolved_run_profile_id: String,
-        resolved_run_profile_version: u64,
-        event_cursor: EventCursor,
-    },
-    DeferredBusy {
-        thread_id: ThreadId,
-        accepted_message_ref: AcceptedMessageRef,
-        active_run_id: TurnRunId,
-        status: TurnStatus,
-        event_cursor: EventCursor,
-    },
-    AlreadySubmitted {
-        thread_id: ThreadId,
-        accepted_message_ref: AcceptedMessageRef,
-        run_id: TurnRunId,
-        status: TurnStatus,
-        event_cursor: EventCursor,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornTimelineRequest {
-    pub thread_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornTimelineResponse {
-    pub thread: SessionThreadRecord,
-    pub messages: Vec<ThreadMessageRecord>,
-    pub summary_artifacts: Vec<SummaryArtifact>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornStreamEventsRequest {
-    pub thread_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_cursor: Option<ProjectionCursor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornStreamEventsResponse {
-    pub events: Vec<ProductOutboundEnvelope>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornCancelRunResponse {
-    pub run_id: TurnRunId,
-    pub status: TurnStatus,
-    pub event_cursor: EventCursor,
-    pub already_terminal: bool,
-}
-
-impl From<CancelRunResponse> for RebornCancelRunResponse {
-    fn from(value: CancelRunResponse) -> Self {
-        Self {
-            run_id: value.run_id,
-            status: value.status,
-            event_cursor: value.event_cursor,
-            already_terminal: value.already_terminal,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornResumeGateResponse {
-    pub run_id: TurnRunId,
-    pub status: TurnStatus,
-    pub event_cursor: EventCursor,
-}
-
-impl From<ResumeTurnResponse> for RebornResumeGateResponse {
-    fn from(value: ResumeTurnResponse) -> Self {
-        Self {
-            run_id: value.run_id,
-            status: value.status,
-            event_cursor: value.event_cursor,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum RebornResolveGateResponse {
-    Resumed(RebornResumeGateResponse),
-    Cancelled(RebornCancelRunResponse),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RebornServicesErrorCode {
-    InvalidRequest,
-    Unauthorized,
-    NotFound,
-    Conflict,
-    RateLimited,
-    Unavailable,
-    Internal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("Reborn WebUI service error: {code:?}")]
-pub struct RebornServicesError {
-    pub code: RebornServicesErrorCode,
-    pub status_code: u16,
-    pub retryable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub validation_code: Option<WebUiInboundValidationCode>,
-}
-
-impl RebornServicesError {
-    fn validation(error: WebUiInboundValidationError) -> Self {
-        Self {
-            code: RebornServicesErrorCode::InvalidRequest,
-            status_code: 400,
-            retryable: false,
-            field: Some(error.field),
-            validation_code: Some(error.code),
-        }
-    }
-
-    fn from_status(code: RebornServicesErrorCode, status_code: u16, retryable: bool) -> Self {
-        Self {
-            code,
-            status_code,
-            retryable,
-            field: None,
-            validation_code: None,
-        }
-    }
-
-    fn internal_invariant() -> Self {
-        Self::from_status(RebornServicesErrorCode::Internal, 500, false)
-    }
-
-    fn service_unavailable(retryable: bool) -> Self {
-        Self::from_status(RebornServicesErrorCode::Unavailable, 503, retryable)
-    }
-}
-
-impl From<WebUiInboundValidationError> for RebornServicesError {
-    fn from(value: WebUiInboundValidationError) -> Self {
-        Self::validation(value)
     }
 }
 

@@ -20,7 +20,6 @@
 #![forbid(unsafe_code)]
 
 pub mod action;
-pub mod api;
 pub mod binding;
 pub mod error;
 #[cfg(any(test, feature = "test-support"))]
@@ -31,4 +30,25 @@ pub mod reborn_services;
 pub mod webui_inbound;
 pub mod workflow;
 
-pub use api::*;
+pub use action::{
+    ActionDispatchKind, ActionFingerprintKey, ActionPhase, AuthRequestRef, LinkedThreadActionId,
+    ProductActionId, ProductCommandName, ProductInboundAction, SourceBindingKey,
+};
+pub use binding::{ConversationBindingService, ResolveBindingRequest, ResolvedBinding};
+pub use error::ProductWorkflowError;
+#[cfg(any(test, feature = "test-support"))]
+pub use fakes::{FakeConversationBindingService, FakeIdempotencyLedger, FakeInboundTurnService};
+pub use inbound_turn::{DefaultInboundTurnService, InboundTurnOutcome, InboundTurnService};
+pub use ledger::{IdempotencyDecision, IdempotencyLedger};
+pub use reborn_services::{
+    RebornCancelRunResponse, RebornCreateThreadResponse, RebornResolveGateResponse,
+    RebornResumeGateResponse, RebornServices, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornStreamEventsRequest, RebornStreamEventsResponse,
+    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
+};
+pub use webui_inbound::{
+    WebUiAuthenticatedCaller, WebUiCancelReason, WebUiCancelRunRequest, WebUiCreateThreadRequest,
+    WebUiGateResolution, WebUiInboundCommand, WebUiInboundValidationCode,
+    WebUiInboundValidationError, WebUiResolveGateRequest, WebUiSendMessageRequest,
+};
+pub use workflow::DefaultProductWorkflow;
