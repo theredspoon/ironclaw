@@ -615,6 +615,10 @@ fn boundary_rules() -> Vec<BoundaryRule> {
             ],
         },
         BoundaryRule {
+            // Registry is a contracts-only Reborn crate. Runtime/dispatcher/engine
+            // crates would invert ownership, secrets crates could expose raw
+            // material instead of opaque handles, and v1 WASM/channel crates
+            // would bypass the Reborn registry boundary.
             crate_name: "ironclaw_product_adapter_registry",
             forbidden: vec![
                 "ironclaw",

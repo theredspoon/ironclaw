@@ -386,6 +386,7 @@ fn rejects_value_shaped_credentials_in_component_ref() {
         "xoxp-1234567890-abcdef",
         "xoxs-1234567890-abcdef",
         "xoxe-1234567890-abcdef",
+        "AKIASOMEFAKEAWSKEYID",
         "ASIASOMEFAKEAWSKEYID",
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.signature",
     ];
@@ -412,4 +413,27 @@ flags = ["inbound_messages"]
             "value {value} should trip inline-secret guard, got {err:?}"
         );
     }
+}
+
+#[test]
+fn accepts_component_ref_with_aws_like_prefix_but_not_key_shape() {
+    let raw = r#"
+api_version = "ironclaw.product_adapter_manifest/v1"
+kind = "ProductAdapterManifest"
+adapter_id = "asian-markets-adapter"
+version = "0.1.0"
+surface_kind = "external_channel"
+component_ref = "asian-markets-adapter"
+
+[auth]
+kind = "bearer_token"
+
+[capabilities]
+flags = ["inbound_messages"]
+"#;
+
+    ProductAdapterManifestDocument::from_toml(raw)
+        .unwrap()
+        .into_manifest()
+        .unwrap();
 }

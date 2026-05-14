@@ -22,17 +22,23 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+/// Opaque reference to the adapter component artifact named by a manifest.
+///
+/// This crate treats the reference as data only; loading and resolving the
+/// component belongs to runtime layers outside the registry boundary.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ProductAdapterComponentRef(String);
 
 impl ProductAdapterComponentRef {
+    /// Builds a component reference after rejecting empty/control-character values.
     pub fn new(value: impl Into<String>) -> Result<Self, RegistryError> {
         let value = value.into();
         validate_nonempty_noncontrol("component_ref", &value)?;
         Ok(Self(value))
     }
 
+    /// Returns the original component-reference string.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -48,17 +54,25 @@ impl<'de> Deserialize<'de> for ProductAdapterComponentRef {
     }
 }
 
+/// Opaque manifest revision token used for equality-based pinning.
+///
+/// Current validation only rejects empty/control-character values because this
+/// contracts crate does not choose a digest algorithm. Future callers that rely
+/// on cryptographic authenticity should tighten this to an algorithm-qualified
+/// digest shape before accepting external input.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ManifestHash(String);
 
 impl ManifestHash {
+    /// Builds a manifest hash token after rejecting empty/control-character values.
     pub fn new(value: impl Into<String>) -> Result<Self, RegistryError> {
         let value = value.into();
         validate_nonempty_noncontrol("manifest_hash", &value)?;
         Ok(Self(value))
     }
 
+    /// Returns the original manifest hash token.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -74,6 +88,7 @@ impl<'de> Deserialize<'de> for ManifestHash {
     }
 }
 
+/// Adapter manifest identity captured by an installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductAdapterManifestRef {
     adapter_id: ProductAdapterId,
@@ -81,6 +96,7 @@ pub struct ProductAdapterManifestRef {
 }
 
 impl ProductAdapterManifestRef {
+    /// Creates a reference to an adapter manifest and optional revision token.
     pub fn new(adapter_id: ProductAdapterId, manifest_hash: Option<ManifestHash>) -> Self {
         Self {
             adapter_id,
@@ -88,10 +104,12 @@ impl ProductAdapterManifestRef {
         }
     }
 
+    /// Returns the adapter id this reference targets.
     pub fn adapter_id(&self) -> &ProductAdapterId {
         &self.adapter_id
     }
 
+    /// Returns the optional manifest revision token pinned by this reference.
     pub fn manifest_hash(&self) -> Option<&ManifestHash> {
         self.manifest_hash.as_ref()
     }
@@ -261,6 +279,11 @@ pub struct ProductAdapterManifest {
 }
 
 impl ProductAdapterManifest {
+    /// Builds a validated adapter manifest.
+    ///
+    /// Validation guarantees required credentials are unique, declared egress
+    /// targets do not duplicate `(host, credential_handle)` pairs, and every
+    /// egress credential handle is declared in `required_credentials`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         adapter_id: ProductAdapterId,
@@ -288,38 +311,47 @@ impl ProductAdapterManifest {
         Ok(manifest)
     }
 
+    /// Returns the stable adapter id declared by this manifest.
     pub fn adapter_id(&self) -> &ProductAdapterId {
         &self.adapter_id
     }
 
+    /// Returns the adapter implementation version declared by this manifest.
     pub fn version(&self) -> &Version {
         &self.version
     }
 
+    /// Returns the product surface this adapter integrates with.
     pub fn surface_kind(&self) -> ProductSurfaceKind {
         self.surface_kind
     }
 
+    /// Returns the component artifact reference; this crate never loads it.
     pub fn component_ref(&self) -> &ProductAdapterComponentRef {
         &self.component_ref
     }
 
+    /// Returns capability flags exposed by the adapter.
     pub fn capabilities(&self) -> &ProductAdapterCapabilities {
         &self.capabilities
     }
 
+    /// Returns inbound authentication requirements for this adapter.
     pub fn auth_requirement(&self) -> &AuthRequirement {
         &self.auth_requirement
     }
 
+    /// Returns egress destinations and optional credential handles.
     pub fn declared_egress(&self) -> &[DeclaredEgressTarget] {
         &self.declared_egress
     }
 
+    /// Returns credential handles an installation may bind to secret handles.
     pub fn required_credentials(&self) -> &[EgressCredentialHandle] {
         &self.required_credentials
     }
 
+    /// Returns optional revision token used for installation pinning.
     pub fn manifest_hash(&self) -> Option<&ManifestHash> {
         self.manifest_hash.as_ref()
     }
@@ -406,6 +438,7 @@ pub struct ProductAdapterCredentialBinding {
 }
 
 impl ProductAdapterCredentialBinding {
+    /// Binds an adapter-declared credential handle to an opaque host secret handle.
     pub fn new(credential_handle: EgressCredentialHandle, secret_handle: SecretHandle) -> Self {
         Self {
             credential_handle,
@@ -413,15 +446,18 @@ impl ProductAdapterCredentialBinding {
         }
     }
 
+    /// Returns the credential handle declared by the adapter manifest.
     pub fn credential_handle(&self) -> &EgressCredentialHandle {
         &self.credential_handle
     }
 
+    /// Returns the opaque host secret handle for runtime lookup.
     pub fn secret_handle(&self) -> &SecretHandle {
         &self.secret_handle
     }
 }
 
+/// Last known runtime health for an installed adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProductAdapterHealthSnapshot {
     status: ProductAdapterHealth,
@@ -430,6 +466,9 @@ pub struct ProductAdapterHealthSnapshot {
 }
 
 impl ProductAdapterHealthSnapshot {
+    /// Creates a health snapshot.
+    ///
+    /// Messages must already be redacted by callers via [`RedactedString`].
     pub fn new(
         status: ProductAdapterHealth,
         checked_at: Option<DateTime<Utc>>,
@@ -442,18 +481,22 @@ impl ProductAdapterHealthSnapshot {
         }
     }
 
+    /// Returns a default healthy snapshot with no check timestamp/message.
     pub fn healthy() -> Self {
         Self::new(ProductAdapterHealth::Healthy, None, None)
     }
 
+    /// Returns health status.
     pub fn status(&self) -> ProductAdapterHealth {
         self.status
     }
 
+    /// Returns time the health status was checked, if known.
     pub fn checked_at(&self) -> Option<DateTime<Utc>> {
         self.checked_at
     }
 
+    /// Returns redacted health detail, if one was supplied.
     pub fn message(&self) -> Option<&RedactedString> {
         self.message.as_ref()
     }
@@ -478,6 +521,10 @@ pub struct ProductAdapterInstallation {
 }
 
 impl ProductAdapterInstallation {
+    /// Builds a validated installation snapshot.
+    ///
+    /// Validation guarantees the manifest reference targets the same adapter id
+    /// and credential bindings do not repeat adapter-declared handles.
     pub fn new(
         installation_id: AdapterInstallationId,
         adapter_id: ProductAdapterId,
@@ -505,30 +552,37 @@ impl ProductAdapterInstallation {
         Ok(installation)
     }
 
+    /// Returns unique installation id.
     pub fn installation_id(&self) -> &AdapterInstallationId {
         &self.installation_id
     }
 
+    /// Returns adapter id this installation instantiates.
     pub fn adapter_id(&self) -> &ProductAdapterId {
         &self.adapter_id
     }
 
+    /// Returns current activation state.
     pub fn activation_state(&self) -> ProductAdapterActivationState {
         self.activation_state
     }
 
+    /// Returns manifest reference captured by this installation.
     pub fn manifest_ref(&self) -> &ProductAdapterManifestRef {
         &self.manifest_ref
     }
 
+    /// Returns credential-handle bindings for runtime secret lookup.
     pub fn credential_bindings(&self) -> &[ProductAdapterCredentialBinding] {
         &self.credential_bindings
     }
 
+    /// Returns last known runtime health.
     pub fn health(&self) -> &ProductAdapterHealthSnapshot {
         &self.health
     }
 
+    /// Returns last time activation state or health changed.
     pub fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
@@ -586,28 +640,40 @@ impl<'de> Deserialize<'de> for ProductAdapterInstallation {
     }
 }
 
+/// Errors raised while parsing manifests, validating registry contracts, or mutating store state.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RegistryError {
+    /// A typed field failed local syntax/value validation.
     #[error("invalid {field}: {reason}")]
     InvalidValue { field: &'static str, reason: String },
+    /// A manifest declared the same required credential handle more than once.
     #[error("duplicate credential handle {handle}")]
     DuplicateCredentialHandle { handle: EgressCredentialHandle },
+    /// An installation bound the same credential handle more than once.
     #[error("duplicate credential binding {handle}")]
     DuplicateCredentialBinding { handle: EgressCredentialHandle },
+    /// A manifest declared the same `(host, credential_handle)` egress pair more than once.
     #[error("duplicate egress target")]
     DuplicateEgressTarget,
+    /// A manifest egress entry references a credential handle not declared as required.
     #[error("egress references undeclared credential handle {handle}")]
     UndeclaredEgressCredentialHandle { handle: EgressCredentialHandle },
+    /// TOML or serde parsing failed before producing a validated manifest document.
     #[error("product adapter manifest parse failed: {reason}")]
     ManifestParse { reason: String },
+    /// Manifest `api_version` is not supported by this crate.
     #[error("unsupported product adapter manifest api_version {api_version}")]
     UnsupportedManifestVersion { api_version: String },
+    /// Manifest ingestion found inline secret material in a field/key/value.
     #[error("inline secret material is not allowed in manifest field {field}")]
     InlineSecretMaterial { field: String },
+    /// Installation references an adapter id with no registered manifest.
     #[error("installation references unknown adapter manifest {adapter_id}")]
     UnknownManifest { adapter_id: ProductAdapterId },
+    /// Installation binds a credential handle absent from the registered manifest.
     #[error("installation binds undeclared credential handle {handle}")]
     UndeclaredCredentialHandle { handle: EgressCredentialHandle },
+    /// Installation adapter id and manifest-reference adapter id disagree.
     #[error(
         "installation adapter {adapter_id} does not match manifest adapter {manifest_adapter_id}"
     )]
@@ -615,45 +681,133 @@ pub enum RegistryError {
         adapter_id: ProductAdapterId,
         manifest_adapter_id: ProductAdapterId,
     },
+    /// Installation manifest hash and registered manifest hash are not symmetrically equal.
     #[error("installation manifest hash does not match registered manifest hash for {adapter_id}")]
     ManifestHashMismatch { adapter_id: ProductAdapterId },
+    /// Requested installation id does not exist in the store.
     #[error("installation {installation_id} was not found")]
     InstallationNotFound {
         installation_id: AdapterInstallationId,
     },
 }
 
+/// Async persistence contract for product adapter manifests and installations.
+///
+/// Implementations must preserve cross-write invariants: stored installations
+/// remain valid against their registered manifest, and activation transitions to
+/// [`ProductAdapterActivationState::Enabled`] re-validate against current
+/// manifest state before persisting.
 #[async_trait]
 pub trait ProductAdapterRegistryStore: Send + Sync {
+    /// Lists all registered manifests sorted by adapter id.
     async fn list_manifests(&self) -> Result<Vec<ProductAdapterManifest>, RegistryError>;
+
+    /// Fetches a manifest by adapter id, returning `None` when absent.
     async fn get_manifest(
         &self,
         adapter_id: &ProductAdapterId,
     ) -> Result<Option<ProductAdapterManifest>, RegistryError>;
+
+    /// Inserts or replaces a manifest after validating every affected installation.
     async fn upsert_manifest(&self, manifest: ProductAdapterManifest) -> Result<(), RegistryError>;
 
+    /// Lists all installations sorted by installation id.
     async fn list_installations(&self) -> Result<Vec<ProductAdapterInstallation>, RegistryError>;
+
+    /// Lists installations currently enabled for runtime traffic, sorted by installation id.
     async fn list_enabled_installations(
         &self,
     ) -> Result<Vec<ProductAdapterInstallation>, RegistryError>;
+
+    /// Fetches an installation by id, returning `None` when absent.
     async fn get_installation(
         &self,
         installation_id: &AdapterInstallationId,
     ) -> Result<Option<ProductAdapterInstallation>, RegistryError>;
+
+    /// Inserts or replaces an installation after validating it against its registered manifest.
     async fn upsert_installation(
         &self,
         installation: ProductAdapterInstallation,
     ) -> Result<(), RegistryError>;
+
+    /// Changes activation state and updates `updated_at` only when state changes.
+    ///
+    /// Enabling re-validates against the current manifest; disabling or marking
+    /// installed remains allowed so operators can quarantine invalid state.
     async fn set_activation_state(
         &self,
         installation_id: &AdapterInstallationId,
         state: ProductAdapterActivationState,
     ) -> Result<(), RegistryError>;
+
+    /// Replaces last-known health and updates `updated_at`.
     async fn update_health(
         &self,
         installation_id: &AdapterInstallationId,
         health: ProductAdapterHealthSnapshot,
     ) -> Result<(), RegistryError>;
+}
+
+#[async_trait]
+impl<T> ProductAdapterRegistryStore for Arc<T>
+where
+    T: ProductAdapterRegistryStore + ?Sized,
+{
+    async fn list_manifests(&self) -> Result<Vec<ProductAdapterManifest>, RegistryError> {
+        (**self).list_manifests().await
+    }
+
+    async fn get_manifest(
+        &self,
+        adapter_id: &ProductAdapterId,
+    ) -> Result<Option<ProductAdapterManifest>, RegistryError> {
+        (**self).get_manifest(adapter_id).await
+    }
+
+    async fn upsert_manifest(&self, manifest: ProductAdapterManifest) -> Result<(), RegistryError> {
+        (**self).upsert_manifest(manifest).await
+    }
+
+    async fn list_installations(&self) -> Result<Vec<ProductAdapterInstallation>, RegistryError> {
+        (**self).list_installations().await
+    }
+
+    async fn list_enabled_installations(
+        &self,
+    ) -> Result<Vec<ProductAdapterInstallation>, RegistryError> {
+        (**self).list_enabled_installations().await
+    }
+
+    async fn get_installation(
+        &self,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<Option<ProductAdapterInstallation>, RegistryError> {
+        (**self).get_installation(installation_id).await
+    }
+
+    async fn upsert_installation(
+        &self,
+        installation: ProductAdapterInstallation,
+    ) -> Result<(), RegistryError> {
+        (**self).upsert_installation(installation).await
+    }
+
+    async fn set_activation_state(
+        &self,
+        installation_id: &AdapterInstallationId,
+        state: ProductAdapterActivationState,
+    ) -> Result<(), RegistryError> {
+        (**self).set_activation_state(installation_id, state).await
+    }
+
+    async fn update_health(
+        &self,
+        installation_id: &AdapterInstallationId,
+        health: ProductAdapterHealthSnapshot,
+    ) -> Result<(), RegistryError> {
+        (**self).update_health(installation_id, health).await
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -709,16 +863,14 @@ impl ProductAdapterRegistryStore for InMemoryProductAdapterRegistryStore {
     async fn list_enabled_installations(
         &self,
     ) -> Result<Vec<ProductAdapterInstallation>, RegistryError> {
-        let mut installations: Vec<_> = self
+        Ok(self
             .list_installations()
             .await?
             .into_iter()
             .filter(|installation| {
                 installation.activation_state() == ProductAdapterActivationState::Enabled
             })
-            .collect();
-        installations.sort_by(|a, b| a.installation_id().cmp(b.installation_id()));
-        Ok(installations)
+            .collect())
     }
 
     async fn get_installation(
@@ -753,24 +905,24 @@ impl ProductAdapterRegistryStore for InMemoryProductAdapterRegistryStore {
         state: ProductAdapterActivationState,
     ) -> Result<(), RegistryError> {
         let mut inner = self.inner.write().await;
-        let installation = inner.installations.get(installation_id).ok_or_else(|| {
+        let InMemoryRegistryState {
+            manifests,
+            installations,
+        } = &mut *inner;
+        let installation = installations.get_mut(installation_id).ok_or_else(|| {
             RegistryError::InstallationNotFound {
                 installation_id: installation_id.clone(),
             }
         })?;
+        if installation.activation_state() == state {
+            return Ok(());
+        }
         // Cross-write invariant: enabling an installation must re-check it
         // against the current manifest. Disabling/marking installed is
         // always allowed so operators can quarantine misconfigured state.
         if state == ProductAdapterActivationState::Enabled {
-            validate_installation_against_manifest(&inner.manifests, installation)?;
+            validate_installation_against_manifest(manifests, installation)?;
         }
-        // Re-borrow mutably now that the validation borrow has been released.
-        // The same write lock guards both the prior immutable lookup and this
-        // mutable re-borrow, so the entry is guaranteed to still be present.
-        let installation = inner
-            .installations
-            .get_mut(installation_id)
-            .expect("installation was just looked up under the same write lock"); // safety: held under the same RwLock write guard as the prior lookup
         installation.set_activation_state(state);
         Ok(())
     }
@@ -882,10 +1034,8 @@ fn looks_like_inline_secret(value: &str) -> bool {
         "ghu_",  // GitHub user-to-server
         "ghs_",  // GitHub server-to-server
         "ghr_",  // GitHub refresh
-        "akia",  // AWS access key (case-insensitive after lowercase)
-        "asia",  // AWS short-term access key
     ];
-    if PREFIXES.iter().any(|p| lower.starts_with(p)) {
+    if PREFIXES.iter().any(|p| lower.starts_with(p)) || looks_like_aws_access_key(value) {
         return true;
     }
     if lower.contains("begin private key") || lower.contains("begin rsa private key") {
@@ -901,6 +1051,21 @@ fn looks_like_inline_secret(value: &str) -> bool {
         return true;
     }
     looks_like_telegram_token(value)
+}
+
+fn looks_like_aws_access_key(value: &str) -> bool {
+    if value.len() != 20 {
+        return false;
+    }
+    let Some(prefix) = value.get(..4) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("AKIA") && !prefix.eq_ignore_ascii_case("ASIA") {
+        return false;
+    }
+    value[4..]
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 fn has_uri_userinfo(value: &str) -> bool {

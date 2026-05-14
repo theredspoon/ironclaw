@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use ironclaw_host_api::SecretHandle;
 use ironclaw_product_adapter_registry::{
@@ -28,8 +30,8 @@ fn host(value: &str) -> DeclaredEgressHost {
     DeclaredEgressHost::new(value).unwrap()
 }
 
-fn secret(value: &str) -> SecretHandle {
-    SecretHandle::new(value).unwrap()
+fn secret_handle(value: &str) -> SecretHandle {
+    SecretHandle::new(format!("secret_{value}")).unwrap()
 }
 
 fn manifest() -> ProductAdapterManifest {
@@ -64,7 +66,7 @@ fn installation(state: ProductAdapterActivationState) -> ProductAdapterInstallat
         ),
         vec![ProductAdapterCredentialBinding::new(
             credential("telegram_bot_token"),
-            secret("telegram_bot_token"),
+            secret_handle("telegram-prod-bot-token"),
         )],
         Utc::now(),
     )
@@ -113,6 +115,44 @@ async fn explicit_activation_makes_installation_enabled() {
 }
 
 #[tokio::test]
+async fn no_op_activation_transition_does_not_update_timestamp() {
+    let store = InMemoryProductAdapterRegistryStore::default();
+    store.upsert_manifest(manifest()).await.unwrap();
+    let id = installation_id("acme-telegram-prod");
+    store
+        .upsert_installation(installation(ProductAdapterActivationState::Installed))
+        .await
+        .unwrap();
+    let before = store
+        .get_installation(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at();
+
+    store
+        .set_activation_state(&id, ProductAdapterActivationState::Installed)
+        .await
+        .unwrap();
+
+    let after = store
+        .get_installation(&id)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at();
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn arc_store_delegates_to_inner_store() {
+    let store = Arc::new(InMemoryProductAdapterRegistryStore::default());
+    store.upsert_manifest(manifest()).await.unwrap();
+
+    assert_eq!(store.list_manifests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn credential_binding_must_reference_declared_manifest_handle() {
     let store = InMemoryProductAdapterRegistryStore::default();
     store.upsert_manifest(manifest()).await.unwrap();
@@ -131,7 +171,7 @@ async fn credential_binding_must_reference_declared_manifest_handle() {
         ),
         vec![ProductAdapterCredentialBinding::new(
             credential("slack_bot_token"),
-            secret("slack_bot_token"),
+            secret_handle("slack-prod-bot-token"),
         )],
         Utc::now(),
     )
@@ -161,11 +201,11 @@ fn duplicate_credential_bindings_rejected_at_construction() {
         vec![
             ProductAdapterCredentialBinding::new(
                 credential("telegram_bot_token"),
-                secret("telegram_bot_token"),
+                secret_handle("telegram-prod-bot-token"),
             ),
             ProductAdapterCredentialBinding::new(
                 credential("telegram_bot_token"),
-                secret("telegram_bot_token_shadow"),
+                secret_handle("telegram-prod-bot-token-shadow"),
             ),
         ],
         Utc::now(),
@@ -226,7 +266,7 @@ async fn manifest_hash_mismatch_is_rejected() {
         ),
         vec![ProductAdapterCredentialBinding::new(
             credential("telegram_bot_token"),
-            secret("telegram_bot_token"),
+            secret_handle("telegram-prod-bot-token"),
         )],
         Utc::now(),
     )
