@@ -4267,6 +4267,7 @@ dependencies = [
  "async-trait",
  "deadpool-postgres",
  "ironclaw_host_api",
+ "ironclaw_safety",
  "libsql",
  "tempfile",
  "thiserror 2.0.18",
@@ -4306,9 +4307,12 @@ name = "ironclaw_host_runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
+ "chrono-tz",
  "deadpool-postgres",
  "futures-util",
+ "glob",
  "ironclaw_approvals",
  "ironclaw_authorization",
  "ironclaw_capabilities",
@@ -4333,6 +4337,7 @@ dependencies = [
  "ironclaw_turns",
  "ironclaw_wasm",
  "libsql",
+ "regex",
  "rust_decimal",
  "secrecy",
  "serde_json",
@@ -4408,10 +4413,7 @@ name = "ironclaw_mcp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "ironclaw_dispatcher",
- "ironclaw_events",
  "ironclaw_extensions",
- "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_resources",
  "serde_json",
@@ -4497,13 +4499,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironclaw_product_adapters"
+name = "ironclaw_product_adapter_registry"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
  "ironclaw_host_api",
  "ironclaw_product_adapters",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "ironclaw_product_adapters"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ironclaw_host_api",
  "ironclaw_turns",
  "serde",
  "serde_json",
@@ -4539,6 +4556,8 @@ dependencies = [
  "chrono",
  "futures-util",
  "ironclaw_authorization",
+ "ironclaw_event_projections",
+ "ironclaw_events",
  "ironclaw_extensions",
  "ironclaw_filesystem",
  "ironclaw_host_api",
@@ -4546,6 +4565,7 @@ dependencies = [
  "ironclaw_llm",
  "ironclaw_loop_support",
  "ironclaw_processes",
+ "ironclaw_reborn_event_store",
  "ironclaw_resources",
  "ironclaw_scripts",
  "ironclaw_secrets",
@@ -4573,7 +4593,35 @@ dependencies = [
  "clap_complete",
  "ironclaw_reborn",
  "ironclaw_reborn_config",
+ "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ironclaw_reborn_composition"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "deadpool-postgres",
+ "ironclaw_authorization",
+ "ironclaw_extensions",
+ "ironclaw_filesystem",
+ "ironclaw_host_api",
+ "ironclaw_host_runtime",
+ "ironclaw_network",
+ "ironclaw_processes",
+ "ironclaw_reborn_event_store",
+ "ironclaw_resources",
+ "ironclaw_run_state",
+ "ironclaw_secrets",
+ "ironclaw_trust",
+ "ironclaw_turns",
+ "libsql",
+ "secrecy",
+ "tempfile",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -4676,11 +4724,7 @@ dependencies = [
 name = "ironclaw_scripts"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "ironclaw_dispatcher",
- "ironclaw_events",
  "ironclaw_extensions",
- "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_resources",
  "rust_decimal_macros",
@@ -4743,6 +4787,21 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ironclaw_telegram_v2_adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ironclaw_product_adapters",
+ "ironclaw_turns",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4839,6 +4898,23 @@ dependencies = [
  "wat",
  "wit-component 0.245.1",
  "wit-parser 0.245.1",
+]
+
+[[package]]
+name = "ironclaw_wasm_product_adapters"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "hmac 0.12.1",
+ "http 1.4.0",
+ "ironclaw_product_adapters",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

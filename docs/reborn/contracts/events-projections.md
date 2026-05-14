@@ -262,12 +262,20 @@ Durable backends must match `InMemoryDurableEventLog` cursor behavior:
 
 Product-facing timeline, status, approval, auth, tool-call, process, resource, and memory views should be projections over durable logs, not a second source of truth. Projection services must tolerate replay gaps with explicit snapshot/rebase behavior and must not mutate control-plane state while deriving read models.
 
+Run status projections are projection-local read models. Model/reply milestone events use this status mapping:
+
+- `ModelStarted`, `ModelCompleted`, and `ModelFailed` keep the run `running`; model completion means the provider returned, and model failure is attempt-level progress that may be retried/recovered.
+- `AssistantReplyFinalized` marks the run `completed` for metadata-only loop model/reply runs until richer terminal turn-run events are available.
+- `LoopCompleted` and `LoopFailed` are trusted terminal loop milestones; they mark the run `completed` or `failed` with sanitized `error_kind` only.
+
 ### Outbound egress and subscription state
 
-`ironclaw_outbound` owns the metadata-only state needed around projection delivery:
+`ironclaw_outbound` owns the metadata-only state and policy seams needed around projection delivery:
 
 - per-thread notification policy for explicit external fanout and progress opt-in;
 - durable projection subscription cursor checkpoints scoped to actor, thread, and `ProjectionScope`;
+- a projection access-policy port that authorizes actor/thread visibility before subscription cursor state is created;
+- a reply-target validation port used before each external push candidate is turned into a delivery attempt;
 - outbound delivery attempt/status rows for support-visible retry/dead-letter workflows.
 
-This state is not canonical transcript or projection content. Rows store refs, cursors, status enums, timestamps, and sanitized failure kinds only. Product adapters still revalidate reply-target binding authorization before every external push, and delivery failure must not mutate canonical transcript/projection state or mark turns/runs failed.
+This state is not canonical transcript or projection content. Rows store refs, cursors, status enums, timestamps, and sanitized failure kinds only. Product adapters still revalidate reply-target binding authorization before every external push, and delivery failure must not mutate canonical transcript/projection state or mark turns/runs failed. If reply-target authorization is revoked at delivery time, the outbound policy service records a sanitized `authorization_revoked` delivery failure and does not return a sendable target.
