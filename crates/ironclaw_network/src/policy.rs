@@ -154,7 +154,10 @@ pub(crate) fn network_policy_allows(policy: &NetworkPolicy, target: &NetworkTarg
         .any(|pattern| target_matches_pattern(target, pattern))
 }
 
-pub(crate) fn target_matches_pattern(target: &NetworkTarget, pattern: &NetworkTargetPattern) -> bool {
+pub(crate) fn target_matches_pattern(
+    target: &NetworkTarget,
+    pattern: &NetworkTargetPattern,
+) -> bool {
     if let Some(scheme) = pattern.scheme
         && scheme != target.scheme
     {

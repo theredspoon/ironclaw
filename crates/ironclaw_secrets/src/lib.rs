@@ -28,8 +28,8 @@ use ironclaw_host_api::{
     AgentId, CapabilityId, ExtensionId, InvocationId, MissionId, NetworkMethod, ProjectId,
     ResourceScope, SecretHandle, TenantId, ThreadId, Timestamp, UserId,
 };
-pub use legacy_store::{CreateSecretParams, SecretConsumeResult, SecretError, SecretsStore};
 use legacy_store::InMemorySecretsStore;
+pub use legacy_store::{CreateSecretParams, SecretConsumeResult, SecretError, SecretsStore};
 pub use secrecy::SecretString as SecretMaterial;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

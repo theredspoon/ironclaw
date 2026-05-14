@@ -1882,7 +1882,7 @@ struct FirstPartyRuntimeAdapter {
 }
 
 impl FirstPartyRuntimeAdapter {
-    pub fn from_registry(
+    pub(crate) fn from_registry(
         registry: Arc<FirstPartyCapabilityRegistry>,
         filesystem: Arc<dyn RootFilesystem>,
     ) -> Self {
@@ -1998,7 +1998,7 @@ struct WasmRuntimeAdapter {
 }
 
 impl WasmRuntimeAdapter {
-    pub fn new(
+    pub(crate) fn new(
         runtime: WitToolRuntime,
         host: WitToolHost,
         network_policy_store: Arc<NetworkObligationPolicyStore>,
@@ -2015,7 +2015,7 @@ impl WasmRuntimeAdapter {
         }
     }
 
-    pub fn try_new(
+    pub(crate) fn try_new(
         config: WitToolRuntimeConfig,
         host: WitToolHost,
         network_policy_store: Arc<NetworkObligationPolicyStore>,
@@ -2145,7 +2145,7 @@ struct RuntimeDispatchProcessExecutor {
 }
 
 impl RuntimeDispatchProcessExecutor {
-    pub fn new(dispatcher: Arc<dyn CapabilityDispatcher>) -> Self {
+    pub(crate) fn new(dispatcher: Arc<dyn CapabilityDispatcher>) -> Self {
         Self { dispatcher }
     }
 }
