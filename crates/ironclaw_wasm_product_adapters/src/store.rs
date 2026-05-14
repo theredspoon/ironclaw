@@ -95,7 +95,7 @@ impl bindings::near::product_adapter::product_adapter_host::Host for StoreData {
         // TTLs, idempotency windows, or token-validity comparisons on the
         // assumption that successive calls are non-decreasing; use the
         // values for logging/timestamps only.
-        chrono::Utc::now().timestamp_millis().max(0) as u64
+        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
     }
 
     fn http_egress(
@@ -126,7 +126,12 @@ fn truncate_log_message(message: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LOG_MESSAGE_BYTES, truncate_log_message};
+    use std::time::Duration;
+
+    use crate::bindings::near::product_adapter::product_adapter_host::{Host, LogLevel};
+    use crate::config::MAX_LOGS_PER_EXECUTION;
+
+    use super::{MAX_LOG_MESSAGE_BYTES, StoreData, truncate_log_message};
 
     #[test]
     fn truncate_log_message_respects_utf8_boundaries() {
@@ -134,5 +139,31 @@ mod tests {
         let truncated = truncate_log_message(message);
         assert!(truncated.len() <= MAX_LOG_MESSAGE_BYTES);
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn host_log_import_caps_records_at_runtime_boundary() {
+        let mut data = StoreData::new(1024 * 1024, Duration::from_secs(1));
+
+        for index in 0..=MAX_LOGS_PER_EXECUTION {
+            Host::log(&mut data, LogLevel::Info, format!("log-{index}"));
+        }
+
+        assert_eq!(data.logs.len(), MAX_LOGS_PER_EXECUTION);
+        assert_eq!(
+            data.logs.last().expect("last retained log").message,
+            format!("log-{}", MAX_LOGS_PER_EXECUTION - 1)
+        );
+    }
+
+    #[test]
+    fn host_log_import_truncates_messages_at_runtime_boundary() {
+        let mut data = StoreData::new(1024 * 1024, Duration::from_secs(1));
+
+        Host::log(&mut data, LogLevel::Warn, "é".repeat(MAX_LOG_MESSAGE_BYTES));
+
+        let message = &data.logs[0].message;
+        assert!(message.len() <= MAX_LOG_MESSAGE_BYTES);
+        assert!(message.is_char_boundary(message.len()));
     }
 }

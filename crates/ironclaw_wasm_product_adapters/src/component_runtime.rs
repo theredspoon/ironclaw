@@ -407,11 +407,7 @@ fn validate_rendered_egress_request(
         field,
         message: "must be a JSON object".to_string(),
     })?;
-    let index = required_u64_field(
-        object,
-        field,
-        &["egress_target_index", "egress-target-index"],
-    )?;
+    let index = required_u64_field(object, field, "egress_target_index")?;
     let index = usize::try_from(index).map_err(|_| RuntimeError::InvalidJson {
         field,
         message: "egress_target_index is too large".to_string(),
@@ -481,15 +477,14 @@ fn validate_rendered_egress_request(
 fn required_u64_field(
     object: &serde_json::Map<String, Value>,
     field: &'static str,
-    names: &[&str],
+    name: &'static str,
 ) -> Result<u64, RuntimeError> {
-    names
-        .iter()
-        .find_map(|name| object.get(*name))
+    object
+        .get(name)
         .and_then(Value::as_u64)
         .ok_or_else(|| RuntimeError::InvalidJson {
             field,
-            message: format!("must include numeric {}", names[0]),
+            message: format!("must include numeric {name}"),
         })
 }
 
@@ -562,6 +557,12 @@ fn ensure_execution_not_timed_out(
 }
 
 fn execution_failed(message: String, store: &Store<StoreData>) -> RuntimeError {
+    let message = if matches!(store.get_fuel(), Ok(0)) {
+        format!("WASM ProductAdapter execution fuel exhausted: {message}")
+    } else {
+        message
+    };
+
     RuntimeError::ExecutionFailed {
         message,
         logs: store.data().logs.clone(),
@@ -575,5 +576,24 @@ fn classify_instantiation_error(message: String) -> RuntimeError {
         ))
     } else {
         RuntimeError::InstantiationFailed(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PRODUCT_ADAPTER_WIT_VERSION, RuntimeError, classify_instantiation_error};
+
+    #[test]
+    fn instantiation_error_classifier_pins_current_wit_import_diagnostic() {
+        let err = classify_instantiation_error(
+            "unknown import near:product-adapter/product-adapter-host@0.1.0".to_string(),
+        );
+
+        assert!(
+            matches!(err, RuntimeError::InstantiationFailed(ref message)
+                if message.contains("different WIT version")
+                    && message.contains(PRODUCT_ADAPTER_WIT_VERSION)),
+            "{err:?}"
+        );
     }
 }
