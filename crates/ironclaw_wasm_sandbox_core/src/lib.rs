@@ -105,15 +105,17 @@ impl WasiView for SandboxStoreCore {
 
 /// Wasmtime ResourceLimiter implementation from the v1 WASM sandbox.
 ///
-/// This intentionally mirrors v1 behavior: memory checks compare desired
-/// memory size to the per-memory limit, allow reasonable table growth, and
-/// permit multiple component-model internal instances/memories.
+/// This intentionally mirrors the Reborn v1 behavior: memory checks track
+/// aggregate growth across component-model memories while still permitting
+/// multiple internal instances/memories.
 #[derive(Debug)]
 pub struct WasmResourceLimiter {
     memory_limit: u64,
     memory_used: u64,
+    pending_memory_growth: u64,
     max_tables: u32,
     max_instances: u32,
+    max_memories: u32,
 }
 
 impl WasmResourceLimiter {
@@ -121,8 +123,10 @@ impl WasmResourceLimiter {
         Self {
             memory_limit,
             memory_used: 0,
+            pending_memory_growth: 0,
             max_tables: 10,
             max_instances: 10,
+            max_memories: 10,
         }
     }
 
@@ -142,26 +146,43 @@ impl ResourceLimiter for WasmResourceLimiter {
         desired: usize,
         _maximum: Option<usize>,
     ) -> Result<bool, wasmtime::Error> {
-        let desired_u64 = desired as u64;
+        self.pending_memory_growth = 0;
 
-        if desired_u64 > self.memory_limit {
+        let current = current as u64;
+        let desired = desired as u64;
+        let growth = desired.saturating_sub(current);
+        let total_memory = self.memory_used.saturating_add(growth);
+        if total_memory > self.memory_limit {
             tracing::warn!(
-                current = current,
-                desired = desired,
+                current,
+                desired,
+                growth,
+                used = self.memory_used,
+                total = total_memory,
                 limit = self.memory_limit,
-                "WASM memory growth denied: would exceed limit"
+                "WASM memory growth denied"
             );
             return Ok(false);
         }
 
-        self.memory_used = desired_u64;
+        self.memory_used = total_memory;
+        self.pending_memory_growth = growth;
         tracing::trace!(
-            current = current,
-            desired = desired,
+            current,
+            desired,
+            growth,
+            used = self.memory_used,
             limit = self.memory_limit,
             "WASM memory growth allowed"
         );
         Ok(true)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> Result<(), wasmtime::Error> {
+        self.memory_used = self.memory_used.saturating_sub(self.pending_memory_growth);
+        self.pending_memory_growth = 0;
+        tracing::debug!(error = ?error, "WASM memory growth failed after approval");
+        Ok(())
     }
 
     fn table_growing(
@@ -190,7 +211,7 @@ impl ResourceLimiter for WasmResourceLimiter {
     }
 
     fn memories(&self) -> usize {
-        self.max_instances as usize
+        self.max_memories as usize
     }
 }
 
@@ -279,15 +300,11 @@ mod tests {
     }
 
     #[test]
-    fn limiter_matches_v1_per_memory_behavior() {
+    fn limiter_tracks_aggregate_growth_across_memories() {
         let mut limiter = WasmResourceLimiter::new(128 * 1024);
         assert!(limiter.memory_growing(0, 64 * 1024, None).unwrap());
-        assert!(limiter.memory_growing(64 * 1024, 128 * 1024, None).unwrap());
-        assert!(
-            !limiter
-                .memory_growing(128 * 1024, 129 * 1024, None)
-                .unwrap()
-        );
+        assert!(limiter.memory_growing(0, 64 * 1024, None).unwrap());
+        assert!(!limiter.memory_growing(0, 64 * 1024, None).unwrap());
     }
 
     #[test]

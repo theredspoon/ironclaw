@@ -40,6 +40,8 @@ pub enum RuntimeError {
     EngineCreationFailed(String),
     #[error("failed to compile WASM component: {0}")]
     CompilationFailed(String),
+    #[error("WASM component artifact is {actual} bytes; limit is {limit} bytes")]
+    ComponentTooLarge { actual: usize, limit: usize },
     #[error("failed to configure WASM store: {0}")]
     StoreConfiguration(String),
     #[error("failed to configure WASM linker: {0}")]
@@ -159,6 +161,12 @@ impl ProductAdapterComponentRuntime {
         name: &str,
         wasm_bytes: &[u8],
     ) -> Result<PreparedProductAdapterComponent, RuntimeError> {
+        if wasm_bytes.len() > self.config.max_component_bytes {
+            return Err(RuntimeError::ComponentTooLarge {
+                actual: wasm_bytes.len(),
+                limit: self.config.max_component_bytes,
+            });
+        }
         let component = wasmtime::component::Component::new(&self.engine, wasm_bytes)
             .map_err(|error| RuntimeError::CompilationFailed(error.to_string()))?;
         let limits = self.config.default_limits.clone();
@@ -335,6 +343,9 @@ fn auth_requirement_from_wit(
         },
         AuthRequirementKind::BearerToken => AuthRequirement::BearerToken,
     };
+    auth_requirement
+        .validate_metadata()
+        .map_err(|error| RuntimeError::InvalidManifest(error.to_string()))?;
     Ok(auth_requirement)
 }
 
@@ -581,7 +592,10 @@ fn classify_instantiation_error(message: String) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PRODUCT_ADAPTER_WIT_VERSION, RuntimeError, classify_instantiation_error};
+    use super::{
+        PRODUCT_ADAPTER_WIT_VERSION, RuntimeError, auth_requirement_from_wit,
+        classify_instantiation_error, product_adapter,
+    };
 
     #[test]
     fn instantiation_error_classifier_pins_current_wit_import_diagnostic() {
@@ -593,6 +607,57 @@ mod tests {
             matches!(err, RuntimeError::InstantiationFailed(ref message)
                 if message.contains("different WIT version")
                     && message.contains(PRODUCT_ADAPTER_WIT_VERSION)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn wit_auth_requirement_rejects_invalid_header_names() {
+        let err = auth_requirement_from_wit(product_adapter::AuthRequirement {
+            kind: product_adapter::AuthRequirementKind::SharedSecretHeader,
+            header_name: Some("X-Foo\r\nInjected".to_string()),
+            timestamp_header_name: None,
+            cookie_name: None,
+        })
+        .expect_err("invalid header");
+
+        assert!(
+            matches!(err, RuntimeError::InvalidManifest(ref message)
+                if message.contains("auth.header_name")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn wit_auth_requirement_rejects_invalid_timestamp_header_names() {
+        let err = auth_requirement_from_wit(product_adapter::AuthRequirement {
+            kind: product_adapter::AuthRequirementKind::RequestSignature,
+            header_name: Some("X-Signature".to_string()),
+            timestamp_header_name: Some("X-Time;stamp".to_string()),
+            cookie_name: None,
+        })
+        .expect_err("invalid timestamp header");
+
+        assert!(
+            matches!(err, RuntimeError::InvalidManifest(ref message)
+                if message.contains("auth.timestamp_header_name")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn wit_auth_requirement_rejects_invalid_cookie_names() {
+        let err = auth_requirement_from_wit(product_adapter::AuthRequirement {
+            kind: product_adapter::AuthRequirementKind::SessionCookie,
+            header_name: None,
+            timestamp_header_name: None,
+            cookie_name: Some("session=id".to_string()),
+        })
+        .expect_err("invalid cookie name");
+
+        assert!(
+            matches!(err, RuntimeError::InvalidManifest(ref message)
+                if message.contains("auth.name")),
             "{err:?}"
         );
     }

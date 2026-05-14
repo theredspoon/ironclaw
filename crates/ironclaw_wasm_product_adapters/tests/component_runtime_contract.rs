@@ -406,6 +406,24 @@ fn malformed_component_bytes_are_rejected() {
 }
 
 #[test]
+fn oversized_component_bytes_are_rejected_before_compilation() {
+    let config = ProductAdapterComponentRuntimeConfig {
+        max_component_bytes: 4,
+        ..ProductAdapterComponentRuntimeConfig::for_testing()
+    };
+    let runtime = ProductAdapterComponentRuntime::new(config).expect("runtime");
+    let err = runtime
+        .prepare("oversized", b"not wasm but too large")
+        .expect_err("oversized component must be rejected before compile");
+
+    assert!(
+        matches!(err, RuntimeError::ComponentTooLarge { actual, limit }
+            if actual == b"not wasm but too large".len() && limit == 4),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn component_without_product_adapter_exports_is_rejected() {
     let runtime =
         ProductAdapterComponentRuntime::new(ProductAdapterComponentRuntimeConfig::for_testing())
