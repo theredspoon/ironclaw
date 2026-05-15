@@ -342,6 +342,39 @@ async fn libsql_get_returns_none_for_missing_path() {
 }
 
 #[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_write_file_after_put_resets_record_metadata_and_bumps_version() {
+    // PR #3660 reviewer fix: legacy write_file/append_file used to update
+    // only `contents`/`is_dir`/`updated_at`, leaving stale `kind`,
+    // `indexed`, `content_type`, and `version` from a prior put. A
+    // subsequent get() would then return a versioned-entry whose
+    // metadata didn't match the bytes. The fix clears schema metadata
+    // and bumps the version on every legacy write.
+    let filesystem = libsql_root().await;
+    let path = VirtualPath::new("/secrets/leases/STALE").unwrap();
+    let kind = RecordKind::new("credential_lease").unwrap();
+    let scope = IndexKey::new("scope").unwrap();
+    let record_entry = Entry::record(kind, &serde_json::json!({"k": 1}))
+        .unwrap()
+        .with_indexed(scope, IndexValue::Text("acme".into()));
+
+    let v1 = filesystem
+        .put(&path, record_entry, CasExpectation::Absent)
+        .await
+        .unwrap();
+
+    // Legacy write overwrites the entry with opaque bytes.
+    filesystem.write_file(&path, b"opaque").await.unwrap();
+
+    let got = filesystem.get(&path).await.unwrap().unwrap();
+    // Metadata cleared: kind=None, indexed empty. Version bumped from v1.
+    assert!(got.entry.kind.is_none());
+    assert!(got.entry.indexed.is_empty());
+    assert_eq!(got.entry.body, b"opaque");
+    assert!(got.version > v1);
+}
+
+#[cfg(feature = "libsql")]
 async fn libsql_root() -> TestLibSqlRootFilesystem {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("root-filesystem.db");

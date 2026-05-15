@@ -318,14 +318,27 @@ impl RootFilesystem for LibSqlRootFilesystem {
             return Err(directory_write_error(path.clone()));
         }
         let conn = self.connect().await?;
+        // PR #3660 reviewer fix: legacy write_file must also reset the
+        // record metadata (content_type / kind / indexed) and bump the
+        // version, otherwise a get() after a write_file-overwrite of a
+        // previously record-shaped entry returns stale metadata. Treat
+        // legacy writes as opaque-file entries: kind=NULL, indexed='{}',
+        // content_type=application/octet-stream, version bumped from the
+        // current row's version (or 1 for new entries).
         let rows = conn
             .execute(
                 r#"
-                INSERT INTO root_filesystem_entries (path, contents, is_dir, updated_at)
-                VALUES (?1, ?2, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                INSERT INTO root_filesystem_entries
+                    (path, contents, is_dir, content_type, kind, indexed, version, updated_at)
+                VALUES (?1, ?2, 0, 'application/octet-stream', NULL, '{}', 1,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 ON CONFLICT (path) DO UPDATE SET
                     contents = excluded.contents,
                     is_dir = 0,
+                    content_type = excluded.content_type,
+                    kind = excluded.kind,
+                    indexed = excluded.indexed,
+                    version = root_filesystem_entries.version + 1,
                     updated_at = excluded.updated_at
                 WHERE root_filesystem_entries.is_dir = 0
                 "#,
@@ -350,16 +363,27 @@ impl RootFilesystem for LibSqlRootFilesystem {
             return Err(directory_append_error(path.clone()));
         }
         let conn = self.connect().await?;
-        // TODO(reborn): append rewrites the whole DB row. Do not use this path
-        // for high-volume JSONL/event streams; route those through typed event
-        // stores or append-capable artifact backends instead.
+        // PR #3660 reviewer fix: same metadata-reset concern as write_file.
+        // Append also resets kind/indexed/content_type to opaque-file
+        // defaults — appending bytes onto a previously record-shaped
+        // entry was always a category error, and we surface that by
+        // clearing the schema metadata rather than leaving it stale.
+        // TODO(reborn): append rewrites the whole DB row. Do not use this
+        // path for high-volume JSONL/event streams; route those through
+        // typed event stores or append-capable artifact backends.
         conn.execute(
             r#"
-            INSERT INTO root_filesystem_entries (path, contents, is_dir, updated_at)
-            VALUES (?1, ?2, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            INSERT INTO root_filesystem_entries
+                (path, contents, is_dir, content_type, kind, indexed, version, updated_at)
+            VALUES (?1, ?2, 0, 'application/octet-stream', NULL, '{}', 1,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             ON CONFLICT (path) DO UPDATE SET
                 contents = CAST(root_filesystem_entries.contents || excluded.contents AS BLOB),
                 is_dir = 0,
+                content_type = excluded.content_type,
+                kind = excluded.kind,
+                indexed = excluded.indexed,
+                version = root_filesystem_entries.version + 1,
                 updated_at = excluded.updated_at
             "#,
             libsql::params![path.as_str(), libsql::Value::Blob(bytes.to_vec())],

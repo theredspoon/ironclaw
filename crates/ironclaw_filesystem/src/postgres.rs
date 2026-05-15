@@ -274,14 +274,23 @@ impl RootFilesystem for PostgresRootFilesystem {
         {
             return Err(directory_write_error(path.clone()));
         }
+        // PR #3660 reviewer fix: legacy write_file must reset content_type
+        // / kind / indexed and bump version, otherwise get() after
+        // write_file-overwrite of a previously record-shaped entry
+        // returns stale metadata.
         let rows = client
             .execute(
                 r#"
-                INSERT INTO root_filesystem_entries (path, contents, is_dir)
-                VALUES ($1, $2, FALSE)
+                INSERT INTO root_filesystem_entries
+                    (path, contents, is_dir, content_type, kind, indexed, version)
+                VALUES ($1, $2, FALSE, 'application/octet-stream', NULL, '{}'::jsonb, 1)
                 ON CONFLICT (path) DO UPDATE SET
                     contents = EXCLUDED.contents,
                     is_dir = FALSE,
+                    content_type = EXCLUDED.content_type,
+                    kind = EXCLUDED.kind,
+                    indexed = EXCLUDED.indexed,
+                    version = root_filesystem_entries.version + 1,
                     updated_at = NOW()
                 WHERE root_filesystem_entries.is_dir = FALSE
                 "#,
@@ -304,17 +313,26 @@ impl RootFilesystem for PostgresRootFilesystem {
         {
             return Err(directory_append_error(path.clone()));
         }
-        // TODO(reborn): append rewrites the whole DB row. Do not use this path
-        // for high-volume JSONL/event streams; route those through typed event
-        // stores or append-capable artifact backends instead.
+        // PR #3660 reviewer fix: append also resets schema metadata.
+        // Appending bytes onto a previously record-shaped entry was always
+        // a category error; surface it by clearing the schema metadata
+        // rather than leaving it stale on top of changed bytes.
+        // TODO(reborn): append rewrites the whole DB row. Do not use this
+        // path for high-volume JSONL/event streams; route those through
+        // typed event stores or append-capable artifact backends.
         client
             .execute(
                 r#"
-                INSERT INTO root_filesystem_entries (path, contents, is_dir)
-                VALUES ($1, $2, FALSE)
+                INSERT INTO root_filesystem_entries
+                    (path, contents, is_dir, content_type, kind, indexed, version)
+                VALUES ($1, $2, FALSE, 'application/octet-stream', NULL, '{}'::jsonb, 1)
                 ON CONFLICT (path) DO UPDATE SET
                     contents = root_filesystem_entries.contents || EXCLUDED.contents,
                     is_dir = FALSE,
+                    content_type = EXCLUDED.content_type,
+                    kind = EXCLUDED.kind,
+                    indexed = EXCLUDED.indexed,
+                    version = root_filesystem_entries.version + 1,
                     updated_at = NOW()
                 "#,
                 &[&path.as_str(), &bytes],
