@@ -425,14 +425,12 @@ impl CheckpointRecorder {
 
     /// Asserts the exact checkpoint sequence.
     pub fn assert_sequence(&self, expected: &[(CheckpointKind, u32)]) {
-        // safety: test-support assertion helper intentionally panics on mismatch.
-        assert_eq!(self.sequence(), expected);
+        assert_eq!(self.sequence(), expected); // safety: test-support assertion helper intentionally panics on mismatch.
     }
 
     /// Asserts the checkpoint kinds, ignoring iteration numbers.
     pub fn assert_kinds(&self, expected: &[CheckpointKind]) {
-        // safety: test-support assertion helper intentionally panics on mismatch.
-        assert_eq!(self.kinds(), expected);
+        assert_eq!(self.kinds(), expected); // safety: test-support assertion helper intentionally panics on mismatch.
     }
 }
 
@@ -527,8 +525,7 @@ impl ironclaw_turns::run_profile::LoopPromptPort for MockAgentLoopDriverHost {
         }
         Ok(LoopPromptBundle {
             bundle_ref: LoopPromptBundleRef::for_run(&self.run_context, "bundle")
-                // safety: test fixture construction uses a static-valid bundle token.
-                .expect("test bundle ref should be valid"),
+                .expect("test bundle ref should be valid"), // safety: test fixture construction uses a static-valid bundle token.
             messages: vec![LoopModelMessage {
                 role: "user".to_string(),
                 content_ref: loop_message_ref("msg:user"),
