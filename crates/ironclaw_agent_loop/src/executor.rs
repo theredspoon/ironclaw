@@ -1148,6 +1148,9 @@ fn capability_error_class(kind: &CapabilityFailureKind) -> CapabilityErrorClass 
         | CapabilityFailureKind::Resource
         | CapabilityFailureKind::Permanent
         | CapabilityFailureKind::Unknown(_) => CapabilityErrorClass::Permanent,
+        // CapabilityFailureKind is #[non_exhaustive]; treat unrecognised future variants as
+        // permanent failures so callers do not retry indefinitely on unknown error kinds.
+        &_ => CapabilityErrorClass::Permanent,
     }
 }
 

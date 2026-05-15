@@ -112,7 +112,7 @@ impl bindings::near::product_adapter::product_adapter_host::Host for StoreData {
     }
 }
 
-fn truncate_log_message(message: String) -> String {
+fn truncate_log_message(mut message: String) -> String {
     if message.len() <= MAX_LOG_MESSAGE_BYTES {
         return message;
     }
@@ -121,7 +121,8 @@ fn truncate_log_message(message: String) -> String {
     while !message.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
-    message[..end].to_string()
+    message.truncate(end);
+    message
 }
 
 #[cfg(test)]

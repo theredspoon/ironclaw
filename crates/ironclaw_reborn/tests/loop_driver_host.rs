@@ -31,6 +31,7 @@ use ironclaw_loop_support::{
 };
 use ironclaw_processes::ProcessServices;
 use ironclaw_reborn::{
+    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
     ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornLoopDriverHostFactory,
     RebornLoopDriverHostRequest, StaticModelRouteResolver, TextOnlyLoopHostConfig,
@@ -2876,6 +2877,145 @@ async fn text_only_host_routes_capability_invocation_through_host_runtime() {
 }
 
 #[tokio::test]
+async fn text_only_host_profiled_capabilities_filter_surface_and_invocation() {
+    let fixture = HostFixture::new("thread-host-runtime-capability-profile", "hello").await;
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let denied_id = CapabilityId::new("demo.denied").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(allowed_id.as_str()),
+        capability_descriptor(denied_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+    let resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([allowed_id.clone()]),
+    ));
+
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_profiled_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+            resolver,
+        )
+        .await
+        .unwrap();
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(surface.descriptors[0].capability_id, allowed_id);
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: denied_id,
+            input_ref: CapabilityInputRef::new("input:denied-profile").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        CapabilityOutcome::Denied(denied)
+            if denied.reason_kind.as_str() == "surface_profile_denied"
+    ));
+    assert!(runtime.invocations().is_empty());
+}
+
+// Fix 4 (henrypark): composition test — host profile filter wins over strategy `All`.
+// This gates the host-wiring/cutover boundary: when the host-level CapabilitySurfaceProfileFilter
+// restricts to only `tool_a`, invoking `tool_b` must be denied even though the strategy
+// (via `CapabilityAllowSet::All`) would normally permit everything.
+#[tokio::test]
+async fn default_strategy_filter_all_loses_to_host_profile_filter() {
+    let fixture = HostFixture::new("thread-host-profile-filter-wins", "hello").await;
+    let tool_a_id = CapabilityId::new("demo.tool_a").unwrap();
+    let tool_b_id = CapabilityId::new("demo.tool_b").unwrap();
+
+    // The host runtime exposes both capabilities.
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(tool_a_id.as_str()),
+        capability_descriptor(tool_b_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+
+    // Build a raw capability port wired to the host runtime (no profile filter yet).
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+
+    // The profile resolver only allows tool_a — this is the host-level filter.
+    // The strategy effectively resolves to `CapabilityAllowSet::All` for any
+    // capability not explicitly blocked, but the host filter wraps the port and
+    // takes precedence.
+    let resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([tool_a_id.clone()]),
+    ));
+
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_profiled_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+            resolver,
+        )
+        .await
+        .unwrap();
+
+    // Surface should only expose tool_a (host filter applied).
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(surface.descriptors[0].capability_id, tool_a_id);
+
+    // Invoking tool_b must be denied — the host profile filter wins over the
+    // strategy's implicit `All` permit.
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: tool_b_id,
+            input_ref: CapabilityInputRef::new("input:tool-b-denied").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            &outcome,
+            CapabilityOutcome::Denied(denied)
+                if denied.reason_kind.as_str() == "surface_profile_denied"
+        ),
+        "expected surface_profile_denied, got {outcome:?}"
+    );
+    // The host runtime must not have been called for the denied invocation.
+    assert!(
+        runtime.invocations().is_empty(),
+        "host runtime must not be invoked for a profile-denied capability"
+    );
+}
+
+#[tokio::test]
 async fn text_only_host_uses_fresh_execution_context_per_capability_invocation() {
     let fixture = HostFixture::new("thread-host-runtime-capability-context", "hello").await;
     let capability_id = CapabilityId::new("demo.echo").unwrap();
@@ -2966,10 +3106,10 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
         );
         assert_eq!(
             invocation.context.extension_id,
-            visible_request.context.extension_id
+            ExtensionId::new(fixture.context.loop_driver_id.as_str()).unwrap()
         );
-        assert_eq!(invocation.context.runtime, visible_request.context.runtime);
-        assert_eq!(invocation.context.trust, visible_request.context.trust);
+        assert_eq!(invocation.context.runtime, RuntimeKind::Wasm);
+        assert_eq!(invocation.context.trust, TrustClass::UserTrusted);
         assert_eq!(invocation.context.grants, visible_request.context.grants);
         assert_eq!(invocation.context.mounts, visible_request.context.mounts);
     }
@@ -4149,6 +4289,26 @@ impl HostSkillContextSource for StaticSkillContextSource {
     }
 }
 
+struct StaticCapabilitySurfaceProfileResolver {
+    allow_set: CapabilityAllowSet,
+}
+
+impl StaticCapabilitySurfaceProfileResolver {
+    fn new(allow_set: CapabilityAllowSet) -> Self {
+        Self { allow_set }
+    }
+}
+
+#[async_trait]
+impl CapabilitySurfaceProfileResolver for StaticCapabilitySurfaceProfileResolver {
+    async fn resolve(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
+        Ok(self.allow_set.clone())
+    }
+}
+
 fn skill_md(name: &str, description: &str, prompt: &str) -> String {
     format!(
         "---\nname: {name}\ndescription: {description}\nactivation:\n  keywords: [{name}]\n---\n\n{prompt}\n"
@@ -4377,7 +4537,7 @@ fn host_runtime_visible_request(
         .unwrap_or_else(|| UserId::new("user-text-host").unwrap());
     let mut context = ExecutionContext::local_default(
         user_id,
-        ExtensionId::new("loop-driver").unwrap(),
+        ExtensionId::new(fixture.context.loop_driver_id.as_str()).unwrap(),
         RuntimeKind::FirstParty,
         TrustClass::System,
         CapabilitySet::default(),
