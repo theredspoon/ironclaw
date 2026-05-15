@@ -1,4 +1,8 @@
-use std::{collections::HashMap, path::PathBuf, process::Command};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    process::Command,
+};
 
 use serde_json::Value;
 
@@ -35,6 +39,32 @@ fn reborn_boundary_rules_active_crates_are_workspace_members() {
             manifest.display()
         );
     }
+}
+
+#[test]
+fn reborn_virtual_roots_match_storage_placement_contract() {
+    let root = workspace_root();
+    let path_source = std::fs::read_to_string(root.join("crates/ironclaw_host_api/src/path.rs"))
+        .expect("host API path source must be readable");
+    let storage_contract =
+        std::fs::read_to_string(root.join("docs/reborn/contracts/storage-placement.md"))
+            .expect("storage placement contract must be readable");
+    let filesystem_contract =
+        std::fs::read_to_string(root.join("docs/reborn/contracts/filesystem.md"))
+            .expect("filesystem contract must be readable");
+
+    let implemented = extract_virtual_roots_const(&path_source);
+    let storage = extract_storage_placement_roots(&storage_contract);
+    let filesystem = extract_filesystem_namespace_roots(&filesystem_contract);
+
+    assert_eq!(
+        implemented, storage,
+        "ironclaw_host_api VIRTUAL_ROOTS must match storage-placement.md canonical roots"
+    );
+    assert_eq!(
+        filesystem, storage,
+        "filesystem.md namespace roots must match storage-placement.md canonical roots"
+    );
 }
 
 #[test]
@@ -146,6 +176,20 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
     let services =
         std::fs::read_to_string(root.join("crates/ironclaw_host_runtime/src/services.rs"))
             .expect("host runtime services.rs must be readable");
+    let obligations =
+        std::fs::read_to_string(root.join("crates/ironclaw_host_runtime/src/obligations.rs"))
+            .expect("host runtime obligations.rs must be readable");
+    let host_runtime_contract =
+        std::fs::read_to_string(root.join("docs/reborn/contracts/host-runtime.md"))
+            .expect("host runtime contract must be readable");
+    let scripts = std::fs::read_to_string(root.join("crates/ironclaw_scripts/src/lib.rs"))
+        .expect("script runtime lib.rs must be readable");
+    let scripts_manifest = std::fs::read_to_string(root.join("crates/ironclaw_scripts/Cargo.toml"))
+        .expect("script runtime Cargo.toml must be readable");
+    let mcp = std::fs::read_to_string(root.join("crates/ironclaw_mcp/src/lib.rs"))
+        .expect("MCP runtime lib.rs must be readable");
+    let mcp_manifest = std::fs::read_to_string(root.join("crates/ironclaw_mcp/Cargo.toml"))
+        .expect("MCP runtime Cargo.toml must be readable");
 
     let forbidden_lib_exports = [
         "RuntimeDispatchProcessExecutor",
@@ -160,6 +204,36 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
         );
     }
 
+    let obligations_pub_use = extract_pub_use_block(&lib, "pub use obligations::{");
+    let forbidden_obligation_exports = [
+        "NetworkObligationPolicyStore",
+        "RuntimeSecretInjectionStore",
+        "RuntimeSecretInjectionStoreError",
+    ];
+    for export in forbidden_obligation_exports {
+        assert!(
+            !obligations_pub_use.contains(export),
+            "ironclaw_host_runtime must not re-export lower substrate handoff store `{export}`; upper Reborn code should enter through HostRuntimeServices::host_runtime / Arc<dyn HostRuntime>"
+        );
+    }
+
+    let forbidden_lib_accessors = [
+        "pub use obligations::NetworkObligationPolicyStore",
+        "pub use obligations::RuntimeSecretInjectionStore",
+        "pub use obligations::RuntimeSecretInjectionStoreError",
+        "pub use obligations::*",
+        "pub fn with_secret_injection_store(",
+        "pub fn with_network_policy_store(",
+        "pub fn network(&self) -> &N",
+        "pub fn secrets(&self) -> &S",
+    ];
+    for pattern in forbidden_lib_accessors {
+        assert!(
+            !lib.contains(pattern),
+            "HostHttpEgressService must not expose lower substrate escape hatch `{pattern}`; keep raw network/secret/policy handoff wiring private to host-runtime composition"
+        );
+    }
+
     let forbidden_public_services = [
         "pub fn registry(",
         "pub fn filesystem(",
@@ -171,6 +245,9 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
         "pub fn runtime_dispatcher(",
         "pub fn runtime_dispatcher_arc(",
         "pub fn capability_host",
+        "pub fn secret_injection_store(",
+        "pub fn network_policy_store(",
+        "pub fn with_host_http_egress<N, SecretBackend>",
         "pub struct RuntimeDispatchProcessExecutor",
         "pub struct ScriptRuntimeAdapter",
         "pub struct McpRuntimeAdapter",
@@ -182,6 +259,83 @@ fn reborn_host_runtime_services_do_not_expose_lower_substrate_handles() {
             "HostRuntimeServices must not expose lower substrate escape hatch `{pattern}`; keep dispatcher/capability/process handles private to the host-runtime crate"
         );
     }
+
+    let forbidden_obligation_accessors = [
+        "pub struct RuntimeSecretInjectionStore",
+        "pub enum RuntimeSecretInjectionStoreError",
+        "pub struct NetworkObligationPolicyStore",
+        "pub fn insert(",
+        "pub fn take(",
+        "pub fn discard_for_capability(",
+        "pub fn with_handoff_stores(",
+        "pub fn with_network_policy_store(",
+        "pub fn with_secret_injection_store(",
+        "pub fn network_policy_store(&self)",
+        "pub fn secret_injection_store(&self)",
+        "pub fn staged_network_policy_present_for_diagnostics(",
+        "pub fn staged_secret_present_for_diagnostics(",
+    ];
+    for pattern in forbidden_obligation_accessors {
+        assert!(
+            !obligations.contains(pattern),
+            "BuiltinObligationServices and lower handoff stores must not expose lower substrate escape hatch `{pattern}`; keep secret/network handoff stores private to host-runtime composition"
+        );
+    }
+
+    for required_phrase in [
+        "try_with_host_http_egress",
+        "low-level host-runtime/test harness escape hatches",
+        "upper Reborn crates must not use them",
+    ] {
+        assert!(
+            host_runtime_contract.contains(required_phrase),
+            "host-runtime contract should document `{required_phrase}` so raw handoff store seams are not mistaken for upper Reborn APIs"
+        );
+    }
+
+    let forbidden_script_lane_surface = [
+        "RuntimeAdapter",
+        "pub struct ScriptRuntimeAdapter",
+        "pub fn script_error_kind",
+    ];
+    for pattern in forbidden_script_lane_surface {
+        assert!(
+            !scripts.contains(pattern),
+            "ironclaw_scripts must not expose host-runtime dispatcher composition surface `{pattern}`; compose script dispatch adapters inside ironclaw_host_runtime"
+        );
+    }
+
+    assert!(
+        !scripts_manifest.contains("ironclaw_dispatcher"),
+        "ironclaw_scripts must not depend on ironclaw_dispatcher; script dispatcher adapters are host-runtime-private composition"
+    );
+
+    let forbidden_mcp_lane_surface = [
+        "RuntimeAdapter",
+        "pub struct McpRuntimeAdapter",
+        "pub fn mcp_error_kind",
+    ];
+    for pattern in forbidden_mcp_lane_surface {
+        assert!(
+            !mcp.contains(pattern),
+            "ironclaw_mcp must not expose host-runtime dispatcher composition surface `{pattern}`; compose MCP dispatch adapters inside ironclaw_host_runtime"
+        );
+    }
+    assert!(
+        !mcp_manifest.contains("ironclaw_dispatcher"),
+        "ironclaw_mcp must not depend on ironclaw_dispatcher; MCP dispatcher adapters are host-runtime-private composition"
+    );
+}
+
+fn extract_pub_use_block<'a>(contents: &'a str, start_marker: &str) -> &'a str {
+    let Some(start) = contents.find(start_marker) else {
+        return "";
+    };
+    let after_start = &contents[start..];
+    let Some(end) = after_start.find("};") else {
+        return after_start;
+    };
+    &after_start[..end]
 }
 
 #[test]
@@ -255,6 +409,35 @@ fn reborn_turns_public_surface_uses_turn_ids_not_runtime_or_process_ids() {
 }
 
 #[test]
+fn wasm_sandbox_core_is_standalone_v1_parity_kernel() {
+    let root = workspace_root().join("crates/ironclaw_wasm_sandbox_core");
+    assert!(
+        root.join("Cargo.toml").exists(),
+        "shared WASM sandbox core should exist before ProductAdapters duplicate v1 sandbox setup"
+    );
+    assert!(
+        root.join("CLAUDE.md").exists(),
+        "shared WASM sandbox core needs local guardrails"
+    );
+
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+    let package = packages
+        .iter()
+        .find(|package| package["name"] == "ironclaw_wasm_sandbox_core")
+        .expect("ironclaw_wasm_sandbox_core must be a workspace package");
+    let workspace_deps = workspace_dependency_names(package)
+        .filter_map(|dependency| dependency["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        workspace_deps.is_empty(),
+        "WASM sandbox core should stay independent of IronClaw domain crates; got {workspace_deps:?}"
+    );
+}
+
+#[test]
 fn wasm_product_adapter_crate_has_local_guardrails() {
     let guardrails = workspace_root().join("crates/ironclaw_wasm_product_adapters/CLAUDE.md");
     assert!(
@@ -289,6 +472,9 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
     //   * hex                 — HMAC signature encoding in the auth verifier.
     //   * tracing             — structured logging for hardened error paths
     //                           added in the zmanian review.
+    //   * serde_json          — validates temporary JSON-shim WIT payloads.
+    //   * ironclaw_wasm_sandbox_core — shared v1-style minimal WASI sandbox kernel.
+    //   * wasmtime            — component type and generated binding instantiation.
     // Every addition is justified by a concrete call site in src/. Adding a
     // dep here without a matching call site is a contract violation — and
     // adding workflow/runtime crates beyond this list still requires
@@ -300,16 +486,62 @@ fn wasm_product_adapter_crate_keeps_minimal_host_glue_dependencies() {
         "hmac",
         "http",
         "ironclaw_product_adapters",
+        "ironclaw_wasm_sandbox_core",
+        "serde_json",
         "sha2",
         "subtle",
         "thiserror",
         "tokio",
         "tracing",
+        "wasmtime",
     ];
     assert_eq!(
         deps, expected,
         "ironclaw_wasm_product_adapters should stay thin host glue; add runtime/workflow dependencies only when a call-site proves they are required"
     );
+}
+
+#[test]
+fn wasm_product_adapter_runtime_uses_v1_style_minimal_wasi() {
+    let root = workspace_root();
+    let core = std::fs::read_to_string(root.join("crates/ironclaw_wasm_sandbox_core/src/lib.rs"))
+        .expect("WASM sandbox core must be readable");
+    let adapter_store =
+        std::fs::read_to_string(root.join("crates/ironclaw_wasm_product_adapters/src/store.rs"))
+            .expect("ProductAdapter WASM store must be readable");
+    let adapter_runtime = std::fs::read_to_string(
+        root.join("crates/ironclaw_wasm_product_adapters/src/component_runtime.rs"),
+    )
+    .expect("ProductAdapter WASM runtime must be readable");
+
+    assert!(
+        adapter_store.contains("SandboxStoreCore")
+            && adapter_runtime.contains("add_minimal_wasi_to_linker"),
+        "ProductAdapter components should use the shared v1-style WASM sandbox core instead of duplicating WASI setup"
+    );
+    assert!(
+        core.contains("wasmtime_wasi::p2::add_to_linker_sync"),
+        "shared sandbox core should register WASI p2 like v1 tools/channels"
+    );
+    assert!(
+        core.contains("WasiCtxBuilder::new().build()"),
+        "shared sandbox core should use the v1 minimal default: no env, args, preopens, or inherited network"
+    );
+    for forbidden in [
+        "inherit_env",
+        "inherit_stdio",
+        "preopened_dir",
+        "inherit_network",
+        "allow_ip_name_lookup(true)",
+        "socket_addr_check(|_, _| Box::pin(async { true }))",
+    ] {
+        assert!(
+            !core.contains(forbidden)
+                && !adapter_store.contains(forbidden)
+                && !adapter_runtime.contains(forbidden),
+            "ProductAdapter minimal WASI must not enable `{forbidden}`; HTTP egress stays host-mediated"
+        );
+    }
 }
 
 #[test]
@@ -571,6 +803,45 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_network",
                 "ironclaw_engine",
                 "ironclaw_gateway",
+            ],
+        },
+        BoundaryRule {
+            // Registry is a contracts-only Reborn crate. Runtime/dispatcher/engine
+            // crates would invert ownership, secrets crates could expose raw
+            // material instead of opaque handles, and v1 WASM/channel crates
+            // would bypass the Reborn registry boundary.
+            crate_name: "ironclaw_product_adapter_registry",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_authorization",
+                "ironclaw_approvals",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_runtime",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                "ironclaw_product_workflow",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_threads",
+                "ironclaw_tui",
+                "ironclaw_wasm",
+                "ironclaw_wasm_product_adapters",
             ],
         },
         BoundaryRule {
@@ -1108,6 +1379,76 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn extract_virtual_roots_const(source: &str) -> BTreeSet<String> {
+    let const_body = source
+        .split("const VIRTUAL_ROOTS: &[&str] = &[")
+        .nth(1)
+        .and_then(|tail| tail.split("];").next())
+        .expect("VIRTUAL_ROOTS const array must be present");
+    extract_quoted_absolute_paths(const_body)
+}
+
+fn extract_storage_placement_roots(contract: &str) -> BTreeSet<String> {
+    contract
+        .lines()
+        .filter_map(|line| {
+            let root = line
+                .strip_prefix("| `")?
+                .split('`')
+                .next()
+                .expect("table cell must close code span");
+            let root = if root.starts_with("/engine/") {
+                "/engine"
+            } else {
+                root
+            };
+            Some(root.to_string())
+        })
+        .filter(|root| is_canonical_virtual_root(root))
+        .collect()
+}
+
+fn extract_filesystem_namespace_roots(contract: &str) -> BTreeSet<String> {
+    let roots_block = contract
+        .split("Frozen V1 canonical virtual roots")
+        .nth(1)
+        .and_then(|tail| tail.split("Recommended meaning:").next())
+        .expect("filesystem.md must list frozen V1 canonical virtual roots");
+    roots_block
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_canonical_virtual_root(line))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn extract_quoted_absolute_paths(source: &str) -> BTreeSet<String> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix('"')?.split('"').next())
+        .filter(|root| is_canonical_virtual_root(root))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn is_canonical_virtual_root(value: &str) -> bool {
+    matches!(
+        value,
+        "/engine"
+            | "/system/settings"
+            | "/system/extensions"
+            | "/system/skills"
+            | "/users"
+            | "/projects"
+            | "/memory"
+            | "/artifacts"
+            | "/tmp"
+            | "/secrets"
+            | "/events"
+    )
+}
+
 fn package_dependencies(package: &Value) -> Option<(String, Vec<String>)> {
     let name = package["name"].as_str()?.to_string();
     let dependencies = workspace_dependency_names(package)
@@ -1183,22 +1524,8 @@ fn assert_no_normal_workspace_deps<'a>(
         // The landing plan introduces Reborn crates in grouped PRs. Boundary
         // rules become active as soon as their crate is present in the
         // workspace, while absent future crates are ignored in earlier slices.
-        //
-        // Fail closed when the crate directory is on disk but missing from
-        // `cargo metadata` — that combination means the crate exists but
-        // was never registered as a workspace member, so its forbidden
-        // edges would otherwise silently pass without ever being checked.
-        let crate_manifest = workspace_root()
-            .join("crates")
-            .join(crate_name)
-            .join("Cargo.toml");
-        assert!(
-            !crate_manifest.exists(),
-            "{crate_name} has a Cargo.toml at {} but is not in `cargo metadata` output; \
-             add it to the root `Cargo.toml` `workspace.members` so the boundary rule \
-             actually runs against its dependencies",
-            crate_manifest.display()
-        );
+        // `reborn_boundary_rules_active_crates_are_workspace_members` covers
+        // present-on-disk crates that are missing from `cargo metadata`.
         return;
     };
     for forbidden in forbidden {

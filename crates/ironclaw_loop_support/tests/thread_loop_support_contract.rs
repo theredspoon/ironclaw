@@ -28,12 +28,15 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostErrorKind, AssistantReply, BeginAssistantDraft, CapabilityDeniedReasonKind,
         CapabilityInputRef, CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
-        FinalizeAssistantMessage, HostManagedLoopPromptPort, InMemoryLoopHostMilestoneSink,
-        InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextPort, LoopContextRequest,
-        LoopHostMilestoneKind, LoopInputCursor, LoopInputCursorToken, LoopModelMessage,
-        LoopModelPort, LoopModelRequest, LoopModelRouteSnapshot, LoopPromptPort, LoopRunContext,
-        LoopTranscriptPort, ParentLoopOutput, PromptSkillContextMetadata, SkillVisibility,
-        UpdateAssistantDraft, VisibleCapabilityRequest,
+        FinalizeAssistantMessage, HostManagedLoopPromptPort,
+        InMemoryInstructionMaterializationStore, InMemoryLoopHostMilestoneSink,
+        InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextBundle, LoopContextMessage,
+        LoopContextPort, LoopContextRequest, LoopContextSnippet, LoopHostMilestoneKind,
+        LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest,
+        LoopModelRouteSnapshot, LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleRef,
+        LoopPromptPort, LoopRunContext, LoopTranscriptPort, ParentLoopOutput,
+        PromptSkillContextMetadata, SkillVisibility, UpdateAssistantDraft,
+        VisibleCapabilityRequest,
     },
 };
 use tracing_test::traced_test;
@@ -61,7 +64,11 @@ async fn thread_context_port_loads_policy_filtered_transcript_messages() {
     assert_eq!(bundle.messages[0].safe_summary, "user message available");
     assert!(!bundle.messages[0].safe_summary.contains("hello reborn"));
     assert_eq!(
-        bundle.messages[0].message_ref.as_str(),
+        bundle.messages[0]
+            .message_ref
+            .as_ref()
+            .expect("message_ref")
+            .as_str(),
         format!("msg:{}", fixture.user_message_id).as_str()
     );
     assert!(bundle.memory_snippets.is_empty());
@@ -108,6 +115,8 @@ async fn thread_context_port_preserves_summary_replacements_as_system_messages()
     assert!(
         bundle.messages[0]
             .message_ref
+            .as_ref()
+            .expect("message_ref")
             .as_str()
             .starts_with("msg:summary-")
     );
@@ -375,16 +384,15 @@ async fn prompt_and_model_ports_send_selected_skill_context_to_gateway() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
     assert_eq!(prompt_bundle.messages.len(), 2);
     assert_eq!(prompt_bundle.messages[0].role, "system");
-    assert!(
-        prompt_bundle.messages[0]
-            .content_ref
-            .as_str()
-            .starts_with("msg:snippet.skill.alpha.")
+    assert_eq!(
+        prompt_bundle.messages[0].content_ref,
+        LoopMessageRef::new("msg:snippet.skill.alpha.0.5241b0c7358325ab").unwrap()
     );
 
     let gateway = Arc::new(RecordingGateway::reply("model says hi"));
@@ -426,6 +434,89 @@ async fn prompt_and_model_ports_send_selected_skill_context_to_gateway() {
 }
 
 #[tokio::test]
+async fn prompt_and_model_ports_resolve_instruction_memory_and_identity_refs() {
+    let fixture = ThreadFixture::new().await;
+    let materialization_store = Arc::new(InMemoryInstructionMaterializationStore::default());
+    let context_port = Arc::new(StaticLoopContextPort {
+        bundle: LoopContextBundle {
+            identity_messages: vec![LoopContextMessage {
+                message_ref: Some(LoopMessageRef::new("msg:identity-policy").unwrap()),
+                role: "system".to_string(),
+                safe_summary: "identity policy summary".to_string(),
+            }],
+            messages: vec![LoopContextMessage {
+                message_ref: Some(
+                    LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+                ),
+                role: "user".to_string(),
+                safe_summary: "user message available".to_string(),
+            }],
+            instruction_snippets: vec![LoopContextSnippet {
+                snippet_ref: "instruction:project".to_string(),
+                safe_summary: "project instruction summary".to_string(),
+                metadata: None,
+            }],
+            memory_snippets: vec![LoopContextSnippet {
+                snippet_ref: "memory:project-summary".to_string(),
+                safe_summary: "project memory summary".to_string(),
+                metadata: None,
+            }],
+        },
+    });
+    let milestones = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let prompt_port =
+        HostManagedLoopPromptPort::new(fixture.run_context.clone(), context_port, milestones)
+            .with_instruction_materialization_store(materialization_store.clone());
+    let prompt_bundle = prompt_port
+        .build_prompt_bundle(ironclaw_turns::run_profile::LoopPromptBundleRequest {
+            mode: ironclaw_turns::run_profile::PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+            inline_messages: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(prompt_bundle.messages.len(), 4);
+
+    let gateway = Arc::new(RecordingGateway::reply("model says hi"));
+    let model_port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway.clone(),
+        16,
+    )
+    .with_instruction_materialization_store(materialization_store);
+
+    model_port
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap();
+
+    let calls = gateway.calls.lock().unwrap();
+    let contents = calls[0]
+        .messages
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        contents,
+        vec![
+            "identity policy summary",
+            "project instruction summary",
+            "project memory summary",
+            "hello reborn",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn prompt_port_records_installed_skill_trust_metadata_without_prompt_payload() {
     let fixture = ThreadFixture::new().await;
     let source = Arc::new(StaticSkillContextSource::new(vec![
@@ -462,6 +553,7 @@ async fn prompt_port_records_installed_skill_trust_metadata_without_prompt_paylo
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -521,6 +613,7 @@ async fn prompt_port_records_multiple_active_skill_metadata_in_prompt_order() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -584,6 +677,7 @@ async fn prompt_and_model_ports_keep_duplicate_skill_names_distinct() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -649,6 +743,7 @@ async fn model_port_rejects_skill_context_refs_when_source_changes_after_prompt_
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -1118,14 +1213,12 @@ async fn model_port_resolves_thread_message_refs_and_delegates_to_gateway() {
         gateway.clone(),
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1166,12 +1259,11 @@ async fn model_port_threads_resolved_model_route_snapshot_to_gateway() {
         gateway.clone(),
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     port.stream_model(LoopModelRequest {
-        messages: vec![LoopModelMessage {
-            role: "user".to_string(),
-            content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
-        }],
+        messages,
         surface_version: None,
         model_preference: None,
     })
@@ -1209,12 +1301,11 @@ async fn model_port_resolves_explicit_refs_that_fall_outside_context_window() {
         gateway.clone(),
         1,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     port.stream_model(LoopModelRequest {
-        messages: vec![LoopModelMessage {
-            role: "user".to_string(),
-            content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
-        }],
+        messages,
         surface_version: None,
         model_preference: None,
     })
@@ -1223,6 +1314,46 @@ async fn model_port_resolves_explicit_refs_that_fall_outside_context_window() {
 
     let calls = gateway.calls.lock().unwrap();
     assert_eq!(calls[0].messages[0].content, "hello reborn");
+}
+
+#[tokio::test]
+async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
+    let fixture = ThreadFixture::new().await;
+    let tool_result_ref = LoopMessageRef::new("msg:11111111-1111-1111-1111-111111111111").unwrap();
+    let thread_service = Arc::new(StaticContextThreadService::new(ContextMessage {
+        message_id: Some(ThreadMessageId::parse("11111111-1111-1111-1111-111111111111").unwrap()),
+        summary_id: None,
+        sequence: 1,
+        kind: MessageKind::ToolResultReference,
+        content: "tool result content".to_string(),
+    }));
+    let context_port = Arc::new(ThreadBackedLoopContextPort::new(
+        thread_service,
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        16,
+    ));
+    let prompt_port = HostManagedLoopPromptPort::new(
+        fixture.run_context.clone(),
+        context_port,
+        Arc::new(InMemoryLoopHostMilestoneSink::default()),
+    );
+
+    let prompt_bundle = prompt_port
+        .build_prompt_bundle(ironclaw_turns::run_profile::LoopPromptBundleRequest {
+            mode: ironclaw_turns::run_profile::PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+            inline_messages: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(prompt_bundle.messages.len(), 1);
+    assert_eq!(prompt_bundle.messages[0].role, "tool_result_reference");
+    assert_eq!(prompt_bundle.messages[0].content_ref, tool_result_ref);
 }
 
 #[tokio::test]
@@ -1250,7 +1381,7 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
         .await
         .unwrap();
     assert_eq!(context.messages[0].role, "tool_result_reference");
-    assert_eq!(context.messages[0].message_ref, tool_result_ref);
+    assert_eq!(context.messages[0].message_ref, Some(tool_result_ref));
 
     let gateway = Arc::new(RecordingGateway::reply("model says hi"));
     let model_port = ThreadBackedLoopModelPort::new(
@@ -1260,17 +1391,21 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
         gateway.clone(),
         16,
     );
+    let messages = context
+        .messages
+        .into_iter()
+        .filter_map(|message| {
+            message.message_ref.map(|content_ref| LoopModelMessage {
+                role: message.role,
+                content_ref,
+            })
+        })
+        .collect::<Vec<_>>();
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     model_port
         .stream_model(LoopModelRequest {
-            messages: context
-                .messages
-                .into_iter()
-                .map(|message| LoopModelMessage {
-                    role: message.role,
-                    content_ref: message.message_ref,
-                })
-                .collect(),
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1303,14 +1438,12 @@ async fn model_port_emits_model_milestones_without_prompt_or_output_payloads() {
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: Some(
                 fixture
@@ -1367,14 +1500,12 @@ async fn model_port_emits_started_and_failed_milestones_when_gateway_fails() {
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1425,14 +1556,12 @@ async fn model_port_logs_model_started_milestone_failure_without_losing_response
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1466,14 +1595,12 @@ async fn model_port_logs_model_completed_milestone_failure_without_losing_respon
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1502,14 +1629,15 @@ async fn model_port_rejects_message_role_that_disagrees_with_thread_record() {
         gateway.clone(),
         16,
     );
+    let messages = vec![LoopModelMessage {
+        role: "system".to_string(),
+        content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+    }];
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "system".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1531,14 +1659,12 @@ async fn model_port_surfaces_fail_closed_gateway_policy_errors_without_raw_detai
         gateway,
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1550,7 +1676,60 @@ async fn model_port_surfaces_fail_closed_gateway_policy_errors_without_raw_detai
     assert!(!wire.contains("RAW_PROVIDER_SECRET"));
 }
 
+#[tokio::test]
+async fn model_port_replaces_invalid_gateway_safe_summary_with_stable_summary() {
+    let fixture = ThreadFixture::new().await;
+    let gateway = Arc::new(RecordingGateway::deny_with_safe_summary(
+        "RAW_PROVIDER_SECRET invalid api key sk-provider-secret /host/path tool_input",
+    ));
+    let port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway,
+        16,
+    );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
+
+    let error = port
+        .stream_model(LoopModelRequest {
+            messages,
+            surface_version: None,
+            model_preference: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
+    assert_eq!(error.safe_summary, "model profile is not permitted");
+    let wire = format!("{}{:?}", serde_json::to_string(&error).unwrap(), error);
+    for forbidden in [
+        "RAW_PROVIDER_SECRET",
+        "invalid api key",
+        "sk-provider-secret",
+        "/host/path",
+        "tool_input",
+    ] {
+        assert!(!wire.contains(forbidden), "model error leaked {forbidden}");
+    }
+}
+
 #[derive(Clone)]
+struct StaticLoopContextPort {
+    bundle: LoopContextBundle,
+}
+
+#[async_trait]
+impl LoopContextPort for StaticLoopContextPort {
+    async fn load_loop_context(
+        &self,
+        _request: LoopContextRequest,
+    ) -> Result<LoopContextBundle, ironclaw_turns::run_profile::AgentLoopHostError> {
+        Ok(self.bundle.clone())
+    }
+}
+
 struct StaticSkillContextSource {
     candidates: Vec<HostSkillContextCandidate>,
 }
@@ -1601,6 +1780,27 @@ fn skill_md(name: &str, description: &str, prompt: &str) -> String {
     format!(
         "---\nname: {name}\ndescription: {description}\nactivation:\n  keywords: [{name}]\n---\n\n{prompt}\n"
     )
+}
+
+fn user_model_messages(fixture: &ThreadFixture) -> Vec<LoopModelMessage> {
+    vec![LoopModelMessage {
+        role: "user".to_string(),
+        content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+    }]
+}
+
+fn issue_prompt_grant(context: &LoopRunContext, messages: &[LoopModelMessage]) {
+    let bundle = LoopPromptBundle {
+        bundle_ref: LoopPromptBundleRef::for_run(context, "test-bundle").unwrap(),
+        messages: messages.to_vec(),
+        surface_version: None,
+        instruction_fingerprint: None,
+        identity_message_count: 0,
+        instruction_snippet_count: 0,
+    };
+    LoopPromptBundleAuthority::shared()
+        .issue_bundle(context, &bundle)
+        .unwrap();
 }
 
 struct ThreadFixture {
@@ -2041,6 +2241,16 @@ impl RecordingGateway {
             response: Err(HostManagedModelError::new(
                 HostManagedModelErrorKind::PolicyDenied,
                 raw_detail,
+            )),
+        }
+    }
+
+    fn deny_with_safe_summary(safe_summary: &str) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            response: Err(HostManagedModelError::safe(
+                HostManagedModelErrorKind::PolicyDenied,
+                safe_summary,
             )),
         }
     }

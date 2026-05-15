@@ -12,6 +12,18 @@ fn profile_wire_values_are_stable() {
 }
 
 #[test]
+fn all_profiles_are_exposed_in_display_order() {
+    assert_eq!(
+        RebornProfile::all(),
+        &[
+            RebornProfile::LocalDev,
+            RebornProfile::Production,
+            RebornProfile::MigrationDryRun,
+        ]
+    );
+}
+
+#[test]
 fn profile_parsing_accepts_expected_values() {
     assert_eq!(
         RebornProfile::from_str("local-dev"),
@@ -73,4 +85,46 @@ fn boot_config_defaults_profile_to_local_dev() {
             .expect("boot config should resolve");
 
     assert_eq!(config.profile(), RebornProfile::LocalDev);
+}
+
+#[test]
+fn boot_config_rejects_invalid_profile_from_env_parts() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let error = RebornBootConfig::resolve_from_env_parts(
+        Some(temp.path().join("reborn-home").into_os_string()),
+        None,
+        None,
+        Some(OsString::from("prod")),
+    )
+    .expect_err("invalid boot profile should fail through the caller-level config path");
+
+    assert_eq!(
+        error,
+        RebornConfigError::InvalidProfile {
+            name: REBORN_PROFILE_ENV,
+            value: "prod".to_string(),
+        }
+    );
+}
+
+#[test]
+fn boot_config_rejects_empty_profile_from_env_parts() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let error = RebornBootConfig::resolve_from_env_parts(
+        Some(temp.path().join("reborn-home").into_os_string()),
+        None,
+        None,
+        Some(OsString::from("")),
+    )
+    .expect_err("empty boot profile should fail through the caller-level config path");
+
+    assert_eq!(
+        error,
+        RebornConfigError::InvalidProfile {
+            name: REBORN_PROFILE_ENV,
+            value: String::new(),
+        }
+    );
 }

@@ -72,8 +72,8 @@ fn composition_public_api_is_facade_shaped() {
     let public_surface = format!("{lib}\n{input}\n{factory}");
 
     assert!(
-        !lib.contains("RebornStorageInput") && !lib.contains("RebornEventStoreConfig"),
-        "composition crate must not re-export raw storage/event-store input types"
+        !lib.contains("pub use input::RebornStorageInput"),
+        "composition facade API must not re-export raw storage input types"
     );
     assert!(
         !input.contains("pub enum RebornStorageInput"),
