@@ -64,9 +64,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_policy_returns_default_for_local_manifest() {
+    fn fail_closed_policy_returns_default_for_local_manifest() {
         use ironclaw_host_api::{PackageId, PackageIdentity, PackageSource, RequestedTrustClass};
-        let policy = HostTrustPolicy::empty();
+        let policy = HostTrustPolicy::fail_closed();
         let identity = PackageIdentity::new(
             PackageId::new("any").unwrap(),
             PackageSource::LocalManifest {
@@ -83,7 +83,37 @@ mod tests {
             })
             .unwrap();
         assert!(!decision.effective_trust.is_privileged());
+        assert_eq!(
+            decision.effective_trust.class(),
+            ironclaw_host_api::TrustClass::Sandbox
+        );
+        assert!(decision.authority_ceiling.allowed_effects.is_empty());
         assert_eq!(decision.provenance, TrustProvenance::Default);
+    }
+
+    #[test]
+    fn empty_policy_alias_is_fail_closed() {
+        use ironclaw_host_api::{PackageId, PackageIdentity, PackageSource, RequestedTrustClass};
+        let identity = PackageIdentity::new(
+            PackageId::new("any").unwrap(),
+            PackageSource::Admin,
+            None,
+            None,
+        );
+        let input = TrustPolicyInput {
+            identity,
+            requested_trust: RequestedTrustClass::FirstPartyRequested,
+            requested_authority: std::collections::BTreeSet::new(),
+        };
+        let fail_closed = HostTrustPolicy::fail_closed().evaluate(&input).unwrap();
+        let empty_alias = HostTrustPolicy::empty().evaluate(&input).unwrap();
+
+        assert_eq!(
+            empty_alias.effective_trust.class(),
+            fail_closed.effective_trust.class()
+        );
+        assert_eq!(empty_alias.authority_ceiling, fail_closed.authority_ceiling);
+        assert_eq!(empty_alias.provenance, fail_closed.provenance);
     }
 }
 
