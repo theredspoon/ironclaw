@@ -529,6 +529,9 @@ pub enum AgentLoopHostErrorKind {
     ScopeMismatch,
     StaleSurface,
     InvalidInvocation,
+    /// The request payload itself is well-formed but its content is invalid in
+    /// the current host state (e.g. schema id/version mismatch on checkpoint load).
+    Invalid,
     PolicyDenied,
     BudgetExceeded,
     Unavailable,
@@ -546,6 +549,7 @@ impl AgentLoopHostErrorKind {
             Self::ScopeMismatch => "scope_mismatch",
             Self::StaleSurface => "stale_surface",
             Self::InvalidInvocation => "invalid_invocation",
+            Self::Invalid => "invalid",
             Self::PolicyDenied => "policy_denied",
             Self::BudgetExceeded => "budget_exceeded",
             Self::Unavailable => "unavailable",

@@ -1625,7 +1625,7 @@ impl LoopCheckpointPort for HostManagedLoopCheckpointPort {
             || metadata.schema_version != request.expected_schema_version
         {
             return Err(AgentLoopHostError::new(
-                AgentLoopHostErrorKind::InvalidInvocation,
+                AgentLoopHostErrorKind::Invalid,
                 "checkpoint schema id/version does not match the resume request",
             ));
         }
@@ -2030,7 +2030,45 @@ mod tests {
             .await
             .expect_err("schema mismatch must reject");
 
-        assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+        assert_eq!(error.kind, AgentLoopHostErrorKind::Invalid);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_port_load_payload_rejects_schema_version_mismatch() {
+        let context = test_run_context().await;
+        let expected_schema_id = context.checkpoint_schema_id.clone();
+        let stored_schema_version = context.checkpoint_schema_version;
+        let (port, _state_store, _checkpoint_store) = test_checkpoint_port(context);
+        let state_ref = port
+            .stage_checkpoint_payload(StageCheckpointPayloadRequest {
+                kind: LoopCheckpointKind::BeforeModel,
+                schema_id: expected_schema_id.as_str().to_string(),
+                payload: b"{}".to_vec(),
+            })
+            .await
+            .expect("stage checkpoint payload");
+        let checkpoint_id = port
+            .checkpoint(LoopCheckpointRequest {
+                kind: LoopCheckpointKind::BeforeModel,
+                state_ref,
+            })
+            .await
+            .expect("write checkpoint metadata");
+
+        // Load with a bumped schema version — stored = N, expected = N+1.
+        let bumped_version =
+            ironclaw_turns::RunProfileVersion::new(stored_schema_version.as_u64() + 1);
+
+        let error = port
+            .load_checkpoint_payload(LoadCheckpointPayloadRequest {
+                checkpoint_id,
+                expected_schema_id,
+                expected_schema_version: bumped_version,
+            })
+            .await
+            .expect_err("schema version mismatch must reject");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::Invalid);
     }
 
     #[tokio::test]

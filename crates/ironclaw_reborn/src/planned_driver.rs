@@ -21,8 +21,7 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverHost,
         AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, AgentLoopHostError,
-        AgentLoopHostErrorKind, LoadCheckpointPayloadRequest, LoopCheckpointKind, LoopDriverId,
-        LoopRunContext,
+        LoadCheckpointPayloadRequest, LoopCheckpointKind, LoopDriverId, LoopRunContext,
     },
 };
 
@@ -207,12 +206,7 @@ pub(crate) fn map_executor_error(error: AgentLoopExecutorError) -> AgentLoopDriv
 
 fn map_resume_load_error(error: AgentLoopHostError) -> AgentLoopDriverError {
     tracing::warn!(?error, "planned driver could not load checkpoint payload");
-    match error.kind {
-        AgentLoopHostErrorKind::InvalidInvocation => AgentLoopDriverError::InvalidRequest {
-            reason: "checkpoint load: invalid_invocation".to_string(),
-        },
-        _ => checkpoint_unavailable_error(),
-    }
+    checkpoint_unavailable_error()
 }
 
 fn map_resume_payload_error(error: CheckpointPayloadError) -> AgentLoopDriverError {
@@ -466,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_schema_mismatch_load_error_is_invalid_request() {
+    async fn resume_schema_mismatch_load_error_is_checkpoint_unavailable() {
         let registry = build_loop_family_registry().expect("registry");
         let driver = PlannedDriver::default_from_registry(&registry).expect("driver");
         let context = run_context_for_driver(&driver);
@@ -496,9 +490,9 @@ mod tests {
             .await;
 
         assert_eq!(
-            result.expect_err("schema mismatch should be a request error"),
-            AgentLoopDriverError::InvalidRequest {
-                reason: "checkpoint load: invalid_invocation".to_string()
+            result.expect_err("schema mismatch should fail as checkpoint_unavailable"),
+            AgentLoopDriverError::Failed {
+                reason_kind: "checkpoint_unavailable".to_string()
             }
         );
         assert_eq!(host.load_call_count(), 1);
@@ -512,8 +506,8 @@ mod tests {
     async fn planned_driver_resume_schema_version_drift_fails_cleanly() {
         // Stage a valid checkpoint payload under schema_version = 1 (current).
         // Resume with a run context bumped to schema_version = 2.
-        // The host sees expected_schema_version = 2 but stored = 1 → InvalidInvocation
-        // → mapped to InvalidRequest (not checkpoint_unavailable).
+        // The host sees expected_schema_version = 2 but stored = 1 → Invalid
+        // → mapped to Failed(checkpoint_unavailable).
         let registry = build_loop_family_registry().expect("registry");
         let driver = PlannedDriver::default_from_registry(&registry).expect("driver");
         let mut context = run_context_for_driver(&driver);
@@ -553,8 +547,8 @@ mod tests {
 
         assert_eq!(
             result.expect_err("schema version drift must fail"),
-            AgentLoopDriverError::InvalidRequest {
-                reason: "checkpoint load: invalid_invocation".to_string()
+            AgentLoopDriverError::Failed {
+                reason_kind: "checkpoint_unavailable".to_string()
             }
         );
         assert_eq!(host.load_call_count(), 1);
@@ -751,7 +745,7 @@ mod tests {
                 || request.expected_schema_version != self.loaded.schema_version
             {
                 return Err(AgentLoopHostError::new(
-                    AgentLoopHostErrorKind::InvalidInvocation,
+                    AgentLoopHostErrorKind::Invalid,
                     "test checkpoint schema mismatch",
                 ));
             }

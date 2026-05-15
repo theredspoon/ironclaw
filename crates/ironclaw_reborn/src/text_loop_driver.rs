@@ -173,11 +173,11 @@ fn map_host_error(stage: &'static str, error: AgentLoopHostError) -> AgentLoopDr
     );
 
     match error.kind {
-        AgentLoopHostErrorKind::InvalidInvocation | AgentLoopHostErrorKind::ScopeMismatch => {
-            AgentLoopDriverError::InvalidRequest {
-                reason: format!("{stage}: {}", error.kind.as_str()),
-            }
-        }
+        AgentLoopHostErrorKind::InvalidInvocation
+        | AgentLoopHostErrorKind::Invalid
+        | AgentLoopHostErrorKind::ScopeMismatch => AgentLoopDriverError::InvalidRequest {
+            reason: format!("{stage}: {}", error.kind.as_str()),
+        },
         AgentLoopHostErrorKind::Unavailable | AgentLoopHostErrorKind::Cancelled => {
             AgentLoopDriverError::Unavailable {
                 reason: format!("{stage}: {}", error.kind.as_str()),

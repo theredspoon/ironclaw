@@ -979,6 +979,7 @@ fn model_error_class(error: &AgentLoopHostError) -> Option<ModelErrorClass> {
         | AgentLoopHostErrorKind::ScopeMismatch
         | AgentLoopHostErrorKind::StaleSurface
         | AgentLoopHostErrorKind::InvalidInvocation
+        | AgentLoopHostErrorKind::Invalid
         | AgentLoopHostErrorKind::PolicyDenied
         | AgentLoopHostErrorKind::CheckpointRejected
         | AgentLoopHostErrorKind::TranscriptWriteFailed => None,
