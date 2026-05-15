@@ -5,9 +5,9 @@ use ironclaw_host_api::VirtualPath;
 
 use crate::backend::{EventRecord, StorageTxn};
 use crate::{
-    BackendCapabilities, BackendId, BackendKind, CasExpectation, ContentKind, DirEntry, Entry,
-    FileStat, FilesystemError, FilesystemOperation, Filter, IndexPolicy, IndexSpec, Page,
-    RecordVersion, RootFilesystem, SeqNo, StorageClass, VersionedEntry, path_prefix_matches,
+    BackendCapabilities, BackendId, BackendKind, Capability, CasExpectation, ContentKind, DirEntry,
+    Entry, FileStat, FilesystemError, Filter, IndexPolicy, IndexSpec, Page, RecordVersion,
+    RootFilesystem, SeqNo, StorageClass, VersionedEntry, path_prefix_matches,
 };
 
 /// Trusted catalog record for one virtual filesystem mount.
@@ -152,43 +152,32 @@ fn validate_mount_capabilities(
     backend: BackendCapabilities,
 ) -> Result<(), FilesystemError> {
     let declared = descriptor.capabilities;
-    let mut shortfalls: Vec<&'static str> = Vec::new();
-    if declared.records && !backend.records {
-        shortfalls.push("records");
-    }
-    if declared.query && !backend.query {
-        shortfalls.push("query");
-    }
-    if declared.index.exact && !backend.index.exact {
-        shortfalls.push("index.exact");
-    }
-    if declared.index.prefix && !backend.index.prefix {
-        shortfalls.push("index.prefix");
-    }
-    if declared.index.fts && !backend.index.fts {
-        shortfalls.push("index.fts");
-    }
-    if declared.index.vector && !backend.index.vector {
-        shortfalls.push("index.vector");
-    }
-    if declared.events && !backend.events {
-        shortfalls.push("events");
-    }
-    let backend_txn = txn_capability_rank(backend.txn);
-    let declared_txn = txn_capability_rank(declared.txn);
-    if declared_txn > backend_txn {
-        shortfalls.push("txn");
-    }
-    if shortfalls.is_empty() {
+    // Only validate the **new** capability axes — legacy bytes flags stay
+    // descriptor-driven (see the function-level doc comment).
+    const NEW_AXES: &[Capability] = &[
+        Capability::Records,
+        Capability::Query,
+        Capability::IndexExact,
+        Capability::IndexPrefix,
+        Capability::IndexFts,
+        Capability::IndexVector,
+        Capability::Events,
+    ];
+    let mut shortfalls: Vec<Capability> = NEW_AXES
+        .iter()
+        .copied()
+        .filter(|cap| declared.has(*cap) && !backend.has(*cap))
+        .collect();
+    let backend_txn = txn_capability_rank(backend.txn());
+    let declared_txn = txn_capability_rank(declared.txn());
+    let txn_shortfall = declared_txn > backend_txn;
+    if shortfalls.is_empty() && !txn_shortfall {
         Ok(())
     } else {
-        Err(FilesystemError::Backend {
+        Err(FilesystemError::DescriptorOverclaims {
             path: descriptor.virtual_root.clone(),
-            operation: FilesystemOperation::MountLocal,
-            reason: format!(
-                "mount descriptor claims capabilities the backend does not provide: {}",
-                shortfalls.join(", ")
-            ),
+            missing: std::mem::take(&mut shortfalls),
+            txn_shortfall,
         })
     }
 }

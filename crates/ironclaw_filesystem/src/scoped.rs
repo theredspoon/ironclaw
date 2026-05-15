@@ -102,22 +102,31 @@ where
         self.root.tail(&virtual_path, from).await
     }
 
-    // ─── Legacy bytes-plane methods (transitional) ────────────────────────
+    // ─── Legacy bytes-plane methods (DEPRECATED — transitional) ───────────
     //
     // These remain for the migration window. New code should prefer the
-    // unified ops above. They will be removed once consumers migrate
-    // (task 17).
+    // unified ops above (`put`/`get`/`read_bytes`/`write_bytes`). Removed
+    // once consumers migrate (task #17). Marked deprecated via doc comment
+    // rather than `#[deprecated]` attribute to avoid generating compiler
+    // warnings across every downstream call site during the transition.
 
+    /// **DEPRECATED — use [`read_bytes`](Self::read_bytes) or
+    /// [`get`](Self::get) instead.**
     pub async fn read_file(&self, path: &ScopedPath) -> Result<Vec<u8>, FilesystemError> {
         let virtual_path = self.resolve_with_permission(path, FilesystemOperation::ReadFile)?;
         self.root.read_file(&virtual_path).await
     }
 
+    /// **DEPRECATED — use [`write_bytes`](Self::write_bytes) or
+    /// [`put`](Self::put) instead.**
     pub async fn write_file(&self, path: &ScopedPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         let virtual_path = self.resolve_with_permission(path, FilesystemOperation::WriteFile)?;
         self.root.write_file(&virtual_path, bytes).await
     }
 
+    /// **DEPRECATED — no direct replacement on the unified surface.** Use
+    /// `append`/`tail` for log-shaped mounts or `get`+`put` for
+    /// read-modify-write.
     pub async fn append_file(
         &self,
         path: &ScopedPath,
@@ -142,6 +151,8 @@ where
         self.root.delete(&virtual_path).await
     }
 
+    /// **DEPRECATED — the unified entry plane infers directories from path
+    /// prefixes.** New consumer code must not call this.
     pub async fn create_dir_all(&self, path: &ScopedPath) -> Result<(), FilesystemError> {
         let virtual_path = self.resolve_with_permission(path, FilesystemOperation::CreateDirAll)?;
         self.root.create_dir_all(&virtual_path).await

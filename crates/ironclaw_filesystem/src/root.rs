@@ -156,13 +156,31 @@ pub trait RootFilesystem: Send + Sync {
         unsupported(path, FilesystemOperation::Tail)
     }
 
-    // ─── Legacy bytes plane (transitional) ────────────────────────────────
+    // ─── Legacy bytes plane (DEPRECATED — removed after consumer migration) ─
+    //
+    // The methods below predate the unified [`put`]/[`get`] surface and exist
+    // only so existing call sites (engine v2 sandbox tools, the host_runtime
+    // coding tools, in-tree test scaffolds) keep compiling during the
+    // consumer-migration window. New code MUST use the unified ops:
+    //   - `read_file(path)`     → `get(path)?.entry.body`
+    //   - `write_file(path, b)` → `put(path, Entry::bytes(b), CasExpectation::Any)`
+    //   - `append_file(path, b)`→ no replacement on the unified surface; use
+    //                              `append`/`tail` for log-shaped mounts, or
+    //                              `get`+`put` for read-modify-write
+    //   - `create_dir_all(path)`→ no longer needed; the entry plane infers
+    //                              directories from path prefixes
+    //
+    // These methods will be removed in the consumer-migration cleanup pass
+    // (task #17 in the rework plan). Do not extend them; do not call them
+    // from new consumer code.
 
-    /// Reads a file by canonical virtual path without exposing backend host paths in errors.
+    /// **DEPRECATED — use [`get`](Self::get) instead.**
     ///
-    /// Legacy entry point — new code should call [`get`](Self::get). Default
-    /// impl routes through `get` and extracts the body; backends that have a
-    /// faster native byte read may override.
+    /// Reads a file by canonical virtual path without exposing backend host
+    /// paths in errors. Default impl routes through `get` and extracts the
+    /// body; backends that have a faster native byte read may override.
+    /// Removed once consumer migration completes (rework task #17). New
+    /// consumer code must call `get` directly.
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
         match self.get(path).await? {
             Some(entry) => Ok(entry.entry.body),
@@ -173,36 +191,42 @@ pub trait RootFilesystem: Send + Sync {
         }
     }
 
-    /// Writes bytes to a canonical virtual path while preserving backend containment.
+    /// **DEPRECATED — use [`put`](Self::put) instead.**
     ///
-    /// Legacy entry point — new code should call [`put`](Self::put). Default
-    /// impl routes through `put` with `CasExpectation::Any`.
+    /// Writes bytes to a canonical virtual path while preserving backend
+    /// containment. Default impl routes through `put` with
+    /// `CasExpectation::Any`. Removed once consumer migration completes
+    /// (rework task #17). New consumer code must call `put` with
+    /// `Entry::bytes(...)` and an explicit `CasExpectation`.
     async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError> {
         self.put(path, Entry::bytes(bytes.to_vec()), CasExpectation::Any)
             .await
             .map(|_| ())
     }
 
-    /// Appends bytes to a canonical virtual path. Distinct from
-    /// [`append`](Self::append), which is the event-plane sequence operation.
-    /// Backends that do not support byte-append must fail closed before side
-    /// effects.
+    /// **DEPRECATED — no direct replacement on the unified surface.**
+    ///
+    /// Distinct from [`append`](Self::append), which is the event-plane
+    /// sequence operation. Use `append`/`tail` for log-shaped mounts or a
+    /// `get` + `put` read-modify-write loop for arbitrary bytes. Removed
+    /// once consumer migration completes (rework task #17).
     async fn append_file(&self, path: &VirtualPath, _bytes: &[u8]) -> Result<(), FilesystemError> {
-        Err(FilesystemError::Backend {
+        Err(FilesystemError::Unsupported {
             path: path.clone(),
             operation: FilesystemOperation::AppendFile,
-            reason: "append_file is not supported by this backend".to_string(),
         })
     }
 
+    /// **DEPRECATED — the entry plane infers directories from path prefixes.**
+    ///
     /// Creates a canonical virtual directory and any missing parents.
     /// Backends that do not support directories must fail closed before side
-    /// effects.
+    /// effects. New consumer code must not call this — `put` against a leaf
+    /// path implicitly establishes the directory hierarchy.
     async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
-        Err(FilesystemError::Backend {
+        Err(FilesystemError::Unsupported {
             path: path.clone(),
             operation: FilesystemOperation::CreateDirAll,
-            reason: "create_dir_all is not supported by this backend".to_string(),
         })
     }
 }

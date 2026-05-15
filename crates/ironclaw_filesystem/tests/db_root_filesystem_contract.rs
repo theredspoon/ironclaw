@@ -687,3 +687,366 @@ async fn libsql_root() -> TestLibSqlRootFilesystem {
         _dir: db_dir,
     }
 }
+
+// ─── Postgres behavioral tests ────────────────────────────────────────────
+//
+// PR #3659 reviewer flagged that the libsql contract suite has no Postgres
+// counterpart, even though the Postgres backend ships substantial new code.
+// These tests mirror the libsql shape (put/get round-trip, CAS Absent /
+// Version / Any, query with Filter shapes, ensure_index conflict +
+// race-idempotence, Range numeric vs text comparison) and gracefully skip
+// when no Postgres is reachable via `DATABASE_URL` /
+// `IRONCLAW_FILESYSTEM_POSTGRES_URL`.
+
+#[cfg(feature = "postgres")]
+mod postgres_tests {
+    use super::*;
+    use ironclaw_filesystem::PostgresRootFilesystem;
+
+    async fn postgres_pool() -> Option<deadpool_postgres::Pool> {
+        if std::env::var("IRONCLAW_SKIP_POSTGRES_TESTS").is_ok() {
+            return None;
+        }
+        let url = std::env::var("IRONCLAW_FILESYSTEM_POSTGRES_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+        let config = url.parse::<tokio_postgres::Config>().ok()?;
+        let manager = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
+        deadpool_postgres::Pool::builder(manager)
+            .max_size(4)
+            .build()
+            .ok()
+    }
+
+    /// Build a fresh Postgres-backed filesystem with migrations applied.
+    /// Returns `None` if no Postgres is reachable — caller must early-return
+    /// so the test passes in environments without a DB. Each test uses a
+    /// unique path prefix so concurrent runs against a shared DB don't
+    /// interfere.
+    async fn postgres_root() -> Option<(PostgresRootFilesystem, String)> {
+        let pool = postgres_pool().await?;
+        let fs = PostgresRootFilesystem::new(pool);
+        fs.run_migrations().await.ok()?;
+        // Unique per-test prefix under /secrets/leases (a known VirtualPath
+        // root). Concurrent test runs against the same Postgres get
+        // isolation via the prefix; cleanup happens by the next test's
+        // delete on its own prefix or by the test DB being torn down
+        // between runs.
+        let prefix = format!("/secrets/leases/pgtest_{}", uuid::Uuid::new_v4().simple());
+        Some((fs, prefix))
+    }
+
+    fn vpath(prefix: &str, leaf: &str) -> VirtualPath {
+        VirtualPath::new(format!("{prefix}/{leaf}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn postgres_native_put_get_round_trip_with_record_metadata() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let path = vpath(&prefix, "L1");
+        let kind = RecordKind::new("credential_lease").unwrap();
+        let scope_key = IndexKey::new("scope").unwrap();
+        let status_key = IndexKey::new("status").unwrap();
+        let entry = Entry::record(kind.clone(), &serde_json::json!({"hidden": true}))
+            .unwrap()
+            .with_indexed(scope_key.clone(), IndexValue::Text("acme".into()))
+            .with_indexed(status_key.clone(), IndexValue::Text("active".into()));
+
+        let version1 = fs.put(&path, entry, CasExpectation::Absent).await.unwrap();
+        assert_eq!(version1.get(), 1);
+
+        let got = fs
+            .get(&path)
+            .await
+            .unwrap()
+            .expect("entry should be present");
+        assert_eq!(got.version, version1);
+        assert_eq!(got.entry.kind.as_ref(), Some(&kind));
+        assert_eq!(got.entry.indexed.len(), 2);
+        assert!(got.entry.indexed.contains_key(&scope_key));
+        assert!(got.entry.indexed.contains_key(&status_key));
+    }
+
+    #[tokio::test]
+    async fn postgres_native_put_cas_absent_rejects_existing_path() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let path = vpath(&prefix, "L2");
+        fs.put(&path, Entry::bytes(vec![1]), CasExpectation::Absent)
+            .await
+            .unwrap();
+        let err = fs
+            .put(&path, Entry::bytes(vec![2]), CasExpectation::Absent)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::VersionMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn postgres_native_put_cas_version_advances_and_rejects_stale() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let path = vpath(&prefix, "L3");
+        let v1 = fs
+            .put(&path, Entry::bytes(vec![1]), CasExpectation::Absent)
+            .await
+            .unwrap();
+        let v2 = fs
+            .put(&path, Entry::bytes(vec![2]), CasExpectation::Version(v1))
+            .await
+            .unwrap();
+        assert!(v2 > v1);
+        let err = fs
+            .put(&path, Entry::bytes(vec![3]), CasExpectation::Version(v1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::VersionMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn postgres_native_put_cas_any_increments_existing_version() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let path = vpath(&prefix, "L4");
+        let v1 = fs
+            .put(&path, Entry::bytes(vec![1]), CasExpectation::Absent)
+            .await
+            .unwrap();
+        let v2 = fs
+            .put(&path, Entry::bytes(vec![2]), CasExpectation::Any)
+            .await
+            .unwrap();
+        assert_eq!(v2.get(), v1.get() + 1);
+        let got = fs.get(&path).await.unwrap().unwrap();
+        assert_eq!(got.version, v2);
+        assert_eq!(got.entry.body, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn postgres_get_returns_none_for_missing_path() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let path = vpath(&prefix, "missing");
+        assert!(fs.get(&path).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_ensure_index_is_idempotent_and_conflict_aware() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(prefix).unwrap();
+        let name = IndexName::new("by_scope_status").unwrap();
+        let keys = vec![
+            IndexKey::new("scope").unwrap(),
+            IndexKey::new("status").unwrap(),
+        ];
+        let spec_exact = IndexSpec::new(name.clone(), keys.clone(), IndexKind::Exact);
+        let spec_prefix = IndexSpec::new(name, keys, IndexKind::Prefix);
+
+        fs.ensure_index(&prefix_path, &spec_exact).await.unwrap();
+        // Idempotent re-declaration.
+        fs.ensure_index(&prefix_path, &spec_exact).await.unwrap();
+        // Conflicting kind under same name fails.
+        let err = fs
+            .ensure_index(&prefix_path, &spec_prefix)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FilesystemError::IndexConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn postgres_query_filters_on_indexed_projection() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let kind = RecordKind::new("lease").unwrap();
+        let scope_key = IndexKey::new("scope").unwrap();
+        let status_key = IndexKey::new("status").unwrap();
+
+        for (leaf, scope, status) in [
+            ("A", "acme", "active"),
+            ("B", "acme", "revoked"),
+            ("C", "globex", "active"),
+            ("D", "acme", "active"),
+        ] {
+            let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+                .unwrap()
+                .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()))
+                .with_indexed(status_key.clone(), IndexValue::Text(status.into()));
+            fs.put(&vpath(&prefix, leaf), entry, CasExpectation::Absent)
+                .await
+                .unwrap();
+        }
+
+        let results = fs
+            .query(
+                &prefix_path,
+                &Filter::And(vec![
+                    Filter::Eq {
+                        key: scope_key,
+                        value: IndexValue::Text("acme".into()),
+                    },
+                    Filter::Eq {
+                        key: status_key,
+                        value: IndexValue::Text("active".into()),
+                    },
+                ]),
+                Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn postgres_query_range_on_i64_is_numeric_not_lexicographic() {
+        // PR #3661 reviewer: Postgres Range on IndexValue::I64 used to be
+        // lexicographic via `indexed->>'key' BETWEEN ...` on text. The fix
+        // casts both sides to BIGINT so `2..10` includes `9` but not `99`.
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let kind = RecordKind::new("widget").unwrap();
+        let size = IndexKey::new("size").unwrap();
+        for (leaf, n) in [
+            ("W2", 2i64),
+            ("W9", 9),
+            ("W10", 10),
+            ("W11", 11),
+            ("W99", 99),
+        ] {
+            let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+                .unwrap()
+                .with_indexed(size.clone(), IndexValue::I64(n));
+            fs.put(&vpath(&prefix, leaf), entry, CasExpectation::Absent)
+                .await
+                .unwrap();
+        }
+        // Range 2..=10 should include {2, 9, 10} numerically. Lexicographic
+        // comparison on '2' / '10' would miss `9` (since "9" > "10" as text).
+        let results = fs
+            .query(
+                &prefix_path,
+                &Filter::Range {
+                    key: size,
+                    lo: IndexValue::I64(2),
+                    hi: IndexValue::I64(10),
+                },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn postgres_query_prefix_filter_literal_percent_is_not_a_wildcard() {
+        // PR #3661 reviewer: literal `tenant:%` must not become a wildcard.
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let kind = RecordKind::new("lease").unwrap();
+        let scope_key = IndexKey::new("scope").unwrap();
+        for (leaf, scope) in [
+            ("P1", "tenant:%"),
+            ("P2", "tenant:acme"),
+            ("P3", "tenant:globex"),
+        ] {
+            let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+                .unwrap()
+                .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()));
+            fs.put(&vpath(&prefix, leaf), entry, CasExpectation::Absent)
+                .await
+                .unwrap();
+        }
+        let results = fs
+            .query(
+                &prefix_path,
+                &Filter::PrefixOn {
+                    key: scope_key,
+                    value: IndexValue::Text("tenant:%".into()),
+                },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn postgres_query_or_empty_matches_nothing_and_all_matches_every_row() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let prefix_path = VirtualPath::new(&prefix).unwrap();
+        let kind = RecordKind::new("lease").unwrap();
+        let scope_key = IndexKey::new("scope").unwrap();
+        for (leaf, scope) in [("A", "acme"), ("B", "globex")] {
+            let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+                .unwrap()
+                .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()));
+            fs.put(&vpath(&prefix, leaf), entry, CasExpectation::Absent)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            fs.query(&prefix_path, &Filter::All, Page::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            fs.query(&prefix_path, &Filter::Or(Vec::new()), Page::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs.query(&prefix_path, &Filter::And(Vec::new()), Page::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_write_file_after_put_resets_record_metadata_and_bumps_version() {
+        let Some((fs, prefix)) = postgres_root().await else {
+            return;
+        };
+        let path = vpath(&prefix, "STALE");
+        let kind = RecordKind::new("credential_lease").unwrap();
+        let scope = IndexKey::new("scope").unwrap();
+        let record_entry = Entry::record(kind, &serde_json::json!({"k": 1}))
+            .unwrap()
+            .with_indexed(scope, IndexValue::Text("acme".into()));
+
+        let v1 = fs
+            .put(&path, record_entry, CasExpectation::Absent)
+            .await
+            .unwrap();
+
+        // Legacy write must reset record metadata + bump version.
+        #[allow(deprecated)]
+        fs.write_file(&path, b"opaque").await.unwrap();
+
+        let got = fs.get(&path).await.unwrap().unwrap();
+        assert!(got.entry.kind.is_none());
+        assert!(got.entry.indexed.is_empty());
+        assert_eq!(got.entry.body, b"opaque");
+        assert!(got.version > v1);
+    }
+}

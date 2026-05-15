@@ -5,13 +5,14 @@ use ironclaw_host_api::VirtualPath;
 
 use crate::db::{
     child_path_like_pattern, db_error, direct_children, directory_append_error,
-    directory_write_error, is_not_found, not_found, system_time_from_unix_seconds,
+    directory_write_error, escape_like_literal, escape_like_with_trailing_wildcard, is_not_found,
+    not_found, record_version_from_i64, sql_index_name, system_time_from_unix_seconds,
     valid_engine_path, virtual_path_prefixes,
 };
 use crate::{
     BackendCapabilities, CasExpectation, ContentType, DirEntry, Entry, FileStat, FileType,
-    FilesystemError, FilesystemOperation, Filter, IndexCapability, IndexKey, IndexKind, IndexSpec,
-    IndexValue, Page, RecordKind, RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
+    FilesystemError, FilesystemOperation, Filter, IndexKey, IndexKind, IndexSpec, IndexValue, Page,
+    RecordKind, RecordVersion, RootFilesystem, VersionedEntry,
 };
 
 #[cfg(feature = "postgres")]
@@ -56,26 +57,10 @@ impl PostgresRootFilesystem {
 #[async_trait]
 impl RootFilesystem for PostgresRootFilesystem {
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            read: true,
-            write: true,
-            append: true,
-            list: true,
-            stat: true,
-            delete: true,
-            records: true,
-            query: true,
-            index: IndexCapability {
-                exact: true,
-                prefix: true,
-                fts: false,
-                vector: false,
-            },
-            txn: TxnCapability::Cas,
-            events: false,
-            indexed: false,
-            embedded: false,
-        }
+        // sql_typical: read/write/append/list/stat/delete/records/query/
+        // IndexExact/IndexPrefix/CAS. Events + FTS/Vector indexes stay off
+        // until their respective backend ports land.
+        BackendCapabilities::sql_typical()
     }
 
     async fn put(
@@ -92,12 +77,12 @@ impl RootFilesystem for PostgresRootFilesystem {
         {
             return Err(directory_write_error(path.clone()));
         }
-        let indexed_json =
-            serde_json::to_value(&entry.indexed).map_err(|error| FilesystemError::Backend {
+        let indexed_json = serde_json::to_value(&entry.indexed).map_err(|_| {
+            FilesystemError::SerializeIndexed {
                 path: path.clone(),
                 operation: FilesystemOperation::WriteFile,
-                reason: format!("failed to serialize indexed projection: {error}"),
-            })?;
+            }
+        })?;
         let kind_str = entry.kind.as_ref().map(|k| k.as_str().to_string());
         let content_type_str = entry.content_type.as_str().to_string();
         let body = entry.body;
@@ -205,7 +190,7 @@ impl RootFilesystem for PostgresRootFilesystem {
                     return Err(directory_write_error(path.clone()));
                 };
                 let version: i64 = row.get("version");
-                Ok(RecordVersion::from_backend(version.max(0) as u64))
+                record_version_from_i64(path, version)
             }
         }
     }
@@ -238,7 +223,7 @@ impl RootFilesystem for PostgresRootFilesystem {
         let entry = build_entry(path, body, content_type_raw, kind_raw, indexed_value)?;
         Ok(Some(VersionedEntry {
             entry,
-            version: RecordVersion::from_backend(version_raw.max(0) as u64),
+            version: record_version_from_i64(path, version_raw)?,
         }))
     }
 
@@ -261,7 +246,7 @@ impl RootFilesystem for PostgresRootFilesystem {
             return Err(FilesystemError::IndexConflict {
                 path: path.clone(),
                 name: spec.name.clone(),
-                reason: "spec must declare at least one key".to_string(),
+                reason: crate::IndexConflictReason::EmptyKeys,
             });
         }
         let keys_json = serde_json::to_value(
@@ -270,10 +255,9 @@ impl RootFilesystem for PostgresRootFilesystem {
                 .map(|k| k.as_str().to_string())
                 .collect::<Vec<_>>(),
         )
-        .map_err(|error| FilesystemError::Backend {
+        .map_err(|_| FilesystemError::SerializeIndexed {
             path: path.clone(),
             operation: FilesystemOperation::EnsureIndex,
-            reason: format!("failed to serialize index keys: {error}"),
         })?;
 
         let client = self.client().await?;
@@ -299,10 +283,9 @@ impl RootFilesystem for PostgresRootFilesystem {
             )
             .await
             .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?
-            .ok_or_else(|| FilesystemError::Backend {
+            .ok_or_else(|| FilesystemError::IndexSpecMissingAfterUpsert {
                 path: path.clone(),
-                operation: FilesystemOperation::EnsureIndex,
-                reason: "index spec disappeared after upsert".to_string(),
+                name: spec.name.clone(),
             })?;
         let existing_keys: serde_json::Value = row.get("keys");
         let existing_kind: String = row.get("kind");
@@ -310,7 +293,7 @@ impl RootFilesystem for PostgresRootFilesystem {
             return Err(FilesystemError::IndexConflict {
                 path: path.clone(),
                 name: spec.name.clone(),
-                reason: "spec already declared with different keys or kind".to_string(),
+                reason: crate::IndexConflictReason::SpecMismatch,
             });
         }
 
@@ -339,7 +322,7 @@ impl RootFilesystem for PostgresRootFilesystem {
     ) -> Result<Vec<VersionedEntry>, FilesystemError> {
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
         let path_str = path.as_str().to_string();
-        let prefix_pattern = escape_like_pattern(&format!("{}/%", path.as_str()));
+        let prefix_pattern = escape_like_with_trailing_wildcard(&format!("{}/%", path.as_str()));
         params.push(Box::new(path_str));
         params.push(Box::new(prefix_pattern));
 
@@ -381,10 +364,8 @@ impl RootFilesystem for PostgresRootFilesystem {
                 let version_raw: i64 = row.get("version");
                 let entry =
                     build_entry(&row_path, body, content_type_raw, kind_raw, indexed_value)?;
-                Ok(VersionedEntry {
-                    entry,
-                    version: RecordVersion::from_backend(version_raw.max(0) as u64),
-                })
+                let version = record_version_from_i64(&row_path, version_raw)?;
+                Ok(VersionedEntry { entry, version })
             })
             .collect()
     }
@@ -464,9 +445,11 @@ impl RootFilesystem for PostgresRootFilesystem {
         // Appending bytes onto a previously record-shaped entry was always
         // a category error; surface it by clearing the schema metadata
         // rather than leaving it stale on top of changed bytes.
-        // TODO(reborn): append rewrites the whole DB row. Do not use this
-        // path for high-volume JSONL/event streams; route those through
-        // typed event stores or append-capable artifact backends.
+        // Note: append rewrites the whole DB row. This is acceptable for
+        // the legacy bytes plane (slated for removal in the consumer-
+        // migration cleanup pass — see RootFilesystem::append_file's
+        // deprecation note). New callers must use `append`/`tail` for
+        // log-shaped mounts or `get`+`put` read-modify-write.
         client
             .execute(
                 r#"
@@ -685,66 +668,12 @@ impl PostgresRootFilesystem {
             )
             .await
             .map_err(|error| db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
-        Ok(row.map(|row| {
+        row.map(|row| {
             let version: i64 = row.get("version");
-            RecordVersion::from_backend(version.max(0) as u64)
-        }))
+            record_version_from_i64(path, version)
+        })
+        .transpose()
     }
-}
-
-#[cfg(feature = "postgres")]
-fn sql_index_name(prefix: &str, name: &str) -> String {
-    let prefix_clean: String = prefix
-        .trim_matches('/')
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let raw = format!("idx_rfs_{prefix_clean}_{name}");
-    if raw.len() > 62 {
-        let cutoff = raw
-            .char_indices()
-            .nth(62)
-            .map(|(i, _)| i)
-            .unwrap_or(raw.len());
-        raw[..cutoff].to_string()
-    } else {
-        raw
-    }
-}
-
-/// LIKE-pattern escape that preserves a trailing wildcard appended by the
-/// caller (the path-prefix scan in `query`).
-#[cfg(feature = "postgres")]
-fn escape_like_pattern(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '%' if chars.peek().is_some() => out.push_str("!%"),
-            '_' => out.push_str("!_"),
-            '!' => out.push_str("!!"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Fully-literal LIKE escape for user-supplied values. PR #3661 reviewer
-/// fix: the `Filter::PrefixOn` value must be treated as a literal — a
-/// stored prefix of `tenant:%` must not become a `%` wildcard at query
-/// time.
-#[cfg(feature = "postgres")]
-fn escape_like_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '%' => out.push_str("!%"),
-            '_' => out.push_str("!_"),
-            '!' => out.push_str("!!"),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Translate a [`Filter`] tree into a postgres WHERE-clause fragment.
@@ -891,10 +820,9 @@ fn build_entry(
     let indexed: BTreeMap<IndexKey, IndexValue> = if indexed_value.is_null() {
         BTreeMap::new()
     } else {
-        serde_json::from_value(indexed_value).map_err(|error| FilesystemError::Backend {
+        serde_json::from_value(indexed_value).map_err(|_| FilesystemError::DeserializeIndexed {
             path: path.clone(),
             operation: FilesystemOperation::ReadFile,
-            reason: format!("failed to parse indexed projection: {error}"),
         })?
     };
     Ok(Entry {

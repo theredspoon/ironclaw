@@ -104,12 +104,64 @@ pub enum FilesystemError {
     },
     /// Declaring an index conflicted with an existing definition (e.g. the
     /// same name already exists with a different `keys` ordering or `kind`).
-    #[error("index conflict for {name} at {path}: {reason}")]
+    #[error("index conflict for {name} at {path}: {reason:?}")]
     IndexConflict {
         path: VirtualPath,
         name: IndexName,
-        reason: String,
+        reason: IndexConflictReason,
     },
+    /// Mount descriptor advertised capabilities the backend doesn't provide
+    /// on the new capability axes (records / query / index / events) or the
+    /// transaction tier. Surfaced at mount time so consumers see the
+    /// shortfall before any op-time `Unsupported` arrives.
+    #[error(
+        "mount descriptor at {path} claims capabilities the backend does not provide: \
+         missing={missing:?}, txn_shortfall={txn_shortfall}"
+    )]
+    DescriptorOverclaims {
+        path: VirtualPath,
+        missing: Vec<Capability>,
+        txn_shortfall: bool,
+    },
+    /// JSON serialization of an [`Entry::indexed`](crate::Entry::indexed)
+    /// projection failed. Indicates a non-serializable value managed to slip
+    /// into the indexed map.
+    #[error("failed to serialize indexed projection for {operation} at {path}")]
+    SerializeIndexed {
+        path: VirtualPath,
+        operation: FilesystemOperation,
+    },
+    /// JSON deserialization of an indexed projection round-tripping out of
+    /// storage failed. Indicates either schema drift or a backend that
+    /// produced a malformed payload.
+    #[error("failed to deserialize indexed projection for {operation} at {path}")]
+    DeserializeIndexed {
+        path: VirtualPath,
+        operation: FilesystemOperation,
+    },
+    /// A persisted [`RecordVersion`](crate::RecordVersion) read back as a
+    /// value outside `u64`'s range (e.g. negative on a libSQL `INTEGER`
+    /// column). Symptom of schema corruption or unsafe direct SQL writes —
+    /// surface as a backend error rather than silently masking to `0`.
+    #[error("corrupt record version {raw} at {path}")]
+    CorruptRecordVersion { path: VirtualPath, raw: i64 },
+    /// Sentinel "this can't happen" surface: an `INSERT ... ON CONFLICT DO
+    /// NOTHING` followed by a `SELECT` returned no row. The only way this
+    /// fires is if a concurrent `DELETE` from outside the index-spec code
+    /// path raced with the ensure_index call.
+    #[error("index spec disappeared after upsert at {path}: {name}")]
+    IndexSpecMissingAfterUpsert { path: VirtualPath, name: IndexName },
+}
+
+/// Reason a [`FilesystemError::IndexConflict`] was raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexConflictReason {
+    /// The existing spec has different `keys` or a different `kind` from the
+    /// one declared in this call.
+    SpecMismatch,
+    /// The declaration has an empty `keys` list. Indexes must declare at
+    /// least one key.
+    EmptyKeys,
 }
 
 /// Coarse file type returned by [`FileStat`] and [`DirEntry`].
@@ -217,28 +269,63 @@ pub enum IndexPolicy {
 
 /// Index kinds a backend can materialize when it serves the record plane.
 ///
-/// A backend that cannot serve a requested kind fails [`ensure_index`](
-/// crate::StorageBackend::ensure_index) closed with
-/// [`FilesystemError::Unsupported`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Individual capability a backend can advertise.
+///
+/// Each variant is a single bit in the [`BackendCapabilities`] bitmask.
+/// Transaction semantics are richer than a single bit (ordered: None → Cas →
+/// MultiKey) and live in [`TxnCapability`] alongside the bitmask.
+///
+/// `read`/`write`/`append`/`list`/`stat`/`delete` predate the unified surface
+/// and are kept here so existing catalog metadata still round-trips; the
+/// mount-time validator in
+/// [`CompositeRootFilesystem`](crate::CompositeRootFilesystem) only enforces
+/// the **new** capability axes (Records, Query, Index*, Events) until each
+/// backend opts into an accurate `capabilities()` override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct IndexCapability {
-    pub exact: bool,
-    pub prefix: bool,
-    pub fts: bool,
-    pub vector: bool,
+pub enum Capability {
+    // Legacy bytes plane.
+    Read,
+    Write,
+    Append,
+    List,
+    Stat,
+    Delete,
+    // Record plane.
+    Records,
+    Query,
+    // Index kinds.
+    IndexExact,
+    IndexPrefix,
+    IndexFts,
+    IndexVector,
+    // Event plane (`append`/`tail`).
+    Events,
 }
 
-impl IndexCapability {
-    /// Convenience constructor for backends that serve everything the byte
-    /// plane needs (most SQL backends).
-    pub const fn sql_typical() -> Self {
-        Self {
-            exact: true,
-            prefix: true,
-            fts: false,
-            vector: false,
-        }
+impl Capability {
+    const fn bit(self) -> u32 {
+        1 << (self as u32)
+    }
+
+    /// Iterator over every capability. Useful for serialization and
+    /// validation reporting.
+    pub fn all() -> &'static [Capability] {
+        &[
+            Capability::Read,
+            Capability::Write,
+            Capability::Append,
+            Capability::List,
+            Capability::Stat,
+            Capability::Delete,
+            Capability::Records,
+            Capability::Query,
+            Capability::IndexExact,
+            Capability::IndexPrefix,
+            Capability::IndexFts,
+            Capability::IndexVector,
+            Capability::Events,
+        ]
     }
 }
 
@@ -261,26 +348,131 @@ pub enum TxnCapability {
 
 /// Capabilities advertised by a mounted backend for diagnostics and routing.
 ///
-/// Mount-time validation refuses a backend whose capabilities cannot satisfy
-/// the index/record/transaction needs declared by the consumer that will be
-/// constructed against it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Stored as a compact `u32` bitmask over [`Capability`] plus an ordered
+/// [`TxnCapability`]. Build with `BackendCapabilities::empty().with(...)` —
+/// or use one of the `sql_typical` / `in_memory_full` / `bytes_only`
+/// convenience constructors. Mount-time validation in
+/// [`CompositeRootFilesystem`](crate::CompositeRootFilesystem) refuses
+/// backends whose capabilities don't satisfy the descriptor's claims on the
+/// new axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BackendCapabilities {
-    // Bytes plane.
-    pub read: bool,
-    pub write: bool,
-    pub append: bool,
-    pub list: bool,
-    pub stat: bool,
-    pub delete: bool,
-    // Record plane.
-    pub records: bool,
-    pub query: bool,
-    pub index: IndexCapability,
-    pub txn: TxnCapability,
-    // Event plane (append/tail).
-    pub events: bool,
-    // Legacy flags retained for existing catalog consumers.
-    pub indexed: bool,
-    pub embedded: bool,
+    flags: u32,
+    txn: TxnCapability,
+}
+
+impl BackendCapabilities {
+    /// No capabilities advertised — the safe default.
+    pub const fn empty() -> Self {
+        Self {
+            flags: 0,
+            txn: TxnCapability::None,
+        }
+    }
+
+    /// Add a [`Capability`] flag.
+    pub const fn with(mut self, cap: Capability) -> Self {
+        self.flags |= cap.bit();
+        self
+    }
+
+    /// Remove a [`Capability`] flag.
+    pub const fn without(mut self, cap: Capability) -> Self {
+        self.flags &= !cap.bit();
+        self
+    }
+
+    /// Set the transaction capability tier.
+    pub const fn with_txn(mut self, txn: TxnCapability) -> Self {
+        self.txn = txn;
+        self
+    }
+
+    /// Does this backend advertise `cap`?
+    pub const fn has(&self, cap: Capability) -> bool {
+        self.flags & cap.bit() != 0
+    }
+
+    /// Transaction tier.
+    pub const fn txn(&self) -> TxnCapability {
+        self.txn
+    }
+
+    /// All capabilities currently set, in [`Capability::all`] order.
+    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
+        Capability::all().iter().copied().filter(|c| self.has(*c))
+    }
+
+    /// Convenience: read + write + list + stat + delete + records + query
+    /// + IndexExact + IndexPrefix + CAS — the typical SQL backend shape.
+    pub const fn sql_typical() -> Self {
+        Self::empty()
+            .with(Capability::Read)
+            .with(Capability::Write)
+            .with(Capability::Append)
+            .with(Capability::List)
+            .with(Capability::Stat)
+            .with(Capability::Delete)
+            .with(Capability::Records)
+            .with(Capability::Query)
+            .with(Capability::IndexExact)
+            .with(Capability::IndexPrefix)
+            .with_txn(TxnCapability::Cas)
+    }
+
+    /// Convenience: every capability the in-memory reference backend
+    /// implements. Includes Events on top of `sql_typical`.
+    pub const fn in_memory_full() -> Self {
+        Self::sql_typical().with(Capability::Events)
+    }
+
+    /// Convenience: read + write + append + list + stat + delete only.
+    /// Matches a byte-only backend that hasn't yet opted into records.
+    pub const fn bytes_only() -> Self {
+        Self::empty()
+            .with(Capability::Read)
+            .with(Capability::Write)
+            .with(Capability::Append)
+            .with(Capability::List)
+            .with(Capability::Stat)
+            .with(Capability::Delete)
+    }
+}
+
+/// Serialize/deserialize as `{ caps: [...], txn: "..." }` so the on-the-wire
+/// shape stays readable rather than leaking the bitmask integer. Decoder
+/// silently ignores unknown capability strings — a backend that advertises a
+/// future variant against an older reader degrades to "missing" rather than
+/// failing parse.
+impl Serialize for BackendCapabilities {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            caps: Vec<Capability>,
+            txn: &'a TxnCapability,
+        }
+        Wire {
+            caps: self.iter().collect(),
+            txn: &self.txn,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendCapabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            caps: Vec<Capability>,
+            #[serde(default)]
+            txn: TxnCapability,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut out = BackendCapabilities::empty().with_txn(wire.txn);
+        for cap in wire.caps {
+            out = out.with(cap);
+        }
+        Ok(out)
+    }
 }

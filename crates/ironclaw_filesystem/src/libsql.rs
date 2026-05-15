@@ -6,13 +6,14 @@ use ironclaw_host_api::VirtualPath;
 
 use crate::db::{
     child_path_like_pattern, direct_children, directory_append_error, directory_write_error,
-    is_not_found, libsql_db_error, not_found, system_time_from_unix_seconds, valid_engine_path,
-    virtual_path_prefixes,
+    escape_like_literal, escape_like_with_trailing_wildcard, is_not_found, libsql_db_error,
+    not_found, record_version_from_i64, sql_index_name, system_time_from_unix_seconds,
+    valid_engine_path, virtual_path_prefixes,
 };
 use crate::{
     BackendCapabilities, CasExpectation, ContentType, DirEntry, Entry, FileStat, FileType,
-    FilesystemError, FilesystemOperation, Filter, IndexCapability, IndexKey, IndexKind, IndexSpec,
-    IndexValue, Page, RecordKind, RecordVersion, RootFilesystem, TxnCapability, VersionedEntry,
+    FilesystemError, FilesystemOperation, Filter, IndexKey, IndexKind, IndexSpec, IndexValue, Page,
+    RecordKind, RecordVersion, RootFilesystem, VersionedEntry,
 };
 
 #[cfg(feature = "libsql")]
@@ -66,29 +67,10 @@ impl LibSqlRootFilesystem {
 #[async_trait]
 impl RootFilesystem for LibSqlRootFilesystem {
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            read: true,
-            write: true,
-            append: true,
-            list: true,
-            stat: true,
-            delete: true,
-            records: true,
-            // Native query over indexed projection with Filter::Eq/PrefixOn/
-            // Range/And/Or; ensure_index materializes expression indexes on
-            // json_extract(indexed, '$.key').
-            query: true,
-            index: IndexCapability {
-                exact: true,
-                prefix: true,
-                fts: false,
-                vector: false,
-            },
-            txn: TxnCapability::Cas,
-            events: false,
-            indexed: false,
-            embedded: false,
-        }
+        // sql_typical covers read/write/append/list/stat/delete/records/query
+        // /IndexExact/IndexPrefix/CAS. Events stay off until the append/tail
+        // backend port lands; IndexFts/Vector ditto.
+        BackendCapabilities::sql_typical()
     }
 
     async fn put(
@@ -107,12 +89,12 @@ impl RootFilesystem for LibSqlRootFilesystem {
         {
             return Err(directory_write_error(path.clone()));
         }
-        let indexed_json =
-            serde_json::to_string(&entry.indexed).map_err(|error| FilesystemError::Backend {
+        let indexed_json = serde_json::to_string(&entry.indexed).map_err(|_| {
+            FilesystemError::SerializeIndexed {
                 path: path.clone(),
                 operation: FilesystemOperation::WriteFile,
-                reason: format!("failed to serialize indexed projection: {error}"),
-            })?;
+            }
+        })?;
         let kind_str = entry.kind.as_ref().map(|k| k.as_str().to_string());
         let content_type_str = entry.content_type.as_str().to_string();
         let body = entry.body;
@@ -276,7 +258,7 @@ impl RootFilesystem for LibSqlRootFilesystem {
         let entry = build_entry(path, body, content_type_raw, kind_raw, indexed_raw)?;
         Ok(Some(VersionedEntry {
             entry,
-            version: RecordVersion::from_backend(version_raw.max(0) as u64),
+            version: record_version_from_i64(path, version_raw)?,
         }))
     }
 
@@ -301,7 +283,7 @@ impl RootFilesystem for LibSqlRootFilesystem {
             return Err(FilesystemError::IndexConflict {
                 path: path.clone(),
                 name: spec.name.clone(),
-                reason: "spec must declare at least one key".to_string(),
+                reason: crate::IndexConflictReason::EmptyKeys,
             });
         }
         let keys_json = serde_json::to_string(
@@ -311,10 +293,9 @@ impl RootFilesystem for LibSqlRootFilesystem {
                 .map(|k| k.as_str().to_string())
                 .collect::<Vec<_>>(),
         )
-        .map_err(|error| FilesystemError::Backend {
+        .map_err(|_| FilesystemError::SerializeIndexed {
             path: path.clone(),
             operation: FilesystemOperation::EnsureIndex,
-            reason: format!("failed to serialize index keys: {error}"),
         })?;
 
         let conn = self.connect().await?;
@@ -357,10 +338,9 @@ impl RootFilesystem for LibSqlRootFilesystem {
             .map_err(|error| {
                 libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
             })?
-            .ok_or_else(|| FilesystemError::Backend {
+            .ok_or_else(|| FilesystemError::IndexSpecMissingAfterUpsert {
                 path: path.clone(),
-                operation: FilesystemOperation::EnsureIndex,
-                reason: "index spec disappeared after upsert".to_string(),
+                name: spec.name.clone(),
             })?;
         let existing_keys: String = row.get(0).map_err(|error| {
             libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
@@ -372,7 +352,7 @@ impl RootFilesystem for LibSqlRootFilesystem {
             return Err(FilesystemError::IndexConflict {
                 path: path.clone(),
                 name: spec.name.clone(),
-                reason: "spec already declared with different keys or kind".to_string(),
+                reason: crate::IndexConflictReason::SpecMismatch,
             });
         }
         drop(rows);
@@ -401,7 +381,9 @@ impl RootFilesystem for LibSqlRootFilesystem {
     ) -> Result<Vec<VersionedEntry>, FilesystemError> {
         let mut params: Vec<libsql::Value> = vec![libsql::Value::Text(path.as_str().to_string())];
         let prefix_pattern = format!("{}/%", path.as_str());
-        params.push(libsql::Value::Text(escape_like_pattern(&prefix_pattern)));
+        params.push(libsql::Value::Text(escape_like_with_trailing_wildcard(
+            &prefix_pattern,
+        )));
 
         let mut conditions = String::new();
         translate_filter(path, filter, &mut conditions, &mut params)?;
@@ -450,10 +432,8 @@ impl RootFilesystem for LibSqlRootFilesystem {
                 libsql_db_error(row_path.clone(), FilesystemOperation::Query, error)
             })?;
             let entry = build_entry(&row_path, body, content_type_raw, kind_raw, indexed_raw)?;
-            out.push(VersionedEntry {
-                entry,
-                version: RecordVersion::from_backend(version_raw.max(0) as u64),
-            });
+            let version = record_version_from_i64(&row_path, version_raw)?;
+            out.push(VersionedEntry { entry, version });
         }
         Ok(out)
     }
@@ -547,9 +527,12 @@ impl RootFilesystem for LibSqlRootFilesystem {
         // defaults — appending bytes onto a previously record-shaped
         // entry was always a category error, and we surface that by
         // clearing the schema metadata rather than leaving it stale.
-        // TODO(reborn): append rewrites the whole DB row. Do not use this
-        // path for high-volume JSONL/event streams; route those through
-        // typed event stores or append-capable artifact backends.
+        // Note: append rewrites the whole DB row. This is acceptable for
+        // the legacy bytes plane (slated for removal in the consumer-
+        // migration cleanup pass — see RootFilesystem::append_file's
+        // deprecation note). New callers must use `append`/`tail` for
+        // log-shaped mounts or `get`+`put` read-modify-write — both avoid
+        // the full-row rewrite.
         conn.execute(
             r#"
             INSERT INTO root_filesystem_entries
@@ -848,7 +831,7 @@ impl LibSqlRootFilesystem {
         let version: i64 = row
             .get(0)
             .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
-        Ok(Some(RecordVersion::from_backend(version.max(0) as u64)))
+        Ok(Some(record_version_from_i64(path, version)?))
     }
 }
 
@@ -868,10 +851,9 @@ fn build_entry(
     let indexed: BTreeMap<IndexKey, IndexValue> = if indexed_raw.is_empty() {
         BTreeMap::new()
     } else {
-        serde_json::from_str(&indexed_raw).map_err(|error| FilesystemError::Backend {
+        serde_json::from_str(&indexed_raw).map_err(|_| FilesystemError::DeserializeIndexed {
             path: path.clone(),
             operation: FilesystemOperation::ReadFile,
-            reason: format!("failed to parse indexed projection: {error}"),
         })?
     };
     Ok(Entry {
@@ -919,75 +901,6 @@ async fn ensure_libsql_index_specs_table(conn: &libsql::Connection) -> Result<()
             libsql_db_error(valid_engine_path(), FilesystemOperation::EnsureIndex, error)
         })?;
     Ok(())
-}
-
-/// Build a deterministic SQL index identifier from a mount prefix + spec name.
-///
-/// IndexKey/IndexName are validated to be simple identifiers (no path
-/// separators, whitespace, or control chars), so the prefix's slashes are
-/// the only non-identifier characters we need to replace. Length is bounded
-/// — Postgres caps at 63, SQLite is more permissive — so we truncate after
-/// sanitisation. Collisions across mounts are tolerable: distinct
-/// `(prefix, name)` pairs share an index when their sanitized forms match,
-/// and the index is still correct (the planner just sees a wider index).
-#[cfg(feature = "libsql")]
-fn sql_index_name(prefix: &str, name: &str) -> String {
-    let prefix_clean: String = prefix
-        .trim_matches('/')
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let raw = format!("idx_rfs_{prefix_clean}_{name}");
-    // Identifier length budget chosen to satisfy Postgres' 63-char cap so
-    // libsql and postgres can share the same naming logic in future refactors.
-    if raw.len() > 62 {
-        let cutoff = raw
-            .char_indices()
-            .nth(62)
-            .map(|(i, _)| i)
-            .unwrap_or(raw.len());
-        raw[..cutoff].to_string()
-    } else {
-        raw
-    }
-}
-
-/// Escape a LIKE pattern that already contains a trailing `%` wildcard
-/// intentionally appended by the caller (the path-prefix scan case in
-/// `query`). The trailing `%` is preserved so it remains a wildcard;
-/// every other `%`, `_`, and `!` is escaped.
-#[cfg(feature = "libsql")]
-fn escape_like_pattern(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '%' if chars.peek().is_some() => out.push_str("!%"),
-            '_' => out.push_str("!_"),
-            '!' => out.push_str("!!"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Escape user-supplied LIKE input where every `%`, `_`, and `!` must be
-/// treated as a literal. Used for `Filter::PrefixOn` values — reviewer
-/// (PR #3661) flagged that the prior code reused `escape_like_pattern`,
-/// which intentionally leaves a final `%` unescaped. A literal prefix
-/// like `tenant:%` would then match anything starting with `tenant:`.
-#[cfg(feature = "libsql")]
-fn escape_like_literal(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '%' => out.push_str("!%"),
-            '_' => out.push_str("!_"),
-            '!' => out.push_str("!!"),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// Translate a [`Filter`] tree into a libsql WHERE-clause fragment.

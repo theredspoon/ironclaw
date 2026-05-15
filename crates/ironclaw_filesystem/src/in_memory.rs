@@ -28,8 +28,8 @@ use tokio::sync::Mutex;
 use crate::backend::{EventRecord, StorageTxn};
 use crate::{
     BackendCapabilities, CasExpectation, DirEntry, Entry, FileStat, FileType, FilesystemError,
-    FilesystemOperation, Filter, IndexCapability, IndexKey, IndexKind, IndexName, IndexSpec,
-    IndexValue, Page, RecordVersion, RootFilesystem, SeqNo, TxnCapability, VersionedEntry,
+    FilesystemOperation, Filter, IndexKey, IndexKind, IndexName, IndexSpec, IndexValue, Page,
+    RecordVersion, RootFilesystem, SeqNo, VersionedEntry,
 };
 
 #[derive(Clone)]
@@ -71,26 +71,7 @@ impl Default for InMemoryBackend {
 #[async_trait]
 impl RootFilesystem for InMemoryBackend {
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            read: true,
-            write: true,
-            append: true,
-            list: true,
-            stat: true,
-            delete: true,
-            records: true,
-            query: true,
-            index: IndexCapability {
-                exact: true,
-                prefix: true,
-                fts: false,
-                vector: false,
-            },
-            txn: TxnCapability::Cas,
-            events: true,
-            indexed: false,
-            embedded: false,
-        }
+        BackendCapabilities::in_memory_full()
     }
 
     async fn put(
@@ -279,7 +260,7 @@ impl RootFilesystem for InMemoryBackend {
                 return Err(FilesystemError::IndexConflict {
                     path: path.clone(),
                     name: existing.name.clone(),
-                    reason: "spec already declared with different keys or kind".to_string(),
+                    reason: crate::IndexConflictReason::SpecMismatch,
                 });
             }
             return Ok(());
@@ -407,26 +388,15 @@ fn filter_matches(
                 // values purely on enum-variant ordering rather than
                 // domain ordering. Require all three sides to share a
                 // variant; mismatched bound/value variants don't match.
-                index_value_variant(lo) == index_value_variant(hi)
-                    && index_value_variant(v) == index_value_variant(lo)
-                    && v >= lo
-                    && v <= hi
+                let lo_d = std::mem::discriminant(lo);
+                let hi_d = std::mem::discriminant(hi);
+                let v_d = std::mem::discriminant(v);
+                lo_d == hi_d && v_d == lo_d && v >= lo && v <= hi
             }
             None => false,
         },
         Filter::And(children) => children.iter().all(|f| filter_matches(f, indexed)),
         Filter::Or(children) => children.iter().any(|f| filter_matches(f, indexed)),
-    }
-}
-
-/// Identify the [`IndexValue`] variant for cross-variant Range matching
-/// (see PR #3659 reviewer note in `filter_matches`).
-fn index_value_variant(value: &IndexValue) -> u8 {
-    match value {
-        IndexValue::Bool(_) => 0,
-        IndexValue::I64(_) => 1,
-        IndexValue::Text(_) => 2,
-        IndexValue::Bytes(_) => 3,
     }
 }
 

@@ -46,8 +46,8 @@ pub use record::{
 pub use root::RootFilesystem;
 pub use scoped::ScopedFilesystem;
 pub use types::{
-    BackendCapabilities, BackendId, BackendKind, ContentKind, DirEntry, FileStat, FileType,
-    FilesystemError, FilesystemOperation, IndexCapability, IndexPolicy, StorageClass,
+    BackendCapabilities, BackendId, BackendKind, Capability, ContentKind, DirEntry, FileStat,
+    FileType, FilesystemError, FilesystemOperation, IndexConflictReason, IndexPolicy, StorageClass,
     TxnCapability,
 };
 
