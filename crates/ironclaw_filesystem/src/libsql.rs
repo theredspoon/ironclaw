@@ -257,6 +257,7 @@ impl RootFilesystem for LibSqlRootFilesystem {
             .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::ReadFile, error))?;
         let entry = build_entry(path, body, content_type_raw, kind_raw, indexed_raw)?;
         Ok(Some(VersionedEntry {
+            path: path.clone(),
             entry,
             version: record_version_from_i64(path, version_raw)?,
         }))
@@ -433,7 +434,11 @@ impl RootFilesystem for LibSqlRootFilesystem {
             })?;
             let entry = build_entry(&row_path, body, content_type_raw, kind_raw, indexed_raw)?;
             let version = record_version_from_i64(&row_path, version_raw)?;
-            out.push(VersionedEntry { entry, version });
+            out.push(VersionedEntry {
+                path: row_path,
+                entry,
+                version,
+            });
         }
         Ok(out)
     }
@@ -953,13 +958,20 @@ fn translate_filter(
             Ok(())
         }
         Filter::Range { key, lo, hi } => {
+            // PR #3659 review fix: guard the comparison with a JSON-type
+            // check so a row whose stored value at `$.{key}` is a different
+            // variant (e.g. text under a numeric range) does NOT participate
+            // in BETWEEN. Without this guard a mixed-variant store can pull
+            // unrelated values into the result set or fail the query
+            // entirely on a cast failure.
             let lo_idx = bind_index_value(path, lo, params)?;
             let hi_idx = bind_index_value(path, hi, params)?;
+            let expected_json_type = index_value_json_type(lo);
             out.push_str(&format!(
-                "(json_extract(indexed, '$.{}') BETWEEN ?{} AND ?{})",
+                "(json_type(indexed, '$.{}') = '{expected_json_type}' \
+                 AND json_extract(indexed, '$.{}') BETWEEN ?{lo_idx} AND ?{hi_idx})",
                 key.as_str(),
-                lo_idx,
-                hi_idx
+                key.as_str(),
             ));
             Ok(())
         }
@@ -1014,6 +1026,21 @@ fn bind_index_value(
     };
     params.push(bound);
     Ok(params.len())
+}
+
+/// Maps an [`IndexValue`] variant to the corresponding SQLite `json_type`
+/// discriminator string. Used to guard `Filter::Range` so cross-variant
+/// stored values don't participate in BETWEEN comparisons (PR #3659 review
+/// fix).
+#[cfg(feature = "libsql")]
+fn index_value_json_type(value: &IndexValue) -> &'static str {
+    match value {
+        IndexValue::Text(_) => "text",
+        IndexValue::I64(_) => "integer",
+        // SQLite's json_type returns "true" / "false" for booleans, not "boolean".
+        IndexValue::Bool(_) => "integer", // we encode bools as 0/1 integers above
+        IndexValue::Bytes(_) => "text",
+    }
 }
 
 #[cfg(feature = "libsql")]

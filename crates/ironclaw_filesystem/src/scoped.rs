@@ -74,9 +74,29 @@ where
     }
 
     /// Begin a multi-key transaction (capability-gated).
+    ///
+    /// PR #3659 review fix: returns a permission-checking wrapper around the
+    /// underlying [`StorageTxn`] so the per-operation ACL is preserved across
+    /// the transaction boundary. Without this wrapper, a caller granted only
+    /// `write` could still `get` / `delete` through the raw txn handle once
+    /// any backend implements transactions.
     pub async fn begin(&self, prefix: &ScopedPath) -> Result<Box<dyn StorageTxn>, FilesystemError> {
         let virtual_path = self.resolve_with_permission(prefix, FilesystemOperation::BeginTxn)?;
-        self.root.begin(&virtual_path).await
+        let inner = self.root.begin(&virtual_path).await?;
+        // Snapshot the mount permissions that authorized the txn so the
+        // wrapper can apply them per-op without revisiting `MountView`
+        // (which would need a ScopedPath we no longer have at this point).
+        let permissions = self
+            .mounts
+            .resolve_with_grant(prefix)?
+            .1
+            .permissions
+            .clone();
+        Ok(Box::new(ScopedStorageTxn {
+            inner,
+            permissions,
+            mount_prefix: virtual_path,
+        }))
     }
 
     // ─── Event/tail plane ─────────────────────────────────────────────────
@@ -230,5 +250,67 @@ fn operation_allowed(permissions: &MountPermissions, operation: FilesystemOperat
         FilesystemOperation::BeginTxn => permissions.write,
         // Tail mirrors read on the byte plane (append is covered by AppendFile).
         FilesystemOperation::Tail => permissions.read,
+    }
+}
+
+/// Permission-checking wrapper around an inner [`StorageTxn`] returned by
+/// [`ScopedFilesystem::begin`]. Preserves the per-operation ACL across the
+/// txn boundary so a write-only scoped caller cannot read or delete through
+/// the txn handle (PR #3659 review fix).
+struct ScopedStorageTxn {
+    inner: Box<dyn StorageTxn>,
+    permissions: MountPermissions,
+    mount_prefix: VirtualPath,
+}
+
+impl ScopedStorageTxn {
+    fn check(&self, operation: FilesystemOperation) -> Result<(), FilesystemError> {
+        if operation_allowed(&self.permissions, operation) {
+            Ok(())
+        } else {
+            // The transaction is anchored at `mount_prefix`; surface the
+            // mount root rather than the per-call VirtualPath to avoid
+            // implying that the caller is denied at one specific child
+            // while allowed elsewhere — the txn-time grant applies to
+            // the whole prefix.
+            Err(FilesystemError::Backend {
+                path: self.mount_prefix.clone(),
+                operation,
+                reason: "scoped transaction lacks the required permission".to_string(),
+            })
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageTxn for ScopedStorageTxn {
+    async fn put(
+        &mut self,
+        path: &VirtualPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        self.check(FilesystemOperation::WriteFile)?;
+        self.inner.put(path, entry, cas).await
+    }
+
+    async fn get(&mut self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        self.check(FilesystemOperation::ReadFile)?;
+        self.inner.get(path).await
+    }
+
+    async fn delete(&mut self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        self.check(FilesystemOperation::Delete)?;
+        self.inner.delete(path).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), FilesystemError> {
+        // Commit/rollback are bookkeeping; they were authorized at `begin`
+        // time and require no additional per-op check.
+        self.inner.commit().await
+    }
+
+    async fn rollback(self: Box<Self>) {
+        self.inner.rollback().await
     }
 }

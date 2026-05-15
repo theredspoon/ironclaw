@@ -222,6 +222,7 @@ impl RootFilesystem for PostgresRootFilesystem {
         let version_raw: i64 = row.get("version");
         let entry = build_entry(path, body, content_type_raw, kind_raw, indexed_value)?;
         Ok(Some(VersionedEntry {
+            path: path.clone(),
             entry,
             version: record_version_from_i64(path, version_raw)?,
         }))
@@ -365,7 +366,11 @@ impl RootFilesystem for PostgresRootFilesystem {
                 let entry =
                     build_entry(&row_path, body, content_type_raw, kind_raw, indexed_value)?;
                 let version = record_version_from_i64(&row_path, version_raw)?;
-                Ok(VersionedEntry { entry, version })
+                Ok(VersionedEntry {
+                    path: row_path,
+                    entry,
+                    version,
+                })
             })
             .collect()
     }
@@ -722,8 +727,12 @@ fn translate_filter(
             // the extracted JSON text and bound params to `BIGINT` so the
             // BETWEEN comparison is numeric. Otherwise `'2' BETWEEN '10'
             // AND '99'` would compare lexicographically and miss values.
-            // Mixed-variant ranges still hit text comparison (also matches
-            // the in-memory backend's behaviour for cross-variant bounds).
+            //
+            // PR #3659 review fix: guard each cast with a `jsonb_typeof`
+            // check so a row whose stored value at `'{key}'` is a different
+            // variant (e.g. text under a numeric range) is filtered out
+            // BEFORE the cast — otherwise one stored text value can fail
+            // the whole query with a `bigint` cast error.
             match (lo, hi) {
                 (IndexValue::I64(lo_val), IndexValue::I64(hi_val)) => {
                     params.push(Box::new(*lo_val));
@@ -731,16 +740,21 @@ fn translate_filter(
                     params.push(Box::new(*hi_val));
                     let hi_idx = params.len();
                     out.push_str(&format!(
-                        "((indexed->>'{}')::bigint BETWEEN ${lo_idx} AND ${hi_idx})",
-                        key.as_str()
+                        "(jsonb_typeof(indexed->'{}') = 'number' \
+                         AND (indexed->>'{}')::bigint BETWEEN ${lo_idx} AND ${hi_idx})",
+                        key.as_str(),
+                        key.as_str(),
                     ));
                 }
                 _ => {
                     let lo_idx = bind_index_value(path, lo, params)?;
                     let hi_idx = bind_index_value(path, hi, params)?;
+                    let expected_json_type = index_value_jsonb_typeof(lo);
                     out.push_str(&format!(
-                        "(indexed->>'{}' BETWEEN ${lo_idx} AND ${hi_idx})",
-                        key.as_str()
+                        "(jsonb_typeof(indexed->'{}') = '{expected_json_type}' \
+                         AND indexed->>'{}' BETWEEN ${lo_idx} AND ${hi_idx})",
+                        key.as_str(),
+                        key.as_str(),
                     ));
                 }
             }
@@ -773,6 +787,19 @@ fn translate_compound(
     }
     out.push(')');
     Ok(())
+}
+
+/// Maps an [`IndexValue`] variant to its Postgres `jsonb_typeof` string.
+/// Used to guard `Filter::Range` so cross-variant stored values are filtered
+/// out before any cast/comparison (PR #3659 review fix). Postgres returns:
+/// `"string"` / `"number"` / `"boolean"` / `"null"` / `"object"` / `"array"`.
+#[cfg(feature = "postgres")]
+fn index_value_jsonb_typeof(value: &IndexValue) -> &'static str {
+    match value {
+        IndexValue::Text(_) | IndexValue::Bytes(_) => "string",
+        IndexValue::I64(_) => "number",
+        IndexValue::Bool(_) => "boolean",
+    }
 }
 
 #[cfg(feature = "postgres")]

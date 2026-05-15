@@ -210,6 +210,7 @@ impl RootFilesystem for LocalFilesystem {
     async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
         match self.read_file(path).await {
             Ok(body) => Ok(Some(VersionedEntry {
+                path: path.clone(),
                 entry: Entry::bytes(body),
                 version: RecordVersion::from_backend(0),
             })),

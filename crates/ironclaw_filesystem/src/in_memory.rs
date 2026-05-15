@@ -105,6 +105,7 @@ impl RootFilesystem for InMemoryBackend {
             .entries
             .get(path.as_str())
             .map(|stored| VersionedEntry {
+                path: path.clone(),
                 entry: stored.entry.clone(),
                 version: stored.version,
             }))
@@ -231,7 +232,9 @@ impl RootFilesystem for InMemoryBackend {
         }
         Ok(matched[start..end]
             .iter()
-            .map(|(_, stored)| VersionedEntry {
+            .map(|(matched_path, stored)| VersionedEntry {
+                path: VirtualPath::new((*matched_path).clone())
+                    .unwrap_or_else(|_| unreachable!("stored paths originated as VirtualPath")),
                 entry: stored.entry.clone(),
                 version: stored.version,
             })
@@ -705,5 +708,78 @@ mod tests {
         fs.write_file(&path, b"payload").await.unwrap();
         let bytes = fs.read_file(&path).await.unwrap();
         assert_eq!(bytes, b"payload");
+    }
+
+    #[tokio::test]
+    async fn get_and_query_populate_versioned_entry_path() {
+        // PR #3659 review fix: `VersionedEntry` now carries the
+        // [`VirtualPath`] of the record so query consumers can drive
+        // `put`/`delete` workflows directly off the result.
+        let fs = InMemoryBackend::new();
+        let path = vpath("/memory/a");
+        let kind = crate::RecordKind::new("test").unwrap();
+        let entry = crate::Entry::record(kind.clone(), &serde_json::json!({"k": 1}))
+            .unwrap()
+            .with_indexed(
+                crate::IndexKey::new("k").unwrap(),
+                crate::IndexValue::I64(1),
+            );
+        fs.put(&path, entry, CasExpectation::Absent).await.unwrap();
+
+        let got = fs.get(&path).await.unwrap().expect("get returns Some");
+        assert_eq!(got.path, path, "get must populate VersionedEntry.path");
+
+        let results = fs
+            .query(
+                &vpath("/memory"),
+                &crate::Filter::Eq {
+                    key: crate::IndexKey::new("k").unwrap(),
+                    value: crate::IndexValue::I64(1),
+                },
+                crate::Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].path, path,
+            "query must populate VersionedEntry.path for every row"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_filter_rejects_cross_variant_stored_values() {
+        // PR #3659 review fix: a numeric Range must not match rows that
+        // happen to have a text value under the same indexed key.
+        // (The in-memory backend already enforced this via the
+        // `std::mem::discriminant` fix; this regression test locks it in.)
+        let fs = InMemoryBackend::new();
+        let kind = crate::RecordKind::new("test").unwrap();
+        let key = crate::IndexKey::new("v").unwrap();
+        for (path_str, value) in [
+            ("/memory/numeric", crate::IndexValue::I64(5)),
+            ("/memory/text", crate::IndexValue::Text("5".into())),
+        ] {
+            let entry = crate::Entry::record(kind.clone(), &serde_json::json!({"v": 5}))
+                .unwrap()
+                .with_indexed(key.clone(), value);
+            fs.put(&vpath(path_str), entry, CasExpectation::Absent)
+                .await
+                .unwrap();
+        }
+        let results = fs
+            .query(
+                &vpath("/memory"),
+                &crate::Filter::Range {
+                    key,
+                    lo: crate::IndexValue::I64(1),
+                    hi: crate::IndexValue::I64(10),
+                },
+                crate::Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "only the numeric row should match");
+        assert_eq!(results[0].path.as_str(), "/memory/numeric");
     }
 }

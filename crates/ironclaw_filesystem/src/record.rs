@@ -334,13 +334,17 @@ impl Entry {
     }
 }
 
-/// Versioned read result returned by [`get`](crate::StorageBackend::get) and
-/// [`query`](crate::StorageBackend::query).
+/// Versioned read result returned by [`get`](crate::RootFilesystem::get) and
+/// [`query`](crate::RootFilesystem::query).
 ///
 /// `version` is the value to pass to [`CasExpectation::Version`] in a
-/// subsequent write to avoid lost updates.
+/// subsequent write to avoid lost updates. `path` carries the addressable
+/// [`VirtualPath`] of the record so query consumers can drive
+/// `put`/`delete` workflows without re-deriving the path from
+/// `entry.indexed` (PR #3659 review fix).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionedEntry {
+    pub path: ironclaw_host_api::VirtualPath,
     pub entry: Entry,
     pub version: RecordVersion,
 }
