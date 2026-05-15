@@ -33,12 +33,19 @@ use ironclaw_loop_support::{
     identity_message_ref,
 };
 use ironclaw_processes::ProcessServices;
-use ironclaw_reborn::{
+use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
-    ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornLoopDriverHostFactory,
-    RebornLoopDriverHostRequest, StaticModelRouteResolver, TextOnlyLoopHostConfig,
-    TextOnlyModelReplyDriver,
+};
+use ironclaw_reborn::loop_driver_host::{
+    RebornLoopDriverHost, RebornLoopDriverHostFactory, RebornLoopDriverHostRequest,
+    TextOnlyLoopHostConfig,
+};
+use ironclaw_reborn::model_routes::{
+    ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, StaticModelRouteResolver,
+};
+use ironclaw_reborn::text_loop_driver::TextOnlyModelReplyDriver;
+use ironclaw_reborn::{
     driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
     loop_exit_applier::{
         BlockedEvidenceRequest, CompletionEvidenceRequest, FailureEvidenceRequest,
@@ -4047,7 +4054,7 @@ async fn text_only_host_rejects_mismatched_capability_authority_context() {
 
     assert!(matches!(
         error,
-        ironclaw_reborn::RebornLoopDriverHostError::InvalidRequest { .. }
+        ironclaw_reborn::loop_driver_host::RebornLoopDriverHostError::InvalidRequest { .. }
     ));
     assert!(runtime.invocations().is_empty());
 }
@@ -5571,7 +5578,7 @@ impl HostFixture {
         )
     }
 
-    async fn build_host(&self) -> ironclaw_reborn::RebornLoopDriverHost {
+    async fn build_host(&self) -> RebornLoopDriverHost {
         self.factory()
             .build_text_only_host(RebornLoopDriverHostRequest {
                 claimed_run: self.claimed.clone(),
