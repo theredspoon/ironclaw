@@ -147,13 +147,11 @@ pub(super) fn dispatch(
 }
 
 fn method(input: &Value) -> Result<NetworkMethod, FirstPartyCapabilityError> {
-    match input
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("get")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let method = match input.get("method") {
+        Some(value) => value.as_str().ok_or_else(input_error)?,
+        None => "get",
+    };
+    match method.to_ascii_lowercase().as_str() {
         "get" => Ok(NetworkMethod::Get),
         "post" => Ok(NetworkMethod::Post),
         "put" => Ok(NetworkMethod::Put),

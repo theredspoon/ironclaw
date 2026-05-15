@@ -133,9 +133,20 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
                 ));
             }
         };
-        let output_bytes = bounded_output_bytes(&output)?;
+        let wall_clock_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let output_bytes = bounded_output_bytes(&output).map_err(|error| {
+            if network_egress_bytes > 0 {
+                error.with_usage(ResourceUsage {
+                    wall_clock_ms,
+                    network_egress_bytes,
+                    ..ResourceUsage::default()
+                })
+            } else {
+                error
+            }
+        })?;
         let usage = ResourceUsage {
-            wall_clock_ms: start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            wall_clock_ms,
             output_bytes,
             network_egress_bytes,
             ..ResourceUsage::default()

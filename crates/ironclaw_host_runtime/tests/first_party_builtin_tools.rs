@@ -14,7 +14,7 @@ use ironclaw_host_runtime::{
     TIME_CAPABILITY_ID, VisibleCapabilityAccess, VisibleCapabilityRequest,
     WRITE_FILE_CAPABILITY_ID, builtin_first_party_handlers, builtin_first_party_package,
 };
-use ironclaw_resources::InMemoryResourceGovernor;
+use ironclaw_resources::{InMemoryResourceGovernor, ResourceAccount};
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
     HostTrustPolicy, TrustDecision, TrustProvenance,
@@ -324,6 +324,10 @@ async fn builtin_http_rejects_ambiguous_body_and_zero_timeout() {
     for input in [
         json!({
             "url": "https://api.example.test/v1/items",
+            "method": 123
+        }),
+        json!({
+            "url": "https://api.example.test/v1/items",
             "body": "plain",
             "body_base64": "YmluYXJ5"
         }),
@@ -337,6 +341,34 @@ async fn builtin_http_rejects_ambiguous_body_and_zero_timeout() {
             .unwrap_err();
         assert_eq!(error, RuntimeFailureKind::InvalidInput);
     }
+}
+
+#[tokio::test]
+async fn builtin_http_accounts_request_bytes_when_output_is_too_large() {
+    let egress = Arc::new(RecordingRuntimeHttpEgress::with_body(vec![
+        b'\\';
+        700 * 1024
+    ]));
+    let governor = Arc::new(InMemoryResourceGovernor::new());
+    let runtime = runtime_with_http_egress_and_governor(Arc::clone(&egress), Arc::clone(&governor));
+
+    let error = invoke_with_context(
+        &runtime,
+        HTTP_CAPABILITY_ID,
+        json!({
+            "method": "post",
+            "url": "https://api.example.test/v1/items",
+            "body": "paid",
+            "response_body_limit": 700 * 1024
+        }),
+        execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy()),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::OutputTooLarge);
+    let tenant_account = ResourceAccount::tenant(TenantId::new(LOCAL_DEFAULT_TENANT_ID).unwrap());
+    assert_eq!(governor.usage_for(&tenant_account).network_egress_bytes, 4);
 }
 
 #[tokio::test]
@@ -1288,10 +1320,20 @@ fn runtime_with_http_egress<T>(egress: Arc<T>) -> impl HostRuntime
 where
     T: RuntimeHttpEgress + 'static,
 {
+    runtime_with_http_egress_and_governor(egress, Arc::new(InMemoryResourceGovernor::new()))
+}
+
+fn runtime_with_http_egress_and_governor<T>(
+    egress: Arc<T>,
+    governor: Arc<InMemoryResourceGovernor>,
+) -> impl HostRuntime
+where
+    T: RuntimeHttpEgress + 'static,
+{
     HostRuntimeServices::new(
         Arc::new(registry()),
         Arc::new(LocalFilesystem::new()),
-        Arc::new(InMemoryResourceGovernor::new()),
+        governor,
         Arc::new(GrantAuthorizer::new()),
         ironclaw_processes::ProcessServices::in_memory(),
         CapabilitySurfaceVersion::new("surface-v1").unwrap(),
