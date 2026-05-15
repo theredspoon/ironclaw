@@ -85,6 +85,51 @@ async fn host_capability_port_composition_factory_builds_loop_capability_port() 
     assert!(surface.descriptors.is_empty());
 }
 
+#[tokio::test]
+async fn visible_capability_request_rejects_elevated_trust_context() {
+    // A visible_request.context that carries a host-reserved trust class (FirstParty or System)
+    // must be rejected before its authority fields flow into RuntimeCapabilityRequest via
+    // invocation_context_from_visible. This is a regression guard for the gap identified in
+    // PR #3644 (serrrfirat review): validate_visible_request_scope previously checked only scope
+    // fields, leaving trust/extension_id/runtime unvalidated.
+    let thread_id = ThreadId::new("thread-elevated-trust-rejection").unwrap();
+    let mut context = ExecutionContext::local_default(
+        UserId::new("user-elevated-trust-rejection").unwrap(),
+        ExtensionId::new("loop-support-elevated").unwrap(),
+        RuntimeKind::FirstParty,
+        TrustClass::FirstParty,
+        CapabilitySet::default(),
+        MountView::default(),
+    )
+    .unwrap();
+    context.thread_id = Some(thread_id.clone());
+    context.resource_scope.thread_id = Some(thread_id.clone());
+    let run_context = loop_run_context(&context, thread_id).await;
+    let visible_request =
+        HostVisibleCapabilityRequest::new(context, SurfaceKind::new("agent_loop").unwrap());
+
+    let factory = HostRuntimeLoopCapabilityPortFactory::new(
+        Arc::new(EmptyHostRuntime),
+        visible_request,
+        Arc::new(UnusedInputResolver),
+        Arc::new(UnusedResultWriter),
+        None,
+    );
+    let port: Arc<dyn LoopCapabilityPort> = factory.for_run_context(run_context);
+
+    let err = port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .expect_err("elevated trust context must be rejected");
+
+    assert_eq!(
+        err.kind,
+        AgentLoopHostErrorKind::Unauthorized,
+        "expected Unauthorized for host-reserved trust class, got {:?}",
+        err.kind
+    );
+}
+
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir

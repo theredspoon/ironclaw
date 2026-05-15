@@ -96,6 +96,8 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
             slots[original_index] = Some(outcome);
         }
 
+        // Truncate to the slot position after the last returned allowed outcome,
+        // preserving interleaved denials up to that point.
         let truncate_to = if n_inner == allowed_idx.len() {
             slots.len()
         } else if n_inner == 0 {

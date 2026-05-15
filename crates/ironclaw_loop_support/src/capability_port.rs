@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_host_api::{
     CapabilityId, CorrelationId, EffectKind, ExecutionContext, ExtensionId, InvocationId,
-    ResourceEstimate, sha256_digest_token,
+    ResourceEstimate, TrustClass, sha256_digest_token,
 };
 use ironclaw_host_runtime::{
     HostRuntime, HostRuntimeError, IdempotencyKey, RuntimeBlockedReason, RuntimeCapabilityOutcome,
@@ -407,6 +407,20 @@ impl HostRuntimeLoopCapabilityPort {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::ScopeMismatch,
                 "capability execution context is not scoped to this loop run",
+            ));
+        }
+        // Reject host-reserved trust classes (FirstParty, System) in the visible-request
+        // context. These are host-only authority levels; a loop-layer context carrying them
+        // indicates misconfiguration or an attempted privilege escalation and must not be
+        // forwarded into RuntimeCapabilityRequest via invocation_context_from_visible.
+        //
+        // TODO(ws-9): structural fix — build invocation_context_from_visible from
+        // host-resolved authority state (not the caller-supplied DTO) for extension_id,
+        // runtime, grants, and mounts. Tracked in nearai/ironclaw#3644.
+        if matches!(context.trust, TrustClass::FirstParty | TrustClass::System) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unauthorized,
+                "capability execution context carries a host-reserved trust class",
             ));
         }
         Ok(())

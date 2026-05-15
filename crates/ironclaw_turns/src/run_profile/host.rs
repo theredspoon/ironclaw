@@ -1213,6 +1213,7 @@ pub struct CapabilityFailure {
     pub safe_summary: String,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CapabilityFailureKind {
     Authorization,
