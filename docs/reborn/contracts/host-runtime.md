@@ -62,6 +62,28 @@ MCP HTTP/SSE follows the same rule through `ironclaw_mcp::McpHostHttpClient`: th
 
 Credential injection plans identify their material source. `RuntimeCredentialSource::SecretStoreLease` keeps the compatibility path for host-derived credentials that have not already been consumed by an obligation handler. `RuntimeCredentialSource::StagedObligation { capability_id }` is the `InjectSecretOnce` handoff path: `HostHttpEgressService` must be configured with the same `RuntimeSecretInjectionStore` as the obligation handler and must call `take(scope, capability_id, handle)` before runtime/network use. Missing required staged material fails before outbound transport, and successful or failed transport attempts cannot reuse the staged value because `take(...)` removes it first. If one approved request plan injects the same source+handle into multiple targets, the egress service consumes the staged or leased material once and reuses it only within that request.
 
-For WASM host-mediated HTTP imports, `WasmRuntimeHttpAdapter` carries the invoking capability id into `WasmRuntimeCredentialProvider`. Host composition can use `WasmStagedRuntimeCredentials` rules to emit exact-url or request-wide `StagedObligation` injection plans; the WASM guest still supplies only method/url/headers/body and never chooses credential handles or targets.
+For WASM host-mediated HTTP imports, `WasmRuntimeHttpAdapter` carries the invoking capability id into `WasmRuntimeCredentialProvider`. Host composition can use `WasmStagedRuntimeCredentials` rules to emit exact-request or request-wide `StagedObligation` injection plans; the WASM guest still supplies only method/url/headers/body and never chooses credential handles or targets.
+
+## Credential account resolution
+
+Host API manifest contracts can project credential requirements into `HostApiCredentialRequirement` records keyed by extension id, host API id, manifest section path, capability id, credential account id, and secret handle. `CredentialAccountResolver` consumes those projected records plus a scoped `CredentialAccountStore` and request method/URL, then proves:
+
+- the projected requirement belongs to the invoking extension, host API section, and capability
+- the scoped credential account exists when required
+- the account is visible to the request scope under the durable credential-account
+  dimensions (`tenant_id`, `user_id`, `agent_id`, and `project_id`), while
+  mission/thread/invocation drift remains allowed
+- the credential store did not return a different account id than the one requested
+- the account is active and owned by the same extension
+- the account destination policy matches the request method/URL
+- the projected secret handle is actually bound to that credential account
+
+Successful resolution returns secret staging requirements, including each handle's required/optional semantics, plus exact-method-and-URL `WasmStagedRuntimeCredential` rules. The method/URL narrowing is deliberate: even if a projected requirement is broader, the resolved runtime credential rule must not silently apply to a different WASM HTTP request in the same invocation.
+
+Within a single resolution, matching requirements share account lookups by
+credential account id so duplicate projected requirements cannot multiply
+backend fetches.
+
+This resolver is a planning/projection boundary only. It does not read raw secret material, issue OAuth repairs, mutate credential-account state, or grant authority without the upstream capability/obligation workflow. Final `InjectCredentialOnce` obligation wiring remains the product path that should connect credential account resolution, secret staging, blocked-auth repair, and runtime adapter construction.
 
 Script execution keeps Docker containers ambient-network-disabled by default (`docker run --network none`). If scripts later gain a brokered HTTP SDK, sidecar, helper process, or host API, every request must flow through `ironclaw_scripts::ScriptRuntimeHttpAdapter<RuntimeHttpEgress>`. The host supplies the `ResourceScope`, `CapabilityId`, `NetworkPolicy`, credential injection plan, response body limit, and timeout; script/runtime input must not invent secret handles, raw credential headers/query parameters, DNS checks, private-IP checks, or direct HTTP clients inside `ironclaw_scripts`.
