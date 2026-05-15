@@ -60,7 +60,7 @@ fn parses_product_adapter_host_api_section_from_extension_manifest_v2() {
     assert_eq!(record.extension_id().as_str(), "telegram-v2");
     assert_eq!(record.product_adapters().len(), 1);
     let adapter = &record.product_adapters()[0];
-    assert_eq!(adapter.adapter_id().as_str(), "telegram-v2");
+    assert_eq!(adapter.adapter_id().as_str(), "telegram-v2/inbound");
     assert_eq!(adapter.surface_kind(), ProductSurfaceKind::ExternalChannel);
     assert!(matches!(
         adapter.auth_requirement(),

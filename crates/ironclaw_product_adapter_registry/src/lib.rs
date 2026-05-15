@@ -610,7 +610,11 @@ impl ExtensionInstallationStore for InMemoryExtensionInstallationStore {
         state: ExtensionActivationState,
     ) -> Result<(), RegistryError> {
         let mut inner = self.inner.write().await;
-        let installation = inner.installations.get(installation_id).ok_or_else(|| {
+        let InMemoryState {
+            manifests,
+            installations,
+        } = &mut *inner;
+        let installation = installations.get_mut(installation_id).ok_or_else(|| {
             RegistryError::InstallationNotFound {
                 installation_id: installation_id.clone(),
             }
@@ -619,15 +623,9 @@ impl ExtensionInstallationStore for InMemoryExtensionInstallationStore {
             return Ok(());
         }
         if state == ExtensionActivationState::Enabled {
-            validate_installation_against_manifest(&inner.manifests, installation)?;
+            validate_installation_against_manifest(manifests, installation)?;
         }
-        inner
-            .installations
-            .get_mut(installation_id)
-            .ok_or_else(|| RegistryError::InstallationNotFound {
-                installation_id: installation_id.clone(),
-            })?
-            .set_activation_state(state);
+        installation.set_activation_state(state);
         Ok(())
     }
 
@@ -678,7 +676,16 @@ impl ProductAdapterHostApiSection {
                     reason: error.to_string(),
                 }
             })?;
-        let adapter_id = ProductAdapterId::new(extension_id.as_str()).map_err(|error| {
+        // Derive adapter_id from the extension id and section subsection name
+        // so that multiple product-adapter sections within the same extension
+        // are distinguishable downstream.
+        let subsection = section
+            .as_str()
+            .strip_prefix(PRODUCT_ADAPTER_SECTION_PREFIX)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .unwrap_or("default");
+        let adapter_id_str = format!("{}/{}", extension_id.as_str(), subsection);
+        let adapter_id = ProductAdapterId::new(&adapter_id_str).map_err(|error| {
             RegistryError::InvalidValue {
                 field: "adapter_id",
                 reason: error.to_string(),
@@ -796,10 +803,16 @@ pub async fn list_enabled_product_adapter_entries(
                 extension_id: installation.extension_id().clone(),
             })?;
         validate_installation_against_one_manifest(manifest, &installation)?;
-        let Some(adapter) = manifest.product_adapters().first().cloned() else {
+        let adapters = manifest.product_adapters();
+        if adapters.is_empty() {
             continue; // extension is enabled but not a product adapter — skip
-        };
-        entries.push(ProductAdapterRuntimeEntry::new(installation, adapter));
+        }
+        for adapter in adapters {
+            entries.push(ProductAdapterRuntimeEntry::new(
+                installation.clone(),
+                adapter.clone(),
+            ));
+        }
     }
     Ok(entries)
 }
@@ -884,8 +897,6 @@ pub enum RegistryError {
     UndeclaredEgressCredentialHandle { handle: EgressCredentialHandle },
     #[error("installation references unknown extension manifest {extension_id}")]
     UnknownManifest { extension_id: ExtensionId },
-    #[error("extension {extension_id} is not a product adapter manifest")]
-    NotProductAdapterExtension { extension_id: ExtensionId },
     #[error("installation binds undeclared credential handle {handle}")]
     UndeclaredCredentialHandle { handle: EgressCredentialHandle },
     #[error(
