@@ -854,10 +854,4 @@ mod tests {
             self.inner.emit_loop_progress(event).await
         }
     }
-
-    impl LoopCancellationPort for ResumePayloadHost {
-        fn observe_cancellation(&self) -> Option<LoopCancellationSignal> {
-            None
-        }
-    }
 }

@@ -35,11 +35,12 @@ use ironclaw_loop_support::{
 use ironclaw_processes::ProcessServices;
 use ironclaw_reborn::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
-    ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornLoopDriverHostFactory,
+    DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, HostRuntimeLoopCapabilityPort,
+    LoopCapabilityInputResolver, LoopCapabilityPortFactory, LoopCapabilityResultWriter, ModelRoute,
+    ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornLoopDriverHostFactory,
     RebornLoopDriverHostRequest, StaticModelRouteResolver, TextOnlyLoopHostConfig,
-    TextOnlyModelReplyDriver,
-    driver_registry::{DriverKind, DriverRegistry, DriverRequirements},
+    TextOnlyModelReplyDriver, build_default_planned_runtime, default_planned_run_profile_resolver,
+    driver_registry::{DriverKind, DriverRegistry, DriverRequirements, LoopDriverRegistryKey},
     loop_exit_applier::{
         BlockedEvidenceRequest, CompletionEvidenceRequest, FailureEvidenceRequest,
         FinalCheckpointEvidenceRequest, LoopExitApplier, LoopExitEvidencePort,
@@ -92,9 +93,19 @@ use ironclaw_turns::{
         ParentLoopOutput, PromptMode, SkillVisibility, StageCheckpointPayloadRequest,
         VisibleCapabilityRequest,
     },
-    runner::ClaimedTurnRun,
+    runner::{ClaimRunRequest, ClaimedTurnRun, TurnRunTransitionPort},
 };
 use serde_json::{Value, json};
+
+fn driver_requirements_for(
+    descriptor: &AgentLoopDriverDescriptor,
+    requirements: DriverRequirements,
+) -> HashMap<LoopDriverRegistryKey, DriverRequirements> {
+    HashMap::from([(
+        LoopDriverRegistryKey::from_descriptor(descriptor).unwrap(),
+        requirements,
+    )])
+}
 
 #[tokio::test]
 async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
@@ -1760,6 +1771,285 @@ async fn text_only_host_factory_create_host_uses_claimed_model_route_snapshot() 
         host.run_context().resolved_model_route,
         Some(persisted_snapshot)
     );
+}
+
+#[tokio::test]
+async fn planned_host_factory_create_host_uses_profiled_capabilities() {
+    let fixture = HostFixture::new("thread-host-planned-profiled-capabilities", "hello").await;
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let denied_id = CapabilityId::new("demo.denied").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(allowed_id.as_str()),
+        capability_descriptor(denied_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
+        runtime: runtime.clone(),
+        visible_request: host_runtime_visible_request(&fixture, ["demo"]),
+        io,
+        milestone_sink: fixture.milestone_sink.clone(),
+    });
+    let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([allowed_id.clone()]),
+    ));
+    let planned = default_planned_run_profile_resolver()
+        .unwrap()
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+    claimed.resolved_run_profile = planned;
+
+    let host = fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &claimed.resolved_run_profile.loop_driver,
+            DriverRequirements::all_required(),
+        ))
+        .with_profiled_capability_port_factory(capability_factory, surface_resolver)
+        .create_host(&claimed)
+        .await
+        .unwrap();
+
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(surface.descriptors[0].capability_id, allowed_id);
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: denied_id,
+            input_ref: CapabilityInputRef::new("input:denied-from-planned-host").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        CapabilityOutcome::Denied(denied)
+            if denied.reason_kind.as_str() == "surface_profile_denied"
+    ));
+    assert!(runtime.invocations().is_empty());
+}
+
+#[tokio::test]
+async fn planned_host_factory_create_host_requires_profiled_capabilities() {
+    let fixture = HostFixture::new("thread-host-planned-missing-capabilities", "hello").await;
+    let planned = default_planned_run_profile_resolver()
+        .unwrap()
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+    claimed.resolved_run_profile = planned;
+
+    let error = match fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &claimed.resolved_run_profile.loop_driver,
+            DriverRequirements::all_required(),
+        ))
+        .create_host(&claimed)
+        .await
+    {
+        Ok(_) => panic!("planned hosts must fail closed without profiled capabilities"),
+        Err(error) => error,
+    };
+
+    assert!(error.reason.contains("profiled capability port factory"));
+    assert!(error.reason.contains("capability-required driver host"));
+    assert!(!error.reason.contains("planned driver host"));
+}
+
+#[tokio::test]
+async fn planned_host_factory_fails_closed_when_driver_requirements_are_missing() {
+    let fixture = HostFixture::new("thread-host-planned-missing-requirements", "hello").await;
+    let planned = default_planned_run_profile_resolver()
+        .unwrap()
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+    claimed.resolved_run_profile = planned;
+
+    let error = match fixture.factory().create_host(&claimed).await {
+        Ok(_) => panic!("non-text-only hosts must fail closed without driver requirements"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.reason,
+        "loop driver requirements metadata is unavailable; cannot determine capability requirements"
+    );
+}
+
+#[tokio::test]
+async fn planned_host_factory_sanitizes_capability_profile_resolver_errors() {
+    let fixture = HostFixture::new("thread-host-planned-profile-resolver-error", "hello").await;
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(allowed_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
+        runtime,
+        visible_request: host_runtime_visible_request(&fixture, ["demo"]),
+        io,
+        milestone_sink: fixture.milestone_sink.clone(),
+    });
+    let surface_resolver = Arc::new(FailingCapabilitySurfaceProfileResolver::internal(
+        "RAW_SECRET_TOKEN /tmp/private/trace",
+    ));
+    let planned = default_planned_run_profile_resolver()
+        .unwrap()
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+    claimed.resolved_run_profile = planned;
+
+    let error = match fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &claimed.resolved_run_profile.loop_driver,
+            DriverRequirements::all_required(),
+        ))
+        .with_profiled_capability_port_factory(capability_factory, surface_resolver)
+        .create_host(&claimed)
+        .await
+    {
+        Ok(_) => panic!("resolver failures must reject host creation"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.reason,
+        "invalid loop driver host request: capability surface profile could not be resolved"
+    );
+    assert!(!error.reason.contains("RAW_SECRET_TOKEN"));
+    assert!(!error.reason.contains("/tmp/private"));
+}
+
+#[tokio::test]
+async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_host_factory() {
+    let fixture = HostFixture::new_unsubmitted("thread-runtime-planned-default", "hello").await;
+    let turn_store = Arc::new(InMemoryTurnStateStore::default());
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let denied_id = CapabilityId::new("demo.denied").unwrap();
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(allowed_id.as_str()),
+        capability_descriptor(denied_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
+        runtime: runtime.clone(),
+        visible_request: host_runtime_visible_request(&fixture, ["demo"]),
+        io,
+        milestone_sink: fixture.milestone_sink.clone(),
+    });
+    let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([allowed_id.clone()]),
+    ));
+    let evidence = Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
+        fixture.thread_service.clone(),
+        turn_store.clone(),
+        turn_store.clone(),
+    ));
+    let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
+        turn_state: turn_store.clone(),
+        thread_service: fixture.thread_service.clone(),
+        thread_scope: fixture.thread_scope.clone(),
+        model_gateway: fixture.gateway.clone(),
+        checkpoint_state_store: fixture.checkpoint_state_store.clone(),
+        loop_checkpoint_store: turn_store.clone(),
+        milestone_sink: fixture.milestone_sink.clone(),
+        capability_factory,
+        capability_surface_resolver: surface_resolver,
+        loop_exit_evidence: evidence,
+        config: DefaultPlannedRuntimeConfig {
+            worker: TurnRunnerWorkerConfig {
+                heartbeat_interval: std::time::Duration::from_millis(20),
+                poll_interval: std::time::Duration::from_millis(10),
+                scope_filter: Some(fixture.context.scope.clone()),
+            },
+            ..DefaultPlannedRuntimeConfig::default()
+        },
+        model_route_resolver: None,
+        cancellation_factory: None,
+        skill_context_source: None,
+        input_queue: None,
+        identity_context_source: Arc::new(StaticIdentityContextSource::new(Vec::new())),
+    })
+    .unwrap();
+
+    let SubmitTurnResponse::Accepted { run_id, status, .. } = composition
+        .coordinator
+        .submit_turn(SubmitTurnRequest {
+            scope: fixture.context.scope.clone(),
+            actor: TurnActor::new(UserId::new("user-text-host").unwrap()),
+            accepted_message_ref: AcceptedMessageRef::new("accepted-runtime-planned").unwrap(),
+            source_binding_ref: SourceBindingRef::new("source-web").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web").unwrap(),
+            requested_run_profile: None,
+            idempotency_key: IdempotencyKey::new("idem-runtime-planned").unwrap(),
+            received_at: Utc::now(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, TurnStatus::Queued);
+
+    let claimed = turn_store
+        .claim_next_run(ClaimRunRequest {
+            runner_id: composition.worker.runner_id(),
+            lease_token: TurnLeaseToken::new(),
+            scope_filter: Some(fixture.context.scope.clone()),
+        })
+        .await
+        .unwrap()
+        .expect("submitted planned run should be claimable");
+    assert_eq!(claimed.state.run_id, run_id);
+    assert_eq!(
+        claimed.resolved_run_profile.profile_id.as_str(),
+        "reborn-planned-default"
+    );
+
+    let host = composition
+        .host_factory
+        .create_host(&claimed)
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(surface.descriptors[0].capability_id, allowed_id);
+
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: denied_id,
+            input_ref: CapabilityInputRef::new("input:runtime-denied").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        CapabilityOutcome::Denied(denied)
+            if denied.reason_kind.as_str() == "surface_profile_denied"
+    ));
+    assert!(runtime.invocations().is_empty());
 }
 
 #[tokio::test]
@@ -4570,6 +4860,53 @@ impl CapabilitySurfaceProfileResolver for StaticCapabilitySurfaceProfileResolver
         _run_context: &LoopRunContext,
     ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
         Ok(self.allow_set.clone())
+    }
+}
+
+struct FailingCapabilitySurfaceProfileResolver {
+    reason: String,
+}
+
+impl FailingCapabilitySurfaceProfileResolver {
+    fn internal(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl CapabilitySurfaceProfileResolver for FailingCapabilitySurfaceProfileResolver {
+    async fn resolve(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
+        Err(CapabilityResolveError::internal(self.reason.clone()))
+    }
+}
+
+struct TestHostRuntimeCapabilityFactory {
+    runtime: Arc<RecordingHostRuntime>,
+    visible_request: ironclaw_host_runtime::VisibleCapabilityRequest,
+    io: Arc<InMemoryCapabilityIo>,
+    milestone_sink: Arc<InMemoryLoopHostMilestoneSink>,
+}
+
+#[async_trait]
+impl LoopCapabilityPortFactory for TestHostRuntimeCapabilityFactory {
+    async fn create_capability_port(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
+        let port = HostRuntimeLoopCapabilityPort::new(
+            self.runtime.clone(),
+            run_context.clone(),
+            self.visible_request.clone(),
+            self.io.clone(),
+            self.io.clone(),
+        )
+        .with_milestone_sink(self.milestone_sink.clone());
+        Ok(Arc::new(port))
     }
 }
 

@@ -17,15 +17,58 @@ impl RunCommand {
 #[derive(Debug, Clone)]
 struct RuntimeShellReport {
     config: RebornBootConfig,
-    driver_registry_initialized: bool,
+    text_only_driver: ComponentStatus,
+    planned_driver: ComponentStatus,
+    planned_default_profile: ComponentStatus,
+}
+
+#[derive(Debug, Clone)]
+enum ComponentStatus {
+    Initialized,
+    Failed(String),
+}
+
+impl ComponentStatus {
+    fn from_result<T, E: std::fmt::Display>(result: Result<T, E>) -> Self {
+        match result {
+            Ok(_) => Self::Initialized,
+            Err(error) => Self::Failed(error.to_string()),
+        }
+    }
+
+    fn is_initialized(&self) -> bool {
+        matches!(self, Self::Initialized)
+    }
+
+    fn render(&self, ok_label: &str) -> String {
+        match self {
+            Self::Initialized => ok_label.to_string(),
+            Self::Failed(reason) => format!("unavailable: {reason}"),
+        }
+    }
 }
 
 impl RuntimeShellReport {
     fn initialize(context: RebornCliContext) -> Self {
-        let _registry = ironclaw_reborn::driver_registry::DriverRegistry::new();
+        let mut registry = ironclaw_reborn::driver_registry::DriverRegistry::new();
+        let text_only_driver =
+            ComponentStatus::from_result(ironclaw_reborn::register_default_text_only_driver(
+                &mut registry,
+                ironclaw_reborn::TextOnlyModelReplyDriverConfig::default(),
+            ));
+        let planned_driver = match ironclaw_reborn::build_loop_family_registry() {
+            Ok(family_registry) => ComponentStatus::from_result(
+                ironclaw_reborn::register_default_planned_driver(&mut registry, family_registry),
+            ),
+            Err(error) => ComponentStatus::Failed(error.to_string()),
+        };
+        let planned_default_profile =
+            ComponentStatus::from_result(ironclaw_reborn::default_planned_run_profile_resolver());
         Self {
             config: context.boot_config().clone(),
-            driver_registry_initialized: true,
+            text_only_driver,
+            planned_driver,
+            planned_default_profile,
         }
     }
 
@@ -39,12 +82,26 @@ impl RuntimeShellReport {
         println!("v1_state: not-used");
         println!("driver_registry: initialized");
         println!(
+            "text_only_driver: {}",
+            self.text_only_driver.render("initialized")
+        );
+        println!(
+            "planned_driver: {}",
+            self.planned_driver.render("initialized")
+        );
+        let runtime_shell_initialized =
+            self.text_only_driver.is_initialized() && self.planned_driver.is_initialized();
+        println!(
             "runtime_shell: {}",
-            if self.driver_registry_initialized {
+            if runtime_shell_initialized {
                 "initialized"
             } else {
                 "unavailable"
             }
+        );
+        println!(
+            "planned_default_profile: {}",
+            self.planned_default_profile.render("available")
         );
     }
 }
