@@ -1,21 +1,42 @@
 #![forbid(unsafe_code)]
 
-//! Minimal Reborn production composition root.
+//! Reborn composition root.
 //!
-//! This crate intentionally wires substrate services only. Product/AppBuilder
-//! integration belongs in later slices.
+//! Two entry points:
+//!
+//! - [`build_reborn_services`] — substrate-only facades (host runtime,
+//!   turn coordinator). Useful when an outer harness wires the loop
+//!   drivers / turn-runner itself (e.g. v1 `AppBuilder`).
+//! - [`build_reborn_runtime`] — full runtime assembly: substrate + loop
+//!   driver registry + LLM model gateway (under `root-llm-provider`) +
+//!   turn-runner worker, spawned as one unit. This is the single entry
+//!   point used by the standalone `ironclaw-reborn` binary and any
+//!   future Reborn ingress.
+//!
+//! Downstream callers should not name internal Reborn types directly:
+//! [`RebornRuntime`] exposes only task-level methods, so callers never
+//! import `TurnCoordinator`, `SessionThreadService`, `HostManagedModel
+//! Gateway`, etc.
 
 mod error;
 mod factory;
 mod input;
 mod profile;
 mod readiness;
+mod runtime;
+mod runtime_input;
 
 pub use error::RebornBuildError;
 pub use factory::{RebornServices, build_reborn_services};
 pub use input::RebornBuildInput;
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
+pub use runtime::{
+    AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, build_reborn_runtime,
+};
+pub use runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
+#[cfg(feature = "root-llm-provider")]
+pub use runtime_input::RebornLlmConfig;
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
