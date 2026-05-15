@@ -307,6 +307,7 @@ mod sdk {
         Client,
         authentication::matrix::MatrixSession,
         config::SyncSettings,
+        deserialized_responses::EncryptionInfo,
         room::Room,
         ruma::{
             OwnedUserId,
@@ -692,7 +693,9 @@ mod sdk {
                 let ready = Arc::clone(&ready);
                 let pairing_store = Arc::clone(&self.pairing_store);
                 let http_client = self.http_client.clone();
-                move |ev: OriginalSyncRoomMessageEvent, room: Room| {
+                move |ev: OriginalSyncRoomMessageEvent,
+                      room: Room,
+                      encryption_info: Option<EncryptionInfo>| {
                     let config = config.clone();
                     let bot_user_id = bot_user_id.clone();
                     let http_client = http_client.clone();
@@ -764,6 +767,7 @@ mod sdk {
                             sender = %sender,
                             room_id = %room_id,
                             event_id = %event_id,
+                            encrypted = encryption_info.is_some(),
                             content_len = text.len(),
                             "Matrix: message received"
                         );
@@ -1864,6 +1868,29 @@ mod tests {
         assert_eq!(
             ctx.get("matrix_homeserver").map(|s| s.as_str()),
             Some("https://matrix.org")
+        );
+    }
+
+    #[cfg(feature = "matrix-sdk-channel")]
+    #[test]
+    fn test_sdk_message_handler_requests_encryption_info() {
+        let source = include_str!("matrix.rs");
+        let handler = source
+            .split("// Text message handler.")
+            .nth(1)
+            .and_then(|after_marker| {
+                after_marker
+                    .split("// Log undecryptable encrypted events")
+                    .next()
+            })
+            .expect("SDK text message handler source block should be discoverable");
+        assert!(
+            handler.contains(
+                "move |ev: OriginalSyncRoomMessageEvent,\n\
+                      room: Room,\n\
+                      encryption_info: Option<EncryptionInfo>|"
+            ),
+            "Matrix SDK message handlers must request EncryptionInfo so decrypted E2EE messages dispatch"
         );
     }
 
