@@ -184,7 +184,11 @@ pub fn create_llm_provider_with_config(
 /// Dispatches on `RegistryProviderConfig::protocol` to build the appropriate
 /// rig-core client. This single function replaces what used to be 5 separate
 /// `create_*_provider` functions.
-fn create_registry_provider(
+///
+/// Public so the Reborn composition root (`ironclaw_reborn_composition`) can
+/// build a provider directly from a `RegistryProviderConfig` without dragging
+/// in the v1 `SessionManager` plumbing that `create_llm_provider` requires.
+pub fn create_registry_provider(
     config: &RegistryProviderConfig,
     request_timeout_secs: u64,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
