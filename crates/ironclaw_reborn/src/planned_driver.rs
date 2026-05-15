@@ -267,9 +267,8 @@ fn checkpoint_kind_name(kind: CheckpointKind) -> &'static str {
 fn resumable_checkpoint_kind_from_host(kind: LoopCheckpointKind) -> Result<CheckpointKind, ()> {
     match kind {
         LoopCheckpointKind::BeforeModel => Ok(CheckpointKind::BeforeModel),
-        LoopCheckpointKind::BeforeSideEffect
-        | LoopCheckpointKind::BeforeBlock
-        | LoopCheckpointKind::Final => {
+        LoopCheckpointKind::BeforeBlock => Ok(CheckpointKind::BeforeBlock),
+        LoopCheckpointKind::BeforeSideEffect | LoopCheckpointKind::Final => {
             tracing::warn!(
                 ?kind,
                 "planned driver cannot resume checkpoint kind without exact continuation semantics"
@@ -579,7 +578,7 @@ mod tests {
         let context = run_context_for_driver(&driver);
         let checkpoint_id = TurnCheckpointId::new();
         let loaded = LoadedCheckpointPayload {
-            kind: LoopCheckpointKind::BeforeBlock,
+            kind: LoopCheckpointKind::BeforeSideEffect,
             schema_id: context.checkpoint_schema_id.clone(),
             schema_version: context.checkpoint_schema_version,
             payload: RedactedCheckpointPayload::new(b"{}".to_vec())
