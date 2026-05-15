@@ -1,5 +1,7 @@
 //! Extension Manifest v2 contract tests.
 
+use std::sync::Arc;
+
 use ironclaw_extensions::{
     CapabilityVisibility, ExtensionManifestV2, ExtensionRuntimeV2, HostApiContractRegistry,
     HostApiId, HostApiManifestContract, HostApiMultiplicity, HostApiRefV2, MANIFEST_SCHEMA_VERSION,
@@ -933,19 +935,19 @@ impl HostApiManifestContract for FakeHostApiContract {
     }
 }
 
-fn host_api_registry() -> HostApiContractRegistry<'static> {
-    let product = Box::leak(Box::new(FakeHostApiContract::new(
+fn host_api_registry() -> HostApiContractRegistry {
+    let product = Arc::new(FakeHostApiContract::new(
         "ironclaw.product_adapter/v1",
         "product_adapter",
         HostApiMultiplicity::Multiple,
         "surface_kind",
-    )));
-    let capabilities = Box::leak(Box::new(FakeHostApiContract::new(
+    ));
+    let capabilities = Arc::new(FakeHostApiContract::new(
         "ironclaw.capability_provider/v1",
         "capability_provider",
         HostApiMultiplicity::Single,
         "capabilities",
-    )));
+    ));
     let mut registry = HostApiContractRegistry::new();
     registry.register(product).unwrap();
     registry.register(capabilities).unwrap();
@@ -1178,24 +1180,24 @@ output_schema_ref = "schemas/telegram/legacy.output.v1.json"
 
 #[test]
 fn duplicate_contract_registration_does_not_replace_existing_contract() {
-    let product = Box::leak(Box::new(FakeHostApiContract::new(
+    let product = Arc::new(FakeHostApiContract::new(
         "ironclaw.product_adapter/v1",
         "product_adapter",
         HostApiMultiplicity::Multiple,
         "surface_kind",
-    )));
-    let replacement = Box::leak(Box::new(FakeHostApiContract::new(
+    ));
+    let replacement = Arc::new(FakeHostApiContract::new(
         "ironclaw.product_adapter/v1",
         "product_adapter",
         HostApiMultiplicity::Multiple,
         "replacement_only",
-    )));
-    let capabilities = Box::leak(Box::new(FakeHostApiContract::new(
+    ));
+    let capabilities = Arc::new(FakeHostApiContract::new(
         "ironclaw.capability_provider/v1",
         "capability_provider",
         HostApiMultiplicity::Single,
         "capabilities",
-    )));
+    ));
     let mut registry = HostApiContractRegistry::new();
     registry.register(product).unwrap();
     let err = registry.register(replacement).unwrap_err();

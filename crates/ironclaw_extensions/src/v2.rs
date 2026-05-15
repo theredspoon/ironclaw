@@ -36,6 +36,7 @@
 //! schema.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 
 use ironclaw_host_api::{
     CapabilityId, CapabilityProfileId, CapabilityProfileSchemaRef, EffectKind, ExtensionId,
@@ -169,7 +170,7 @@ pub enum HostApiMultiplicity {
 /// `ironclaw_extensions` owns the generic envelope and section dispatch. Domain
 /// crates own section patterns, cardinality, typed schema validation, and
 /// projection into their read models.
-pub trait HostApiManifestContract {
+pub trait HostApiManifestContract: Send + Sync {
     fn id(&self) -> &HostApiId;
 
     fn multiplicity(&self) -> HostApiMultiplicity {
@@ -186,11 +187,11 @@ pub trait HostApiManifestContract {
 }
 
 /// Composition-wired registry of host API manifest contracts.
-pub struct HostApiContractRegistry<'a> {
-    contracts: BTreeMap<HostApiId, &'a dyn HostApiManifestContract>,
+pub struct HostApiContractRegistry {
+    contracts: BTreeMap<HostApiId, Arc<dyn HostApiManifestContract>>,
 }
 
-impl<'a> HostApiContractRegistry<'a> {
+impl HostApiContractRegistry {
     pub fn new() -> Self {
         Self {
             contracts: BTreeMap::new(),
@@ -199,7 +200,7 @@ impl<'a> HostApiContractRegistry<'a> {
 
     pub fn register(
         &mut self,
-        contract: &'a dyn HostApiManifestContract,
+        contract: Arc<dyn HostApiManifestContract>,
     ) -> Result<(), ManifestV2Error> {
         let id = contract.id().clone();
         if self.contracts.contains_key(&id) {
@@ -249,7 +250,7 @@ impl<'a> HostApiContractRegistry<'a> {
     }
 }
 
-impl Default for HostApiContractRegistry<'_> {
+impl Default for HostApiContractRegistry {
     fn default() -> Self {
         Self::new()
     }
@@ -348,6 +349,12 @@ pub struct ExtensionManifestV2 {
     pub runtime: ExtensionRuntimeV2,
     /// Host API contracts this extension implements. Empty only for legacy v2
     /// capability-only manifests during cutover.
+    ///
+    /// Contract handlers must treat manifest trust fields as untrusted
+    /// declaration metadata. Runtime authority and effective trust must come
+    /// from composition-owned trust policy evaluation, not from
+    /// [`descriptor_trust_default`](Self::descriptor_trust_default) or the raw
+    /// [`requested_trust`](Self::requested_trust) request.
     pub host_apis: Vec<HostApiRefV2>,
     pub capabilities: Vec<CapabilityDeclV2>,
 }
@@ -487,7 +494,7 @@ impl ExtensionManifestV2 {
         input: &str,
         source: ManifestSource,
         host_port_catalog: &HostPortCatalog,
-        registry: &HostApiContractRegistry<'_>,
+        registry: &HostApiContractRegistry,
     ) -> Result<Self, ManifestV2Error> {
         if input.len() > MAX_MANIFEST_BYTES {
             return Err(ManifestV2Error::ManifestTooLarge {

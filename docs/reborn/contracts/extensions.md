@@ -188,6 +188,7 @@ Rules:
 
 - `ironclaw_extensions` parses the envelope, validates host API refs, and dispatches to a composition-wired host API contract registry.
 - Domain contract handlers own section pattern validation, cardinality, typed section schema validation, and catalog/read-model projection.
+- Domain contract handlers must not treat manifest `trust` / `descriptor_trust_default` as effective runtime authority. Effective trust and grants come from composition-owned trust policy evaluation, not self-declared manifest metadata.
 - Model-visible capability-provider sections must carry enough cold metadata to project an LLM-facing tool descriptor: stable capability ID, human description, input schema ref, output schema ref, prompt docs ref, effects, permission default, and visibility.
 - The LLM consumes the projected hot capability surface, not the raw manifest section. Catalog publication resolves schema/doc refs into compact per-turn tool descriptors.
 - Unknown `host_api.id` values fail closed.
