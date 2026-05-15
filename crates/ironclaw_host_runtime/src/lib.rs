@@ -1407,55 +1407,21 @@ fn lowercase_percent_escapes(value: &str) -> String {
     output
 }
 
-#[cfg(test)]
-mod security_findings_poc {
-    //! Proof-of-concept tests for the security review of the runtime HTTP
-    //! egress credential injection path. Each test below is a failing
-    //! regression test for a finding from the 2026-05 review; the fix lands
-    //! alongside the assertion flip.
-    //!
-    //! Findings covered here:
-    //!
-    //! - **H1** — `RuntimeCredentialMaterialCacheEntry::value` once held
-    //!   `Option<String>`, so the leased plaintext stayed on the heap until
-    //!   the egress request ended and was then freed without zeroization.
-    //!   The cache now holds `Option<SecretMaterial>` so the bytes are
-    //!   wiped when the `Vec` is dropped at end-of-call. The test is kept
-    //!   as a regression guard: any future refactor that downgrades the
-    //!   cache value back to a non-zeroizing type fails the assertion.
-
-    use super::{RuntimeCredentialMaterialCacheEntry, RuntimeCredentialMaterialKey};
-    use ironclaw_host_api::SecretHandle;
-
-    /// **Finding H1 — regression guard.** The credential material cache
-    /// value must be a zeroize-on-drop type. Holding the leased plaintext
-    /// as `Option<String>` (the original bug) leaves it on the heap until
-    /// the cache `Vec` is dropped at end-of-call, then frees the bytes
-    /// without wiping. `Option<SecretMaterial>` (alias for
-    /// `secrecy::SecretString = SecretBox<str>`) carries `ZeroizeOnDrop`
-    /// semantics: the assertion checks that the value-field type name
-    /// names a zeroize-on-drop carrier.
-    #[test]
-    fn h1_credential_material_cache_value_must_be_zeroizing() {
-        let entry = RuntimeCredentialMaterialCacheEntry {
-            key: RuntimeCredentialMaterialKey::SecretStoreLease {
-                handle: SecretHandle::new("h").unwrap(),
-            },
-            value: None,
-        };
-        let value_type = std::any::type_name_of_val(&entry.value);
-        // `secrecy::SecretString` is `type SecretString = SecretBox<str>`, so
-        // the concrete type name from `type_name_of_val` is the inner
-        // `SecretBox<...>`. Accept any of the zeroize-on-drop carriers in
-        // the secrecy family.
-        assert!(
-            value_type.contains("SecretBox<")
-                || value_type.contains("SecretString")
-                || value_type.contains("SecretMaterial"),
-            "H1: credential cache value type must be zeroize-on-drop \
-             (SecretBox/SecretString/SecretMaterial), got {value_type}. A plain \
-             String leaves plaintext on the heap for the duration of the \
-             egress request, defeating SecretMaterial::ZeroizeOnDrop."
-        );
+/// **Finding H1 — compile-time regression guard.**
+///
+/// The credential material cache value field must hold a `ZeroizeOnDrop`
+/// carrier. Holding the leased plaintext as `Option<String>` (the original
+/// bug) leaves it on the heap until the cache `Vec` is dropped at end-of-call,
+/// then frees the bytes without wiping. This `const _: fn(...) = ...`
+/// references the field's inner type through a `ZeroizeOnDrop`-bounded helper,
+/// so any refactor that downgrades the field to a non-zeroizing type (e.g.
+/// plain `Option<String>`) stops the crate from compiling rather than waiting
+/// for a test run. `String` implements `Zeroize` but not `ZeroizeOnDrop`, so
+/// the constraint fires on exactly the bug shape this guard protects against.
+/// The function is never called — only type-checked.
+const _: fn(&RuntimeCredentialMaterialCacheEntry) = |entry| {
+    fn require_zeroize_on_drop<T: ?Sized + secrecy::zeroize::ZeroizeOnDrop>(_: &T) {}
+    if let Some(value) = entry.value.as_ref() {
+        require_zeroize_on_drop(value);
     }
-}
+};

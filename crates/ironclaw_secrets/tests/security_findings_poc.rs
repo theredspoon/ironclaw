@@ -25,6 +25,11 @@
 //!   the new decrypt path. This locks in the "no on-disk compatibility with
 //!   pre-AAD rows" design decision: bootstrap must fail closed instead of
 //!   returning unauthenticated plaintext.
+//! - **Cross-domain replay** — confirms that ciphertext authenticated under
+//!   one AAD domain (e.g. `reborn/v1/secret_record`) cannot be decrypted
+//!   under another (e.g. `reborn/v1/credential_account`), even when the
+//!   identity bytes after the domain prefix match. The domain tag is the
+//!   load-bearing protection against cross-shape replay.
 
 use ironclaw_secrets::{
     CredentialSessionId, SecretError, SecretMaterial, SecretsCrypto, secret_record_aad,
@@ -45,7 +50,7 @@ use ironclaw_secrets::{
     CreateSecretParams, CredentialAccount, CredentialAccountId, CredentialAccountStatus,
     CredentialAccountStore, CredentialPathPolicy, CredentialSessionRequest, CredentialSessionStore,
     CredentialTargetPolicy, InMemoryCredentialBroker, LibSqlCredentialStore, LibSqlSecretsStore,
-    RedactedJson, SecretsStore,
+    RedactedJson, SecretsStore, credential_account_aad,
 };
 #[cfg(feature = "libsql")]
 use serde_json::json;
@@ -268,6 +273,57 @@ fn aad_binding_rejects_pre_aad_secret_record_ciphertext() {
          returned to the caller, otherwise an attacker can downgrade rows \
          to the legacy format and bypass the row-binding guard. got={result:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-domain replay — secret_record ↔ credential_account
+// ---------------------------------------------------------------------------
+
+/// PR #3592 review follow-up. Domain separation is the load-bearing
+/// protection against cross-shape replay: a `secret_record`-shape ciphertext
+/// must not be acceptable under `credential_account` AAD even when the
+/// identity bytes after the domain prefix happen to align. This test
+/// constructs a ciphertext authenticated under `secret_record_aad(user, name)`
+/// and asserts that decrypting it with a `credential_account_aad` that uses
+/// the same `name` as the account id fails with `DecryptionFailed`. The
+/// reverse direction is symmetric and not retested.
+#[cfg(feature = "libsql")]
+#[test]
+fn cross_domain_replay_secret_record_to_credential_account_fails() {
+    let crypto = SecretsCrypto::new(SecretMaterial::from(
+        "0123456789abcdef0123456789abcdef".to_string(),
+    ))
+    .expect("valid 32-byte hex test key");
+
+    // Encrypt under the secret-record domain with identity bytes that match
+    // the credential-account row we'll try to "promote" the ciphertext into.
+    let plaintext = b"PLAINTEXT_cross_domain_replay_canary";
+    let secret_aad = secret_record_aad("tenant-a", "openai_prod");
+    let (encrypted_value, key_salt) = crypto.encrypt(plaintext, &secret_aad).unwrap();
+
+    // Build the credential-account AAD whose post-domain identity bytes are
+    // intentionally close to the secret-record case. The only thing that
+    // should reject decryption is the differing domain tag in `build_aad`.
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    let cred_aad = credential_account_aad(&scope, &account_id);
+
+    let result = crypto.decrypt(&encrypted_value, &key_salt, &cred_aad);
+    assert!(
+        matches!(result, Err(SecretError::DecryptionFailed(_))),
+        "Cross-domain replay must fail closed: secret_record ciphertext was \
+         accepted under credential_account AAD. The domain tag in build_aad \
+         is the load-bearing protection against cross-shape replay. \
+         got={result:?}"
+    );
+
+    // Sanity check: decrypt under the original AAD still works, so the
+    // failure above is genuinely from the domain mismatch and not from
+    // unrelated tampering.
+    let ok = crypto
+        .decrypt(&encrypted_value, &key_salt, &secret_aad)
+        .expect("original-domain decrypt must round-trip");
+    assert_eq!(ok.expose().as_bytes(), plaintext);
 }
 
 // ---------------------------------------------------------------------------

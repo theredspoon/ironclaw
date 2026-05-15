@@ -2103,7 +2103,16 @@ fn decrypt_json_payload<T: serde::de::DeserializeOwned>(
     from_json(decrypted.expose())
 }
 
-fn credential_account_aad(scope: &ResourceScope, account_id: &CredentialAccountId) -> Vec<u8> {
+/// AAD for the credential-account payload, binding ciphertext to
+/// `(scope, account_id)`.
+///
+/// Production storage code reaches this through the credential store API and
+/// never needs to call it directly. It is `pub` so contract tests and
+/// integration fixtures that bypass the store and write directly to
+/// `reborn_credential_accounts` can construct ciphertext the production code
+/// will accept — and cross-domain replay tests can prove that swapping AAD
+/// between domains fails decryption.
+pub fn credential_account_aad(scope: &ResourceScope, account_id: &CredentialAccountId) -> Vec<u8> {
     let key = DbScopeKey::from_account_scope(scope);
     build_aad(
         AAD_DOMAIN_CREDENTIAL_ACCOUNT,
@@ -2117,7 +2126,11 @@ fn credential_account_aad(scope: &ResourceScope, account_id: &CredentialAccountI
     )
 }
 
-fn credential_session_aad(scope: &ResourceScope, session_id: CredentialSessionId) -> Vec<u8> {
+/// AAD for the credential-session payload, binding ciphertext to
+/// `(scope, session_id)`.
+///
+/// Same fixture-only motivation as [`credential_account_aad`].
+pub fn credential_session_aad(scope: &ResourceScope, session_id: CredentialSessionId) -> Vec<u8> {
     let key = DbScopeKey::from_full_scope(scope);
     let session_id_string = session_id.to_private_storage_string();
     build_aad(

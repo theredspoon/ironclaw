@@ -16,6 +16,8 @@ mod legacy_store;
 pub use db::{LibSqlCredentialStore, LibSqlSecretsStore};
 #[cfg(feature = "postgres")]
 pub use db::{PostgresCredentialStore, PostgresSecretsStore};
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+pub use db::{credential_account_aad, credential_session_aad};
 
 use std::collections::HashMap;
 use std::fmt;
