@@ -43,6 +43,34 @@ pub(crate) fn validate_simple_identifier(kind: &'static str, s: &str) -> Result<
             reason: "must be 128 characters or fewer".to_string(),
         });
     }
+    // Tightened identifier shape after PR #3661 reviewer flag:
+    //   `IndexKey::new("a.b")` used to pass validation but interact with
+    //   `json_extract(indexed, '$.a.b')` as a nested-path traversal rather
+    //   than the literal key `"a.b"`. Similarly, raw names used as DDL
+    //   identifiers without SQL quoting allowed `-` / `.` / unicode through.
+    //   Restrict to `[A-Za-z_][A-Za-z0-9_]*` so the same value is safe as a
+    //   JSON path component, a SQL identifier, and a row key.
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(HostApiError::InvalidId {
+            kind,
+            value: s.to_string(),
+            reason: "must start with an ASCII letter or underscore".to_string(),
+        });
+    }
+    if bytes[1..]
+        .iter()
+        .any(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+    {
+        return Err(HostApiError::InvalidId {
+            kind,
+            value: s.to_string(),
+            reason: "must contain only ASCII letters, digits, and underscores".to_string(),
+        });
+    }
+    // Legacy traversal/whitespace checks retained as belt-and-suspenders;
+    // the ASCII alphanumeric rule above already rejects them.
     if s.contains('/')
         || s.contains('\\')
         || s.contains('\0')
@@ -282,6 +310,22 @@ mod tests {
         assert!(IndexName::new("scope/leases").is_err());
         assert!(IndexName::new("with space").is_err());
         assert!(IndexName::new("ok_name_1").is_ok());
+    }
+
+    #[test]
+    fn index_key_rejects_chars_that_break_sql_or_json_paths() {
+        // Reviewer (PR #3661) flagged that allowing `.` lets
+        // `json_extract(indexed, '$.a.b')` traverse rather than match the
+        // literal key `"a.b"`, and that other punctuation can break DDL.
+        // After tightening, IndexKey/Name accept `[A-Za-z_][A-Za-z0-9_]*`
+        // only.
+        assert!(IndexKey::new("a.b").is_err());
+        assert!(IndexKey::new("a-b").is_err());
+        assert!(IndexKey::new("1abc").is_err()); // can't start with digit
+        assert!(IndexKey::new("").is_err());
+        assert!(IndexKey::new("scope").is_ok());
+        assert!(IndexKey::new("_internal").is_ok());
+        assert!(IndexKey::new("scope_v2").is_ok());
     }
 
     #[test]

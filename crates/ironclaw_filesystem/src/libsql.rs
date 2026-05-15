@@ -318,8 +318,30 @@ impl RootFilesystem for LibSqlRootFilesystem {
         })?;
 
         let conn = self.connect().await?;
-        // Conflict check: idempotent if same spec already declared, else
+        // PR #3661 reviewer fix: the prior SELECT-then-INSERT was racey.
+        // Two processes declaring the same spec concurrently could both
+        // miss the row and then one would hit a unique-constraint backend
+        // error instead of getting the promised idempotent success.
+        //
+        // Fix: INSERT ... ON CONFLICT DO NOTHING in a single round-trip,
+        // then read back the canonical row and compare. If the stored
+        // spec matches ours we're idempotent; if it differs we surface
         // IndexConflict.
+        conn.execute(
+            "INSERT INTO root_filesystem_index_specs (prefix, name, keys, kind) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (prefix, name) DO NOTHING",
+            libsql::params![
+                path.as_str(),
+                spec.name.as_str(),
+                keys_json.clone(),
+                kind_str.clone(),
+            ],
+        )
+        .await
+        .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
+
+        // Read back what's there and validate it matches.
         let mut rows = conn
             .query(
                 "SELECT keys, kind FROM root_filesystem_index_specs WHERE prefix = ?1 AND name = ?2",
@@ -329,41 +351,31 @@ impl RootFilesystem for LibSqlRootFilesystem {
             .map_err(|error| {
                 libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
             })?;
-        if let Some(row) = rows.next().await.map_err(|error| {
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| {
+                libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+            })?
+            .ok_or_else(|| FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::EnsureIndex,
+                reason: "index spec disappeared after upsert".to_string(),
+            })?;
+        let existing_keys: String = row.get(0).map_err(|error| {
             libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
-        })? {
-            let existing_keys: String = row.get(0).map_err(|error| {
-                libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
-            })?;
-            let existing_kind: String = row.get(1).map_err(|error| {
-                libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
-            })?;
-            if existing_keys != keys_json || existing_kind != kind_str {
-                return Err(FilesystemError::IndexConflict {
-                    path: path.clone(),
-                    name: spec.name.clone(),
-                    reason: "spec already declared with different keys or kind".to_string(),
-                });
-            }
-            return Ok(());
+        })?;
+        let existing_kind: String = row.get(1).map_err(|error| {
+            libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error)
+        })?;
+        if existing_keys != keys_json || existing_kind != kind_str {
+            return Err(FilesystemError::IndexConflict {
+                path: path.clone(),
+                name: spec.name.clone(),
+                reason: "spec already declared with different keys or kind".to_string(),
+            });
         }
         drop(rows);
-
-        // Record the spec then materialize a SQL expression index on the
-        // declared keys. The index is global on the table; queries route
-        // by path-prefix in the WHERE clause and the planner can still use
-        // this index for filter predicates.
-        conn.execute(
-            "INSERT INTO root_filesystem_index_specs (prefix, name, keys, kind) VALUES (?1, ?2, ?3, ?4)",
-            libsql::params![
-                path.as_str(),
-                spec.name.as_str(),
-                keys_json.clone(),
-                kind_str,
-            ],
-        )
-        .await
-        .map_err(|error| libsql_db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
 
         let index_name = sql_index_name(path.as_str(), spec.name.as_str());
         let expressions: Vec<String> = spec
@@ -940,6 +952,10 @@ fn sql_index_name(prefix: &str, name: &str) -> String {
     }
 }
 
+/// Escape a LIKE pattern that already contains a trailing `%` wildcard
+/// intentionally appended by the caller (the path-prefix scan case in
+/// `query`). The trailing `%` is preserved so it remains a wildcard;
+/// every other `%`, `_`, and `!` is escaped.
 #[cfg(feature = "libsql")]
 fn escape_like_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
@@ -955,9 +971,34 @@ fn escape_like_pattern(pattern: &str) -> String {
     out
 }
 
-/// Translate a [`Filter`] tree into a libsql WHERE-clause fragment, appending
-/// bound parameters to `params` in left-to-right order. The fragment is
-/// wrapped in parentheses unless empty.
+/// Escape user-supplied LIKE input where every `%`, `_`, and `!` must be
+/// treated as a literal. Used for `Filter::PrefixOn` values — reviewer
+/// (PR #3661) flagged that the prior code reused `escape_like_pattern`,
+/// which intentionally leaves a final `%` unescaped. A literal prefix
+/// like `tenant:%` would then match anything starting with `tenant:`.
+#[cfg(feature = "libsql")]
+fn escape_like_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("!%"),
+            '_' => out.push_str("!_"),
+            '!' => out.push_str("!!"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Translate a [`Filter`] tree into a libsql WHERE-clause fragment.
+///
+/// Reviewer (PR #3661) flagged that the prior version's "skip empty
+/// children" logic conflated `Filter::All` with the identity element of
+/// each compound, so `Or([])` returned every row instead of none and
+/// `And([All])` could emit malformed SQL. The fix: every node always
+/// produces a non-empty fragment — `Filter::All` becomes the literal
+/// `TRUE`, empty `And` becomes `TRUE`, empty `Or` becomes `FALSE`. This
+/// matches the in-memory backend's `all`/`any` semantics.
 #[cfg(feature = "libsql")]
 fn translate_filter(
     path: &VirtualPath,
@@ -966,7 +1007,10 @@ fn translate_filter(
     params: &mut Vec<libsql::Value>,
 ) -> Result<(), FilesystemError> {
     match filter {
-        Filter::All => Ok(()),
+        Filter::All => {
+            out.push_str("TRUE");
+            Ok(())
+        }
         Filter::Eq { key, value } => {
             let placeholder = bind_index_value(path, value, params)?;
             out.push_str(&format!(
@@ -983,7 +1027,10 @@ fn translate_filter(
                     operation: FilesystemOperation::Query,
                 });
             };
-            let escaped = escape_like_pattern(prefix_value);
+            // PR #3661 reviewer fix: user-input prefix must be fully
+            // escaped (including any literal `%` characters) before
+            // appending the LIKE wildcard.
+            let escaped = escape_like_literal(prefix_value);
             params.push(libsql::Value::Text(format!("{escaped}%")));
             out.push_str(&format!(
                 "(json_extract(indexed, '$.{}') LIKE ?{} ESCAPE '!')",
@@ -1003,8 +1050,8 @@ fn translate_filter(
             ));
             Ok(())
         }
-        Filter::And(children) => translate_compound(path, children, " AND ", out, params),
-        Filter::Or(children) => translate_compound(path, children, " OR ", out, params),
+        Filter::And(children) => translate_compound(path, children, " AND ", "TRUE", out, params),
+        Filter::Or(children) => translate_compound(path, children, " OR ", "FALSE", out, params),
     }
 }
 
@@ -1013,25 +1060,23 @@ fn translate_compound(
     path: &VirtualPath,
     children: &[Filter],
     joiner: &str,
+    empty_identity: &str,
     out: &mut String,
     params: &mut Vec<libsql::Value>,
 ) -> Result<(), FilesystemError> {
     if children.is_empty() {
+        out.push_str(empty_identity);
         return Ok(());
     }
     out.push('(');
-    let mut first = true;
-    for child in children {
-        let mut sub = String::new();
-        translate_filter(path, child, &mut sub, params)?;
-        if sub.is_empty() {
-            continue;
-        }
-        if !first {
+    for (i, child) in children.iter().enumerate() {
+        if i > 0 {
             out.push_str(joiner);
         }
-        out.push_str(&sub);
-        first = false;
+        // Recurse: every child now produces a non-empty fragment thanks to
+        // the `Filter::All -> TRUE` rule, so we don't need the prior
+        // "skip empty" branch that broke `Or([])`/`And([All])`.
+        translate_filter(path, child, out, params)?;
     }
     out.push(')');
     Ok(())

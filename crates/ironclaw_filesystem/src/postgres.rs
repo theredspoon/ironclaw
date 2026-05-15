@@ -277,38 +277,42 @@ impl RootFilesystem for PostgresRootFilesystem {
         })?;
 
         let client = self.client().await?;
-        let existing = client
+        // PR #3661 reviewer fix: race-idempotent declaration. Single
+        // INSERT ... ON CONFLICT DO NOTHING followed by a read-back +
+        // canonical-spec equality check. Two concurrent declarers of the
+        // same spec both succeed; declarers of conflicting specs see
+        // IndexConflict deterministically.
+        client
+            .execute(
+                "INSERT INTO root_filesystem_index_specs (prefix, name, keys, kind) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (prefix, name) DO NOTHING",
+                &[&path.as_str(), &spec.name.as_str(), &keys_json, &kind_str],
+            )
+            .await
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
+
+        let row = client
             .query_opt(
                 "SELECT keys, kind FROM root_filesystem_index_specs WHERE prefix = $1 AND name = $2",
                 &[&path.as_str(), &spec.name.as_str()],
             )
             .await
-            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
-        if let Some(row) = existing {
-            let existing_keys: serde_json::Value = row.get("keys");
-            let existing_kind: String = row.get("kind");
-            if existing_keys != keys_json || existing_kind != kind_str {
-                return Err(FilesystemError::IndexConflict {
-                    path: path.clone(),
-                    name: spec.name.clone(),
-                    reason: "spec already declared with different keys or kind".to_string(),
-                });
-            }
-            return Ok(());
+            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?
+            .ok_or_else(|| FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::EnsureIndex,
+                reason: "index spec disappeared after upsert".to_string(),
+            })?;
+        let existing_keys: serde_json::Value = row.get("keys");
+        let existing_kind: String = row.get("kind");
+        if existing_keys != keys_json || existing_kind != kind_str {
+            return Err(FilesystemError::IndexConflict {
+                path: path.clone(),
+                name: spec.name.clone(),
+                reason: "spec already declared with different keys or kind".to_string(),
+            });
         }
-
-        client
-            .execute(
-                "INSERT INTO root_filesystem_index_specs (prefix, name, keys, kind) VALUES ($1, $2, $3, $4)",
-                &[
-                    &path.as_str(),
-                    &spec.name.as_str(),
-                    &keys_json,
-                    &kind_str,
-                ],
-            )
-            .await
-            .map_err(|error| db_error(path.clone(), FilesystemOperation::EnsureIndex, error))?;
 
         let index_name = sql_index_name(path.as_str(), spec.name.as_str());
         let expressions: Vec<String> = spec
@@ -708,6 +712,8 @@ fn sql_index_name(prefix: &str, name: &str) -> String {
     }
 }
 
+/// LIKE-pattern escape that preserves a trailing wildcard appended by the
+/// caller (the path-prefix scan in `query`).
 #[cfg(feature = "postgres")]
 fn escape_like_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
@@ -723,9 +729,32 @@ fn escape_like_pattern(pattern: &str) -> String {
     out
 }
 
+/// Fully-literal LIKE escape for user-supplied values. PR #3661 reviewer
+/// fix: the `Filter::PrefixOn` value must be treated as a literal — a
+/// stored prefix of `tenant:%` must not become a `%` wildcard at query
+/// time.
+#[cfg(feature = "postgres")]
+fn escape_like_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' => out.push_str("!%"),
+            '_' => out.push_str("!_"),
+            '!' => out.push_str("!!"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Translate a [`Filter`] tree into a postgres WHERE-clause fragment.
 /// Bound parameters use `$N` placeholders sized from `params.len() + 1`.
-/// Returns once `out` has been appended.
+///
+/// PR #3661 fixes carried over from the libsql translator:
+/// - `Filter::All` emits `TRUE`; empty `And` → `TRUE`, empty `Or` →
+///   `FALSE` (matching in-memory `all`/`any` semantics).
+/// - `Filter::Range` on `IndexValue::I64` bounds casts both sides to
+///   `BIGINT` so the comparison is numeric, not lexicographic on text.
 #[cfg(feature = "postgres")]
 fn translate_filter(
     path: &VirtualPath,
@@ -734,7 +763,10 @@ fn translate_filter(
     params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) -> Result<(), FilesystemError> {
     match filter {
-        Filter::All => Ok(()),
+        Filter::All => {
+            out.push_str("TRUE");
+            Ok(())
+        }
         Filter::Eq { key, value } => {
             let placeholder = bind_index_value(path, value, params)?;
             out.push_str(&format!("(indexed->>'{}' = ${placeholder})", key.as_str()));
@@ -747,7 +779,7 @@ fn translate_filter(
                     operation: FilesystemOperation::Query,
                 });
             };
-            let escaped = escape_like_pattern(prefix_value);
+            let escaped = escape_like_literal(prefix_value);
             params.push(Box::new(format!("{escaped}%")));
             out.push_str(&format!(
                 "(indexed->>'{}' LIKE ${} ESCAPE '!')",
@@ -757,16 +789,36 @@ fn translate_filter(
             Ok(())
         }
         Filter::Range { key, lo, hi } => {
-            let lo_idx = bind_index_value(path, lo, params)?;
-            let hi_idx = bind_index_value(path, hi, params)?;
-            out.push_str(&format!(
-                "(indexed->>'{}' BETWEEN ${lo_idx} AND ${hi_idx})",
-                key.as_str()
-            ));
+            // PR #3661 reviewer fix: when both bounds are `I64`, cast both
+            // the extracted JSON text and bound params to `BIGINT` so the
+            // BETWEEN comparison is numeric. Otherwise `'2' BETWEEN '10'
+            // AND '99'` would compare lexicographically and miss values.
+            // Mixed-variant ranges still hit text comparison (also matches
+            // the in-memory backend's behaviour for cross-variant bounds).
+            match (lo, hi) {
+                (IndexValue::I64(lo_val), IndexValue::I64(hi_val)) => {
+                    params.push(Box::new(*lo_val));
+                    let lo_idx = params.len();
+                    params.push(Box::new(*hi_val));
+                    let hi_idx = params.len();
+                    out.push_str(&format!(
+                        "((indexed->>'{}')::bigint BETWEEN ${lo_idx} AND ${hi_idx})",
+                        key.as_str()
+                    ));
+                }
+                _ => {
+                    let lo_idx = bind_index_value(path, lo, params)?;
+                    let hi_idx = bind_index_value(path, hi, params)?;
+                    out.push_str(&format!(
+                        "(indexed->>'{}' BETWEEN ${lo_idx} AND ${hi_idx})",
+                        key.as_str()
+                    ));
+                }
+            }
             Ok(())
         }
-        Filter::And(children) => translate_compound(path, children, " AND ", out, params),
-        Filter::Or(children) => translate_compound(path, children, " OR ", out, params),
+        Filter::And(children) => translate_compound(path, children, " AND ", "TRUE", out, params),
+        Filter::Or(children) => translate_compound(path, children, " OR ", "FALSE", out, params),
     }
 }
 
@@ -775,25 +827,20 @@ fn translate_compound(
     path: &VirtualPath,
     children: &[Filter],
     joiner: &str,
+    empty_identity: &str,
     out: &mut String,
     params: &mut Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>,
 ) -> Result<(), FilesystemError> {
     if children.is_empty() {
+        out.push_str(empty_identity);
         return Ok(());
     }
     out.push('(');
-    let mut first = true;
-    for child in children {
-        let mut sub = String::new();
-        translate_filter(path, child, &mut sub, params)?;
-        if sub.is_empty() {
-            continue;
-        }
-        if !first {
+    for (i, child) in children.iter().enumerate() {
+        if i > 0 {
             out.push_str(joiner);
         }
-        out.push_str(&sub);
-        first = false;
+        translate_filter(path, child, out, params)?;
     }
     out.push(')');
     Ok(())

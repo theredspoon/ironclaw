@@ -526,6 +526,107 @@ async fn libsql_query_prefix_filter_matches_text_prefix() {
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
+async fn libsql_query_or_empty_matches_nothing_and_all_matches_every_row() {
+    // PR #3661 reviewer fix: empty `Or` was returning every row instead
+    // of none, and `Filter::All` was being skipped in compound contexts.
+    // After the translator change every node emits a non-empty fragment
+    // (`All` -> `TRUE`, empty `And` -> `TRUE`, empty `Or` -> `FALSE`).
+    let filesystem = libsql_root().await;
+    let kind = RecordKind::new("lease").unwrap();
+    let scope_key = IndexKey::new("scope").unwrap();
+    for (path, scope) in [
+        ("/secrets/leases/A", "acme"),
+        ("/secrets/leases/B", "globex"),
+    ] {
+        let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()));
+        filesystem
+            .put(
+                &VirtualPath::new(path).unwrap(),
+                entry,
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+    let prefix = VirtualPath::new("/secrets/leases").unwrap();
+
+    // `All` matches every row.
+    let all = filesystem
+        .query(&prefix, &Filter::All, Page::default())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+
+    // Empty `Or` matches nothing.
+    let none = filesystem
+        .query(&prefix, &Filter::Or(Vec::new()), Page::default())
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+
+    // Empty `And` matches everything (identity).
+    let and_empty = filesystem
+        .query(&prefix, &Filter::And(Vec::new()), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(and_empty.len(), 2);
+
+    // `And([All])` is well-formed and matches everything.
+    let and_all = filesystem
+        .query(&prefix, &Filter::And(vec![Filter::All]), Page::default())
+        .await
+        .unwrap();
+    assert_eq!(and_all.len(), 2);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_query_prefix_filter_literal_percent_is_not_a_wildcard() {
+    // PR #3661 reviewer fix: a literal prefix containing `%` was being
+    // passed to LIKE with its `%` left unescaped (because the prior
+    // escape helper preserved trailing `%`). `tenant:%` would then match
+    // anything starting with `tenant:` instead of literally `tenant:%`.
+    let filesystem = libsql_root().await;
+    let kind = RecordKind::new("lease").unwrap();
+    let scope_key = IndexKey::new("scope").unwrap();
+    for (path, scope) in [
+        ("/secrets/leases/P1", "tenant:%"),
+        ("/secrets/leases/P2", "tenant:acme"),
+        ("/secrets/leases/P3", "tenant:globex"),
+    ] {
+        let entry = Entry::record(kind.clone(), &serde_json::json!({}))
+            .unwrap()
+            .with_indexed(scope_key.clone(), IndexValue::Text(scope.into()));
+        filesystem
+            .put(
+                &VirtualPath::new(path).unwrap(),
+                entry,
+                CasExpectation::Absent,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Literal-prefix `tenant:%` should match only the row whose stored
+    // scope literally starts with `tenant:%`, not the two `tenant:` rows.
+    let results = filesystem
+        .query(
+            &VirtualPath::new("/secrets/leases").unwrap(),
+            &Filter::PrefixOn {
+                key: scope_key,
+                value: IndexValue::Text("tenant:%".into()),
+            },
+            Page::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
 async fn libsql_query_paginates_results() {
     let filesystem = libsql_root().await;
     let kind = RecordKind::new("lease").unwrap();
