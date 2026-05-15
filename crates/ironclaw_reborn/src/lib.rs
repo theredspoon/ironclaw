@@ -10,6 +10,7 @@ pub mod loop_driver_host;
 pub mod loop_exit_applier;
 pub mod milestone_events;
 pub mod model_routes;
+pub mod planned_driver;
 pub mod production_readiness;
 pub mod text_loop_driver;
 pub mod turn_runner;
@@ -37,4 +38,5 @@ pub use model_routes::{
     ModelRouteResolver, ModelRouteSource, ModelSelectionMode, ModelSlot,
     ResolvedModelRouteSnapshot, StaticModelRouteResolver,
 };
+pub use planned_driver::PlannedDriver;
 pub use text_loop_driver::{TextOnlyModelReplyDriver, TextOnlyModelReplyDriverConfig};
