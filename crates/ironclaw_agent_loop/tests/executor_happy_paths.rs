@@ -64,7 +64,7 @@ async fn calls_then_reply_completes() {
 }
 
 #[tokio::test]
-async fn parallel_batch_runs_in_one_iteration() {
+async fn parallel_policy_batches_two_calls_in_one_iteration() {
     let script = ScenarioScript {
         model_responses: VecDeque::from([
             ScriptedModelResponse::Calls(vec![
@@ -106,6 +106,58 @@ async fn parallel_batch_runs_in_one_iteration() {
             }
         )
     }));
+}
+
+#[tokio::test]
+async fn mixed_parallel_batch_blocks_after_recording_completed_results() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([ScriptedModelResponse::Calls(vec![
+            ScriptedCapabilityCall::new("demo.a"),
+            ScriptedCapabilityCall::new("demo.b"),
+        ])]),
+        capability_outcomes: VecDeque::from([vec![
+            ScriptedCapabilityOutcome::completed("result:a"),
+            ScriptedCapabilityOutcome::ApprovalRequired {
+                gate_ref: "gate:approval".to_string(),
+            },
+        ]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, checkpoints) = MockAgentLoopDriverHost::builder()
+        .visible_capabilities(vec![
+            capability_descriptor(capability_id("demo.a"), ConcurrencyHint::SafeForParallel),
+            capability_descriptor(capability_id("demo.b"), ConcurrencyHint::SafeForParallel),
+        ])
+        .script(script)
+        .build();
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = CanonicalAgentLoopExecutor
+        .execute_family(&families::default(), &host, state)
+        .await
+        .expect("loop execution should succeed");
+
+    match exit {
+        LoopExit::Blocked(blocked) => {
+            assert_eq!(blocked.gate_ref.as_str(), "gate:approval");
+        }
+        other => panic!("expected blocked exit, got {other:?}"),
+    }
+    assert!(host.call_log().iter().any(|call| {
+        matches!(
+            call,
+            MockHostCall::InvokeCapabilityBatch {
+                call_count: 2,
+                stop_on_first_suspension: false
+            }
+        )
+    }));
+    checkpoints.assert_sequence(&[
+        (CheckpointKind::BeforeModel, 0),
+        (CheckpointKind::BeforeSideEffect, 0),
+        (CheckpointKind::BeforeBlock, 0),
+    ]);
 }
 
 #[tokio::test]

@@ -28,7 +28,7 @@ fn run_request(
 
 #[tokio::test]
 async fn default_planned_driver_smoke() {
-    let registry = build_loop_family_registry();
+    let registry = build_loop_family_registry().expect("registry should build");
     let driver = PlannedDriver::default_from_registry(&registry).expect("driver should build");
     let (host, _) = MockAgentLoopDriverHost::builder()
         .script(ScenarioScript::reply_only("hi"))
@@ -40,12 +40,12 @@ async fn default_planned_driver_smoke() {
         .expect("planned driver run should succeed");
 
     assert!(matches!(exit, LoopExit::Completed(_)));
-    assert_eq!(driver.descriptor().id.as_str(), "reborn:default-loop");
+    assert_eq!(driver.descriptor().id.as_str(), "reborn:planned-default");
 }
 
 #[tokio::test]
 async fn planned_driver_executor_error_maps_to_unavailable() {
-    let registry = build_loop_family_registry();
+    let registry = build_loop_family_registry().expect("registry should build");
     let driver = PlannedDriver::default_from_registry(&registry).expect("driver should build");
     let (host, _) = MockAgentLoopDriverHost::builder()
         .script(ScenarioScript::reply_only("hi"))
@@ -70,7 +70,7 @@ async fn planned_driver_executor_error_maps_to_unavailable() {
 
 #[tokio::test]
 async fn planned_driver_rejects_mismatched_profile_assignment() {
-    let registry = build_loop_family_registry();
+    let registry = build_loop_family_registry().expect("registry should build");
     let driver = PlannedDriver::default_from_registry(&registry).expect("driver should build");
     let (host, _) = MockAgentLoopDriverHost::builder()
         .script(ScenarioScript::reply_only("hi"))

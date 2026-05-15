@@ -89,6 +89,27 @@ async fn recovery_budget_exhaustion_uses_single_call_retry() {
     }
 
     let calls = host.call_log();
+    assert!(
+        matches!(
+            calls.as_slice(),
+            [
+                MockHostCall::PollInputs,
+                MockHostCall::BuildPromptBundle,
+                MockHostCall::VisibleCapabilities,
+                MockHostCall::StageCheckpointPayload(CheckpointKind::BeforeModel),
+                MockHostCall::SaveCheckpoint(CheckpointKind::BeforeModel),
+                MockHostCall::StreamModel,
+                MockHostCall::StageCheckpointPayload(CheckpointKind::BeforeSideEffect),
+                MockHostCall::SaveCheckpoint(CheckpointKind::BeforeSideEffect),
+                MockHostCall::InvokeCapabilityBatch { .. },
+                MockHostCall::InvokeCapability { .. },
+                MockHostCall::InvokeCapability { .. },
+                MockHostCall::StageCheckpointPayload(CheckpointKind::Final),
+                MockHostCall::SaveCheckpoint(CheckpointKind::Final),
+            ]
+        ),
+        "retry result ordering should stay on the wire; got {calls:?}"
+    );
     assert_eq!(
         calls
             .iter()

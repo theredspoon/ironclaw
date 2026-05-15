@@ -1,8 +1,13 @@
 use ironclaw_agent_loop::{
+    executor::{AgentLoopExecutor, CanonicalAgentLoopExecutor},
+    families,
     state::{CapabilityCallSignature, CheckpointKind, CheckpointPayloadError, LoopExecutionState},
-    test_support::{LoopExecutionStateBuilder, capability_id, test_run_context},
+    test_support::{
+        LoopExecutionStateBuilder, MockAgentLoopDriverHost, ScenarioScript, capability_id,
+        test_run_context,
+    },
 };
-use ironclaw_turns::LoopFailureKind;
+use ironclaw_turns::{LoopExit, LoopFailureKind, run_profile::LoopRunInfoPort};
 use serde_json::json;
 
 #[test]
@@ -99,4 +104,24 @@ fn args_hash_jcs_stable() {
         .expect("signature should build");
 
     assert_eq!(first.args_hash, second.args_hash);
+}
+
+#[tokio::test]
+async fn checkpoint_payload_reload_continues_through_executor() {
+    let (host, checkpoints) = MockAgentLoopDriverHost::builder()
+        .script(ScenarioScript::reply_only("after reload"))
+        .build();
+    let initial = LoopExecutionState::initial_for_run(host.run_context());
+    let payload = serde_json::to_vec(&initial).expect("state should serialize");
+    let reloaded =
+        LoopExecutionState::from_checkpoint_payload(&payload, CheckpointKind::BeforeSideEffect)
+            .expect("checkpoint payload should reload");
+
+    let exit = CanonicalAgentLoopExecutor
+        .execute_family(&families::default(), &host, reloaded)
+        .await
+        .expect("loop execution should succeed after reload");
+
+    assert!(matches!(exit, LoopExit::Completed(_)));
+    checkpoints.assert_sequence(&[(CheckpointKind::BeforeModel, 0), (CheckpointKind::Final, 0)]);
 }

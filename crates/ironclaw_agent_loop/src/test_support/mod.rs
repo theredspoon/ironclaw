@@ -33,7 +33,10 @@ use ironclaw_turns::{
     },
 };
 
-use crate::state::{CapabilityCallSignature, CheckpointKind, LoopExecutionState};
+use crate::state::{
+    CapabilityCallSignature, CheckpointKind, LoopExecutionState, RecoveryAttemptClass,
+    RecoveryStrategyState,
+};
 
 /// Scriptable implementation of [`AgentLoopDriverHost`].
 ///
@@ -171,7 +174,7 @@ pub enum MockHostCall {
     /// A single capability retry was requested.
     InvokeCapability {
         /// Capability id used for the retry.
-        capability_name: String,
+        capability_id: CapabilityId,
     },
     /// Assistant reply finalization was requested.
     FinalizeAssistantMessage,
@@ -422,11 +425,13 @@ impl CheckpointRecorder {
 
     /// Asserts the exact checkpoint sequence.
     pub fn assert_sequence(&self, expected: &[(CheckpointKind, u32)]) {
+        // safety: test-support assertion helper intentionally panics on mismatch.
         assert_eq!(self.sequence(), expected);
     }
 
     /// Asserts the checkpoint kinds, ignoring iteration numbers.
     pub fn assert_kinds(&self, expected: &[CheckpointKind]) {
+        // safety: test-support assertion helper intentionally panics on mismatch.
         assert_eq!(self.kinds(), expected);
     }
 }
@@ -470,7 +475,10 @@ impl LoopExecutionStateBuilder {
 
     /// Sets the recovery attempt counter.
     pub fn recovery_attempts(mut self, attempts: u32) -> Self {
-        self.state.recovery_state.attempts = attempts;
+        self.state.recovery_state = RecoveryStrategyState::with_attempts_for(
+            RecoveryAttemptClass::ModelTransient,
+            attempts,
+        );
         self
     }
 
@@ -519,7 +527,8 @@ impl ironclaw_turns::run_profile::LoopPromptPort for MockAgentLoopDriverHost {
         }
         Ok(LoopPromptBundle {
             bundle_ref: LoopPromptBundleRef::for_run(&self.run_context, "bundle")
-                .unwrap_or_else(|error| panic!("test bundle ref should be valid: {error}")),
+                // safety: test fixture construction uses a static-valid bundle token.
+                .expect("test bundle ref should be valid"),
             messages: vec![LoopModelMessage {
                 role: "user".to_string(),
                 content_ref: loop_message_ref("msg:user"),
@@ -592,7 +601,7 @@ impl ironclaw_turns::run_profile::LoopCapabilityPort for MockAgentLoopDriverHost
         request: CapabilityInvocation,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
         self.record_call(MockHostCall::InvokeCapability {
-            capability_name: request.capability_id.to_string(),
+            capability_id: request.capability_id,
         });
         lock_or_panic(&self.script)
             .single_call_retry_outcomes
