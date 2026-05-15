@@ -1546,6 +1546,7 @@ where
                 Arc::new(FirstPartyRuntimeAdapter::from_registry(
                     Arc::clone(runtime),
                     Arc::clone(&self.filesystem) as Arc<dyn RootFilesystem>,
+                    Arc::clone(&self.runtime_http_egress),
                 )),
             );
         }
@@ -1881,16 +1882,19 @@ where
 struct FirstPartyRuntimeAdapter {
     registry: Arc<FirstPartyCapabilityRegistry>,
     filesystem: Arc<dyn RootFilesystem>,
+    runtime_http_egress: SharedRuntimeHttpEgress,
 }
 
 impl FirstPartyRuntimeAdapter {
     pub(crate) fn from_registry(
         registry: Arc<FirstPartyCapabilityRegistry>,
         filesystem: Arc<dyn RootFilesystem>,
+        runtime_http_egress: SharedRuntimeHttpEgress,
     ) -> Self {
         Self {
             registry,
             filesystem,
+            runtime_http_egress,
         }
     }
 }
@@ -1936,6 +1940,7 @@ where
             estimate: request.estimate,
             mounts: request.mounts,
             filesystem: Arc::clone(&self.filesystem),
+            runtime_http_egress: runtime_http_egress(&self.runtime_http_egress),
             input: request.input,
         }))
         .catch_unwind()
