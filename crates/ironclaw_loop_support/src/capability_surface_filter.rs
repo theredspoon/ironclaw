@@ -98,7 +98,9 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
 
         // Truncate to the slot position after the last returned allowed outcome,
         // preserving interleaved denials up to that point.
-        let truncate_to = if n_inner == allowed_idx.len() {
+        let truncate_to = if stopped_on_suspension && n_inner > 0 {
+            allowed_idx[n_inner - 1] + 1
+        } else if n_inner == allowed_idx.len() {
             slots.len()
         } else if n_inner == 0 {
             allowed_idx.first().copied().unwrap_or(slots.len())
@@ -151,11 +153,11 @@ mod tests {
     use std::sync::Mutex;
 
     use ironclaw_host_api::{CapabilityId, RuntimeKind};
-    use ironclaw_turns::LoopResultRef;
     use ironclaw_turns::run_profile::{
         CapabilityDescriptorView, CapabilityInputRef, CapabilityResultMessage,
         CapabilitySurfaceVersion, ConcurrencyHint,
     };
+    use ironclaw_turns::{LoopGateRef, LoopResultRef};
 
     use super::*;
 
@@ -248,6 +250,13 @@ mod tests {
             safe_summary: "done".to_string(),
             terminate_hint: false,
         })
+    }
+
+    fn approval_required(gate_ref: &str) -> CapabilityOutcome {
+        CapabilityOutcome::ApprovalRequired {
+            gate_ref: LoopGateRef::new(gate_ref).expect("test gate ref is valid"),
+            safe_summary: "approval needed".to_string(),
+        }
     }
 
     fn denied_reason(outcome: &CapabilityOutcome) -> Option<&str> {
@@ -399,6 +408,41 @@ mod tests {
             Some("surface_profile_denied")
         );
         assert!(outcome.stopped_on_suspension);
+    }
+
+    #[tokio::test]
+    async fn stopped_inner_batch_truncates_denials_after_last_allowed_outcome() {
+        let inner = Arc::new(SpyPort::default());
+        *inner.batch_outcome.lock().expect("batch outcome lock") = Some(CapabilityBatchOutcome {
+            outcomes: vec![approval_required("gate:first")],
+            stopped_on_suspension: true,
+        });
+        let filter = CapabilitySurfaceProfileFilter::new(
+            inner.clone(),
+            Arc::new(CapabilityAllowSet::allowlist([capability_id("demo.first")])),
+        );
+
+        let outcome = filter
+            .invoke_capability_batch(CapabilityBatchInvocation {
+                invocations: vec![
+                    invocation("demo.first", "input:first"),
+                    invocation("demo.denied", "input:denied"),
+                ],
+                stop_on_first_suspension: true,
+            })
+            .await
+            .expect("batch outcome");
+
+        assert!(outcome.stopped_on_suspension);
+        assert_eq!(outcome.outcomes.len(), 1);
+        assert!(matches!(
+            outcome.outcomes.as_slice(),
+            [CapabilityOutcome::ApprovalRequired { .. }]
+        ));
+        let batches = inner.batches.lock().expect("batch lock");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].invocations.len(), 1);
+        assert!(batches[0].stop_on_first_suspension);
     }
 
     #[tokio::test]

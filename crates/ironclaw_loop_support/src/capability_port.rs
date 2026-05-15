@@ -701,7 +701,7 @@ fn invocation_context_from_visible(
     context.runtime = capability.runtime;
     context.trust = trust;
     context.grants = invocation_grants_from_visible(
-        &base.grants,
+        base,
         capability_id,
         &loop_driver_extension,
         allowed_effects,
@@ -723,20 +723,19 @@ fn invocation_context_from_visible(
 }
 
 fn invocation_grants_from_visible(
-    grants: &CapabilitySet,
+    base: &ExecutionContext,
     capability_id: &CapabilityId,
     loop_driver_extension: &ExtensionId,
     allowed_effects: &[EffectKind],
 ) -> Result<CapabilitySet, AgentLoopHostError> {
     let mut filtered = CapabilitySet::default();
-    for grant in &grants.grants {
+    for grant in &base.grants.grants {
         if grant.capability != *capability_id {
             continue;
         }
-        if grant.grantee != Principal::Extension(loop_driver_extension.clone())
+        if !grant_principal_matches_visible_context(&grant.grantee, base, loop_driver_extension)
             || !matches!(grant.issued_by, Principal::HostRuntime)
             || !effects_are_covered(&grant.constraints.allowed_effects, allowed_effects)
-            || grant.constraints.mounts != MountView::default()
         {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Unauthorized,
@@ -746,6 +745,23 @@ fn invocation_grants_from_visible(
         filtered.grants.push(grant.clone());
     }
     Ok(filtered)
+}
+
+fn grant_principal_matches_visible_context(
+    principal: &Principal,
+    context: &ExecutionContext,
+    loop_driver_extension: &ExtensionId,
+) -> bool {
+    match principal {
+        Principal::Tenant(id) => id == &context.tenant_id,
+        Principal::User(id) => id == &context.user_id,
+        Principal::Agent(id) => context.agent_id.as_ref() == Some(id),
+        Principal::Project(id) => context.project_id.as_ref() == Some(id),
+        Principal::Mission(id) => context.mission_id.as_ref() == Some(id),
+        Principal::Thread(id) => context.thread_id.as_ref() == Some(id),
+        Principal::Extension(id) => id == loop_driver_extension,
+        Principal::HostRuntime | Principal::System(_) => false,
+    }
 }
 
 fn effects_are_covered(required: &[EffectKind], allowed: &[EffectKind]) -> bool {
@@ -1111,12 +1127,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invocation_context_rejects_same_scope_grant_with_mount_authority() {
+    async fn invocation_context_preserves_host_mount_grants_without_context_mounts() {
         let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
-        let mut context = execution_context("thread-elevated-mount-grant");
+        let mut context = execution_context("thread-host-mount-grant");
         let run_context = loop_run_context(&context).await;
         let loop_driver_extension =
             ExtensionId::new(run_context.loop_driver_id.as_str()).expect("valid extension id");
+        let grant_mounts = MountView::new(vec![MountGrant::new(
+            MountAlias::new("/workspace").expect("valid mount alias"),
+            VirtualPath::new("/projects/demo").expect("valid virtual path"),
+            MountPermissions::read_only(),
+        )])
+        .expect("valid mount view");
         context.grants.grants.push(CapabilityGrant {
             id: CapabilityGrantId::new(),
             capability: capability_id.clone(),
@@ -1124,12 +1146,7 @@ mod tests {
             issued_by: Principal::HostRuntime,
             constraints: GrantConstraints {
                 allowed_effects: vec![EffectKind::ReadFilesystem],
-                mounts: MountView::new(vec![MountGrant::new(
-                    MountAlias::new("/workspace").expect("valid mount alias"),
-                    VirtualPath::new("/projects/demo").expect("valid virtual path"),
-                    MountPermissions::read_only(),
-                )])
-                .expect("valid mount view"),
+                mounts: grant_mounts.clone(),
                 network: NetworkPolicy::default(),
                 secrets: Vec::new(),
                 resource_ceiling: None,
@@ -1143,7 +1160,7 @@ mod tests {
             estimate: ResourceEstimate::default(),
         };
 
-        let err = invocation_context_from_visible(
+        let invocation_context = invocation_context_from_visible(
             &context,
             &run_context,
             &capability_id,
@@ -1151,9 +1168,57 @@ mod tests {
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
         )
-        .expect_err("mount-bearing grant must be rejected");
+        .expect("host-issued mount grant should be preserved");
 
-        assert_eq!(err.kind, AgentLoopHostErrorKind::Unauthorized);
+        assert_eq!(invocation_context.mounts, MountView::default());
+        assert_eq!(invocation_context.grants.grants.len(), 1);
+        assert_eq!(
+            invocation_context.grants.grants[0].constraints.mounts,
+            grant_mounts
+        );
+    }
+
+    #[tokio::test]
+    async fn invocation_context_preserves_matching_host_scope_grant() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-host-scope-grant");
+        let run_context = loop_run_context(&context).await;
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::Thread(context.thread_id.clone().expect("thread id")),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::ReadFilesystem],
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::Wasm,
+            estimate: ResourceEstimate::default(),
+        };
+
+        let invocation_context = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::Sandbox,
+            &[EffectKind::ReadFilesystem],
+        )
+        .expect("matching host scope grant should be preserved");
+
+        assert_eq!(invocation_context.grants.grants.len(), 1);
+        assert!(matches!(
+            &invocation_context.grants.grants[0].grantee,
+            Principal::Thread(_)
+        ));
     }
 
     #[tokio::test]
