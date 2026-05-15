@@ -11,6 +11,7 @@ pub mod loop_exit_applier;
 mod milestone_events;
 mod model_routes;
 mod planned_driver;
+mod planned_driver_factory;
 pub mod production_readiness;
 mod text_loop_driver;
 pub mod turn_runner;
@@ -43,4 +44,14 @@ pub use model_routes::{
     ResolvedModelRouteSnapshot, StaticModelRouteResolver,
 };
 pub use planned_driver::PlannedDriver;
+pub use planned_driver_factory::{
+    DefaultPlannedDriverBuild, DefaultPlannedDriverRegistrationError, PLANNED_DEFAULT_PROFILE_ID,
+    PLANNED_DRIVER_CHECKPOINT_SCHEMA_ID, PLANNED_DRIVER_CHECKPOINT_SCHEMA_VERSION,
+    PLANNED_DRIVER_DEFAULT_ID, PLANNED_DRIVER_DEFAULT_VERSION, default_planned_driver,
+    default_planned_run_profile_resolver, planned_default_profile_id,
+    planned_driver_checkpoint_schema_id, planned_driver_checkpoint_schema_version,
+    planned_driver_default_id, planned_driver_default_version, planned_driver_descriptor,
+    register_default_planned_driver, register_default_planned_profile,
+    register_default_text_only_driver,
+};
 pub use text_loop_driver::{TextOnlyModelReplyDriver, TextOnlyModelReplyDriverConfig};
