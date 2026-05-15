@@ -399,6 +399,11 @@ struct AcceptedWebUiMessage {
 
 /// Optional create-thread helper for routes that want an explicit allocation
 /// before first turn submission.
+///
+/// When `requested_thread_id` is omitted, `client_action_id` deterministically
+/// replays the generated thread id. When callers provide an explicit thread id,
+/// that id is the thread identity; conflicting explicit ids for the same client
+/// action are not reconciled at this layer.
 impl RebornServices {
     pub async fn create_thread(
         &self,
@@ -425,10 +430,7 @@ impl RebornServices {
                 thread_id: Some(thread_id),
                 created_by_actor_id: caller.user_id.as_str().to_string(),
                 title: None,
-                metadata_json: Some(format!(
-                    "{{\"client_action_id\":\"{}\"}}",
-                    escape_json_string(client_action_id.as_str())
-                )),
+                metadata_json: Some(create_thread_metadata_json(&client_action_id)?),
             })
             .await
             .map_err(map_thread_error)?;
@@ -582,7 +584,7 @@ fn map_turn_error(error: TurnError) -> RebornServicesError {
             (RebornServicesErrorCode::NotFound, 404, false)
         }
         ironclaw_turns::TurnErrorCategory::Unauthorized => {
-            (RebornServicesErrorCode::Unauthorized, 403, false)
+            (RebornServicesErrorCode::Forbidden, 403, false)
         }
         ironclaw_turns::TurnErrorCategory::InvalidRequest => {
             (RebornServicesErrorCode::InvalidRequest, 400, false)
@@ -603,7 +605,8 @@ fn map_adapter_error(error: ProductAdapterError) -> RebornServicesError {
         } => {
             let code = match status_code {
                 400 => RebornServicesErrorCode::InvalidRequest,
-                403 => RebornServicesErrorCode::Unauthorized,
+                401 => RebornServicesErrorCode::Unauthenticated,
+                403 => RebornServicesErrorCode::Forbidden,
                 404 => RebornServicesErrorCode::NotFound,
                 409 => RebornServicesErrorCode::Conflict,
                 429 => RebornServicesErrorCode::RateLimited,
@@ -617,7 +620,7 @@ fn map_adapter_error(error: ProductAdapterError) -> RebornServicesError {
             RebornServicesError::service_unavailable(true)
         }
         ProductAdapterError::Authentication(_) => {
-            RebornServicesError::from_status(RebornServicesErrorCode::Unauthorized, 401, false)
+            RebornServicesError::from_status(RebornServicesErrorCode::Unauthenticated, 401, false)
         }
         ProductAdapterError::MalformedInboundPayload { .. }
         | ProductAdapterError::InvalidIdentifier { .. } => {
@@ -625,7 +628,7 @@ fn map_adapter_error(error: ProductAdapterError) -> RebornServicesError {
         }
         ProductAdapterError::EgressDenied { .. }
         | ProductAdapterError::EgressUndeclaredHost { .. } => {
-            RebornServicesError::from_status(RebornServicesErrorCode::Unauthorized, 403, false)
+            RebornServicesError::from_status(RebornServicesErrorCode::Forbidden, 403, false)
         }
         ProductAdapterError::Internal { .. } => {
             RebornServicesError::from_status(RebornServicesErrorCode::Internal, 500, false)
@@ -633,18 +636,13 @@ fn map_adapter_error(error: ProductAdapterError) -> RebornServicesError {
     }
 }
 
-fn escape_json_string(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| match ch {
-            '\\' => "\\\\".chars().collect::<Vec<_>>(),
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\n' => "\\n".chars().collect::<Vec<_>>(),
-            '\r' => "\\r".chars().collect::<Vec<_>>(),
-            '\t' => "\\t".chars().collect::<Vec<_>>(),
-            other => vec![other],
-        })
-        .collect()
+fn create_thread_metadata_json(
+    client_action_id: &ironclaw_turns::IdempotencyKey,
+) -> Result<String, RebornServicesError> {
+    serde_json::to_string(&serde_json::json!({
+        "client_action_id": client_action_id.as_str(),
+    }))
+    .map_err(|_| RebornServicesError::internal_invariant())
 }
 
 fn generated_thread_id(

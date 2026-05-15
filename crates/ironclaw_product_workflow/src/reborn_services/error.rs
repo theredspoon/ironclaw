@@ -6,7 +6,8 @@ use crate::{WebUiInboundValidationCode, WebUiInboundValidationError};
 #[serde(rename_all = "snake_case")]
 pub enum RebornServicesErrorCode {
     InvalidRequest,
-    Unauthorized,
+    Unauthenticated,
+    Forbidden,
     NotFound,
     Conflict,
     RateLimited,

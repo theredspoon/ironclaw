@@ -5,11 +5,15 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
+use ironclaw_product_adapters::{
+    ProductAdapterError, ProductOutboundEnvelope, ProjectionStream, ProjectionSubscriptionRequest,
+    ProtocolAuthFailure,
+};
 use ironclaw_product_workflow::{
     RebornResolveGateResponse, RebornServices, RebornServicesApi, RebornServicesErrorCode,
-    RebornSubmitTurnResponse, RebornTimelineRequest, WebUiAuthenticatedCaller,
-    WebUiCancelRunRequest, WebUiCreateThreadRequest, WebUiInboundValidationCode,
-    WebUiResolveGateRequest, WebUiSendMessageRequest,
+    RebornStreamEventsRequest, RebornSubmitTurnResponse, RebornTimelineRequest,
+    WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
+    WebUiInboundValidationCode, WebUiResolveGateRequest, WebUiSendMessageRequest,
 };
 use ironclaw_threads::{InMemorySessionThreadService, MessageStatus, SessionThreadService};
 use ironclaw_turns::{
@@ -38,9 +42,17 @@ struct FakeTurnCoordinator {
     submissions: Mutex<Vec<SubmitTurnRequest>>,
     cancellations: Mutex<Vec<CancelRunRequest>>,
     resumptions: Mutex<Vec<ResumeTurnRequest>>,
+    submit_error: Mutex<Option<TurnError>>,
 }
 
 impl FakeTurnCoordinator {
+    fn with_submit_error(error: TurnError) -> Self {
+        Self {
+            submit_error: Mutex::new(Some(error)),
+            ..Self::default()
+        }
+    }
+
     fn submission_count(&self) -> usize {
         self.submissions.lock().expect("lock").len()
     }
@@ -68,6 +80,9 @@ impl TurnCoordinator for FakeTurnCoordinator {
         &self,
         request: SubmitTurnRequest,
     ) -> Result<SubmitTurnResponse, TurnError> {
+        if let Some(error) = self.submit_error.lock().expect("lock").take() {
+            return Err(error);
+        }
         self.submissions.lock().expect("lock").push(request.clone());
         Ok(SubmitTurnResponse::Accepted {
             turn_id: TurnId::new(),
@@ -126,6 +141,20 @@ impl TurnCoordinator for FakeTurnCoordinator {
     }
 }
 
+struct AuthFailureProjectionStream;
+
+#[async_trait]
+impl ProjectionStream for AuthFailureProjectionStream {
+    async fn drain(
+        &self,
+        _request: ProjectionSubscriptionRequest,
+    ) -> Result<Vec<ProductOutboundEnvelope>, ProductAdapterError> {
+        Err(ProductAdapterError::Authentication(
+            ProtocolAuthFailure::SignatureMismatch,
+        ))
+    }
+}
+
 #[tokio::test]
 async fn duplicate_create_thread_replays_generated_thread_for_same_client_action() {
     let services = RebornServices::new(
@@ -150,6 +179,33 @@ async fn duplicate_create_thread_replays_generated_thread_for_same_client_action
 
     assert_eq!(first.thread.thread_id, replayed.thread.thread_id);
     assert_eq!(first.thread.metadata_json, replayed.thread.metadata_json);
+}
+
+#[tokio::test]
+async fn create_thread_metadata_is_serialized_json() {
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    );
+    let client_action_id = "create-quote-\"-slash-\\-line-\u{2028}".to_string();
+
+    let response = services
+        .create_thread(
+            caller(),
+            serde_json::from_value::<WebUiCreateThreadRequest>(json!({
+                "client_action_id": client_action_id
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect("create succeeds");
+
+    let metadata = response.thread.metadata_json.expect("metadata");
+    let metadata: serde_json::Value = serde_json::from_str(&metadata).expect("metadata json");
+    assert_eq!(
+        metadata["client_action_id"].as_str(),
+        Some(client_action_id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -262,6 +318,55 @@ async fn validation_errors_are_stable_and_sanitized() {
     let rendered = serde_json::to_string(&err).expect("json");
     assert!(!rendered.contains("backend"));
     assert!(!rendered.contains("TurnCoordinator"));
+}
+
+#[tokio::test]
+async fn turn_unauthorized_maps_to_forbidden() {
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::with_submit_error(
+            TurnError::Unauthorized,
+        )),
+    );
+
+    let err = services
+        .submit_turn(
+            caller(),
+            serde_json::from_value::<WebUiSendMessageRequest>(json!({
+                "client_action_id": "send-forbidden",
+                "thread_id": "thread-alpha",
+                "content": "hello from webui"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect_err("turn unauthorized is forbidden");
+
+    assert_eq!(err.code, RebornServicesErrorCode::Forbidden);
+    assert_eq!(err.status_code, 403);
+}
+
+#[tokio::test]
+async fn adapter_authentication_maps_to_unauthenticated() {
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    )
+    .with_event_stream(Arc::new(AuthFailureProjectionStream));
+
+    let err = services
+        .stream_events(
+            caller(),
+            RebornStreamEventsRequest {
+                thread_id: "thread-alpha".to_string(),
+                after_cursor: None,
+            },
+        )
+        .await
+        .expect_err("adapter auth failure is unauthenticated");
+
+    assert_eq!(err.code, RebornServicesErrorCode::Unauthenticated);
+    assert_eq!(err.status_code, 401);
 }
 
 #[tokio::test]
