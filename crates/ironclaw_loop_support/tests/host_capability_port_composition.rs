@@ -5,8 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use ironclaw_host_api::{
-    CapabilityId, CapabilitySet, ExecutionContext, ExtensionId, MountView, RuntimeKind, ThreadId,
-    TrustClass, UserId,
+    CapabilityId, CapabilitySet, ExecutionContext, ExtensionId, MountAlias, MountGrant,
+    MountPermissions, MountView, RuntimeKind, ThreadId, TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
     CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, CapabilitySurfaceVersion, HostRuntime,
@@ -86,20 +86,20 @@ async fn host_capability_port_composition_factory_builds_loop_capability_port() 
 }
 
 #[tokio::test]
-async fn visible_capability_request_rejects_elevated_trust_context() {
-    // A visible_request.context that carries a host-reserved trust class (FirstParty or System)
-    // must be rejected before its authority fields flow into RuntimeCapabilityRequest via
-    // invocation_context_from_visible. This is a regression guard for the gap identified in
-    // PR #3644 (serrrfirat review): validate_visible_request_scope previously checked only scope
-    // fields, leaving trust/extension_id/runtime unvalidated.
-    let thread_id = ThreadId::new("thread-elevated-trust-rejection").unwrap();
+async fn visible_capability_request_rejects_caller_supplied_mounts() {
+    let thread_id = ThreadId::new("thread-caller-mount-rejection").unwrap();
     let mut context = ExecutionContext::local_default(
-        UserId::new("user-elevated-trust-rejection").unwrap(),
-        ExtensionId::new("loop-support-elevated").unwrap(),
-        RuntimeKind::FirstParty,
-        TrustClass::FirstParty,
+        UserId::new("user-caller-mount-rejection").unwrap(),
+        ExtensionId::new("loop-support-mounts").unwrap(),
+        RuntimeKind::Wasm,
+        TrustClass::UserTrusted,
         CapabilitySet::default(),
-        MountView::default(),
+        MountView::new(vec![MountGrant::new(
+            MountAlias::new("/workspace").unwrap(),
+            VirtualPath::new("/projects/demo").unwrap(),
+            MountPermissions::read_write(),
+        )])
+        .unwrap(),
     )
     .unwrap();
     context.thread_id = Some(thread_id.clone());
@@ -120,12 +120,12 @@ async fn visible_capability_request_rejects_elevated_trust_context() {
     let err = port
         .visible_capabilities(VisibleCapabilityRequest)
         .await
-        .expect_err("elevated trust context must be rejected");
+        .expect_err("caller-supplied mounts must be rejected");
 
     assert_eq!(
         err.kind,
         AgentLoopHostErrorKind::Unauthorized,
-        "expected Unauthorized for host-reserved trust class, got {:?}",
+        "expected Unauthorized for caller-supplied mounts, got {:?}",
         err.kind
     );
 }

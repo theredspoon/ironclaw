@@ -5,8 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use ironclaw_host_api::{
-    CapabilityId, CorrelationId, EffectKind, ExecutionContext, ExtensionId, InvocationId,
-    ResourceEstimate, TrustClass, sha256_digest_token,
+    CapabilityId, CapabilitySet, CorrelationId, EffectKind, ExecutionContext, ExtensionId,
+    InvocationId, MountView, Principal, ResourceEstimate, RuntimeKind, sha256_digest_token,
 };
 use ironclaw_host_runtime::{
     HostRuntime, HostRuntimeError, IdempotencyKey, RuntimeBlockedReason, RuntimeCapabilityOutcome,
@@ -109,6 +109,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
 #[derive(Clone)]
 struct SurfaceCapabilitySnapshot {
     provider: ExtensionId,
+    runtime: RuntimeKind,
     estimate: ResourceEstimate,
 }
 
@@ -409,18 +410,10 @@ impl HostRuntimeLoopCapabilityPort {
                 "capability execution context is not scoped to this loop run",
             ));
         }
-        // Reject host-reserved trust classes (FirstParty, System) in the visible-request
-        // context. These are host-only authority levels; a loop-layer context carrying them
-        // indicates misconfiguration or an attempted privilege escalation and must not be
-        // forwarded into RuntimeCapabilityRequest via invocation_context_from_visible.
-        //
-        // TODO(ws-9): structural fix — build invocation_context_from_visible from
-        // host-resolved authority state (not the caller-supplied DTO) for extension_id,
-        // runtime, grants, and mounts. Tracked in nearai/ironclaw#3644.
-        if matches!(context.trust, TrustClass::FirstParty | TrustClass::System) {
+        if context.mounts != MountView::default() {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Unauthorized,
-                "capability execution context carries a host-reserved trust class",
+                "capability execution context must not carry caller-supplied mounts",
             ));
         }
         Ok(())
@@ -496,6 +489,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                     capability_id.clone(),
                     SurfaceCapabilitySnapshot {
                         provider: capability.descriptor.provider.clone(),
+                        runtime: capability.descriptor.runtime,
                         estimate: capability.estimated_resources.clone(),
                     },
                 );
@@ -602,7 +596,14 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             .runtime
             .invoke_capability(
                 RuntimeCapabilityRequest::new(
-                    invocation_context_from_visible(&self.visible_request.context),
+                    invocation_context_from_visible(
+                        &self.visible_request.context,
+                        &self.run_context,
+                        &request.capability_id,
+                        &capability,
+                        trust_decision.effective_trust.class(),
+                        &trust_decision.authority_ceiling.allowed_effects,
+                    )?,
                     request.capability_id,
                     capability.estimate,
                     input,
@@ -651,9 +652,9 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
 }
 
 pub fn concurrency_hint_from_effects(effects: &[EffectKind]) -> ConcurrencyHint {
-    // Empty effects list: treat as safe-for-parallel (capabilities with no declared effects
-    // are assumed read-only). Callers must not register write-effect capabilities without
-    // declaring effects.
+    if effects.is_empty() {
+        return ConcurrencyHint::Exclusive;
+    }
     if effects
         .iter()
         .all(|effect| matches!(effect, EffectKind::ReadFilesystem | EffectKind::UseSecret))
@@ -680,15 +681,75 @@ fn should_retry_result_write(
         )
 }
 
-fn invocation_context_from_visible(base: &ExecutionContext) -> ExecutionContext {
+fn invocation_context_from_visible(
+    base: &ExecutionContext,
+    run_context: &LoopRunContext,
+    capability_id: &CapabilityId,
+    capability: &SurfaceCapabilitySnapshot,
+    trust: ironclaw_host_api::TrustClass,
+    allowed_effects: &[EffectKind],
+) -> Result<ExecutionContext, AgentLoopHostError> {
     let mut context = base.clone();
+    let loop_driver_extension =
+        ExtensionId::new(run_context.loop_driver_id.as_str()).map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "loop driver id could not be represented as an execution extension",
+            )
+        })?;
+    context.extension_id = loop_driver_extension.clone();
+    context.runtime = capability.runtime;
+    context.trust = trust;
+    context.grants = invocation_grants_from_visible(
+        &base.grants,
+        capability_id,
+        &loop_driver_extension,
+        allowed_effects,
+    )?;
+    context.mounts = MountView::default();
     let invocation_id = InvocationId::new();
     context.invocation_id = invocation_id;
     context.correlation_id = CorrelationId::new();
     context.process_id = None;
     context.parent_process_id = None;
     context.resource_scope.invocation_id = invocation_id;
-    context
+    context.validate().map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            "capability execution context is invalid",
+        )
+    })?;
+    Ok(context)
+}
+
+fn invocation_grants_from_visible(
+    grants: &CapabilitySet,
+    capability_id: &CapabilityId,
+    loop_driver_extension: &ExtensionId,
+    allowed_effects: &[EffectKind],
+) -> Result<CapabilitySet, AgentLoopHostError> {
+    let mut filtered = CapabilitySet::default();
+    for grant in &grants.grants {
+        if grant.capability != *capability_id {
+            continue;
+        }
+        if grant.grantee != Principal::Extension(loop_driver_extension.clone())
+            || !matches!(grant.issued_by, Principal::HostRuntime)
+            || !effects_are_covered(&grant.constraints.allowed_effects, allowed_effects)
+            || grant.constraints.mounts != MountView::default()
+        {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unauthorized,
+                "capability execution context carries an untrusted grant",
+            ));
+        }
+        filtered.grants.push(grant.clone());
+    }
+    Ok(filtered)
+}
+
+fn effects_are_covered(required: &[EffectKind], allowed: &[EffectKind]) -> bool {
+    required.iter().all(|effect| allowed.contains(effect))
 }
 
 fn invocation_idempotency_key(
@@ -904,12 +965,20 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_host_api::{
+        AgentId, CapabilityGrant, CapabilityGrantId, GrantConstraints, MountAlias, MountGrant,
+        MountPermissions, NetworkPolicy, ProjectId, TenantId, TrustClass, UserId, VirtualPath,
+    };
+    use ironclaw_turns::{
+        InMemoryRunProfileResolver, RunProfileResolutionRequest, RunProfileResolver, TurnId,
+        TurnRunId, TurnScope,
+    };
 
     #[test]
-    fn concurrency_hint_treats_empty_effects_as_parallel_safe() {
+    fn concurrency_hint_treats_empty_effects_as_exclusive() {
         assert_eq!(
             concurrency_hint_from_effects(&[]),
-            ConcurrencyHint::SafeForParallel
+            ConcurrencyHint::Exclusive
         );
     }
 
@@ -946,5 +1015,239 @@ mod tests {
                 "{effect:?}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_failure_kind_mapping_preserves_current_categories() {
+        let cases = [
+            (
+                RuntimeFailureKind::Authorization,
+                CapabilityFailureKind::Authorization,
+            ),
+            (RuntimeFailureKind::Backend, CapabilityFailureKind::Backend),
+            (
+                RuntimeFailureKind::Cancelled,
+                CapabilityFailureKind::Cancelled,
+            ),
+            (
+                RuntimeFailureKind::Dispatcher,
+                CapabilityFailureKind::Dispatcher,
+            ),
+            (
+                RuntimeFailureKind::InvalidInput,
+                CapabilityFailureKind::InvalidInput,
+            ),
+            (
+                RuntimeFailureKind::MissingRuntime,
+                CapabilityFailureKind::MissingRuntime,
+            ),
+            (RuntimeFailureKind::Network, CapabilityFailureKind::Network),
+            (
+                RuntimeFailureKind::OutputTooLarge,
+                CapabilityFailureKind::OutputTooLarge,
+            ),
+            (RuntimeFailureKind::Process, CapabilityFailureKind::Process),
+            (
+                RuntimeFailureKind::Resource,
+                CapabilityFailureKind::Resource,
+            ),
+        ];
+
+        for (runtime, expected) in cases {
+            assert_eq!(
+                runtime_failure_kind_to_loop(runtime).expect("mapped failure kind"),
+                expected,
+                "{runtime:?}"
+            );
+        }
+
+        assert_eq!(
+            runtime_failure_kind_to_loop(RuntimeFailureKind::Unknown)
+                .expect("unknown failure kind")
+                .as_str(),
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn invocation_context_rejects_same_scope_elevated_grant() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-elevated-grant");
+        let run_context = loop_run_context(&context).await;
+        let loop_driver_extension =
+            ExtensionId::new(run_context.loop_driver_id.as_str()).expect("valid extension id");
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::Extension(loop_driver_extension),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::WriteFilesystem],
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::Wasm,
+            estimate: ResourceEstimate::default(),
+        };
+
+        let err = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::Sandbox,
+            &[EffectKind::ReadFilesystem],
+        )
+        .expect_err("elevated grant must be rejected");
+
+        assert_eq!(err.kind, AgentLoopHostErrorKind::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn invocation_context_rejects_same_scope_grant_with_mount_authority() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-elevated-mount-grant");
+        let run_context = loop_run_context(&context).await;
+        let loop_driver_extension =
+            ExtensionId::new(run_context.loop_driver_id.as_str()).expect("valid extension id");
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::Extension(loop_driver_extension),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::ReadFilesystem],
+                mounts: MountView::new(vec![MountGrant::new(
+                    MountAlias::new("/workspace").expect("valid mount alias"),
+                    VirtualPath::new("/projects/demo").expect("valid virtual path"),
+                    MountPermissions::read_only(),
+                )])
+                .expect("valid mount view"),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::Wasm,
+            estimate: ResourceEstimate::default(),
+        };
+
+        let err = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::Sandbox,
+            &[EffectKind::ReadFilesystem],
+        )
+        .expect_err("mount-bearing grant must be rejected");
+
+        assert_eq!(err.kind, AgentLoopHostErrorKind::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn invocation_context_derives_runtime_authority_from_loop_and_surface() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-derived-authority");
+        let run_context = loop_run_context(&context).await;
+        let loop_driver_extension =
+            ExtensionId::new(run_context.loop_driver_id.as_str()).expect("valid extension id");
+        context.extension_id = ExtensionId::new("caller-supplied").expect("valid extension id");
+        context.runtime = RuntimeKind::System;
+        context.trust = TrustClass::System;
+        context.mounts = MountView::new(vec![MountGrant::new(
+            MountAlias::new("/workspace").expect("valid mount alias"),
+            VirtualPath::new("/projects/demo").expect("valid virtual path"),
+            MountPermissions::read_write(),
+        )])
+        .expect("valid mount view");
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::Extension(loop_driver_extension.clone()),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::DispatchCapability],
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::Script,
+            estimate: ResourceEstimate::default(),
+        };
+
+        let invocation_context = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::UserTrusted,
+            &[EffectKind::DispatchCapability],
+        )
+        .expect("context");
+
+        assert_eq!(invocation_context.extension_id, loop_driver_extension);
+        assert_eq!(invocation_context.runtime, RuntimeKind::Script);
+        assert_eq!(invocation_context.trust, TrustClass::UserTrusted);
+        assert_eq!(invocation_context.mounts, MountView::default());
+        assert_eq!(invocation_context.grants.grants.len(), 1);
+    }
+
+    fn execution_context(thread: &str) -> ExecutionContext {
+        let thread_id = ironclaw_host_api::ThreadId::new(thread).expect("valid thread id");
+        let mut context = ExecutionContext::local_default(
+            UserId::new("user-capability-port").expect("valid user"),
+            ExtensionId::new("loop-driver").expect("valid extension"),
+            RuntimeKind::FirstParty,
+            TrustClass::System,
+            CapabilitySet::default(),
+            MountView::default(),
+        )
+        .expect("valid context");
+        context.tenant_id = TenantId::new("tenant-capability-port").expect("valid tenant");
+        context.agent_id = Some(AgentId::new("agent-capability-port").expect("valid agent"));
+        context.project_id =
+            Some(ProjectId::new("project-capability-port").expect("valid project"));
+        context.thread_id = Some(thread_id.clone());
+        context.resource_scope.tenant_id = context.tenant_id.clone();
+        context.resource_scope.agent_id = context.agent_id.clone();
+        context.resource_scope.project_id = context.project_id.clone();
+        context.resource_scope.thread_id = Some(thread_id);
+        context
+    }
+
+    async fn loop_run_context(context: &ExecutionContext) -> LoopRunContext {
+        let resolved = InMemoryRunProfileResolver::default()
+            .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+            .await
+            .expect("profile resolves");
+        LoopRunContext::new(
+            TurnScope::new(
+                context.tenant_id.clone(),
+                context.agent_id.clone(),
+                context.project_id.clone(),
+                context.thread_id.clone().expect("thread id"),
+            ),
+            TurnId::new(),
+            TurnRunId::new(),
+            resolved,
+        )
     }
 }

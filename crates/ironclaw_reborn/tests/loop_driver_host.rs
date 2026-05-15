@@ -2934,10 +2934,10 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
         );
         assert_eq!(
             invocation.context.extension_id,
-            visible_request.context.extension_id
+            ExtensionId::new(fixture.context.loop_driver_id.as_str()).unwrap()
         );
-        assert_eq!(invocation.context.runtime, visible_request.context.runtime);
-        assert_eq!(invocation.context.trust, visible_request.context.trust);
+        assert_eq!(invocation.context.runtime, RuntimeKind::Wasm);
+        assert_eq!(invocation.context.trust, TrustClass::UserTrusted);
         assert_eq!(invocation.context.grants, visible_request.context.grants);
         assert_eq!(invocation.context.mounts, visible_request.context.mounts);
     }
@@ -4365,7 +4365,7 @@ fn host_runtime_visible_request(
         .unwrap_or_else(|| UserId::new("user-text-host").unwrap());
     let mut context = ExecutionContext::local_default(
         user_id,
-        ExtensionId::new("loop-driver").unwrap(),
+        ExtensionId::new(fixture.context.loop_driver_id.as_str()).unwrap(),
         RuntimeKind::FirstParty,
         TrustClass::System,
         CapabilitySet::default(),
