@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ironclaw_host_api::{CapabilityId, ExtensionId, RuntimeKind, ThreadId};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -1613,6 +1614,34 @@ pub trait LoopProgressPort: Send + Sync {
     async fn emit_loop_progress(&self, event: LoopProgressEvent) -> Result<(), AgentLoopHostError>;
 }
 
+/// Per-run cancellation observation point.
+///
+/// The canonical executor consults this between strategy calls. The method is
+/// intentionally synchronous and non-blocking: implementations should expose a
+/// cheap snapshot, usually backed by an atomic flag plus immutable signal data.
+///
+/// **Cancellation is cooperative and boundary-observation only — it is not
+/// preempted across in-flight host calls.** `build_prompt_bundle`,
+/// `stream_model`, and `invoke_capability` are awaited to completion before
+/// the next observation point is reached. A stuck model stream or long-running
+/// capability call will not observe cancellation until control returns to the
+/// executor. Implementations of those host methods that need finer-grained
+/// cancellation must integrate their own abort signal internally; this port
+/// only covers the between-call boundaries that the executor controls.
+pub trait LoopCancellationPort: Send + Sync {
+    /// Returns `Some(signal)` once cancellation has been requested for this run.
+    ///
+    /// Implementations must be idempotent across reads. After the request fires,
+    /// repeated calls must keep returning the same signal.
+    fn observe_cancellation(&self) -> Option<LoopCancellationSignal>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopCancellationSignal {
+    pub reason_kind: LoopCancelReasonKind,
+    pub requested_at: DateTime<Utc>,
+}
+
 pub trait AgentLoopDriverHost:
     LoopRunInfoPort
     + LoopContextPort
@@ -1623,6 +1652,7 @@ pub trait AgentLoopDriverHost:
     + LoopTranscriptPort
     + LoopCheckpointPort
     + LoopProgressPort
+    + LoopCancellationPort
     + Send
     + Sync
 {
@@ -1638,6 +1668,7 @@ impl<T> AgentLoopDriverHost for T where
         + LoopTranscriptPort
         + LoopCheckpointPort
         + LoopProgressPort
+        + LoopCancellationPort
         + Send
         + Sync
 {
