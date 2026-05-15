@@ -18,14 +18,29 @@ impl RunCommand {
 struct RuntimeShellReport {
     config: RebornBootConfig,
     driver_registry_initialized: bool,
+    planned_default_profile_available: bool,
 }
 
 impl RuntimeShellReport {
     fn initialize(context: RebornCliContext) -> Self {
-        let _registry = ironclaw_reborn::driver_registry::DriverRegistry::new();
+        let mut registry = ironclaw_reborn::driver_registry::DriverRegistry::new();
+        let text_only_registered = ironclaw_reborn::register_default_text_only_driver(
+            &mut registry,
+            ironclaw_reborn::TextOnlyModelReplyDriverConfig::default(),
+        )
+        .is_ok();
+        let planned_registered = ironclaw_reborn::build_loop_family_registry()
+            .map(|family_registry| {
+                ironclaw_reborn::register_default_planned_driver(&mut registry, family_registry)
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        let planned_default_profile_available =
+            ironclaw_reborn::default_planned_run_profile_resolver().is_ok();
         Self {
             config: context.boot_config().clone(),
-            driver_registry_initialized: true,
+            driver_registry_initialized: text_only_registered && planned_registered,
+            planned_default_profile_available,
         }
     }
 
@@ -42,6 +57,14 @@ impl RuntimeShellReport {
             "runtime_shell: {}",
             if self.driver_registry_initialized {
                 "initialized"
+            } else {
+                "unavailable"
+            }
+        );
+        println!(
+            "planned_default_profile: {}",
+            if self.planned_default_profile_available {
+                "available"
             } else {
                 "unavailable"
             }

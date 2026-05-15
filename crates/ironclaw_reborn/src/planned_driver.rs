@@ -333,7 +333,7 @@ mod tests {
         );
         assert_eq!(
             descriptor.checkpoint_schema_id,
-            Some(CheckpointSchemaId::new(PLANNED_DRIVER_CHECKPOINT_SCHEMA_ID).expect("valid"))
+            Some(CheckpointSchemaId::new(CHECKPOINT_SCHEMA_ID).expect("valid"))
         );
         assert_eq!(
             descriptor.checkpoint_schema_version,
@@ -852,12 +852,6 @@ mod tests {
             event: LoopProgressEvent,
         ) -> Result<(), AgentLoopHostError> {
             self.inner.emit_loop_progress(event).await
-        }
-    }
-
-    impl LoopCancellationPort for ResumePayloadHost {
-        fn observe_cancellation(&self) -> Option<LoopCancellationSignal> {
-            None
         }
     }
 }
