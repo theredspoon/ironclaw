@@ -1,5 +1,35 @@
 use clap::{Args, Subcommand};
-use ironclaw_reborn::ModelSlot;
+
+/// CLI-local mirror of the `ironclaw_reborn::ModelSlot` names used by the
+/// `models list` / `models status` diagnostic commands. Kept here so the CLI
+/// does not import `ironclaw_reborn` directly — the slot taxonomy is fixed
+/// by the composition root and only the labels are surfaced here.
+#[derive(Debug, Clone, Copy)]
+enum ModelSlot {
+    Default,
+    Mission,
+}
+
+impl ModelSlot {
+    const ALL: [Self; 2] = [Self::Default, Self::Mission];
+
+    fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Mission => "mission",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct ModelsCommand {

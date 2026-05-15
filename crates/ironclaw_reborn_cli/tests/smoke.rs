@@ -489,8 +489,15 @@ fn run_initializes_minimal_runtime_shell_without_touching_v1_state() {
     let home_dir = temp.path().join("home");
     let v1_base_dir = temp.path().join("v1-state");
 
+    // `--dry-run` preserves the legacy diagnostic-only behavior: no agent
+    // is started, no state directories are created. The same shell
+    // identifiers (profile, home, v1_state, runtime_shell) are reported so
+    // existing tooling that scrapes `run` output keeps working. Without
+    // the flag, `run` boots the live agent and would create the local-dev
+    // root, which the rest of this test forbids.
     let output = Command::new(reborn_bin())
         .arg("run")
+        .arg("--dry-run")
         .env("IRONCLAW_REBORN_HOME", &reborn_home)
         .env("HOME", &home_dir)
         .env("IRONCLAW_BASE_DIR", &v1_base_dir)
@@ -515,10 +522,6 @@ fn run_initializes_minimal_runtime_shell_without_touching_v1_state() {
     );
     assert!(stdout.contains("profile: local-dev"), "stdout: {stdout}");
     assert!(stdout.contains("v1_state: not-used"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("driver_registry: initialized"),
-        "stdout: {stdout}"
-    );
     assert!(
         stdout.contains("runtime_shell: initialized"),
         "stdout: {stdout}"
@@ -631,8 +634,12 @@ fn doctor_reports_explicit_profile() {
 fn run_reports_explicit_profile() {
     let temp = tempfile::tempdir().expect("tempdir");
 
+    // Production / migration-dry-run profiles are recognized by the boot
+    // config but not yet wired into the assembled runtime. `--dry-run`
+    // exercises the boot-config path without booting the agent.
     let output = Command::new(reborn_bin())
         .arg("run")
+        .arg("--dry-run")
         .env("IRONCLAW_REBORN_HOME", temp.path().join("reborn-home"))
         .env("IRONCLAW_REBORN_PROFILE", "migration-dry-run")
         .output()
@@ -646,10 +653,6 @@ fn run_reports_explicit_profile() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("profile: migration-dry-run"),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("driver_registry: initialized"),
         "stdout: {stdout}"
     );
 }
