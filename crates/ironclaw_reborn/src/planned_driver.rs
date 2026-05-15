@@ -21,7 +21,8 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopDriver, AgentLoopDriverDescriptor, AgentLoopDriverError, AgentLoopDriverHost,
         AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, AgentLoopHostError,
-        LoadCheckpointPayloadRequest, LoopCheckpointKind, LoopDriverId,
+        AgentLoopHostErrorKind, LoadCheckpointPayloadRequest, LoopCheckpointKind, LoopDriverId,
+        LoopRunContext,
     },
 };
 
@@ -102,8 +103,8 @@ impl AgentLoopDriver for PlannedDriver {
         request: AgentLoopDriverResumeRequest,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
     ) -> Result<LoopExit, AgentLoopDriverError> {
-        validate_resume_request(&request, &self.descriptor)?;
         let run_context = host.run_context();
+        validate_resume_request(&request, run_context, &self.descriptor)?;
         let payload = host
             .load_checkpoint_payload(LoadCheckpointPayloadRequest {
                 checkpoint_id: request.checkpoint_id,
@@ -153,30 +154,20 @@ fn validate_run_request(
 
 fn validate_resume_request(
     request: &AgentLoopDriverResumeRequest,
+    run_context: &LoopRunContext,
     descriptor: &AgentLoopDriverDescriptor,
 ) -> Result<(), AgentLoopDriverError> {
+    if request.turn_id != run_context.turn_id || request.run_id != run_context.run_id {
+        return Err(AgentLoopDriverError::InvalidRequest {
+            reason: "driver request does not match loop host run context".to_string(),
+        });
+    }
+    if request.resolved_run_profile != run_context.resolved_run_profile {
+        return Err(AgentLoopDriverError::InvalidRequest {
+            reason: "driver request profile does not match loop host run context".to_string(),
+        });
+    }
     validate_descriptor_assignment(&request.resolved_run_profile.loop_driver, descriptor)?;
-    let want = descriptor.checkpoint_schema_id.as_ref();
-    let have = request
-        .resolved_run_profile
-        .loop_driver
-        .checkpoint_schema_id
-        .as_ref();
-    if want != have {
-        return Err(AgentLoopDriverError::InvalidRequest {
-            reason: "checkpoint schema id does not match driver descriptor".to_string(),
-        });
-    }
-    let want = descriptor.checkpoint_schema_version;
-    let have = request
-        .resolved_run_profile
-        .loop_driver
-        .checkpoint_schema_version;
-    if want != have {
-        return Err(AgentLoopDriverError::InvalidRequest {
-            reason: "checkpoint schema version does not match driver descriptor".to_string(),
-        });
-    }
     Ok(())
 }
 
@@ -216,7 +207,12 @@ pub(crate) fn map_executor_error(error: AgentLoopExecutorError) -> AgentLoopDriv
 
 fn map_resume_load_error(error: AgentLoopHostError) -> AgentLoopDriverError {
     tracing::warn!(?error, "planned driver could not load checkpoint payload");
-    checkpoint_unavailable_error()
+    match error.kind {
+        AgentLoopHostErrorKind::InvalidInvocation => AgentLoopDriverError::InvalidRequest {
+            reason: "checkpoint load: invalid_invocation".to_string(),
+        },
+        _ => checkpoint_unavailable_error(),
+    }
 }
 
 fn map_resume_payload_error(error: CheckpointPayloadError) -> AgentLoopDriverError {
@@ -461,11 +457,54 @@ mod tests {
         assert!(matches!(
             result,
             Err(AgentLoopDriverError::InvalidRequest { reason })
-                if reason == "driver request profile is not assigned to this planned driver"
+                if reason == "driver request profile does not match loop host run context"
         ));
         assert!(
             host.call_log().is_empty(),
             "invalid family must fail before any host port is invoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_schema_mismatch_load_error_is_invalid_request() {
+        let registry = build_loop_family_registry().expect("registry");
+        let driver = PlannedDriver::default_from_registry(&registry).expect("driver");
+        let context = run_context_for_driver(&driver);
+        let checkpoint_id = TurnCheckpointId::new();
+        let loaded = LoadedCheckpointPayload {
+            kind: LoopCheckpointKind::BeforeModel,
+            schema_id: CheckpointSchemaId::new("different_checkpoint_schema").expect("valid"),
+            schema_version: context.checkpoint_schema_version,
+            payload: RedactedCheckpointPayload::new(b"{}".to_vec())
+                .expect("valid checkpoint payload"),
+        };
+        let (inner, _checkpoints) = MockAgentLoopDriverHost::builder()
+            .run_context(context.clone())
+            .build();
+        let host = ResumePayloadHost::new(inner, checkpoint_id, loaded);
+
+        let result = driver
+            .resume(
+                AgentLoopDriverResumeRequest {
+                    turn_id: context.turn_id,
+                    run_id: context.run_id,
+                    checkpoint_id,
+                    resolved_run_profile: context.resolved_run_profile.clone(),
+                },
+                &host,
+            )
+            .await;
+
+        assert_eq!(
+            result.expect_err("schema mismatch should be a request error"),
+            AgentLoopDriverError::InvalidRequest {
+                reason: "checkpoint load: invalid_invocation".to_string()
+            }
+        );
+        assert_eq!(host.load_call_count(), 1);
+        assert!(
+            host.call_log().is_empty(),
+            "invalid checkpoint load must fail before executor host ports"
         );
     }
 
