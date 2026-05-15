@@ -17,13 +17,13 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, CancellationPolicy,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityCallCandidate,
-        CapabilityDescriptorView, CapabilityFailure, CapabilityInputRef, CapabilityInvocation,
-        CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceProfileId,
-        CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass,
-        ConcurrencyHint, ContextProfileId, FinalizeAssistantMessage, LoopCheckpointKind,
-        LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextBundle, LoopContextRequest,
-        LoopDriverId, LoopInput, LoopInputBatch, LoopInputCursor, LoopModelMessage,
-        LoopModelRequest, LoopModelResponse, LoopProgressEvent, LoopPromptBundle,
+        CapabilityDescriptorView, CapabilityFailure, CapabilityFailureKind, CapabilityInputRef,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage,
+        CapabilitySurfaceProfileId, CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId,
+        ConcurrencyClass, ConcurrencyHint, ContextProfileId, FinalizeAssistantMessage,
+        LoopCheckpointKind, LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextBundle,
+        LoopContextRequest, LoopDriverId, LoopInput, LoopInputBatch, LoopInputCursor,
+        LoopModelMessage, LoopModelRequest, LoopModelResponse, LoopProgressEvent, LoopPromptBundle,
         LoopPromptBundleRef, LoopPromptBundleRequest, LoopRunContext, LoopRunInfoPort,
         ModelProfileId, ModelStreamChunk, ParentLoopOutput, RedactedRunProfileProvenance,
         ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier, RunClassId,
@@ -372,7 +372,7 @@ pub enum ScriptedCapabilityOutcome {
     /// Failed result.
     Failed {
         /// Error kind string consumed by the executor classifier.
-        error_kind: String,
+        error_kind: CapabilityFailureKind,
     },
 }
 
@@ -394,9 +394,9 @@ impl ScriptedCapabilityOutcome {
     }
 
     /// Creates a failed outcome using the provided error kind.
-    pub fn failed(error_kind: impl Into<String>) -> Self {
+    pub fn failed(error_kind: impl AsRef<str>) -> Self {
         Self::Failed {
-            error_kind: error_kind.into(),
+            error_kind: scripted_failure_kind(error_kind.as_ref()),
         }
     }
 }
@@ -878,6 +878,30 @@ fn checkpoint_kind_from_host(kind: LoopCheckpointKind) -> CheckpointKind {
         LoopCheckpointKind::BeforeSideEffect => CheckpointKind::BeforeSideEffect,
         LoopCheckpointKind::BeforeBlock => CheckpointKind::BeforeBlock,
         LoopCheckpointKind::Final => CheckpointKind::Final,
+    }
+}
+
+fn scripted_failure_kind(kind: &str) -> CapabilityFailureKind {
+    match kind {
+        "authorization" => CapabilityFailureKind::Authorization,
+        "backend" => CapabilityFailureKind::Backend,
+        "cancelled" => CapabilityFailureKind::Cancelled,
+        "dispatcher" => CapabilityFailureKind::Dispatcher,
+        "input_invalid" | "invalid_input" => CapabilityFailureKind::InvalidInput,
+        "missing_runtime" => CapabilityFailureKind::MissingRuntime,
+        "network" => CapabilityFailureKind::Network,
+        "output_too_large" => CapabilityFailureKind::OutputTooLarge,
+        "policy_denied" => CapabilityFailureKind::PolicyDenied,
+        "process" => CapabilityFailureKind::Process,
+        "resource" => CapabilityFailureKind::Resource,
+        "transient" => CapabilityFailureKind::Transient,
+        "unavailable" => CapabilityFailureKind::Unavailable,
+        "internal" => CapabilityFailureKind::Internal,
+        "permanent" => CapabilityFailureKind::Permanent,
+        other => match CapabilityFailureKind::unknown(other.to_string()) {
+            Ok(kind) => kind,
+            Err(_) => CapabilityFailureKind::Permanent,
+        },
     }
 }
 
