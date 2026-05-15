@@ -26,6 +26,7 @@ mod error;
 mod fakes;
 mod inbound_turn;
 mod ledger;
+mod reborn_services;
 mod webui_inbound;
 mod workflow;
 
@@ -39,6 +40,12 @@ pub use error::ProductWorkflowError;
 pub use fakes::{FakeConversationBindingService, FakeIdempotencyLedger, FakeInboundTurnService};
 pub use inbound_turn::{DefaultInboundTurnService, InboundTurnOutcome, InboundTurnService};
 pub use ledger::{IdempotencyDecision, IdempotencyLedger};
+pub use reborn_services::{
+    RebornCancelRunResponse, RebornCreateThreadResponse, RebornResolveGateResponse,
+    RebornResumeGateResponse, RebornServices, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornStreamEventsRequest, RebornStreamEventsResponse,
+    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
+};
 pub use webui_inbound::{
     WebUiAuthenticatedCaller, WebUiCancelReason, WebUiCancelRunRequest, WebUiCreateThreadRequest,
     WebUiGateResolution, WebUiInboundCommand, WebUiInboundValidationCode,
