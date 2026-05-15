@@ -73,7 +73,10 @@ where
     pub cancellation_factory: Option<Arc<dyn RunCancellationFactory>>,
     pub skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     pub input_queue: Option<Arc<dyn HostInputQueue>>,
-    pub identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
+    /// Required by the WS-14 planned-driver brief for the WS-16 runtime smoke
+    /// and WS-17 product cutover. `None` is only acceptable for helper-level
+    /// WS-14 unit tests; live composition must always supply identity context.
+    pub identity_context_source: Arc<dyn HostIdentityContextSource>,
 }
 
 pub struct RebornRuntimeLoopComposition<T, S, G>
@@ -109,6 +112,18 @@ impl fmt::Display for DefaultPlannedRuntimeBuildError {
 
 impl Error for DefaultPlannedRuntimeBuildError {}
 
+impl From<DriverRegistryError> for DefaultPlannedRuntimeBuildError {
+    fn from(error: DriverRegistryError) -> Self {
+        Self::DriverRegistry(error)
+    }
+}
+
+impl From<DefaultPlannedDriverRegistrationError> for DefaultPlannedRuntimeBuildError {
+    fn from(error: DefaultPlannedDriverRegistrationError) -> Self {
+        Self::PlannedDriver(error)
+    }
+}
+
 pub fn build_default_planned_runtime<T, S, G>(
     parts: DefaultPlannedRuntimeParts<T, S, G>,
 ) -> Result<RebornRuntimeLoopComposition<T, S, G>, DefaultPlannedRuntimeBuildError>
@@ -118,8 +133,7 @@ where
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
 {
     let mut registry = DriverRegistry::new();
-    register_default_text_only_driver(&mut registry, parts.config.text_only_driver)
-        .map_err(DefaultPlannedRuntimeBuildError::DriverRegistry)?;
+    register_default_text_only_driver(&mut registry, parts.config.text_only_driver)?;
     let family_registry = build_loop_family_registry().map_err(|error| {
         DefaultPlannedRuntimeBuildError::PlannedDriver(
             DefaultPlannedDriverRegistrationError::DriverBuild(
@@ -129,8 +143,7 @@ where
             ),
         )
     })?;
-    register_default_planned_driver(&mut registry, family_registry)
-        .map_err(DefaultPlannedRuntimeBuildError::PlannedDriver)?;
+    register_default_planned_driver(&mut registry, family_registry)?;
     let driver_registry = Arc::new(registry);
 
     let resolver = Arc::new(
@@ -173,9 +186,7 @@ where
     if let Some(queue) = parts.input_queue {
         host_factory = host_factory.with_input_queue(queue);
     }
-    if let Some(source) = parts.identity_context_source {
-        host_factory = host_factory.with_identity_context_source(source);
-    }
+    host_factory = host_factory.with_identity_context_source(parts.identity_context_source);
     let host_factory = Arc::new(host_factory);
 
     let transition_port: Arc<dyn TurnRunTransitionPort> = parts.turn_state;

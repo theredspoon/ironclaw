@@ -19,6 +19,12 @@ use crate::driver_registry::{DriverRequirements, LoopDriverRegistryKey, Requirem
 use crate::model_routes::{ModelRouteError, ModelRouteResolver, ModelSlot};
 use crate::text_loop_driver::{TEXT_ONLY_DRIVER_ID, TEXT_ONLY_DRIVER_VERSION};
 
+// Pre-WS-14 text-only driver key used by `is_text_only_driver_key`'s
+// fail-closed allowlist. Kept alongside the WS-7 `TEXT_ONLY_DRIVER_ID` so
+// legacy registry entries still resolve through the text-only host path.
+// Retire once no callers register or persist the `lightweight_loop` key —
+// after the WS-17 product cutover and any downstream migrations are
+// confirmed complete.
 const LEGACY_TEXT_ONLY_DRIVER_ID: &str = "lightweight_loop";
 const LEGACY_TEXT_ONLY_DRIVER_VERSION: u64 = 1;
 const LEGACY_TEXT_ONLY_CHECKPOINT_SCHEMA_ID: &str = "interactive_checkpoint_v1";

@@ -1983,7 +1983,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         cancellation_factory: None,
         skill_context_source: None,
         input_queue: None,
-        identity_context_source: None,
+        identity_context_source: Arc::new(StaticIdentityContextSource::new(Vec::new())),
     })
     .unwrap();
 
