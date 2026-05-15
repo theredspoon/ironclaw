@@ -18,6 +18,7 @@ handling, gate routing, mission routing, and redacted acknowledgements.
 | `ConversationBindingService` | Resolves external adapter refs → canonical Reborn identifiers |
 | `IdempotencyLedger` | Durable action deduplication port |
 | `ProductInboundAction` | Durable ledger record for inbound actions |
+| `WebUiService` / `DefaultWebUiService` | Native WebChat v2 facade (#3611) — typed surface for browser route handlers; routes the 4 mutation commands to thread service + turn coordinator and the 2 timeline reads to the event projection service, without exposing any of them to handlers |
 
 ## Dependencies
 
@@ -25,6 +26,8 @@ handling, gate routing, mission routing, and redacted acknowledgements.
 - `ironclaw_turns` — turn coordinator, scope, IDs
 - `ironclaw_threads` — session thread service contract
 - `ironclaw_host_api` — canonical identifiers (TenantId, UserId, etc.)
+- `ironclaw_event_projections` — read-model boundary for WebUI timeline (#3611)
+- `ironclaw_events` — `EventStreamKey` / `ReadScope` used to assemble projection requests
 
 ## Boundary rules
 
@@ -38,3 +41,4 @@ Enable `test-support` feature for in-memory fakes:
 - `FakeConversationBindingService`
 - `FakeIdempotencyLedger`
 - `FakeInboundTurnService`
+- `FakeWebUiService`

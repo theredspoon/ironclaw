@@ -14,6 +14,12 @@ use crate::binding::{ConversationBindingService, ResolveBindingRequest, Resolved
 use crate::error::ProductWorkflowError;
 use crate::inbound_turn::{InboundTurnOutcome, InboundTurnService};
 use crate::ledger::{IdempotencyDecision, IdempotencyLedger};
+use crate::webui_service::{
+    WebUiCancelRunCommand, WebUiCreateThreadCommand, WebUiGateResolved, WebUiGetTimelineCommand,
+    WebUiMessageAccepted, WebUiMessageRunOutcome, WebUiResolveGateCommand, WebUiRunCancelled,
+    WebUiSendMessageCommand, WebUiService, WebUiServiceError, WebUiThreadCreated,
+    WebUiTimelineCursor, WebUiTimelineReplay, WebUiTimelineSnapshot,
+};
 
 // ---------------------------------------------------------------------------
 // FakeConversationBindingService
@@ -352,4 +358,277 @@ impl InboundTurnService for FakeInboundTurnService {
             binding,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// FakeWebUiService
+// ---------------------------------------------------------------------------
+
+/// In-memory fake for the WebUI service facade.
+///
+/// Records every command invocation and returns programmable outcomes, so
+/// downstream route-handler tests can verify wiring without spinning up the
+/// real thread service or turn coordinator.
+pub struct FakeWebUiService {
+    state: Mutex<FakeWebUiState>,
+}
+
+#[derive(Default)]
+struct FakeWebUiState {
+    create_thread_calls: Vec<WebUiCreateThreadCommand>,
+    send_message_calls: Vec<WebUiSendMessageCommand>,
+    cancel_run_calls: Vec<WebUiCancelRunCommand>,
+    resolve_gate_calls: Vec<WebUiResolveGateCommand>,
+    timeline_snapshot_calls: Vec<WebUiGetTimelineCommand>,
+    timeline_updates_calls: Vec<WebUiGetTimelineCommand>,
+    create_thread_outcome: Option<WebUiThreadCreated>,
+    send_message_outcome: Option<WebUiMessageAccepted>,
+    cancel_run_outcome: Option<WebUiRunCancelled>,
+    resolve_gate_outcome: Option<WebUiGateResolved>,
+    timeline_snapshot_outcome: Option<WebUiTimelineSnapshot>,
+    timeline_updates_outcome: Option<WebUiTimelineReplay>,
+    create_thread_error: Option<WebUiServiceError>,
+    send_message_error: Option<WebUiServiceError>,
+    cancel_run_error: Option<WebUiServiceError>,
+    resolve_gate_error: Option<WebUiServiceError>,
+    timeline_snapshot_error: Option<WebUiServiceError>,
+    timeline_updates_error: Option<WebUiServiceError>,
+}
+
+impl FakeWebUiService {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(FakeWebUiState::default()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FakeWebUiState> {
+        self.state.lock().expect("fake webui state lock poisoned") // safety: test-support fake
+    }
+
+    pub fn program_create_thread(&self, outcome: WebUiThreadCreated) {
+        self.lock().create_thread_outcome = Some(outcome);
+    }
+
+    pub fn program_send_message(&self, outcome: WebUiMessageAccepted) {
+        self.lock().send_message_outcome = Some(outcome);
+    }
+
+    pub fn program_cancel_run(&self, outcome: WebUiRunCancelled) {
+        self.lock().cancel_run_outcome = Some(outcome);
+    }
+
+    pub fn program_resolve_gate(&self, outcome: WebUiGateResolved) {
+        self.lock().resolve_gate_outcome = Some(outcome);
+    }
+
+    pub fn program_timeline_snapshot(&self, outcome: WebUiTimelineSnapshot) {
+        self.lock().timeline_snapshot_outcome = Some(outcome);
+    }
+
+    pub fn program_timeline_updates(&self, outcome: WebUiTimelineReplay) {
+        self.lock().timeline_updates_outcome = Some(outcome);
+    }
+
+    pub fn fail_create_thread(&self, error: WebUiServiceError) {
+        self.lock().create_thread_error = Some(error);
+    }
+
+    pub fn fail_send_message(&self, error: WebUiServiceError) {
+        self.lock().send_message_error = Some(error);
+    }
+
+    pub fn fail_cancel_run(&self, error: WebUiServiceError) {
+        self.lock().cancel_run_error = Some(error);
+    }
+
+    pub fn fail_resolve_gate(&self, error: WebUiServiceError) {
+        self.lock().resolve_gate_error = Some(error);
+    }
+
+    pub fn fail_timeline_snapshot(&self, error: WebUiServiceError) {
+        self.lock().timeline_snapshot_error = Some(error);
+    }
+
+    pub fn fail_timeline_updates(&self, error: WebUiServiceError) {
+        self.lock().timeline_updates_error = Some(error);
+    }
+
+    pub fn create_thread_calls(&self) -> Vec<WebUiCreateThreadCommand> {
+        self.lock().create_thread_calls.clone()
+    }
+
+    pub fn send_message_calls(&self) -> Vec<WebUiSendMessageCommand> {
+        self.lock().send_message_calls.clone()
+    }
+
+    pub fn cancel_run_calls(&self) -> Vec<WebUiCancelRunCommand> {
+        self.lock().cancel_run_calls.clone()
+    }
+
+    pub fn resolve_gate_calls(&self) -> Vec<WebUiResolveGateCommand> {
+        self.lock().resolve_gate_calls.clone()
+    }
+
+    pub fn timeline_snapshot_calls(&self) -> Vec<WebUiGetTimelineCommand> {
+        self.lock().timeline_snapshot_calls.clone()
+    }
+
+    pub fn timeline_updates_calls(&self) -> Vec<WebUiGetTimelineCommand> {
+        self.lock().timeline_updates_calls.clone()
+    }
+}
+
+impl Default for FakeWebUiService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl WebUiService for FakeWebUiService {
+    async fn create_thread(
+        &self,
+        command: WebUiCreateThreadCommand,
+    ) -> Result<WebUiThreadCreated, WebUiServiceError> {
+        let mut state = self.lock();
+        state.create_thread_calls.push(command.clone());
+        if let Some(error) = state.create_thread_error.clone() {
+            return Err(error);
+        }
+        if let Some(outcome) = state.create_thread_outcome.clone() {
+            return Ok(outcome);
+        }
+        let thread_id = command
+            .requested_thread_id
+            .unwrap_or_else(|| ThreadId::new("thread:fake-webui").expect("fake thread id"));
+        Ok(WebUiThreadCreated { thread_id })
+    }
+
+    async fn send_message(
+        &self,
+        command: WebUiSendMessageCommand,
+    ) -> Result<WebUiMessageAccepted, WebUiServiceError> {
+        let mut state = self.lock();
+        state.send_message_calls.push(command.clone());
+        if let Some(error) = state.send_message_error.clone() {
+            return Err(error);
+        }
+        if let Some(outcome) = state.send_message_outcome.clone() {
+            return Ok(outcome);
+        }
+        let accepted_message_ref =
+            AcceptedMessageRef::new(format!("msg:fake:{}", command.client_action_id.as_str()))
+                .map_err(|_| WebUiServiceError::InvalidInput)?;
+        Ok(WebUiMessageAccepted {
+            thread_id: command.scope.thread_id.clone(),
+            accepted_message_ref,
+            run: WebUiMessageRunOutcome::Submitted {
+                run_id: TurnRunId::new(),
+            },
+        })
+    }
+
+    async fn cancel_run(
+        &self,
+        command: WebUiCancelRunCommand,
+    ) -> Result<WebUiRunCancelled, WebUiServiceError> {
+        let mut state = self.lock();
+        state.cancel_run_calls.push(command.clone());
+        if let Some(error) = state.cancel_run_error.clone() {
+            return Err(error);
+        }
+        if let Some(outcome) = state.cancel_run_outcome.clone() {
+            return Ok(outcome);
+        }
+        Ok(WebUiRunCancelled {
+            run_id: command.run_id,
+            already_terminal: false,
+        })
+    }
+
+    async fn resolve_gate(
+        &self,
+        command: WebUiResolveGateCommand,
+    ) -> Result<WebUiGateResolved, WebUiServiceError> {
+        let mut state = self.lock();
+        state.resolve_gate_calls.push(command.clone());
+        if let Some(error) = state.resolve_gate_error.clone() {
+            return Err(error);
+        }
+        if let Some(outcome) = state.resolve_gate_outcome.clone() {
+            return Ok(outcome);
+        }
+        Ok(WebUiGateResolved::Resumed {
+            run_id: command.run_id,
+        })
+    }
+
+    async fn get_timeline_snapshot(
+        &self,
+        command: WebUiGetTimelineCommand,
+    ) -> Result<WebUiTimelineSnapshot, WebUiServiceError> {
+        let mut state = self.lock();
+        state.timeline_snapshot_calls.push(command.clone());
+        if let Some(error) = state.timeline_snapshot_error.clone() {
+            return Err(error);
+        }
+        if let Some(outcome) = state.timeline_snapshot_outcome.clone() {
+            return Ok(outcome);
+        }
+        Ok(empty_timeline_snapshot(&command))
+    }
+
+    async fn get_timeline_updates(
+        &self,
+        command: WebUiGetTimelineCommand,
+    ) -> Result<WebUiTimelineReplay, WebUiServiceError> {
+        let mut state = self.lock();
+        state.timeline_updates_calls.push(command.clone());
+        if let Some(error) = state.timeline_updates_error.clone() {
+            return Err(error);
+        }
+        if let Some(outcome) = state.timeline_updates_outcome.clone() {
+            return Ok(outcome);
+        }
+        Ok(empty_timeline_replay(&command))
+    }
+}
+
+fn empty_timeline_snapshot(command: &WebUiGetTimelineCommand) -> WebUiTimelineSnapshot {
+    WebUiTimelineSnapshot {
+        entries: Vec::new(),
+        runs: Vec::new(),
+        next_cursor: synthesize_cursor(command),
+        truncated: false,
+    }
+}
+
+fn empty_timeline_replay(command: &WebUiGetTimelineCommand) -> WebUiTimelineReplay {
+    WebUiTimelineReplay {
+        entries: Vec::new(),
+        runs: Vec::new(),
+        next_cursor: synthesize_cursor(command),
+        truncated: false,
+    }
+}
+
+fn synthesize_cursor(command: &WebUiGetTimelineCommand) -> WebUiTimelineCursor {
+    use ironclaw_event_projections::{ProjectionCursor, ProjectionScope};
+    use ironclaw_events::{EventStreamKey, ReadScope};
+    let stream = EventStreamKey::new(
+        command.caller.tenant_id.clone(),
+        command.caller.user_id.clone(),
+        command.caller.agent_id.clone(),
+    );
+    let read_scope = ReadScope {
+        project_id: command.caller.project_id.clone(),
+        mission_id: None,
+        thread_id: Some(command.thread_id.clone()),
+        process_id: None,
+    };
+    WebUiTimelineCursor::from_projection(ProjectionCursor::origin_for_scope(ProjectionScope {
+        stream,
+        read_scope,
+    }))
 }
