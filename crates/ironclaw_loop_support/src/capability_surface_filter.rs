@@ -133,7 +133,14 @@ fn surface_profile_denied_outcome() -> CapabilityOutcome {
 fn surface_profile_denied_kind() -> CapabilityDeniedReasonKind {
     match CapabilityDeniedReasonKind::unknown("surface_profile_denied") {
         Ok(kind) => kind,
-        Err(_) => CapabilityDeniedReasonKind::EmptySurface,
+        Err(_) => {
+            debug_assert!(
+                false,
+                "surface_profile_denied_kind() fallback reached — this is a contract bug: \
+                 'surface_profile_denied' must be a valid reason kind value"
+            );
+            CapabilityDeniedReasonKind::EmptySurface
+        }
     }
 }
 

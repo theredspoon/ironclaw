@@ -5,6 +5,7 @@ use ironclaw_host_api::CapabilityId;
 use ironclaw_turns::run_profile::LoopRunContext;
 use thiserror::Error;
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityAllowSet {
     All,
@@ -24,6 +25,7 @@ impl CapabilityAllowSet {
     }
 }
 
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum CapabilityResolveError {
     #[error("capability surface profile is unavailable: {reason}")]

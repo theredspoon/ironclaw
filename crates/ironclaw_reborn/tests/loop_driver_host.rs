@@ -2762,6 +2762,87 @@ async fn text_only_host_profiled_capabilities_filter_surface_and_invocation() {
     assert!(runtime.invocations().is_empty());
 }
 
+// Fix 4 (henrypark): composition test — host profile filter wins over strategy `All`.
+// This gates the host-wiring/cutover boundary: when the host-level CapabilitySurfaceProfileFilter
+// restricts to only `tool_a`, invoking `tool_b` must be denied even though the strategy
+// (via `CapabilityAllowSet::All`) would normally permit everything.
+#[tokio::test]
+async fn default_strategy_filter_all_loses_to_host_profile_filter() {
+    let fixture = HostFixture::new("thread-host-profile-filter-wins", "hello").await;
+    let tool_a_id = CapabilityId::new("demo.tool_a").unwrap();
+    let tool_b_id = CapabilityId::new("demo.tool_b").unwrap();
+
+    // The host runtime exposes both capabilities.
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(tool_a_id.as_str()),
+        capability_descriptor(tool_b_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+
+    // Build a raw capability port wired to the host runtime (no profile filter yet).
+    let capability_port = HostRuntimeLoopCapabilityPort::new(
+        runtime.clone(),
+        fixture.context.clone(),
+        host_runtime_visible_request(&fixture, ["demo"]),
+        io.clone(),
+        io,
+    );
+
+    // The profile resolver only allows tool_a — this is the host-level filter.
+    // The strategy effectively resolves to `CapabilityAllowSet::All` for any
+    // capability not explicitly blocked, but the host filter wraps the port and
+    // takes precedence.
+    let resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([tool_a_id.clone()]),
+    ));
+
+    let host = fixture
+        .factory()
+        .build_text_only_host_with_profiled_capabilities(
+            RebornLoopDriverHostRequest {
+                claimed_run: fixture.claimed.clone(),
+                loop_run_context: fixture.context.clone(),
+            },
+            Arc::new(capability_port),
+            resolver,
+        )
+        .await
+        .unwrap();
+
+    // Surface should only expose tool_a (host filter applied).
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert_eq!(surface.descriptors.len(), 1);
+    assert_eq!(surface.descriptors[0].capability_id, tool_a_id);
+
+    // Invoking tool_b must be denied — the host profile filter wins over the
+    // strategy's implicit `All` permit.
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: tool_b_id,
+            input_ref: CapabilityInputRef::new("input:tool-b-denied").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            &outcome,
+            CapabilityOutcome::Denied(denied)
+                if denied.reason_kind.as_str() == "surface_profile_denied"
+        ),
+        "expected surface_profile_denied, got {outcome:?}"
+    );
+    // The host runtime must not have been called for the denied invocation.
+    assert!(
+        runtime.invocations().is_empty(),
+        "host runtime must not be invoked for a profile-denied capability"
+    );
+}
+
 #[tokio::test]
 async fn text_only_host_uses_fresh_execution_context_per_capability_invocation() {
     let fixture = HostFixture::new("thread-host-runtime-capability-context", "hello").await;

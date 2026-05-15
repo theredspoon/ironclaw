@@ -637,6 +637,9 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
 }
 
 pub fn concurrency_hint_from_effects(effects: &[EffectKind]) -> ConcurrencyHint {
+    // Empty effects list: treat as safe-for-parallel (capabilities with no declared effects
+    // are assumed read-only). Callers must not register write-effect capabilities without
+    // declaring effects.
     if effects
         .iter()
         .all(|effect| matches!(effect, EffectKind::ReadFilesystem | EffectKind::UseSecret))

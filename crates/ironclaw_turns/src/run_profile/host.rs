@@ -1146,6 +1146,7 @@ pub struct CapabilityDenied {
     pub safe_summary: String,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CapabilityDeniedReasonKind {
     EmptySurface,
