@@ -171,7 +171,9 @@ pub(crate) fn build_aad(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
 }
 
 pub(crate) const AAD_DOMAIN_SECRET_RECORD: &[u8] = b"reborn/v1/secret_record";
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 pub(crate) const AAD_DOMAIN_CREDENTIAL_ACCOUNT: &[u8] = b"reborn/v1/credential_account";
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 pub(crate) const AAD_DOMAIN_CREDENTIAL_SESSION: &[u8] = b"reborn/v1/credential_session";
 pub(crate) const AAD_DOMAIN_SECRET_STORE_KEY_CHECK: &[u8] = b"reborn/v1/secret_store_key_check";
 

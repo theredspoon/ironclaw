@@ -10,21 +10,45 @@
 //! - **H3** — `reborn_secret_records` rows have no AAD/post-decrypt binding
 //!   between ciphertext and `(user_id, name)`. A DB-write adversary can swap
 //!   `(encrypted_value, key_salt)` between two rows and `get_decrypted` will
-//!   silently return the wrong plaintext.
+//!   silently return the wrong plaintext. Two follow-up tests extend the same
+//!   row-swap guard to `reborn_credential_accounts` and
+//!   `reborn_credential_sessions`, which were called out in PR #3592 review
+//!   as needing the same AAD-binding regression coverage.
 //! - **M1** — `CredentialSessionId` `Display` emits the raw UUID despite
 //!   `Debug` being redacted, so `format!("{id}")` in a log line leaks the
 //!   bearer-like value.
 //! - **M2** — `SecretsCrypto::new` accepts low-entropy 32-byte master keys
 //!   (e.g. 32 zero bytes), making captured ciphertext brute-forceable when
 //!   an operator copy-pastes a weak key.
+//! - **AAD format invariant** — confirms that ciphertext produced without
+//!   AAD binding (the pre-fix legacy format) cannot be silently accepted by
+//!   the new decrypt path. This locks in the "no on-disk compatibility with
+//!   pre-AAD rows" design decision: bootstrap must fail closed instead of
+//!   returning unauthenticated plaintext.
 
-use ironclaw_secrets::{CredentialSessionId, SecretError, SecretMaterial, SecretsCrypto};
+use ironclaw_secrets::{
+    CredentialSessionId, SecretError, SecretMaterial, SecretsCrypto, secret_record_aad,
+};
 
 #[cfg(feature = "libsql")]
 use std::sync::Arc;
 
 #[cfg(feature = "libsql")]
-use ironclaw_secrets::{CreateSecretParams, LibSqlSecretsStore, SecretsStore};
+use chrono::Utc;
+#[cfg(feature = "libsql")]
+use ironclaw_host_api::{
+    AgentId, CapabilityId, ExtensionId, InvocationId, MissionId, NetworkMethod, ProjectId,
+    ResourceScope, SecretHandle, TenantId, ThreadId, UserId,
+};
+#[cfg(feature = "libsql")]
+use ironclaw_secrets::{
+    CreateSecretParams, CredentialAccount, CredentialAccountId, CredentialAccountStatus,
+    CredentialAccountStore, CredentialPathPolicy, CredentialSessionRequest, CredentialSessionStore,
+    CredentialTargetPolicy, InMemoryCredentialBroker, LibSqlCredentialStore, LibSqlSecretsStore,
+    RedactedJson, SecretsStore,
+};
+#[cfg(feature = "libsql")]
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // H3 — row-swap returns the wrong plaintext
@@ -207,4 +231,294 @@ fn m2_secrets_crypto_must_reject_low_entropy_master_keys() {
              with trivial entropy that are then used as HKDF input."
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// AAD format invariant — pre-AAD ciphertext is rejected at decrypt
+// ---------------------------------------------------------------------------
+
+/// PR #3592 review (serrrfirat) flagged that switching to AAD-bound decrypt
+/// makes any row written by the previous code path unreadable. The PR's
+/// answer is "`reborn-integration` has no live data so we don't need a
+/// compatibility/migration path." This test locks that decision in: a
+/// ciphertext produced under the legacy "empty AAD" shape cannot be silently
+/// accepted by the new AAD-bound decrypt path. If it ever could, an attacker
+/// with DB write access could downgrade rows to the pre-fix format and
+/// recover plaintext that is no longer bound to `(user_id, name)`.
+#[test]
+fn aad_binding_rejects_pre_aad_secret_record_ciphertext() {
+    let crypto = SecretsCrypto::new(SecretMaterial::from(
+        "0123456789abcdef0123456789abcdef".to_string(),
+    ))
+    .expect("valid 32-byte hex test key");
+
+    // Encrypt with empty AAD — this is what the pre-fix code path produced.
+    let plaintext = b"PLAINTEXT_should_not_round_trip";
+    let (encrypted_value, key_salt) = crypto.encrypt(plaintext, &[]).unwrap();
+
+    // The new decrypt path always supplies a domain-bound AAD. If the AES-GCM
+    // tag check were skipped or if AAD were ignored, this would return the
+    // plaintext.
+    let aad = secret_record_aad("tenant-a.user-a", "low_priv_key");
+    let result = crypto.decrypt(&encrypted_value, &key_salt, &aad);
+
+    assert!(
+        matches!(result, Err(SecretError::DecryptionFailed(_))),
+        "Pre-AAD ciphertext must be rejected at decrypt — never silently \
+         returned to the caller, otherwise an attacker can downgrade rows \
+         to the legacy format and bypass the row-binding guard. got={result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H3 follow-up — credential account row-swap
+// ---------------------------------------------------------------------------
+
+/// PR #3592 review (serrrfirat) called out that `reborn_credential_accounts`
+/// payloads also need a regression guard for the row-swap shape that
+/// motivated the H3 fix on `reborn_secret_records`. This extends the same
+/// test to the credential account table: two rows in the same scope, swap
+/// `(encrypted_payload, payload_key_salt)` between them, and assert that the
+/// store refuses to return the other account's payload.
+///
+/// The fix wires AES-GCM AAD to `(scope, account_id)`, so the swap fails the
+/// tag check at decrypt time.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn h3_libsql_credential_account_row_swap_must_not_return_other_accounts_payload() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let db = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let store = LibSqlCredentialStore::new(Arc::clone(&db), test_crypto());
+    store.run_migrations().await.unwrap();
+
+    let scope = sample_scope("tenant-a", "user-a");
+    let low_priv_id = CredentialAccountId::new("low_priv").unwrap();
+    let high_priv_id = CredentialAccountId::new("high_priv_admin").unwrap();
+
+    let mut low_priv = sample_account(scope.clone(), low_priv_id.clone());
+    low_priv.redacted_metadata = RedactedJson::new(json!({ "marker": "LOW_PRIV_PAYLOAD" }));
+    let mut high_priv = sample_account(scope.clone(), high_priv_id.clone());
+    high_priv.redacted_metadata = RedactedJson::new(json!({ "marker": "HIGH_PRIV_PAYLOAD" }));
+
+    store.put_account(low_priv).await.unwrap();
+    store.put_account(high_priv.clone()).await.unwrap();
+
+    // Read the high-priv ciphertext, then overwrite the low-priv row's
+    // ciphertext columns. Row identity (scope + account_id) stays put — only
+    // the encrypted blob and salt move.
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT encrypted_payload, payload_key_salt FROM reborn_credential_accounts \
+             WHERE tenant_id = ?1 AND user_id = ?2 AND agent_id = ?3 AND project_id = ?4 \
+               AND account_id = ?5",
+            libsql::params![
+                scope.tenant_id.as_str(),
+                scope.user_id.as_str(),
+                scope.agent_id.as_ref().unwrap().as_str(),
+                scope.project_id.as_ref().unwrap().as_str(),
+                high_priv_id.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("high-priv row");
+    let high_priv_blob: Vec<u8> = row.get(0).unwrap();
+    let high_priv_salt: Vec<u8> = row.get(1).unwrap();
+
+    conn.execute(
+        "UPDATE reborn_credential_accounts SET encrypted_payload = ?1, payload_key_salt = ?2 \
+         WHERE tenant_id = ?3 AND user_id = ?4 AND agent_id = ?5 AND project_id = ?6 \
+           AND account_id = ?7",
+        libsql::params![
+            high_priv_blob,
+            high_priv_salt,
+            scope.tenant_id.as_str(),
+            scope.user_id.as_str(),
+            scope.agent_id.as_ref().unwrap().as_str(),
+            scope.project_id.as_ref().unwrap().as_str(),
+            low_priv_id.as_str(),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let lookup = store.get_account(&scope, &low_priv_id).await;
+    match lookup {
+        Ok(Some(account)) => panic!(
+            "credential-account row swap leaked another account's payload: {:?}",
+            account.redacted_metadata
+        ),
+        Ok(None) | Err(_) => {
+            // Either outcome is acceptable: the AAD-bound decrypt must fail
+            // closed (DecryptionFailed) or upstream validation must drop the
+            // mismatched row before returning it.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H3 follow-up — credential session row-swap
+// ---------------------------------------------------------------------------
+
+/// Same shape as the credential-account row-swap test, applied to
+/// `reborn_credential_sessions`. The AAD binds ciphertext to
+/// `(scope, session_id)`, so a write-side adversary cannot lift the
+/// ciphertext for a high-privilege session into the row for a
+/// low-privilege one and have `get_session` decrypt cleanly.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn h3_libsql_credential_session_row_swap_must_not_return_other_sessions_payload() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let db_path = dir.join("credentials.db");
+    let db = Arc::new(libsql::Builder::new_local(&db_path).build().await.unwrap());
+    let store = LibSqlCredentialStore::new(Arc::clone(&db), test_crypto());
+    store.run_migrations().await.unwrap();
+
+    let scope = sample_scope("tenant-a", "user-a");
+    let account_id = CredentialAccountId::new("openai_prod").unwrap();
+    store
+        .put_account(sample_account(scope.clone(), account_id.clone()))
+        .await
+        .unwrap();
+
+    let low_priv_session = broker_session(scope.clone(), account_id.clone(), Some(1), None);
+    let high_priv_session = broker_session(scope.clone(), account_id.clone(), Some(1000), None);
+    let low_priv_id = low_priv_session.correlation_id();
+    let high_priv_id = high_priv_session.correlation_id();
+    store.issue_session(low_priv_session).await.unwrap();
+    store.issue_session(high_priv_session).await.unwrap();
+
+    // `CredentialSessionId::Display` is redacted, so the primary-key lookup
+    // string is not directly available to the test. Identify the two rows by
+    // their distinct `max_uses` values and lift the ciphertext blobs from
+    // the high-priv row into the low-priv row.
+    let conn = db.connect().unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT session_id, max_uses, encrypted_payload, payload_key_salt \
+             FROM reborn_credential_sessions",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut low_priv_pk: Option<String> = None;
+    let mut high_priv_blob: Option<(Vec<u8>, Vec<u8>)> = None;
+    while let Some(row) = rows.next().await.unwrap() {
+        let sid: String = row.get(0).unwrap();
+        let max_uses: Option<i64> = row.get(1).unwrap();
+        let blob: Vec<u8> = row.get(2).unwrap();
+        let salt: Vec<u8> = row.get(3).unwrap();
+        match max_uses {
+            Some(1) => low_priv_pk = Some(sid),
+            Some(1000) => high_priv_blob = Some((blob, salt)),
+            _ => {}
+        }
+    }
+    let low_priv_pk = low_priv_pk.expect("low-priv row exists");
+    let (high_priv_blob, high_priv_salt) =
+        high_priv_blob.expect("high-priv row exists with captured blob");
+
+    conn.execute(
+        "UPDATE reborn_credential_sessions SET encrypted_payload = ?1, payload_key_salt = ?2 \
+         WHERE session_id = ?3",
+        libsql::params![high_priv_blob, high_priv_salt, low_priv_pk],
+    )
+    .await
+    .unwrap();
+
+    // The low-priv row now carries the high-priv ciphertext but its own
+    // session_id. AAD-bound decrypt must reject it; if anything, returning
+    // `Ok(None)` or an error is acceptable. Returning the swapped session
+    // would be the bug.
+    let lookup = store.get_session(&scope, low_priv_id).await;
+    match lookup {
+        Ok(Some(session)) => {
+            assert_ne!(
+                session.correlation_id(),
+                high_priv_id,
+                "credential-session row swap leaked another session's correlation id; \
+                 AAD binding to (scope, session_id) is not in effect"
+            );
+            panic!(
+                "credential-session row swap returned a non-empty session that should \
+                 have failed the AAD tag check"
+            );
+        }
+        Ok(None) | Err(_) => {
+            // Acceptable: AAD-bound decrypt failed closed, or the validate-
+            // row pass dropped the mismatched ciphertext.
+        }
+    }
+}
+
+#[cfg(feature = "libsql")]
+fn test_crypto() -> Arc<SecretsCrypto> {
+    Arc::new(
+        SecretsCrypto::new(SecretMaterial::from(
+            "0123456789abcdef0123456789abcdef".to_string(),
+        ))
+        .unwrap(),
+    )
+}
+
+#[cfg(feature = "libsql")]
+fn sample_scope(tenant: &str, user: &str) -> ResourceScope {
+    ResourceScope {
+        tenant_id: TenantId::new(tenant).unwrap(),
+        user_id: UserId::new(user).unwrap(),
+        agent_id: Some(AgentId::new("agent-a").unwrap()),
+        project_id: Some(ProjectId::new("project-a").unwrap()),
+        mission_id: Some(MissionId::new("mission-a").unwrap()),
+        thread_id: Some(ThreadId::new("thread-a").unwrap()),
+        invocation_id: InvocationId::new(),
+    }
+}
+
+#[cfg(feature = "libsql")]
+fn sample_account(scope: ResourceScope, id: CredentialAccountId) -> CredentialAccount {
+    CredentialAccount {
+        scope,
+        id,
+        provider_or_extension_id: ExtensionId::new("openai").unwrap(),
+        label: "Production".to_string(),
+        status: CredentialAccountStatus::Active,
+        secret_handles: vec![SecretHandle::new("openai_key").unwrap()],
+        allowed_targets: vec![CredentialTargetPolicy {
+            scheme: "https".to_string(),
+            host: "api.example.com".to_string(),
+            port: Some(443),
+            path: CredentialPathPolicy::Prefix("/v1/".to_string()),
+            methods: vec![NetworkMethod::Get],
+        }],
+        redacted_metadata: RedactedJson::new(json!({ "last_four": "1234" })),
+        updated_at: Utc::now(),
+    }
+}
+
+#[cfg(feature = "libsql")]
+fn broker_session(
+    scope: ResourceScope,
+    account_id: CredentialAccountId,
+    max_uses: Option<u64>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+) -> ironclaw_secrets::CredentialSession {
+    let broker = InMemoryCredentialBroker::new();
+    broker
+        .put_account(sample_account(scope.clone(), account_id.clone()))
+        .unwrap();
+    broker
+        .create_session(CredentialSessionRequest {
+            invocation_id: scope.invocation_id,
+            scope,
+            capability_id: CapabilityId::new("openai.chat").unwrap(),
+            extension_id: ExtensionId::new("openai").unwrap(),
+            account_id,
+            method: NetworkMethod::Get,
+            url: "https://api.example.com/v1/models".to_string(),
+            expires_at,
+            max_uses,
+        })
+        .unwrap()
 }
