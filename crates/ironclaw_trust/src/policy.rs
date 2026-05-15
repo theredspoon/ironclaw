@@ -107,6 +107,10 @@ impl HostTrustPolicy {
         Self::from_parts_unchecked(Vec::new(), Box::new(SystemClock))
     }
 
+    pub fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
     /// Construct with an explicit clock. Tests inject `FixedClock` here so
     /// `evaluated_at` is reproducible across runs.
     pub fn with_clock(

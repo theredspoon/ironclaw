@@ -6,6 +6,12 @@ pub enum RebornBuildError {
     InvalidConfig { reason: String },
     #[error("reborn composition requires database handle for {backend}")]
     MissingDatabaseHandle { backend: &'static str },
+    #[error("reborn composition requires configured production trust policy")]
+    MissingProductionTrustPolicy,
+    #[error("reborn composition production trust policy must contain at least one source")]
+    EmptyProductionTrustPolicy,
+    #[error("reborn composition requires live turn scheduler wake notifier")]
+    MissingTurnRunWakeNotifier,
     #[error("reborn composition failed production validation")]
     ProductionWiring {
         report: ironclaw_host_runtime::ProductionWiringReport,

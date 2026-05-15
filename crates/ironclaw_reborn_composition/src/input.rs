@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ironclaw_secrets::SecretMaterial;
+use ironclaw_host_runtime::SchedulerTurnRunWakeNotifier;
+use ironclaw_trust::HostTrustPolicy;
 
 use crate::RebornCompositionProfile;
 
@@ -9,6 +10,8 @@ pub struct RebornBuildInput {
     pub(crate) profile: RebornCompositionProfile,
     pub(crate) owner_id: String,
     pub(crate) storage: RebornStorageInput,
+    pub(crate) production_trust_policy: Option<Arc<HostTrustPolicy>>,
+    pub(crate) turn_run_wake_notifier: Option<Arc<SchedulerTurnRunWakeNotifier>>,
     pub(crate) required_runtime_backends: Vec<ironclaw_host_api::RuntimeKind>,
     pub(crate) require_runtime_http_egress: bool,
     pub(crate) require_wasm_credentials: bool,
@@ -23,14 +26,14 @@ pub(crate) enum RebornStorageInput {
     Libsql {
         db: Arc<libsql::Database>,
         path_or_url: String,
-        auth_token: Option<SecretMaterial>,
-        secret_master_key: SecretMaterial,
+        auth_token: Option<ironclaw_secrets::SecretMaterial>,
+        secret_master_key: ironclaw_secrets::SecretMaterial,
     },
     #[cfg(feature = "postgres")]
     Postgres {
         pool: deadpool_postgres::Pool,
-        url: SecretMaterial,
-        secret_master_key: SecretMaterial,
+        url: ironclaw_secrets::SecretMaterial,
+        secret_master_key: ironclaw_secrets::SecretMaterial,
     },
 }
 
@@ -57,8 +60,8 @@ impl RebornBuildInput {
         owner_id: impl Into<String>,
         db: Arc<libsql::Database>,
         path_or_url: impl Into<String>,
-        auth_token: Option<SecretMaterial>,
-        secret_master_key: SecretMaterial,
+        auth_token: Option<ironclaw_secrets::SecretMaterial>,
+        secret_master_key: ironclaw_secrets::SecretMaterial,
     ) -> Self {
         Self::new(
             profile,
@@ -77,8 +80,8 @@ impl RebornBuildInput {
         profile: RebornCompositionProfile,
         owner_id: impl Into<String>,
         pool: deadpool_postgres::Pool,
-        url: SecretMaterial,
-        secret_master_key: SecretMaterial,
+        url: ironclaw_secrets::SecretMaterial,
+        secret_master_key: ironclaw_secrets::SecretMaterial,
     ) -> Self {
         Self::new(
             profile,
@@ -96,6 +99,19 @@ impl RebornBuildInput {
         backends: impl IntoIterator<Item = ironclaw_host_api::RuntimeKind>,
     ) -> Self {
         self.required_runtime_backends = backends.into_iter().collect();
+        self
+    }
+
+    pub fn with_production_trust_policy(mut self, policy: Arc<HostTrustPolicy>) -> Self {
+        self.production_trust_policy = Some(policy);
+        self
+    }
+
+    pub fn with_turn_run_wake_notifier(
+        mut self,
+        notifier: Arc<SchedulerTurnRunWakeNotifier>,
+    ) -> Self {
+        self.turn_run_wake_notifier = Some(notifier);
         self
     }
 
@@ -118,6 +134,8 @@ impl RebornBuildInput {
             profile,
             owner_id: owner_id.into(),
             storage,
+            production_trust_policy: None,
+            turn_run_wake_notifier: None,
             required_runtime_backends: Vec::new(),
             require_runtime_http_egress: false,
             require_wasm_credentials: false,

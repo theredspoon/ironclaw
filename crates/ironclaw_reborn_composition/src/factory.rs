@@ -3,17 +3,12 @@ use std::sync::Arc;
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
 use ironclaw_filesystem::LocalFilesystem;
-use ironclaw_host_runtime::{
-    CapabilitySurfaceVersion, HostRuntimeServices, ProductionWiringConfig,
-};
+use ironclaw_host_runtime::{CapabilitySurfaceVersion, HostRuntimeServices};
 use ironclaw_processes::ProcessServices;
 use ironclaw_resources::InMemoryResourceGovernor;
 use ironclaw_run_state::{InMemoryApprovalRequestStore, InMemoryRunStateStore};
 use ironclaw_trust::HostTrustPolicy;
-use ironclaw_turns::{
-    DefaultTurnCoordinator, InMemoryTurnStateStore, TurnRunWake, TurnRunWakeNotifier,
-    TurnRunWakeNotifyError,
-};
+use ironclaw_turns::{DefaultTurnCoordinator, InMemoryTurnStateStore};
 
 use crate::input::RebornStorageInput;
 use crate::{
@@ -65,27 +60,13 @@ pub async fn build_reborn_services(
     }
 }
 
-#[derive(Debug, Default)]
-struct RebornCompositionWakeNotifier;
-
-impl TurnRunWakeNotifier for RebornCompositionWakeNotifier {
-    fn notify_queued_run(&self, wake: TurnRunWake) -> Result<(), TurnRunWakeNotifyError> {
-        tracing::debug!(
-            run_id = %wake.run_id,
-            status = ?wake.status,
-            "queued Reborn turn without live scheduler; channel cutover is not enabled"
-        );
-        Err(TurnRunWakeNotifyError::DeliveryUnavailable)
-    }
-}
-
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 fn production_config(
     required_runtime_backends: Vec<ironclaw_host_api::RuntimeKind>,
     require_runtime_http_egress: bool,
     require_wasm_credentials: bool,
-) -> ProductionWiringConfig {
-    let mut config = ProductionWiringConfig::new(required_runtime_backends);
+) -> ironclaw_host_runtime::ProductionWiringConfig {
+    let mut config = ironclaw_host_runtime::ProductionWiringConfig::new(required_runtime_backends);
     if require_runtime_http_egress {
         config = config.require_runtime_http_egress();
     }
@@ -151,6 +132,8 @@ async fn build_production_shaped(
         profile,
         owner_id: _,
         storage,
+        production_trust_policy,
+        turn_run_wake_notifier,
         required_runtime_backends,
         require_runtime_http_egress,
         require_wasm_credentials,
@@ -163,6 +146,8 @@ async fn build_production_shaped(
     );
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     let _ = (
+        production_trust_policy,
+        turn_run_wake_notifier,
         required_runtime_backends,
         require_runtime_http_egress,
         require_wasm_credentials,
@@ -184,9 +169,12 @@ async fn build_production_shaped(
             auth_token,
             secret_master_key,
         } => {
+            let production_wiring =
+                production_wiring(production_trust_policy, turn_run_wake_notifier)?;
             build_libsql_production(
                 profile,
                 wiring_config,
+                production_wiring,
                 db,
                 path_or_url,
                 auth_token,
@@ -199,14 +187,50 @@ async fn build_production_shaped(
             pool,
             url,
             secret_master_key,
-        } => build_postgres_production(profile, wiring_config, pool, url, secret_master_key).await,
+        } => {
+            let production_wiring =
+                production_wiring(production_trust_policy, turn_run_wake_notifier)?;
+            build_postgres_production(
+                profile,
+                wiring_config,
+                production_wiring,
+                pool,
+                url,
+                secret_master_key,
+            )
+            .await
+        }
     }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+struct RebornProductionWiring {
+    trust_policy: Arc<HostTrustPolicy>,
+    turn_run_wake_notifier: Arc<ironclaw_host_runtime::SchedulerTurnRunWakeNotifier>,
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn production_wiring(
+    trust_policy: Option<Arc<HostTrustPolicy>>,
+    turn_run_wake_notifier: Option<Arc<ironclaw_host_runtime::SchedulerTurnRunWakeNotifier>>,
+) -> Result<RebornProductionWiring, RebornBuildError> {
+    let trust_policy = trust_policy.ok_or(RebornBuildError::MissingProductionTrustPolicy)?;
+    if !trust_policy.has_sources() {
+        return Err(RebornBuildError::EmptyProductionTrustPolicy);
+    }
+    let turn_run_wake_notifier =
+        turn_run_wake_notifier.ok_or(RebornBuildError::MissingTurnRunWakeNotifier)?;
+    Ok(RebornProductionWiring {
+        trust_policy,
+        turn_run_wake_notifier,
+    })
 }
 
 #[cfg(feature = "libsql")]
 async fn build_libsql_production(
     profile: RebornCompositionProfile,
-    wiring_config: ProductionWiringConfig,
+    wiring_config: ironclaw_host_runtime::ProductionWiringConfig,
+    production_wiring: RebornProductionWiring,
     db: Arc<libsql::Database>,
     path_or_url: String,
     auth_token: Option<ironclaw_secrets::SecretMaterial>,
@@ -246,7 +270,7 @@ async fn build_libsql_production(
         ProcessServices::filesystem(Arc::clone(&filesystem)),
         CapabilitySurfaceVersion::new("reborn-app-v1")?,
     )
-    .with_trust_policy(Arc::new(HostTrustPolicy::empty()))
+    .with_trust_policy(production_wiring.trust_policy)
     .with_capability_leases(leases)
     .with_secret_store(secret_store)
     .with_libsql_resource_governor(Arc::clone(&db))
@@ -257,7 +281,7 @@ async fn build_libsql_production(
     .await?
     .with_libsql_turn_state_store(db)
     .await?
-    .with_turn_run_wake_notifier(Arc::new(RebornCompositionWakeNotifier));
+    .with_turn_run_wake_notifier(production_wiring.turn_run_wake_notifier);
 
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> =
         Arc::new(services.turn_coordinator_for_production()?);
@@ -274,7 +298,8 @@ async fn build_libsql_production(
 #[cfg(feature = "postgres")]
 async fn build_postgres_production(
     profile: RebornCompositionProfile,
-    wiring_config: ProductionWiringConfig,
+    wiring_config: ironclaw_host_runtime::ProductionWiringConfig,
+    production_wiring: RebornProductionWiring,
     pool: deadpool_postgres::Pool,
     url: ironclaw_secrets::SecretMaterial,
     secret_master_key: ironclaw_secrets::SecretMaterial,
@@ -307,7 +332,7 @@ async fn build_postgres_production(
         ProcessServices::filesystem(Arc::clone(&filesystem)),
         CapabilitySurfaceVersion::new("reborn-app-v1")?,
     )
-    .with_trust_policy(Arc::new(HostTrustPolicy::empty()))
+    .with_trust_policy(production_wiring.trust_policy)
     .with_capability_leases(leases)
     .with_secret_store(secret_store)
     .with_postgres_resource_governor(pool.clone())
@@ -318,7 +343,7 @@ async fn build_postgres_production(
     .await?
     .with_postgres_turn_state_store(pool)
     .await?
-    .with_turn_run_wake_notifier(Arc::new(RebornCompositionWakeNotifier));
+    .with_turn_run_wake_notifier(production_wiring.turn_run_wake_notifier);
 
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> =
         Arc::new(services.turn_coordinator_for_production()?);
