@@ -17,10 +17,11 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
         CapabilityBatchOutcome, CapabilityDenied, CapabilityDeniedReasonKind,
-        CapabilityDescriptorView, CapabilityFailure, CapabilityInputRef, CapabilityInvocation,
-        CapabilityOutcome, CapabilityResultMessage, ConcurrencyHint, LoopCapabilityPort,
-        LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopProcessRef, LoopRunContext,
-        LoopSafeSummary, ProcessHandleSummary, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        CapabilityDescriptorView, CapabilityFailure, CapabilityFailureKind, CapabilityInputRef,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, ConcurrencyHint,
+        LoopCapabilityPort, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopProcessRef,
+        LoopRunContext, LoopSafeSummary, ProcessHandleSummary, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
 };
 use tokio::sync::Notify;
@@ -560,10 +561,10 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             Err(error) => {
                 if let Err(clear_error) = self.clear_dispatch(&idempotency_key) {
                     tracing::warn!(
-                        clear_error = %clear_error,
-                        "failed to clear capability dispatch record after input resolution error"
+                        cleanup_error = %clear_error,
+                        original_error = ?error,
+                        "failed to clean up state after input resolution failure"
                     );
-                    return Err(clear_error);
                 }
                 return Err(error);
             }
@@ -576,10 +577,10 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
         {
             if let Err(clear_error) = self.clear_dispatch(&idempotency_key) {
                 tracing::warn!(
-                    clear_error = %clear_error,
-                    "failed to clear capability dispatch record after milestone emission error"
+                    cleanup_error = %clear_error,
+                    original_error = ?error,
+                    "failed to clean up state after milestone emission failure"
                 );
-                return Err(clear_error);
             }
             return Err(error);
         }
@@ -601,10 +602,10 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             Err(error) => {
                 if let Err(clear_error) = self.clear_dispatch(&idempotency_key) {
                     tracing::warn!(
-                        clear_error = %clear_error,
-                        "failed to clear capability dispatch record after host runtime error"
+                        cleanup_error = %clear_error,
+                        original_error = ?error,
+                        "failed to clean up state after host runtime failure"
                     );
-                    return Err(clear_error);
                 }
                 return Err(host_runtime_error(error));
             }
@@ -759,7 +760,7 @@ async fn runtime_outcome_to_loop(
                 })
             } else {
                 CapabilityOutcome::Failed(CapabilityFailure {
-                    error_kind: failure.kind.as_str().to_string(),
+                    error_kind: runtime_failure_kind_to_loop(failure.kind)?,
                     safe_summary: runtime_safe_summary(
                         failure.message,
                         "capability invocation failed",
@@ -769,13 +770,32 @@ async fn runtime_outcome_to_loop(
         }
         RuntimeCapabilityOutcome::Unknown(unknown) => {
             CapabilityOutcome::Failed(CapabilityFailure {
-                error_kind: unknown.kind,
+                error_kind: capability_failure_kind(unknown.kind)?,
                 safe_summary: runtime_safe_summary(
                     unknown.message,
                     "capability invocation returned an unknown outcome",
                 ),
             })
         }
+    })
+}
+
+fn runtime_failure_kind_to_loop(
+    kind: RuntimeFailureKind,
+) -> Result<CapabilityFailureKind, AgentLoopHostError> {
+    Ok(match kind {
+        RuntimeFailureKind::Authorization => CapabilityFailureKind::Authorization,
+        RuntimeFailureKind::Backend => CapabilityFailureKind::Backend,
+        RuntimeFailureKind::Cancelled => CapabilityFailureKind::Cancelled,
+        RuntimeFailureKind::Dispatcher => CapabilityFailureKind::Dispatcher,
+        RuntimeFailureKind::InvalidInput => CapabilityFailureKind::InvalidInput,
+        RuntimeFailureKind::MissingRuntime => CapabilityFailureKind::MissingRuntime,
+        RuntimeFailureKind::Network => CapabilityFailureKind::Network,
+        RuntimeFailureKind::OutputTooLarge => CapabilityFailureKind::OutputTooLarge,
+        RuntimeFailureKind::Process => CapabilityFailureKind::Process,
+        RuntimeFailureKind::Resource => CapabilityFailureKind::Resource,
+        RuntimeFailureKind::Unknown => capability_failure_kind("unknown")?,
+        _ => capability_failure_kind(kind.as_str())?,
     })
 }
 
@@ -808,6 +828,17 @@ fn capability_denied_reason_kind(
         AgentLoopHostError::new(
             AgentLoopHostErrorKind::Internal,
             "capability denied reason kind could not be represented",
+        )
+    })
+}
+
+fn capability_failure_kind(
+    value: impl Into<String>,
+) -> Result<CapabilityFailureKind, AgentLoopHostError> {
+    CapabilityFailureKind::unknown(value).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "capability failure kind could not be represented",
         )
     })
 }
