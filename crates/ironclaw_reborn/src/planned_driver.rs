@@ -508,6 +508,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn planned_driver_resume_schema_version_drift_fails_cleanly() {
+        // Stage a valid checkpoint payload under schema_version = 1 (current).
+        // Resume with a run context bumped to schema_version = 2.
+        // The host sees expected_schema_version = 2 but stored = 1 → InvalidInvocation
+        // → mapped to InvalidRequest (not checkpoint_unavailable).
+        let registry = build_loop_family_registry().expect("registry");
+        let driver = PlannedDriver::default_from_registry(&registry).expect("driver");
+        let mut context = run_context_for_driver(&driver);
+        let checkpoint_id = TurnCheckpointId::new();
+
+        // The stored payload carries the old (correct) schema version.
+        let stored_schema_version = context.checkpoint_schema_version;
+        let loaded = LoadedCheckpointPayload {
+            kind: LoopCheckpointKind::BeforeModel,
+            schema_id: context.checkpoint_schema_id.clone(),
+            schema_version: stored_schema_version,
+            payload: RedactedCheckpointPayload::new(b"{}".to_vec())
+                .expect("valid checkpoint payload"),
+        };
+
+        // Bump the run context's schema version to simulate a driver upgrade.
+        let bumped_version = RunProfileVersion::new(stored_schema_version.as_u64() + 1);
+        context.checkpoint_schema_version = bumped_version;
+        context.resolved_run_profile.checkpoint_schema_version = bumped_version;
+
+        let (inner, _checkpoints) = MockAgentLoopDriverHost::builder()
+            .run_context(context.clone())
+            .build();
+        let host = ResumePayloadHost::new(inner, checkpoint_id, loaded);
+
+        let result = driver
+            .resume(
+                AgentLoopDriverResumeRequest {
+                    turn_id: context.turn_id,
+                    run_id: context.run_id,
+                    checkpoint_id,
+                    resolved_run_profile: context.resolved_run_profile.clone(),
+                },
+                &host,
+            )
+            .await;
+
+        assert_eq!(
+            result.expect_err("schema version drift must fail"),
+            AgentLoopDriverError::InvalidRequest {
+                reason: "checkpoint load: invalid_invocation".to_string()
+            }
+        );
+        assert_eq!(host.load_call_count(), 1);
+        assert!(
+            host.call_log().is_empty(),
+            "schema version drift must fail before any executor host ports are invoked"
+        );
+    }
+
     fn run_context_for_driver(
         driver: &PlannedDriver,
     ) -> ironclaw_turns::run_profile::LoopRunContext {
