@@ -17,6 +17,10 @@ use ironclaw_host_api::{
 use serde_json::Value;
 
 /// Already-authorized first-party capability dispatch input.
+///
+/// This is host-composed first-party surface, so the struct is `non_exhaustive`:
+/// external crates may inspect fields in custom handlers but must not construct
+/// it with a struct literal.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct FirstPartyCapabilityRequest {

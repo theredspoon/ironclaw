@@ -421,12 +421,14 @@ async fn builtin_http_documents_mixed_utf8_response_as_binary() {
     .await
     .unwrap();
 
+    // Invalid UTF-8 makes the whole response binary so callers never receive
+    // split or lossy text/body fragments.
     assert_eq!(output["body_base64"], json!("aGVsbG//d29ybGQ="));
     assert!(output.get("body_text").is_none());
 }
 
 #[tokio::test]
-async fn builtin_http_rejects_header_nulls_and_oversized_header_sets() {
+async fn builtin_http_rejects_invalid_header_names_and_oversized_header_sets() {
     let egress = Arc::new(RecordingRuntimeHttpEgress::default());
     let runtime = runtime_with_http_egress(egress);
     let context = execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy());
@@ -442,6 +444,18 @@ async fn builtin_http_rejects_header_nulls_and_oversized_header_sets() {
         json!({
             "url": "https://api.example.test/v1/items",
             "headers": [{"name": "x\0bad", "value": "ok"}]
+        }),
+        json!({
+            "url": "https://api.example.test/v1/items",
+            "headers": [{"name": "x bad", "value": "ok"}]
+        }),
+        json!({
+            "url": "https://api.example.test/v1/items",
+            "headers": [{"name": "x:bad", "value": "ok"}]
+        }),
+        json!({
+            "url": "https://api.example.test/v1/items",
+            "headers": [{"name": "x-é", "value": "ok"}]
         }),
         json!({
             "url": "https://api.example.test/v1/items",

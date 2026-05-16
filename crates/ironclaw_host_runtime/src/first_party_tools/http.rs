@@ -3,7 +3,8 @@ use ironclaw_extensions::{CapabilityManifest, ExtensionError};
 use ironclaw_host_api::{
     CapabilityId, EffectKind, NetworkMethod, NetworkPolicy, PermissionMode, ResourceCeiling,
     ResourceEstimate, ResourceProfile, ResourceUsage, RuntimeDispatchErrorKind,
-    RuntimeHttpEgressError, RuntimeHttpEgressRequest, RuntimeKind, SandboxQuota,
+    RuntimeHttpEgressError, RuntimeHttpEgressReasonCode, RuntimeHttpEgressRequest, RuntimeKind,
+    SandboxQuota,
 };
 use serde_json::{Map, Value, json};
 
@@ -13,7 +14,7 @@ use super::{FIRST_PARTY_MAX_OUTPUT_BYTES, input_error};
 
 pub const HTTP_CAPABILITY_ID: &str = "builtin.http";
 
-const DEFAULT_HTTP_TIMEOUT_MS: u32 = 30_000;
+const DEFAULT_HTTP_TIMEOUT_MS: u32 = 10_000;
 const MAX_HTTP_TIMEOUT_MS: u32 = 30_000;
 const DEFAULT_RESPONSE_BODY_LIMIT: u64 = 512 * 1024;
 const MAX_RESPONSE_BODY_LIMIT: u64 = 700 * 1024;
@@ -63,7 +64,7 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                     ]
                 },
                 "body": {
-                    "description": "UTF-8 string or JSON value to send as the request body"
+                    "description": "UTF-8 string or JSON value to send as the request body. No Content-Type is set automatically; pass it via headers."
                 },
                 "body_base64": {
                     "type": "string",
@@ -71,7 +72,7 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                 },
                 "response_body_limit": {
                     "type": "integer",
-                    "description": "Maximum response body bytes to return. Omit to use the built-in fail-closed default cap; values must be at least 1.",
+                    "description": "Maximum raw response body bytes to return. Omit to use the built-in fail-closed default cap; values must be at least 1. Binary responses are base64-encoded and must still fit the first-party output ceiling.",
                     "minimum": 1,
                     "maximum": MAX_RESPONSE_BODY_LIMIT
                 },
@@ -133,7 +134,12 @@ pub(super) async fn dispatch(
     };
     let response = tokio::task::spawn_blocking(move || egress.execute(http_request))
         .await
-        .map_err(|_| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::Backend))?
+        .map_err(|error| {
+            if error.is_panic() {
+                tracing::error!("first-party HTTP egress worker panicked");
+            }
+            FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::Backend)
+        })?
         .map_err(http_error)?;
     let mut output = Map::new();
     output.insert("status".to_string(), json!(response.status));
@@ -218,12 +224,9 @@ fn headers(input: &Value) -> Result<Vec<(String, String)>, FirstPartyCapabilityE
 }
 
 fn header_pair(name: &str, value: &str) -> Result<(String, String), FirstPartyCapabilityError> {
-    if name.trim().is_empty()
+    if !valid_header_name(name)
         || name.len() > MAX_HTTP_HEADER_NAME_BYTES
         || value.len() > MAX_HTTP_HEADER_VALUE_BYTES
-        || name
-            .chars()
-            .any(|character| matches!(character, '\r' | '\n' | '\0'))
         || value
             .chars()
             .any(|character| matches!(character, '\r' | '\n' | '\0'))
@@ -231,6 +234,33 @@ fn header_pair(name: &str, value: &str) -> Result<(String, String), FirstPartyCa
         return Err(input_error());
     }
     Ok((name.to_string(), value.to_string()))
+}
+
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
+        })
 }
 
 fn body(input: &Value) -> Result<Vec<u8>, FirstPartyCapabilityError> {
@@ -296,14 +326,14 @@ fn response_headers(headers: Vec<(String, String)>) -> Value {
 }
 
 fn http_error(error: RuntimeHttpEgressError) -> FirstPartyCapabilityError {
-    let kind = match &error {
-        RuntimeHttpEgressError::Credential { .. } => RuntimeDispatchErrorKind::Client,
-        RuntimeHttpEgressError::Request { .. } => RuntimeDispatchErrorKind::InputEncode,
-        RuntimeHttpEgressError::Network { reason, .. } if response_body_limit_reason(reason) => {
+    let kind = match error.reason_code() {
+        RuntimeHttpEgressReasonCode::CredentialUnavailable => RuntimeDispatchErrorKind::Client,
+        RuntimeHttpEgressReasonCode::RequestDenied => RuntimeDispatchErrorKind::InputEncode,
+        RuntimeHttpEgressReasonCode::NetworkError => RuntimeDispatchErrorKind::NetworkDenied,
+        RuntimeHttpEgressReasonCode::ResponseError => RuntimeDispatchErrorKind::OutputDecode,
+        RuntimeHttpEgressReasonCode::ResponseBodyLimitExceeded => {
             RuntimeDispatchErrorKind::OutputTooLarge
         }
-        RuntimeHttpEgressError::Network { .. } => RuntimeDispatchErrorKind::NetworkDenied,
-        RuntimeHttpEgressError::Response { reason, .. } => response_error_kind(reason),
     };
     tracing::debug!(
         runtime_http_reason = error.stable_runtime_reason(),
@@ -315,16 +345,4 @@ fn http_error(error: RuntimeHttpEgressError) -> FirstPartyCapabilityError {
         usage.network_egress_bytes = error.request_bytes();
     }
     FirstPartyCapabilityError::new(kind).with_usage(usage)
-}
-
-fn response_error_kind(reason: &str) -> RuntimeDispatchErrorKind {
-    if response_body_limit_reason(reason) || reason.contains("too_large") {
-        RuntimeDispatchErrorKind::OutputTooLarge
-    } else {
-        RuntimeDispatchErrorKind::OutputDecode
-    }
-}
-
-fn response_body_limit_reason(reason: &str) -> bool {
-    reason.contains("response_body_limit") || reason.contains("body_limit")
 }
