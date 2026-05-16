@@ -627,24 +627,11 @@ impl HostIdentityContextSource for EmptyIdentityContextSource {
 fn build_llm_gateway(
     cfg: RebornLlmConfig,
 ) -> Result<Arc<dyn ironclaw_loop_support::HostManagedModelGateway>, RebornRuntimeError> {
-    use ironclaw_llm::{ProviderProtocol, RegistryProviderConfig, config::CacheRetention};
+    use ironclaw_llm::{RegistryProviderConfig, config::CacheRetention};
     use ironclaw_reborn::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
     use ironclaw_turns::run_profile::ModelProfileId;
 
-    let protocol = match cfg.protocol.as_str() {
-        "openai_completions" | "openai" => ProviderProtocol::OpenAiCompletions,
-        "anthropic" => ProviderProtocol::Anthropic,
-        "ollama" => ProviderProtocol::Ollama,
-        "deepseek" => ProviderProtocol::DeepSeek,
-        "gemini" => ProviderProtocol::Gemini,
-        "openrouter" => ProviderProtocol::OpenRouter,
-        "github_copilot" => ProviderProtocol::GithubCopilot,
-        other => {
-            return Err(RebornRuntimeError::LlmProvider(format!(
-                "unsupported llm protocol: {other}"
-            )));
-        }
-    };
+    let protocol = parse_provider_protocol(&cfg.protocol)?;
     let registry_config = RegistryProviderConfig {
         protocol,
         provider_id: cfg.provider_id.clone(),
@@ -663,11 +650,80 @@ fn build_llm_gateway(
         ironclaw_llm::create_registry_provider(&registry_config, cfg.request_timeout_secs)
             .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
 
-    let model_profile_id = ModelProfileId::new("interactive_model").expect("static id");
+    let model_profile_id = ModelProfileId::new("interactive_model").map_err(|reason| {
+        RebornRuntimeError::LlmProvider(format!("invalid interactive model profile id: {reason}"))
+    })?;
     let policy =
         LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, Some(cfg.model.clone()));
     let gateway = LlmProviderModelGateway::new(provider, policy);
     Ok(Arc::new(gateway))
+}
+
+#[cfg(feature = "root-llm-provider")]
+fn parse_provider_protocol(
+    protocol: &str,
+) -> Result<ironclaw_llm::ProviderProtocol, RebornRuntimeError> {
+    let normalized_protocol = if protocol == "openai" || protocol == "openai_completions" {
+        "open_ai_completions"
+    } else if protocol == "deepseek" {
+        "deep_seek"
+    } else if protocol == "openrouter" {
+        "open_router"
+    } else {
+        protocol
+    };
+
+    serde_json::from_value(serde_json::Value::String(normalized_protocol.to_string())).map_err(
+        |_| RebornRuntimeError::LlmProvider(format!("unsupported llm protocol: {protocol}")),
+    )
+}
+
+#[cfg(all(test, feature = "root-llm-provider"))]
+mod tests {
+    use ironclaw_llm::ProviderProtocol;
+
+    use super::parse_provider_protocol;
+
+    #[test]
+    fn parses_supported_provider_protocols_without_wildcard_mapping() {
+        assert_eq!(
+            parse_provider_protocol("openai_completions").unwrap(),
+            ProviderProtocol::OpenAiCompletions
+        );
+        assert_eq!(
+            parse_provider_protocol("openai").unwrap(),
+            ProviderProtocol::OpenAiCompletions
+        );
+        assert_eq!(
+            parse_provider_protocol("anthropic").unwrap(),
+            ProviderProtocol::Anthropic
+        );
+        assert_eq!(
+            parse_provider_protocol("ollama").unwrap(),
+            ProviderProtocol::Ollama
+        );
+        assert_eq!(
+            parse_provider_protocol("deepseek").unwrap(),
+            ProviderProtocol::DeepSeek
+        );
+        assert_eq!(
+            parse_provider_protocol("gemini").unwrap(),
+            ProviderProtocol::Gemini
+        );
+        assert_eq!(
+            parse_provider_protocol("openrouter").unwrap(),
+            ProviderProtocol::OpenRouter
+        );
+        assert_eq!(
+            parse_provider_protocol("github_copilot").unwrap(),
+            ProviderProtocol::GithubCopilot
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_provider_protocol() {
+        assert!(parse_provider_protocol("made_up_protocol").is_err());
+    }
 }
 
 fn build_stub_gateway() -> Arc<dyn ironclaw_loop_support::HostManagedModelGateway> {
