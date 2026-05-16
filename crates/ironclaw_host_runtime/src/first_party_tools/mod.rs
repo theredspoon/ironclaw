@@ -115,7 +115,7 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
             TIME_CAPABILITY_ID => time::dispatch(&request.input)?,
             JSON_CAPABILITY_ID => json::dispatch(&request.input)?,
             HTTP_CAPABILITY_ID => {
-                let result = http::dispatch(&request)?;
+                let result = http::dispatch(&request).await?;
                 network_egress_bytes = result.network_egress_bytes;
                 result.output
             }

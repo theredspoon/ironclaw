@@ -18,6 +18,10 @@ const MAX_HTTP_TIMEOUT_MS: u32 = 30_000;
 const DEFAULT_RESPONSE_BODY_LIMIT: u64 = 512 * 1024;
 const MAX_RESPONSE_BODY_LIMIT: u64 = 700 * 1024;
 const DEFAULT_NETWORK_EGRESS_BYTES: u64 = 16 * 1024;
+const MAX_NETWORK_EGRESS_BYTES: u64 = 256 * 1024;
+const MAX_HTTP_HEADERS: usize = 64;
+const MAX_HTTP_HEADER_NAME_BYTES: usize = 512;
+const MAX_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
 
 pub(super) struct HttpDispatchOutput {
     pub output: Value,
@@ -39,6 +43,7 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                 },
                 "url": { "type": "string" },
                 "headers": {
+                    "description": "Request headers as either an array of {name,value} pairs or an object. Array form preserves duplicate header names; object form does not.",
                     "oneOf": [
                         {
                             "type": "array",
@@ -66,7 +71,8 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                 },
                 "response_body_limit": {
                     "type": "integer",
-                    "minimum": 0,
+                    "description": "Maximum response body bytes to return. Omit to use the built-in fail-closed default cap; values must be at least 1.",
+                    "minimum": 1,
                     "maximum": MAX_RESPONSE_BODY_LIMIT
                 },
                 "timeout_ms": {
@@ -91,7 +97,7 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                 max_wall_clock_ms: Some(MAX_HTTP_TIMEOUT_MS.into()),
                 max_output_bytes: Some(FIRST_PARTY_MAX_OUTPUT_BYTES),
                 sandbox: Some(SandboxQuota {
-                    network_egress_bytes: Some(FIRST_PARTY_MAX_OUTPUT_BYTES),
+                    network_egress_bytes: Some(MAX_NETWORK_EGRESS_BYTES),
                     ..SandboxQuota::default()
                 }),
             }),
@@ -99,13 +105,17 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
     })
 }
 
-pub(super) fn dispatch(
+pub(super) async fn dispatch(
     request: &FirstPartyCapabilityRequest,
 ) -> Result<HttpDispatchOutput, FirstPartyCapabilityError> {
     let egress = request
         .runtime_http_egress
         .as_ref()
-        .ok_or_else(|| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::NetworkDenied))?;
+        .ok_or_else(|| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::NetworkDenied))?
+        .clone();
+    // Keep this handler as a translator only: URL parsing, DNS/private-IP
+    // enforcement, allowlists, transport, and credential injection remain in
+    // HostHttpEgressService / ironclaw_network.
     let http_request = RuntimeHttpEgressRequest {
         runtime: RuntimeKind::FirstParty,
         scope: request.scope.clone(),
@@ -116,13 +126,20 @@ pub(super) fn dispatch(
         body: body(&request.input)?,
         network_policy: NetworkPolicy::default(),
         credential_injections: Vec::new(),
+        // Always send a bounded limit, even when caller omits the field, so the
+        // host transport stays fail-closed instead of inheriting an unbounded cap.
         response_body_limit: Some(response_body_limit(&request.input)?),
         timeout_ms: Some(timeout_ms(&request.input)?),
     };
-    let response = egress.execute(http_request).map_err(http_error)?;
+    let response = tokio::task::spawn_blocking(move || egress.execute(http_request))
+        .await
+        .map_err(|_| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::Backend))?
+        .map_err(http_error)?;
     let mut output = Map::new();
     output.insert("status".to_string(), json!(response.status));
     output.insert("headers".to_string(), response_headers(response.headers));
+    // Response bodies must be valid UTF-8 to appear as body_text. Any invalid
+    // byte returns the full response as body_base64 to avoid lossy surprises.
     match String::from_utf8(response.body) {
         Ok(body_text) => {
             output.insert("body_text".to_string(), Value::String(body_text));
@@ -176,14 +193,14 @@ fn headers(input: &Value) -> Result<Vec<(String, String)>, FirstPartyCapabilityE
     let Some(headers) = input.get("headers") else {
         return Ok(Vec::new());
     };
-    match headers {
+    let parsed: Vec<(String, String)> = match headers {
         Value::Object(object) => object
             .iter()
             .map(|(name, value)| {
                 let value = value.as_str().ok_or_else(input_error)?;
                 header_pair(name, value)
             })
-            .collect(),
+            .collect::<Result<_, _>>()?,
         Value::Array(items) => items
             .iter()
             .map(|item| {
@@ -191,19 +208,25 @@ fn headers(input: &Value) -> Result<Vec<(String, String)>, FirstPartyCapabilityE
                 let value = required_string(item, "value")?;
                 header_pair(name, value)
             })
-            .collect(),
-        _ => Err(input_error()),
+            .collect::<Result<_, _>>()?,
+        _ => return Err(input_error()),
+    };
+    if parsed.len() > MAX_HTTP_HEADERS {
+        return Err(input_error());
     }
+    Ok(parsed)
 }
 
 fn header_pair(name: &str, value: &str) -> Result<(String, String), FirstPartyCapabilityError> {
     if name.trim().is_empty()
+        || name.len() > MAX_HTTP_HEADER_NAME_BYTES
+        || value.len() > MAX_HTTP_HEADER_VALUE_BYTES
         || name
             .chars()
-            .any(|character| matches!(character, '\r' | '\n'))
+            .any(|character| matches!(character, '\r' | '\n' | '\0'))
         || value
             .chars()
-            .any(|character| matches!(character, '\r' | '\n'))
+            .any(|character| matches!(character, '\r' | '\n' | '\0'))
     {
         return Err(input_error());
     }
@@ -226,10 +249,11 @@ fn body(input: &Value) -> Result<Vec<u8>, FirstPartyCapabilityError> {
 }
 
 fn response_body_limit(input: &Value) -> Result<u64, FirstPartyCapabilityError> {
-    capped_u64(
+    ranged_u64(
         input,
         "response_body_limit",
         DEFAULT_RESPONSE_BODY_LIMIT,
+        1,
         MAX_RESPONSE_BODY_LIMIT,
     )
 }
@@ -243,15 +267,6 @@ fn timeout_ms(input: &Value) -> Result<u32, FirstPartyCapabilityError> {
         MAX_HTTP_TIMEOUT_MS.into(),
     )?;
     u32::try_from(value).map_err(|_| input_error())
-}
-
-fn capped_u64(
-    input: &Value,
-    field: &str,
-    default: u64,
-    max: u64,
-) -> Result<u64, FirstPartyCapabilityError> {
-    ranged_u64(input, field, default, 0, max)
 }
 
 fn ranged_u64(
@@ -281,10 +296,35 @@ fn response_headers(headers: Vec<(String, String)>) -> Value {
 }
 
 fn http_error(error: RuntimeHttpEgressError) -> FirstPartyCapabilityError {
-    FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::NetworkDenied).with_usage(
-        ResourceUsage {
-            network_egress_bytes: error.request_bytes(),
-            ..ResourceUsage::default()
-        },
-    )
+    let kind = match &error {
+        RuntimeHttpEgressError::Credential { .. } => RuntimeDispatchErrorKind::Client,
+        RuntimeHttpEgressError::Request { .. } => RuntimeDispatchErrorKind::InputEncode,
+        RuntimeHttpEgressError::Network { reason, .. } if response_body_limit_reason(reason) => {
+            RuntimeDispatchErrorKind::OutputTooLarge
+        }
+        RuntimeHttpEgressError::Network { .. } => RuntimeDispatchErrorKind::NetworkDenied,
+        RuntimeHttpEgressError::Response { reason, .. } => response_error_kind(reason),
+    };
+    tracing::debug!(
+        runtime_http_reason = error.stable_runtime_reason(),
+        dispatch_error_kind = kind.as_str(),
+        "first-party HTTP egress failed"
+    );
+    let mut usage = ResourceUsage::default();
+    if !matches!(error, RuntimeHttpEgressError::Credential { .. }) {
+        usage.network_egress_bytes = error.request_bytes();
+    }
+    FirstPartyCapabilityError::new(kind).with_usage(usage)
+}
+
+fn response_error_kind(reason: &str) -> RuntimeDispatchErrorKind {
+    if response_body_limit_reason(reason) || reason.contains("too_large") {
+        RuntimeDispatchErrorKind::OutputTooLarge
+    } else {
+        RuntimeDispatchErrorKind::OutputDecode
+    }
+}
+
+fn response_body_limit_reason(reason: &str) -> bool {
+    reason.contains("response_body_limit") || reason.contains("body_limit")
 }
