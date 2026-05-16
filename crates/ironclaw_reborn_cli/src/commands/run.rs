@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::Args;
 use ironclaw_reborn_composition::{
     RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime,
+    reborn_runtime_readiness_snapshot,
 };
 use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
 
@@ -60,14 +61,44 @@ impl RunCommand {
 
 fn run_dry(context: RebornCliContext) -> anyhow::Result<()> {
     let config = context.boot_config();
-    println!("IronClaw Reborn runtime shell");
+    let readiness = reborn_runtime_readiness_snapshot();
+    let driver_registry_initialized =
+        readiness.text_only_driver.is_initialized() && readiness.planned_driver.is_initialized();
+    println!("IronClaw Reborn runtime readiness snapshot");
     println!("binary: ironclaw-reborn");
     println!("version: {}", env!("CARGO_PKG_VERSION"));
     println!("reborn_home: {}", config.home().path().display());
     println!("home_source: {}", config.home().source_label());
     println!("profile: {}", config.profile());
     println!("v1_state: not-used");
-    println!("runtime_shell: initialized (dry-run)");
+    println!(
+        "text_only_driver: {}",
+        readiness.text_only_driver.render("initialized")
+    );
+    println!(
+        "planned_driver: {}",
+        readiness.planned_driver.render("initialized")
+    );
+    println!(
+        "driver_registry: {}",
+        if driver_registry_initialized {
+            "initialized"
+        } else {
+            "unavailable"
+        }
+    );
+    println!(
+        "local_runtime_shell_readiness: {}",
+        if driver_registry_initialized && readiness.planned_default_profile.is_initialized() {
+            "ready"
+        } else {
+            "unavailable"
+        }
+    );
+    println!(
+        "planned_default_profile: {}",
+        readiness.planned_default_profile.render("available")
+    );
     Ok(())
 }
 

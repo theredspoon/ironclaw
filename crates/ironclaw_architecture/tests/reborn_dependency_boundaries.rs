@@ -399,10 +399,9 @@ fn reborn_loop_support_llm_wiring_stays_out_of_root_src() {
     // and `ironclaw_llm` (direct) live behind a `root-llm-provider` feature
     // on the composition crate, so a default build of composition stays
     // substrate-only.
-    let composition_manifest = std::fs::read_to_string(
-        root.join("crates/ironclaw_reborn_composition/Cargo.toml"),
-    )
-    .expect("Reborn composition manifest must be readable");
+    let composition_manifest =
+        std::fs::read_to_string(root.join("crates/ironclaw_reborn_composition/Cargo.toml"))
+            .expect("Reborn composition manifest must be readable");
     assert!(
         composition_manifest.contains("root-llm-provider")
             && composition_manifest.contains("ironclaw_llm")

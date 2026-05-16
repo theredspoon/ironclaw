@@ -25,6 +25,7 @@ pub mod model_routes;
 pub mod planned_driver;
 pub mod planned_driver_factory;
 pub mod production_readiness;
+pub mod runtime;
 pub mod text_loop_driver;
 pub mod turn_runner;
 
