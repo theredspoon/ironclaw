@@ -24,7 +24,7 @@ use ironclaw_product_workflow::{
     InboundTurnService, ResolvedBinding,
 };
 use ironclaw_reborn::loop_driver_host::LoopCapabilityPortFactory;
-use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
+use ironclaw_reborn::loop_exit_applier::InMemoryLoopExitEvidencePort;
 use ironclaw_reborn::model_routes::{
     ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, StaticModelRouteResolver,
 };
@@ -137,15 +137,7 @@ impl ProductLiveAgentLoopHarness {
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
             capability_factory: Arc::new(EmptyCapabilityFactory),
             capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
-            loop_exit_evidence: Arc::new(
-                ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
-                    Arc::new(thread_service.clone()),
-                    Arc::clone(&turn_store) as Arc<dyn TurnStateStore>,
-                    checkpoint_store,
-                    thread_scope.clone(),
-                )
-                .with_cancellation_factory(cancellation_factory.clone()),
-            ),
+            loop_exit_evidence: Arc::new(InMemoryLoopExitEvidencePort::new()),
             config: DefaultPlannedRuntimeConfig::default(),
             model_route_resolver: Some(model_route_resolver),
             cancellation_factory: Some(cancellation_factory),
@@ -341,6 +333,22 @@ struct ReadyRunCancellationFactory {
     handles: Arc<Mutex<HashMap<TurnRunId, RunCancellationHandle>>>,
 }
 
+impl ReadyRunCancellationFactory {
+    fn handle_for(&self, run_id: TurnRunId) -> Option<RunCancellationHandle> {
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .get(&run_id)
+            .cloned()
+    }
+
+    fn product_cancellation_observed(&self, run_id: TurnRunId) -> bool {
+        self.handle_for(run_id)
+            .map(|handle| handle.is_requested())
+            .unwrap_or(false)
+    }
+}
+
 #[async_trait]
 impl RunCancellationFactory for ReadyRunCancellationFactory {
     async fn handle_for_run(
@@ -360,20 +368,21 @@ impl RunCancellationFactory for ReadyRunCancellationFactory {
         if wake.status != TurnStatus::CancelRequested {
             return;
         }
-        if let Some(handle) = self
-            .handles
-            .lock()
-            .expect("ready cancellation lock poisoned")
-            .get(&wake.run_id)
-            .cloned()
-        {
+        if let Some(handle) = self.handle_for(wake.run_id) {
             handle.request(LoopCancelReasonKind::UserRequested);
         }
     }
 
     fn product_live_cancellation_probe(&self) -> Option<Box<dyn ProductLiveCancellationProbe>> {
+        let run_id = TurnRunId::new();
+        let handle = RunCancellationHandle::default();
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .insert(run_id, handle);
         Some(Box::new(ReadyRunCancellationProbe {
-            handle: RunCancellationHandle::default(),
+            handles: Arc::clone(&self.handles),
+            run_id,
         }))
     }
 
@@ -381,18 +390,33 @@ impl RunCancellationFactory for ReadyRunCancellationFactory {
         &self,
         run_id: TurnRunId,
     ) -> Result<bool, AgentLoopHostError> {
-        Ok(self
-            .handles
-            .lock()
-            .expect("ready cancellation lock poisoned")
-            .get(&run_id)
-            .map(RunCancellationHandle::is_requested)
-            .unwrap_or(false))
+        Ok(self.product_cancellation_observed(run_id))
     }
 }
 
 struct ReadyRunCancellationProbe {
-    handle: RunCancellationHandle,
+    handles: Arc<Mutex<HashMap<TurnRunId, RunCancellationHandle>>>,
+    run_id: TurnRunId,
+}
+
+impl ReadyRunCancellationProbe {
+    fn handle(&self) -> RunCancellationHandle {
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .get(&self.run_id)
+            .cloned()
+            .expect("probe handle retained for readiness check")
+    }
+}
+
+impl Drop for ReadyRunCancellationProbe {
+    fn drop(&mut self) {
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .remove(&self.run_id);
+    }
 }
 
 impl ProductLiveCancellationProbe for ReadyRunCancellationProbe {
@@ -400,12 +424,12 @@ impl ProductLiveCancellationProbe for ReadyRunCancellationProbe {
         &self,
         reason_kind: LoopCancelReasonKind,
     ) -> Result<(), AgentLoopHostError> {
-        self.handle.request(reason_kind);
+        self.handle().request(reason_kind);
         Ok(())
     }
 
     fn is_cancellation_observed(&self) -> Result<bool, AgentLoopHostError> {
-        Ok(self.handle.is_requested())
+        Ok(self.handle().is_requested())
     }
 }
 
