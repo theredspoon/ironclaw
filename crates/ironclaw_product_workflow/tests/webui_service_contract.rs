@@ -51,6 +51,10 @@ struct RecordingTurnCoordinator {
     submit_response: Mutex<Option<Result<SubmitTurnResponse, TurnError>>>,
     resume_response: Mutex<Option<Result<ResumeTurnResponse, TurnError>>>,
     cancel_response: Mutex<Option<Result<CancelRunResponse, TurnError>>>,
+    // get_run_state is consulted by the facade before denied/cancelled gate
+    // resolutions to verify the run is parked on the supplied gate_ref. Tests
+    // program this independently from the cancel response.
+    get_run_state_response: Mutex<Option<Result<TurnRunState, TurnError>>>,
 }
 
 impl RecordingTurnCoordinator {
@@ -60,6 +64,7 @@ impl RecordingTurnCoordinator {
             submit_response: Mutex::new(None),
             resume_response: Mutex::new(None),
             cancel_response: Mutex::new(None),
+            get_run_state_response: Mutex::new(None),
         }
     }
 
@@ -73,6 +78,10 @@ impl RecordingTurnCoordinator {
 
     fn program_cancel(&self, response: Result<CancelRunResponse, TurnError>) {
         *self.cancel_response.lock().unwrap() = Some(response);
+    }
+
+    fn program_get_run_state(&self, response: Result<TurnRunState, TurnError>) {
+        *self.get_run_state_response.lock().unwrap() = Some(response);
     }
 
     fn submits(&self) -> Vec<SubmitTurnRequest> {
@@ -124,7 +133,11 @@ impl TurnCoordinator for RecordingTurnCoordinator {
     }
 
     async fn get_run_state(&self, _request: GetRunStateRequest) -> Result<TurnRunState, TurnError> {
-        Err(TurnError::ScopeNotFound)
+        self.get_run_state_response
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(Err(TurnError::ScopeNotFound))
     }
 }
 
@@ -262,10 +275,59 @@ fn build_service() -> (
     (threads, coordinator, projections, service)
 }
 
+/// Ensure the thread for `scope.thread_id` is materialized with `caller` as
+/// owner so subsequent ownership checks (`assert_thread_owned_by`) succeed.
+async fn setup_owned_thread(
+    service: &DefaultWebUiService,
+    caller: &WebUiAuthenticatedCaller,
+    thread: &ThreadId,
+) {
+    service
+        .create_thread(WebUiCreateThreadCommand {
+            caller: caller.clone(),
+            client_action_id: idempotency(&format!("setup-{}", thread.as_str())),
+            requested_thread_id: Some(thread.clone()),
+        })
+        .await
+        .expect("setup owned thread");
+}
+
+/// Construct a `TurnRunState` for the recording-stub `get_run_state` response
+/// so tests can assert the facade's gate-aware cancel verification.
+fn run_state_parked_on(
+    scope: &TurnScope,
+    run_id: TurnRunId,
+    gate_ref: Option<GateRef>,
+) -> TurnRunState {
+    TurnRunState {
+        scope: scope.clone(),
+        turn_id: ironclaw_turns::TurnId::new(),
+        run_id,
+        status: TurnStatus::BlockedApproval,
+        accepted_message_ref: ironclaw_turns::AcceptedMessageRef::new("msg:stub")
+            .expect("message ref"),
+        source_binding_ref: ironclaw_turns::SourceBindingRef::new("src:stub").expect("src"),
+        reply_target_binding_ref: ironclaw_turns::ReplyTargetBindingRef::new("reply:stub")
+            .expect("reply"),
+        resolved_run_profile_id: ironclaw_turns::RunProfileId::new("default").expect("profile id"),
+        resolved_run_profile_version: ironclaw_turns::RunProfileVersion::new(1),
+        resolved_model_route: None,
+        received_at: chrono::Utc::now(),
+        checkpoint_id: None,
+        gate_ref,
+        failure: None,
+        event_cursor: Default::default(),
+    }
+}
+
 fn submit_accepted(scope: &TurnScope) -> SubmitTurnResponse {
+    submit_accepted_with_run_id(scope, TurnRunId::new())
+}
+
+fn submit_accepted_with_run_id(scope: &TurnScope, run_id: TurnRunId) -> SubmitTurnResponse {
     SubmitTurnResponse::Accepted {
         turn_id: ironclaw_turns::TurnId::new(),
-        run_id: TurnRunId::new(),
+        run_id,
         status: TurnStatus::Queued,
         resolved_run_profile_id: ironclaw_turns::RunProfileId::new("default").expect("profile id"),
         resolved_run_profile_version: ironclaw_turns::RunProfileVersion::new(1),
@@ -423,6 +485,47 @@ async fn create_thread_scope_mismatch_maps_to_forbidden() {
     assert!(!err.retryable());
 }
 
+// Regression: deriving thread_id only from `client_action_id` would let two
+// unrelated callers using the same idempotency key collide on the globally
+// unique `ThreadId` and serve the second a 403. Derive must be namespaced by
+// caller scope so distinct callers get distinct ids even when keys clash.
+#[tokio::test]
+async fn create_thread_namespaces_derived_id_by_caller_scope() {
+    let (_threads, _coordinator, _projections, service) = build_service();
+
+    let alice = caller_with_agent();
+    let bob = WebUiAuthenticatedCaller::new(
+        TenantId::new("tenant-bravo").expect("tenant"),
+        UserId::new("user-bob").expect("user"),
+        Some(AgentId::new("agent-bob").expect("agent")),
+        None,
+    );
+
+    let alice_thread = service
+        .create_thread(WebUiCreateThreadCommand {
+            caller: alice,
+            client_action_id: idempotency("same-key"),
+            requested_thread_id: None,
+        })
+        .await
+        .expect("alice create");
+
+    let bob_thread = service
+        .create_thread(WebUiCreateThreadCommand {
+            caller: bob,
+            client_action_id: idempotency("same-key"),
+            requested_thread_id: None,
+        })
+        .await
+        .expect("bob create");
+
+    assert_ne!(
+        alice_thread.thread_id, bob_thread.thread_id,
+        "two callers using the same client_action_id must NOT collide on \
+         a globally-unique ThreadId; the derive must namespace by caller scope"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // send_message
 // ---------------------------------------------------------------------------
@@ -552,6 +655,58 @@ async fn send_message_requires_agent_context() {
     assert_eq!(err, WebUiServiceError::MissingAgentContext);
 }
 
+// Regression: a browser retrying send_message with the same client_action_id
+// after a successful first call must NOT receive 409. The coordinator replays
+// the original SubmitTurnResponse, the message is already Submitted, and
+// mark_message_submitted would otherwise return InvalidMessageTransition
+// { from: Submitted }. The facade must swallow exactly that transition.
+#[tokio::test]
+async fn send_message_idempotent_retry_returns_submitted_outcome() {
+    let (_threads, coordinator, _projections, service) = build_service();
+    let caller = caller_with_agent();
+    let thread = thread_id("thread:webui:retry");
+    let scope = turn_scope_for(&caller, &thread);
+
+    // First call: succeeds end to end.
+    coordinator.program_submit(Ok(submit_accepted(&scope)));
+    let first = service
+        .send_message(WebUiSendMessageCommand {
+            scope: scope.clone(),
+            actor: caller.actor(),
+            client_action_id: idempotency("retry-1"),
+            content: "hello".to_string(),
+        })
+        .await
+        .expect("first send");
+    let first_run_id = match first.run {
+        WebUiMessageRunOutcome::Submitted { run_id } => run_id,
+        other => panic!("expected Submitted, got {other:?}"),
+    };
+
+    // Second call: same client_action_id. The InMemorySessionThreadService
+    // returns the same accepted message (in Submitted state now), and we
+    // program the coordinator to replay an Accepted response with the same
+    // run_id (mirroring the real coordinator's idempotency ledger). The
+    // facade must NOT bubble up a 409 from mark_message_submitted.
+    coordinator.program_submit(Ok(submit_accepted_with_run_id(&scope, first_run_id)));
+    let second = service
+        .send_message(WebUiSendMessageCommand {
+            scope,
+            actor: caller.actor(),
+            client_action_id: idempotency("retry-1"),
+            content: "hello".to_string(),
+        })
+        .await
+        .expect("idempotent retry must succeed");
+
+    match second.run {
+        WebUiMessageRunOutcome::Submitted { run_id } => assert_eq!(run_id, first_run_id),
+        other => panic!("expected Submitted on retry, got {other:?}"),
+    }
+    assert_eq!(first.accepted_message_ref, second.accepted_message_ref);
+    assert_eq!(first.thread_id, second.thread_id);
+}
+
 // ---------------------------------------------------------------------------
 // cancel_run
 // ---------------------------------------------------------------------------
@@ -560,7 +715,9 @@ async fn send_message_requires_agent_context() {
 async fn cancel_run_forwards_to_coordinator_and_maps_response() {
     let (_threads, coordinator, _projections, service) = build_service();
     let caller = caller_with_agent();
-    let scope = turn_scope_for(&caller, &thread_id("thread:webui:zeta"));
+    let thread = thread_id("thread:webui:zeta");
+    let scope = turn_scope_for(&caller, &thread);
+    setup_owned_thread(&service, &caller, &thread).await;
     let run_id = TurnRunId::new();
     coordinator.program_cancel(Ok(CancelRunResponse {
         run_id,
@@ -594,7 +751,9 @@ async fn cancel_run_forwards_to_coordinator_and_maps_response() {
 async fn cancel_run_propagates_turn_error() {
     let (_threads, coordinator, _projections, service) = build_service();
     let caller = caller_with_agent();
-    let scope = turn_scope_for(&caller, &thread_id("thread:webui:eta"));
+    let thread = thread_id("thread:webui:eta");
+    let scope = turn_scope_for(&caller, &thread);
+    setup_owned_thread(&service, &caller, &thread).await;
     coordinator.program_cancel(Err(TurnError::ScopeNotFound));
 
     let err = service
@@ -614,6 +773,45 @@ async fn cancel_run_propagates_turn_error() {
         }
         other => panic!("expected TurnRejected, got {other:?}"),
     }
+}
+
+// Regression: cancel_run must reject when the authenticated user does not own
+// the thread. TurnScope only carries (tenant, agent, project, thread_id), so
+// without this check any caller sharing an agent scope could cancel another
+// user's run by guessing the run_id.
+#[tokio::test]
+async fn cancel_run_rejects_cross_user_access() {
+    let (_threads, coordinator, _projections, service) = build_service();
+    let alice = caller_with_agent();
+    let thread = thread_id("thread:webui:alice-owned");
+    setup_owned_thread(&service, &alice, &thread).await;
+
+    let bob = WebUiAuthenticatedCaller::new(
+        TenantId::new("tenant-alpha").expect("tenant"),
+        UserId::new("user-bob").expect("user"),
+        alice.agent_id.clone(),
+        alice.project_id.clone(),
+    );
+    // Bob shares Alice's (tenant, agent, project) scope. He guesses Alice's
+    // thread_id and tries to cancel her run.
+    let bob_scope = bob.turn_scope(thread);
+
+    let err = service
+        .cancel_run(WebUiCancelRunCommand {
+            scope: bob_scope,
+            actor: bob.actor(),
+            run_id: TurnRunId::new(),
+            reason: SanitizedCancelReason::UserRequested,
+            client_action_id: idempotency("cancel-cross"),
+        })
+        .await
+        .expect_err("cross-user cancel must be rejected");
+
+    // Indistinguishable from a non-existent thread — no existence leak.
+    assert_eq!(err, WebUiServiceError::NotFound);
+    assert_eq!(err.status_code(), 404);
+    // The cross-user request must never reach the coordinator.
+    assert!(coordinator.cancels().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +839,9 @@ fn cancel_response(run_id: TurnRunId) -> CancelRunResponse {
 async fn resolve_gate_approved_routes_to_resume_turn() {
     let (_threads, coordinator, _projections, service) = build_service();
     let caller = caller_with_agent();
-    let scope = turn_scope_for(&caller, &thread_id("thread:webui:theta"));
+    let thread = thread_id("thread:webui:theta");
+    let scope = turn_scope_for(&caller, &thread);
+    setup_owned_thread(&service, &caller, &thread).await;
     let run_id = TurnRunId::new();
     coordinator.program_resume(Ok(resume_response(run_id)));
 
@@ -662,6 +862,41 @@ async fn resolve_gate_approved_routes_to_resume_turn() {
         other => panic!("expected Resumed, got {other:?}"),
     }
     assert_eq!(coordinator.resumes().len(), 1);
+    assert!(coordinator.cancels().is_empty());
+}
+
+// Regression: `Approved { always: true }` requests a persistent approval
+// which this facade cannot honor (no approval-policy port). Reject as
+// Unsupported instead of silently downgrading to one-shot.
+#[tokio::test]
+async fn resolve_gate_approved_with_persistent_flag_returns_unsupported() {
+    let (_threads, coordinator, _projections, service) = build_service();
+    let caller = caller_with_agent();
+    let thread = thread_id("thread:webui:persistent");
+    setup_owned_thread(&service, &caller, &thread).await;
+    let scope = turn_scope_for(&caller, &thread);
+
+    let err = service
+        .resolve_gate(WebUiResolveGateCommand {
+            scope,
+            actor: caller.actor(),
+            run_id: TurnRunId::new(),
+            gate_ref: GateRef::new("gate:approval:99").expect("gate"),
+            client_action_id: idempotency("gate-persistent"),
+            resolution: WebUiGateResolution::Approved { always: true },
+        })
+        .await
+        .expect_err("always: true must be rejected as Unsupported");
+
+    match &err {
+        WebUiServiceError::Unsupported { what } => {
+            assert_eq!(*what, "persistent_approved_gate_resolution");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    assert_eq!(err.status_code(), 501);
+    assert!(!err.retryable());
+    assert!(coordinator.resumes().is_empty());
     assert!(coordinator.cancels().is_empty());
 }
 
@@ -708,8 +943,12 @@ async fn resolve_gate_credential_provided_returns_unsupported_until_binding_port
 async fn resolve_gate_denied_routes_to_cancel_run() {
     let (_threads, coordinator, _projections, service) = build_service();
     let caller = caller_with_agent();
-    let scope = turn_scope_for(&caller, &thread_id("thread:webui:kappa"));
+    let thread = thread_id("thread:webui:kappa");
+    setup_owned_thread(&service, &caller, &thread).await;
+    let scope = turn_scope_for(&caller, &thread);
     let run_id = TurnRunId::new();
+    let gate = GateRef::new("gate:approval:43").expect("gate");
+    coordinator.program_get_run_state(Ok(run_state_parked_on(&scope, run_id, Some(gate.clone()))));
     coordinator.program_cancel(Ok(cancel_response(run_id)));
 
     let outcome = service
@@ -717,7 +956,7 @@ async fn resolve_gate_denied_routes_to_cancel_run() {
             scope,
             actor: caller.actor(),
             run_id,
-            gate_ref: GateRef::new("gate:approval:43").expect("gate"),
+            gate_ref: gate,
             client_action_id: idempotency("gate-3"),
             resolution: WebUiGateResolution::Denied,
         })
@@ -736,8 +975,12 @@ async fn resolve_gate_denied_routes_to_cancel_run() {
 async fn resolve_gate_cancelled_routes_to_cancel_run() {
     let (_threads, coordinator, _projections, service) = build_service();
     let caller = caller_with_agent();
-    let scope = turn_scope_for(&caller, &thread_id("thread:webui:lambda"));
+    let thread = thread_id("thread:webui:lambda");
+    setup_owned_thread(&service, &caller, &thread).await;
+    let scope = turn_scope_for(&caller, &thread);
     let run_id = TurnRunId::new();
+    let gate = GateRef::new("gate:approval:44").expect("gate");
+    coordinator.program_get_run_state(Ok(run_state_parked_on(&scope, run_id, Some(gate.clone()))));
     coordinator.program_cancel(Ok(cancel_response(run_id)));
 
     let outcome = service
@@ -745,7 +988,7 @@ async fn resolve_gate_cancelled_routes_to_cancel_run() {
             scope,
             actor: caller.actor(),
             run_id,
-            gate_ref: GateRef::new("gate:approval:44").expect("gate"),
+            gate_ref: gate,
             client_action_id: idempotency("gate-4"),
             resolution: WebUiGateResolution::Cancelled,
         })
@@ -754,6 +997,77 @@ async fn resolve_gate_cancelled_routes_to_cancel_run() {
 
     assert!(matches!(outcome, WebUiGateResolved::Cancelled { .. }));
     assert_eq!(coordinator.cancels().len(), 1);
+}
+
+// Regression: cancel_run is not gate-aware. Without a parked-on-gate check, a
+// denied/cancelled resolution carrying a stale or attacker-supplied gate_ref
+// would cancel any non-terminal run with the matching run_id. Mismatched
+// gate must produce Conflict and cancel_run must never be invoked.
+#[tokio::test]
+async fn resolve_gate_denied_with_stale_gate_ref_returns_conflict() {
+    let (_threads, coordinator, _projections, service) = build_service();
+    let caller = caller_with_agent();
+    let thread = thread_id("thread:webui:stale-gate");
+    setup_owned_thread(&service, &caller, &thread).await;
+    let scope = turn_scope_for(&caller, &thread);
+    let run_id = TurnRunId::new();
+    let current_gate = GateRef::new("gate:approval:current").expect("gate");
+    let stale_gate = GateRef::new("gate:approval:stale").expect("gate");
+    // The run is parked on `current_gate`, but the browser supplies `stale_gate`.
+    coordinator.program_get_run_state(Ok(run_state_parked_on(&scope, run_id, Some(current_gate))));
+
+    let err = service
+        .resolve_gate(WebUiResolveGateCommand {
+            scope,
+            actor: caller.actor(),
+            run_id,
+            gate_ref: stale_gate,
+            client_action_id: idempotency("gate-stale"),
+            resolution: WebUiGateResolution::Denied,
+        })
+        .await
+        .expect_err("stale gate_ref must produce Conflict, not silent cancel");
+
+    assert_eq!(err, WebUiServiceError::Conflict);
+    assert_eq!(err.status_code(), 409);
+    assert!(
+        coordinator.cancels().is_empty(),
+        "cancel_run must NOT be called"
+    );
+}
+
+// Regression: a caller who does not own the thread must not be able to deny
+// or approve gates on that thread.
+#[tokio::test]
+async fn resolve_gate_rejects_cross_user_access() {
+    let (_threads, coordinator, _projections, service) = build_service();
+    let alice = caller_with_agent();
+    let thread = thread_id("thread:webui:alice-gate");
+    setup_owned_thread(&service, &alice, &thread).await;
+
+    let bob = WebUiAuthenticatedCaller::new(
+        TenantId::new("tenant-alpha").expect("tenant"),
+        UserId::new("user-bob").expect("user"),
+        alice.agent_id.clone(),
+        alice.project_id.clone(),
+    );
+    let bob_scope = bob.turn_scope(thread);
+
+    let err = service
+        .resolve_gate(WebUiResolveGateCommand {
+            scope: bob_scope,
+            actor: bob.actor(),
+            run_id: TurnRunId::new(),
+            gate_ref: GateRef::new("gate:approval:any").expect("gate"),
+            client_action_id: idempotency("gate-cross"),
+            resolution: WebUiGateResolution::Approved { always: false },
+        })
+        .await
+        .expect_err("cross-user gate resolution must be rejected");
+
+    assert_eq!(err, WebUiServiceError::NotFound);
+    assert!(coordinator.resumes().is_empty());
+    assert!(coordinator.cancels().is_empty());
 }
 
 // ---------------------------------------------------------------------------

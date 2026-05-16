@@ -17,13 +17,14 @@ use ironclaw_event_projections::{
 use ironclaw_events::{EventStreamKey, ReadScope};
 use ironclaw_host_api::ThreadId;
 use ironclaw_threads::{
-    EnsureThreadRequest, MessageContent, SessionThreadError, SessionThreadService, ThreadScope,
+    EnsureThreadRequest, MessageContent, MessageStatus, SessionThreadError, SessionThreadService,
+    ThreadHistoryRequest, ThreadMessageId, ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, CancelRunRequest, GateRef, IdempotencyKey, ReplyTargetBindingRef,
-    ResumeTurnRequest, SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest,
-    SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnErrorCategory, TurnRunId,
-    TurnScope,
+    AcceptedMessageRef, CancelRunRequest, GateRef, GetRunStateRequest, IdempotencyKey,
+    ReplyTargetBindingRef, ResumeTurnRequest, SanitizedCancelReason, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError,
+    TurnErrorCategory, TurnRunId, TurnScope,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -202,7 +203,7 @@ pub struct WebUiRunCancelled {
 /// Successful outcome of [`WebUiService::resolve_gate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebUiGateResolved {
-    /// Gate approved (or a credential was supplied) — run resumed.
+    /// Gate approved — run resumed.
     Resumed { run_id: TurnRunId },
     /// Gate denied or cancelled by the user — run cancellation requested.
     Cancelled {
@@ -345,19 +346,28 @@ fn turn_category_status_code(category: TurnErrorCategory) -> u16 {
 
 impl From<ProjectionError> for WebUiServiceError {
     fn from(value: ProjectionError) -> Self {
-        match value {
+        let mapped = match &value {
             ProjectionError::InvalidRequest { .. } => Self::InvalidInput,
             ProjectionError::Source { .. } => Self::Transient,
             ProjectionError::RebaseRequired { earliest, .. } => Self::TimelineRebaseRequired {
-                earliest_cursor: Box::new(WebUiTimelineCursor::from_projection(*earliest)),
+                earliest_cursor: Box::new(WebUiTimelineCursor::from_projection(
+                    (**earliest).clone(),
+                )),
             },
+        };
+        match &mapped {
+            Self::Transient => {
+                tracing::error!(error = %value, "WebUI facade: projection source failure")
+            }
+            _ => tracing::debug!(error = %value, "WebUI facade: projection rejected request"),
         }
+        mapped
     }
 }
 
 impl From<SessionThreadError> for WebUiServiceError {
     fn from(value: SessionThreadError) -> Self {
-        match value {
+        let mapped = match &value {
             // Resource does not exist for this caller.
             SessionThreadError::UnknownThread { .. }
             | SessionThreadError::UnknownMessage { .. } => Self::NotFound,
@@ -380,15 +390,34 @@ impl From<SessionThreadError> for WebUiServiceError {
             | SessionThreadError::Serialization(_)
             | SessionThreadError::Deserialization(_)
             | SessionThreadError::Backend(_) => Self::Transient,
+        };
+        // Severity tracks operator concern, not HTTP class: backend failures
+        // are error!, cross-scope rejections are warn!, everything else is debug!.
+        match &mapped {
+            Self::Transient => {
+                tracing::error!(error = %value, "WebUI facade: thread service backend failure")
+            }
+            Self::Forbidden => {
+                tracing::warn!(error = %value, "WebUI facade: cross-scope thread access rejected")
+            }
+            _ => tracing::debug!(error = %value, "WebUI facade: thread service rejected request"),
         }
+        mapped
     }
 }
 
 impl From<TurnError> for WebUiServiceError {
     fn from(value: TurnError) -> Self {
-        Self::TurnRejected {
-            category: value.category(),
+        let category = value.category();
+        match category {
+            TurnErrorCategory::Unavailable => {
+                tracing::error!(error = %value, ?category, "WebUI facade: turn coordinator unavailable")
+            }
+            _ => {
+                tracing::debug!(error = %value, ?category, "WebUI facade: turn coordinator rejected request")
+            }
         }
+        Self::TurnRejected { category }
     }
 }
 
@@ -431,13 +460,15 @@ impl WebUiService for DefaultWebUiService {
         } = command;
 
         // C1 fix: when the browser omits `requested_thread_id`, derive a
-        // deterministic id from the client-supplied idempotency key. A naive
-        // `Uuid::new_v4()` here would create a fresh thread on every retry
-        // (network drops, double-submit), violating the implicit idempotency
-        // contract carried by `IdempotencyKey`.
+        // deterministic id from the caller scope plus the client-supplied
+        // idempotency key. A naive `Uuid::new_v4()` would create a fresh
+        // thread on every retry, and a derive that ignored caller scope
+        // would let two unrelated callers with colliding action ids fight
+        // over a globally-unique `ThreadId` (the second would get 403
+        // ThreadScopeMismatch).
         let thread_id = match requested_thread_id {
             Some(id) => id,
-            None => derive_webui_thread_id(&client_action_id)?,
+            None => derive_webui_thread_id(&caller, &client_action_id)?,
         };
         let scope = webui_thread_scope(&caller)?;
 
@@ -517,15 +548,19 @@ impl WebUiService for DefaultWebUiService {
             Ok(SubmitTurnResponse::Accepted {
                 turn_id, run_id, ..
             }) => {
-                self.thread_service
-                    .mark_message_submitted(
-                        &thread_scope,
-                        &thread_id,
-                        accepted.message_id,
-                        turn_id.to_string(),
-                        run_id.to_string(),
-                    )
-                    .await?;
+                // On idempotent retry the coordinator replays the original
+                // SubmitTurnResponse and the message is already Submitted, so
+                // mark_message_submitted would otherwise turn a clean retry
+                // into a 409. Swallow that exact transition.
+                mark_submitted_idempotent(
+                    self.thread_service.as_ref(),
+                    &thread_scope,
+                    &thread_id,
+                    accepted.message_id,
+                    turn_id.to_string(),
+                    run_id.to_string(),
+                )
+                .await?;
                 Ok(WebUiMessageAccepted {
                     thread_id,
                     accepted_message_ref,
@@ -533,9 +568,13 @@ impl WebUiService for DefaultWebUiService {
                 })
             }
             Err(TurnError::ThreadBusy(busy)) => {
-                self.thread_service
-                    .mark_message_deferred_busy(&thread_scope, &thread_id, accepted.message_id)
-                    .await?;
+                mark_deferred_busy_idempotent(
+                    self.thread_service.as_ref(),
+                    &thread_scope,
+                    &thread_id,
+                    accepted.message_id,
+                )
+                .await?;
                 Ok(WebUiMessageAccepted {
                     thread_id,
                     accepted_message_ref,
@@ -559,6 +598,11 @@ impl WebUiService for DefaultWebUiService {
             reason,
             client_action_id,
         } = command;
+
+        // TurnScope has no owner_user_id and the coordinator has no per-user
+        // authority check, so without this gate any caller sharing the agent
+        // scope can cancel another user's run by guessing run_id.
+        assert_thread_owned_by(self.thread_service.as_ref(), &scope, &actor).await?;
 
         let response = self
             .turn_coordinator
@@ -591,7 +635,16 @@ impl WebUiService for DefaultWebUiService {
         } = command;
 
         match resolution {
-            WebUiGateResolution::Approved { .. } => {
+            WebUiGateResolution::Approved { always } => {
+                // `always: true` requests a *persistent* approval but this
+                // facade has only one-shot `resume_turn` and no approval-policy
+                // port. Fail loud rather than silently downgrade.
+                if always {
+                    return Err(WebUiServiceError::Unsupported {
+                        what: "persistent_approved_gate_resolution",
+                    });
+                }
+                assert_thread_owned_by(self.thread_service.as_ref(), &scope, &actor).await?;
                 let source_binding_id = webui_binding_id(&actor);
                 let source_binding_ref = build_source_binding_ref(&source_binding_id)?;
                 let reply_target_binding_ref = build_reply_target_binding_ref(&source_binding_id)?;
@@ -622,6 +675,17 @@ impl WebUiService for DefaultWebUiService {
                 what: "credential_provided_gate_resolution",
             }),
             WebUiGateResolution::Denied | WebUiGateResolution::Cancelled => {
+                assert_thread_owned_by(self.thread_service.as_ref(), &scope, &actor).await?;
+                // `cancel_run` is not gate-aware, so without this check a
+                // denied/cancelled resolution for a stale or attacker-supplied
+                // gate_ref would terminate any non-terminal run sharing run_id.
+                assert_run_parked_on_gate(
+                    self.turn_coordinator.as_ref(),
+                    &scope,
+                    run_id,
+                    &gate_ref,
+                )
+                .await?;
                 let response = self
                     .turn_coordinator
                     .cancel_run(CancelRunRequest {
@@ -673,13 +737,158 @@ impl WebUiService for DefaultWebUiService {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Derive a deterministic `ThreadId` from the browser-supplied idempotency
-/// key. Same `client_action_id` → same thread_id, so `ensure_thread` makes
-/// the retry path a no-op instead of creating a duplicate row.
+/// Verify that `actor` owns `scope.thread_id` before forwarding a mutation to
+/// the turn coordinator.
+///
+/// `TurnScope` is keyed by `(tenant, agent, project, thread)` and the
+/// coordinator has no per-user authority check. Without this gate, a caller
+/// who can guess another user's `thread_id` under the same agent scope can
+/// drive `cancel_run` / `resume_turn` for that user's runs. We resolve the
+/// thread through `SessionThreadService` with `owner_user_id: Some(actor)` in
+/// the read scope so the only happy path is one where the actor genuinely
+/// owns the thread.
+///
+/// Non-matching threads come back as `UnknownThread` (mapped to `NotFound`),
+/// not `Forbidden`, so the response is indistinguishable from a thread that
+/// genuinely does not exist — no cross-user existence leak.
+///
+/// Implementation note: `list_thread_history` is the only read-only access
+/// to `SessionThreadRecord` exposed today. The full message list is
+/// discarded. A leaner `get_thread_record` read on `SessionThreadService`
+/// would let us avoid that allocation; tracked as a perf followup.
+async fn assert_thread_owned_by(
+    thread_service: &dyn SessionThreadService,
+    scope: &TurnScope,
+    actor: &TurnActor,
+) -> Result<(), WebUiServiceError> {
+    let Some(agent_id) = scope.agent_id.clone() else {
+        return Err(WebUiServiceError::MissingAgentContext);
+    };
+    let thread_scope = ThreadScope {
+        tenant_id: scope.tenant_id.clone(),
+        agent_id,
+        project_id: scope.project_id.clone(),
+        owner_user_id: Some(actor.user_id.clone()),
+        mission_id: None,
+    };
+    let _history = thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: thread_scope,
+            thread_id: scope.thread_id.clone(),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Verify that the run identified by `run_id` is currently parked on
+/// `expected_gate_ref` before issuing a denial/cancellation against that
+/// gate.
+///
+/// `cancel_run` is not gate-aware — it terminates a run by `run_id`
+/// regardless of which gate (if any) it is parked on. Without this check, a
+/// stale or attacker-chosen `gate_ref` paired with a known `run_id` would
+/// still cancel the run, even though the user's denial was for a different
+/// gate. This narrows the attack/UX-bug surface to a TOCTOU race that
+/// requires winning the window between `get_run_state` and `cancel_run`;
+/// full elimination requires a gate-aware rejection API in the turn
+/// coordinator (tracked as a followup).
+async fn assert_run_parked_on_gate(
+    turn_coordinator: &dyn TurnCoordinator,
+    scope: &TurnScope,
+    run_id: TurnRunId,
+    expected_gate_ref: &GateRef,
+) -> Result<(), WebUiServiceError> {
+    let state = turn_coordinator
+        .get_run_state(GetRunStateRequest {
+            scope: scope.clone(),
+            run_id,
+        })
+        .await?;
+    match state.gate_ref.as_ref() {
+        Some(parked) if parked == expected_gate_ref => Ok(()),
+        _ => Err(WebUiServiceError::Conflict),
+    }
+}
+
+/// Mark a message as `Submitted`, tolerating the "already submitted" case
+/// that arises on an idempotent retry.
+///
+/// When the browser retries the same `client_action_id` after a prior
+/// successful send, `accept_inbound_message` returns the existing message
+/// (via `InboundIdempotencyKey`) and the turn coordinator replays the same
+/// `SubmitTurnResponse::Accepted`. The thread message itself is already in
+/// `Submitted` state from the first call, so a second `mark_message_submitted`
+/// would return `InvalidMessageTransition { from: Submitted, .. }`. That
+/// would surface to the browser as 409 Conflict, turning a clean retry into
+/// an error. We swallow exactly that transition and treat it as success;
+/// every other transition error still bubbles up.
+async fn mark_submitted_idempotent(
+    thread_service: &dyn SessionThreadService,
+    scope: &ThreadScope,
+    thread_id: &ThreadId,
+    message_id: ThreadMessageId,
+    turn_id: String,
+    turn_run_id: String,
+) -> Result<(), WebUiServiceError> {
+    match thread_service
+        .mark_message_submitted(scope, thread_id, message_id, turn_id, turn_run_id)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(SessionThreadError::InvalidMessageTransition {
+            from: MessageStatus::Submitted,
+            ..
+        }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Mirror of [`mark_submitted_idempotent`] for the deferred-busy path.
+async fn mark_deferred_busy_idempotent(
+    thread_service: &dyn SessionThreadService,
+    scope: &ThreadScope,
+    thread_id: &ThreadId,
+    message_id: ThreadMessageId,
+) -> Result<(), WebUiServiceError> {
+    match thread_service
+        .mark_message_deferred_busy(scope, thread_id, message_id)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(SessionThreadError::InvalidMessageTransition {
+            from: MessageStatus::DeferredBusy,
+            ..
+        }) => Ok(()),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// Derive a deterministic `ThreadId` from the caller scope plus the
+/// browser-supplied idempotency key.
+///
+/// The caller scope must be part of the namespace because `SessionThreadService`
+/// stores `ThreadId` as a globally-unique primary key. Two unrelated callers
+/// using the same `client_action_id` (a likely default value like
+/// `"new-thread"`) would otherwise collide: the first creates the thread,
+/// the second hits `ThreadScopeMismatch` and gets 403 Forbidden through no
+/// fault of their own.
+///
+/// With the caller scope included, retries from the *same* caller still
+/// converge on the same id (the idempotency property we want), while
+/// distinct callers always get distinct ids.
 fn derive_webui_thread_id(
+    caller: &WebUiAuthenticatedCaller,
     client_action_id: &IdempotencyKey,
 ) -> Result<ThreadId, WebUiServiceError> {
-    let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, client_action_id.as_str().as_bytes());
+    let payload = format!(
+        "{}\0{}\0{}\0{}\0{}",
+        caller.tenant_id.as_str(),
+        caller.user_id.as_str(),
+        caller.agent_id.as_ref().map(|a| a.as_str()).unwrap_or(""),
+        caller.project_id.as_ref().map(|p| p.as_str()).unwrap_or(""),
+        client_action_id.as_str(),
+    );
+    let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, payload.as_bytes());
     ThreadId::new(format!("thread:webui:{id}")).map_err(|_| WebUiServiceError::InvalidInput)
 }
 
