@@ -4648,6 +4648,7 @@ dependencies = [
  "ironclaw_network",
  "ironclaw_processes",
  "ironclaw_reborn",
+ "ironclaw_reborn_config",
  "ironclaw_reborn_event_store",
  "ironclaw_resources",
  "ironclaw_run_state",
@@ -4672,7 +4673,10 @@ dependencies = [
 name = "ironclaw_reborn_config"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
 ]
 
 [[package]]

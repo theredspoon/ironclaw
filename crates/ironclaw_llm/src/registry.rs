@@ -229,21 +229,40 @@ impl ProviderRegistry {
         Self { providers, lookup }
     }
 
-    /// Load the default registry: built-in providers + user overrides.
+    /// Load the default registry: built-in providers + user overrides
+    /// from `~/.ironclaw/providers.json` (v1's canonical location).
     ///
-    /// User providers from `~/.ironclaw/providers.json` are appended,
-    /// with later entries overriding earlier ones by ID/alias.
+    /// Equivalent to `load_from_path(user_providers_path())`. Kept as
+    /// the v1-default entry point so existing callers don't have to
+    /// thread a path through.
     pub fn load() -> Self {
+        Self::load_from_path(user_providers_path().as_deref())
+    }
+
+    /// Load the registry with a caller-supplied user-overlay path.
+    ///
+    /// Built-in providers are always loaded from the compiled-in
+    /// `providers.json`. If `user_path` is `Some` and the file exists
+    /// it is parsed and appended; later entries override earlier ones
+    /// by id/alias. If parsing fails the file is skipped with a
+    /// `tracing::warn`, preserving the v1 fail-open-with-log behavior
+    /// so a malformed user file never breaks boot.
+    ///
+    /// Reborn's standalone composition root supplies
+    /// `$IRONCLAW_REBORN_HOME/providers.json` here so the two binaries
+    /// (v1 and Reborn-standalone) can have independent user catalogs
+    /// without colliding on `~/.ironclaw/providers.json`.
+    pub fn load_from_path(user_path: Option<&std::path::Path>) -> Self {
         let builtins: Vec<ProviderDefinition> =
             serde_json::from_str(include_str!("../../../providers.json"))
                 .expect("built-in providers.json must be valid JSON"); // safety: compile-time embedded file
 
         let mut all = builtins;
 
-        if let Some(user_path) = user_providers_path()
+        if let Some(user_path) = user_path
             && user_path.exists()
         {
-            match std::fs::read_to_string(&user_path) {
+            match std::fs::read_to_string(user_path) {
                 Ok(contents) => match serde_json::from_str::<Vec<ProviderDefinition>>(&contents) {
                     Ok(user_defs) => {
                         tracing::info!(
