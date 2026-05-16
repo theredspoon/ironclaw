@@ -89,6 +89,10 @@ fn looks_like_long_hex(value: &str) -> bool {
 
 /// Returns `Err` if `value` looks like inline secret material that
 /// must not appear in a declarative config file.
+///
+/// Prefix markers are matched as substrings, not only at string start.
+/// This is intentionally aggressive so embedded credentials in URLs or
+/// copied console snippets fail closed instead of being persisted.
 pub fn reject_inline_secret(label: &'static str, value: &str) -> Result<(), InlineSecretError> {
     let value = value.trim();
     // Empty / very short values can't carry secrets meaningfully — and a
@@ -130,7 +134,7 @@ pub(crate) enum SecretPattern {
 impl fmt::Display for SecretPattern {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Prefix(prefix) => write!(formatter, "value starts with `{prefix}`"),
+            Self::Prefix(prefix) => write!(formatter, "value contains secret marker `{prefix}`"),
             Self::Jwt => formatter.write_str("value is JWT-shaped (`<hdr>.<payload>.<sig>`)"),
             Self::LongHex => formatter.write_str("value is a long hex run (>= 32 hex chars)"),
         }

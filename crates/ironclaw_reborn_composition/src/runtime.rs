@@ -555,12 +555,14 @@ fn build_llm_gateway(
     use ironclaw_turns::run_profile::ModelProfileId;
 
     let protocol = match cfg.protocol.as_str() {
-        "openai_completions" | "openai" => ProviderProtocol::OpenAiCompletions,
+        "open_ai_completions" | "openai_completions" | "openai" => {
+            ProviderProtocol::OpenAiCompletions
+        }
         "anthropic" => ProviderProtocol::Anthropic,
         "ollama" => ProviderProtocol::Ollama,
-        "deepseek" => ProviderProtocol::DeepSeek,
+        "deep_seek" | "deepseek" => ProviderProtocol::DeepSeek,
         "gemini" => ProviderProtocol::Gemini,
-        "openrouter" => ProviderProtocol::OpenRouter,
+        "open_router" | "openrouter" => ProviderProtocol::OpenRouter,
         "github_copilot" => ProviderProtocol::GithubCopilot,
         other => {
             return Err(RebornRuntimeError::LlmProvider(format!(

@@ -570,12 +570,12 @@ api_version = "ironclaw.runtime/v9"
 
     #[test]
     fn accepts_v1_minor_bumps_forward_compat() {
-        let toml = r#"
-api_version = "ironclaw.runtime/v1.7"
-"#;
-        let cfg = RebornConfigFile::parse_text(toml, &attributed())
-            .expect("minor bumps must be accepted");
-        assert_eq!(cfg.api_version.as_deref(), Some("ironclaw.runtime/v1.7"));
+        for version in ["ironclaw.runtime/v1.0", "ironclaw.runtime/v1.7"] {
+            let toml = format!(r#"api_version = "{version}""#);
+            let cfg = RebornConfigFile::parse_text(&toml, &attributed())
+                .expect("minor bumps must be accepted");
+            assert_eq!(cfg.api_version.as_deref(), Some(version));
+        }
     }
 
     #[test]

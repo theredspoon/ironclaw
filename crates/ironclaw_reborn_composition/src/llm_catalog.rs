@@ -33,7 +33,7 @@ use thiserror::Error;
 use ironclaw_llm::{ProviderRegistry, registry::ProviderDefinition};
 use ironclaw_reborn_config::{LlmSlotSelection, reject_inline_secret};
 
-use crate::runtime_input::RebornLlmConfig;
+use crate::runtime_input::{DEFAULT_LLM_REQUEST_TIMEOUT_SECS, RebornLlmConfig};
 
 /// Errors surfaced when resolving an `LlmSlotSelection` against the
 /// merged provider catalog.
@@ -170,7 +170,7 @@ pub fn resolve_against_registry(
         base_url,
         api_key,
         protocol: serialize_protocol(provider.protocol),
-        request_timeout_secs: 120,
+        request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
         extra_headers,
     })
 }
@@ -318,10 +318,16 @@ fn resolve_extra_headers(
     provider: &ProviderDefinition,
 ) -> Result<Vec<(String, String)>, RebornLlmCatalogError> {
     let env_headers = match provider.extra_headers_env.as_deref() {
-        Some(env) => nonempty_env(env)
-            .map(|value| parse_extra_headers(&provider.id, env, &value))
-            .transpose()?
-            .unwrap_or_default(),
+        Some(env) => {
+            // Header values intentionally come from env without inline-secret rejection:
+            // env vars are the approved secret-carrying channel. The catalog-supplied
+            // env var name is validated by `validate_catalog_env_var` before this runs,
+            // and `parse_extra_headers` never echoes header values in errors.
+            nonempty_env(env)
+                .map(|value| parse_extra_headers(&provider.id, env, &value))
+                .transpose()?
+                .unwrap_or_default()
+        }
         None => Vec::new(),
     };
 
@@ -396,13 +402,13 @@ fn merge_extra_headers(
 fn serialize_protocol(protocol: ironclaw_llm::ProviderProtocol) -> String {
     use ironclaw_llm::ProviderProtocol;
     match protocol {
-        ProviderProtocol::OpenAiCompletions => "openai_completions",
+        ProviderProtocol::OpenAiCompletions => "open_ai_completions",
         ProviderProtocol::Anthropic => "anthropic",
         ProviderProtocol::Ollama => "ollama",
         ProviderProtocol::GithubCopilot => "github_copilot",
-        ProviderProtocol::DeepSeek => "deepseek",
+        ProviderProtocol::DeepSeek => "deep_seek",
         ProviderProtocol::Gemini => "gemini",
-        ProviderProtocol::OpenRouter => "openrouter",
+        ProviderProtocol::OpenRouter => "open_router",
     }
     .to_string()
 }
@@ -652,6 +658,23 @@ mod tests {
     }
 
     #[test]
+    fn serializes_protocols_with_serde_snake_case_names() {
+        assert_eq!(
+            serialize_protocol(ProviderProtocol::OpenAiCompletions),
+            "open_ai_completions"
+        );
+        assert_eq!(serialize_protocol(ProviderProtocol::DeepSeek), "deep_seek");
+        assert_eq!(
+            serialize_protocol(ProviderProtocol::OpenRouter),
+            "open_router"
+        );
+        assert_eq!(
+            serialize_protocol(ProviderProtocol::GithubCopilot),
+            "github_copilot"
+        );
+    }
+
+    #[test]
     fn optional_missing_base_url_resolves_to_client_default() {
         let registry = ProviderRegistry::new(vec![provider_no_base_url_required("alpha")]);
         let selection = LlmSlotSelection {
@@ -753,6 +776,23 @@ mod tests {
         assert!(
             !rendered.contains(&pasted_secret),
             "error must not echo header value: {rendered}"
+        );
+    }
+
+    #[test]
+    fn secret_shaped_extra_headers_env_name_fails_before_value_lookup() {
+        let mut provider = provider_no_key_required("alpha");
+        provider.extra_headers_env = Some("sk-proj-1234567890abcdef".to_string());
+
+        let err = validate_catalog_provider(&provider).expect_err("secret-shaped env must fail");
+        let rendered = err.to_string();
+        assert!(matches!(
+            err,
+            RebornLlmCatalogError::CatalogFieldInvalid { .. }
+        ));
+        assert!(
+            !rendered.contains("sk-proj-1234567890abcdef"),
+            "error must not echo secret-shaped env name: {rendered}"
         );
     }
 

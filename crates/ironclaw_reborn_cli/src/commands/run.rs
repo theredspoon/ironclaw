@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
-use ironclaw_reborn_composition::{
-    RebornCompositionProfile, RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime,
-};
+use ironclaw_reborn_composition::{RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime};
 use ironclaw_reborn_config::{REBORN_PROFILE_ENV, RebornBootConfig, RebornProfile};
 
 use crate::context::RebornCliContext;
@@ -166,17 +164,15 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
 
     let local_dev_root: PathBuf = config.home().path().join("local-dev");
 
-    let effective_profile = effective_profile(config, config_file.as_ref())?;
-    let composition_profile = match effective_profile {
-        RebornProfile::LocalDev => RebornCompositionProfile::LocalDev,
+    match effective_profile(config, config_file.as_ref())? {
+        RebornProfile::LocalDev => {}
         other => {
             anyhow::bail!(
                 "ironclaw-reborn run currently supports profile=local-dev; got profile={other}. \
                  Production wiring lands in a follow-up slice."
             );
         }
-    };
-    let _ = composition_profile;
+    }
 
     let services_input = RebornBuildInput::local_dev(owner_id, local_dev_root);
 
@@ -293,10 +289,7 @@ fn reject_unsupported_runtime_sections(
 fn runner_settings(
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
 ) -> anyhow::Result<TurnRunnerSettings> {
-    let mut settings = TurnRunnerSettings {
-        heartbeat_interval: Duration::from_secs(5),
-        poll_interval: Duration::from_millis(200),
-    };
+    let mut settings = TurnRunnerSettings::default();
     if let Some(runner) = config_file.and_then(|file| file.runner.as_ref()) {
         if let Some(secs) = runner.heartbeat_interval_secs {
             if secs == 0 {

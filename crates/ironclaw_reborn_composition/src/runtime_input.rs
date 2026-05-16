@@ -24,6 +24,12 @@ use crate::input::RebornBuildInput;
 /// composition-owned types so callers (the CLI) never name `ironclaw_llm`
 /// directly.
 #[cfg(feature = "root-llm-provider")]
+pub const DEFAULT_LLM_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+pub const DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_TURN_RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[cfg(feature = "root-llm-provider")]
 #[derive(Debug, Clone)]
 pub struct RebornLlmConfig {
     /// Provider id (e.g. `"openai"`, `"anthropic"`, `"ollama"`).
@@ -36,9 +42,10 @@ pub struct RebornLlmConfig {
     /// like Ollama.
     pub api_key: Option<secrecy::SecretString>,
     /// API protocol identifier — maps onto
-    /// `ironclaw_llm::ProviderProtocol`. Accepted values:
-    /// `"openai_completions"`, `"anthropic"`, `"ollama"`, `"deepseek"`,
-    /// `"gemini"`, `"openrouter"`, `"github_copilot"`.
+    /// `ironclaw_llm::ProviderProtocol`. Canonical values follow
+    /// `ProviderProtocol`'s serde `snake_case` names:
+    /// `"open_ai_completions"`, `"anthropic"`, `"ollama"`, `"deep_seek"`,
+    /// `"gemini"`, `"open_router"`, `"github_copilot"`.
     pub protocol: String,
     /// Request timeout in seconds passed to the underlying HTTP client.
     pub request_timeout_secs: u64,
@@ -60,8 +67,8 @@ impl RebornLlmConfig {
             model: model.into(),
             base_url: base_url.into(),
             api_key: Some(api_key),
-            protocol: "openai_completions".to_string(),
-            request_timeout_secs: 120,
+            protocol: "open_ai_completions".to_string(),
+            request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
             extra_headers: Vec::new(),
         }
     }
@@ -77,8 +84,8 @@ pub struct TurnRunnerSettings {
 impl Default for TurnRunnerSettings {
     fn default() -> Self {
         Self {
-            heartbeat_interval: Duration::from_secs(10),
-            poll_interval: Duration::from_secs(2),
+            heartbeat_interval: DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
+            poll_interval: DEFAULT_TURN_RUNNER_POLL_INTERVAL,
         }
     }
 }

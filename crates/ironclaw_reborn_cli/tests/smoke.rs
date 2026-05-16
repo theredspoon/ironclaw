@@ -923,26 +923,31 @@ fn config_init_preflights_both_targets_before_writing() {
 fn config_init_with_force_overwrites() {
     let temp = tempfile::tempdir().expect("tempdir");
     let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(reborn_home.join("config.toml"), "partial config\n").expect("write config");
+    std::fs::write(reborn_home.join("providers.json"), "partial providers\n")
+        .expect("write providers");
 
-    let first = Command::new(reborn_bin())
-        .args(["config", "init"])
-        .env_remove("USERPROFILE")
-        .env("IRONCLAW_REBORN_HOME", &reborn_home)
-        .output()
-        .expect("first init should run");
-    assert!(first.status.success());
-
-    let second = Command::new(reborn_bin())
+    let output = Command::new(reborn_bin())
         .args(["config", "init", "--force"])
         .env_remove("USERPROFILE")
         .env("IRONCLAW_REBORN_HOME", &reborn_home)
         .output()
         .expect("forced init should run");
     assert!(
-        second.status.success(),
+        output.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&second.stderr)
+        String::from_utf8_lossy(&output.stderr)
     );
+
+    let config_text =
+        std::fs::read_to_string(reborn_home.join("config.toml")).expect("config.toml readable");
+    let providers_text = std::fs::read_to_string(reborn_home.join("providers.json"))
+        .expect("providers.json readable");
+    assert!(!config_text.contains("partial config"));
+    assert!(!providers_text.contains("partial providers"));
+    assert!(config_text.contains("api_version = \"ironclaw.runtime/v1\""));
+    assert!(providers_text.contains("\"id\": \"acme-openrouter\""));
 }
 
 #[test]
