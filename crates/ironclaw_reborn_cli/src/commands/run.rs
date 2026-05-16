@@ -84,6 +84,13 @@ async fn send_once(
     text: &str,
 ) -> anyhow::Result<()> {
     let reply = runtime.send_user_message(conversation, text).await?;
+    if !reply.is_successful_final_reply() {
+        anyhow::bail!(
+            "reborn run did not produce an assistant reply (status={:?}, run_id={})",
+            reply.status,
+            reply.run_id
+        );
+    }
     print_reply(&reply);
     Ok(())
 }
@@ -115,9 +122,18 @@ async fn run_repl(
                 match line? {
                     Some(text) if text.trim().is_empty() => continue,
                     Some(text) => {
-                        match runtime.send_user_message(conversation, text.trim()).await {
-                            Ok(reply) => print_reply(&reply),
-                            Err(error) => eprintln!("error: {error}"),
+                        match runtime.send_user_message(conversation, &text).await {
+                            Ok(reply) if reply.is_successful_final_reply() => print_reply(&reply),
+                            Ok(reply) if stdin_is_tty => print_reply(&reply),
+                            Ok(reply) => {
+                                anyhow::bail!(
+                                    "reborn run did not produce an assistant reply (status={:?}, run_id={})",
+                                    reply.status,
+                                    reply.run_id
+                                );
+                            }
+                            Err(error) if stdin_is_tty => eprintln!("error: {error}"),
+                            Err(error) => return Err(error.into()),
                         }
                     }
                     None => {

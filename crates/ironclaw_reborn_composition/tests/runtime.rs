@@ -7,7 +7,7 @@ use ironclaw_reborn_composition::{
 use ironclaw_turns::TurnStatus;
 
 #[tokio::test]
-async fn stub_gateway_send_returns_recovery_required_without_waiting_for_poll() {
+async fn stub_gateway_send_cancels_recovery_required_and_releases_conversation() {
     let root = tempfile::tempdir().unwrap();
     let input = RebornRuntimeInput::from_services(RebornBuildInput::local_dev(
         "runtime-test-owner",
@@ -34,8 +34,19 @@ async fn stub_gateway_send_returns_recovery_required_without_waiting_for_poll() 
     .unwrap()
     .unwrap();
 
-    assert_eq!(reply.status, TurnStatus::RecoveryRequired);
+    assert_eq!(reply.status, TurnStatus::Cancelled);
     assert_eq!(reply.text, None);
+
+    let second_reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.send_user_message(&conversation, "hello again"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(second_reply.status, TurnStatus::Cancelled);
+    assert_eq!(second_reply.text, None);
 
     runtime.shutdown().await.unwrap();
 }

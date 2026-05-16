@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -42,11 +43,11 @@ use ironclaw_threads::{
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, AgentLoopDriver, DefaultTurnCoordinator, GetRunStateRequest,
-    IdempotencyKey, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
+    AcceptedMessageRef, AgentLoopDriver, CancelRunRequest, DefaultTurnCoordinator,
+    GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
     InMemoryTurnStateStore, LoopExitApplier, ReplyTargetBindingRef, RunProfileId,
-    RunProfileVersion, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor,
-    TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnStatus,
+    RunProfileVersion, SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest,
+    SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnStatus,
     run_profile::{
         CapabilitySurfaceProfileId, CheckpointSchemaId, InMemoryRunProfileRegistry,
         InMemoryRunProfileResolver, RunProfileDefinition,
@@ -71,6 +72,15 @@ pub struct AssistantReply {
     pub run_id: TurnRunId,
     pub status: TurnStatus,
     pub text: Option<String>,
+}
+
+impl AssistantReply {
+    /// True when a caller can treat the reply as a successful single-shot
+    /// response. Recovery/failed/cancelled runs may still produce diagnostics,
+    /// but they did not produce the requested assistant text.
+    pub fn is_successful_final_reply(&self) -> bool {
+        self.status == TurnStatus::Completed && self.text.is_some()
+    }
 }
 
 /// Errors returned by `RebornRuntime` methods.
@@ -139,6 +149,7 @@ pub struct RebornRuntime {
     source_binding_id: String,
     reply_target_binding_id: String,
     wake_sender: TurnRunnerWakeSender,
+    send_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +212,7 @@ impl RebornRuntime {
         conversation: &ConversationId,
         text: &str,
     ) -> Result<AssistantReply, RebornRuntimeError> {
+        let _send_guard = self.send_lock.lock().await;
         if self.worker_handle.is_finished() {
             return Err(RebornRuntimeError::WorkerStopped);
         }
@@ -303,20 +315,60 @@ impl RebornRuntime {
                     run_id,
                 })
                 .await?;
-            if state.status.is_terminal() || matches!(state.status, TurnStatus::RecoveryRequired) {
-                // RecoveryRequired isn't "terminal" in the durable state
-                // machine (a future recovery worker could resume it), but for
-                // the standalone CLI it is end-of-line: there is no recovery
-                // worker in this composition. Surface it like Failed.
+            if state.status.is_terminal() {
                 return Ok(state.status);
             }
+            if state.status == TurnStatus::RecoveryRequired {
+                // RecoveryRequired keeps the durable turn active because a
+                // future recovery worker may resume it. The standalone
+                // runtime has no recovery worker, so cancel it before
+                // returning to release the conversation lock.
+                let response = self
+                    .turn_coordinator
+                    .cancel_run(CancelRunRequest {
+                        scope: scope.clone(),
+                        actor: TurnActor::new(self.actor_user_id.clone()),
+                        run_id,
+                        reason: SanitizedCancelReason::OperatorRequested,
+                        idempotency_key: IdempotencyKey::new(format!(
+                            "{}-recovery-required-cancel-{}",
+                            self.source_binding_id, run_id
+                        ))
+                        .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?,
+                    })
+                    .await?;
+                return Ok(response.status);
+            }
             if start.elapsed() > self.poll_settings.max_total {
+                self.cancel_run_for_timeout(scope, run_id).await?;
                 return Err(RebornRuntimeError::RunTimeout {
                     timeout: self.poll_settings.max_total,
                 });
             }
             tokio::time::sleep(self.poll_settings.interval).await;
         }
+    }
+
+    async fn cancel_run_for_timeout(
+        &self,
+        scope: &TurnScope,
+        run_id: TurnRunId,
+    ) -> Result<(), RebornRuntimeError> {
+        self.turn_coordinator
+            .cancel_run(CancelRunRequest {
+                scope: scope.clone(),
+                actor: TurnActor::new(self.actor_user_id.clone()),
+                run_id,
+                reason: SanitizedCancelReason::Timeout,
+                idempotency_key: IdempotencyKey::new(format!(
+                    "{}-timeout-cancel-{}",
+                    self.source_binding_id, run_id
+                ))
+                .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?,
+            })
+            .await?;
+        self.wake_sender.wake();
+        Ok(())
     }
 
     async fn read_latest_assistant_text(
@@ -447,7 +499,10 @@ pub async fn build_reborn_runtime(
         tenant_id,
         agent_id,
         project_id: None,
-        owner_user_id: Some(actor_user_id.clone()),
+        // Keep this scope aligned with `ThreadCheckpointLoopExitEvidencePort`,
+        // which reconstructs thread scope from `TurnScope` for completion
+        // evidence and currently has no owner-user dimension there.
+        owner_user_id: None,
         mission_id: None,
     };
 
@@ -477,6 +532,7 @@ pub async fn build_reborn_runtime(
         source_binding_id: validated_identity.source_binding_id,
         reply_target_binding_id: validated_identity.reply_target_binding_id,
         wake_sender,
+        send_lock: Mutex::new(()),
     })
 }
 

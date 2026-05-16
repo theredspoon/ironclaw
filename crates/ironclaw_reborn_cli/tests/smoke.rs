@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
 
 const INVALID_PROFILE_MESSAGE: &str = "IRONCLAW_REBORN_PROFILE must be one of";
 
@@ -575,6 +578,66 @@ fn doctor_uses_reborn_home_override_without_touching_v1_state() {
     assert!(
         !reborn_home.exists(),
         "doctor should not create state directories"
+    );
+}
+
+#[test]
+fn run_message_exits_nonzero_when_runtime_does_not_produce_reply() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::new(reborn_bin())
+        .arg("run")
+        .arg("--message")
+        .arg("hello")
+        .env_clear()
+        .env("IRONCLAW_REBORN_HOME", temp.path().join("reborn-home"))
+        .env("HOME", temp.path().join("home"))
+        .output()
+        .expect("ironclaw-reborn run --message should run");
+
+    assert!(
+        !output.status.success(),
+        "run --message should fail when the runtime cannot produce assistant text"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("reborn run did not produce an assistant reply"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn run_piped_stdin_exits_nonzero_when_runtime_does_not_produce_reply() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let mut child = Command::new(reborn_bin())
+        .arg("run")
+        .env_clear()
+        .env("IRONCLAW_REBORN_HOME", temp.path().join("reborn-home"))
+        .env("HOME", temp.path().join("home"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ironclaw-reborn run should start");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"  hello  \n")
+        .expect("prompt should be written");
+    let output = child
+        .wait_with_output()
+        .expect("ironclaw-reborn run should finish");
+
+    assert!(
+        !output.status.success(),
+        "piped run should fail when the runtime cannot produce assistant text"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("reborn run did not produce an assistant reply"),
+        "stderr: {stderr}"
     );
 }
 
