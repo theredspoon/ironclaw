@@ -4532,9 +4532,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "ironclaw_extensions",
  "ironclaw_host_api",
  "ironclaw_product_adapters",
- "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
