@@ -4,16 +4,20 @@ use std::{error::Error, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use ironclaw_loop_support::{
-    CapabilitySurfaceProfileResolver, HostIdentityContextSource, HostInputQueue,
-    HostManagedModelGateway, HostRuntimeLoopCapabilityPortFactory, HostSkillContextSource,
-    RunCancellationFactory,
+    CapabilitySurfaceProfileResolver, CompositeTurnRunWakeNotifier, HostIdentityContextSource,
+    HostInputQueue, HostManagedModelGateway, HostRuntimeLoopCapabilityPortFactory,
+    HostSkillContextSource, ProductLiveCancellationReadiness, RunCancellationFactory,
+    verify_product_live_cancellation_probe,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 use ironclaw_turns::{
     AgentLoopDriverError, CheckpointStateStore, DefaultTurnCoordinator, LoopCheckpointStore,
     RunProfileResolver, TurnRunWakeNotifier, TurnStateStore,
     loop_exit::LoopExitEvidencePort,
-    run_profile::{AgentLoopHostError, LoopCapabilityPort, LoopHostMilestoneSink, LoopRunContext},
+    run_profile::{
+        AgentLoopHostError, InstructionSafetyContext, LoopCapabilityPort, LoopHostMilestoneSink,
+        LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext,
+    },
     runner::TurnRunTransitionPort,
 };
 
@@ -23,7 +27,7 @@ use crate::{
     loop_driver_host::{
         LoopCapabilityPortFactory, RebornLoopDriverHostFactory, TextOnlyLoopHostConfig,
     },
-    loop_exit_applier::LoopExitApplier,
+    loop_exit_applier::{LoopExitApplier, ThreadCheckpointLoopExitEvidencePort},
     model_routes::ModelRouteResolver,
     planned_driver_factory::{
         DefaultPlannedDriverRegistrationError, default_planned_run_profile_resolver,
@@ -35,21 +39,11 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DefaultPlannedRuntimeConfig {
     pub worker: TurnRunnerWorkerConfig,
     pub text_only_driver: TextOnlyModelReplyDriverConfig,
     pub host: TextOnlyLoopHostConfig,
-}
-
-impl Default for DefaultPlannedRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            worker: TurnRunnerWorkerConfig::default(),
-            text_only_driver: TextOnlyModelReplyDriverConfig::default(),
-            host: TextOnlyLoopHostConfig::default(),
-        }
-    }
 }
 
 pub struct DefaultPlannedRuntimeParts<T, S, G>
@@ -77,6 +71,13 @@ where
     /// and WS-17 product cutover. `None` is only acceptable for helper-level
     /// WS-14 unit tests; live composition must always supply identity context.
     pub identity_context_source: Arc<dyn HostIdentityContextSource>,
+    /// WS-17 product-live readiness extensions. `RebornLoopDriverHostFactory`
+    /// defaults these to no-op implementations so legacy WS-14 helper tests
+    /// keep compiling. `build_product_live_planned_runtime` fails closed when
+    /// any of them is `None`, matching the cancellation/identity contract.
+    pub model_policy_guard: Option<Arc<dyn LoopModelPolicyGuard>>,
+    pub model_budget_accountant: Option<Arc<dyn LoopModelBudgetAccountant>>,
+    pub safety_context: Option<InstructionSafetyContext>,
 }
 
 pub struct RebornRuntimeLoopComposition<T, S, G>
@@ -124,6 +125,145 @@ impl From<DefaultPlannedDriverRegistrationError> for DefaultPlannedRuntimeBuildE
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductLiveRuntimeReadinessComponent {
+    ModelRouteResolver,
+    InputQueue,
+    CancellationFactory,
+    IdentityContextSource,
+    ModelPolicyGuard,
+    ModelBudgetAccountant,
+    SafetyContext,
+}
+
+impl ProductLiveRuntimeReadinessComponent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelRouteResolver => "model_route_resolver",
+            Self::InputQueue => "input_queue",
+            Self::CancellationFactory => "cancellation_factory",
+            Self::IdentityContextSource => "identity_context_source",
+            Self::ModelPolicyGuard => "model_policy_guard",
+            Self::ModelBudgetAccountant => "model_budget_accountant",
+            Self::SafetyContext => "safety_context",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ProductLiveRuntimeBuildError {
+    Missing(ProductLiveRuntimeReadinessComponent),
+    Inert(ProductLiveRuntimeReadinessComponent),
+    Probe {
+        component: ProductLiveRuntimeReadinessComponent,
+        source: AgentLoopHostError,
+    },
+    Runtime(DefaultPlannedRuntimeBuildError),
+}
+
+impl fmt::Display for ProductLiveRuntimeBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(component) => {
+                write!(
+                    formatter,
+                    "product live runtime missing {}",
+                    component.as_str()
+                )
+            }
+            Self::Inert(component) => {
+                write!(
+                    formatter,
+                    "product live runtime has inert {}",
+                    component.as_str()
+                )
+            }
+            Self::Probe { component, source } => {
+                write!(
+                    formatter,
+                    "product live runtime could not probe {}: {}",
+                    component.as_str(),
+                    source,
+                )
+            }
+            Self::Runtime(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl Error for ProductLiveRuntimeBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Probe { source, .. } => Some(source),
+            Self::Runtime(error) => Some(error),
+            Self::Missing(_) | Self::Inert(_) => None,
+        }
+    }
+}
+
+pub fn build_product_live_planned_runtime<T, S, G>(
+    mut parts: DefaultPlannedRuntimeParts<T, S, G>,
+) -> Result<RebornRuntimeLoopComposition<T, S, G>, ProductLiveRuntimeBuildError>
+where
+    T: TurnStateStore + TurnRunTransitionPort + Send + Sync + 'static,
+    S: SessionThreadService + ?Sized + Send + Sync + 'static,
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    if parts.model_route_resolver.is_none() {
+        return Err(ProductLiveRuntimeBuildError::Missing(
+            ProductLiveRuntimeReadinessComponent::ModelRouteResolver,
+        ));
+    }
+    if parts.input_queue.is_none() {
+        return Err(ProductLiveRuntimeBuildError::Missing(
+            ProductLiveRuntimeReadinessComponent::InputQueue,
+        ));
+    }
+    if parts.model_policy_guard.is_none() {
+        return Err(ProductLiveRuntimeBuildError::Missing(
+            ProductLiveRuntimeReadinessComponent::ModelPolicyGuard,
+        ));
+    }
+    if parts.model_budget_accountant.is_none() {
+        return Err(ProductLiveRuntimeBuildError::Missing(
+            ProductLiveRuntimeReadinessComponent::ModelBudgetAccountant,
+        ));
+    }
+    if parts.safety_context.is_none() {
+        return Err(ProductLiveRuntimeBuildError::Missing(
+            ProductLiveRuntimeReadinessComponent::SafetyContext,
+        ));
+    }
+    let Some(cancellation_factory) = parts.cancellation_factory.clone() else {
+        return Err(ProductLiveRuntimeBuildError::Missing(
+            ProductLiveRuntimeReadinessComponent::CancellationFactory,
+        ));
+    };
+    let readiness =
+        verify_product_live_cancellation_probe(cancellation_factory.as_ref()).map_err(|error| {
+            ProductLiveRuntimeBuildError::Probe {
+                component: ProductLiveRuntimeReadinessComponent::CancellationFactory,
+                source: error,
+            }
+        })?;
+    if readiness != ProductLiveCancellationReadiness::ExternallyControllable {
+        return Err(ProductLiveRuntimeBuildError::Inert(
+            ProductLiveRuntimeReadinessComponent::CancellationFactory,
+        ));
+    }
+    let turn_state_store: Arc<dyn TurnStateStore> = parts.turn_state.clone();
+    parts.loop_exit_evidence = Arc::new(
+        ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
+            Arc::clone(&parts.thread_service),
+            turn_state_store,
+            Arc::clone(&parts.loop_checkpoint_store),
+            parts.thread_scope.clone(),
+        )
+        .with_cancellation_factory(cancellation_factory),
+    );
+    build_default_planned_runtime(parts).map_err(ProductLiveRuntimeBuildError::Runtime)
+}
+
 pub fn build_default_planned_runtime<T, S, G>(
     parts: DefaultPlannedRuntimeParts<T, S, G>,
 ) -> Result<RebornRuntimeLoopComposition<T, S, G>, DefaultPlannedRuntimeBuildError>
@@ -153,7 +293,19 @@ where
     let run_profile_resolver: Arc<dyn RunProfileResolver> = resolver;
 
     let (wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
-    let wake_notifier: Arc<dyn TurnRunWakeNotifier> = Arc::new(wake_sender.clone());
+    let worker_wake_notifier: Arc<dyn TurnRunWakeNotifier> = Arc::new(wake_sender.clone());
+    // When a cancellation factory is supplied, fan-out each coordinator wake to
+    // BOTH the worker AND the factory's `notify_run_wake` observer. Without
+    // this composite, the worker still wakes but retained product run handles
+    // never flip on `cancel_run` — breaking end-to-end product-live
+    // cancellation observation.
+    let wake_notifier: Arc<dyn TurnRunWakeNotifier> = match parts.cancellation_factory.clone() {
+        Some(factory) => Arc::new(CompositeTurnRunWakeNotifier::new(
+            worker_wake_notifier,
+            factory,
+        )),
+        None => worker_wake_notifier,
+    };
     let coordinator = Arc::new(
         DefaultTurnCoordinator::new(Arc::clone(&parts.turn_state))
             .with_run_profile_resolver(Arc::clone(&run_profile_resolver))
@@ -187,6 +339,15 @@ where
     }
     if let Some(queue) = parts.input_queue {
         host_factory = host_factory.with_input_queue(queue);
+    }
+    if let Some(guard) = parts.model_policy_guard {
+        host_factory = host_factory.with_model_policy_guard(guard);
+    }
+    if let Some(accountant) = parts.model_budget_accountant {
+        host_factory = host_factory.with_model_budget_accountant(accountant);
+    }
+    if let Some(safety) = parts.safety_context {
+        host_factory = host_factory.with_safety_context(safety);
     }
     host_factory = host_factory.with_identity_context_source(parts.identity_context_source);
     let host_factory = Arc::new(host_factory);
