@@ -1066,10 +1066,19 @@ Product/API crates must not:
 
 Each `IngressRouteDescriptor` must carry a fully resolved `IngressPolicy`:
 
+- route patterns are local absolute path patterns, already normalized by
+  rejection rather than cleanup: no URLs, query strings, fragments, backslashes,
+  NUL/control characters, leading/trailing whitespace, duplicate `/`, or `..`
+  traversal segments;
 - listener class (`LocalGateway`, `PublicWebhook`, `OAuthCallback`, `InternalWorker`, `TestOnly`);
 - auth policy, with explicit justification for public routes;
 - scope extraction source;
+- auth policy and scope source are coherent: public routes cannot use
+  authenticated-caller scope, required-auth routes cannot use public-route
+  scope, and test-fixture scope requires a test-only listener class;
 - body and rate-limit policy, with explicit justification when rate limiting is disabled;
+- justification strings are clean human-readable reasons and reject leading or
+  trailing whitespace instead of normalizing it;
 - CORS and WebSocket Origin policy;
 - streaming mode;
 - audit/trace class;

@@ -36,6 +36,12 @@ fn validate_route_pattern(value: &str) -> Result<(), HostApiError> {
             "must be at most 512 bytes",
         ));
     }
+    if value.trim() != value {
+        return Err(HostApiError::invalid_path(
+            value,
+            "leading or trailing whitespace is not allowed",
+        ));
+    }
     if !value.starts_with('/') {
         return Err(HostApiError::invalid_path(
             value,
@@ -46,6 +52,12 @@ fn validate_route_pattern(value: &str) -> Result<(), HostApiError> {
         return Err(HostApiError::invalid_path(
             value,
             "must not be a URL or network-path reference",
+        ));
+    }
+    if value.contains("//") {
+        return Err(HostApiError::invalid_path(
+            value,
+            "duplicate slashes are not allowed",
         ));
     }
     if value.contains('?') || value.contains('#') {
@@ -66,6 +78,12 @@ fn validate_route_pattern(value: &str) -> Result<(), HostApiError> {
             "NUL/control characters are not allowed",
         ));
     }
+    if value.split('/').any(|segment| segment == "..") {
+        return Err(HostApiError::invalid_path(
+            value,
+            "path traversal segments are not allowed",
+        ));
+    }
     Ok(())
 }
 
@@ -74,6 +92,11 @@ fn validate_justification(kind: &'static str, value: &str) -> Result<(), HostApi
     if trimmed.is_empty() {
         return Err(HostApiError::invariant(format!(
             "{kind} justification must not be empty"
+        )));
+    }
+    if trimmed != value {
+        return Err(HostApiError::invariant(format!(
+            "{kind} justification must not contain leading or trailing whitespace"
         )));
     }
     if value.len() > 512 {
@@ -279,6 +302,7 @@ impl<'de> Deserialize<'de> for IngressPolicy {
 impl IngressPolicy {
     pub fn new(parts: IngressPolicyParts) -> Result<Self, HostApiError> {
         validate_auth_policy(&parts.auth)?;
+        validate_auth_scope(parts.listener_class, &parts.auth, parts.scope_source)?;
         validate_streaming_origin(parts.streaming, parts.websocket_origin)?;
 
         Ok(Self {
@@ -549,6 +573,27 @@ fn validate_auth_policy(auth: &IngressAuthPolicy) -> Result<(), HostApiError> {
     Ok(())
 }
 
+fn validate_auth_scope(
+    listener_class: ListenerClass,
+    auth: &IngressAuthPolicy,
+    scope_source: IngressScopeSource,
+) -> Result<(), HostApiError> {
+    match (auth, scope_source) {
+        (IngressAuthPolicy::Public { .. }, IngressScopeSource::AuthenticatedCaller) => Err(
+            HostApiError::invariant("public ingress auth must not use authenticated caller scope"),
+        ),
+        (IngressAuthPolicy::Required { .. }, IngressScopeSource::PublicRoute) => Err(
+            HostApiError::invariant("required ingress auth must not use public route scope"),
+        ),
+        (_, IngressScopeSource::TestFixture) if listener_class != ListenerClass::TestOnly => {
+            Err(HostApiError::invariant(
+                "test fixture ingress scope requires a test-only listener class",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate_streaming_origin(
     streaming: StreamingMode,
     websocket_origin: WebSocketOriginPolicy,
@@ -618,6 +663,11 @@ mod tests {
             "api/chat",
             "https://example.com/api",
             "//example.com/api",
+            " /api/chat",
+            "/api/chat ",
+            "/api//chat",
+            "/api/../chat",
+            "/../api/chat",
             "/api/chat?debug=true",
             "/api/chat#fragment",
             "/api\\chat",
@@ -640,6 +690,14 @@ mod tests {
             .expect_err("empty public justification must reject");
         assert!(empty.to_string().contains("must not be empty"));
 
+        let leading = IngressJustification::new("public route", " operational exception")
+            .expect_err("leading whitespace must reject");
+        assert!(leading.to_string().contains("leading or trailing"));
+
+        let trailing = IngressJustification::new("public route", "operational exception ")
+            .expect_err("trailing whitespace must reject");
+        assert!(trailing.to_string().contains("leading or trailing"));
+
         let mut parts = base_policy_parts();
         parts.auth = IngressAuthPolicy::Public {
             justification: justification(),
@@ -648,6 +706,35 @@ mod tests {
         parts.listener_class = ListenerClass::OAuthCallback;
         parts.audit = AuditTraceClass::PublicCallback;
         IngressPolicy::new(parts).expect("public route with justification should pass");
+    }
+
+    #[test]
+    fn auth_policy_must_match_scope_source() {
+        let mut public_with_authenticated_scope = base_policy_parts();
+        public_with_authenticated_scope.auth = IngressAuthPolicy::Public {
+            justification: justification(),
+        };
+        let err = IngressPolicy::new(public_with_authenticated_scope)
+            .expect_err("public auth must reject authenticated caller scope");
+        assert!(err.to_string().contains("public ingress auth"));
+
+        let mut required_with_public_scope = base_policy_parts();
+        required_with_public_scope.scope_source = IngressScopeSource::PublicRoute;
+        let err = IngressPolicy::new(required_with_public_scope)
+            .expect_err("required auth must reject public route scope");
+        assert!(err.to_string().contains("required ingress auth"));
+
+        let mut test_scope_on_non_test_listener = base_policy_parts();
+        test_scope_on_non_test_listener.scope_source = IngressScopeSource::TestFixture;
+        let err = IngressPolicy::new(test_scope_on_non_test_listener)
+            .expect_err("test fixture scope must reject non-test listeners");
+        assert!(err.to_string().contains("test fixture"));
+
+        let mut test_only = base_policy_parts();
+        test_only.listener_class = ListenerClass::TestOnly;
+        test_only.scope_source = IngressScopeSource::TestFixture;
+        test_only.audit = AuditTraceClass::TestOnly;
+        IngressPolicy::new(test_only).expect("test-only listener may use test fixture scope");
     }
 
     #[test]
