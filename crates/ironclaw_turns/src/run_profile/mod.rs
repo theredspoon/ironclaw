@@ -33,16 +33,18 @@ pub use host::{
     CapabilityDeniedReasonKind, CapabilityDeniedReasonKindValue, CapabilityDescriptorView,
     CapabilityFailure, CapabilityFailureKind, CapabilityFailureKindValue, CapabilityInputRef,
     CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
-    ConcurrencyHint, FinalizeAssistantMessage, LoopCancelReasonKind, LoopCapabilityPort,
-    LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopCheckpointStateRef,
-    LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest, LoopContextSnippet,
-    LoopContextSnippetMetadata, LoopDriverNoteKind, LoopGateKind, LoopInlineMessage,
-    LoopInlineMessageRole, LoopInput, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
-    LoopInputPort, LoopInterruptKind, LoopModelMessage, LoopModelPort, LoopModelRequest,
-    LoopModelResponse, LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
-    LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleGrant, LoopPromptBundleRef,
-    LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
-    LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode,
+    ConcurrencyHint, FinalizeAssistantMessage, LoadCheckpointPayloadRequest,
+    LoadedCheckpointPayload, LoopCancelReasonKind, LoopCancellationPort, LoopCancellationSignal,
+    LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest,
+    LoopCheckpointStateRef, LoopContextBundle, LoopContextMessage, LoopContextPort,
+    LoopContextRequest, LoopContextSnippet, LoopContextSnippetMetadata, LoopDriverNoteKind,
+    LoopGateKind, LoopInlineMessage, LoopInlineMessageRole, LoopInput, LoopInputAck,
+    LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInputCursorToken, LoopInputPort,
+    LoopInterruptKind, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
+    LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
+    LoopPromptBundleAuthority, LoopPromptBundleGrant, LoopPromptBundleRef, LoopPromptBundleRequest,
+    LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
+    ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode,
     StageCheckpointPayloadRequest, UpdateAssistantDraft, VisibleCapabilityRequest,
     VisibleCapabilitySurface, sanitize_model_visible_text, validate_model_route_component_value,
 };
@@ -77,7 +79,7 @@ pub use refs::{
 };
 pub use resolver::{
     InMemoryRunProfileRegistry, InMemoryRunProfileResolver, RunProfileDefinition,
-    RunProfileResolutionRequest, RunProfileResolver,
+    RunProfileRegistryError, RunProfileResolutionRequest, RunProfileResolver,
 };
 pub use skill_context::{
     InstalledSkillSnapshot, NoopSkillContextSource, SkillContextBudget, SkillContextError,

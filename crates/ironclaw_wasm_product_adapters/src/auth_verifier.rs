@@ -51,9 +51,11 @@ impl Clock for SystemClock {
 }
 
 /// Test-only clock that returns a fixed timestamp.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FixedClock(pub u64);
 
+#[cfg(test)]
 impl Clock for FixedClock {
     fn now_unix_seconds(&self) -> u64 {
         self.0

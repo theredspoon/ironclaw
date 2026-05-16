@@ -114,6 +114,10 @@ impl HostTrustPolicy {
         Self::from_parts_unchecked(Vec::new(), Box::new(SystemClock))
     }
 
+    pub fn has_sources(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
     /// Compatibility alias for [`Self::fail_closed`].
     ///
     /// The name is historical; semantics are deny-by-default, not vacuous
