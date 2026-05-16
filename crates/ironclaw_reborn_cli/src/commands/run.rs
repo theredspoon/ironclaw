@@ -150,7 +150,18 @@ fn print_reply(reply: &ironclaw_reborn_composition::AssistantReply) {
 fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntimeInput> {
     use ironclaw_reborn_composition::RebornBuildInput;
 
-    let owner_id = "reborn-cli";
+    // Read the operator's boot TOML if present. Missing file is OK
+    // (operator may not have run `ironclaw-reborn config init` yet);
+    // sparse fields are OK (each absent field falls back to the
+    // CLI-shaped default baked into composition).
+    let config_file = read_config_file(config)?;
+
+    let owner_id = config_file
+        .as_ref()
+        .and_then(|file| file.identity.as_ref())
+        .and_then(|identity| identity.default_owner.as_deref())
+        .unwrap_or("reborn-cli");
+
     let local_dev_root: PathBuf = config.home().path().join("local-dev");
 
     let composition_profile = match config.profile() {
@@ -162,30 +173,113 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
             );
         }
     };
-    let _ = composition_profile; // currently always LocalDev when reached.
+    let _ = composition_profile;
 
     let services_input = RebornBuildInput::local_dev(owner_id, local_dev_root);
 
-    #[allow(unused_mut)] // mutated only when `root-llm-provider` is enabled
+    #[allow(unused_mut)]
     let mut runtime_input = RebornRuntimeInput::from_services(services_input)
-        .with_runner_settings(TurnRunnerSettings {
-            heartbeat_interval: Duration::from_secs(5),
-            poll_interval: Duration::from_millis(200),
-        });
+        .with_runner_settings(runner_settings(config_file.as_ref()));
 
     #[cfg(feature = "root-llm-provider")]
     {
-        if let Some(llm) = resolve_llm_config_from_env()? {
-            runtime_input = runtime_input.with_llm(llm);
-        } else {
-            tracing::warn!(
-                "no LLM provider env vars detected; runs will fail until you set \
-                 OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_BASE_URL / etc."
-            );
+        match resolve_llm_config(config, config_file.as_ref())? {
+            LlmResolutionOutcome::Resolved(llm) => {
+                runtime_input = runtime_input.with_llm(llm);
+            }
+            LlmResolutionOutcome::NoSelectionConfigured => {
+                tracing::warn!(
+                    "no LLM selection configured; set `[llm.default]` in {} or export \
+                     OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_BASE_URL. \
+                     Runs will fail until an LLM is wired.",
+                    config.home().config_file_path().display()
+                );
+            }
         }
     }
 
     Ok(runtime_input)
+}
+
+fn read_config_file(
+    config: &RebornBootConfig,
+) -> anyhow::Result<Option<ironclaw_reborn_config::RebornConfigFile>> {
+    use ironclaw_reborn_config::RebornConfigFile;
+    let path = config.home().config_file_path();
+    let file = RebornConfigFile::load(&path).map_err(anyhow::Error::from)?;
+    if let Some(parsed) = &file {
+        tracing::debug!(
+            path = %path.display(),
+            api_version = ?parsed.api_version,
+            "loaded boot config TOML"
+        );
+    }
+    Ok(file)
+}
+
+fn runner_settings(
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> TurnRunnerSettings {
+    let mut settings = TurnRunnerSettings {
+        heartbeat_interval: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(200),
+    };
+    if let Some(runner) = config_file.and_then(|file| file.runner.as_ref()) {
+        if let Some(secs) = runner.heartbeat_interval_secs {
+            settings.heartbeat_interval = Duration::from_secs(secs);
+        }
+        if let Some(ms) = runner.poll_interval_ms {
+            settings.poll_interval = Duration::from_millis(ms);
+        }
+    }
+    settings
+}
+
+#[cfg(feature = "root-llm-provider")]
+enum LlmResolutionOutcome {
+    Resolved(ironclaw_reborn_composition::RebornLlmConfig),
+    NoSelectionConfigured,
+}
+
+#[cfg(feature = "root-llm-provider")]
+fn resolve_llm_config(
+    boot: &RebornBootConfig,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<LlmResolutionOutcome> {
+    // Preference order:
+    //   1. boot TOML [llm.default] (catalog-driven via providers.json)
+    //   2. env-only fallback (legacy: OPENAI_API_KEY etc.) for ergonomics
+    //   3. no LLM configured -> stub gateway, send fails at first message
+    if let Some(selection) = config_file.and_then(|file| file.default_llm_slot()) {
+        let providers_path = boot.home().providers_file_path();
+        let providers_arg = if providers_path.exists() {
+            Some(providers_path.as_path())
+        } else {
+            None
+        };
+        let llm = ironclaw_reborn_composition::resolve_llm_selection_against_catalog(
+            selection,
+            providers_arg,
+        )?;
+        tracing::info!(
+            provider_id = %llm.provider_id,
+            model = %llm.model,
+            base_url = %llm.base_url,
+            "resolved LLM selection from config.toml against provider catalog"
+        );
+        return Ok(LlmResolutionOutcome::Resolved(llm));
+    }
+
+    if let Some(llm) = resolve_llm_config_from_env()? {
+        tracing::info!(
+            provider_id = %llm.provider_id,
+            model = %llm.model,
+            "resolved LLM selection from environment (no [llm.default] in config.toml)"
+        );
+        return Ok(LlmResolutionOutcome::Resolved(llm));
+    }
+
+    Ok(LlmResolutionOutcome::NoSelectionConfigured)
 }
 
 #[cfg(feature = "root-llm-provider")]

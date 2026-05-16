@@ -830,3 +830,202 @@ fn doctor_rejects_missing_home_for_default_reborn_home() {
         "stderr: {stderr}"
     );
 }
+
+// ─── Boot-config TOML + provider catalog (epic #3036 prep) ───────────────────
+
+#[test]
+fn config_init_writes_both_files() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    let output = Command::new(reborn_bin())
+        .args(["config", "init"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn config init should run");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(reborn_home.join("config.toml").exists(), "config.toml missing");
+    assert!(
+        reborn_home.join("providers.json").exists(),
+        "providers.json missing"
+    );
+    let config_text =
+        std::fs::read_to_string(reborn_home.join("config.toml")).expect("config.toml readable");
+    assert!(
+        config_text.contains("api_version = \"ironclaw.runtime/v1\""),
+        "config.toml should stamp api_version; got: {config_text}"
+    );
+}
+
+#[test]
+fn config_init_refuses_to_clobber_without_force() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+
+    let first = Command::new(reborn_bin())
+        .args(["config", "init"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("first init should run");
+    assert!(first.status.success());
+
+    let second = Command::new(reborn_bin())
+        .args(["config", "init"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("second init should run");
+    assert!(!second.status.success(), "second init must refuse to clobber");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--force"),
+        "stderr should point at --force; got: {stderr}"
+    );
+}
+
+#[test]
+fn config_init_with_force_overwrites() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+
+    let first = Command::new(reborn_bin())
+        .args(["config", "init"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("first init should run");
+    assert!(first.status.success());
+
+    let second = Command::new(reborn_bin())
+        .args(["config", "init", "--force"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("forced init should run");
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
+#[test]
+fn config_path_reports_file_presence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+
+    // Pre-init: files are absent.
+    let absent_output = Command::new(reborn_bin())
+        .args(["config", "path"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("config path runs without files");
+    assert!(absent_output.status.success());
+    let absent_stdout = String::from_utf8_lossy(&absent_output.stdout);
+    assert!(
+        absent_stdout.contains("config_file") && absent_stdout.contains("absent"),
+        "stdout: {absent_stdout}"
+    );
+
+    // After init: files report present.
+    let init_output = Command::new(reborn_bin())
+        .args(["config", "init"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("init runs");
+    assert!(init_output.status.success());
+
+    let present_output = Command::new(reborn_bin())
+        .args(["config", "path"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("config path runs after init");
+    assert!(present_output.status.success());
+    let present_stdout = String::from_utf8_lossy(&present_output.stdout);
+    assert!(
+        present_stdout.contains("config_file") && present_stdout.contains("present"),
+        "stdout: {present_stdout}"
+    );
+    assert!(
+        present_stdout.contains("providers") && present_stdout.contains("present"),
+        "stdout: {present_stdout}"
+    );
+}
+
+#[test]
+fn run_with_inline_secret_in_config_fails_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    let bad_config = r#"
+[llm.default]
+provider_id = "openai"
+api_key_env = "sk-proj-1234567890abcdef12345678"
+"#;
+    std::fs::write(reborn_home.join("config.toml"), bad_config).expect("write bad config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OLLAMA_BASE_URL")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(
+        !output.status.success(),
+        "inline secret must cause failure; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inline secret") || stderr.contains("secret"),
+        "stderr should mention inline secret rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_resolves_provider_from_config_and_demands_api_key_env() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    let cfg = r#"
+[llm.default]
+provider_id = "openai"
+model = "gpt-4o-mini"
+api_key_env = "REBORN_TEST_UNSET_BC8F4D_KEY"
+"#;
+    std::fs::write(reborn_home.join("config.toml"), cfg).expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OLLAMA_BASE_URL")
+        .env_remove("REBORN_TEST_UNSET_BC8F4D_KEY")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(
+        !output.status.success(),
+        "missing api key must fail; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("REBORN_TEST_UNSET_BC8F4D_KEY"),
+        "stderr should name the unset env var; got: {stderr}"
+    );
+}
