@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::Args;
 use ironclaw_reborn_composition::{
-    RebornCompositionProfile, RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime,
+    RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime,
 };
 use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
 
@@ -28,7 +28,7 @@ pub(crate) struct RunCommand {
 
 impl RunCommand {
     pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
-        let _ = init_tracing();
+        init_tracing();
         if self.dry_run {
             return run_dry(context);
         }
@@ -153,16 +153,15 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
     let owner_id = "reborn-cli";
     let local_dev_root: PathBuf = config.home().path().join("local-dev");
 
-    let composition_profile = match config.profile() {
-        RebornProfile::LocalDev => RebornCompositionProfile::LocalDev,
+    match config.profile() {
+        RebornProfile::LocalDev => {}
         other => {
             anyhow::bail!(
                 "ironclaw-reborn run currently supports profile=local-dev; got profile={other}. \
                  Production wiring lands in a follow-up slice."
             );
         }
-    };
-    let _ = composition_profile; // currently always LocalDev when reached.
+    }
 
     let services_input = RebornBuildInput::local_dev(owner_id, local_dev_root);
 
@@ -171,7 +170,8 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
         .with_runner_settings(TurnRunnerSettings {
             heartbeat_interval: Duration::from_secs(5),
             poll_interval: Duration::from_millis(200),
-        });
+        })
+        .with_identity(RebornRuntimeIdentity::reborn_cli());
 
     #[cfg(feature = "root-llm-provider")]
     {
@@ -195,8 +195,8 @@ fn resolve_llm_config_from_env()
     use secrecy::SecretString;
 
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        let model = std::env::var("IRONCLAW_REBORN_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let model =
+            std::env::var("IRONCLAW_REBORN_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         let base_url = std::env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
         return Ok(Some(RebornLlmConfig::openai_compat(
@@ -222,8 +222,8 @@ fn resolve_llm_config_from_env()
         }));
     }
     if let Ok(base_url) = std::env::var("OLLAMA_BASE_URL") {
-        let model = std::env::var("IRONCLAW_REBORN_MODEL")
-            .unwrap_or_else(|_| "llama3.2".to_string());
+        let model =
+            std::env::var("IRONCLAW_REBORN_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
         return Ok(Some(RebornLlmConfig {
             provider_id: "ollama".to_string(),
             model,
@@ -237,15 +237,14 @@ fn resolve_llm_config_from_env()
     Ok(None)
 }
 
-fn init_tracing() -> Result<(), ()> {
+fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
     let filter = EnvFilter::try_from_env("IRONCLAW_REBORN_LOG").unwrap_or_else(|_| {
         EnvFilter::new("info,ironclaw_reborn=info,ironclaw_reborn_composition=info")
     });
-    fmt()
+    let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .try_init()
-        .map_err(|_| ())
+        .try_init();
 }

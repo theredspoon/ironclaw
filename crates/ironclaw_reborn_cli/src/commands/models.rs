@@ -1,36 +1,5 @@
 use clap::{Args, Subcommand};
 
-/// CLI-local mirror of the `ironclaw_reborn::ModelSlot` names used by the
-/// `models list` / `models status` diagnostic commands. Kept here so the CLI
-/// does not import `ironclaw_reborn` directly — the slot taxonomy is fixed
-/// by the composition root and only the labels are surfaced here.
-#[derive(Debug, Clone, Copy)]
-enum ModelSlot {
-    Default,
-    Mission,
-}
-
-impl ModelSlot {
-    const ALL: [Self; 2] = [Self::Default, Self::Mission];
-
-    fn all() -> &'static [Self] {
-        &Self::ALL
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Mission => "mission",
-        }
-    }
-}
-
-impl std::fmt::Display for ModelSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 #[derive(Debug, Args)]
 pub(crate) struct ModelsCommand {
     #[command(subcommand)]
@@ -70,12 +39,12 @@ impl ModelsCommand {
 
 impl ModelsListCommand {
     fn execute(self) -> anyhow::Result<()> {
-        let slots = ModelSlot::all();
+        let slots = ironclaw_reborn_composition::reborn_model_slot_names();
 
         if self.json {
             let slots = slots
                 .iter()
-                .map(|slot| serde_json::json!({ "slot": slot.as_str() }))
+                .map(|slot| serde_json::json!({ "slot": slot }))
                 .collect::<Vec<_>>();
             println!(
                 "{}",
@@ -100,14 +69,14 @@ impl ModelsListCommand {
 
 impl ModelsStatusCommand {
     fn execute(self) -> anyhow::Result<()> {
-        let slots = ModelSlot::all();
+        let slots = ironclaw_reborn_composition::reborn_model_slot_names();
 
         if self.json {
             let slot_status: serde_json::Map<String, serde_json::Value> = slots
                 .iter()
                 .map(|slot| {
                     (
-                        slot.as_str().to_string(),
+                        (*slot).to_string(),
                         serde_json::Value::from("not-configured"),
                     )
                 })

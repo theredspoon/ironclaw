@@ -35,12 +35,11 @@ use ironclaw_reborn::loop_driver_host::{RebornLoopDriverHostFactory, TextOnlyLoo
 use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
 use ironclaw_reborn::text_loop_driver::TextOnlyModelReplyDriver;
 use ironclaw_reborn::turn_runner::{
-    TurnRunnerWakeReceiver, TurnRunnerWorker, TurnRunnerWorkerConfig,
+    TurnRunnerWakeReceiver, TurnRunnerWakeSender, TurnRunnerWorker, TurnRunnerWorkerConfig,
 };
 use ironclaw_threads::{
-    AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService,
-    MessageContent, MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest,
-    ThreadScope,
+    AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
+    MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_turns::{
     AcceptedMessageRef, AgentLoopDriver, DefaultTurnCoordinator, GetRunStateRequest,
@@ -54,10 +53,8 @@ use ironclaw_turns::{
     },
 };
 
-use crate::{
-    RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services,
-};
-use crate::runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
+use crate::runtime_input::{RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings};
+use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
 #[cfg(feature = "root-llm-provider")]
 use crate::runtime_input::RebornLlmConfig;
@@ -139,6 +136,9 @@ pub struct RebornRuntime {
     worker_cancel: CancellationToken,
     poll_settings: PollSettings,
     actor_user_id: UserId,
+    source_binding_id: String,
+    reply_target_binding_id: String,
+    wake_sender: TurnRunnerWakeSender,
 }
 
 #[derive(Debug, Clone)]
@@ -169,9 +169,11 @@ impl RebornRuntime {
     /// The thread is materialized inside the session thread service so
     /// `accept_inbound_message` does not error on the first send.
     pub async fn new_conversation(&self) -> Result<ConversationId, RebornRuntimeError> {
-        let thread_id = ThreadId::new(format!("reborn-conv-{}", Uuid::new_v4()))
-            .map_err(|reason| RebornRuntimeError::InvalidArgument {
-                reason: reason.to_string(),
+        let thread_id =
+            ThreadId::new(format!("reborn-conv-{}", Uuid::new_v4())).map_err(|reason| {
+                RebornRuntimeError::InvalidArgument {
+                    reason: reason.to_string(),
+                }
             })?;
         self.thread_service
             .ensure_thread(EnsureThreadRequest {
@@ -209,23 +211,27 @@ impl RebornRuntime {
                 scope: self.thread_scope.clone(),
                 thread_id: conversation.0.clone(),
                 actor_id: self.actor_user_id.as_str().to_string(),
-                source_binding_id: Some("reborn-cli".to_string()),
-                reply_target_binding_id: Some("reborn-cli".to_string()),
-                external_event_id: Some(format!("reborn-cli:{}", Uuid::new_v4())),
+                source_binding_id: Some(self.source_binding_id.clone()),
+                reply_target_binding_id: Some(self.reply_target_binding_id.clone()),
+                // This task-level API does not receive an upstream stable
+                // event id, so mint a best-effort unique id scoped to the
+                // caller-provided source binding.
+                external_event_id: Some(format!("{}:{}", self.source_binding_id, Uuid::new_v4())),
                 content: MessageContent::text(text.to_string()),
             })
             .await
             .map_err(|error| RebornRuntimeError::ThreadService(error.to_string()))?;
 
-        let accepted_message_ref =
-            AcceptedMessageRef::new(format!("msg:{}", accepted.message_id))
+        let accepted_message_ref = AcceptedMessageRef::new(format!("msg:{}", accepted.message_id))
+            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
+        let source_binding_ref = SourceBindingRef::new(self.source_binding_id.clone())
+            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
+        let reply_target_binding_ref =
+            ReplyTargetBindingRef::new(self.reply_target_binding_id.clone())
                 .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
-        let source_binding_ref = SourceBindingRef::new("reborn-cli")
-            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
-        let reply_target_binding_ref = ReplyTargetBindingRef::new("reborn-cli")
-            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
-        let idempotency_key = IdempotencyKey::new(format!("reborn-cli-{}", Uuid::new_v4()))
-            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
+        let idempotency_key =
+            IdempotencyKey::new(format!("{}-{}", self.source_binding_id, Uuid::new_v4()))
+                .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
 
         let response = self
             .turn_coordinator
@@ -242,6 +248,7 @@ impl RebornRuntime {
             .await?;
 
         let SubmitTurnResponse::Accepted { run_id, .. } = response;
+        self.wake_sender.wake();
 
         let terminal_status = self.wait_for_terminal(&scope, run_id).await?;
         let assistant_text = self
@@ -260,7 +267,13 @@ impl RebornRuntime {
     /// returning.
     pub async fn shutdown(self) -> Result<(), RebornRuntimeError> {
         self.worker_cancel.cancel();
-        let _ = self.worker_handle.await;
+        if let Err(error) = self.worker_handle.await {
+            if error.is_panic() {
+                tracing::error!(%error, "reborn worker task panicked during shutdown");
+            } else {
+                tracing::warn!(%error, "reborn worker task was cancelled during shutdown");
+            }
+        }
         Ok(())
     }
 
@@ -290,9 +303,7 @@ impl RebornRuntime {
                     run_id,
                 })
                 .await?;
-            if state.status.is_terminal()
-                || matches!(state.status, TurnStatus::RecoveryRequired)
-            {
+            if state.status.is_terminal() || matches!(state.status, TurnStatus::RecoveryRequired) {
                 // RecoveryRequired isn't "terminal" in the durable state
                 // machine (a future recovery worker could resume it), but for
                 // the standalone CLI it is end-of-line: there is no recovery
@@ -355,6 +366,7 @@ pub async fn build_reborn_runtime(
         #[cfg(feature = "root-llm-provider")]
         llm,
         runner,
+        identity,
     } = input;
 
     let services_input = services_input.ok_or(RebornRuntimeError::InvalidArgument {
@@ -415,22 +427,22 @@ pub async fn build_reborn_runtime(
             .with_run_profile_resolver(Arc::new(resolver)),
     );
 
-    // Thread scope: a stable, single-tenant scope for the CLI session.
-    let tenant_id = TenantId::new("reborn-cli").map_err(|reason| {
+    let validated_identity = validate_runtime_identity(identity)?;
+
+    let tenant_id = TenantId::new(validated_identity.tenant_id.clone()).map_err(|reason| {
         RebornRuntimeError::InvalidArgument {
             reason: format!("tenant id: {reason}"),
         }
     })?;
-    let agent_id = AgentId::new("reborn-cli-agent").map_err(|reason| {
+    let agent_id = AgentId::new(validated_identity.agent_id.clone()).map_err(|reason| {
         RebornRuntimeError::InvalidArgument {
             reason: format!("agent id: {reason}"),
         }
     })?;
-    let actor_user_id = UserId::new(owner_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
+    let actor_user_id =
+        UserId::new(owner_id.clone()).map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("user id: {reason}"),
-        }
-    })?;
+        })?;
     let thread_scope = ThreadScope {
         tenant_id,
         agent_id,
@@ -441,7 +453,7 @@ pub async fn build_reborn_runtime(
 
     // Driver registry + worker — these are gated on the model gateway being
     // available (i.e. the `root-llm-provider` feature + LLM config).
-    let (worker_cancel, worker_handle) = build_and_spawn_worker(
+    let (worker_cancel, worker_handle, wake_sender) = build_and_spawn_worker(
         runner,
         Arc::clone(&turn_state_store),
         Arc::clone(&checkpoint_state_store) as Arc<_>,
@@ -462,7 +474,36 @@ pub async fn build_reborn_runtime(
         worker_cancel,
         poll_settings: PollSettings::default(),
         actor_user_id,
+        source_binding_id: validated_identity.source_binding_id,
+        reply_target_binding_id: validated_identity.reply_target_binding_id,
+        wake_sender,
     })
+}
+
+fn validate_runtime_identity(
+    identity: RebornRuntimeIdentity,
+) -> Result<RebornRuntimeIdentity, RebornRuntimeError> {
+    TenantId::new(identity.tenant_id.clone()).map_err(|reason| {
+        RebornRuntimeError::InvalidArgument {
+            reason: format!("tenant id: {reason}"),
+        }
+    })?;
+    AgentId::new(identity.agent_id.clone()).map_err(|reason| {
+        RebornRuntimeError::InvalidArgument {
+            reason: format!("agent id: {reason}"),
+        }
+    })?;
+    SourceBindingRef::new(identity.source_binding_id.clone()).map_err(|reason| {
+        RebornRuntimeError::InvalidArgument {
+            reason: format!("source binding id: {reason}"),
+        }
+    })?;
+    ReplyTargetBindingRef::new(identity.reply_target_binding_id.clone()).map_err(|reason| {
+        RebornRuntimeError::InvalidArgument {
+            reason: format!("reply target binding id: {reason}"),
+        }
+    })?;
+    Ok(identity)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,7 +516,7 @@ fn build_and_spawn_worker(
     thread_scope: ThreadScope,
     text_only_descriptor: ironclaw_turns::run_profile::AgentLoopDriverDescriptor,
     #[cfg(feature = "root-llm-provider")] llm: Option<RebornLlmConfig>,
-) -> Result<(CancellationToken, JoinHandle<()>), RebornRuntimeError> {
+) -> Result<(CancellationToken, JoinHandle<()>, TurnRunnerWakeSender), RebornRuntimeError> {
     use ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink;
 
     // Driver registry — registers the text-only driver under its descriptor.
@@ -532,7 +573,7 @@ fn build_and_spawn_worker(
         evidence_port,
     ));
 
-    let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
+    let (wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
     let worker = TurnRunnerWorker::new(
         TurnRunnerWorkerConfig {
             heartbeat_interval: runner.heartbeat_interval,
@@ -550,16 +591,13 @@ fn build_and_spawn_worker(
     let handle = tokio::spawn(async move {
         worker.run(cancel_clone).await;
     });
-    Ok((cancel, handle))
+    Ok((cancel, handle, wake_sender))
 }
 
 #[cfg(feature = "root-llm-provider")]
 fn build_llm_gateway(
     cfg: RebornLlmConfig,
-) -> Result<
-    Arc<dyn ironclaw_loop_support::HostManagedModelGateway>,
-    RebornRuntimeError,
-> {
+) -> Result<Arc<dyn ironclaw_loop_support::HostManagedModelGateway>, RebornRuntimeError> {
     use ironclaw_llm::{ProviderProtocol, RegistryProviderConfig, config::CacheRetention};
     use ironclaw_reborn::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
     use ironclaw_turns::run_profile::ModelProfileId;
@@ -592,18 +630,18 @@ fn build_llm_gateway(
         cache_retention: CacheRetention::None,
         unsupported_params: Vec::new(),
     };
-    let provider = ironclaw_llm::create_registry_provider(&registry_config, cfg.request_timeout_secs)
-        .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
+    let provider =
+        ironclaw_llm::create_registry_provider(&registry_config, cfg.request_timeout_secs)
+            .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
 
     let model_profile_id = ModelProfileId::new("interactive_model").expect("static id");
-    let policy = LlmModelProfilePolicy::new()
-        .allow_model_profile(model_profile_id, Some(cfg.model.clone()));
+    let policy =
+        LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, Some(cfg.model.clone()));
     let gateway = LlmProviderModelGateway::new(provider, policy);
     Ok(Arc::new(gateway))
 }
 
-fn build_stub_gateway()
--> Arc<dyn ironclaw_loop_support::HostManagedModelGateway> {
+fn build_stub_gateway() -> Arc<dyn ironclaw_loop_support::HostManagedModelGateway> {
     use async_trait::async_trait;
     use ironclaw_loop_support::{
         HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,

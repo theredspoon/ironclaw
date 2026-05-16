@@ -34,9 +34,20 @@ pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState
 pub use runtime::{
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, build_reborn_runtime,
 };
-pub use runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
 #[cfg(feature = "root-llm-provider")]
 pub use runtime_input::RebornLlmConfig;
+pub use runtime_input::{RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings};
+
+/// Reborn model purpose slot names exposed for diagnostic callers.
+///
+/// This keeps CLI diagnostics on the composition boundary instead of making
+/// the CLI mirror `ironclaw_reborn::model_routes::ModelSlot`.
+pub fn reborn_model_slot_names() -> Vec<&'static str> {
+    ironclaw_reborn::model_routes::ModelSlot::all()
+        .iter()
+        .map(|slot| slot.as_str())
+        .collect()
+}
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
