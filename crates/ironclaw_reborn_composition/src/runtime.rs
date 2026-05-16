@@ -20,6 +20,7 @@
 //! property that satisfies the "narrow Reborn public surface" requirement
 //! pinned by `crates/ironclaw_architecture/tests/reborn_dependency_boundaries.rs`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,7 +49,7 @@ use ironclaw_threads::{
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, CancelRunRequest, GetRunStateRequest, IdempotencyKey,
+    AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
     InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
     ReplyTargetBindingRef, RunProfileResolutionRequest, SanitizedCancelReason, SourceBindingRef,
     SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId,
@@ -59,7 +60,7 @@ use ironclaw_turns::{
     },
 };
 
-use crate::runtime_input::{RebornRuntimeIdentity, RebornRuntimeInput};
+use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
 use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
 #[cfg(feature = "root-llm-provider")]
@@ -107,6 +108,8 @@ pub enum RebornRuntimeError {
     TurnCoordinator(String),
     #[error("run did not reach a terminal state within {timeout:?}")]
     RunTimeout { timeout: Duration },
+    #[error("run cancelled by caller")]
+    OperationCancelled,
     #[error("invalid scope or identifier: {reason}")]
     InvalidArgument { reason: String },
     #[cfg(feature = "root-llm-provider")]
@@ -144,26 +147,11 @@ pub struct RebornRuntime {
     worker_cancel: CancellationToken,
     poll_settings: PollSettings,
     actor_user_id: UserId,
-    source_binding_id: String,
-    reply_target_binding_id: String,
+    source_binding_ref: SourceBindingRef,
+    reply_target_binding_ref: ReplyTargetBindingRef,
     default_run_profile_id: String,
     wake_sender: TurnRunnerWakeSender,
-    send_lock: Mutex<()>,
-}
-
-#[derive(Debug, Clone)]
-struct PollSettings {
-    interval: Duration,
-    max_total: Duration,
-}
-
-impl Default for PollSettings {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_millis(100),
-            max_total: Duration::from_secs(180),
-        }
-    }
+    send_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
 }
 
 impl RebornRuntime {
@@ -216,7 +204,21 @@ impl RebornRuntime {
         conversation: &ConversationId,
         text: &str,
     ) -> Result<AssistantReply, RebornRuntimeError> {
-        let _send_guard = self.send_lock.lock().await;
+        self.send_user_message_with_cancellation(conversation, text, CancellationToken::new())
+            .await
+    }
+
+    /// Submit a user message with a cooperative cancellation token. If the
+    /// token fires while waiting for completion, the runtime cancels the run
+    /// before returning.
+    pub async fn send_user_message_with_cancellation(
+        &self,
+        conversation: &ConversationId,
+        text: &str,
+        cancellation: CancellationToken,
+    ) -> Result<AssistantReply, RebornRuntimeError> {
+        let send_lock = self.send_lock_for(conversation).await;
+        let _send_guard = send_lock.lock().await;
         if self.worker_handle.is_finished() {
             return Err(RebornRuntimeError::WorkerStopped);
         }
@@ -227,12 +229,16 @@ impl RebornRuntime {
                 scope: self.thread_scope.clone(),
                 thread_id: conversation.0.clone(),
                 actor_id: self.actor_user_id.as_str().to_string(),
-                source_binding_id: Some(self.source_binding_id.clone()),
-                reply_target_binding_id: Some(self.reply_target_binding_id.clone()),
+                source_binding_id: Some(self.source_binding_ref.as_str().to_string()),
+                reply_target_binding_id: Some(self.reply_target_binding_ref.as_str().to_string()),
                 // This task-level API does not receive an upstream stable
                 // event id, so mint a best-effort unique id scoped to the
                 // caller-provided source binding.
-                external_event_id: Some(format!("{}:{}", self.source_binding_id, Uuid::new_v4())),
+                external_event_id: Some(format!(
+                    "{}:{}",
+                    self.source_binding_ref.as_str(),
+                    Uuid::new_v4()
+                )),
                 content: MessageContent::text(text.to_string()),
             })
             .await
@@ -240,23 +246,21 @@ impl RebornRuntime {
 
         let accepted_message_ref = AcceptedMessageRef::new(format!("msg:{}", accepted.message_id))
             .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
-        let source_binding_ref = SourceBindingRef::new(self.source_binding_id.clone())
-            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
-        let reply_target_binding_ref =
-            ReplyTargetBindingRef::new(self.reply_target_binding_id.clone())
-                .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
-        let idempotency_key =
-            IdempotencyKey::new(format!("{}-{}", self.source_binding_id, Uuid::new_v4()))
-                .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
+        let idempotency_key = IdempotencyKey::new(format!(
+            "{}-{}",
+            self.source_binding_ref.as_str(),
+            Uuid::new_v4()
+        ))
+        .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
 
         let response = self
             .turn_coordinator
             .submit_turn(SubmitTurnRequest {
                 scope: scope.clone(),
                 actor: TurnActor::new(self.actor_user_id.clone()),
-                accepted_message_ref: accepted_message_ref.clone(),
-                source_binding_ref,
-                reply_target_binding_ref,
+                accepted_message_ref,
+                source_binding_ref: self.source_binding_ref.clone(),
+                reply_target_binding_ref: self.reply_target_binding_ref.clone(),
                 requested_run_profile: None,
                 idempotency_key,
                 received_at: Utc::now(),
@@ -264,9 +268,21 @@ impl RebornRuntime {
             .await?;
 
         let SubmitTurnResponse::Accepted { run_id, .. } = response;
+        if cancellation.is_cancelled() {
+            self.cancel_run(
+                &scope,
+                run_id,
+                SanitizedCancelReason::UserRequested,
+                "caller-cancel",
+            )
+            .await?;
+            return Err(RebornRuntimeError::OperationCancelled);
+        }
         self.wake_sender.wake();
 
-        let terminal_status = self.wait_for_terminal(&scope, run_id).await?;
+        let terminal_status = self
+            .wait_for_terminal(&scope, run_id, &cancellation)
+            .await?;
         let assistant_text = self
             .read_latest_assistant_text(&conversation.0, run_id)
             .await?;
@@ -302,10 +318,20 @@ impl RebornRuntime {
         )
     }
 
+    async fn send_lock_for(&self, conversation: &ConversationId) -> Arc<Mutex<()>> {
+        let mut locks = self.send_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(conversation.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     async fn wait_for_terminal(
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
+        cancellation: &CancellationToken,
     ) -> Result<TurnStatus, RebornRuntimeError> {
         let start = std::time::Instant::now();
         loop {
@@ -328,51 +354,68 @@ impl RebornRuntime {
                 // runtime has no recovery worker, so cancel it before
                 // returning to release the conversation lock.
                 let response = self
-                    .turn_coordinator
-                    .cancel_run(CancelRunRequest {
-                        scope: scope.clone(),
-                        actor: TurnActor::new(self.actor_user_id.clone()),
+                    .cancel_run(
+                        scope,
                         run_id,
-                        reason: SanitizedCancelReason::OperatorRequested,
-                        idempotency_key: IdempotencyKey::new(format!(
-                            "{}-recovery-required-cancel-{}",
-                            self.source_binding_id, run_id
-                        ))
-                        .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?,
-                    })
+                        SanitizedCancelReason::OperatorRequested,
+                        "recovery-required-cancel",
+                    )
                     .await?;
                 return Ok(response.status);
             }
             if start.elapsed() > self.poll_settings.max_total {
-                self.cancel_run_for_timeout(scope, run_id).await?;
+                self.cancel_run(
+                    scope,
+                    run_id,
+                    SanitizedCancelReason::Timeout,
+                    "timeout-cancel",
+                )
+                .await?;
                 return Err(RebornRuntimeError::RunTimeout {
                     timeout: self.poll_settings.max_total,
                 });
             }
-            tokio::time::sleep(self.poll_settings.interval).await;
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    self.cancel_run(
+                        scope,
+                        run_id,
+                        SanitizedCancelReason::UserRequested,
+                        "caller-cancel",
+                    )
+                    .await?;
+                    return Err(RebornRuntimeError::OperationCancelled);
+                }
+                _ = tokio::time::sleep(self.poll_settings.interval) => {}
+            }
         }
     }
 
-    async fn cancel_run_for_timeout(
+    async fn cancel_run(
         &self,
         scope: &TurnScope,
         run_id: TurnRunId,
-    ) -> Result<(), RebornRuntimeError> {
-        self.turn_coordinator
+        reason: SanitizedCancelReason,
+        idempotency_suffix: &str,
+    ) -> Result<CancelRunResponse, RebornRuntimeError> {
+        let response = self
+            .turn_coordinator
             .cancel_run(CancelRunRequest {
                 scope: scope.clone(),
                 actor: TurnActor::new(self.actor_user_id.clone()),
                 run_id,
-                reason: SanitizedCancelReason::Timeout,
+                reason,
                 idempotency_key: IdempotencyKey::new(format!(
-                    "{}-timeout-cancel-{}",
-                    self.source_binding_id, run_id
+                    "{}-{}-{}",
+                    self.source_binding_ref.as_str(),
+                    idempotency_suffix,
+                    run_id
                 ))
                 .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?,
             })
             .await?;
         self.wake_sender.wake();
-        Ok(())
+        Ok(response)
     }
 
     async fn read_latest_assistant_text(
@@ -422,6 +465,7 @@ pub async fn build_reborn_runtime(
         #[cfg(feature = "root-llm-provider")]
         llm,
         runner,
+        poll,
         identity,
     } = input;
 
@@ -453,16 +497,8 @@ pub async fn build_reborn_runtime(
 
     let validated_identity = validate_runtime_identity(identity)?;
 
-    let tenant_id = TenantId::new(validated_identity.tenant_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
-            reason: format!("tenant id: {reason}"),
-        }
-    })?;
-    let agent_id = AgentId::new(validated_identity.agent_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
-            reason: format!("agent id: {reason}"),
-        }
-    })?;
+    let tenant_id = validated_identity.tenant_id.clone();
+    let agent_id = validated_identity.agent_id.clone();
     let actor_user_id =
         UserId::new(owner_id.clone()).map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("user id: {reason}"),
@@ -550,40 +586,51 @@ pub async fn build_reborn_runtime(
         thread_scope,
         worker_handle,
         worker_cancel,
-        poll_settings: PollSettings::default(),
+        poll_settings: poll,
         actor_user_id,
-        source_binding_id: validated_identity.source_binding_id,
-        reply_target_binding_id: validated_identity.reply_target_binding_id,
+        source_binding_ref: validated_identity.source_binding_ref,
+        reply_target_binding_ref: validated_identity.reply_target_binding_ref,
         default_run_profile_id,
         wake_sender,
-        send_lock: Mutex::new(()),
+        send_locks: Mutex::new(HashMap::new()),
     })
+}
+
+struct ValidatedRuntimeIdentity {
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    source_binding_ref: SourceBindingRef,
+    reply_target_binding_ref: ReplyTargetBindingRef,
 }
 
 fn validate_runtime_identity(
     identity: RebornRuntimeIdentity,
-) -> Result<RebornRuntimeIdentity, RebornRuntimeError> {
-    TenantId::new(identity.tenant_id.clone()).map_err(|reason| {
+) -> Result<ValidatedRuntimeIdentity, RebornRuntimeError> {
+    let tenant_id = TenantId::new(identity.tenant_id).map_err(|reason| {
         RebornRuntimeError::InvalidArgument {
             reason: format!("tenant id: {reason}"),
         }
     })?;
-    AgentId::new(identity.agent_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
+    let agent_id =
+        AgentId::new(identity.agent_id).map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("agent id: {reason}"),
-        }
-    })?;
-    SourceBindingRef::new(identity.source_binding_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
-            reason: format!("source binding id: {reason}"),
-        }
-    })?;
-    ReplyTargetBindingRef::new(identity.reply_target_binding_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
+        })?;
+    let source_binding_ref =
+        SourceBindingRef::new(identity.source_binding_id).map_err(|reason| {
+            RebornRuntimeError::InvalidArgument {
+                reason: format!("source binding id: {reason}"),
+            }
+        })?;
+    let reply_target_binding_ref = ReplyTargetBindingRef::new(identity.reply_target_binding_id)
+        .map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("reply target binding id: {reason}"),
-        }
-    })?;
-    Ok(identity)
+        })?;
+    Ok(ValidatedRuntimeIdentity {
+        tenant_id,
+        agent_id,
+        source_binding_ref,
+        reply_target_binding_ref,
+    })
 }
 
 struct EmptyCapabilityFactory;
@@ -663,19 +710,22 @@ fn build_llm_gateway(
 fn parse_provider_protocol(
     protocol: &str,
 ) -> Result<ironclaw_llm::ProviderProtocol, RebornRuntimeError> {
-    let normalized_protocol = if protocol == "openai" || protocol == "openai_completions" {
-        "open_ai_completions"
-    } else if protocol == "deepseek" {
-        "deep_seek"
-    } else if protocol == "openrouter" {
-        "open_router"
-    } else {
-        protocol
-    };
+    use ironclaw_llm::ProviderProtocol;
 
-    serde_json::from_value(serde_json::Value::String(normalized_protocol.to_string())).map_err(
-        |_| RebornRuntimeError::LlmProvider(format!("unsupported llm protocol: {protocol}")),
-    )
+    match protocol {
+        "open_ai_completions" | "openai_completions" | "openai" => {
+            Ok(ProviderProtocol::OpenAiCompletions)
+        }
+        "anthropic" => Ok(ProviderProtocol::Anthropic),
+        "ollama" => Ok(ProviderProtocol::Ollama),
+        "github_copilot" => Ok(ProviderProtocol::GithubCopilot),
+        "deep_seek" | "deepseek" => Ok(ProviderProtocol::DeepSeek),
+        "gemini" => Ok(ProviderProtocol::Gemini),
+        "open_router" | "openrouter" => Ok(ProviderProtocol::OpenRouter),
+        _ => Err(RebornRuntimeError::LlmProvider(format!(
+            "unsupported llm protocol: {protocol}"
+        ))),
+    }
 }
 
 #[cfg(all(test, feature = "root-llm-provider"))]
@@ -686,6 +736,10 @@ mod tests {
 
     #[test]
     fn parses_supported_provider_protocols_without_wildcard_mapping() {
+        assert_eq!(
+            parse_provider_protocol("open_ai_completions").unwrap(),
+            ProviderProtocol::OpenAiCompletions
+        );
         assert_eq!(
             parse_provider_protocol("openai_completions").unwrap(),
             ProviderProtocol::OpenAiCompletions
@@ -703,12 +757,20 @@ mod tests {
             ProviderProtocol::Ollama
         );
         assert_eq!(
+            parse_provider_protocol("deep_seek").unwrap(),
+            ProviderProtocol::DeepSeek
+        );
+        assert_eq!(
             parse_provider_protocol("deepseek").unwrap(),
             ProviderProtocol::DeepSeek
         );
         assert_eq!(
             parse_provider_protocol("gemini").unwrap(),
             ProviderProtocol::Gemini
+        );
+        assert_eq!(
+            parse_provider_protocol("open_router").unwrap(),
+            ProviderProtocol::OpenRouter
         );
         assert_eq!(
             parse_provider_protocol("openrouter").unwrap(),

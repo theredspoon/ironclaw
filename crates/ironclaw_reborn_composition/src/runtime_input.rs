@@ -8,6 +8,8 @@
 //!   that satisfies the loop-support `HostManagedModelGateway` contract.
 //! - **Turn-runner configuration** — poll/heartbeat intervals for the worker
 //!   loop.
+//! - **Completion polling configuration** — interval/timeout policy for
+//!   waiting on submitted turns to finish.
 //! - **Runtime identity** — tenant/agent and source/reply binding identifiers
 //!   supplied by the caller so this composition root stays channel-agnostic.
 //!
@@ -68,9 +70,11 @@ pub struct RebornLlmConfig {
     /// like Ollama.
     pub api_key: Option<secrecy::SecretString>,
     /// API protocol identifier — maps onto
-    /// `ironclaw_llm::ProviderProtocol`. Accepted values:
-    /// `"openai_completions"`, `"anthropic"`, `"ollama"`, `"deepseek"`,
-    /// `"gemini"`, `"openrouter"`, `"github_copilot"`.
+    /// `ironclaw_llm::ProviderProtocol`. Canonical accepted values:
+    /// `"open_ai_completions"`, `"anthropic"`, `"ollama"`, `"deep_seek"`,
+    /// `"gemini"`, `"open_router"`, `"github_copilot"`.
+    /// Legacy aliases `"openai"`, `"openai_completions"`, `"deepseek"`,
+    /// and `"openrouter"` are also accepted.
     pub protocol: String,
     /// Request timeout in seconds passed to the underlying HTTP client.
     pub request_timeout_secs: u64,
@@ -92,7 +96,7 @@ impl RebornLlmConfig {
             model: model.into(),
             base_url: base_url.into(),
             api_key: Some(api_key),
-            protocol: "openai_completions".to_string(),
+            protocol: "open_ai_completions".to_string(),
             request_timeout_secs: 120,
             extra_headers: Vec::new(),
         }
@@ -115,6 +119,22 @@ impl Default for TurnRunnerSettings {
     }
 }
 
+/// Completion polling policy for `RebornRuntime::send_user_message`.
+#[derive(Debug, Clone)]
+pub struct PollSettings {
+    pub interval: Duration,
+    pub max_total: Duration,
+}
+
+impl Default for PollSettings {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(100),
+            max_total: Duration::from_secs(180),
+        }
+    }
+}
+
 /// Full input for `build_reborn_runtime` — substrate config plus the extras
 /// needed to assemble a runnable Reborn agent.
 #[derive(Default)]
@@ -123,6 +143,7 @@ pub struct RebornRuntimeInput {
     #[cfg(feature = "root-llm-provider")]
     pub llm: Option<RebornLlmConfig>,
     pub runner: TurnRunnerSettings,
+    pub poll: PollSettings,
     pub identity: RebornRuntimeIdentity,
 }
 
@@ -137,6 +158,7 @@ impl RebornRuntimeInput {
             #[cfg(feature = "root-llm-provider")]
             llm: None,
             runner: TurnRunnerSettings::default(),
+            poll: PollSettings::default(),
             identity: RebornRuntimeIdentity::default(),
         }
     }
@@ -149,6 +171,11 @@ impl RebornRuntimeInput {
 
     pub fn with_runner_settings(mut self, runner: TurnRunnerSettings) -> Self {
         self.runner = runner;
+        self
+    }
+
+    pub fn with_poll_settings(mut self, poll: PollSettings) -> Self {
+        self.poll = poll;
         self
     }
 

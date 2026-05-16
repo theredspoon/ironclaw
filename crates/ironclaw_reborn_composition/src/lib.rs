@@ -36,7 +36,9 @@ pub use runtime::{
 };
 #[cfg(feature = "root-llm-provider")]
 pub use runtime_input::RebornLlmConfig;
-pub use runtime_input::{RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings};
+pub use runtime_input::{
+    PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings,
+};
 
 /// Reborn model purpose slot names exposed for diagnostic callers.
 ///

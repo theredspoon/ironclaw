@@ -603,6 +603,8 @@ fn run_message_exits_nonzero_when_runtime_does_not_produce_reply() {
         !output.status.success(),
         "run --message should fail when the runtime cannot produce assistant text"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.is_empty(), "stdout should stay reply-only: {stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("reborn run did not produce an assistant reply"),
@@ -638,6 +640,8 @@ fn run_piped_stdin_exits_nonzero_when_runtime_does_not_produce_reply() {
         !output.status.success(),
         "piped run should fail when the runtime cannot produce assistant text"
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.is_empty(), "stdout should stay reply-only: {stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("reborn run did not produce an assistant reply"),

@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use clap::Args;
 use ironclaw_reborn_composition::{
-    RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime,
-    reborn_runtime_readiness_snapshot,
+    PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings,
+    build_reborn_runtime, reborn_runtime_readiness_snapshot,
 };
 use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
+use tokio_util::sync::CancellationToken;
 
 use crate::context::RebornCliContext;
 
@@ -45,11 +46,12 @@ impl RunCommand {
             print_runtime_banner(context.boot_config());
 
             let conversation = runtime.new_conversation().await?;
+            let cancellation = install_ctrl_c_cancellation();
 
             let outcome = if let Some(text) = message {
-                send_once(&runtime, &conversation, &text).await
+                send_once(&runtime, &conversation, &text, cancellation).await
             } else {
-                run_repl(&runtime, &conversation).await
+                run_repl(&runtime, &conversation, cancellation).await
             };
 
             runtime.shutdown().await?;
@@ -114,8 +116,11 @@ async fn send_once(
     runtime: &ironclaw_reborn_composition::RebornRuntime,
     conversation: &ironclaw_reborn_composition::ConversationId,
     text: &str,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
-    let reply = runtime.send_user_message(conversation, text).await?;
+    let reply = runtime
+        .send_user_message_with_cancellation(conversation, text, cancellation)
+        .await?;
     if !reply.is_successful_final_reply() {
         anyhow::bail!(
             "reborn run did not produce an assistant reply (status={:?}, run_id={})",
@@ -130,6 +135,7 @@ async fn send_once(
 async fn run_repl(
     runtime: &ironclaw_reborn_composition::RebornRuntime,
     conversation: &ironclaw_reborn_composition::ConversationId,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let stdin_is_tty = std::io::stdin().is_terminal();
     if stdin_is_tty {
@@ -139,9 +145,6 @@ async fn run_repl(
     let reader = tokio::io::BufReader::new(stdin);
     use tokio::io::AsyncBufReadExt;
     let mut lines = reader.lines();
-
-    let cancel = tokio::signal::ctrl_c();
-    tokio::pin!(cancel);
 
     loop {
         if stdin_is_tty {
@@ -154,7 +157,14 @@ async fn run_repl(
                 match line? {
                     Some(text) if text.trim().is_empty() => continue,
                     Some(text) => {
-                        match runtime.send_user_message(conversation, &text).await {
+                        match runtime
+                            .send_user_message_with_cancellation(
+                                conversation,
+                                &text,
+                                cancellation.clone(),
+                            )
+                            .await
+                        {
                             Ok(reply) if reply.is_successful_final_reply() => print_reply(&reply),
                             Ok(reply) if stdin_is_tty => print_reply(&reply),
                             Ok(reply) => {
@@ -164,7 +174,12 @@ async fn run_repl(
                                     reply.run_id
                                 );
                             }
-                            Err(error) if stdin_is_tty => eprintln!("error: {error}"),
+                            Err(error) if stdin_is_tty => {
+                                eprintln!("error: {error}");
+                                if cancellation.is_cancelled() {
+                                    return Ok(());
+                                }
+                            }
                             Err(error) => return Err(error.into()),
                         }
                     }
@@ -176,7 +191,7 @@ async fn run_repl(
                     }
                 }
             }
-            _ = &mut cancel => {
+            _ = cancellation.cancelled() => {
                 eprintln!();
                 eprintln!("(repl) caught ctrl-c, shutting down");
                 return Ok(());
@@ -188,11 +203,22 @@ async fn run_repl(
 fn print_reply(reply: &ironclaw_reborn_composition::AssistantReply) {
     match reply.text.as_deref() {
         Some(text) => println!("{text}"),
-        None => println!(
+        None => eprintln!(
             "(no assistant text; status={:?}, run_id={})",
             reply.status, reply.run_id
         ),
     }
+}
+
+fn install_ctrl_c_cancellation() -> CancellationToken {
+    let cancellation = CancellationToken::new();
+    let ctrl_c_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            ctrl_c_cancellation.cancel();
+        }
+    });
+    cancellation
 }
 
 fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntimeInput> {
@@ -218,6 +244,10 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
         .with_runner_settings(TurnRunnerSettings {
             heartbeat_interval: Duration::from_secs(5),
             poll_interval: Duration::from_millis(200),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(200),
+            max_total: Duration::from_secs(180),
         })
         .with_identity(RebornRuntimeIdentity::reborn_cli());
 
