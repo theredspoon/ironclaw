@@ -21,28 +21,28 @@
 mod error;
 mod factory;
 mod input;
-mod profile;
-mod readiness;
 #[cfg(feature = "root-llm-provider")]
 mod llm_catalog;
+mod profile;
+mod readiness;
 mod runtime;
 mod runtime_input;
 
 pub use error::RebornBuildError;
 pub use factory::{RebornServices, build_reborn_services};
 pub use input::RebornBuildInput;
+#[cfg(feature = "root-llm-provider")]
+pub use llm_catalog::{
+    RebornLlmCatalogError, resolve_against_registry, resolve_llm_selection_against_catalog,
+};
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
 pub use runtime::{
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, build_reborn_runtime,
 };
-pub use runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
-#[cfg(feature = "root-llm-provider")]
-pub use llm_catalog::{
-    RebornLlmCatalogError, resolve_against_registry, resolve_llm_selection_against_catalog,
-};
 #[cfg(feature = "root-llm-provider")]
 pub use runtime_input::RebornLlmConfig;
+pub use runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;

@@ -25,6 +25,10 @@ use ironclaw_host_runtime::{
     VisibleCapability, VisibleCapabilityAccess,
 };
 use ironclaw_loop_support::{
+    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
+    HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
+};
+use ironclaw_loop_support::{
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
     HostIdentityMessageContent, HostInputBatch, HostInputEnvelope, HostInputQueue,
     HostInputQueueError, HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
@@ -33,10 +37,6 @@ use ironclaw_loop_support::{
     identity_message_ref,
 };
 use ironclaw_processes::ProcessServices;
-use ironclaw_loop_support::{
-    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    HostRuntimeLoopCapabilityPort, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
-};
 use ironclaw_reborn::loop_driver_host::{
     RebornLoopDriverHost, RebornLoopDriverHostFactory, RebornLoopDriverHostRequest,
     TextOnlyLoopHostConfig,

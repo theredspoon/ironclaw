@@ -28,11 +28,10 @@ mod secrets_guard;
 
 pub use boot::RebornBootConfig;
 pub use config_file::{
-    BootSection, DriversSection, HarnessSection, IdentitySection, LlmSlotSelection,
-    PolicySection, REBORN_CONFIG_API_VERSION, RebornConfigFile, RebornConfigFileError,
-    RunnerSection,
+    BootSection, DriversSection, HarnessSection, IdentitySection, LlmSlotSelection, PolicySection,
+    REBORN_CONFIG_API_VERSION, RebornConfigFile, RebornConfigFileError, RunnerSection,
 };
 pub use doctor::RebornDoctorReport;
 pub use home::{REBORN_HOME_ENV, RebornConfigError, RebornHome, RebornHomeSource};
 pub use profile::{REBORN_PROFILE_ENV, RebornProfile};
-pub use secrets_guard::InlineSecretError;
+pub use secrets_guard::{InlineSecretError, reject_inline_secret};

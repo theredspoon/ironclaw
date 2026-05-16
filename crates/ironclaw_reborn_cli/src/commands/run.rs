@@ -6,7 +6,7 @@ use clap::Args;
 use ironclaw_reborn_composition::{
     RebornCompositionProfile, RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime,
 };
-use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
+use ironclaw_reborn_config::{REBORN_PROFILE_ENV, RebornBootConfig, RebornProfile};
 
 use crate::context::RebornCliContext;
 
@@ -156,6 +156,8 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
     // CLI-shaped default baked into composition).
     let config_file = read_config_file(config)?;
 
+    reject_unsupported_runtime_sections(config_file.as_ref())?;
+
     let owner_id = config_file
         .as_ref()
         .and_then(|file| file.identity.as_ref())
@@ -164,7 +166,8 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
 
     let local_dev_root: PathBuf = config.home().path().join("local-dev");
 
-    let composition_profile = match config.profile() {
+    let effective_profile = effective_profile(config, config_file.as_ref())?;
+    let composition_profile = match effective_profile {
         RebornProfile::LocalDev => RebornCompositionProfile::LocalDev,
         other => {
             anyhow::bail!(
@@ -179,7 +182,7 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
 
     #[allow(unused_mut)]
     let mut runtime_input = RebornRuntimeInput::from_services(services_input)
-        .with_runner_settings(runner_settings(config_file.as_ref()));
+        .with_runner_settings(runner_settings(config_file.as_ref())?);
 
     #[cfg(feature = "root-llm-provider")]
     {
@@ -217,22 +220,100 @@ fn read_config_file(
     Ok(file)
 }
 
+fn effective_profile(
+    config: &RebornBootConfig,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<RebornProfile> {
+    // Env wins over file. `RebornBootConfig` already parsed/validated env,
+    // so if the variable is present we keep that value.
+    if std::env::var_os(REBORN_PROFILE_ENV).is_some() {
+        return Ok(config.profile());
+    }
+
+    let Some(profile) = config_file
+        .and_then(|file| file.boot.as_ref())
+        .and_then(|boot| boot.profile.as_deref())
+    else {
+        return Ok(config.profile());
+    };
+
+    profile.parse::<RebornProfile>().map_err(|error| {
+        anyhow::anyhow!("config file [boot].profile `{profile}` is invalid: {error}")
+    })
+}
+
+fn reject_unsupported_runtime_sections(
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<()> {
+    let Some(file) = config_file else {
+        return Ok(());
+    };
+
+    if let Some(identity) = file.identity.as_ref() {
+        let mut unsupported = Vec::new();
+        if identity.tenant.is_some() {
+            unsupported.push("tenant");
+        }
+        if identity.default_agent.is_some() {
+            unsupported.push("default_agent");
+        }
+        if identity.default_project.is_some() {
+            unsupported.push("default_project");
+        }
+        if !unsupported.is_empty() {
+            anyhow::bail!(
+                "config file [identity] field(s) {} are parsed but not wired in this runtime slice; \
+                 leave them commented until identity-scope wiring lands (default_owner is supported)",
+                unsupported.join(", ")
+            );
+        }
+    }
+
+    let mut sections = Vec::new();
+    if file.policy.is_some() {
+        sections.push("[policy]");
+    }
+    if file.drivers.is_some() {
+        sections.push("[drivers]");
+    }
+    if file.harness.is_some() {
+        sections.push("[harness]");
+    }
+    if sections.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "config file section(s) {} are parsed but not wired in this runtime slice; \
+             leave them commented until epic #3036 substrate lands",
+            sections.join(", ")
+        )
+    }
+}
+
 fn runner_settings(
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
-) -> TurnRunnerSettings {
+) -> anyhow::Result<TurnRunnerSettings> {
     let mut settings = TurnRunnerSettings {
         heartbeat_interval: Duration::from_secs(5),
         poll_interval: Duration::from_millis(200),
     };
     if let Some(runner) = config_file.and_then(|file| file.runner.as_ref()) {
         if let Some(secs) = runner.heartbeat_interval_secs {
+            if secs == 0 {
+                anyhow::bail!(
+                    "config file [runner].heartbeat_interval_secs must be greater than 0"
+                );
+            }
             settings.heartbeat_interval = Duration::from_secs(secs);
         }
         if let Some(ms) = runner.poll_interval_ms {
+            if ms == 0 {
+                anyhow::bail!("config file [runner].poll_interval_ms must be greater than 0");
+            }
             settings.poll_interval = Duration::from_millis(ms);
         }
     }
-    settings
+    Ok(settings)
 }
 
 #[cfg(feature = "root-llm-provider")]
@@ -252,19 +333,13 @@ fn resolve_llm_config(
     //   3. no LLM configured -> stub gateway, send fails at first message
     if let Some(selection) = config_file.and_then(|file| file.default_llm_slot()) {
         let providers_path = boot.home().providers_file_path();
-        let providers_arg = if providers_path.exists() {
-            Some(providers_path.as_path())
-        } else {
-            None
-        };
         let llm = ironclaw_reborn_composition::resolve_llm_selection_against_catalog(
             selection,
-            providers_arg,
+            Some(providers_path.as_path()),
         )?;
         tracing::info!(
             provider_id = %llm.provider_id,
             model = %llm.model,
-            base_url = %llm.base_url,
             "resolved LLM selection from config.toml against provider catalog"
         );
         return Ok(LlmResolutionOutcome::Resolved(llm));
@@ -289,8 +364,8 @@ fn resolve_llm_config_from_env()
     use secrecy::SecretString;
 
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        let model = std::env::var("IRONCLAW_REBORN_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let model =
+            std::env::var("IRONCLAW_REBORN_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
         let base_url = std::env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
         return Ok(Some(RebornLlmConfig::openai_compat(
@@ -316,8 +391,8 @@ fn resolve_llm_config_from_env()
         }));
     }
     if let Ok(base_url) = std::env::var("OLLAMA_BASE_URL") {
-        let model = std::env::var("IRONCLAW_REBORN_MODEL")
-            .unwrap_or_else(|_| "llama3.2".to_string());
+        let model =
+            std::env::var("IRONCLAW_REBORN_MODEL").unwrap_or_else(|_| "llama3.2".to_string());
         return Ok(Some(RebornLlmConfig {
             provider_id: "ollama".to_string(),
             model,

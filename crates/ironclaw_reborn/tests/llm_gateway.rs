@@ -15,8 +15,7 @@ use ironclaw_reborn::model_gateway::{
     StaticModelRouteProviderPool, ThreadBackedLoopModelGateway,
 };
 use ironclaw_reborn::model_routes::{
-    ModelRoute, ModelRoutePolicy, ModelRouteProviderKey, ModelSelectionMode, ModelSlot,
-    StaticModelRouteResolver,
+    ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, StaticModelRouteResolver,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,

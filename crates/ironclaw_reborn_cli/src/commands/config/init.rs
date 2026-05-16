@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use clap::Args;
@@ -29,16 +30,47 @@ impl ConfigInitCommand {
         })?;
 
         let config_path = home.config_file_path();
-        write_atomic(&config_path, &config_stub(), self.force, "config.toml")?;
-
         let providers_path = home.providers_file_path();
-        write_atomic(&providers_path, PROVIDERS_STUB, self.force, "providers.json")?;
+        preflight_targets(
+            [
+                (&config_path, "config.toml"),
+                (&providers_path, "providers.json"),
+            ],
+            self.force,
+        )?;
+
+        write_atomic(&config_path, &config_stub(), self.force, "config.toml")?;
+        write_atomic(
+            &providers_path,
+            PROVIDERS_STUB,
+            self.force,
+            "providers.json",
+        )?;
 
         println!("wrote: {}", config_path.display());
         println!("wrote: {}", providers_path.display());
         println!();
         println!("edit them, then run `ironclaw-reborn run`.");
         Ok(())
+    }
+}
+
+fn preflight_targets<const N: usize>(
+    targets: [(&Path, &'static str); N],
+    force: bool,
+) -> anyhow::Result<()> {
+    if force {
+        return Ok(());
+    }
+    let existing = targets
+        .into_iter()
+        .filter(|(path, _)| path.exists())
+        .map(|(path, label)| format!("{label} already exists at {}", path.display()))
+        .collect::<Vec<_>>();
+    if existing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}; pass --force to overwrite", existing.join("; "))
     }
 }
 
@@ -54,15 +86,35 @@ fn write_atomic(
             path.display()
         );
     }
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
-    ));
-    fs::write(&tmp, contents)
-        .map_err(|error| anyhow::anyhow!("write {}: {error}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|error| {
-        anyhow::anyhow!("rename {} -> {}: {error}", tmp.display(), path.display())
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| anyhow::anyhow!("create temp file in {}: {error}", parent.display()))?;
+    tmp.write_all(contents.as_bytes())
+        .map_err(|error| anyhow::anyhow!("write {}: {error}", tmp.path().display()))?;
+    tmp.flush()
+        .map_err(|error| anyhow::anyhow!("flush {}: {error}", tmp.path().display()))?;
+
+    if force {
+        tmp.persist(path).map_err(|error| {
+            anyhow::anyhow!(
+                "persist {} -> {}: {}",
+                error.file.path().display(),
+                path.display(),
+                error.error
+            )
+        })?;
+    } else {
+        tmp.persist_noclobber(path).map_err(|error| {
+            anyhow::anyhow!(
+                "persist {} -> {}: {}",
+                error.file.path().display(),
+                path.display(),
+                error.error
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -96,36 +148,31 @@ api_version = "{api_version}"
 profile = "local-dev"
 
 [identity]
-# Tenant / agent / owner-user scope this runtime acts under by default.
-# Per-conversation overrides flow through `new_conversation_for`.
-tenant         = "reborn-cli"
-default_agent  = "reborn-cli-agent"
+# Owner-user scope this runtime acts under by default. This field is wired today.
 default_owner  = "reborn-cli"
-# default_project = "your-project"  # optional
+# Tenant / agent / project scope land with the identity substrate from epic #3036.
+# Leave these commented until then; `run` rejects them in this slice rather
+# than silently ignoring operator intent.
+# tenant         = "reborn-cli"
+# default_agent  = "reborn-cli-agent"
+# default_project = "your-project"
 
-[policy]
-# DeploymentMode authority ceiling. One of:
-#   local_single_user, hosted_multi_tenant, enterprise_dedicated.
-deployment_mode         = "local_single_user"
-# Default RuntimeProfile. One of:
-#   secure_default, local_safe, local_dev, local_yolo,
-#   hosted_safe, hosted_dev, hosted_yolo_tenant_scoped,
-#   enterprise_safe, enterprise_dev, sandboxed, experiment.
-default_profile         = "local_dev"
-# Default ApprovalPolicy. One of:
-#   ask_always, ask_writes, ask_destructive, org_policy, minimal.
-default_approval_policy = "ask_destructive"
+# [policy]
+# # Policy selection lands with epic #3036. Leave this section commented in
+# # this slice; `run` rejects it rather than silently ignoring operator intent.
+# deployment_mode         = "local_single_user"
+# default_profile         = "local_dev"
+# default_approval_policy = "ask_destructive"
 
-[drivers]
-# Default loop driver. Recognized values: "text_only", "planned".
-# (planned-driver wiring lands in a follow-up slice per epic #3036.)
-default     = "text_only"
-# additional = ["planned"]   # registered so per-turn requested_run_profile
-                              # can pick them
+# [drivers]
+# # Driver selection lands with epic #3036. Leave this section commented in
+# # this slice; `run` rejects it rather than silently ignoring operator intent.
+# default     = "text_only"
+# additional = ["planned"]
 
 # [harness]
-# # Active harness for newly-created conversations. Logged at boot;
-# # takes effect once the harness substrate from epic #3036 lands.
+# # Active harness lands with epic #3036. Leave this section commented in
+# # this slice; `run` rejects it rather than silently ignoring operator intent.
 # id = "red-team"
 
 [runner]

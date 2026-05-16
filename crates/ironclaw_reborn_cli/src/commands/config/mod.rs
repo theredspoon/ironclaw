@@ -51,8 +51,16 @@ impl ConfigPathCommand {
         println!("reborn_home: {}", report.home_path().display());
         println!("home_source: {}", report.home_source_label());
         println!("profile: {}", report.profile());
-        println!("config_file: {} ({})", config_path.display(), exists(&config_path));
-        println!("providers: {} ({})", providers_path.display(), exists(&providers_path));
+        println!(
+            "config_file: {} ({})",
+            config_path.display(),
+            exists(&config_path)
+        );
+        println!(
+            "providers: {} ({})",
+            providers_path.display(),
+            exists(&providers_path)
+        );
         println!("v1_state: {}", report.v1_state());
         Ok(())
     }

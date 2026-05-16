@@ -223,29 +223,78 @@ impl RebornConfigFile {
     }
 
     fn validate(&self, attributed_path: &Path) -> Result<(), RebornConfigFileError> {
+        // Inline-secret check on every operator-supplied string before
+        // any later validator can echo the value in a more specific error.
+        let path_str = || attributed_path.display().to_string();
+        let check = |label: &'static str, value: &str| -> Result<(), RebornConfigFileError> {
+            reject_inline_secret(label, value).map_err(|source| {
+                RebornConfigFileError::InlineSecret {
+                    path: path_str(),
+                    source,
+                }
+            })
+        };
+
         if let Some(api_version) = self.api_version.as_deref() {
+            check("api_version", api_version)?;
             validate_api_version(api_version, attributed_path)?;
         }
-
-        // Inline-secret check on every field that an operator might
-        // be tempted to paste a key into.
-        let path_str = || attributed_path.display().to_string();
-        let check =
-            |label: &'static str, value: &str| -> Result<(), RebornConfigFileError> {
-                reject_inline_secret(label, value).map_err(|source| {
-                    RebornConfigFileError::InlineSecret {
-                        path: path_str(),
-                        source,
-                    }
-                })
-            };
+        if let Some(boot) = &self.boot
+            && let Some(profile) = &boot.profile
+        {
+            check("boot.profile", profile)?;
+        }
+        if let Some(identity) = &self.identity {
+            if let Some(tenant) = &identity.tenant {
+                check("identity.tenant", tenant)?;
+            }
+            if let Some(default_agent) = &identity.default_agent {
+                check("identity.default_agent", default_agent)?;
+            }
+            if let Some(default_owner) = &identity.default_owner {
+                check("identity.default_owner", default_owner)?;
+            }
+            if let Some(default_project) = &identity.default_project {
+                check("identity.default_project", default_project)?;
+            }
+        }
+        if let Some(policy) = &self.policy {
+            if let Some(deployment_mode) = &policy.deployment_mode {
+                check("policy.deployment_mode", deployment_mode)?;
+            }
+            if let Some(default_profile) = &policy.default_profile {
+                check("policy.default_profile", default_profile)?;
+            }
+            if let Some(default_approval_policy) = &policy.default_approval_policy {
+                check("policy.default_approval_policy", default_approval_policy)?;
+            }
+        }
+        if let Some(drivers) = &self.drivers {
+            if let Some(default) = &drivers.default {
+                check("drivers.default", default)?;
+            }
+            if let Some(additional) = &drivers.additional {
+                for driver in additional {
+                    check("drivers.additional", driver)?;
+                }
+            }
+        }
+        if let Some(harness) = &self.harness
+            && let Some(id) = &harness.id
+        {
+            check("harness.id", id)?;
+        }
         if let Some(llm) = &self.llm {
             // The error message names the *field*, not the specific
             // slot. The slot identity is not security-relevant for the
             // "don't paste a key here" guard; operators inspecting the
             // file see which slot via the TOML structure anyway. This
             // keeps the label set static and avoids `Box::leak`.
-            for selection in llm.values() {
+            for (slot, selection) in llm {
+                check("llm.<slot>", slot)?;
+                if let Some(provider_id) = &selection.provider_id {
+                    check("llm.<slot>.provider_id", provider_id)?;
+                }
                 if let Some(api_key_env) = &selection.api_key_env {
                     check("llm.<slot>.api_key_env", api_key_env)?;
                 }
@@ -275,15 +324,35 @@ fn validate_api_version(found: &str, path: &Path) -> Result<(), RebornConfigFile
             reason: "expected prefix `ironclaw.runtime/v`".to_string(),
         });
     };
-    let major_str = rest.split('.').next().unwrap_or("");
-    let major: u32 =
-        major_str
-            .parse()
-            .map_err(|error: std::num::ParseIntError| RebornConfigFileError::InvalidApiVersion {
+    let mut parts = rest.split('.');
+    let major_str = parts.next().unwrap_or("");
+    let major: u32 = major_str
+        .parse()
+        .map_err(
+            |error: std::num::ParseIntError| RebornConfigFileError::InvalidApiVersion {
                 path: path.display().to_string(),
                 found: found.to_string(),
                 reason: format!("major version is not a u32: {error}"),
-            })?;
+            },
+        )?;
+    if let Some(minor_str) = parts.next() {
+        let _minor: u32 = minor_str
+            .parse()
+            .map_err(
+                |error: std::num::ParseIntError| RebornConfigFileError::InvalidApiVersion {
+                    path: path.display().to_string(),
+                    found: found.to_string(),
+                    reason: format!("minor version is not a u32: {error}"),
+                },
+            )?;
+    }
+    if parts.next().is_some() {
+        return Err(RebornConfigFileError::InvalidApiVersion {
+            path: path.display().to_string(),
+            found: found.to_string(),
+            reason: "expected at most major.minor components".to_string(),
+        });
+    }
     // We are v1. Anything else is a fail-closed major mismatch.
     if major != 1 {
         return Err(RebornConfigFileError::IncompatibleApiVersion {
@@ -365,7 +434,10 @@ api_key_env = "ANTHROPIC_API_KEY"
 "#;
         let cfg = RebornConfigFile::parse_text(toml, &attributed()).expect("must parse");
         assert_eq!(cfg.api_version.as_deref(), Some("ironclaw.runtime/v1"));
-        assert_eq!(cfg.boot.as_ref().unwrap().profile.as_deref(), Some("local-dev"));
+        assert_eq!(
+            cfg.boot.as_ref().unwrap().profile.as_deref(),
+            Some("local-dev")
+        );
         assert_eq!(
             cfg.identity.as_ref().unwrap().tenant.as_deref(),
             Some("acme")
@@ -377,10 +449,7 @@ api_key_env = "ANTHROPIC_API_KEY"
         let default_slot = cfg.default_llm_slot().expect("default slot present");
         assert_eq!(default_slot.provider_id.as_deref(), Some("openai"));
         assert_eq!(default_slot.model.as_deref(), Some("gpt-4o-mini"));
-        assert_eq!(
-            default_slot.api_key_env.as_deref(),
-            Some("OPENAI_API_KEY")
-        );
+        assert_eq!(default_slot.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
         let llm = cfg.llm.as_ref().unwrap();
         assert!(llm.contains_key("mission"));
     }
@@ -422,12 +491,77 @@ api_key_env = "sk-proj-1234567890abcdef1234567890"
     }
 
     #[test]
+    fn rejects_inline_secret_in_provider_id() {
+        let toml = r#"
+[llm.default]
+provider_id = " sk-proj-1234567890abcdef1234567890 "
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("inline secret must be rejected");
+        assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+    }
+
+    #[test]
+    fn rejects_inline_secret_in_boot_profile_before_profile_parse() {
+        let toml = r#"
+[boot]
+profile = "sk-proj-1234567890abcdef1234567890"
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("inline secret must be rejected");
+        assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+    }
+
+    #[test]
+    fn rejects_inline_secret_in_identity_default_owner() {
+        let toml = r#"
+[identity]
+default_owner = "sk-proj-1234567890abcdef1234567890"
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("inline secret must be rejected");
+        assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+    }
+
+    #[test]
+    fn rejects_inline_secret_in_driver_list() {
+        let toml = r#"
+[drivers]
+additional = ["planned", "sk-proj-1234567890abcdef1234567890"]
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("inline secret must be rejected");
+        assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+    }
+
+    #[test]
+    fn rejects_inline_secret_in_api_version_before_version_parse() {
+        let toml = r#"
+api_version = "sk-proj-1234567890abcdef1234567890"
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("inline secret must be rejected");
+        assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+    }
+
+    #[test]
+    fn rejects_inline_secret_in_llm_slot_key() {
+        let toml = r#"
+[llm."sk-proj-1234567890abcdef1234567890"]
+provider_id = "openai"
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("inline secret must be rejected");
+        assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+    }
+
+    #[test]
     fn rejects_future_major_api_version_fail_closed() {
         let toml = r#"
 api_version = "ironclaw.runtime/v9"
 "#;
-        let err = RebornConfigFile::parse_text(toml, &attributed())
-            .expect_err("major bump must fail");
+        let err =
+            RebornConfigFile::parse_text(toml, &attributed()).expect_err("major bump must fail");
         assert!(matches!(
             err,
             RebornConfigFileError::IncompatibleApiVersion { .. }
@@ -451,6 +585,22 @@ api_version = "ironclaw.runtime/notaversion"
 "#;
         let err = RebornConfigFile::parse_text(toml, &attributed())
             .expect_err("garbage version must fail");
-        assert!(matches!(err, RebornConfigFileError::InvalidApiVersion { .. }));
+        assert!(matches!(
+            err,
+            RebornConfigFileError::InvalidApiVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_api_version_minor() {
+        let toml = r#"
+api_version = "ironclaw.runtime/v1.not-a-number"
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("malformed minor version must fail");
+        assert!(matches!(
+            err,
+            RebornConfigFileError::InvalidApiVersion { .. }
+        ));
     }
 }

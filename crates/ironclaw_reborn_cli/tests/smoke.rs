@@ -848,7 +848,10 @@ fn config_init_writes_both_files() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(reborn_home.join("config.toml").exists(), "config.toml missing");
+    assert!(
+        reborn_home.join("config.toml").exists(),
+        "config.toml missing"
+    );
     assert!(
         reborn_home.join("providers.json").exists(),
         "providers.json missing"
@@ -880,11 +883,39 @@ fn config_init_refuses_to_clobber_without_force() {
         .env("IRONCLAW_REBORN_HOME", &reborn_home)
         .output()
         .expect("second init should run");
-    assert!(!second.status.success(), "second init must refuse to clobber");
+    assert!(
+        !second.status.success(),
+        "second init must refuse to clobber"
+    );
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
         stderr.contains("already exists") && stderr.contains("--force"),
         "stderr should point at --force; got: {stderr}"
+    );
+}
+
+#[test]
+fn config_init_preflights_both_targets_before_writing() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(reborn_home.join("providers.json"), "[]\n").expect("write providers");
+
+    let output = Command::new(reborn_bin())
+        .args(["config", "init"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("init should run");
+    assert!(!output.status.success(), "init must refuse clobber");
+    assert!(
+        !reborn_home.join("config.toml").exists(),
+        "config.toml must not be written after providers preflight fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("providers.json") && stderr.contains("--force"),
+        "stderr should name existing target and --force; got: {stderr}"
     );
 }
 
@@ -991,6 +1022,265 @@ api_key_env = "sk-proj-1234567890abcdef12345678"
     assert!(
         stderr.contains("inline secret") || stderr.contains("secret"),
         "stderr should mention inline secret rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_honors_boot_profile_from_config_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[boot]
+profile = "production"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env_remove("IRONCLAW_REBORN_PROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(
+        !output.status.success(),
+        "production profile should fail until wired; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("profile=production"),
+        "stderr should mention config-selected profile; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_inline_secret_in_provider_id_without_echoing_value() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    let secret = "sk-proj-1234567890abcdef1234567890";
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        format!(
+            r#"
+[llm.default]
+provider_id = " {secret} "
+"#
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!output.status.success(), "inline secret must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("inline secret") || stderr.contains("secret"),
+        "stderr should mention secret rejection; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains(secret),
+        "stderr must not echo pasted secret; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_unsupported_identity_scope_fields() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[identity]
+tenant = "acme"
+default_owner = "operator"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!output.status.success(), "unsupported identity must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[identity]") && stderr.contains("tenant") && stderr.contains("not wired"),
+        "stderr should explain unsupported identity scope; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_unsupported_policy_driver_and_harness_sections() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[policy]
+default_approval_policy = "ask_always"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!output.status.success(), "unsupported policy must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[policy]") && stderr.contains("not wired"),
+        "stderr should explain unsupported section; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_malformed_explicit_provider_overlay() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[llm.default]
+provider_id = "openai"
+"#,
+    )
+    .expect("write config");
+    std::fs::write(reborn_home.join("providers.json"), "not json").expect("write providers");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!output.status.success(), "malformed overlay must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("provider catalog") || stderr.contains("providers.json"),
+        "stderr should explain provider catalog load failure; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_empty_required_api_key_env() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[llm.default]
+provider_id = "empty-key-provider"
+"#,
+    )
+    .expect("write config");
+    std::fs::write(
+        reborn_home.join("providers.json"),
+        r#"[
+  {
+    "id": "empty-key-provider",
+    "protocol": "open_ai_completions",
+    "api_key_env": "REBORN_TEST_EMPTY_KEY",
+    "api_key_required": true,
+    "model_env": "REBORN_TEST_MODEL",
+    "default_model": "test-model",
+    "description": "test provider"
+  }
+]
+"#,
+    )
+    .expect("write providers");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .env("REBORN_TEST_EMPTY_KEY", "")
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!output.status.success(), "empty API key must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("REBORN_TEST_EMPTY_KEY") && stderr.contains("requires API key env var"),
+        "stderr should treat empty key as unset; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_zero_runner_heartbeat_interval() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[runner]
+heartbeat_interval_secs = 0
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(
+        !output.status.success(),
+        "zero heartbeat interval must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("heartbeat_interval_secs") && stderr.contains("greater than 0"),
+        "stderr should explain heartbeat interval rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_zero_runner_poll_interval() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[runner]
+poll_interval_ms = 0
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!output.status.success(), "zero poll interval must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("poll_interval_ms") && stderr.contains("greater than 0"),
+        "stderr should explain poll interval rejection; got: {stderr}"
     );
 }
 

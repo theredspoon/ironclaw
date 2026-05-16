@@ -38,9 +38,8 @@ use ironclaw_reborn::turn_runner::{
     TurnRunnerWakeReceiver, TurnRunnerWorker, TurnRunnerWorkerConfig,
 };
 use ironclaw_threads::{
-    AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService,
-    MessageContent, MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest,
-    ThreadScope,
+    AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
+    MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_turns::{
     AcceptedMessageRef, AgentLoopDriver, DefaultTurnCoordinator, GetRunStateRequest,
@@ -54,10 +53,8 @@ use ironclaw_turns::{
     },
 };
 
-use crate::{
-    RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services,
-};
 use crate::runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
+use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
 #[cfg(feature = "root-llm-provider")]
 use crate::runtime_input::RebornLlmConfig;
@@ -169,9 +166,11 @@ impl RebornRuntime {
     /// The thread is materialized inside the session thread service so
     /// `accept_inbound_message` does not error on the first send.
     pub async fn new_conversation(&self) -> Result<ConversationId, RebornRuntimeError> {
-        let thread_id = ThreadId::new(format!("reborn-conv-{}", Uuid::new_v4()))
-            .map_err(|reason| RebornRuntimeError::InvalidArgument {
-                reason: reason.to_string(),
+        let thread_id =
+            ThreadId::new(format!("reborn-conv-{}", Uuid::new_v4())).map_err(|reason| {
+                RebornRuntimeError::InvalidArgument {
+                    reason: reason.to_string(),
+                }
             })?;
         self.thread_service
             .ensure_thread(EnsureThreadRequest {
@@ -217,9 +216,8 @@ impl RebornRuntime {
             .await
             .map_err(|error| RebornRuntimeError::ThreadService(error.to_string()))?;
 
-        let accepted_message_ref =
-            AcceptedMessageRef::new(format!("msg:{}", accepted.message_id))
-                .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
+        let accepted_message_ref = AcceptedMessageRef::new(format!("msg:{}", accepted.message_id))
+            .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
         let source_binding_ref = SourceBindingRef::new("reborn-cli")
             .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?;
         let reply_target_binding_ref = ReplyTargetBindingRef::new("reborn-cli")
@@ -290,9 +288,7 @@ impl RebornRuntime {
                     run_id,
                 })
                 .await?;
-            if state.status.is_terminal()
-                || matches!(state.status, TurnStatus::RecoveryRequired)
-            {
+            if state.status.is_terminal() || matches!(state.status, TurnStatus::RecoveryRequired) {
                 // RecoveryRequired isn't "terminal" in the durable state
                 // machine (a future recovery worker could resume it), but for
                 // the standalone CLI it is end-of-line: there is no recovery
@@ -416,21 +412,18 @@ pub async fn build_reborn_runtime(
     );
 
     // Thread scope: a stable, single-tenant scope for the CLI session.
-    let tenant_id = TenantId::new("reborn-cli").map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
+    let tenant_id =
+        TenantId::new("reborn-cli").map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("tenant id: {reason}"),
-        }
-    })?;
-    let agent_id = AgentId::new("reborn-cli-agent").map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
+        })?;
+    let agent_id =
+        AgentId::new("reborn-cli-agent").map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("agent id: {reason}"),
-        }
-    })?;
-    let actor_user_id = UserId::new(owner_id.clone()).map_err(|reason| {
-        RebornRuntimeError::InvalidArgument {
+        })?;
+    let actor_user_id =
+        UserId::new(owner_id.clone()).map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("user id: {reason}"),
-        }
-    })?;
+        })?;
     let thread_scope = ThreadScope {
         tenant_id,
         agent_id,
@@ -556,10 +549,7 @@ fn build_and_spawn_worker(
 #[cfg(feature = "root-llm-provider")]
 fn build_llm_gateway(
     cfg: RebornLlmConfig,
-) -> Result<
-    Arc<dyn ironclaw_loop_support::HostManagedModelGateway>,
-    RebornRuntimeError,
-> {
+) -> Result<Arc<dyn ironclaw_loop_support::HostManagedModelGateway>, RebornRuntimeError> {
     use ironclaw_llm::{ProviderProtocol, RegistryProviderConfig, config::CacheRetention};
     use ironclaw_reborn::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
     use ironclaw_turns::run_profile::ModelProfileId;
@@ -592,18 +582,18 @@ fn build_llm_gateway(
         cache_retention: CacheRetention::None,
         unsupported_params: Vec::new(),
     };
-    let provider = ironclaw_llm::create_registry_provider(&registry_config, cfg.request_timeout_secs)
-        .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
+    let provider =
+        ironclaw_llm::create_registry_provider(&registry_config, cfg.request_timeout_secs)
+            .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
 
     let model_profile_id = ModelProfileId::new("interactive_model").expect("static id");
-    let policy = LlmModelProfilePolicy::new()
-        .allow_model_profile(model_profile_id, Some(cfg.model.clone()));
+    let policy =
+        LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, Some(cfg.model.clone()));
     let gateway = LlmProviderModelGateway::new(provider, policy);
     Ok(Arc::new(gateway))
 }
 
-fn build_stub_gateway()
--> Arc<dyn ironclaw_loop_support::HostManagedModelGateway> {
+fn build_stub_gateway() -> Arc<dyn ironclaw_loop_support::HostManagedModelGateway> {
     use async_trait::async_trait;
     use ironclaw_loop_support::{
         HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,

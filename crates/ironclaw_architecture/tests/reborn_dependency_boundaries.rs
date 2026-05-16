@@ -399,10 +399,9 @@ fn reborn_loop_support_llm_wiring_stays_out_of_root_src() {
     // and `ironclaw_llm` (direct) live behind a `root-llm-provider` feature
     // on the composition crate, so a default build of composition stays
     // substrate-only.
-    let composition_manifest = std::fs::read_to_string(
-        root.join("crates/ironclaw_reborn_composition/Cargo.toml"),
-    )
-    .expect("Reborn composition manifest must be readable");
+    let composition_manifest =
+        std::fs::read_to_string(root.join("crates/ironclaw_reborn_composition/Cargo.toml"))
+            .expect("Reborn composition manifest must be readable");
     assert!(
         composition_manifest.contains("root-llm-provider")
             && composition_manifest.contains("ironclaw_llm")
@@ -485,8 +484,6 @@ fn reborn_internal_crate_keeps_directory_of_modules_lib_rs() {
     }
 }
 
-
-
 /// Lock the boot-config TOML + provider-catalog layering for the
 /// standalone `ironclaw-reborn` binary.
 ///
@@ -515,9 +512,8 @@ fn reborn_internal_crate_keeps_directory_of_modules_lib_rs() {
 fn reborn_boot_config_file_layout_is_pinned() {
     let root = workspace_root();
 
-    let config_lib =
-        std::fs::read_to_string(root.join("crates/ironclaw_reborn_config/src/lib.rs"))
-            .expect("reborn config lib.rs must be readable");
+    let config_lib = std::fs::read_to_string(root.join("crates/ironclaw_reborn_config/src/lib.rs"))
+        .expect("reborn config lib.rs must be readable");
     for required_export in [
         "pub use config_file::",
         "RebornConfigFile",
@@ -531,13 +527,9 @@ fn reborn_boot_config_file_layout_is_pinned() {
         );
     }
 
-    let home_src =
-        std::fs::read_to_string(root.join("crates/ironclaw_reborn_config/src/home.rs"))
-            .expect("reborn config home.rs must be readable");
-    for required_method in [
-        "pub fn config_file_path",
-        "pub fn providers_file_path",
-    ] {
+    let home_src = std::fs::read_to_string(root.join("crates/ironclaw_reborn_config/src/home.rs"))
+        .expect("reborn config home.rs must be readable");
+    for required_method in ["pub fn config_file_path", "pub fn providers_file_path"] {
         assert!(
             home_src.contains(required_method),
             "RebornHome must expose `{required_method}` so the CLI / composition can locate \
@@ -561,10 +553,9 @@ fn reborn_boot_config_file_layout_is_pinned() {
     // regression that bypasses it (e.g. a future contributor adds a
     // new section and forgets to call `reject_inline_secret`) would
     // silently allow pasted credentials through.
-    let config_file_src = std::fs::read_to_string(
-        root.join("crates/ironclaw_reborn_config/src/config_file.rs"),
-    )
-    .expect("reborn config_file.rs must be readable");
+    let config_file_src =
+        std::fs::read_to_string(root.join("crates/ironclaw_reborn_config/src/config_file.rs"))
+            .expect("reborn config_file.rs must be readable");
     assert!(
         config_file_src.contains("reject_inline_secret"),
         "RebornConfigFile::validate must call `reject_inline_secret` on operator-pasteable \
@@ -576,8 +567,7 @@ fn reborn_boot_config_file_layout_is_pinned() {
     // composition without forcing `ironclaw_reborn_config` to depend
     // on `ironclaw_llm` (which would violate _config's standalone
     // boundary). The composition crate is the legitimate consumer.
-    let llm_catalog = root
-        .join("crates/ironclaw_reborn_composition/src/llm_catalog.rs");
+    let llm_catalog = root.join("crates/ironclaw_reborn_composition/src/llm_catalog.rs");
     assert!(
         llm_catalog.exists(),
         "composition must expose a catalog resolver at {} so the CLI can stitch \
@@ -602,9 +592,8 @@ fn reborn_boot_config_file_layout_is_pinned() {
     // catalog file location is selectable per-deployment (the
     // standalone Reborn binary points at $IRONCLAW_REBORN_HOME/providers.json,
     // not v1's ~/.ironclaw/providers.json).
-    let llm_registry =
-        std::fs::read_to_string(root.join("crates/ironclaw_llm/src/registry.rs"))
-            .expect("ironclaw_llm registry.rs must be readable");
+    let llm_registry = std::fs::read_to_string(root.join("crates/ironclaw_llm/src/registry.rs"))
+        .expect("ironclaw_llm registry.rs must be readable");
     assert!(
         llm_registry.contains("pub fn load_from_path"),
         "ironclaw_llm::ProviderRegistry must expose `load_from_path` so callers can \

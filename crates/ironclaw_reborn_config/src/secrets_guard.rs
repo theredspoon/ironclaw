@@ -89,10 +89,8 @@ fn looks_like_long_hex(value: &str) -> bool {
 
 /// Returns `Err` if `value` looks like inline secret material that
 /// must not appear in a declarative config file.
-pub(crate) fn reject_inline_secret(
-    label: &'static str,
-    value: &str,
-) -> Result<(), InlineSecretError> {
+pub fn reject_inline_secret(label: &'static str, value: &str) -> Result<(), InlineSecretError> {
+    let value = value.trim();
     // Empty / very short values can't carry secrets meaningfully — and a
     // legitimate value like `model = "gpt-4o-mini"` would otherwise trip
     // a careless prefix match.
@@ -100,7 +98,7 @@ pub(crate) fn reject_inline_secret(
         return Ok(());
     }
     for prefix in SECRET_PREFIXES {
-        if value.starts_with(prefix) {
+        if value.contains(prefix) {
             return Err(InlineSecretError {
                 label,
                 pattern: SecretPattern::Prefix(prefix),
@@ -168,13 +166,17 @@ mod tests {
         // direct `xoxb-...` literal even when it is obviously a test
         // fixture). The composed string has the same shape the
         // production rejection rule catches.
-        let value = format!("{}{}", "xo", "xb-1234567890123-1234567890123-aBcDeFgHiJkLmNoPqRsTuVwX");
+        let value = format!(
+            "{}{}",
+            "xo", "xb-1234567890123-1234567890123-aBcDeFgHiJkLmNoPqRsTuVwX"
+        );
         assert!(reject_inline_secret("any", &value).is_err());
     }
 
     #[test]
     fn rejects_jwt_shape() {
-        let value = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let value =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
         let err = reject_inline_secret("any", value).expect_err("jwt must reject");
         assert_eq!(err.pattern, SecretPattern::Jwt);
     }
@@ -187,12 +189,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_secret_with_surrounding_whitespace() {
+        let value = " sk-proj-1234567890abcdef12345678 ";
+        let err = reject_inline_secret("any", value).expect_err("trimmed secret must reject");
+        assert_eq!(err.pattern, SecretPattern::Prefix("sk-"));
+    }
+
+    #[test]
+    fn rejects_embedded_secret_prefix() {
+        let value = "https://proxy.example/v1?key=sk-proj-1234567890abcdef12345678";
+        let err = reject_inline_secret("llm.default.base_url", value)
+            .expect_err("embedded secret must reject");
+        assert_eq!(err.pattern, SecretPattern::Prefix("sk-"));
+    }
+
+    #[test]
     fn allows_env_ref_strings() {
-        for ok in [
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "REBORN_TEST_LLM_KEY",
-        ] {
+        for ok in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "REBORN_TEST_LLM_KEY"] {
             reject_inline_secret("llm.default.api_key_env", ok).expect("env-ref must pass");
         }
     }
