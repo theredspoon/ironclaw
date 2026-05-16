@@ -28,7 +28,6 @@ mod inbound_turn;
 mod ledger;
 mod reborn_services;
 mod webui_inbound;
-mod webui_service;
 mod workflow;
 
 pub use action::{
@@ -38,9 +37,7 @@ pub use action::{
 pub use binding::{ConversationBindingService, ResolveBindingRequest, ResolvedBinding};
 pub use error::ProductWorkflowError;
 #[cfg(any(test, feature = "test-support"))]
-pub use fakes::{
-    FakeConversationBindingService, FakeIdempotencyLedger, FakeInboundTurnService, FakeWebUiService,
-};
+pub use fakes::{FakeConversationBindingService, FakeIdempotencyLedger, FakeInboundTurnService};
 pub use inbound_turn::{DefaultInboundTurnService, InboundTurnOutcome, InboundTurnService};
 pub use ledger::{IdempotencyDecision, IdempotencyLedger};
 pub use reborn_services::{
@@ -53,12 +50,5 @@ pub use webui_inbound::{
     WebUiAuthenticatedCaller, WebUiCancelReason, WebUiCancelRunRequest, WebUiCreateThreadRequest,
     WebUiGateResolution, WebUiInboundCommand, WebUiInboundValidationCode,
     WebUiInboundValidationError, WebUiResolveGateRequest, WebUiSendMessageRequest,
-};
-pub use webui_service::{
-    DefaultWebUiService, WEBUI_TIMELINE_DEFAULT_LIMIT, WebUiCancelRunCommand,
-    WebUiCreateThreadCommand, WebUiGateResolved, WebUiGetTimelineCommand, WebUiMessageAccepted,
-    WebUiMessageRunOutcome, WebUiResolveGateCommand, WebUiRunCancelled, WebUiSendMessageCommand,
-    WebUiService, WebUiServiceError, WebUiThreadCreated, WebUiTimelineCursor, WebUiTimelineReplay,
-    WebUiTimelineSnapshot,
 };
 pub use workflow::DefaultProductWorkflow;

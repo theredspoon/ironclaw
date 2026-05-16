@@ -4564,8 +4564,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "ironclaw_event_projections",
- "ironclaw_events",
  "ironclaw_host_api",
  "ironclaw_loop_support",
  "ironclaw_product_adapters",

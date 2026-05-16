@@ -20,8 +20,6 @@ test-support = ["ironclaw_product_adapters/test-support"]
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-ironclaw_event_projections = { path = "../ironclaw_event_projections", version = "0.1.0" }
-ironclaw_events = { path = "../ironclaw_events", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0" }
 ironclaw_threads = { path = "../ironclaw_threads", version = "0.1.0" }
