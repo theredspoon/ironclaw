@@ -71,6 +71,7 @@ fn run_dry(context: RebornCliContext) -> anyhow::Result<()> {
     println!("home_source: {}", config.home().source_label());
     println!("profile: {}", config.profile());
     println!("v1_state: not-used");
+    println!("runtime_driver: planned-agent-loop");
     println!(
         "text_only_driver: {}",
         readiness.text_only_driver.render("initialized")

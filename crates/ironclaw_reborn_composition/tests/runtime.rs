@@ -25,6 +25,8 @@ async fn stub_gateway_send_cancels_recovery_required_and_releases_conversation()
     });
 
     let runtime = build_reborn_runtime(input).await.unwrap();
+    assert_eq!(runtime.default_run_profile_id(), "reborn-planned-default");
+
     let conversation = runtime.new_conversation().await.unwrap();
     let reply = tokio::time::timeout(
         Duration::from_secs(2),

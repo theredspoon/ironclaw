@@ -526,6 +526,10 @@ fn run_reports_runtime_readiness_snapshot_without_touching_v1_state() {
     assert!(stdout.contains("profile: local-dev"), "stdout: {stdout}");
     assert!(stdout.contains("v1_state: not-used"), "stdout: {stdout}");
     assert!(
+        stdout.contains("runtime_driver: planned-agent-loop"),
+        "stdout: {stdout}"
+    );
+    assert!(
         stdout.contains("local_runtime_shell_readiness: ready"),
         "stdout: {stdout}"
     );

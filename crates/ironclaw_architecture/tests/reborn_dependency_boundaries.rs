@@ -471,9 +471,10 @@ fn reborn_internal_crate_keeps_directory_of_modules_lib_rs() {
     for required in [
         "pub async fn build_reborn_runtime",
         "pub struct RebornRuntime",
-        "use ironclaw_reborn::driver_registry::",
         "use ironclaw_reborn::loop_driver_host::",
-        "use ironclaw_reborn::turn_runner::",
+        "use ironclaw_reborn::runtime::",
+        "build_default_planned_runtime",
+        "DefaultPlannedRuntimeParts",
     ] {
         assert!(
             composition_runtime_source.contains(required),

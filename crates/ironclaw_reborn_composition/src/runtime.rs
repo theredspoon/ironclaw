@@ -31,30 +31,35 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
-use ironclaw_reborn::driver_registry::{DriverKind, DriverRegistry, DriverRequirements};
-use ironclaw_reborn::loop_driver_host::{RebornLoopDriverHostFactory, TextOnlyLoopHostConfig};
-use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
-use ironclaw_reborn::text_loop_driver::TextOnlyModelReplyDriver;
-use ironclaw_reborn::turn_runner::{
-    TurnRunnerWakeReceiver, TurnRunnerWakeSender, TurnRunnerWorker, TurnRunnerWorkerConfig,
+use ironclaw_loop_support::{
+    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
+    EmptyLoopCapabilityPort, HostIdentityContextBuildError, HostIdentityContextCandidate,
+    HostIdentityContextSource,
 };
+use ironclaw_reborn::loop_driver_host::LoopCapabilityPortFactory;
+use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
+use ironclaw_reborn::runtime::{
+    DefaultPlannedRuntimeBuildError, DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts,
+    build_default_planned_runtime,
+};
+use ironclaw_reborn::turn_runner::{TurnRunnerWakeSender, TurnRunnerWorkerConfig};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_turns::{
-    AcceptedMessageRef, AgentLoopDriver, CancelRunRequest, DefaultTurnCoordinator,
-    GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
-    InMemoryTurnStateStore, LoopExitApplier, ReplyTargetBindingRef, RunProfileId,
-    RunProfileVersion, SanitizedCancelReason, SourceBindingRef, SubmitTurnRequest,
-    SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnScope, TurnStatus,
+    AcceptedMessageRef, CancelRunRequest, GetRunStateRequest, IdempotencyKey,
+    InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
+    ReplyTargetBindingRef, RunProfileResolutionRequest, SanitizedCancelReason, SourceBindingRef,
+    SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId,
+    TurnScope, TurnStatus,
     run_profile::{
-        CapabilitySurfaceProfileId, CheckpointSchemaId, InMemoryRunProfileRegistry,
-        InMemoryRunProfileResolver, RunProfileDefinition,
+        AgentLoopHostError, InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopRunContext,
+        PromptMode,
     },
 };
 
-use crate::runtime_input::{RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings};
+use crate::runtime_input::{RebornRuntimeIdentity, RebornRuntimeInput};
 use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
 #[cfg(feature = "root-llm-provider")]
@@ -117,19 +122,12 @@ impl From<TurnError> for RebornRuntimeError {
     }
 }
 
-/// Custom run-profile id used by the Reborn standalone runtime. Distinct from
-/// the v1 builtin `interactive_default` so registrations don't collide.
-/// Only lowercase ASCII letters, digits, `_`, `-`, `:` are accepted by the
-/// bounded-loop-string validator.
-pub(crate) fn reborn_runtime_profile_id() -> RunProfileId {
-    RunProfileId::new("reborn_text_only").expect("static profile id is valid")
-}
-
-/// Capability surface profile id paired with the text-only driver. The
-/// text-only driver does not consume capabilities, so this is informational.
-pub(crate) fn reborn_runtime_capability_surface_id() -> CapabilitySurfaceProfileId {
-    CapabilitySurfaceProfileId::new("reborn_text_only_no_tools")
-        .expect("static capability surface id is valid")
+impl From<DefaultPlannedRuntimeBuildError> for RebornRuntimeError {
+    fn from(value: DefaultPlannedRuntimeBuildError) -> Self {
+        Self::InvalidArgument {
+            reason: value.to_string(),
+        }
+    }
 }
 
 /// Started, running Reborn agent runtime.
@@ -148,6 +146,7 @@ pub struct RebornRuntime {
     actor_user_id: UserId,
     source_binding_id: String,
     reply_target_binding_id: String,
+    default_run_profile_id: String,
     wake_sender: TurnRunnerWakeSender,
     send_lock: Mutex<()>,
 }
@@ -172,6 +171,11 @@ impl RebornRuntime {
     /// Exposed for diagnostics / readiness reporting; **not** for traffic.
     pub fn services(&self) -> &RebornServices {
         &self.services
+    }
+
+    /// Diagnostic id for the no-profile run profile selected by this runtime.
+    pub fn default_run_profile_id(&self) -> &str {
+        &self.default_run_profile_id
     }
 
     /// Create a fresh conversation. Returns the opaque conversation id used
@@ -447,38 +451,6 @@ pub async fn build_reborn_runtime(
     let loop_checkpoint_store = Arc::new(InMemoryLoopCheckpointStore::default());
     let thread_service = Arc::new(InMemorySessionThreadService::default());
 
-    // Custom run-profile resolver pointing at the text-only driver.
-    let text_only_descriptor = TextOnlyModelReplyDriver::default().descriptor();
-    let mut registry = InMemoryRunProfileRegistry::with_builtin_profiles();
-    registry
-        .register(RunProfileDefinition::interactive_like(
-            reborn_runtime_profile_id(),
-            text_only_descriptor.clone(),
-            text_only_descriptor
-                .checkpoint_schema_id
-                .clone()
-                .unwrap_or_else(|| {
-                    CheckpointSchemaId::new("reborn_text_only_checkpoint")
-                        .expect("static checkpoint id is valid")
-                }),
-            text_only_descriptor
-                .checkpoint_schema_version
-                .unwrap_or(RunProfileVersion::new(1)),
-            reborn_runtime_capability_surface_id(),
-        ))
-        .map_err(|error| RebornRuntimeError::InvalidArgument {
-            reason: format!("could not register reborn run profile: {error}"),
-        })?;
-    let resolver = InMemoryRunProfileResolver::new_with_implicit_default(
-        registry,
-        reborn_runtime_profile_id(),
-    );
-
-    let turn_coordinator: Arc<dyn TurnCoordinator> = Arc::new(
-        DefaultTurnCoordinator::new(Arc::clone(&turn_state_store) as Arc<_>)
-            .with_run_profile_resolver(Arc::new(resolver)),
-    );
-
     let validated_identity = validate_runtime_identity(identity)?;
 
     let tenant_id = TenantId::new(validated_identity.tenant_id.clone()).map_err(|reason| {
@@ -506,19 +478,70 @@ pub async fn build_reborn_runtime(
         mission_id: None,
     };
 
-    // Driver registry + worker — these are gated on the model gateway being
-    // available (i.e. the `root-llm-provider` feature + LLM config).
-    let (worker_cancel, worker_handle, wake_sender) = build_and_spawn_worker(
-        runner,
-        Arc::clone(&turn_state_store),
-        Arc::clone(&checkpoint_state_store) as Arc<_>,
-        Arc::clone(&loop_checkpoint_store) as Arc<_>,
+    #[cfg(feature = "root-llm-provider")]
+    let model_gateway = match llm {
+        Some(cfg) => build_llm_gateway(cfg)?,
+        None => build_stub_gateway(),
+    };
+    #[cfg(not(feature = "root-llm-provider"))]
+    let model_gateway = build_stub_gateway();
+
+    let loop_exit_evidence = Arc::new(ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
         Arc::clone(&thread_service),
+        Arc::clone(&turn_state_store) as Arc<dyn ironclaw_turns::TurnStateStore>,
+        Arc::clone(&loop_checkpoint_store) as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
         thread_scope.clone(),
-        text_only_descriptor.clone(),
-        #[cfg(feature = "root-llm-provider")]
-        llm,
-    )?;
+    ));
+
+    let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
+        turn_state: Arc::clone(&turn_state_store),
+        thread_service: Arc::clone(&thread_service),
+        thread_scope: thread_scope.clone(),
+        model_gateway,
+        checkpoint_state_store: Arc::clone(&checkpoint_state_store)
+            as Arc<dyn ironclaw_turns::CheckpointStateStore>,
+        loop_checkpoint_store: Arc::clone(&loop_checkpoint_store)
+            as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
+        milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
+        capability_factory: Arc::new(EmptyCapabilityFactory),
+        capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
+        loop_exit_evidence,
+        config: DefaultPlannedRuntimeConfig {
+            worker: TurnRunnerWorkerConfig {
+                heartbeat_interval: runner.heartbeat_interval,
+                poll_interval: runner.poll_interval,
+                scope_filter: None,
+            },
+            ..DefaultPlannedRuntimeConfig::default()
+        },
+        model_route_resolver: None,
+        cancellation_factory: None,
+        skill_context_source: None,
+        input_queue: None,
+        identity_context_source: Arc::new(EmptyIdentityContextSource),
+        model_policy_guard: None,
+        model_budget_accountant: None,
+        safety_context: None,
+    })?;
+    let default_run_profile_id = composition
+        .run_profile_resolver
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("could not resolve default run profile: {error}"),
+        })?
+        .profile_id
+        .as_str()
+        .to_string();
+
+    let worker_cancel = CancellationToken::new();
+    let worker = Arc::clone(&composition.worker);
+    let worker_cancel_clone = worker_cancel.clone();
+    let worker_handle = tokio::spawn(async move {
+        worker.run(worker_cancel_clone).await;
+    });
+    let turn_coordinator: Arc<dyn TurnCoordinator> = composition.coordinator;
+    let wake_sender = composition.wake_sender;
 
     Ok(RebornRuntime {
         services,
@@ -531,6 +554,7 @@ pub async fn build_reborn_runtime(
         actor_user_id,
         source_binding_id: validated_identity.source_binding_id,
         reply_target_binding_id: validated_identity.reply_target_binding_id,
+        default_run_profile_id,
         wake_sender,
         send_lock: Mutex::new(()),
     })
@@ -562,92 +586,41 @@ fn validate_runtime_identity(
     Ok(identity)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_and_spawn_worker(
-    runner: TurnRunnerSettings,
-    turn_state_store: Arc<InMemoryTurnStateStore>,
-    checkpoint_state_store: Arc<dyn ironclaw_turns::CheckpointStateStore>,
-    loop_checkpoint_store: Arc<dyn ironclaw_turns::LoopCheckpointStore>,
-    thread_service: Arc<InMemorySessionThreadService>,
-    thread_scope: ThreadScope,
-    text_only_descriptor: ironclaw_turns::run_profile::AgentLoopDriverDescriptor,
-    #[cfg(feature = "root-llm-provider")] llm: Option<RebornLlmConfig>,
-) -> Result<(CancellationToken, JoinHandle<()>, TurnRunnerWakeSender), RebornRuntimeError> {
-    use ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink;
+struct EmptyCapabilityFactory;
 
-    // Driver registry — registers the text-only driver under its descriptor.
-    let mut registry = DriverRegistry::new();
-    let text_only_driver = Arc::new(TextOnlyModelReplyDriver::default());
-    registry
-        .register_driver(
-            text_only_driver,
-            DriverRequirements::all_optional(),
-            DriverKind::Production,
-        )
-        .map_err(|error| RebornRuntimeError::InvalidArgument {
-            reason: format!("could not register text-only driver: {error:?}"),
-        })?;
-    let _ = text_only_descriptor; // descriptor used implicitly through the driver
+#[async_trait::async_trait]
+impl LoopCapabilityPortFactory for EmptyCapabilityFactory {
+    async fn create_capability_port(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
+        Ok(Arc::new(EmptyLoopCapabilityPort))
+    }
+}
 
-    let driver_registry = Arc::new(registry);
+struct AllowAllCapabilitySurfaceResolver;
 
-    // Build the model gateway adapter, if available. Always return *some*
-    // gateway (stub if needed) so the worker boots even when the operator
-    // hasn't configured an LLM yet; the failure surfaces at first
-    // `send_user_message` instead of at startup. This keeps `ironclaw-reborn
-    // run` ergonomic when an operator just wants to confirm the binary boots.
-    #[cfg(feature = "root-llm-provider")]
-    let model_gateway = match llm {
-        Some(cfg) => build_llm_gateway(cfg)?,
-        None => build_stub_gateway(),
-    };
-    #[cfg(not(feature = "root-llm-provider"))]
-    let model_gateway = build_stub_gateway();
+#[async_trait::async_trait]
+impl CapabilitySurfaceProfileResolver for AllowAllCapabilitySurfaceResolver {
+    async fn resolve(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
+        Ok(CapabilityAllowSet::All)
+    }
+}
 
-    let milestone_sink: Arc<dyn ironclaw_turns::run_profile::LoopHostMilestoneSink> =
-        Arc::new(InMemoryLoopHostMilestoneSink::default());
+struct EmptyIdentityContextSource;
 
-    let host_factory = RebornLoopDriverHostFactory::new(
-        Arc::clone(&thread_service),
-        thread_scope.clone(),
-        model_gateway,
-        Arc::clone(&checkpoint_state_store),
-        Arc::clone(&turn_state_store) as Arc<dyn ironclaw_turns::TurnStateStore>,
-        Arc::clone(&loop_checkpoint_store),
-        milestone_sink,
-        TextOnlyLoopHostConfig::default(),
-    );
-    let host_factory: Arc<dyn ironclaw_reborn::turn_runner::HostFactory> = Arc::new(host_factory);
-
-    let evidence_port = Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
-        Arc::clone(&thread_service),
-        Arc::clone(&turn_state_store) as Arc<dyn ironclaw_turns::TurnStateStore>,
-        Arc::clone(&loop_checkpoint_store),
-    ));
-    let loop_exit_applier = Arc::new(LoopExitApplier::new(
-        Arc::clone(&turn_state_store) as Arc<dyn ironclaw_turns::runner::TurnRunTransitionPort>,
-        evidence_port,
-    ));
-
-    let (wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
-    let worker = TurnRunnerWorker::new(
-        TurnRunnerWorkerConfig {
-            heartbeat_interval: runner.heartbeat_interval,
-            poll_interval: runner.poll_interval,
-            scope_filter: None,
-        },
-        Arc::clone(&turn_state_store) as Arc<dyn ironclaw_turns::runner::TurnRunTransitionPort>,
-        loop_exit_applier,
-        driver_registry,
-        host_factory,
-        wake_receiver,
-    );
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    let handle = tokio::spawn(async move {
-        worker.run(cancel_clone).await;
-    });
-    Ok((cancel, handle, wake_sender))
+#[async_trait::async_trait]
+impl HostIdentityContextSource for EmptyIdentityContextSource {
+    async fn load_identity_candidates(
+        &self,
+        _run_context: &LoopRunContext,
+        _mode: PromptMode,
+    ) -> Result<Vec<HostIdentityContextCandidate>, HostIdentityContextBuildError> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(feature = "root-llm-provider")]
