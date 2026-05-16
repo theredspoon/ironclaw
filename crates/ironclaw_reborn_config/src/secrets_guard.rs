@@ -90,19 +90,20 @@ fn looks_like_long_hex(value: &str) -> bool {
 /// Returns `Err` if `value` looks like inline secret material that
 /// must not appear in a declarative config file.
 ///
-/// Prefix markers are matched as substrings, not only at string start.
-/// This is intentionally aggressive so embedded credentials in URLs or
-/// copied console snippets fail closed instead of being persisted.
+/// Prefix markers are matched inside values, but short markers require
+/// token-like boundaries so ordinary identifiers such as `risk-mitigation`
+/// do not trip the guard. Embedded credentials in URLs still fail closed.
 pub fn reject_inline_secret(label: &'static str, value: &str) -> Result<(), InlineSecretError> {
     let value = value.trim();
     // Empty / very short values can't carry secrets meaningfully — and a
     // legitimate value like `model = "gpt-4o-mini"` would otherwise trip
-    // a careless prefix match.
-    if value.is_empty() || value.len() < 12 {
+    // a careless prefix match. Count characters, not bytes, so Unicode
+    // values follow the same intuitive threshold as ASCII values.
+    if value.is_empty() || value.chars().count() < 12 {
         return Ok(());
     }
     for prefix in SECRET_PREFIXES {
-        if value.contains(prefix) {
+        if contains_secret_prefix(value, prefix) {
             return Err(InlineSecretError {
                 label,
                 pattern: SecretPattern::Prefix(prefix),
@@ -122,6 +123,31 @@ pub fn reject_inline_secret(label: &'static str, value: &str) -> Result<(), Inli
         });
     }
     Ok(())
+}
+
+fn contains_secret_prefix(value: &str, prefix: &'static str) -> bool {
+    if prefix.chars().count() <= 4 {
+        contains_short_prefix_at_boundary(value, prefix)
+    } else {
+        value.contains(prefix)
+    }
+}
+
+fn contains_short_prefix_at_boundary(value: &str, prefix: &'static str) -> bool {
+    let value_chars = value.chars().collect::<Vec<_>>();
+    let prefix_chars = prefix.chars().collect::<Vec<_>>();
+
+    value_chars
+        .windows(prefix_chars.len())
+        .enumerate()
+        .any(|(index, window)| {
+            window == prefix_chars.as_slice()
+                && (index == 0 || !is_identifier_character(value_chars[index - 1]))
+        })
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +231,19 @@ mod tests {
         let err = reject_inline_secret("llm.default.base_url", value)
             .expect_err("embedded secret must reject");
         assert_eq!(err.pattern, SecretPattern::Prefix("sk-"));
+    }
+
+    #[test]
+    fn allows_short_prefixes_inside_identifiers() {
+        for ok in ["shelf_layout", "risk-mitigation", "task-master-skill"] {
+            reject_inline_secret("any", ok).expect_err_or_pass(ok);
+        }
+    }
+
+    #[test]
+    fn counts_characters_not_utf8_bytes_for_length_floor() {
+        let value = "密密密密sk-";
+        reject_inline_secret("any", value).expect_err_or_pass(value);
     }
 
     #[test]

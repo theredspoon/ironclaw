@@ -175,7 +175,7 @@ pub enum RebornConfigFileError {
         found: String,
         expected: &'static str,
     },
-    #[error("config file `{path}` field validation failed: {0}", source)]
+    #[error("config file `{path}` field validation failed: {source}")]
     InlineSecret {
         path: String,
         #[source]

@@ -76,11 +76,12 @@ pub enum RebornLlmCatalogError {
     /// Catalog field is malformed or secret-shaped. Do not echo it:
     /// values may be pasted secret material from providers.json.
     #[error(
-        "llm provider `{provider}` has an invalid catalog field `{field}`; provider catalog fields \
-         must not contain inline secret material"
+        "llm provider `{provider}` at providers.json[{catalog_index}] has an invalid catalog field `{field}`; \
+         provider catalog fields must not contain inline secret material"
     )]
     CatalogFieldInvalid {
         provider: String,
+        catalog_index: usize,
         field: &'static str,
     },
     /// Provider requires a base URL (e.g. generic OpenAI-compatible) but
@@ -149,7 +150,13 @@ pub fn resolve_against_registry(
                     .join(", "),
             })?;
 
-    validate_catalog_provider(provider)?;
+    let catalog_index = registry
+        .all()
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, provider))
+        .unwrap_or(0);
+
+    validate_catalog_provider(provider, catalog_index)?;
 
     // API key resolution.
     let api_key = read_api_key(selection, provider)?;
@@ -157,10 +164,10 @@ pub fn resolve_against_registry(
     // Base URL resolution (provider env override > selection > catalog default).
     // An empty base URL is intentional for providers such as OpenAI: the
     // `ironclaw_llm` client constructors use it to select protocol defaults.
-    let base_url = resolve_base_url(selection, provider)?;
+    let base_url = resolve_base_url(selection, provider, catalog_index)?;
 
     // Model resolution (provider env override > selection > catalog default).
-    let model = resolve_model(selection, provider)?;
+    let model = resolve_model(selection, provider, catalog_index)?;
 
     let extra_headers = resolve_extra_headers(provider)?;
 
@@ -175,33 +182,48 @@ pub fn resolve_against_registry(
     })
 }
 
-fn validate_catalog_provider(provider: &ProviderDefinition) -> Result<(), RebornLlmCatalogError> {
-    validate_catalog_text(provider, "id", &provider.id)?;
+fn validate_catalog_provider(
+    provider: &ProviderDefinition,
+    catalog_index: usize,
+) -> Result<(), RebornLlmCatalogError> {
+    validate_catalog_text(provider, catalog_index, "id", &provider.id)?;
     if let Some(base_url) = provider.default_base_url.as_deref() {
-        validate_catalog_text(provider, "default_base_url", base_url)?;
+        validate_catalog_text(provider, catalog_index, "default_base_url", base_url)?;
     }
-    validate_catalog_text(provider, "default_model", &provider.default_model)?;
-    validate_catalog_env_var(provider, "model_env", &provider.model_env)?;
+    validate_catalog_text(
+        provider,
+        catalog_index,
+        "default_model",
+        &provider.default_model,
+    )?;
+    validate_catalog_env_var(provider, catalog_index, "model_env", &provider.model_env)?;
     if let Some(base_url_env) = provider.base_url_env.as_deref() {
-        validate_catalog_env_var(provider, "base_url_env", base_url_env)?;
+        validate_catalog_env_var(provider, catalog_index, "base_url_env", base_url_env)?;
     }
     if let Some(api_key_env) = provider.api_key_env.as_deref() {
-        validate_catalog_env_var(provider, "api_key_env", api_key_env)?;
+        validate_catalog_env_var(provider, catalog_index, "api_key_env", api_key_env)?;
     }
     if let Some(extra_headers_env) = provider.extra_headers_env.as_deref() {
-        validate_catalog_env_var(provider, "extra_headers_env", extra_headers_env)?;
+        validate_catalog_env_var(
+            provider,
+            catalog_index,
+            "extra_headers_env",
+            extra_headers_env,
+        )?;
     }
     Ok(())
 }
 
 fn validate_catalog_text(
     provider: &ProviderDefinition,
+    catalog_index: usize,
     field: &'static str,
     value: &str,
 ) -> Result<(), RebornLlmCatalogError> {
     if reject_inline_secret("provider catalog field", value).is_err() {
         return Err(RebornLlmCatalogError::CatalogFieldInvalid {
             provider: safe_catalog_display_value("providers.<id>", &provider.id),
+            catalog_index,
             field,
         });
     }
@@ -210,6 +232,7 @@ fn validate_catalog_text(
 
 fn validate_catalog_env_var(
     provider: &ProviderDefinition,
+    catalog_index: usize,
     field: &'static str,
     value: &str,
 ) -> Result<(), RebornLlmCatalogError> {
@@ -218,6 +241,7 @@ fn validate_catalog_env_var(
     {
         return Err(RebornLlmCatalogError::CatalogFieldInvalid {
             provider: safe_catalog_display_value("providers.<id>", &provider.id),
+            catalog_index,
             field,
         });
     }
@@ -283,6 +307,7 @@ fn is_env_var_name(value: &str) -> bool {
 fn resolve_base_url(
     selection: &LlmSlotSelection,
     provider: &ProviderDefinition,
+    catalog_index: usize,
 ) -> Result<String, RebornLlmCatalogError> {
     let base_url = provider
         .base_url_env
@@ -292,7 +317,7 @@ fn resolve_base_url(
         .or_else(|| provider.default_base_url.clone())
         .unwrap_or_default();
 
-    validate_catalog_text(provider, "resolved_base_url", &base_url)?;
+    validate_catalog_text(provider, catalog_index, "resolved_base_url", &base_url)?;
 
     if provider.base_url_required && base_url.is_empty() {
         return Err(RebornLlmCatalogError::BaseUrlUnconfigured {
@@ -306,11 +331,12 @@ fn resolve_base_url(
 fn resolve_model(
     selection: &LlmSlotSelection,
     provider: &ProviderDefinition,
+    catalog_index: usize,
 ) -> Result<String, RebornLlmCatalogError> {
     let model = nonempty_env(&provider.model_env)
         .or_else(|| selection.model.clone())
         .unwrap_or_else(|| provider.default_model.clone());
-    validate_catalog_text(provider, "resolved_model", &model)?;
+    validate_catalog_text(provider, catalog_index, "resolved_model", &model)?;
     Ok(model)
 }
 
@@ -374,6 +400,9 @@ fn parse_extra_headers(
                 reason: "header name must not be empty".to_string(),
             });
         }
+        // Empty values are allowed: some APIs use presence-only headers,
+        // and the env var is operator-controlled. Servers that reject an
+        // empty value will return a provider-specific HTTP error later.
         headers.push((key.to_string(), header_value.trim().to_string()));
     }
     Ok(headers)
@@ -784,7 +813,7 @@ mod tests {
         let mut provider = provider_no_key_required("alpha");
         provider.extra_headers_env = Some("sk-proj-1234567890abcdef".to_string());
 
-        let err = validate_catalog_provider(&provider).expect_err("secret-shaped env must fail");
+        let err = validate_catalog_provider(&provider, 7).expect_err("secret-shaped env must fail");
         let rendered = err.to_string();
         assert!(matches!(
             err,
@@ -793,6 +822,10 @@ mod tests {
         assert!(
             !rendered.contains("sk-proj-1234567890abcdef"),
             "error must not echo secret-shaped env name: {rendered}"
+        );
+        assert!(
+            rendered.contains("providers.json[7]"),
+            "error must identify catalog index: {rendered}"
         );
     }
 

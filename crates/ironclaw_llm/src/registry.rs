@@ -42,6 +42,14 @@ pub enum ProviderRegistryLoadError {
     },
 }
 
+impl ProviderRegistryLoadError {
+    fn overlay_path(&self) -> &str {
+        match self {
+            Self::Read { path, .. } | Self::Parse { path, .. } => path,
+        }
+    }
+}
+
 /// API protocol a provider speaks.
 ///
 /// Determines which rig-core client constructor to use.
@@ -280,6 +288,7 @@ impl ProviderRegistry {
             Ok(registry) => registry,
             Err(error) => {
                 tracing::warn!(
+                    path = %error.overlay_path(),
                     error = %error,
                     "Failed to load user providers.json, skipping"
                 );
@@ -395,6 +404,15 @@ fn user_providers_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_registry_load_error_exposes_overlay_path() {
+        let error = ProviderRegistryLoadError::Read {
+            path: "/tmp/providers.json".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        assert_eq!(error.overlay_path(), "/tmp/providers.json");
+    }
 
     #[test]
     fn test_builtin_registry_loads() {
