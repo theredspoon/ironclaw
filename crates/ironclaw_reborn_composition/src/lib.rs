@@ -23,6 +23,8 @@ mod factory;
 mod input;
 mod profile;
 mod readiness;
+#[cfg(feature = "root-llm-provider")]
+mod llm_catalog;
 mod runtime;
 mod runtime_input;
 
@@ -35,6 +37,10 @@ pub use runtime::{
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, build_reborn_runtime,
 };
 pub use runtime_input::{RebornRuntimeInput, TurnRunnerSettings};
+#[cfg(feature = "root-llm-provider")]
+pub use llm_catalog::{
+    RebornLlmCatalogError, resolve_against_registry, resolve_llm_selection_against_catalog,
+};
 #[cfg(feature = "root-llm-provider")]
 pub use runtime_input::RebornLlmConfig;
 
