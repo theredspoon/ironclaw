@@ -623,6 +623,7 @@ impl DurableState {
             turn_id: None,
             turn_run_id: None,
             tool_result_ref: None,
+            tool_result_provider_call: None,
             content: Some(request.content.into_text()),
             redaction_ref: None,
         });
@@ -732,6 +733,7 @@ impl DurableState {
             turn_id: None,
             turn_run_id: Some(request.turn_run_id),
             tool_result_ref: None,
+            tool_result_provider_call: None,
             content: Some(request.content.into_text()),
             redaction_ref: None,
         };
@@ -745,6 +747,12 @@ impl DurableState {
         request: AppendToolResultReferenceRequest,
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         let thread = get_thread_mut(self, &request.scope, &request.thread_id)?;
+        let provider_call = request.provider_call;
+        if let Some(provider_call) = &provider_call {
+            provider_call
+                .validate()
+                .map_err(SessionThreadError::Serialization)?;
+        }
         let envelope = ToolResultReferenceEnvelope::new(request.result_ref, request.safe_summary)
             .map_err(SessionThreadError::Serialization)?;
         if let Some(existing) = thread.messages.iter().find(|message| {
@@ -768,6 +776,7 @@ impl DurableState {
             turn_id: None,
             turn_run_id: Some(request.turn_run_id),
             tool_result_ref: Some(envelope.result_ref),
+            tool_result_provider_call: provider_call,
             content: Some(content),
             redaction_ref: None,
         };
@@ -809,6 +818,7 @@ impl DurableState {
             get_message_mut(self, &request.scope, &request.thread_id, request.message_id)?;
         message.status = MessageStatus::Redacted;
         message.content = None;
+        message.tool_result_provider_call = None;
         message.redaction_ref = Some(request.redaction_ref);
         Ok(message.clone())
     }
@@ -836,7 +846,7 @@ impl DurableState {
         let thread = get_thread(self, &request.scope, &request.thread_id)?;
         Ok(ThreadHistory {
             thread: thread.record.clone(),
-            messages: thread.messages.clone(),
+            messages: history_messages(thread),
             summary_artifacts: history_summary_artifacts(thread),
         })
     }
@@ -1016,6 +1026,7 @@ fn context_messages_with_summary_replacements(thread: &StoredThread) -> Vec<Cont
                 summary_id: Some(summary.summary_id),
                 sequence: summary.start_sequence,
                 kind: MessageKind::Summary,
+                tool_result_provider_call: None,
                 content: summary.content.clone(),
             });
             emitted_summaries.push(summary.summary_id);
@@ -1028,6 +1039,7 @@ fn context_messages_with_summary_replacements(thread: &StoredThread) -> Vec<Cont
                 summary_id: None,
                 sequence: message.sequence,
                 kind: message.kind,
+                tool_result_provider_call: message.tool_result_provider_call.clone(),
                 content,
             });
         }
@@ -1050,6 +1062,18 @@ fn history_summary_artifacts(thread: &StoredThread) -> Vec<SummaryArtifact> {
             } else {
                 summary.clone()
             }
+        })
+        .collect()
+}
+
+fn history_messages(thread: &StoredThread) -> Vec<ThreadMessageRecord> {
+    thread
+        .messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            message.tool_result_provider_call = None;
+            message
         })
         .collect()
 }

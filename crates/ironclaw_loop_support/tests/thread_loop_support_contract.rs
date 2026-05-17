@@ -37,8 +37,8 @@ use ironclaw_turns::{
         LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest,
         LoopModelRouteSnapshot, LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleRef,
         LoopPromptPort, LoopRunContext, LoopTranscriptPort, ParentLoopOutput, PromptMode,
-        PromptSkillContextMetadata, SkillVisibility, UpdateAssistantDraft,
-        VisibleCapabilityRequest,
+        PromptSkillContextMetadata, ProviderToolCallReference, SkillVisibility,
+        UpdateAssistantDraft, VisibleCapabilityRequest,
     },
 };
 use tracing_test::traced_test;
@@ -1156,6 +1156,16 @@ async fn transcript_port_appends_tool_result_reference_envelope_idempotently() {
         .append_capability_result_ref(AppendCapabilityResultRef {
             result_ref: result_ref.clone(),
             safe_summary: "tool completed".to_string(),
+            provider_call: Some(ProviderToolCallReference {
+                provider_turn_id: "turn_1".to_string(),
+                provider_call_id: "call_1".to_string(),
+                provider_tool_name: "demo__echo".to_string(),
+                capability_id: CapabilityId::new("demo.echo").unwrap(),
+                arguments: serde_json::json!({"message":"hello"}),
+                response_reasoning: Some("provider reasoning".to_string()),
+                reasoning: Some("provider reasoning".to_string()),
+                signature: Some("sig-1".to_string()),
+            }),
         })
         .await
         .unwrap();
@@ -1163,6 +1173,7 @@ async fn transcript_port_appends_tool_result_reference_envelope_idempotently() {
         .append_capability_result_ref(AppendCapabilityResultRef {
             result_ref: result_ref.clone(),
             safe_summary: "retry summary ignored".to_string(),
+            provider_call: None,
         })
         .await
         .unwrap();
@@ -1192,6 +1203,42 @@ async fn transcript_port_appends_tool_result_reference_envelope_idempotently() {
     assert_eq!(envelope.version, 1);
     assert_eq!(envelope.result_ref, result_ref.as_str());
     assert_eq!(envelope.safe_summary.as_str(), "tool completed");
+    assert!(records[0].tool_result_provider_call.is_none());
+    let context = fixture
+        .thread_service
+        .load_context_window(ironclaw_threads::LoadContextWindowRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+            max_messages: 16,
+        })
+        .await
+        .unwrap();
+    let context_record = context
+        .messages
+        .iter()
+        .find(|message| message.kind == MessageKind::ToolResultReference)
+        .expect("tool result reference context");
+    let provider_call = context_record
+        .tool_result_provider_call
+        .as_ref()
+        .expect("provider call metadata");
+    assert_eq!(provider_call.provider_turn_id, "turn_1");
+    assert_eq!(provider_call.provider_call_id, "call_1");
+    assert_eq!(provider_call.provider_tool_name, "demo__echo");
+    assert_eq!(provider_call.capability_id.as_str(), "demo.echo");
+    assert_eq!(
+        provider_call.arguments,
+        serde_json::json!({"message":"hello"})
+    );
+    assert_eq!(
+        provider_call.response_reasoning.as_deref(),
+        Some("provider reasoning")
+    );
+    assert_eq!(
+        provider_call.reasoning.as_deref(),
+        Some("provider reasoning")
+    );
+    assert_eq!(provider_call.signature.as_deref(), Some("sig-1"));
 }
 
 #[tokio::test]
@@ -1207,6 +1254,7 @@ async fn transcript_port_rejects_unsafe_tool_result_summary() {
         .append_capability_result_ref(AppendCapabilityResultRef {
             result_ref: LoopResultRef::new("result:unsafe-tool").unwrap(),
             safe_summary: "raw tool input includes secret".to_string(),
+            provider_call: None,
         })
         .await
         .unwrap_err();
@@ -1660,6 +1708,7 @@ async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
         summary_id: None,
         sequence: 1,
         kind: MessageKind::ToolResultReference,
+        tool_result_provider_call: None,
         content: "tool result content".to_string(),
     }));
     let context_port = Arc::new(ThreadBackedLoopContextPort::new(
@@ -1692,7 +1741,7 @@ async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
 }
 
 #[tokio::test]
-async fn model_port_round_trips_tool_result_reference_context_as_system_model_input() {
+async fn model_port_round_trips_tool_result_reference_context_as_typed_model_input() {
     let fixture = ThreadFixture::new().await;
     let tool_result_ref = LoopMessageRef::new("msg:11111111-1111-1111-1111-111111111111").unwrap();
     let thread_service = Arc::new(StaticContextThreadService::new(ContextMessage {
@@ -1700,6 +1749,7 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
         summary_id: None,
         sequence: 1,
         kind: MessageKind::ToolResultReference,
+        tool_result_provider_call: None,
         content: "tool result content".to_string(),
     }));
     let context_port = ThreadBackedLoopContextPort::new(
@@ -1751,7 +1801,7 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
     let calls = gateway.calls.lock().unwrap();
     assert_eq!(
         calls[0].messages[0].role,
-        HostManagedModelMessageRole::System
+        HostManagedModelMessageRole::ToolResult
     );
     assert_eq!(calls[0].messages[0].content, "tool result content");
 }

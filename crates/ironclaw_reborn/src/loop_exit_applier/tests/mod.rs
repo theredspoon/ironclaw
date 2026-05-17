@@ -751,6 +751,7 @@ async fn thread_checkpoint_evidence_rejects_wrong_run_and_malformed_result_ref_r
             turn_id: None,
             turn_run_id: Some(expected_run_id.to_string()),
             tool_result_ref: Some(malformed_result.as_str().to_string()),
+            tool_result_provider_call: None,
             content: Some("not-json".to_string()),
             redaction_ref: None,
         });
@@ -766,6 +767,7 @@ async fn thread_checkpoint_evidence_rejects_wrong_run_and_malformed_result_ref_r
             turn_id: None,
             turn_run_id: Some(expected_run_id.to_string()),
             tool_result_ref: Some(unsafe_summary_result.as_str().to_string()),
+            tool_result_provider_call: None,
             content: Some(format!(
                 r#"{{"version":1,"result_ref":"{}","safe_summary":"raw tool input includes secret"}}"#,
                 unsafe_summary_result.as_str()
@@ -1062,6 +1064,7 @@ where
             turn_run_id: run_id.to_string(),
             result_ref: result_ref.as_str().to_string(),
             safe_summary: ToolResultSafeSummary::new("tool completed").expect("safe summary"),
+            provider_call: None,
         })
         .await
         .expect("tool result reference")

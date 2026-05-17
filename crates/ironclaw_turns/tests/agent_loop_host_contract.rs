@@ -287,6 +287,7 @@ async fn instruction_bundle_builder_orders_sections_and_rebuilds_deterministical
             safe_name: "Echo".to_string(),
             safe_description: "Echo safe input".to_string(),
             concurrency_hint: ConcurrencyHint::SafeForParallel,
+            parameters_schema: serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}}),
         }],
     };
     let request = InstructionBundleRequest {
@@ -1164,6 +1165,7 @@ async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_r
             safe_name: "Echo".to_string(),
             safe_description: "Echo safe input".to_string(),
             concurrency_hint: ConcurrencyHint::SafeForParallel,
+            parameters_schema: serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}}),
         }],
     };
     let port = HostManagedLoopPromptPort::new(
@@ -1837,6 +1839,7 @@ impl RecordingAgentLoopHost {
                     safe_name: "Echo".to_string(),
                     safe_description: "Returns an opaque result ref".to_string(),
                     concurrency_hint: ConcurrencyHint::Exclusive,
+                    parameters_schema: serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}}),
                 }],
             },
             context_message_safe_summary: "hello".to_string(),

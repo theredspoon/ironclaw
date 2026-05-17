@@ -44,7 +44,8 @@ pub use host::{
     LoopModelRouteSnapshot, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
     LoopPromptBundleAuthority, LoopPromptBundleGrant, LoopPromptBundleRef, LoopPromptBundleRequest,
     LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
-    ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode,
+    ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, PromptMode, ProviderToolCall,
+    ProviderToolCallReference, ProviderToolCallReplay, ProviderToolDefinition,
     StageCheckpointPayloadRequest, UpdateAssistantDraft, VisibleCapabilityRequest,
     VisibleCapabilitySurface, sanitize_model_visible_text, validate_model_route_component_value,
 };

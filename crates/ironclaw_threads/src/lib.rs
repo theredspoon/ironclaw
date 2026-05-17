@@ -31,4 +31,6 @@ pub use error::SessionThreadError;
 pub use identifiers::ThreadMessageId;
 pub use in_memory::InMemorySessionThreadService;
 pub use service::SessionThreadService;
-pub use tool_result_reference::{ToolResultReferenceEnvelope, ToolResultSafeSummary};
+pub use tool_result_reference::{
+    ProviderToolCallReferenceEnvelope, ToolResultReferenceEnvelope, ToolResultSafeSummary,
+};

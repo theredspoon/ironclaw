@@ -51,9 +51,10 @@ use tokio::sync::{Mutex, OnceCell};
 use async_trait::async_trait;
 use ironclaw_threads::{
     AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage,
-    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus, SessionThreadError,
-    SessionThreadService, SummaryArtifact, ThreadHistoryRequest, ThreadMessageId,
-    ThreadMessageRecord, ThreadScope, ToolResultSafeSummary, UpdateAssistantDraftRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
+    ProviderToolCallReferenceEnvelope, SessionThreadError, SessionThreadService, SummaryArtifact,
+    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope, ToolResultSafeSummary,
+    UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef, TurnId, TurnRunId,
@@ -63,12 +64,12 @@ use ironclaw_turns::{
         BeginAssistantDraft, CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityInvocation, CapabilityOutcome,
         CapabilitySurfaceVersion, FinalizeAssistantMessage, InstructionMaterializationStore,
-        LoopContextBundle, LoopContextMessage, LoopContextPort, LoopContextRequest,
-        LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputCursor, LoopModelMessage,
-        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopPromptBundleAuthority,
-        LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk,
-        ParentLoopOutput, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
-        VisibleCapabilitySurface, sanitize_model_visible_text,
+        LoopCapabilityPort, LoopContextBundle, LoopContextMessage, LoopContextPort,
+        LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputCursor,
+        LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
+        LoopPromptBundleAuthority, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
+        LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, PromptMode, UpdateAssistantDraft,
+        VisibleCapabilityRequest, VisibleCapabilitySurface, sanitize_model_visible_text,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -410,6 +411,9 @@ where
                 turn_run_id: self.run_context.run_id.to_string(),
                 result_ref: request.result_ref.as_str().to_string(),
                 safe_summary,
+                provider_call: request
+                    .provider_call
+                    .map(provider_call_reference_to_envelope),
             })
             .await
             .map_err(transcript_write_error)?;
@@ -579,6 +583,7 @@ where
     thread_scope: ThreadScope,
     run_context: LoopRunContext,
     gateway: Arc<G>,
+    capabilities: Option<Arc<dyn LoopCapabilityPort>>,
     max_messages: usize,
     prompt_authority: LoopPromptBundleAuthority,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
@@ -604,6 +609,7 @@ where
             thread_scope,
             run_context,
             gateway,
+            capabilities: None,
             max_messages,
             prompt_authority: LoopPromptBundleAuthority::shared(),
             milestone_sink: None,
@@ -626,6 +632,7 @@ where
             thread_scope,
             run_context,
             gateway,
+            capabilities: None,
             max_messages,
             prompt_authority: LoopPromptBundleAuthority::shared(),
             milestone_sink: Some(milestone_sink),
@@ -661,6 +668,11 @@ where
         source: Arc<dyn HostIdentityContextSource>,
     ) -> Self {
         self.identity_context_source = Some(source);
+        self
+    }
+
+    pub fn with_capability_port(mut self, capabilities: Arc<dyn LoopCapabilityPort>) -> Self {
+        self.capabilities = Some(capabilities);
         self
     }
 }
@@ -700,18 +712,21 @@ where
         )?;
         let resolved_messages = self.resolve_model_messages(prompt_grant.messages).await?;
         self.emit_model_started(requested_model_profile_id).await;
-        let gateway_response = match self
-            .gateway
-            .stream_model(HostManagedModelRequest {
-                model_profile_id: model_profile_id.clone(),
-                messages: resolved_messages,
-                surface_version: request.surface_version,
-                resolved_model_route: self.run_context.resolved_model_route.clone(),
-                run_id: self.run_context.run_id,
-                turn_id: self.run_context.turn_id,
-            })
-            .await
-        {
+        let host_request = HostManagedModelRequest {
+            model_profile_id: model_profile_id.clone(),
+            messages: resolved_messages,
+            surface_version: request.surface_version,
+            resolved_model_route: self.run_context.resolved_model_route.clone(),
+            run_id: self.run_context.run_id,
+            turn_id: self.run_context.turn_id,
+        };
+        let gateway_response = match if let Some(capabilities) = self.capabilities.as_ref() {
+            self.gateway
+                .stream_model_with_capabilities(host_request, Arc::clone(capabilities))
+                .await
+        } else {
+            self.gateway.stream_model(host_request).await
+        } {
             Ok(response) => response,
             Err(error) => {
                 let host_error = model_gateway_error(error);
@@ -807,6 +822,7 @@ where
                         role: model_role_for_kind(message.kind),
                         content: message.content,
                         content_ref,
+                        tool_result_provider_call: message.tool_result_provider_call,
                     })
                 })
                 .collect();
@@ -883,6 +899,7 @@ where
                     role: HostManagedModelMessageRole::System,
                     content: content.content,
                     content_ref: message.content_ref,
+                    tool_result_provider_call: None,
                 });
                 continue;
             }
@@ -903,6 +920,7 @@ where
                     role: materialized_role,
                     content: materialized.safe_content,
                     content_ref: message.content_ref,
+                    tool_result_provider_call: None,
                 });
                 continue;
             }
@@ -939,6 +957,7 @@ where
                 role: durable_role,
                 content: context_message.content.clone(),
                 content_ref: message.content_ref,
+                tool_result_provider_call: context_message.tool_result_provider_call.clone(),
             });
         }
         Ok(resolved)
@@ -965,6 +984,7 @@ where
                     role: HostManagedModelMessageRole::System,
                     content: snippet.safe_summary,
                     content_ref,
+                    tool_result_provider_call: None,
                 },
             );
         }
@@ -980,6 +1000,14 @@ pub trait HostManagedModelGateway: Send + Sync {
         &self,
         request: HostManagedModelRequest,
     ) -> Result<HostManagedModelResponse, HostManagedModelError>;
+
+    async fn stream_model_with_capabilities(
+        &self,
+        request: HostManagedModelRequest,
+        _capabilities: Arc<dyn LoopCapabilityPort>,
+    ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+        self.stream_model(request).await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1004,6 +1032,8 @@ pub struct HostManagedModelMessage {
     pub role: HostManagedModelMessageRole,
     pub content: String,
     pub content_ref: LoopMessageRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_provider_call: Option<ProviderToolCallReferenceEnvelope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1012,14 +1042,16 @@ pub enum HostManagedModelMessageRole {
     System,
     User,
     Assistant,
+    ToolResult,
 }
 
 impl HostManagedModelMessageRole {
     fn from_loop_role(role: &str) -> Result<Self, AgentLoopHostError> {
         match role {
-            "system" | "tool_result_reference" => Ok(Self::System),
+            "system" => Ok(Self::System),
             "user" => Ok(Self::User),
             "assistant" => Ok(Self::Assistant),
+            "tool_result_reference" => Ok(Self::ToolResult),
             _ => Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::InvalidInvocation,
                 "model message role is unsupported",
@@ -1043,6 +1075,21 @@ impl HostManagedModelResponse {
             output: ParentLoopOutput::AssistantReply(AssistantReply {
                 content: safe_content,
             }),
+        }
+    }
+
+    pub fn capability_calls(
+        calls: Vec<ironclaw_turns::run_profile::CapabilityCallCandidate>,
+        safe_text_delta: impl Into<String>,
+    ) -> Self {
+        let safe_text_delta = sanitize_model_visible_text(safe_text_delta);
+        Self {
+            safe_text_deltas: if safe_text_delta.is_empty() {
+                Vec::new()
+            } else {
+                vec![safe_text_delta]
+            },
+            output: ParentLoopOutput::CapabilityCalls(calls),
         }
     }
 }
@@ -1150,6 +1197,7 @@ fn history_messages_by_ref(messages: Vec<ThreadMessageRecord>) -> HashMap<String
                 summary_id: None,
                 sequence: message.sequence,
                 kind: message.kind,
+                tool_result_provider_call: message.tool_result_provider_call,
                 content,
             };
             message_ref_from_context(&context_message)
@@ -1167,6 +1215,7 @@ fn history_summaries_by_ref(summaries: Vec<SummaryArtifact>) -> HashMap<String, 
                 summary_id: Some(summary.summary_id),
                 sequence: summary.end_sequence,
                 kind: MessageKind::Summary,
+                tool_result_provider_call: None,
                 content: summary.content,
             };
             message_ref_from_context(&context_message)
@@ -1228,6 +1277,21 @@ fn invalid_transcript_ref_error() -> AgentLoopHostError {
     )
 }
 
+fn provider_call_reference_to_envelope(
+    provider_call: ironclaw_turns::run_profile::ProviderToolCallReference,
+) -> ProviderToolCallReferenceEnvelope {
+    ProviderToolCallReferenceEnvelope {
+        provider_turn_id: provider_call.provider_turn_id,
+        provider_call_id: provider_call.provider_call_id,
+        provider_tool_name: provider_call.provider_tool_name,
+        capability_id: provider_call.capability_id,
+        arguments: provider_call.arguments,
+        response_reasoning: provider_call.response_reasoning,
+        reasoning: provider_call.reasoning,
+        signature: provider_call.signature,
+    }
+}
+
 fn role_for_kind(kind: MessageKind) -> &'static str {
     match kind {
         MessageKind::User => "user",
@@ -1243,10 +1307,10 @@ fn model_role_for_kind(kind: MessageKind) -> HostManagedModelMessageRole {
     match kind {
         MessageKind::User => HostManagedModelMessageRole::User,
         MessageKind::Assistant => HostManagedModelMessageRole::Assistant,
-        MessageKind::System
-        | MessageKind::Summary
-        | MessageKind::CheckpointReference
-        | MessageKind::ToolResultReference => HostManagedModelMessageRole::System,
+        MessageKind::System | MessageKind::Summary | MessageKind::CheckpointReference => {
+            HostManagedModelMessageRole::System
+        }
+        MessageKind::ToolResultReference => HostManagedModelMessageRole::ToolResult,
     }
 }
 

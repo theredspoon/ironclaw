@@ -2,7 +2,7 @@ use ironclaw_host_api::{AgentId, MissionId, ProjectId, TenantId, ThreadId, UserI
 use serde::{Deserialize, Serialize};
 
 use crate::identifiers::{SummaryArtifactId, ThreadMessageId};
-use crate::tool_result_reference::ToolResultSafeSummary;
+use crate::tool_result_reference::{ProviderToolCallReferenceEnvelope, ToolResultSafeSummary};
 
 /// Canonical scope carried by a Reborn session thread.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -89,6 +89,10 @@ pub struct ThreadMessageRecord {
     pub turn_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_ref: Option<String>,
+    /// Internal provider replay metadata for reconstructing tool-call turns.
+    /// Product surfaces must render `content`, not this raw provider side channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result_provider_call: Option<ProviderToolCallReferenceEnvelope>,
     pub content: Option<String>,
     pub redaction_ref: Option<String>,
 }
@@ -167,6 +171,7 @@ pub struct AppendToolResultReferenceRequest {
     pub turn_run_id: String,
     pub result_ref: String,
     pub safe_summary: ToolResultSafeSummary,
+    pub provider_call: Option<ProviderToolCallReferenceEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +216,7 @@ pub struct ContextMessage {
     pub summary_id: Option<SummaryArtifactId>,
     pub sequence: u64,
     pub kind: MessageKind,
+    pub tool_result_provider_call: Option<ProviderToolCallReferenceEnvelope>,
     pub content: String,
 }
 

@@ -1048,6 +1048,22 @@ pub struct CapabilityCallCandidate {
     pub surface_version: CapabilitySurfaceVersion,
     pub capability_id: CapabilityId,
     pub input_ref: CapabilityInputRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderToolCallReplay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCallReplay {
+    pub provider_turn_id: String,
+    pub provider_call_id: String,
+    pub provider_tool_name: String,
+    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[async_trait]
@@ -1093,6 +1109,46 @@ pub struct CapabilityDescriptorView {
     pub safe_name: String,
     pub safe_description: String,
     pub concurrency_hint: ConcurrencyHint,
+    #[serde(default)]
+    pub parameters_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolDefinition {
+    pub capability_id: CapabilityId,
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCallReference {
+    pub provider_turn_id: String,
+    pub provider_call_id: String,
+    pub provider_tool_name: String,
+    pub capability_id: CapabilityId,
+    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1342,6 +1398,17 @@ impl<'de> Deserialize<'de> for CapabilityFailureKind {
 
 #[async_trait]
 pub trait LoopCapabilityPort: Send + Sync {
+    fn tool_definitions(&self) -> Result<Vec<ProviderToolDefinition>, AgentLoopHostError> {
+        Ok(Vec::new())
+    }
+
+    async fn register_provider_tool_call(
+        &self,
+        _tool_call: ProviderToolCall,
+    ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
+        Err(unsupported_host_method("register_provider_tool_call"))
+    }
+
     async fn visible_capabilities(
         &self,
         request: VisibleCapabilityRequest,
@@ -1378,6 +1445,8 @@ pub struct FinalizeAssistantMessage {
 pub struct AppendCapabilityResultRef {
     pub result_ref: LoopResultRef,
     pub safe_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call: Option<ProviderToolCallReference>,
 }
 
 #[async_trait]

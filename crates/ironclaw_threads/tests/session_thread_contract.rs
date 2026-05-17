@@ -1,11 +1,12 @@
 use futures::future::join_all;
-use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AppendAssistantDraftRequest, AppendToolResultReferenceRequest,
     CreateSummaryArtifactRequest, EnsureThreadRequest, InMemorySessionThreadService,
-    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
-    SessionThreadService, ThreadHistoryRequest, ThreadMessageId, ThreadScope,
-    ToolResultSafeSummary, UpdateAssistantDraftRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
+    ProviderToolCallReferenceEnvelope, RedactMessageRequest, SessionThreadService,
+    ThreadHistoryRequest, ThreadMessageId, ThreadScope, ToolResultSafeSummary,
+    UpdateAssistantDraftRequest,
 };
 
 fn scope(label: &str) -> ThreadScope {
@@ -54,6 +55,7 @@ async fn append_tool_result_reference_is_finalized_and_idempotent_per_run_result
             turn_run_id: "run-1".into(),
             result_ref: "result:demo".into(),
             safe_summary: ToolResultSafeSummary::new("safe tool result").unwrap(),
+            provider_call: None,
         })
         .await
         .unwrap();
@@ -64,6 +66,7 @@ async fn append_tool_result_reference_is_finalized_and_idempotent_per_run_result
             turn_run_id: "run-1".into(),
             result_ref: "result:demo".into(),
             safe_summary: ToolResultSafeSummary::new("retry content ignored").unwrap(),
+            provider_call: None,
         })
         .await
         .unwrap();
@@ -680,6 +683,72 @@ async fn summary_covering_redacted_message_is_not_loaded_into_model_context() {
     assert_eq!(context.messages.len(), 1);
     assert_eq!(context.messages[0].kind, MessageKind::User);
     assert_eq!(context.messages[0].content, "safe follow-up");
+}
+
+#[tokio::test]
+async fn redaction_removes_tool_result_provider_metadata() {
+    let service = InMemorySessionThreadService::default();
+    let scope = scope("tool-redaction");
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope.clone(),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let tool_result = service
+        .append_tool_result_reference(AppendToolResultReferenceRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            result_ref: "result:redacted-tool".into(),
+            safe_summary: ToolResultSafeSummary::new("safe tool result").unwrap(),
+            provider_call: Some(ProviderToolCallReferenceEnvelope {
+                provider_turn_id: "turn_1".to_string(),
+                provider_call_id: "call_1".to_string(),
+                provider_tool_name: "demo__echo".to_string(),
+                capability_id: CapabilityId::new("demo.echo").unwrap(),
+                arguments: serde_json::json!({"secret":"raw-provider-argument"}),
+                response_reasoning: Some("provider response reasoning".to_string()),
+                reasoning: Some("provider call reasoning".to_string()),
+                signature: Some("sig-1".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+
+    service
+        .redact_message(RedactMessageRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            message_id: tool_result.message_id,
+            redaction_ref: "redaction/audit/tool".into(),
+        })
+        .await
+        .unwrap();
+
+    let history = service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.messages[0].status, MessageStatus::Redacted);
+    assert!(history.messages[0].content.is_none());
+    assert!(history.messages[0].tool_result_provider_call.is_none());
+    let context = service
+        .load_context_window(LoadContextWindowRequest {
+            scope,
+            thread_id: thread.thread_id,
+            max_messages: 16,
+        })
+        .await
+        .unwrap();
+    assert!(context.messages.is_empty());
 }
 
 #[tokio::test]

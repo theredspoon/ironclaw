@@ -1,3 +1,4 @@
+use ironclaw_host_api::CapabilityId;
 use serde::{Deserialize, Serialize};
 
 // Mirrors `ironclaw_turns::LoopResultRef` without adding a threads -> turns
@@ -64,6 +65,43 @@ pub struct ToolResultReferenceEnvelope {
     pub safe_summary: ToolResultSafeSummary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCallReferenceEnvelope {
+    pub provider_turn_id: String,
+    pub provider_call_id: String,
+    pub provider_tool_name: String,
+    pub capability_id: CapabilityId,
+    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+impl ProviderToolCallReferenceEnvelope {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_provider_token(&self.provider_turn_id, "provider turn id", 512)?;
+        validate_provider_token(&self.provider_call_id, "provider call id", 512)?;
+        validate_provider_token(&self.provider_tool_name, "provider tool name", 256)?;
+        let arguments_len = serde_json::to_vec(&self.arguments)
+            .map_err(|error| format!("provider arguments are not serializable: {error}"))?
+            .len();
+        if arguments_len > 16 * 1024 {
+            return Err("provider tool arguments exceed 16384 bytes".to_string());
+        }
+        validate_optional_provider_text(
+            &self.response_reasoning,
+            "provider response reasoning",
+            4096,
+        )?;
+        validate_optional_provider_text(&self.reasoning, "provider reasoning", 4096)?;
+        validate_optional_provider_text(&self.signature, "provider signature", 4096)?;
+        Ok(())
+    }
+}
+
 impl ToolResultReferenceEnvelope {
     pub fn new(
         result_ref: impl Into<String>,
@@ -99,6 +137,37 @@ fn validate_tool_result_ref(value: &str) -> Result<(), String> {
             "tool result ref opaque id must contain only ASCII letters, digits, _, -, or ."
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+fn validate_provider_token(value: &str, label: &str, max_len: usize) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > max_len {
+        return Err(format!("{label} exceeds {max_len} bytes"));
+    }
+    if !value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+    }) {
+        return Err(format!(
+            "{label} must contain only ASCII letters, digits, _, -, ., or :"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_provider_text(
+    value: &Option<String>,
+    label: &str,
+    max_len: usize,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.len() > max_len {
+        return Err(format!("{label} exceeds {max_len} bytes"));
     }
     Ok(())
 }

@@ -6430,6 +6430,7 @@ impl RecordingGateway {
                     surface_version: CapabilitySurfaceVersion::new("empty:v1").unwrap(),
                     capability_id: CapabilityId::new("demo.echo").unwrap(),
                     input_ref: CapabilityInputRef::new("input:opaque-tool-call").unwrap(),
+                    provider_replay: None,
                 },
             ]),
         });

@@ -15,8 +15,8 @@ use ironclaw_turns::{
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
         LoopCancelReasonKind, LoopCancellationSignal, LoopCheckpointKind, LoopCheckpointRequest,
         LoopDriverNoteKind, LoopGateKind, LoopInput, LoopInputAckToken, LoopInputBatch,
-        LoopModelRequest, LoopProgressEvent, ParentLoopOutput, StageCheckpointPayloadRequest,
-        VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopModelRequest, LoopProgressEvent, ParentLoopOutput, ProviderToolCallReference,
+        StageCheckpointPayloadRequest, VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
 };
 
@@ -713,7 +713,7 @@ impl CanonicalAgentLoopExecutor {
     ) -> Result<BatchStep, AgentLoopExecutorError> {
         match outcome {
             CapabilityOutcome::Completed(result) => {
-                append_capability_result_ref(host, &result).await?;
+                append_capability_result_ref(host, &call, &result).await?;
                 push_completed_result(&mut state, result);
                 Ok(BatchStep::Continue(Box::new(state)))
             }
@@ -849,7 +849,7 @@ impl CanonicalAgentLoopExecutor {
                         }
                         promoted => match promoted {
                             CapabilityOutcome::Completed(result) => {
-                                append_capability_result_ref(host, &result).await?;
+                                append_capability_result_ref(host, &call, &result).await?;
                                 push_completed_result(&mut state, result);
                                 return Ok(BatchStep::Continue(Box::new(state)));
                             }
@@ -1619,15 +1619,33 @@ fn push_call_signature_once(
 
 async fn append_capability_result_ref(
     host: &(dyn AgentLoopDriverHost + Send + Sync),
+    call: &CapabilityCallCandidate,
     result: &CapabilityResultMessage,
 ) -> Result<(), AgentLoopExecutorError> {
     host.append_capability_result_ref(AppendCapabilityResultRef {
         result_ref: result.result_ref.clone(),
         safe_summary: result.safe_summary.clone(),
+        provider_call: provider_tool_call_reference(call),
     })
     .await
     .map_err(capability_host_error)?;
     Ok(())
+}
+
+fn provider_tool_call_reference(
+    call: &CapabilityCallCandidate,
+) -> Option<ProviderToolCallReference> {
+    let provider_replay = call.provider_replay.as_ref()?;
+    Some(ProviderToolCallReference {
+        provider_turn_id: provider_replay.provider_turn_id.clone(),
+        provider_call_id: provider_replay.provider_call_id.clone(),
+        provider_tool_name: provider_replay.provider_tool_name.clone(),
+        capability_id: call.capability_id.clone(),
+        arguments: provider_replay.arguments.clone(),
+        response_reasoning: provider_replay.response_reasoning.clone(),
+        reasoning: provider_replay.reasoning.clone(),
+        signature: provider_replay.signature.clone(),
+    })
 }
 
 fn push_completed_result(state: &mut LoopExecutionState, result: CapabilityResultMessage) {
@@ -1661,10 +1679,10 @@ mod tests {
             LoopInputAck, LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
             LoopInterruptKind, LoopModelMessage, LoopModelResponse, LoopProcessRef,
             LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopRunContext,
-            LoopRunInfoPort, ModelProfileId, ModelStreamChunk, ProcessHandleSummary,
-            RedactedRunProfileProvenance, ResolvedRunProfile, ResourceBudgetPolicy,
-            ResourceBudgetTier, RunClassId, RunProfileFingerprint, RuntimeProfileConstraints,
-            SchedulingClass, StageCheckpointPayloadRequest, SteeringPolicy,
+            ProcessHandleSummary, ProviderToolCallReplay, RedactedRunProfileProvenance,
+            ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier, RunClassId,
+            RunProfileFingerprint, RuntimeProfileConstraints, SchedulingClass,
+            StageCheckpointPayloadRequest, SteeringPolicy,
         },
     };
 
@@ -1691,6 +1709,7 @@ mod tests {
         batch_invocations: Arc<Mutex<Vec<CapabilityBatchInvocation>>>,
         single_invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
         staged_payloads: Arc<Mutex<Vec<StageCheckpointPayloadRequest>>>,
+        appended_result_refs: Arc<Mutex<Vec<AppendCapabilityResultRef>>>,
         events: Arc<Mutex<Vec<String>>>,
         prompt_surface_version: Option<CapabilitySurfaceVersion>,
         visible_surface_version: CapabilitySurfaceVersion,
@@ -1719,6 +1738,7 @@ mod tests {
                 batch_invocations: Arc::new(Mutex::new(Vec::new())),
                 single_invocations: Arc::new(Mutex::new(Vec::new())),
                 staged_payloads: Arc::new(Mutex::new(Vec::new())),
+                appended_result_refs: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 prompt_surface_version: Some(surface_version()),
                 visible_surface_version: surface_version(),
@@ -1791,6 +1811,10 @@ mod tests {
 
         fn staged_payloads(&self) -> Vec<StageCheckpointPayloadRequest> {
             self.staged_payloads.lock().expect("lock").clone()
+        }
+
+        fn appended_result_refs(&self) -> Vec<AppendCapabilityResultRef> {
+            self.appended_result_refs.lock().expect("lock").clone()
         }
 
         fn events(&self) -> Vec<String> {
@@ -1993,6 +2017,7 @@ mod tests {
                     safe_name: "demo".to_string(),
                     safe_description: "demo capability".to_string(),
                     concurrency_hint: ironclaw_turns::run_profile::ConcurrencyHint::SafeForParallel,
+                    parameters_schema: serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}}),
                 }],
             })
         }
@@ -2049,9 +2074,17 @@ mod tests {
 
         async fn append_capability_result_ref(
             &self,
-            _request: AppendCapabilityResultRef,
+            request: AppendCapabilityResultRef,
         ) -> Result<LoopMessageRef, AgentLoopHostError> {
-            Ok(LoopMessageRef::new("msg:tool-result").expect("valid"))
+            self.appended_result_refs
+                .lock()
+                .expect("lock")
+                .push(request.clone());
+            Ok(LoopMessageRef::new(format!(
+                "msg:tool-result-{}",
+                request.result_ref.as_str().trim_start_matches("result:")
+            ))
+            .expect("valid"))
         }
     }
 
@@ -3147,6 +3180,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_provider_call_appends_provider_replay_metadata() {
+        let result_ref = LoopResultRef::new("result:provider-call").expect("valid");
+        let host = MockHost::new(vec![provider_calls_response()]).with_batch_outcomes(vec![
+            ironclaw_turns::run_profile::CapabilityBatchOutcome {
+                outcomes: vec![CapabilityOutcome::Completed(CapabilityResultMessage {
+                    result_ref: result_ref.clone(),
+                    safe_summary: "provider call completed".to_string(),
+                    terminate_hint: true,
+                })],
+                stopped_on_suspension: false,
+            },
+        ]);
+        let executor = CanonicalAgentLoopExecutor;
+        let state = LoopExecutionState::initial_for_run(host.run_context());
+
+        executor
+            .execute_family(&crate::families::default(), &host, state)
+            .await
+            .expect("execute");
+
+        let appended = host.appended_result_refs();
+        assert_eq!(appended.len(), 1);
+        let provider_call = appended[0]
+            .provider_call
+            .as_ref()
+            .expect("provider replay metadata");
+        assert_eq!(provider_call.provider_turn_id, "turn_1");
+        assert_eq!(provider_call.provider_call_id, "call_1");
+        assert_eq!(provider_call.provider_tool_name, "demo__echo");
+        assert_eq!(provider_call.capability_id, capability_id());
+        assert_eq!(
+            provider_call.arguments,
+            serde_json::json!({"message":"hello"})
+        );
+        assert_eq!(
+            provider_call.response_reasoning.as_deref(),
+            Some("response reasoning")
+        );
+        assert_eq!(provider_call.reasoning.as_deref(), Some("call reasoning"));
+        assert_eq!(provider_call.signature.as_deref(), Some("sig-1"));
+    }
+
+    #[tokio::test]
     async fn cancellation_checkpoint_failure_still_cancels_for_permissive_profile() {
         let host = MockHost::new(vec![reply_response()]).fail_checkpoint(LoopCheckpointKind::Final);
         host.request_cancellation(LoopCancelReasonKind::UserRequested);
@@ -3211,6 +3287,28 @@ mod tests {
                 surface_version: surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+                provider_replay: None,
+            }]),
+            effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        }
+    }
+
+    fn provider_calls_response() -> LoopModelResponse {
+        LoopModelResponse {
+            chunks: Vec::new(),
+            output: ParentLoopOutput::CapabilityCalls(vec![CapabilityCallCandidate {
+                surface_version: surface_version(),
+                capability_id: capability_id(),
+                input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+                provider_replay: Some(ProviderToolCallReplay {
+                    provider_turn_id: "turn_1".to_string(),
+                    provider_call_id: "call_1".to_string(),
+                    provider_tool_name: "demo__echo".to_string(),
+                    arguments: serde_json::json!({"message":"hello"}),
+                    response_reasoning: Some("response reasoning".to_string()),
+                    reasoning: Some("call reasoning".to_string()),
+                    signature: Some("sig-1".to_string()),
+                }),
             }]),
             effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
         }
@@ -3223,6 +3321,7 @@ mod tests {
                 surface_version: stale_surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+                provider_replay: None,
             }]),
             effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
         }
@@ -3236,11 +3335,13 @@ mod tests {
                     surface_version: stale_surface_version(),
                     capability_id: capability_id(),
                     input_ref: CapabilityInputRef::new("input:stale").expect("valid"),
+                    provider_replay: None,
                 },
                 CapabilityCallCandidate {
                     surface_version: surface_version(),
                     capability_id: capability_id(),
                     input_ref: CapabilityInputRef::new("input:visible").expect("valid"),
+                    provider_replay: None,
                 },
             ]),
             effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
