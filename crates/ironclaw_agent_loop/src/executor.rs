@@ -10,8 +10,8 @@ use ironclaw_turns::{
     LoopBlocked, LoopBlockedKind, LoopCancelled, LoopCancelledReasonKind, LoopCompleted,
     LoopCompletionKind, LoopExit, LoopExitId, LoopFailed, LoopFailureKind,
     run_profile::{
-        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, BatchPolicyKind,
-        CapabilityBatchInvocation, CapabilityCallCandidate, CapabilityFailureKind,
+        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef,
+        BatchPolicyKind, CapabilityBatchInvocation, CapabilityCallCandidate, CapabilityFailureKind,
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
         LoopCancelReasonKind, LoopCancellationSignal, LoopCheckpointKind, LoopCheckpointRequest,
         LoopDriverNoteKind, LoopGateKind, LoopInput, LoopInputAckToken, LoopInputBatch,
@@ -713,6 +713,7 @@ impl CanonicalAgentLoopExecutor {
     ) -> Result<BatchStep, AgentLoopExecutorError> {
         match outcome {
             CapabilityOutcome::Completed(result) => {
+                append_capability_result_ref(host, &result).await?;
                 push_completed_result(&mut state, result);
                 Ok(BatchStep::Continue(Box::new(state)))
             }
@@ -848,6 +849,7 @@ impl CanonicalAgentLoopExecutor {
                         }
                         promoted => match promoted {
                             CapabilityOutcome::Completed(result) => {
+                                append_capability_result_ref(host, &result).await?;
                                 push_completed_result(&mut state, result);
                                 return Ok(BatchStep::Continue(Box::new(state)));
                             }
@@ -1609,6 +1611,19 @@ fn push_call_signature_once(
     if signatures.insert(signature.clone()) {
         state.recent_call_signatures.push(signature);
     }
+    Ok(())
+}
+
+async fn append_capability_result_ref(
+    host: &(dyn AgentLoopDriverHost + Send + Sync),
+    result: &CapabilityResultMessage,
+) -> Result<(), AgentLoopExecutorError> {
+    host.append_capability_result_ref(AppendCapabilityResultRef {
+        result_ref: result.result_ref.clone(),
+        safe_summary: result.safe_summary.clone(),
+    })
+    .await
+    .map_err(capability_host_error)?;
     Ok(())
 }
 
