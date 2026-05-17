@@ -152,10 +152,9 @@ impl LoopExitEvidencePort for InMemoryLoopExitEvidencePort {
 
 /// Durable text/checkpoint-backed evidence adapter for the current Reborn host.
 ///
-/// A completion that includes a durable finalized assistant reply remains
-/// trusted even if the loop also reports capability result refs. Standalone
-/// result-ref-only completion still fails closed until a dedicated durable
-/// result evidence store is wired.
+/// Completions are trusted only when every reported reply ref and result ref is
+/// backed by same-run finalized thread evidence. Result-ref-only completions
+/// are allowed once matching finalized `ToolResultReference` records exist.
 pub struct ThreadCheckpointLoopExitEvidencePort<S>
 where
     S: SessionThreadService + ?Sized,
@@ -412,6 +411,8 @@ fn message_content_matches_result_ref(
     let Some(content) = message.content.as_deref() else {
         return false;
     };
+    // Cheap metadata checks run before this helper. Keep the envelope parse so
+    // forged or malformed transcript content cannot satisfy completion evidence.
     let Ok(envelope) = serde_json::from_str::<ToolResultReferenceEnvelope>(content) else {
         return false;
     };

@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// Safe, product-visible summary text for tool-result transcript references.
+/// Safe summary text for tool-result transcript references.
+///
+/// This mirrors the loop safe-summary policy because thread records can be
+/// replayed into model-visible context through the transcript adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ToolResultSafeSummary(String);
@@ -71,6 +74,12 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
     if value.len() > 512 {
         return Err("tool result summary exceeds 512 bytes".to_string());
     }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err("tool result summary must not contain NUL/control characters".to_string());
+    }
     if value.chars().any(|character| {
         matches!(
             character,
@@ -116,4 +125,21 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
         return Err("tool result summary must not contain API-key-like tokens".to_string());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolResultSafeSummary;
+
+    #[test]
+    fn safe_summary_rejects_control_characters() {
+        assert!(ToolResultSafeSummary::new("line\u{0}break").is_err());
+        assert!(ToolResultSafeSummary::new("line\nbreak").is_err());
+    }
+
+    #[test]
+    fn safe_summary_api_key_check_is_token_based() {
+        assert!(ToolResultSafeSummary::new("sky-high confidence").is_ok());
+        assert!(ToolResultSafeSummary::new("completed with sk-live-token").is_err());
+    }
 }
