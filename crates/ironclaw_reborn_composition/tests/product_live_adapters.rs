@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ironclaw_host_api::{
     AgentId, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
-    ExecutionContext, ExtensionId, GrantConstraints, NetworkPolicy, Principal, RuntimeKind,
-    TenantId, ThreadId, TrustClass, UserId,
+    ExecutionContext, ExtensionId, GrantConstraints, MountAlias, MountGrant, MountPermissions,
+    MountView, NetworkPolicy, Principal, RuntimeKind, TenantId, ThreadId, TrustClass, UserId,
+    VirtualPath,
 };
 use ironclaw_host_runtime::{
-    CapabilitySurfacePolicy, ECHO_CAPABILITY_ID, SurfaceKind,
+    CapabilitySurfacePolicy, ECHO_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SurfaceKind,
     VisibleCapabilityRequest as HostVisibleCapabilityRequest,
 };
 use ironclaw_loop_support::{
@@ -17,7 +18,7 @@ use ironclaw_loop_support::{
     HostManagedModelErrorKind, HostManagedModelGateway, HostManagedModelRequest,
     HostManagedModelResponse, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
     ProductLiveCancellationProbe, RunCancellationFactory, RunCancellationHandle,
-    verify_product_live_cancellation_probe,
+    loop_driver_execution_extension_id, verify_product_live_cancellation_probe,
 };
 use ironclaw_reborn::{
     DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, ModelSelectionMode, ModelSlot,
@@ -25,10 +26,11 @@ use ironclaw_reborn::{
     loop_exit_applier::ThreadCheckpointLoopExitEvidencePort,
 };
 use ironclaw_reborn_composition::{
-    ProductLiveCapabilityIo, ProductLiveModelRouteSettings, ProductLivePlannedRuntimeAdapterConfig,
-    ProductLivePlannedRuntimeAdapterError, ProductLivePlannedRuntimeAdapters,
-    ProductLiveVisibleCapabilityRequestConfig, RebornBuildInput, RebornServices,
-    build_reborn_services, capability_allowlist, visible_capability_request_for_run,
+    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
+    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
+    ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig, RebornBuildInput,
+    RebornServices, build_reborn_services, capability_allowlist,
+    visible_capability_request_for_run,
 };
 use ironclaw_threads::{InMemorySessionThreadService, ThreadScope};
 use ironclaw_trust::EffectiveTrustClass;
@@ -40,7 +42,7 @@ use ironclaw_turns::{
         AgentLoopHostError, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
         InMemoryLoopHostMilestoneSink, InstructionSafetyContext, LoopCancelReasonKind,
         LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext, NoOpBudgetAccountant,
-        NoOpPolicyGuard, PromptMode, VisibleCapabilityRequest,
+        NoOpPolicyGuard, PromptMode, ProviderToolCall, VisibleCapabilityRequest,
     },
 };
 
@@ -194,6 +196,11 @@ async fn visible_capability_request_builder_scopes_context_to_loop_run() {
         request.context.resource_scope.thread_id.as_ref(),
         Some(&run_context.thread_id)
     );
+    assert_eq!(
+        request.context.extension_id,
+        loop_driver_execution_extension_id(&run_context).unwrap(),
+        "visible capability requests must use the same extension principal as invocation"
+    );
     assert!(
         request
             .provider_trust
@@ -222,8 +229,7 @@ async fn local_dev_adapter_invokes_builtin_echo_through_host_runtime_port() {
     let adapters = ProductLivePlannedRuntimeAdapters::from_services(
         &services,
         ProductLivePlannedRuntimeAdapterConfig {
-            visible_capability_request: visible_capability_request_for_run(
-                &run_context,
+            capability_authority_resolver: authority_resolver(
                 ProductLiveVisibleCapabilityRequestConfig::new(
                     UserId::new("user-builtin-echo").unwrap(),
                     ExtensionId::new("planned-driver").unwrap(),
@@ -240,8 +246,7 @@ async fn local_dev_adapter_invokes_builtin_echo_through_host_runtime_port() {
                     ExtensionId::new("builtin").unwrap(),
                     EffectiveTrustClass::user_trusted(),
                 ),
-            )
-            .unwrap(),
+            ),
             capability_input_resolver: io.clone(),
             capability_result_writer: io.clone(),
             capability_allow_set: capability_allowlist([capability_id.clone()]),
@@ -283,6 +288,346 @@ async fn local_dev_adapter_invokes_builtin_echo_through_host_runtime_port() {
         io.result_for_ref(&run_context, &completed.result_ref)
             .unwrap(),
         serde_json::json!("hello product live")
+    );
+}
+
+#[tokio::test]
+async fn local_dev_adapter_invokes_extension_scoped_grants_with_loop_driver_principal() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "extension-grant-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let run_context = loop_run_context("extension-grant").await;
+    let io = Arc::new(ProductLiveCapabilityIo::default());
+    let input_ref = io
+        .stage_input(
+            &run_context,
+            serde_json::json!({ "message": "hello extension grant" }),
+        )
+        .unwrap();
+    let capability_id = capability_id(ECHO_CAPABILITY_ID);
+    let extension_principal =
+        Principal::Extension(loop_driver_execution_extension_id(&run_context).unwrap());
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: authority_resolver(
+                ProductLiveVisibleCapabilityRequestConfig::new(
+                    UserId::new("user-extension-grant").unwrap(),
+                    ExtensionId::new("ignored-configured-driver").unwrap(),
+                    RuntimeKind::FirstParty,
+                    TrustClass::FirstParty,
+                    SurfaceKind::new("agent_loop").unwrap(),
+                    CapabilitySurfacePolicy::allow_all(),
+                )
+                .with_grants(grants_for_principal_with_effects(
+                    extension_principal,
+                    [ECHO_CAPABILITY_ID],
+                    vec![EffectKind::DispatchCapability],
+                ))
+                .with_provider_trust(
+                    ExtensionId::new("builtin").unwrap(),
+                    EffectiveTrustClass::user_trusted(),
+                ),
+            ),
+            capability_input_resolver: io.clone(),
+            capability_result_writer: io.clone(),
+            capability_allow_set: capability_allowlist([capability_id.clone()]),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let capability_port = adapters
+        .capability_factory
+        .create_capability_port(&run_context)
+        .await
+        .unwrap();
+    let surface = capability_port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert!(
+        surface
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.capability_id == capability_id),
+        "extension-scoped grants should authorize the same principal for visibility and invocation"
+    );
+
+    let outcome = capability_port
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref,
+        })
+        .await
+        .unwrap();
+    let CapabilityOutcome::Completed(completed) = outcome else {
+        panic!("expected completed extension-grant echo outcome, got {outcome:?}");
+    };
+    assert_eq!(
+        io.result_for_ref(&run_context, &completed.result_ref)
+            .unwrap(),
+        serde_json::json!("hello extension grant")
+    );
+}
+
+#[tokio::test]
+async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "provider-tool-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let run_context = loop_run_context("provider-tool").await;
+    let io = Arc::new(ProductLiveCapabilityIo::default());
+    let capability_id = capability_id(ECHO_CAPABILITY_ID);
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: authority_resolver(
+                ProductLiveVisibleCapabilityRequestConfig::new(
+                    UserId::new("user-provider-tool").unwrap(),
+                    ExtensionId::new("planned-driver").unwrap(),
+                    RuntimeKind::FirstParty,
+                    TrustClass::FirstParty,
+                    SurfaceKind::new("agent_loop").unwrap(),
+                    CapabilitySurfacePolicy::allow_all(),
+                )
+                .with_grants(dispatch_grants_for_user(
+                    UserId::new("user-provider-tool").unwrap(),
+                    [ECHO_CAPABILITY_ID],
+                ))
+                .with_provider_trust(
+                    ExtensionId::new("builtin").unwrap(),
+                    EffectiveTrustClass::user_trusted(),
+                ),
+            ),
+            capability_input_resolver: io.clone(),
+            capability_result_writer: io.clone(),
+            capability_allow_set: capability_allowlist([capability_id.clone()]),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let capability_port = adapters
+        .capability_factory
+        .create_capability_port(&run_context)
+        .await
+        .unwrap();
+    capability_port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let tool_definition = capability_port
+        .tool_definitions()
+        .unwrap()
+        .into_iter()
+        .find(|definition| definition.capability_id == capability_id)
+        .expect("builtin echo should be advertised as a provider tool");
+
+    let candidate = capability_port
+        .register_provider_tool_call(ProviderToolCall {
+            provider_id: "nearai".to_string(),
+            provider_model_id: "qwen3-coder".to_string(),
+            turn_id: Some("provider-turn:provider-tool".to_string()),
+            id: "call_provider_echo".to_string(),
+            name: tool_definition.name,
+            arguments: serde_json::json!({ "message": "hello from provider tool" }),
+            response_reasoning: Some("model selected echo".to_string()),
+            reasoning: None,
+            signature: Some("sig-provider-tool".to_string()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(candidate.capability_id, capability_id);
+    assert!(
+        candidate
+            .input_ref
+            .as_str()
+            .starts_with(&format!("input:{}:", run_context.run_id)),
+        "provider tool inputs must be scoped to the loop run: {}",
+        candidate.input_ref.as_str()
+    );
+    assert_eq!(
+        io.resolve_capability_input(&run_context, &candidate.input_ref)
+            .await
+            .unwrap(),
+        serde_json::json!({ "message": "hello from provider tool" })
+    );
+    assert!(
+        candidate.provider_replay.is_some(),
+        "provider replay metadata must survive registration"
+    );
+
+    let outcome = capability_port
+        .invoke_capability(CapabilityInvocation {
+            surface_version: candidate.surface_version,
+            capability_id,
+            input_ref: candidate.input_ref,
+        })
+        .await
+        .unwrap();
+    let CapabilityOutcome::Completed(completed) = outcome else {
+        panic!("expected completed provider echo outcome, got {outcome:?}");
+    };
+    assert_eq!(
+        io.result_for_ref(&run_context, &completed.result_ref)
+            .unwrap(),
+        serde_json::json!("hello from provider tool")
+    );
+}
+
+#[tokio::test]
+async fn adapter_config_can_authorize_non_dispatch_provider_trust_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "read-effect-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let run_context = loop_run_context("read-effect").await;
+    let io = Arc::new(ProductLiveCapabilityIo::default());
+    let capability_id = capability_id(READ_FILE_CAPABILITY_ID);
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: authority_resolver(
+                ProductLiveVisibleCapabilityRequestConfig::new(
+                    UserId::new("user-read-effect").unwrap(),
+                    ExtensionId::new("planned-driver").unwrap(),
+                    RuntimeKind::FirstParty,
+                    TrustClass::FirstParty,
+                    SurfaceKind::new("agent_loop").unwrap(),
+                    CapabilitySurfacePolicy::allow_all(),
+                )
+                .with_grants(grants_for_principal_with_effects(
+                    Principal::User(UserId::new("user-read-effect").unwrap()),
+                    [READ_FILE_CAPABILITY_ID],
+                    vec![EffectKind::ReadFilesystem],
+                ))
+                .with_provider_trust_for_effects(
+                    ExtensionId::new("builtin").unwrap(),
+                    EffectiveTrustClass::user_trusted(),
+                    vec![EffectKind::ReadFilesystem],
+                ),
+            ),
+            capability_input_resolver: io.clone(),
+            capability_result_writer: io,
+            capability_allow_set: capability_allowlist([capability_id.clone()]),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let capability_port = adapters
+        .capability_factory
+        .create_capability_port(&run_context)
+        .await
+        .unwrap();
+
+    let surface = capability_port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert!(
+        surface
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.capability_id == capability_id),
+        "read-only first-party capabilities require provider trust with read_filesystem authority"
+    );
+}
+
+#[tokio::test]
+async fn local_dev_adapter_invokes_read_file_with_configured_mounts() {
+    let root = tempfile::tempdir().unwrap();
+    let storage_root = root.path().join("local-dev");
+    std::fs::create_dir_all(storage_root.join("workspace")).unwrap();
+    std::fs::write(storage_root.join("workspace/readme.md"), "alpha\nbeta\n").unwrap();
+    let services =
+        build_reborn_services(RebornBuildInput::local_dev("read-file-owner", storage_root))
+            .await
+            .unwrap();
+    let run_context = loop_run_context("read-file").await;
+    let io = Arc::new(ProductLiveCapabilityIo::default());
+    let input_ref = io
+        .stage_input(
+            &run_context,
+            serde_json::json!({ "path": "/workspace/readme.md", "limit": 1 }),
+        )
+        .unwrap();
+    let capability_id = capability_id(READ_FILE_CAPABILITY_ID);
+    let mounts = read_only_workspace_mounts();
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: authority_resolver(
+                ProductLiveVisibleCapabilityRequestConfig::new(
+                    UserId::new("user-read-file").unwrap(),
+                    ExtensionId::new("planned-driver").unwrap(),
+                    RuntimeKind::FirstParty,
+                    TrustClass::FirstParty,
+                    SurfaceKind::new("agent_loop").unwrap(),
+                    CapabilitySurfacePolicy::allow_all(),
+                )
+                .with_mounts(mounts.clone())
+                .with_grants(grants_for_principal_with_effects_and_mounts(
+                    Principal::User(UserId::new("user-read-file").unwrap()),
+                    [READ_FILE_CAPABILITY_ID],
+                    vec![EffectKind::ReadFilesystem],
+                    mounts,
+                ))
+                .with_provider_trust_for_effects(
+                    ExtensionId::new("builtin").unwrap(),
+                    EffectiveTrustClass::user_trusted(),
+                    vec![EffectKind::ReadFilesystem],
+                ),
+            ),
+            capability_input_resolver: io.clone(),
+            capability_result_writer: io.clone(),
+            capability_allow_set: capability_allowlist([capability_id.clone()]),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let capability_port = adapters
+        .capability_factory
+        .create_capability_port(&run_context)
+        .await
+        .unwrap();
+    let surface = capability_port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+
+    let outcome = capability_port
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id,
+            input_ref,
+        })
+        .await
+        .unwrap();
+    let CapabilityOutcome::Completed(completed) = outcome else {
+        panic!("expected completed read_file outcome, got {outcome:?}");
+    };
+    let output = io
+        .result_for_ref(&run_context, &completed.result_ref)
+        .unwrap();
+    assert_eq!(output["path"], serde_json::json!("/workspace/readme.md"));
+    assert_eq!(output["lines_shown"], serde_json::json!(1));
+    assert!(
+        output["content"]
+            .as_str()
+            .expect("read_file content should be text")
+            .contains("alpha")
     );
 }
 
@@ -347,6 +692,90 @@ async fn adapter_bundle_wires_required_product_live_components() {
     assert!(
         !visible.version.as_str().is_empty(),
         "host-runtime capability facade should supply a concrete surface version"
+    );
+}
+
+#[tokio::test]
+async fn adapter_bundle_builds_visible_requests_from_each_run_context() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "multi-run-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let adapters =
+        ProductLivePlannedRuntimeAdapters::from_services(&services, adapter_config()).unwrap();
+    let first_context = loop_run_context("multi-run-first").await;
+    let second_context = loop_run_context("multi-run-second").await;
+
+    for run_context in [&first_context, &second_context] {
+        let capability_port = adapters
+            .capability_factory
+            .create_capability_port(run_context)
+            .await
+            .unwrap();
+        let visible = capability_port
+            .visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .unwrap();
+        assert!(
+            !visible.version.as_str().is_empty(),
+            "run-scoped visible request should be valid for {}",
+            run_context.run_id
+        );
+    }
+}
+
+#[tokio::test]
+async fn adapter_bundle_resolves_authority_for_each_run_context() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "run-authority-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: Arc::new(RecordingAuthorityResolver {
+                calls: Arc::clone(&calls),
+            }),
+            capability_allow_set: capability_allowlist([capability_id(ECHO_CAPABILITY_ID)]),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let first_context = loop_run_context("run-authority-first").await;
+    let second_context = loop_run_context("run-authority-second").await;
+
+    for run_context in [&first_context, &second_context] {
+        let capability_port = adapters
+            .capability_factory
+            .create_capability_port(run_context)
+            .await
+            .unwrap();
+        let visible = capability_port
+            .visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .unwrap();
+        assert!(
+            visible
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.capability_id == capability_id(ECHO_CAPABILITY_ID)),
+            "per-run authority should authorize echo for {}",
+            run_context.run_id
+        );
+    }
+
+    let recorded = calls.lock().expect("authority call lock poisoned").clone();
+    assert_eq!(
+        recorded,
+        vec![first_context.run_id, second_context.run_id],
+        "adapter must resolve capability authority for each run instead of reusing a fixed request"
     );
 }
 
@@ -438,7 +867,9 @@ async fn model_route_settings_wire_default_and_mission_slots() {
 
 fn adapter_config() -> ProductLivePlannedRuntimeAdapterConfig {
     ProductLivePlannedRuntimeAdapterConfig {
-        visible_capability_request: host_visible_capability_request("adapter-config"),
+        capability_authority_resolver: authority_resolver(visible_capability_request_config(
+            "adapter-config",
+        )),
         capability_input_resolver: Arc::new(UnusedCapabilityIo),
         capability_result_writer: Arc::new(UnusedCapabilityIo),
         capability_allow_set: capability_allowlist([capability_id("demo.allowed")]),
@@ -455,6 +886,71 @@ fn adapter_config() -> ProductLivePlannedRuntimeAdapterConfig {
         )
         .unwrap(),
         milestone_sink: None,
+    }
+}
+
+fn visible_capability_request_config(label: &str) -> ProductLiveVisibleCapabilityRequestConfig {
+    ProductLiveVisibleCapabilityRequestConfig::new(
+        UserId::new(format!("user-{label}")).unwrap(),
+        ExtensionId::new("adapter-test").unwrap(),
+        RuntimeKind::Wasm,
+        TrustClass::UserTrusted,
+        SurfaceKind::new("agent_loop").unwrap(),
+        CapabilitySurfacePolicy::allow_all(),
+    )
+}
+
+fn authority_resolver(
+    config: ProductLiveVisibleCapabilityRequestConfig,
+) -> Arc<dyn ProductLiveCapabilityAuthorityResolver> {
+    Arc::new(StaticAuthorityResolver { config })
+}
+
+struct StaticAuthorityResolver {
+    config: ProductLiveVisibleCapabilityRequestConfig,
+}
+
+#[async_trait]
+impl ProductLiveCapabilityAuthorityResolver for StaticAuthorityResolver {
+    async fn resolve_capability_authority(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>
+    {
+        Ok(self.config.clone())
+    }
+}
+
+struct RecordingAuthorityResolver {
+    calls: Arc<Mutex<Vec<TurnRunId>>>,
+}
+
+#[async_trait]
+impl ProductLiveCapabilityAuthorityResolver for RecordingAuthorityResolver {
+    async fn resolve_capability_authority(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>
+    {
+        let call_index = {
+            let mut calls = self.calls.lock().expect("authority call lock poisoned");
+            calls.push(run_context.run_id);
+            calls.len()
+        };
+        let user_id = UserId::new(format!("user-run-authority-{call_index}")).unwrap();
+        Ok(ProductLiveVisibleCapabilityRequestConfig::new(
+            user_id.clone(),
+            ExtensionId::new("ignored-configured-driver").unwrap(),
+            RuntimeKind::FirstParty,
+            TrustClass::FirstParty,
+            SurfaceKind::new("agent_loop").unwrap(),
+            CapabilitySurfacePolicy::allow_all(),
+        )
+        .with_grants(dispatch_grants_for_user(user_id, [ECHO_CAPABILITY_ID]))
+        .with_provider_trust(
+            ExtensionId::new("builtin").unwrap(),
+            EffectiveTrustClass::user_trusted(),
+        ))
     }
 }
 
@@ -512,23 +1008,61 @@ fn dispatch_grants_for_user<const N: usize>(
     user_id: UserId,
     capabilities: [&str; N],
 ) -> CapabilitySet {
+    grants_for_principal_with_effects(
+        Principal::User(user_id),
+        capabilities,
+        vec![EffectKind::DispatchCapability],
+    )
+}
+
+fn grants_for_principal_with_effects<const N: usize>(
+    grantee: Principal,
+    capabilities: [&str; N],
+    allowed_effects: Vec<EffectKind>,
+) -> CapabilitySet {
+    grants_for_principal_with_effects_and_mounts(
+        grantee,
+        capabilities,
+        allowed_effects,
+        MountView::default(),
+    )
+}
+
+fn grants_for_principal_with_effects_and_mounts<const N: usize>(
+    grantee: Principal,
+    capabilities: [&str; N],
+    allowed_effects: Vec<EffectKind>,
+    mounts: MountView,
+) -> CapabilitySet {
     CapabilitySet {
         grants: capabilities
             .into_iter()
-            .map(|capability| dispatch_grant_for_user(user_id.clone(), capability))
+            .map(|capability| {
+                grant_for_principal_with_effects(
+                    grantee.clone(),
+                    capability,
+                    allowed_effects.clone(),
+                    mounts.clone(),
+                )
+            })
             .collect(),
     }
 }
 
-fn dispatch_grant_for_user(user_id: UserId, capability: &str) -> CapabilityGrant {
+fn grant_for_principal_with_effects(
+    grantee: Principal,
+    capability: &str,
+    allowed_effects: Vec<EffectKind>,
+    mounts: MountView,
+) -> CapabilityGrant {
     CapabilityGrant {
         id: CapabilityGrantId::new(),
         capability: capability_id(capability),
-        grantee: Principal::User(user_id),
+        grantee,
         issued_by: Principal::HostRuntime,
         constraints: GrantConstraints {
-            allowed_effects: vec![EffectKind::DispatchCapability],
-            mounts: ironclaw_host_api::MountView::default(),
+            allowed_effects,
+            mounts,
             network: NetworkPolicy::default(),
             secrets: Vec::new(),
             resource_ceiling: None,
@@ -536,6 +1070,15 @@ fn dispatch_grant_for_user(user_id: UserId, capability: &str) -> CapabilityGrant
             max_invocations: None,
         },
     }
+}
+
+fn read_only_workspace_mounts() -> MountView {
+    MountView::new(vec![MountGrant::new(
+        MountAlias::new("/workspace").unwrap(),
+        VirtualPath::new("/projects/workspace").unwrap(),
+        MountPermissions::read_only(),
+    )])
+    .unwrap()
 }
 
 struct EmptyInputQueue;

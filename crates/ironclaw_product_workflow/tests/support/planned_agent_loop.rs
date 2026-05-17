@@ -36,10 +36,10 @@ use ironclaw_reborn::{
     loop_exit_applier::ThreadCheckpointLoopExitEvidencePort,
 };
 use ironclaw_reborn_composition::{
-    ProductLiveCapabilityIo, ProductLiveModelRouteSettings, ProductLivePlannedRuntimeAdapterConfig,
+    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
+    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
     ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig, RebornBuildInput,
     RebornServices, build_reborn_services, capability_allowlist,
-    visible_capability_request_for_run,
 };
 use ironclaw_threads::{
     InMemorySessionThreadService, SessionThreadService, ThreadHistoryRequest, ThreadMessageRecord,
@@ -588,30 +588,28 @@ impl LoopCapabilityPortFactory for ProductLiveHostRuntimeCapabilityFactory {
             .lock()
             .expect("host-runtime staged input lock poisoned")
             .insert(run_context.run_id, input_ref);
-        let visible_capability_request = visible_capability_request_for_run(
-            run_context,
-            ProductLiveVisibleCapabilityRequestConfig::new(
-                self.user_id.clone(),
-                ExtensionId::new("planned-driver").expect("valid planned driver extension"),
-                RuntimeKind::FirstParty,
-                TrustClass::FirstParty,
-                SurfaceKind::new("agent_loop").expect("valid surface kind"),
-                CapabilitySurfacePolicy::allow_all(),
-            )
-            .with_grants(dispatch_grants_for_user(
-                self.user_id.clone(),
-                [&self.capability_id],
-            ))
-            .with_provider_trust(
-                ExtensionId::new("builtin").expect("valid builtin provider id"),
-                EffectiveTrustClass::user_trusted(),
-            ),
+        let visible_capability_request = ProductLiveVisibleCapabilityRequestConfig::new(
+            self.user_id.clone(),
+            ExtensionId::new("planned-driver").expect("valid planned driver extension"),
+            RuntimeKind::FirstParty,
+            TrustClass::FirstParty,
+            SurfaceKind::new("agent_loop").expect("valid surface kind"),
+            CapabilitySurfacePolicy::allow_all(),
         )
-        .map_err(adapter_error)?;
+        .with_grants(dispatch_grants_for_user(
+            self.user_id.clone(),
+            [&self.capability_id],
+        ))
+        .with_provider_trust(
+            ExtensionId::new("builtin").expect("valid builtin provider id"),
+            EffectiveTrustClass::user_trusted(),
+        );
         let adapters = ProductLivePlannedRuntimeAdapters::from_services(
             &self.services,
             ProductLivePlannedRuntimeAdapterConfig {
-                visible_capability_request,
+                capability_authority_resolver: Arc::new(StaticProductLiveAuthorityResolver {
+                    config: visible_capability_request,
+                }),
                 capability_input_resolver: self.io.clone(),
                 capability_result_writer: self.io.clone(),
                 capability_allow_set: capability_allowlist([self.capability_id.clone()]),
@@ -708,6 +706,21 @@ impl RecordingDelegatingCapabilityPort {
             .expect("harness capability results lock poisoned")
             .push(value);
         Ok(())
+    }
+}
+
+struct StaticProductLiveAuthorityResolver {
+    config: ProductLiveVisibleCapabilityRequestConfig,
+}
+
+#[async_trait]
+impl ProductLiveCapabilityAuthorityResolver for StaticProductLiveAuthorityResolver {
+    async fn resolve_capability_authority(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>
+    {
+        Ok(self.config.clone())
     }
 }
 

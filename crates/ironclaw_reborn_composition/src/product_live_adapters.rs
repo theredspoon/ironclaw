@@ -17,11 +17,14 @@ use ironclaw_host_api::{
     CapabilityId, CapabilitySet, EffectKind, ExecutionContext, ExtensionId, MountView, RuntimeKind,
     TrustClass, UserId,
 };
-use ironclaw_host_runtime::{CapabilitySurfacePolicy, SurfaceKind, VisibleCapabilityRequest};
+use ironclaw_host_runtime::{
+    CapabilitySurfacePolicy, HostRuntime, SurfaceKind, VisibleCapabilityRequest,
+};
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     HostIdentityContextSource, HostInputQueue, HostRuntimeLoopCapabilityPortFactory,
     LoopCapabilityInputResolver, LoopCapabilityResultWriter, RunCancellationFactory,
+    loop_driver_execution_extension_id,
 };
 use ironclaw_reborn::{
     LoopCapabilityPortFactory, ModelRoute, ModelRouteError, ModelRoutePolicy, ModelRouteResolver,
@@ -32,7 +35,8 @@ use ironclaw_turns::{
     LoopResultRef,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityInputRef, InstructionSafetyContext,
-        LoopHostMilestoneSink, LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext,
+        LoopCapabilityPort, LoopHostMilestoneSink, LoopModelBudgetAccountant, LoopModelPolicyGuard,
+        LoopRunContext, ProviderToolCall,
     },
 };
 
@@ -155,6 +159,14 @@ impl LoopCapabilityInputResolver for ProductLiveCapabilityIo {
         }
         Ok(input.payload.clone())
     }
+
+    async fn register_provider_tool_call_input(
+        &self,
+        run_context: &LoopRunContext,
+        tool_call: &ProviderToolCall,
+    ) -> Result<CapabilityInputRef, AgentLoopHostError> {
+        self.stage_input(run_context, tool_call.arguments.clone())
+    }
 }
 
 #[async_trait]
@@ -222,10 +234,10 @@ fn capability_io_internal_error() -> AgentLoopHostError {
 #[derive(Clone)]
 pub struct ProductLiveVisibleCapabilityRequestConfig {
     user_id: UserId,
-    extension_id: ExtensionId,
     runtime: RuntimeKind,
     trust: TrustClass,
     grants: CapabilitySet,
+    mounts: MountView,
     surface_kind: SurfaceKind,
     policy: CapabilitySurfacePolicy,
     provider_trust: BTreeMap<ExtensionId, TrustDecision>,
@@ -234,7 +246,7 @@ pub struct ProductLiveVisibleCapabilityRequestConfig {
 impl ProductLiveVisibleCapabilityRequestConfig {
     pub fn new(
         user_id: UserId,
-        extension_id: ExtensionId,
+        _extension_id: ExtensionId,
         runtime: RuntimeKind,
         trust: TrustClass,
         surface_kind: SurfaceKind,
@@ -242,10 +254,10 @@ impl ProductLiveVisibleCapabilityRequestConfig {
     ) -> Self {
         Self {
             user_id,
-            extension_id,
             runtime,
             trust,
             grants: CapabilitySet::default(),
+            mounts: MountView::default(),
             surface_kind,
             policy,
             provider_trust: BTreeMap::new(),
@@ -257,17 +269,36 @@ impl ProductLiveVisibleCapabilityRequestConfig {
         self
     }
 
+    pub fn with_mounts(mut self, mounts: MountView) -> Self {
+        self.mounts = mounts;
+        self
+    }
+
     pub fn with_provider_trust(
         mut self,
         provider: ExtensionId,
         effective_trust: EffectiveTrustClass,
+    ) -> Self {
+        self = self.with_provider_trust_for_effects(
+            provider,
+            effective_trust,
+            vec![EffectKind::DispatchCapability],
+        );
+        self
+    }
+
+    pub fn with_provider_trust_for_effects(
+        mut self,
+        provider: ExtensionId,
+        effective_trust: EffectiveTrustClass,
+        allowed_effects: Vec<EffectKind>,
     ) -> Self {
         self.provider_trust.insert(
             provider,
             TrustDecision {
                 effective_trust,
                 authority_ceiling: AuthorityCeiling {
-                    allowed_effects: vec![EffectKind::DispatchCapability],
+                    allowed_effects,
                     max_resource_ceiling: None,
                 },
                 provenance: TrustProvenance::AdminConfig,
@@ -276,15 +307,29 @@ impl ProductLiveVisibleCapabilityRequestConfig {
         );
         self
     }
+
+    pub fn with_provider_trust_decision(
+        mut self,
+        provider: ExtensionId,
+        trust_decision: TrustDecision,
+    ) -> Self {
+        self.provider_trust.insert(provider, trust_decision);
+        self
+    }
 }
 
 pub fn visible_capability_request_for_run(
     run_context: &LoopRunContext,
     config: ProductLiveVisibleCapabilityRequestConfig,
 ) -> Result<VisibleCapabilityRequest, ProductLivePlannedRuntimeAdapterError> {
+    let extension_id = loop_driver_execution_extension_id(run_context).map_err(|error| {
+        ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+            reason: error.to_string(),
+        }
+    })?;
     let mut context = ExecutionContext::local_default(
         config.user_id,
-        config.extension_id,
+        extension_id,
         config.runtime,
         config.trust,
         config.grants,
@@ -311,6 +356,14 @@ pub fn visible_capability_request_for_run(
     Ok(VisibleCapabilityRequest::new(context, config.surface_kind)
         .with_policy(config.policy)
         .with_provider_trust(config.provider_trust))
+}
+
+#[async_trait]
+pub trait ProductLiveCapabilityAuthorityResolver: Send + Sync {
+    async fn resolve_capability_authority(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,7 +416,7 @@ impl ProductLiveModelRouteSettings {
 }
 
 pub struct ProductLivePlannedRuntimeAdapterConfig {
-    pub visible_capability_request: VisibleCapabilityRequest,
+    pub capability_authority_resolver: Arc<dyn ProductLiveCapabilityAuthorityResolver>,
     pub capability_input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     pub capability_result_writer: Arc<dyn LoopCapabilityResultWriter>,
     pub capability_allow_set: CapabilityAllowSet,
@@ -400,9 +453,9 @@ impl ProductLivePlannedRuntimeAdapters {
             .clone()
             .ok_or(ProductLivePlannedRuntimeAdapterError::MissingHostRuntime)?;
 
-        let capability_factory = HostRuntimeLoopCapabilityPortFactory::new(
+        let capability_factory = ProductLiveLoopCapabilityPortFactory::new(
             host_runtime,
-            config.visible_capability_request,
+            config.capability_authority_resolver,
             config.capability_input_resolver,
             config.capability_result_writer,
             config.milestone_sink,
@@ -424,6 +477,63 @@ impl ProductLivePlannedRuntimeAdapters {
             safety_context: config.safety_context,
         })
     }
+}
+
+#[derive(Clone)]
+struct ProductLiveLoopCapabilityPortFactory {
+    runtime: Arc<dyn HostRuntime>,
+    authority_resolver: Arc<dyn ProductLiveCapabilityAuthorityResolver>,
+    input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+    result_writer: Arc<dyn LoopCapabilityResultWriter>,
+    milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+}
+
+impl ProductLiveLoopCapabilityPortFactory {
+    fn new(
+        runtime: Arc<dyn HostRuntime>,
+        authority_resolver: Arc<dyn ProductLiveCapabilityAuthorityResolver>,
+        input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+        result_writer: Arc<dyn LoopCapabilityResultWriter>,
+        milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    ) -> Self {
+        Self {
+            runtime,
+            authority_resolver,
+            input_resolver,
+            result_writer,
+            milestone_sink,
+        }
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityPortFactory for ProductLiveLoopCapabilityPortFactory {
+    async fn create_capability_port(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
+        let authority = self
+            .authority_resolver
+            .resolve_capability_authority(run_context)
+            .await
+            .map_err(adapter_error)?;
+        let execution_mounts = authority.mounts.clone();
+        let visible_request =
+            visible_capability_request_for_run(run_context, authority).map_err(adapter_error)?;
+        let factory = HostRuntimeLoopCapabilityPortFactory::new(
+            Arc::clone(&self.runtime),
+            visible_request,
+            Arc::clone(&self.input_resolver),
+            Arc::clone(&self.result_writer),
+            self.milestone_sink.clone(),
+        )
+        .with_execution_mounts(execution_mounts);
+        Ok(factory.for_run_context(run_context.clone()))
+    }
+}
+
+fn adapter_error(error: ProductLivePlannedRuntimeAdapterError) -> AgentLoopHostError {
+    AgentLoopHostError::new(AgentLoopHostErrorKind::InvalidInvocation, error.to_string())
 }
 
 struct StaticCapabilitySurfaceResolver {

@@ -64,6 +64,7 @@ pub struct HostRuntimeLoopCapabilityPortFactory {
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    execution_mounts: MountView,
 }
 
 impl HostRuntimeLoopCapabilityPortFactory {
@@ -80,6 +81,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
             input_resolver,
             result_writer,
             milestone_sink,
+            execution_mounts: MountView::default(),
         }
     }
 
@@ -103,6 +105,11 @@ impl HostRuntimeLoopCapabilityPortFactory {
         self
     }
 
+    pub fn with_execution_mounts(mut self, mounts: MountView) -> Self {
+        self.execution_mounts = mounts;
+        self
+    }
+
     pub fn for_run_context(&self, run_context: LoopRunContext) -> Arc<dyn LoopCapabilityPort> {
         let mut port = HostRuntimeLoopCapabilityPort::new(
             Arc::clone(&self.runtime),
@@ -114,6 +121,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
         if let Some(sink) = &self.milestone_sink {
             port = port.with_milestone_sink(Arc::clone(sink));
         }
+        port = port.with_execution_mounts(self.execution_mounts.clone());
         Arc::new(port)
     }
 }
@@ -260,6 +268,7 @@ pub struct HostRuntimeLoopCapabilityPort {
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    execution_mounts: MountView,
     snapshots: Mutex<HashMap<String, SurfaceSnapshot>>,
     current_surface_version: Mutex<Option<String>>,
     dispatch_records: Mutex<DispatchRecordStore>,
@@ -280,6 +289,7 @@ impl HostRuntimeLoopCapabilityPort {
             input_resolver,
             result_writer,
             milestone_sink: None,
+            execution_mounts: MountView::default(),
             snapshots: Mutex::new(HashMap::new()),
             current_surface_version: Mutex::new(None),
             dispatch_records: Mutex::new(DispatchRecordStore::default()),
@@ -288,6 +298,11 @@ impl HostRuntimeLoopCapabilityPort {
 
     pub fn with_milestone_sink(mut self, sink: Arc<dyn LoopHostMilestoneSink>) -> Self {
         self.milestone_sink = Some(sink);
+        self
+    }
+
+    pub fn with_execution_mounts(mut self, mounts: MountView) -> Self {
+        self.execution_mounts = mounts;
         self
     }
 
@@ -752,6 +767,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                         &capability,
                         trust_decision.effective_trust.class(),
                         &trust_decision.authority_ceiling.allowed_effects,
+                        &self.execution_mounts,
                     )?,
                     request.capability_id,
                     capability.estimate,
@@ -973,6 +989,7 @@ fn invocation_context_from_visible(
     capability: &SurfaceCapabilitySnapshot,
     trust: ironclaw_host_api::TrustClass,
     allowed_effects: &[EffectKind],
+    execution_mounts: &MountView,
 ) -> Result<ExecutionContext, AgentLoopHostError> {
     let mut context = base.clone();
     let loop_driver_extension = loop_driver_execution_extension_id(run_context)?;
@@ -985,7 +1002,7 @@ fn invocation_context_from_visible(
         &loop_driver_extension,
         allowed_effects,
     )?;
-    context.mounts = MountView::default();
+    context.mounts = execution_mounts.clone();
     let invocation_id = InvocationId::new();
     context.invocation_id = invocation_id;
     context.correlation_id = CorrelationId::new();
@@ -1001,7 +1018,7 @@ fn invocation_context_from_visible(
     Ok(context)
 }
 
-fn loop_driver_execution_extension_id(
+pub fn loop_driver_execution_extension_id(
     run_context: &LoopRunContext,
 ) -> Result<ExtensionId, AgentLoopHostError> {
     let raw = run_context.loop_driver_id.as_str();
@@ -1512,6 +1529,7 @@ mod tests {
             &capability,
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
+            &MountView::default(),
         )
         .expect_err("elevated grant must be rejected");
 
@@ -1562,10 +1580,11 @@ mod tests {
             &capability,
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
+            &grant_mounts,
         )
         .expect("host-issued mount grant should be preserved");
 
-        assert_eq!(invocation_context.mounts, MountView::default());
+        assert_eq!(invocation_context.mounts, grant_mounts);
         assert_eq!(invocation_context.grants.grants.len(), 1);
         assert_eq!(
             invocation_context.grants.grants[0].constraints.mounts,
@@ -1609,6 +1628,7 @@ mod tests {
             &capability,
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
+            &MountView::default(),
         )
         .expect("matching host scope grant should be preserved");
 
@@ -1657,6 +1677,7 @@ mod tests {
             &capability,
             TrustClass::FirstParty,
             &[EffectKind::DispatchCapability],
+            &MountView::default(),
         )
         .expect("planned driver id should derive a valid execution principal");
 
@@ -1738,6 +1759,7 @@ mod tests {
             &capability,
             TrustClass::UserTrusted,
             &[EffectKind::DispatchCapability],
+            &MountView::default(),
         )
         .expect("context");
 
