@@ -32,7 +32,8 @@ pub(super) struct HttpDispatchOutput {
 pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
     Ok(CapabilityManifest {
         id: CapabilityId::new(HTTP_CAPABILITY_ID)?,
-        description: "Perform an outbound HTTP request through host egress".to_string(),
+        description: "Perform an outbound HTTP request through host egress. Redirect responses are returned; the host transport does not follow them."
+            .to_string(),
         effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
         default_permission: PermissionMode::Ask,
         parameters_schema: json!({
@@ -64,7 +65,7 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                     ]
                 },
                 "body": {
-                    "description": "UTF-8 string or JSON value to send as the request body. No Content-Type is set automatically; pass it via headers."
+                    "description": "UTF-8 string or JSON value to send as the request body. Non-string JSON bodies default Content-Type to application/json unless a content-type header is supplied."
                 },
                 "body_base64": {
                     "type": "string",
@@ -72,7 +73,7 @@ pub(super) fn manifest() -> Result<CapabilityManifest, ExtensionError> {
                 },
                 "response_body_limit": {
                     "type": "integer",
-                    "description": "Maximum raw response body bytes to return. Omit to use the built-in fail-closed default cap; values must be at least 1. Binary responses are base64-encoded and must still fit the first-party output ceiling.",
+                    "description": "Maximum raw response body bytes to return. Omit to use the built-in fail-closed default cap; values must be at least 1. Binary responses are base64-encoded, raise effective output cost by about 33%, and must still fit the first-party output ceiling.",
                     "minimum": 1,
                     "maximum": MAX_RESPONSE_BODY_LIMIT
                 },
@@ -117,15 +118,20 @@ pub(super) async fn dispatch(
     // Keep this handler as a translator only: URL parsing, DNS/private-IP
     // enforcement, allowlists, transport, and credential injection remain in
     // HostHttpEgressService / ironclaw_network.
+    let mut headers = headers(&request.input)?;
+    if json_body_needs_default_content_type(&request.input) && !has_header(&headers, "content-type")
+    {
+        headers.push(("content-type".to_string(), "application/json".to_string()));
+    }
     let http_request = RuntimeHttpEgressRequest {
         runtime: RuntimeKind::FirstParty,
         scope: request.scope.clone(),
         capability_id: request.capability_id.clone(),
         method: method(&request.input)?,
         url: required_string(&request.input, "url")?.to_string(),
-        headers: headers(&request.input)?,
+        headers,
         body: body(&request.input)?,
-        network_policy: NetworkPolicy::default(),
+        network_policy: staged_policy_placeholder(),
         credential_injections: Vec::new(),
         // Always send a bounded limit, even when caller omits the field, so the
         // host transport stays fail-closed instead of inheriting an unbounded cap.
@@ -267,15 +273,43 @@ fn body(input: &Value) -> Result<Vec<u8>, FirstPartyCapabilityError> {
     if input.get("body").is_some() && input.get("body_base64").is_some() {
         return Err(input_error());
     }
-    if let Some(encoded) = input.get("body_base64") {
+    let body = if let Some(encoded) = input.get("body_base64") {
         let encoded = encoded.as_str().ok_or_else(input_error)?;
-        return BASE64_STANDARD.decode(encoded).map_err(|_| input_error());
+        BASE64_STANDARD.decode(encoded).map_err(|_| input_error())?
+    } else {
+        match input.get("body") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(value)) => value.as_bytes().to_vec(),
+            Some(value) => serde_json::to_vec(value).map_err(|_| input_error())?,
+        }
+    };
+    if body.len() as u64 > MAX_NETWORK_EGRESS_BYTES {
+        return Err(input_error());
     }
-    match input.get("body") {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::String(value)) => Ok(value.as_bytes().to_vec()),
-        Some(value) => serde_json::to_vec(value).map_err(|_| input_error()),
-    }
+    Ok(body)
+}
+
+fn json_body_needs_default_content_type(input: &Value) -> bool {
+    matches!(
+        input.get("body"),
+        Some(Value::Array(_))
+            | Some(Value::Bool(_))
+            | Some(Value::Number(_))
+            | Some(Value::Object(_))
+    )
+}
+
+fn has_header(headers: &[(String, String)], expected: &str) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(expected))
+}
+
+fn staged_policy_placeholder() -> NetworkPolicy {
+    // First-party HTTP policy is staged in HostHttpEgressService from the grant
+    // obligation for this scope/capability. This fallback request field is
+    // ignored on that path and only exists for request-policy test services.
+    NetworkPolicy::default()
 }
 
 fn response_body_limit(input: &Value) -> Result<u64, FirstPartyCapabilityError> {
@@ -327,6 +361,8 @@ fn response_headers(headers: Vec<(String, String)>) -> Value {
 
 fn http_error(error: RuntimeHttpEgressError) -> FirstPartyCapabilityError {
     let kind = match error.reason_code() {
+        // Host credential injection failures are backend/client integration faults;
+        // production maps RuntimeDispatchErrorKind::Client to RuntimeFailureKind::Backend.
         RuntimeHttpEgressReasonCode::CredentialUnavailable => RuntimeDispatchErrorKind::Client,
         RuntimeHttpEgressReasonCode::RequestDenied => RuntimeDispatchErrorKind::InputEncode,
         RuntimeHttpEgressReasonCode::NetworkError => RuntimeDispatchErrorKind::NetworkDenied,

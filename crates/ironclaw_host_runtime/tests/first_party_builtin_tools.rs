@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
 #[cfg(feature = "libsql")]
@@ -313,6 +314,30 @@ async fn builtin_http_invokes_through_host_runtime_egress() {
 }
 
 #[tokio::test]
+async fn builtin_http_defaults_json_body_content_type() {
+    let egress = Arc::new(RecordingRuntimeHttpEgress::with_body(b"ok".to_vec()));
+    let runtime = runtime_with_http_egress(Arc::clone(&egress));
+
+    invoke_with_context(
+        &runtime,
+        HTTP_CAPABILITY_ID,
+        json!({
+            "url": "https://api.example.test/v1/items",
+            "body": {"ok": true}
+        }),
+        execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy()),
+    )
+    .await
+    .unwrap();
+
+    let requests = egress.requests();
+    assert_eq!(
+        requests[0].headers,
+        vec![("content-type".to_string(), "application/json".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn builtin_http_fails_closed_without_runtime_egress() {
     let runtime = runtime();
     let error = invoke_with_context(
@@ -357,6 +382,32 @@ async fn builtin_http_rejects_ambiguous_body_zero_timeout_and_zero_response_limi
             .unwrap_err();
         assert_eq!(error, RuntimeFailureKind::InvalidInput);
     }
+}
+
+#[tokio::test]
+async fn builtin_http_rejects_request_bodies_over_network_egress_cap() {
+    let egress = Arc::new(RecordingRuntimeHttpEgress::default());
+    let runtime = runtime_with_http_egress(Arc::clone(&egress));
+    let context = execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy());
+    let oversized = vec![b'a'; 256 * 1024 + 1];
+
+    for input in [
+        json!({
+            "url": "https://api.example.test/v1/items",
+            "body": String::from_utf8(oversized.clone()).unwrap()
+        }),
+        json!({
+            "url": "https://api.example.test/v1/items",
+            "body_base64": BASE64_STANDARD.encode(&oversized)
+        }),
+    ] {
+        let error = invoke_with_context(&runtime, HTTP_CAPABILITY_ID, input, context.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error, RuntimeFailureKind::InvalidInput);
+    }
+
+    assert!(egress.requests().is_empty());
 }
 
 #[tokio::test]
@@ -597,6 +648,39 @@ async fn builtin_http_exercises_real_policy_private_ip_rejection() {
 
     assert_eq!(error, RuntimeFailureKind::Network);
     assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn builtin_http_returns_redirects_without_following_private_location() {
+    let transport = RecordingTransport::ok(NetworkHttpResponse {
+        status: 302,
+        headers: vec![(
+            "location".to_string(),
+            "http://169.254.169.254/latest/meta-data".to_string(),
+        )],
+        body: Vec::new(),
+        usage: NetworkUsage::default(),
+    });
+    let requests = transport.requests.clone();
+    let network = PolicyNetworkHttpEgress::new_with_resolver(
+        transport,
+        StaticResolver::new(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]),
+    );
+    let runtime = runtime_with_host_http_egress(network);
+
+    let output = invoke_with_context(
+        &runtime,
+        HTTP_CAPABILITY_ID,
+        json!({"url": "https://api.example.test/v1/items"}),
+        execution_context_with_network([HTTP_CAPABILITY_ID], http_test_policy()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(output["status"], json!(302));
+    let recorded = requests.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].url, "https://api.example.test/v1/items");
 }
 
 #[tokio::test]

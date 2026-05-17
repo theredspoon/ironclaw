@@ -19,6 +19,9 @@ pub struct RuntimeHttpEgressRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Request-carried fallback policy used only by legacy/test egress services.
+    /// Production first-party dispatch stages network policy in the host service
+    /// before this request is executed, so the field is ignored on that path.
     pub network_policy: NetworkPolicy,
     /// Host-derived credential injection plan.
     ///
