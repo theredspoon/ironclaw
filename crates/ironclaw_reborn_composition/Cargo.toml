@@ -19,6 +19,7 @@ default = []
 # feature shape (optional dep, `default-features = false`).
 root-llm-provider = [
     "dep:ironclaw_llm",
+    "ironclaw_llm/registry-provider-factory",
     "ironclaw_reborn/root-llm-provider",
 ]
 libsql = [

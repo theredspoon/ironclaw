@@ -467,6 +467,8 @@ pub async fn build_reborn_runtime(
         runner,
         poll,
         identity,
+        #[cfg(test)]
+        model_gateway_override,
     } = input;
 
     let services_input = services_input.ok_or(RebornRuntimeError::InvalidArgument {
@@ -515,12 +517,37 @@ pub async fn build_reborn_runtime(
     };
 
     #[cfg(feature = "root-llm-provider")]
-    let model_gateway = match llm {
-        Some(cfg) => build_llm_gateway(cfg)?,
-        None => build_stub_gateway(),
+    let model_gateway = {
+        #[cfg(test)]
+        if let Some(gateway) = model_gateway_override {
+            gateway
+        } else {
+            match llm {
+                Some(cfg) => build_llm_gateway(cfg)?,
+                None => build_stub_gateway(),
+            }
+        }
+        #[cfg(not(test))]
+        {
+            match llm {
+                Some(cfg) => build_llm_gateway(cfg)?,
+                None => build_stub_gateway(),
+            }
+        }
     };
     #[cfg(not(feature = "root-llm-provider"))]
-    let model_gateway = build_stub_gateway();
+    let model_gateway = {
+        #[cfg(test)]
+        if let Some(gateway) = model_gateway_override {
+            gateway
+        } else {
+            build_stub_gateway()
+        }
+        #[cfg(not(test))]
+        {
+            build_stub_gateway()
+        }
+    };
 
     let loop_exit_evidence = Arc::new(ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
         Arc::clone(&thread_service),
@@ -725,6 +752,93 @@ fn parse_provider_protocol(
         _ => Err(RebornRuntimeError::LlmProvider(format!(
             "unsupported llm protocol: {protocol}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use ironclaw_loop_support::{
+        HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
+        HostManagedModelResponse,
+    };
+    use ironclaw_turns::TurnStatus;
+
+    use crate::input::RebornBuildInput;
+    use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
+
+    use super::build_reborn_runtime;
+
+    #[derive(Debug)]
+    struct RecordingGateway {
+        reply: String,
+        requests: Arc<StdMutex<Vec<HostManagedModelRequest>>>,
+    }
+
+    #[async_trait]
+    impl HostManagedModelGateway for RecordingGateway {
+        async fn stream_model(
+            &self,
+            request: HostManagedModelRequest,
+        ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+            self.requests
+                .lock()
+                .expect("recording gateway requests lock poisoned")
+                .push(request);
+            Ok(HostManagedModelResponse::assistant_reply(
+                self.reply.clone(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn send_user_message_returns_completed_assistant_text_with_recording_gateway() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let gateway = Arc::new(RecordingGateway {
+            reply: "recorded runtime reply".to_string(),
+            requests: Arc::clone(&requests),
+        });
+        let input = RebornRuntimeInput::from_services(RebornBuildInput::local_dev(
+            "runtime-success-owner",
+            root.path().join("local-dev"),
+        ))
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-success-tenant".to_string(),
+            agent_id: "runtime-success-agent".to_string(),
+            source_binding_id: "runtime-success-source".to_string(),
+            reply_target_binding_id: "runtime-success-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let conversation = runtime.new_conversation().await.expect("conversation");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.send_user_message(&conversation, "ping"),
+        )
+        .await
+        .expect("runtime send should finish")
+        .expect("runtime send should succeed");
+
+        assert_eq!(reply.status, TurnStatus::Completed);
+        assert_eq!(reply.text.as_deref(), Some("recorded runtime reply"));
+        assert_eq!(
+            requests
+                .lock()
+                .expect("recording gateway requests lock poisoned")
+                .len(),
+            1
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
     }
 }
 
