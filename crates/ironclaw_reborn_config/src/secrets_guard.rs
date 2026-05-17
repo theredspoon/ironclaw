@@ -19,6 +19,7 @@
 //! silently accepting a secret — the worst failure mode is a noisy
 //! parse error pointing at the offending key, never a leaked credential.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use thiserror::Error;
@@ -93,7 +94,11 @@ fn looks_like_long_hex(value: &str) -> bool {
 /// Prefix markers are matched inside values, but short markers require
 /// token-like boundaries so ordinary identifiers such as `risk-mitigation`
 /// do not trip the guard. Embedded credentials in URLs still fail closed.
-pub fn reject_inline_secret(label: &'static str, value: &str) -> Result<(), InlineSecretError> {
+pub fn reject_inline_secret(
+    label: impl Into<Cow<'static, str>>,
+    value: &str,
+) -> Result<(), InlineSecretError> {
+    let label = label.into();
     let value = value.trim();
     // Empty / very short values can't carry secrets meaningfully — and a
     // legitimate value like `model = "gpt-4o-mini"` would otherwise trip
@@ -105,14 +110,14 @@ pub fn reject_inline_secret(label: &'static str, value: &str) -> Result<(), Inli
     for prefix in SECRET_PREFIXES {
         if contains_secret_prefix(value, prefix) {
             return Err(InlineSecretError {
-                label,
+                label: label.clone(),
                 pattern: SecretPattern::Prefix(prefix),
             });
         }
     }
     if looks_like_jwt(value) {
         return Err(InlineSecretError {
-            label,
+            label: label.clone(),
             pattern: SecretPattern::Jwt,
         });
     }
@@ -174,7 +179,7 @@ impl fmt::Display for SecretPattern {
      never paste the value directly (see docs/reborn/contracts/secrets.md, epic #3036)"
 )]
 pub struct InlineSecretError {
-    pub(crate) label: &'static str,
+    pub(crate) label: Cow<'static, str>,
     pub(crate) pattern: SecretPattern,
 }
 

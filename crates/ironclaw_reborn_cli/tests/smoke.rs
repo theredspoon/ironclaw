@@ -1031,6 +1031,28 @@ api_key_env = "sk-proj-1234567890abcdef12345678"
 }
 
 #[test]
+fn run_warns_when_falling_back_to_stub_gateway() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OLLAMA_BASE_URL")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no LLM selection configured") && stderr.contains("Runs will fail"),
+        "stderr should warn about degraded stub-gateway boot; got: {stderr}"
+    );
+}
+
+#[test]
 fn run_honors_boot_profile_from_config_file() {
     let temp = tempfile::tempdir().expect("tempdir");
     let reborn_home = temp.path().join("reborn-home");

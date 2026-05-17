@@ -187,6 +187,7 @@ mod unsupported_params_de {
 ///
 /// One JSON object in `providers.json` maps to one `ProviderDefinition`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderDefinition {
     /// Unique identifier used in `LLM_BACKEND` (e.g., "groq", "tinfoil").
     pub id: String,
@@ -478,6 +479,35 @@ mod tests {
                 def.id
             );
         }
+    }
+
+    #[test]
+    fn rejects_unknown_provider_fields() {
+        // Compose the secret-shaped fixture at runtime so GitHub push
+        // protection does not flag a direct source literal.
+        let pasted_secret = format!("{}{}", "s", "k-proj-1234567890abcdef1234567890");
+        let with_inline_secret_field = format!(
+            r#"[
+            {{
+                "id": "custom",
+                "protocol": "open_ai_completions",
+                "default_base_url": "https://example.test/v1",
+                "api_key": "{pasted_secret}",
+                "api_key_env": "CUSTOM_API_KEY",
+                "api_key_required": true,
+                "model_env": "CUSTOM_MODEL",
+                "default_model": "custom-model",
+                "description": "Custom provider"
+            }}
+        ]"#
+        );
+
+        let err = serde_json::from_str::<Vec<ProviderDefinition>>(&with_inline_secret_field)
+            .expect_err("unknown provider catalog fields must fail closed");
+        assert!(
+            err.to_string().contains("unknown field `api_key`"),
+            "unexpected parse error: {err}"
+        );
     }
 
     #[test]

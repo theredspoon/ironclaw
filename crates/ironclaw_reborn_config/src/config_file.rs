@@ -32,6 +32,7 @@
 //! enforces shape (sections exist, fields are the right TOML type,
 //! no inline secrets).
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
@@ -226,7 +227,7 @@ impl RebornConfigFile {
         // Inline-secret check on every operator-supplied string before
         // any later validator can echo the value in a more specific error.
         let path_str = || attributed_path.display().to_string();
-        let check = |label: &'static str, value: &str| -> Result<(), RebornConfigFileError> {
+        let check = |label: Cow<'static, str>, value: &str| -> Result<(), RebornConfigFileError> {
             reject_inline_secret(label, value).map_err(|source| {
                 RebornConfigFileError::InlineSecret {
                     path: path_str(),
@@ -236,73 +237,71 @@ impl RebornConfigFile {
         };
 
         if let Some(api_version) = self.api_version.as_deref() {
-            check("api_version", api_version)?;
+            check(Cow::Borrowed("api_version"), api_version)?;
             validate_api_version(api_version, attributed_path)?;
         }
         if let Some(boot) = &self.boot
             && let Some(profile) = &boot.profile
         {
-            check("boot.profile", profile)?;
+            check(Cow::Borrowed("boot.profile"), profile)?;
         }
         if let Some(identity) = &self.identity {
             if let Some(tenant) = &identity.tenant {
-                check("identity.tenant", tenant)?;
+                check(Cow::Borrowed("identity.tenant"), tenant)?;
             }
             if let Some(default_agent) = &identity.default_agent {
-                check("identity.default_agent", default_agent)?;
+                check(Cow::Borrowed("identity.default_agent"), default_agent)?;
             }
             if let Some(default_owner) = &identity.default_owner {
-                check("identity.default_owner", default_owner)?;
+                check(Cow::Borrowed("identity.default_owner"), default_owner)?;
             }
             if let Some(default_project) = &identity.default_project {
-                check("identity.default_project", default_project)?;
+                check(Cow::Borrowed("identity.default_project"), default_project)?;
             }
         }
         if let Some(policy) = &self.policy {
             if let Some(deployment_mode) = &policy.deployment_mode {
-                check("policy.deployment_mode", deployment_mode)?;
+                check(Cow::Borrowed("policy.deployment_mode"), deployment_mode)?;
             }
             if let Some(default_profile) = &policy.default_profile {
-                check("policy.default_profile", default_profile)?;
+                check(Cow::Borrowed("policy.default_profile"), default_profile)?;
             }
             if let Some(default_approval_policy) = &policy.default_approval_policy {
-                check("policy.default_approval_policy", default_approval_policy)?;
+                check(
+                    Cow::Borrowed("policy.default_approval_policy"),
+                    default_approval_policy,
+                )?;
             }
         }
         if let Some(drivers) = &self.drivers {
             if let Some(default) = &drivers.default {
-                check("drivers.default", default)?;
+                check(Cow::Borrowed("drivers.default"), default)?;
             }
             if let Some(additional) = &drivers.additional {
                 for driver in additional {
-                    check("drivers.additional", driver)?;
+                    check(Cow::Borrowed("drivers.additional"), driver)?;
                 }
             }
         }
         if let Some(harness) = &self.harness
             && let Some(id) = &harness.id
         {
-            check("harness.id", id)?;
+            check(Cow::Borrowed("harness.id"), id)?;
         }
         if let Some(llm) = &self.llm {
-            // The error message names the *field*, not the specific
-            // slot. The slot identity is not security-relevant for the
-            // "don't paste a key here" guard; operators inspecting the
-            // file see which slot via the TOML structure anyway. This
-            // keeps the label set static and avoids `Box::leak`.
             for (slot, selection) in llm {
-                check("llm.<slot>", slot)?;
+                check(Cow::Borrowed("llm.<slot>"), slot)?;
                 if let Some(provider_id) = &selection.provider_id {
-                    check("llm.<slot>.provider_id", provider_id)?;
+                    check(llm_slot_field_label(slot, "provider_id"), provider_id)?;
                 }
                 if let Some(api_key_env) = &selection.api_key_env {
-                    check("llm.<slot>.api_key_env", api_key_env)?;
+                    check(llm_slot_field_label(slot, "api_key_env"), api_key_env)?;
                 }
                 if let Some(base_url) = &selection.base_url {
-                    check("llm.<slot>.base_url", base_url)?;
+                    check(llm_slot_field_label(slot, "base_url"), base_url)?;
                 }
                 if let Some(model) = &selection.model {
-                    check("llm.<slot>.model", model)?;
+                    check(llm_slot_field_label(slot, "model"), model)?;
                 }
             }
         }
@@ -313,6 +312,10 @@ impl RebornConfigFile {
     pub fn default_llm_slot(&self) -> Option<&LlmSlotSelection> {
         self.llm.as_ref().and_then(|map| map.get("default"))
     }
+}
+
+fn llm_slot_field_label(slot: &str, field: &str) -> Cow<'static, str> {
+    Cow::Owned(format!("llm.{slot}.{field}"))
 }
 
 fn validate_api_version(found: &str, path: &Path) -> Result<(), RebornConfigFileError> {
@@ -353,7 +356,8 @@ fn validate_api_version(found: &str, path: &Path) -> Result<(), RebornConfigFile
             reason: "expected at most major.minor components".to_string(),
         });
     }
-    // We are v1. Anything else is a fail-closed major mismatch.
+    // Compatibility is major-fail-closed, minor-accept: all v1.x boot
+    // files are valid for this slice, but any other major is refused.
     if major != 1 {
         return Err(RebornConfigFileError::IncompatibleApiVersion {
             path: path.display().to_string(),
@@ -488,6 +492,11 @@ api_key_env = "sk-proj-1234567890abcdef1234567890"
         let err = RebornConfigFile::parse_text(toml, &attributed())
             .expect_err("inline secret must be rejected");
         assert!(matches!(err, RebornConfigFileError::InlineSecret { .. }));
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("llm.default.api_key_env"),
+            "slot-specific label should guide operator to the bad field: {rendered}"
+        );
     }
 
     #[test]
