@@ -185,6 +185,28 @@ impl ProjectionStream for AuthFailureProjectionStream {
     }
 }
 
+#[derive(Default)]
+struct SpyProjectionStream {
+    drain_count: Mutex<usize>,
+}
+
+impl SpyProjectionStream {
+    fn drain_count(&self) -> usize {
+        *self.drain_count.lock().expect("lock")
+    }
+}
+
+#[async_trait]
+impl ProjectionStream for SpyProjectionStream {
+    async fn drain(
+        &self,
+        _request: ProjectionSubscriptionRequest,
+    ) -> Result<Vec<ProductOutboundEnvelope>, ProductAdapterError> {
+        *self.drain_count.lock().expect("lock") += 1;
+        Ok(Vec::new())
+    }
+}
+
 /// Stub thread service whose `list_thread_history` always returns
 /// `ThreadScopeMismatch`. Used to lock in the contract that ownership probes
 /// remap that variant to NotFound, since the current backends happen to return
@@ -556,6 +578,54 @@ async fn refresh_reresolves_thread_to_same_canonical_scope() {
             .as_str(),
         "user-alpha"
     );
+}
+
+#[tokio::test]
+async fn get_timeline_rejects_cross_user_access() {
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    );
+    create_thread_for(&services, caller(), "thread-alpha").await;
+
+    let err = services
+        .get_timeline(
+            caller_for_user("user-beta"),
+            RebornTimelineRequest {
+                thread_id: "thread-alpha".to_string(),
+            },
+        )
+        .await
+        .expect_err("cross-user timeline read must be rejected");
+
+    assert_eq!(err.code, RebornServicesErrorCode::NotFound);
+    assert_eq!(err.status_code, 404);
+}
+
+#[tokio::test]
+async fn stream_events_rejects_cross_user_access_before_draining_stream() {
+    let stream = Arc::new(SpyProjectionStream::default());
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    )
+    .with_event_stream(stream.clone());
+    create_thread_for(&services, caller(), "thread-alpha").await;
+
+    let err = services
+        .stream_events(
+            caller_for_user("user-beta"),
+            RebornStreamEventsRequest {
+                thread_id: "thread-alpha".to_string(),
+                after_cursor: None,
+            },
+        )
+        .await
+        .expect_err("cross-user stream read must be rejected");
+
+    assert_eq!(err.code, RebornServicesErrorCode::NotFound);
+    assert_eq!(err.status_code, 404);
+    assert_eq!(stream.drain_count(), 0);
 }
 
 #[tokio::test]
