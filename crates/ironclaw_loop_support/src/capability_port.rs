@@ -975,13 +975,7 @@ fn invocation_context_from_visible(
     allowed_effects: &[EffectKind],
 ) -> Result<ExecutionContext, AgentLoopHostError> {
     let mut context = base.clone();
-    let loop_driver_extension =
-        ExtensionId::new(run_context.loop_driver_id.as_str()).map_err(|_| {
-            AgentLoopHostError::new(
-                AgentLoopHostErrorKind::Internal,
-                "loop driver id could not be represented as an execution extension",
-            )
-        })?;
+    let loop_driver_extension = loop_driver_execution_extension_id(run_context)?;
     context.extension_id = loop_driver_extension.clone();
     context.runtime = capability.runtime;
     context.trust = trust;
@@ -1005,6 +999,83 @@ fn invocation_context_from_visible(
         )
     })?;
     Ok(context)
+}
+
+fn loop_driver_execution_extension_id(
+    run_context: &LoopRunContext,
+) -> Result<ExtensionId, AgentLoopHostError> {
+    let raw = run_context.loop_driver_id.as_str();
+    if let Ok(extension_id) = ExtensionId::new(raw) {
+        return Ok(extension_id);
+    }
+
+    let digest = sha256_digest_token(raw.as_bytes());
+    let digest_hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    let slug = extension_id_slug(raw);
+    let prefix_budget = 128usize
+        .saturating_sub("loop-driver-".len())
+        .saturating_sub("-".len())
+        .saturating_sub(16);
+    let mut candidate = slug.chars().take(prefix_budget).collect::<String>();
+    if candidate.is_empty() {
+        candidate.push_str("driver");
+    }
+    ExtensionId::new(format!("loop-driver-{candidate}-{}", &digest_hex[..16])).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "loop driver id could not be represented as an execution extension",
+        )
+    })
+}
+
+fn extension_id_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_separator = false;
+    for byte in value.bytes() {
+        let next = match byte {
+            b'a'..=b'z' | b'0'..=b'9' => {
+                last_separator = false;
+                byte as char
+            }
+            b'A'..=b'Z' => {
+                last_separator = false;
+                byte.to_ascii_lowercase() as char
+            }
+            b'_' | b'-' => {
+                if last_separator {
+                    continue;
+                }
+                last_separator = true;
+                '-'
+            }
+            b'.' => {
+                if slug.is_empty() || last_separator {
+                    continue;
+                }
+                last_separator = true;
+                '.'
+            }
+            _ => {
+                if last_separator {
+                    continue;
+                }
+                last_separator = true;
+                '-'
+            }
+        };
+        slug.push(next);
+    }
+    while slug.ends_with(['-', '.']) {
+        slug.pop();
+    }
+    if slug
+        .as_bytes()
+        .first()
+        .is_none_or(|first| !(first.is_ascii_lowercase() || first.is_ascii_digit()))
+    {
+        slug.insert_str(0, "driver");
+    }
+    slug
 }
 
 fn invocation_grants_from_visible(
@@ -1271,8 +1342,8 @@ mod tests {
         MountPermissions, NetworkPolicy, ProjectId, TenantId, TrustClass, UserId, VirtualPath,
     };
     use ironclaw_turns::{
-        InMemoryRunProfileResolver, RunProfileResolutionRequest, RunProfileResolver, TurnId,
-        TurnRunId, TurnScope,
+        InMemoryRunProfileResolver, LoopDriverId, RunProfileResolutionRequest, RunProfileResolver,
+        TurnId, TurnRunId, TurnScope,
     };
 
     #[test]
@@ -1546,6 +1617,78 @@ mod tests {
             &invocation_context.grants.grants[0].grantee,
             Principal::Thread(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn invocation_context_derives_extension_id_for_planned_driver_namespaced_id() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-planned-driver-id");
+        let mut run_context = loop_run_context(&context).await;
+        run_context.loop_driver_id =
+            LoopDriverId::new("reborn:planned-default").expect("valid loop driver id");
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::User(context.user_id.clone()),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::DispatchCapability],
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::FirstParty,
+            estimate: ResourceEstimate::default(),
+            safe_description: "demo echo".to_string(),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+            provider_tool_name: "demo_echo".to_string(),
+        };
+
+        let invocation_context = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::FirstParty,
+            &[EffectKind::DispatchCapability],
+        )
+        .expect("planned driver id should derive a valid execution principal");
+
+        assert_eq!(
+            invocation_context.extension_id,
+            loop_driver_execution_extension_id(&run_context).expect("valid extension")
+        );
+        assert_eq!(invocation_context.grants.grants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_driver_execution_extension_id_includes_digest_to_avoid_slug_collisions() {
+        let context = execution_context("thread-planned-driver-collisions");
+        let mut colon_context = loop_run_context(&context).await;
+        colon_context.loop_driver_id =
+            LoopDriverId::new("reborn:planned-default").expect("valid loop driver id");
+        let mut dash_context = loop_run_context(&context).await;
+        dash_context.loop_driver_id =
+            LoopDriverId::new("reborn-planned-default").expect("valid loop driver id");
+
+        let colon_id =
+            loop_driver_execution_extension_id(&colon_context).expect("valid extension id");
+        let dash_id =
+            loop_driver_execution_extension_id(&dash_context).expect("valid extension id");
+
+        assert_ne!(colon_id, dash_id);
+        assert!(
+            colon_id
+                .as_str()
+                .starts_with("loop-driver-reborn-planned-default-")
+        );
+        assert_eq!(dash_id.as_str(), "reborn-planned-default");
     }
 
     #[tokio::test]

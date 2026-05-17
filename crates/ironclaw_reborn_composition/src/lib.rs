@@ -8,12 +8,19 @@
 mod error;
 mod factory;
 mod input;
+mod product_live_adapters;
 mod profile;
 mod readiness;
 
 pub use error::RebornBuildError;
 pub use factory::{RebornServices, build_reborn_services};
 pub use input::RebornBuildInput;
+pub use product_live_adapters::{
+    ProductLiveCapabilityIo, ProductLiveModelRouteSettings, ProductLivePlannedRuntimeAdapterConfig,
+    ProductLivePlannedRuntimeAdapterError, ProductLivePlannedRuntimeAdapters,
+    ProductLiveVisibleCapabilityRequestConfig, capability_allowlist,
+    visible_capability_request_for_run,
+};
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
 
