@@ -699,11 +699,7 @@ impl ironclaw_turns::run_profile::LoopTranscriptPort for MockAgentLoopDriverHost
         self.record_call(MockHostCall::AppendCapabilityResultRef {
             result_ref: request.result_ref.clone(),
         });
-        Ok(LoopMessageRef::new(format!(
-            "msg:tool-result-{}",
-            request.result_ref.as_str().trim_start_matches("result:")
-        ))
-        .expect("mock tool-result message ref should be valid"))
+        Ok(loop_message_ref("msg:tool-result"))
     }
 }
 
