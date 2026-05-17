@@ -22,7 +22,10 @@ use ironclaw_turns::{
 };
 use uuid::Uuid;
 
-use crate::binding::{ConversationBindingService, ResolveBindingRequest, ResolvedBinding};
+use crate::binding::{
+    ConversationBindingService, ProductConversationRouteKind, ResolveBindingRequest,
+    ResolvedBinding,
+};
 use crate::error::ProductWorkflowError;
 
 /// Result of the inbound turn submission flow.
@@ -150,6 +153,8 @@ where
                 installation_id: envelope.installation_id().clone(),
                 external_actor_ref: envelope.external_actor_ref().clone(),
                 external_conversation_ref: envelope.external_conversation_ref().clone(),
+                external_event_id: envelope.external_event_id().clone(),
+                route_kind: route_kind_for_user_message(payload.trigger),
                 auth_claim: envelope.auth_claim().clone(),
             })
             .await?;
@@ -195,6 +200,22 @@ where
         })
         .submit_or_replay(&self.thread_service, &self.turn_coordinator)
         .await
+    }
+}
+
+fn route_kind_for_user_message(
+    trigger: ironclaw_product_adapters::ProductTriggerReason,
+) -> ProductConversationRouteKind {
+    match trigger {
+        ironclaw_product_adapters::ProductTriggerReason::DirectChat => {
+            ProductConversationRouteKind::Direct
+        }
+        ironclaw_product_adapters::ProductTriggerReason::BotMention
+        | ironclaw_product_adapters::ProductTriggerReason::ReplyToBot
+        | ironclaw_product_adapters::ProductTriggerReason::BotCommand
+        | ironclaw_product_adapters::ProductTriggerReason::LinkedThreadAction => {
+            ProductConversationRouteKind::Shared
+        }
     }
 }
 

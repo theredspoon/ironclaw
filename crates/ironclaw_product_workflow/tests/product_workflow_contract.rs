@@ -1,78 +1,142 @@
 //! Contract tests for the product workflow facade.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
+use ironclaw_conversations::InMemoryConversationServices;
+use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_product_adapters::{
     AdapterInstallationId, ApprovalDecision, ApprovalResolutionPayload, AuthRequirement,
     AuthResolutionPayload, AuthResolutionResult, ExternalActorRef, ExternalConversationRef,
     ExternalEventId, InboundCommandPayload, LinkedThreadActionPayload, ParsedProductInbound,
     ProductAdapterError, ProductAdapterId, ProductInboundAck, ProductInboundEnvelope,
     ProductInboundPayload, ProductRejectionDisposition, ProductTriggerReason, ProductWorkflow,
-    ProductWorkflowRejectionKind, ProtocolAuthEvidence, TrustedInboundContext, UserMessagePayload,
+    ProductWorkflowRejectionKind, ProjectionCursor, ProjectionSubscriptionPayload,
+    ProtocolAuthEvidence, TrustedInboundContext, UserMessagePayload,
 };
 use ironclaw_product_workflow::{
-    ActionDispatchKind, ActionFingerprintKey, AuthRequestRef, DefaultProductWorkflow,
-    FakeIdempotencyLedger, FakeInboundTurnService, IdempotencyDecision, IdempotencyLedger,
-    InboundTurnOutcome, LinkedThreadActionId, ProductCommandName, ProductWorkflowError,
-    ResolvedBinding, SourceBindingKey,
+    ActionDispatchKind, ActionFingerprintKey, AuthRequestRef, DefaultInboundTurnService,
+    DefaultProductWorkflow, FakeConversationBindingService, FakeIdempotencyLedger,
+    FakeInboundTurnService, IdempotencyDecision, IdempotencyLedger, InMemoryIdempotencyLedger,
+    InboundTurnOutcome, LinkedThreadActionId, ProductCommandName,
+    ProductConversationBindingService, ProductInstallationKey, ProductInstallationScope,
+    ProductWorkflowError, ResolvedBinding, SourceBindingKey, StaticProductInstallationResolver,
 };
-use ironclaw_turns::{AcceptedMessageRef, LoopGateRef, TurnError, TurnRunId};
+use ironclaw_threads::InMemorySessionThreadService;
+use ironclaw_turns::{
+    AcceptedMessageRef, CancelRunRequest, CancelRunResponse, EventCursor, GetRunStateRequest,
+    LoopGateRef, ResumeTurnRequest, ResumeTurnResponse, RunProfileId, RunProfileVersion,
+    SubmitTurnRequest, SubmitTurnResponse, TurnCoordinator, TurnError, TurnId, TurnRunId,
+    TurnRunState, TurnStatus,
+};
 
 fn sample_envelope(event_suffix: &str) -> ProductInboundEnvelope {
+    sample_envelope_with_payload(
+        event_suffix,
+        ProductInboundPayload::UserMessage(
+            UserMessagePayload::new("hello", vec![], ProductTriggerReason::DirectChat)
+                .expect("valid"),
+        ),
+    )
+}
+
+fn sample_noop_envelope(event_suffix: &str) -> ProductInboundEnvelope {
+    sample_envelope_with_payload(event_suffix, ProductInboundPayload::NoOp)
+}
+
+fn sample_envelope_with_payload(
+    event_suffix: &str,
+    payload: ProductInboundPayload,
+) -> ProductInboundEnvelope {
+    sample_envelope_with_context(
+        ProductAdapterId::new("test_adapter").expect("valid"),
+        AdapterInstallationId::new("install_alpha").expect("valid"),
+        ExternalEventId::new(format!("evt:{event_suffix}")).expect("valid"),
+        ExternalActorRef::new("test", "user1", Option::<String>::None).expect("valid"),
+        ExternalConversationRef::new(None, "conv1", None, None).expect("valid"),
+        payload,
+    )
+}
+
+fn sample_envelope_with_context(
+    adapter_id: ProductAdapterId,
+    installation_id: AdapterInstallationId,
+    external_event_id: ExternalEventId,
+    external_actor_ref: ExternalActorRef,
+    external_conversation_ref: ExternalConversationRef,
+    payload: ProductInboundPayload,
+) -> ProductInboundEnvelope {
     let evidence = ProtocolAuthEvidence::test_verified(
         AuthRequirement::SharedSecretHeader {
             header_name: "X-Secret".into(),
         },
-        "install_alpha",
+        installation_id.as_str(),
     );
     let context = TrustedInboundContext::from_verified_evidence(
-        ProductAdapterId::new("test_adapter").expect("valid"),
-        AdapterInstallationId::new("install_alpha").expect("valid"),
+        adapter_id,
+        installation_id,
         Utc::now(),
         &evidence,
     )
     .expect("verified");
 
     let parsed = ParsedProductInbound::new(
-        ExternalEventId::new(format!("evt:{event_suffix}")).expect("valid"),
-        ExternalActorRef::new("test", "user1", Option::<String>::None).expect("valid"),
-        ExternalConversationRef::new(None, "conv1", None, None).expect("valid"),
-        ProductInboundPayload::UserMessage(
-            UserMessagePayload::new("hello", vec![], ProductTriggerReason::DirectChat)
-                .expect("valid"),
-        ),
+        external_event_id,
+        external_actor_ref,
+        external_conversation_ref,
+        payload,
     )
     .expect("parsed");
 
     ProductInboundEnvelope::from_trusted_parse(context, parsed).expect("envelope")
 }
 
-fn sample_noop_envelope(event_suffix: &str) -> ProductInboundEnvelope {
-    let evidence = ProtocolAuthEvidence::test_verified(
-        AuthRequirement::SharedSecretHeader {
-            header_name: "X-Secret".into(),
-        },
-        "install_alpha",
-    );
-    let context = TrustedInboundContext::from_verified_evidence(
-        ProductAdapterId::new("test_adapter").expect("valid"),
-        AdapterInstallationId::new("install_alpha").expect("valid"),
-        Utc::now(),
-        &evidence,
-    )
-    .expect("verified");
+#[derive(Default)]
+struct RecordingTurnCoordinator {
+    submissions: Mutex<Vec<SubmitTurnRequest>>,
+}
 
-    let parsed = ParsedProductInbound::new(
-        ExternalEventId::new(format!("evt:{event_suffix}")).expect("valid"),
-        ExternalActorRef::new("test", "user1", Option::<String>::None).expect("valid"),
-        ExternalConversationRef::new(None, "conv1", None, None).expect("valid"),
-        ProductInboundPayload::NoOp,
-    )
-    .expect("parsed");
+impl RecordingTurnCoordinator {
+    fn submissions(&self) -> Vec<SubmitTurnRequest> {
+        self.submissions.lock().expect("lock").clone()
+    }
+}
 
-    ProductInboundEnvelope::from_trusted_parse(context, parsed).expect("envelope")
+#[async_trait]
+impl TurnCoordinator for RecordingTurnCoordinator {
+    async fn submit_turn(
+        &self,
+        request: SubmitTurnRequest,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        let response = SubmitTurnResponse::Accepted {
+            turn_id: TurnId::new(),
+            run_id: TurnRunId::new(),
+            status: TurnStatus::Queued,
+            resolved_run_profile_id: RunProfileId::default_profile(),
+            resolved_run_profile_version: RunProfileVersion::new(1),
+            event_cursor: EventCursor::default(),
+            accepted_message_ref: request.accepted_message_ref.clone(),
+            reply_target_binding_ref: request.reply_target_binding_ref.clone(),
+        };
+        self.submissions.lock().expect("lock").push(request);
+        Ok(response)
+    }
+
+    async fn resume_turn(
+        &self,
+        _request: ResumeTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        panic!("resume_turn is not used by product workflow contract tests")
+    }
+
+    async fn cancel_run(&self, _request: CancelRunRequest) -> Result<CancelRunResponse, TurnError> {
+        panic!("cancel_run is not used by product workflow contract tests")
+    }
+
+    async fn get_run_state(&self, _request: GetRunStateRequest) -> Result<TurnRunState, TurnError> {
+        panic!("get_run_state is not used by product workflow contract tests")
+    }
 }
 
 #[test]
@@ -178,8 +242,22 @@ fn build_workflow() -> (
 ) {
     let inbound = Arc::new(FakeInboundTurnService::new());
     let ledger = Arc::new(FakeIdempotencyLedger::new());
-    let workflow = DefaultProductWorkflow::new(inbound.clone(), ledger.clone());
+    let binding = Arc::new(FakeConversationBindingService::new());
+    let workflow = DefaultProductWorkflow::new(inbound.clone(), ledger.clone(), binding);
     (workflow, inbound, ledger)
+}
+
+fn build_workflow_with_binding() -> (
+    DefaultProductWorkflow,
+    Arc<FakeInboundTurnService>,
+    Arc<FakeIdempotencyLedger>,
+    Arc<FakeConversationBindingService>,
+) {
+    let inbound = Arc::new(FakeInboundTurnService::new());
+    let ledger = Arc::new(FakeIdempotencyLedger::new());
+    let binding = Arc::new(FakeConversationBindingService::new());
+    let workflow = DefaultProductWorkflow::new(inbound.clone(), ledger.clone(), binding.clone());
+    (workflow, inbound, ledger, binding)
 }
 
 #[tokio::test]
@@ -204,6 +282,431 @@ async fn noop_returns_noop_ack() {
     assert!(matches!(ack, ProductInboundAck::NoOp));
     assert_eq!(inbound.accepted_count(), 0);
     assert_eq!(ledger.settled_count(), 1);
+}
+
+#[tokio::test]
+async fn projection_subscription_resolves_through_binding_service() {
+    let (workflow, inbound, _ledger, binding_service) = build_workflow_with_binding();
+    let binding = fake_binding();
+    let cursor = ProjectionCursor::new("cursor:projection-1").expect("valid cursor");
+    let envelope = sample_envelope_with_payload(
+        "projection-1",
+        ProductInboundPayload::SubscriptionRequest(
+            ProjectionSubscriptionPayload::new(
+                Some(binding.thread_id.as_str().to_string()),
+                Some(cursor.clone()),
+            )
+            .expect("valid subscription"),
+        ),
+    );
+    binding_service.program_binding(envelope.source_binding_key(), binding.clone());
+
+    let subscription = workflow
+        .resolve_projection_subscription(envelope)
+        .await
+        .expect("projection subscription");
+
+    assert_eq!(subscription.actor.user_id, binding.user_id);
+    assert_eq!(subscription.scope.tenant_id, binding.tenant_id);
+    assert_eq!(subscription.scope.agent_id, binding.agent_id);
+    assert_eq!(subscription.scope.project_id, binding.project_id);
+    assert_eq!(subscription.scope.thread_id, binding.thread_id);
+    assert_eq!(subscription.after_cursor, Some(cursor));
+    assert_eq!(binding_service.resolve_count(), 1);
+    assert_eq!(inbound.accepted_count(), 0);
+}
+
+#[tokio::test]
+async fn projection_subscription_rejects_mismatched_thread_hint() {
+    let (workflow, _inbound, _ledger, binding_service) = build_workflow_with_binding();
+    let binding = fake_binding();
+    let envelope = sample_envelope_with_payload(
+        "projection-mismatch",
+        ProductInboundPayload::SubscriptionRequest(
+            ProjectionSubscriptionPayload::new(Some("thread:other".into()), None)
+                .expect("valid subscription"),
+        ),
+    );
+    binding_service.program_binding(envelope.source_binding_key(), binding);
+
+    let err = workflow
+        .resolve_projection_subscription(envelope)
+        .await
+        .expect_err("mismatched hint rejects");
+
+    match err {
+        ProductAdapterError::WorkflowRejected {
+            kind,
+            status_code,
+            retryable,
+            ..
+        } => {
+            assert_eq!(kind, ProductWorkflowRejectionKind::InvalidRequest);
+            assert_eq!(status_code, 400);
+            assert!(!retryable);
+        }
+        other => panic!("expected workflow rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn concrete_product_workflow_accepts_user_message_for_trusted_installation() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(
+        conversations,
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            Some("project:alpha"),
+        )],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+    let envelope = sample_envelope("concrete-happy");
+
+    let first = workflow
+        .accept_inbound(envelope.clone())
+        .await
+        .expect("accepted");
+    let duplicate = workflow
+        .accept_inbound(envelope)
+        .await
+        .expect("duplicate replay");
+
+    assert!(matches!(first, ProductInboundAck::Accepted { .. }));
+    assert!(matches!(duplicate, ProductInboundAck::Duplicate { .. }));
+    let submissions = coordinator.submissions();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(submissions[0].scope.tenant_id.as_str(), "tenant:alpha");
+    assert_eq!(
+        submissions[0].scope.agent_id.as_ref().map(AgentId::as_str),
+        Some("agent:alpha")
+    );
+    assert_eq!(
+        submissions[0]
+            .scope
+            .project_id
+            .as_ref()
+            .map(ProjectId::as_str),
+        Some("project:alpha")
+    );
+    assert_eq!(submissions[0].actor.user_id.as_str(), "user:alice");
+}
+
+#[tokio::test]
+async fn concrete_product_workflow_keeps_installations_tenant_isolated() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    for (install, tenant, user) in [
+        ("install_alpha", "tenant:alpha", "user:alice"),
+        ("install_beta", "tenant:beta", "user:bob"),
+    ] {
+        conversations
+            .pair_external_actor(
+                TenantId::new(tenant).expect("tenant"),
+                ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+                ironclaw_conversations::AdapterInstallationId::new(install).expect("install"),
+                ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+                UserId::new(user).expect("user"),
+            )
+            .await;
+    }
+    let binding = product_binding_service(
+        conversations,
+        vec![
+            (
+                "test_adapter",
+                "install_alpha",
+                "tenant:alpha",
+                "agent:alpha",
+                None,
+            ),
+            (
+                "test_adapter",
+                "install_beta",
+                "tenant:beta",
+                "agent:beta",
+                None,
+            ),
+        ],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+
+    workflow
+        .accept_inbound(sample_envelope("tenant-a"))
+        .await
+        .expect("tenant a accepted");
+    workflow
+        .accept_inbound(sample_envelope_with_context(
+            ProductAdapterId::new("test_adapter").expect("adapter"),
+            AdapterInstallationId::new("install_beta").expect("install"),
+            ExternalEventId::new("evt:tenant-b").expect("event"),
+            ExternalActorRef::new("test", "user1", Option::<String>::None).expect("actor"),
+            ExternalConversationRef::new(None, "conv1", None, None).expect("conversation"),
+            ProductInboundPayload::UserMessage(
+                UserMessagePayload::new("hello beta", vec![], ProductTriggerReason::DirectChat)
+                    .expect("message"),
+            ),
+        ))
+        .await
+        .expect("tenant b accepted");
+
+    let submissions = coordinator.submissions();
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(submissions[0].scope.tenant_id.as_str(), "tenant:alpha");
+    assert_eq!(submissions[0].actor.user_id.as_str(), "user:alice");
+    assert_eq!(submissions[1].scope.tenant_id.as_str(), "tenant:beta");
+    assert_eq!(submissions[1].actor.user_id.as_str(), "user:bob");
+    assert_ne!(
+        submissions[0].scope.thread_id,
+        submissions[1].scope.thread_id
+    );
+}
+
+#[tokio::test]
+async fn concrete_product_workflow_rejects_unknown_installation_as_terminal() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(conversations, vec![]);
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+    let envelope = sample_envelope("unknown-install");
+
+    let err = workflow
+        .accept_inbound(envelope.clone())
+        .await
+        .expect_err("unknown installation rejected");
+    assert!(matches!(
+        err,
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::Unauthorized,
+            status_code: 403,
+            retryable: false,
+            ..
+        }
+    ));
+    let duplicate = workflow
+        .accept_inbound(envelope)
+        .await
+        .expect("terminal rejection replays");
+    assert!(matches!(duplicate, ProductInboundAck::Duplicate { .. }));
+    assert!(coordinator.submissions().is_empty());
+}
+
+#[tokio::test]
+async fn concrete_product_workflow_rejects_unpaired_actor_before_turn_submission() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    let binding = product_binding_service(
+        conversations,
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            None,
+        )],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+
+    let err = workflow
+        .accept_inbound(sample_envelope("unpaired"))
+        .await
+        .expect_err("unpaired actor rejected");
+    assert!(matches!(
+        err,
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::ScopeNotFound,
+            status_code: 404,
+            retryable: false,
+            ..
+        }
+    ));
+    assert!(coordinator.submissions().is_empty());
+}
+
+#[tokio::test]
+async fn in_memory_idempotency_ledger_reclaims_expired_in_flight_actions() {
+    let ledger = InMemoryIdempotencyLedger::with_in_flight_lease(Duration::seconds(10));
+    let received_at = Utc::now();
+    let fingerprint = ActionFingerprintKey::new(
+        ProductAdapterId::new("test_adapter").expect("valid"),
+        AdapterInstallationId::new("install_alpha").expect("valid"),
+        SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
+            .expect("valid source binding key"),
+        ExternalEventId::new("evt:lease-memory").expect("valid"),
+    );
+
+    assert!(matches!(
+        ledger
+            .begin_or_replay(fingerprint.clone(), received_at)
+            .await
+            .expect("first reservation"),
+        IdempotencyDecision::New(_)
+    ));
+    let duplicate = ledger
+        .begin_or_replay(fingerprint.clone(), received_at + Duration::seconds(5))
+        .await
+        .expect_err("fresh in-flight action blocks duplicate dispatch");
+    assert!(duplicate.to_string().contains("in flight"));
+    assert!(matches!(
+        ledger
+            .begin_or_replay(fingerprint, received_at + Duration::seconds(11))
+            .await
+            .expect("expired reservation is reclaimed"),
+        IdempotencyDecision::New(_)
+    ));
+}
+
+#[tokio::test]
+async fn in_memory_idempotency_ledger_ignores_stale_releases_after_reclaim() {
+    let ledger = InMemoryIdempotencyLedger::with_in_flight_lease(Duration::seconds(10));
+    let received_at = Utc::now();
+    let fingerprint = ActionFingerprintKey::new(
+        ProductAdapterId::new("test_adapter").expect("valid"),
+        AdapterInstallationId::new("install_alpha").expect("valid"),
+        SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
+            .expect("valid source binding key"),
+        ExternalEventId::new("evt:lease-stale").expect("valid"),
+    );
+
+    let first = match ledger
+        .begin_or_replay(fingerprint.clone(), received_at)
+        .await
+        .expect("first reservation")
+    {
+        IdempotencyDecision::New(action) => action,
+        IdempotencyDecision::Replay(_) => panic!("expected first reservation"),
+    };
+    let second = match ledger
+        .begin_or_replay(fingerprint.clone(), received_at + Duration::seconds(11))
+        .await
+        .expect("expired reservation is reclaimed")
+    {
+        IdempotencyDecision::New(action) => action,
+        IdempotencyDecision::Replay(_) => panic!("expected reclaimed reservation"),
+    };
+
+    ledger
+        .release(first.clone())
+        .await
+        .expect("stale release is ignored");
+    assert!(
+        ledger
+            .begin_or_replay(fingerprint.clone(), received_at + Duration::seconds(12))
+            .await
+            .expect_err("new reservation stays protected after stale release")
+            .to_string()
+            .contains("in flight")
+    );
+
+    let mut stale_settle = first;
+    stale_settle.settle(ProductInboundAck::NoOp);
+    ledger
+        .settle(stale_settle)
+        .await
+        .expect("stale settle is ignored");
+    assert!(
+        ledger
+            .begin_or_replay(fingerprint.clone(), received_at + Duration::seconds(12))
+            .await
+            .expect_err("new reservation stays protected after stale settle")
+            .to_string()
+            .contains("in flight")
+    );
+
+    let mut current_settle = second;
+    current_settle.settle(ProductInboundAck::NoOp);
+    ledger
+        .settle(current_settle)
+        .await
+        .expect("current reservation settles");
+    assert!(matches!(
+        ledger
+            .begin_or_replay(fingerprint, received_at + Duration::seconds(12))
+            .await
+            .expect("settled action replays"),
+        IdempotencyDecision::Replay(_)
+    ));
+}
+
+fn product_binding_service(
+    conversations: Arc<InMemoryConversationServices>,
+    installations: Vec<(&str, &str, &str, &str, Option<&str>)>,
+) -> ProductConversationBindingService {
+    let conversation_port: Arc<dyn ironclaw_conversations::ConversationBindingService> =
+        conversations;
+    let resolver = StaticProductInstallationResolver::new(installations.into_iter().map(
+        |(adapter, installation, tenant, agent, project)| {
+            (
+                ProductInstallationKey::new(
+                    ProductAdapterId::new(adapter).expect("adapter"),
+                    AdapterInstallationId::new(installation).expect("installation"),
+                ),
+                ProductInstallationScope::with_default_scope(
+                    TenantId::new(tenant).expect("tenant"),
+                    AgentId::new(agent).expect("agent"),
+                    project.map(|value| ProjectId::new(value).expect("project")),
+                ),
+            )
+        },
+    ));
+    ProductConversationBindingService::new(conversation_port, resolver)
 }
 
 #[tokio::test]
