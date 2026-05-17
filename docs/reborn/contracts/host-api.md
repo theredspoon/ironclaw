@@ -1072,10 +1072,17 @@ Each `IngressRouteDescriptor` must carry a fully resolved `IngressPolicy`:
   traversal segments;
 - listener class (`LocalGateway`, `PublicWebhook`, `OAuthCallback`, `InternalWorker`, `TestOnly`);
 - auth policy, with explicit justification for public routes;
+- listener class and auth scheme are coherent: public webhooks require webhook
+  signatures, internal workers require internal tokens, effectful local gateway
+  routes require bearer/session auth, and OAuth callbacks require OAuth state
+  unless they are explicitly public no-effect callbacks;
 - scope extraction source;
 - auth policy and scope source are coherent: public routes cannot use
   authenticated-caller scope, required-auth routes cannot use public-route
   scope, and test-fixture scope requires a test-only listener class;
+- public-route scope is limited to no-effect and projection-only paths; product
+  workflow, turn coordination, host-port, and capability-host effects require a
+  resolved tenant/user scope source;
 - body and rate-limit policy, with explicit justification when rate limiting is disabled;
 - justification strings are clean human-readable reasons and reject leading or
   trailing whitespace instead of normalizing it;

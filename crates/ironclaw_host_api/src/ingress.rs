@@ -303,6 +303,8 @@ impl IngressPolicy {
     pub fn new(parts: IngressPolicyParts) -> Result<Self, HostApiError> {
         validate_auth_policy(&parts.auth)?;
         validate_auth_scope(parts.listener_class, &parts.auth, parts.scope_source)?;
+        validate_effect_scope(parts.scope_source, &parts.effect_path)?;
+        validate_listener_auth(parts.listener_class, &parts.auth, &parts.effect_path)?;
         validate_streaming_origin(parts.streaming, parts.websocket_origin)?;
 
         Ok(Self {
@@ -594,6 +596,93 @@ fn validate_auth_scope(
     }
 }
 
+fn validate_effect_scope(
+    scope_source: IngressScopeSource,
+    effect_path: &AllowedEffectPath,
+) -> Result<(), HostApiError> {
+    if scope_source == IngressScopeSource::PublicRoute && is_effectful_path(effect_path) {
+        return Err(HostApiError::invariant(
+            "public route scope must not enter effectful host paths",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_listener_auth(
+    listener_class: ListenerClass,
+    auth: &IngressAuthPolicy,
+    effect_path: &AllowedEffectPath,
+) -> Result<(), HostApiError> {
+    if listener_class == ListenerClass::OAuthCallback
+        && matches!(auth, IngressAuthPolicy::Public { .. })
+        && matches!(effect_path, AllowedEffectPath::NoEffect)
+    {
+        return Ok(());
+    }
+
+    match listener_class {
+        ListenerClass::PublicWebhook => require_auth_scheme(
+            auth,
+            IngressAuthScheme::WebhookSignature,
+            "public webhook ingress requires webhook signature auth",
+        ),
+        ListenerClass::InternalWorker => require_auth_scheme(
+            auth,
+            IngressAuthScheme::InternalToken,
+            "internal worker ingress requires internal token auth",
+        ),
+        ListenerClass::LocalGateway if is_effectful_path(effect_path) => require_any_auth_scheme(
+            auth,
+            &[
+                IngressAuthScheme::BearerToken,
+                IngressAuthScheme::SessionCookie,
+            ],
+            "effectful local gateway ingress requires bearer token or session cookie auth",
+        ),
+        ListenerClass::OAuthCallback => require_auth_scheme(
+            auth,
+            IngressAuthScheme::OAuthState,
+            "oauth callback ingress requires oauth state auth unless it is public no-effect",
+        ),
+        ListenerClass::LocalGateway | ListenerClass::TestOnly => Ok(()),
+    }
+}
+
+fn require_auth_scheme(
+    auth: &IngressAuthPolicy,
+    required: IngressAuthScheme,
+    reason: &'static str,
+) -> Result<(), HostApiError> {
+    require_any_auth_scheme(auth, &[required], reason)
+}
+
+fn require_any_auth_scheme(
+    auth: &IngressAuthPolicy,
+    required: &[IngressAuthScheme],
+    reason: &'static str,
+) -> Result<(), HostApiError> {
+    if auth_has_any_scheme(auth, required) {
+        Ok(())
+    } else {
+        Err(HostApiError::invariant(reason))
+    }
+}
+
+fn auth_has_any_scheme(auth: &IngressAuthPolicy, required: &[IngressAuthScheme]) -> bool {
+    matches!(
+        auth,
+        IngressAuthPolicy::Required { schemes }
+            if required.iter().any(|scheme| schemes.contains(scheme))
+    )
+}
+
+fn is_effectful_path(effect_path: &AllowedEffectPath) -> bool {
+    !matches!(
+        effect_path,
+        AllowedEffectPath::NoEffect | AllowedEffectPath::ProjectionOnly
+    )
+}
+
 fn validate_streaming_origin(
     streaming: StreamingMode,
     websocket_origin: WebSocketOriginPolicy,
@@ -652,6 +741,37 @@ mod tests {
         }
     }
 
+    fn public_route_parts(
+        listener_class: ListenerClass,
+        effect_path: AllowedEffectPath,
+    ) -> IngressPolicyParts {
+        let mut parts = base_policy_parts();
+        parts.listener_class = listener_class;
+        parts.auth = IngressAuthPolicy::Public {
+            justification: justification(),
+        };
+        parts.scope_source = IngressScopeSource::PublicRoute;
+        parts.audit = match listener_class {
+            ListenerClass::TestOnly => AuditTraceClass::TestOnly,
+            _ => AuditTraceClass::PublicCallback,
+        };
+        parts.effect_path = effect_path;
+        parts
+    }
+
+    fn host_resolved_required_parts(
+        listener_class: ListenerClass,
+        schemes: Vec<IngressAuthScheme>,
+        effect_path: AllowedEffectPath,
+    ) -> IngressPolicyParts {
+        let mut parts = base_policy_parts();
+        parts.listener_class = listener_class;
+        parts.auth = IngressAuthPolicy::Required { schemes };
+        parts.scope_source = IngressScopeSource::HostResolved;
+        parts.effect_path = effect_path;
+        parts
+    }
+
     fn valid_policy() -> IngressPolicy {
         IngressPolicy::new(base_policy_parts()).expect("valid policy")
     }
@@ -698,14 +818,11 @@ mod tests {
             .expect_err("trailing whitespace must reject");
         assert!(trailing.to_string().contains("leading or trailing"));
 
-        let mut parts = base_policy_parts();
-        parts.auth = IngressAuthPolicy::Public {
-            justification: justification(),
-        };
-        parts.scope_source = IngressScopeSource::PublicRoute;
-        parts.listener_class = ListenerClass::OAuthCallback;
-        parts.audit = AuditTraceClass::PublicCallback;
-        IngressPolicy::new(parts).expect("public route with justification should pass");
+        IngressPolicy::new(public_route_parts(
+            ListenerClass::OAuthCallback,
+            AllowedEffectPath::NoEffect,
+        ))
+        .expect("public route with justification should pass");
     }
 
     #[test]
@@ -735,6 +852,101 @@ mod tests {
         test_only.scope_source = IngressScopeSource::TestFixture;
         test_only.audit = AuditTraceClass::TestOnly;
         IngressPolicy::new(test_only).expect("test-only listener may use test fixture scope");
+    }
+
+    #[test]
+    fn public_route_scope_cannot_enter_effectful_paths() {
+        let effectful_paths = [
+            AllowedEffectPath::ProductWorkflow,
+            AllowedEffectPath::TurnCoordinator,
+            AllowedEffectPath::HostPort {
+                id: HostPortId::new("host.storage.sql_transaction.first_party")
+                    .expect("valid host port"),
+            },
+            AllowedEffectPath::CapabilityHost {
+                capability_id: CapabilityId::new("builtin.read_file").expect("valid capability"),
+            },
+        ];
+
+        for effect_path in effectful_paths {
+            let err = IngressPolicy::new(public_route_parts(ListenerClass::TestOnly, effect_path))
+                .expect_err("public route scope must reject effectful host paths");
+            assert!(err.to_string().contains("public route scope"));
+        }
+
+        for effect_path in [
+            AllowedEffectPath::NoEffect,
+            AllowedEffectPath::ProjectionOnly,
+        ] {
+            IngressPolicy::new(public_route_parts(ListenerClass::TestOnly, effect_path))
+                .expect("public route scope may describe non-effectful routes");
+        }
+    }
+
+    #[test]
+    fn listener_class_must_match_network_auth_mechanism() {
+        for (listener_class, schemes, effect_path, expected) in [
+            (
+                ListenerClass::PublicWebhook,
+                vec![IngressAuthScheme::BearerToken],
+                AllowedEffectPath::NoEffect,
+                "webhook signature",
+            ),
+            (
+                ListenerClass::InternalWorker,
+                vec![IngressAuthScheme::BearerToken],
+                AllowedEffectPath::NoEffect,
+                "internal token",
+            ),
+            (
+                ListenerClass::LocalGateway,
+                vec![IngressAuthScheme::Oidc],
+                AllowedEffectPath::ProductWorkflow,
+                "local gateway",
+            ),
+            (
+                ListenerClass::OAuthCallback,
+                vec![IngressAuthScheme::BearerToken],
+                AllowedEffectPath::NoEffect,
+                "oauth state",
+            ),
+        ] {
+            let err = IngressPolicy::new(host_resolved_required_parts(
+                listener_class,
+                schemes,
+                effect_path,
+            ))
+            .expect_err("listener class must require its matching auth scheme");
+            assert!(err.to_string().contains(expected));
+        }
+
+        for (listener_class, schemes) in [
+            (
+                ListenerClass::PublicWebhook,
+                vec![IngressAuthScheme::WebhookSignature],
+            ),
+            (
+                ListenerClass::InternalWorker,
+                vec![IngressAuthScheme::InternalToken],
+            ),
+            (
+                ListenerClass::OAuthCallback,
+                vec![IngressAuthScheme::OAuthState],
+            ),
+        ] {
+            IngressPolicy::new(host_resolved_required_parts(
+                listener_class,
+                schemes,
+                AllowedEffectPath::NoEffect,
+            ))
+            .expect("matching auth scheme satisfies listener class");
+        }
+
+        IngressPolicy::new(public_route_parts(
+            ListenerClass::OAuthCallback,
+            AllowedEffectPath::NoEffect,
+        ))
+        .expect("oauth callback may be public only when it has no effect");
     }
 
     #[test]
