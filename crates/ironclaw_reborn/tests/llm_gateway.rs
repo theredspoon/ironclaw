@@ -138,6 +138,8 @@ async fn gateway_with_tool_surface_calls_complete_with_tools_and_returns_capabil
         .provider_replay
         .as_ref()
         .expect("provider replay metadata");
+    assert_eq!(provider_replay.provider_id, "tool-aware-provider");
+    assert_eq!(provider_replay.provider_model_id, "host-selected-model");
     assert_eq!(provider_replay.provider_call_id, "call_1");
     assert_eq!(provider_replay.provider_tool_name, "demo__echo");
     assert_eq!(
@@ -222,6 +224,8 @@ async fn gateway_reconstructs_provider_tool_roundtrip_from_tool_result_reference
     )
     .unwrap();
     let provider_call = ProviderToolCallReferenceEnvelope {
+        provider_id: "tool-aware-provider".to_string(),
+        provider_model_id: "host-selected-model".to_string(),
         provider_turn_id: "turn_1".to_string(),
         provider_call_id: "call_1".to_string(),
         provider_tool_name: "demo__echo".to_string(),
@@ -285,6 +289,8 @@ async fn gateway_reconstructs_multi_tool_provider_turn_from_grouped_result_refer
     )
     .unwrap();
     let first_provider_call = ProviderToolCallReferenceEnvelope {
+        provider_id: "tool-aware-provider".to_string(),
+        provider_model_id: "host-selected-model".to_string(),
         provider_turn_id: "turn_1".to_string(),
         provider_call_id: "call_1".to_string(),
         provider_tool_name: "demo__echo".to_string(),
@@ -295,6 +301,8 @@ async fn gateway_reconstructs_multi_tool_provider_turn_from_grouped_result_refer
         signature: Some("sig-1".to_string()),
     };
     let second_provider_call = ProviderToolCallReferenceEnvelope {
+        provider_id: "tool-aware-provider".to_string(),
+        provider_model_id: "host-selected-model".to_string(),
         provider_turn_id: "turn_1".to_string(),
         provider_call_id: "call_2".to_string(),
         provider_tool_name: "demo__echo".to_string(),
@@ -348,6 +356,46 @@ async fn gateway_reconstructs_multi_tool_provider_turn_from_grouped_result_refer
     assert_eq!(second_tool_result.role, Role::Tool);
     assert_eq!(second_tool_result.tool_call_id.as_deref(), Some("call_2"));
     assert_eq!(second_tool_result.content, "second tool completed");
+}
+
+#[tokio::test]
+async fn gateway_rejects_provider_tool_replay_from_different_provider_route() {
+    let provider = Arc::new(ToolAwareProvider::plain_reply("assistant response"));
+    let gateway = LlmProviderModelGateway::new(
+        provider.clone(),
+        LlmModelProfilePolicy::new()
+            .allow_model_profile(interactive_model(), Some("host-selected-model".to_string())),
+    );
+    let envelope = ToolResultReferenceEnvelope::new(
+        "result:demo-tool",
+        ToolResultSafeSummary::new("tool completed").unwrap(),
+    )
+    .unwrap();
+    let provider_call = ProviderToolCallReferenceEnvelope {
+        provider_id: "other-provider".to_string(),
+        provider_model_id: "host-selected-model".to_string(),
+        provider_turn_id: "turn_1".to_string(),
+        provider_call_id: "call_1".to_string(),
+        provider_tool_name: "demo__echo".to_string(),
+        capability_id: CapabilityId::new("demo.echo").unwrap(),
+        arguments: serde_json::json!({"message":"hello"}),
+        response_reasoning: None,
+        reasoning: None,
+        signature: None,
+    };
+    let mut request = model_request(interactive_model());
+    request.messages = vec![HostManagedModelMessage {
+        role: HostManagedModelMessageRole::ToolResult,
+        content: serde_json::to_string(&envelope).unwrap(),
+        content_ref: LoopMessageRef::new("msg:33333333-3333-3333-3333-333333333333").unwrap(),
+        tool_result_provider_call: Some(provider_call),
+    }];
+
+    let error = gateway.stream_model(request).await.unwrap_err();
+
+    assert_eq!(error.kind, HostManagedModelErrorKind::PolicyDenied);
+    assert!(provider.complete_requests.lock().unwrap().is_empty());
+    assert!(provider.tool_requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1498,6 +1546,8 @@ impl LoopCapabilityPort for GatewayCapabilityPort {
             provider_replay: tool_call
                 .turn_id
                 .map(|provider_turn_id| ProviderToolCallReplay {
+                    provider_id: tool_call.provider_id,
+                    provider_model_id: tool_call.provider_model_id,
                     provider_turn_id,
                     provider_call_id: tool_call.id,
                     provider_tool_name: tool_call.name,

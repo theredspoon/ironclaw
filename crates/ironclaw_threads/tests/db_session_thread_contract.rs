@@ -229,6 +229,8 @@ async fn durable_history_flow(service: &impl SessionThreadService, label: &str) 
             result_ref: "result:durable-demo".into(),
             safe_summary: ToolResultSafeSummary::new("safe durable tool result").unwrap(),
             provider_call: Some(ProviderToolCallReferenceEnvelope {
+                provider_id: "test-provider".to_string(),
+                provider_model_id: "test-model".to_string(),
                 provider_turn_id: "turn_1".to_string(),
                 provider_call_id: "call_1".to_string(),
                 provider_tool_name: "demo__echo".to_string(),

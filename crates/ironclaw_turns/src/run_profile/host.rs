@@ -1054,6 +1054,8 @@ pub struct CapabilityCallCandidate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCallReplay {
+    pub provider_id: String,
+    pub provider_model_id: String,
     pub provider_turn_id: String,
     pub provider_call_id: String,
     pub provider_tool_name: String,
@@ -1123,6 +1125,8 @@ pub struct ProviderToolDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCall {
+    pub provider_id: String,
+    pub provider_model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     pub id: String,
@@ -1138,6 +1142,8 @@ pub struct ProviderToolCall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCallReference {
+    pub provider_id: String,
+    pub provider_model_id: String,
     pub provider_turn_id: String,
     pub provider_call_id: String,
     pub provider_tool_name: String,

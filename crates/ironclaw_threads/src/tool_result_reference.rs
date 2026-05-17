@@ -67,6 +67,8 @@ pub struct ToolResultReferenceEnvelope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCallReferenceEnvelope {
+    pub provider_id: String,
+    pub provider_model_id: String,
     pub provider_turn_id: String,
     pub provider_call_id: String,
     pub provider_tool_name: String,
@@ -82,6 +84,8 @@ pub struct ProviderToolCallReferenceEnvelope {
 
 impl ProviderToolCallReferenceEnvelope {
     pub fn validate(&self) -> Result<(), String> {
+        validate_provider_identity(&self.provider_id, "provider id", 512)?;
+        validate_provider_identity(&self.provider_model_id, "provider model id", 512)?;
         validate_provider_token(&self.provider_turn_id, "provider turn id", 512)?;
         validate_provider_token(&self.provider_call_id, "provider call id", 512)?;
         validate_provider_token(&self.provider_tool_name, "provider tool name", 256)?;
@@ -154,6 +158,22 @@ fn validate_provider_token(value: &str, label: &str, max_len: usize) -> Result<(
         return Err(format!(
             "{label} must contain only ASCII letters, digits, _, -, ., or :"
         ));
+    }
+    Ok(())
+}
+
+fn validate_provider_identity(value: &str, label: &str, max_len: usize) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if value.len() > max_len {
+        return Err(format!("{label} exceeds {max_len} bytes"));
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(format!("{label} must not contain NUL/control characters"));
     }
     Ok(())
 }

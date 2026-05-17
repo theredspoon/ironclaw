@@ -326,6 +326,8 @@ mod tests {
 
     fn provider_call(name: &str) -> ProviderToolCall {
         ProviderToolCall {
+            provider_id: "test-provider".to_string(),
+            provider_model_id: "test-model".to_string(),
             turn_id: Some("turn_1".to_string()),
             id: "call_1".to_string(),
             name: name.to_string(),

@@ -91,7 +91,7 @@ pub struct ThreadMessageRecord {
     pub tool_result_ref: Option<String>,
     /// Internal provider replay metadata for reconstructing tool-call turns.
     /// Product surfaces must render `content`, not this raw provider side channel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub tool_result_provider_call: Option<ProviderToolCallReferenceEnvelope>,
     pub content: Option<String>,
     pub redaction_ref: Option<String>,

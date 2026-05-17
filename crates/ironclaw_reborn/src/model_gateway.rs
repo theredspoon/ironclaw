@@ -235,11 +235,21 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
+        let replay_identity =
+            ProviderReplayIdentity::new(self.provider.model_name(), model_override)?;
+        let mut completion =
+            CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override.to_string());
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
 
-        complete_model_request(self.provider.as_ref(), completion, None, None).await
+        complete_model_request(
+            self.provider.as_ref(),
+            completion,
+            None,
+            None,
+            replay_identity,
+        )
+        .await
     }
 
     async fn stream_model_with_capabilities(
@@ -260,7 +270,10 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
+        let replay_identity =
+            ProviderReplayIdentity::new(self.provider.model_name(), model_override)?;
+        let mut completion =
+            CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override.to_string());
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
 
@@ -273,6 +286,7 @@ where
             completion,
             Some(capabilities),
             Some(provider_turn_scope),
+            replay_identity,
         )
         .await
     }
@@ -421,13 +435,18 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
+        let replay_identity = ProviderReplayIdentity::new(
+            snapshot.route().provider_id(),
+            snapshot.route().model_id(),
+        )?;
+        let mut completion =
+            CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
         add_route_metadata(&mut completion, &snapshot);
 
-        complete_model_request(provider.as_ref(), completion, None, None).await
+        complete_model_request(provider.as_ref(), completion, None, None, replay_identity).await
     }
 
     async fn stream_model_with_capabilities(
@@ -446,7 +465,12 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let mut completion = CompletionRequest::new(convert_messages(request.messages)?);
+        let replay_identity = ProviderReplayIdentity::new(
+            snapshot.route().provider_id(),
+            snapshot.route().model_id(),
+        )?;
+        let mut completion =
+            CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(snapshot.route().model_id().to_string());
         validate_provider_model_binding_matches_route(snapshot.route(), provider.as_ref())?;
         add_request_metadata(&mut completion, &model_profile_id, run_id, turn_id);
@@ -461,6 +485,7 @@ where
             completion,
             Some(capabilities),
             Some(provider_turn_scope),
+            replay_identity,
         )
         .await
     }
@@ -633,11 +658,61 @@ fn pinned_model_override(route: &LlmModelProfileRoute) -> Result<&str, HostManag
     Ok(trimmed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderReplayIdentity {
+    provider_id: String,
+    provider_model_id: String,
+}
+
+impl ProviderReplayIdentity {
+    fn new(
+        provider_id: impl Into<String>,
+        provider_model_id: impl Into<String>,
+    ) -> Result<Self, HostManagedModelError> {
+        let identity = Self {
+            provider_id: provider_id.into(),
+            provider_model_id: provider_model_id.into(),
+        };
+        validate_replay_identity_text(&identity.provider_id, "provider id")?;
+        validate_replay_identity_text(&identity.provider_model_id, "provider model id")?;
+        Ok(identity)
+    }
+}
+
+fn validate_replay_identity_text(
+    value: &str,
+    label: &'static str,
+) -> Result<(), HostManagedModelError> {
+    if value.trim().is_empty() {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            format!("{label} must not be empty"),
+        ));
+    }
+    if value.len() > 512 {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            format!("{label} exceeds 512 bytes"),
+        ));
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            format!("{label} must not contain NUL/control characters"),
+        ));
+    }
+    Ok(())
+}
+
 async fn complete_model_request<P>(
     provider: &P,
     completion: CompletionRequest,
     capabilities: Option<Arc<dyn ironclaw_turns::run_profile::LoopCapabilityPort>>,
     provider_turn_scope: Option<String>,
+    replay_identity: ProviderReplayIdentity,
 ) -> Result<HostManagedModelResponse, HostManagedModelError>
 where
     P: LlmProvider + ?Sized,
@@ -664,6 +739,7 @@ where
                 provider_turn_scope
                     .as_deref()
                     .unwrap_or("model_call=unknown"),
+                &replay_identity,
             )
             .await;
         }
@@ -688,6 +764,7 @@ async fn tool_response_to_host(
     response: ToolCompletionResponse,
     capabilities: Arc<dyn ironclaw_turns::run_profile::LoopCapabilityPort>,
     provider_turn_scope: &str,
+    replay_identity: &ProviderReplayIdentity,
 ) -> Result<HostManagedModelResponse, HostManagedModelError> {
     if !response.tool_calls.is_empty()
         && matches!(
@@ -702,6 +779,7 @@ async fn tool_response_to_host(
                 tool_call,
                 response.reasoning.clone(),
                 provider_turn_id.clone(),
+                replay_identity,
             );
             let candidate = capabilities
                 .register_provider_tool_call(provider_call)
@@ -742,8 +820,11 @@ fn provider_tool_call_from_llm(
     tool_call: ToolCall,
     response_reasoning: Option<String>,
     provider_turn_id: String,
+    replay_identity: &ProviderReplayIdentity,
 ) -> ProviderToolCall {
     ProviderToolCall {
+        provider_id: replay_identity.provider_id.clone(),
+        provider_model_id: replay_identity.provider_model_id.clone(),
         turn_id: Some(provider_turn_id),
         id: tool_call.id,
         name: tool_call.name,
@@ -764,7 +845,7 @@ fn provider_turn_id(provider_turn_scope: &str, tool_calls: &[ToolCall]) -> Strin
         stable.push_str(tool_call.name.as_str());
         stable.push('\0');
     }
-    format!("provider_turn:{}", sha256_hex_prefix(stable.as_bytes(), 16))
+    format!("provider_turn:{}", sha256_hex_prefix(stable.as_bytes(), 32))
 }
 
 fn sha256_hex_prefix(input: &[u8], len: usize) -> String {
@@ -825,6 +906,7 @@ fn map_capability_host_error(error: AgentLoopHostError) -> HostManagedModelError
 
 fn convert_messages(
     messages: Vec<HostManagedModelMessage>,
+    replay_identity: &ProviderReplayIdentity,
 ) -> Result<Vec<ChatMessage>, HostManagedModelError> {
     let mut converted = Vec::with_capacity(messages.len());
     let mut index = 0;
@@ -847,6 +929,7 @@ fn convert_messages(
                     index += 1;
                     continue;
                 };
+                validate_provider_replay_identity(&provider_call, replay_identity)?;
                 let provider_turn_id = provider_call.provider_turn_id.clone();
                 let mut provider_results = vec![(provider_call, replay.safe_summary)];
                 index += 1;
@@ -857,6 +940,7 @@ fn convert_messages(
                     let Some(next_provider_call) = next.provider_call else {
                         break;
                     };
+                    validate_provider_replay_identity(&next_provider_call, replay_identity)?;
                     if next_provider_call.provider_turn_id != provider_turn_id {
                         break;
                     }
@@ -870,6 +954,21 @@ fn convert_messages(
         index += 1;
     }
     Ok(converted)
+}
+
+fn validate_provider_replay_identity(
+    provider_call: &ProviderToolCallReferenceEnvelope,
+    expected: &ProviderReplayIdentity,
+) -> Result<(), HostManagedModelError> {
+    if provider_call.provider_id != expected.provider_id
+        || provider_call.provider_model_id != expected.provider_model_id
+    {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::PolicyDenied,
+            "provider tool-call replay metadata does not match the selected provider route",
+        ));
+    }
+    Ok(())
 }
 
 struct ToolResultReplayMessage {

@@ -1281,6 +1281,8 @@ fn provider_call_reference_to_envelope(
     provider_call: ironclaw_turns::run_profile::ProviderToolCallReference,
 ) -> ProviderToolCallReferenceEnvelope {
     ProviderToolCallReferenceEnvelope {
+        provider_id: provider_call.provider_id,
+        provider_model_id: provider_call.provider_model_id,
         provider_turn_id: provider_call.provider_turn_id,
         provider_call_id: provider_call.provider_call_id,
         provider_tool_name: provider_call.provider_tool_name,

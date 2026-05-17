@@ -1157,6 +1157,8 @@ async fn transcript_port_appends_tool_result_reference_envelope_idempotently() {
             result_ref: result_ref.clone(),
             safe_summary: "tool completed".to_string(),
             provider_call: Some(ProviderToolCallReference {
+                provider_id: "test-provider".to_string(),
+                provider_model_id: "test-model".to_string(),
                 provider_turn_id: "turn_1".to_string(),
                 provider_call_id: "call_1".to_string(),
                 provider_tool_name: "demo__echo".to_string(),

@@ -523,12 +523,20 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
         let mut definitions = snapshot
             .capabilities
             .iter()
-            .filter(|(_, capability)| provider_schema_is_usable(&capability.parameters_schema))
-            .map(|(capability_id, capability)| ProviderToolDefinition {
-                capability_id: capability_id.clone(),
-                name: capability.provider_tool_name.clone(),
-                description: capability.safe_description.clone(),
-                parameters: capability.parameters_schema.clone(),
+            .filter_map(|(capability_id, capability)| {
+                if !provider_schema_is_usable(&capability.parameters_schema) {
+                    tracing::debug!(
+                        capability_id = capability_id.as_str(),
+                        "capability omitted from provider tool definitions because its parameter schema is not provider-usable"
+                    );
+                    return None;
+                }
+                Some(ProviderToolDefinition {
+                    capability_id: capability_id.clone(),
+                    name: capability.provider_tool_name.clone(),
+                    description: capability.safe_description.clone(),
+                    parameters: capability.parameters_schema.clone(),
+                })
             })
             .collect::<Vec<_>>();
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
@@ -581,6 +589,8 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             capability_id,
             input_ref,
             provider_replay: Some(ProviderToolCallReplay {
+                provider_id: tool_call.provider_id,
+                provider_model_id: tool_call.provider_model_id,
                 provider_turn_id,
                 provider_call_id: tool_call.id,
                 provider_tool_name: tool_call.name,
@@ -812,7 +822,7 @@ fn provider_tool_name(
     }
     let digest = sha256_digest_token(capability_id.as_str().as_bytes());
     let suffix = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let suffix = &suffix[..16];
+    let suffix = &suffix[..32];
     let prefix_len = 256usize.saturating_sub("__".len() + suffix.len());
     let prefix = base
         .char_indices()
@@ -824,6 +834,8 @@ fn provider_tool_name(
 }
 
 fn validate_provider_tool_call(tool_call: &ProviderToolCall) -> Result<(), AgentLoopHostError> {
+    validate_provider_identity(&tool_call.provider_id, "provider id", 512)?;
+    validate_provider_identity(&tool_call.provider_model_id, "provider model id", 512)?;
     if let Some(turn_id) = tool_call.turn_id.as_deref() {
         validate_provider_token(turn_id, "provider turn id", 512)?;
     }
@@ -847,6 +859,35 @@ fn validate_provider_tool_call(tool_call: &ProviderToolCall) -> Result<(), Agent
     )?;
     validate_optional_provider_text(&tool_call.reasoning, "provider reasoning", 4096)?;
     validate_optional_provider_text(&tool_call.signature, "provider signature", 4096)?;
+    Ok(())
+}
+
+fn validate_provider_identity(
+    value: &str,
+    label: &'static str,
+    max_len: usize,
+) -> Result<(), AgentLoopHostError> {
+    if value.trim().is_empty() {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            format!("{label} must not be empty"),
+        ));
+    }
+    if value.len() > max_len {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            format!("{label} exceeds {max_len} bytes"),
+        ));
+    }
+    if value
+        .chars()
+        .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            format!("{label} must not contain NUL/control characters"),
+        ));
+    }
     Ok(())
 }
 
@@ -1354,7 +1395,7 @@ mod tests {
 
         assert!(name.len() <= 256);
         let suffix = name.rsplit("__").next().expect("digest suffix");
-        assert_eq!(suffix.len(), 16);
+        assert_eq!(suffix.len(), 32);
         assert!(
             suffix
                 .chars()

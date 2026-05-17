@@ -1298,7 +1298,7 @@ async fn libsql_replace_state(
                     message_kind_key(message.kind),
                     message_status_key(message.status),
                     message.turn_run_id.clone(),
-                    to_json(message)?,
+                    to_message_json(message)?,
                 ],
             )
             .await
@@ -1518,7 +1518,7 @@ async fn postgres_replace_state(
             .await
             .map_err(db_error)?;
         for message in &thread.messages {
-            let payload = to_json(message)?;
+            let payload = to_message_json(message)?;
             client
                 .execute(
                     "INSERT INTO reborn_thread_message_records (message_id, thread_id, scope_key, sequence, kind, status, turn_run_id, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb)",
@@ -1809,6 +1809,25 @@ where
     T: Serialize,
 {
     serde_json::to_string(value)
+        .map_err(|error| SessionThreadError::Serialization(error.to_string()))
+}
+
+fn to_message_json(message: &ThreadMessageRecord) -> Result<String, SessionThreadError> {
+    let mut value = serde_json::to_value(message)
+        .map_err(|error| SessionThreadError::Serialization(error.to_string()))?;
+    if let Some(provider_call) = &message.tool_result_provider_call {
+        let provider_value = serde_json::to_value(provider_call)
+            .map_err(|error| SessionThreadError::Serialization(error.to_string()))?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| {
+                SessionThreadError::Serialization(
+                    "thread message payload was not a JSON object".to_string(),
+                )
+            })?
+            .insert("tool_result_provider_call".to_string(), provider_value);
+    }
+    serde_json::to_string(&value)
         .map_err(|error| SessionThreadError::Serialization(error.to_string()))
 }
 
