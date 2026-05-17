@@ -4635,6 +4635,7 @@ name = "ironclaw_reborn_composition"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "deadpool-postgres",
  "ironclaw_authorization",
  "ironclaw_extensions",
@@ -4643,6 +4644,7 @@ dependencies = [
  "ironclaw_host_runtime",
  "ironclaw_network",
  "ironclaw_processes",
+ "ironclaw_reborn",
  "ironclaw_reborn_event_store",
  "ironclaw_resources",
  "ironclaw_run_state",
