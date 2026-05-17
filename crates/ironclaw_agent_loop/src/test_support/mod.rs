@@ -201,7 +201,7 @@ pub enum MockHostCall {
         /// Result ref that was appended.
         result_ref: LoopResultRef,
         /// Provider call metadata linked to the result, when the model emitted the call.
-        provider_call: Option<ProviderToolCallReference>,
+        provider_call: Box<Option<ProviderToolCallReference>>,
     },
     /// A checkpoint metadata write was requested.
     SaveCheckpoint(CheckpointKind),
@@ -700,7 +700,7 @@ impl ironclaw_turns::run_profile::LoopTranscriptPort for MockAgentLoopDriverHost
     ) -> Result<LoopMessageRef, AgentLoopHostError> {
         self.record_call(MockHostCall::AppendCapabilityResultRef {
             result_ref: request.result_ref.clone(),
-            provider_call: request.provider_call.clone(),
+            provider_call: Box::new(request.provider_call.clone()),
         });
         Ok(loop_message_ref("msg:tool-result"))
     }

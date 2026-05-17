@@ -195,6 +195,7 @@ pub struct LlmProviderModelGateway<P>
 where
     P: LlmProvider + ?Sized,
 {
+    provider_id: String,
     provider: Arc<P>,
     policy: LlmModelProfilePolicy,
     provider_turn_sequence: Arc<AtomicU64>,
@@ -204,8 +205,13 @@ impl<P> LlmProviderModelGateway<P>
 where
     P: LlmProvider + ?Sized,
 {
-    pub fn new(provider: Arc<P>, policy: LlmModelProfilePolicy) -> Self {
+    pub fn new(
+        provider_id: impl Into<String>,
+        provider: Arc<P>,
+        policy: LlmModelProfilePolicy,
+    ) -> Self {
         Self {
+            provider_id: provider_id.into(),
             provider,
             policy,
             provider_turn_sequence: Arc::new(AtomicU64::new(1)),
@@ -235,8 +241,7 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let replay_identity =
-            ProviderReplayIdentity::new(self.provider.model_name(), model_override)?;
+        let replay_identity = ProviderReplayIdentity::new(&self.provider_id, model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override.to_string());
@@ -270,8 +275,7 @@ where
         let model_profile_id = request.model_profile_id.clone();
         let run_id = request.run_id;
         let turn_id = request.turn_id;
-        let replay_identity =
-            ProviderReplayIdentity::new(self.provider.model_name(), model_override)?;
+        let replay_identity = ProviderReplayIdentity::new(&self.provider_id, model_override)?;
         let mut completion =
             CompletionRequest::new(convert_messages(request.messages, &replay_identity)?);
         completion.model = Some(model_override.to_string());
