@@ -654,7 +654,7 @@ async fn thread_checkpoint_evidence_isolates_same_result_ref_across_runs() {
                 turn_id: TurnId::new(),
                 run_id,
                 reply_message_refs: &[],
-                result_refs: &[result_ref.clone()],
+                result_refs: std::slice::from_ref(&result_ref),
             })
             .await
             .expect("same result ref should verify only against same-run durable evidence");
