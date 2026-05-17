@@ -1,9 +1,35 @@
 use serde::{Deserialize, Serialize};
 
+const MAX_TOOL_RESULT_REF_BYTES: usize = 512;
+const MAX_TOOL_RESULT_SUMMARY_BYTES: usize = 512;
+const RAW_PAYLOAD_OR_PATH_DELIMITERS: [char; 9] = ['{', '}', '[', ']', '`', '<', '>', '/', '\\'];
+const SENSITIVE_SUMMARY_MARKERS: [&str; 18] = [
+    "access token",
+    "api key",
+    "api_key",
+    "apikey",
+    "authorization:",
+    "bearer ",
+    "host path",
+    "invalid api key",
+    "invalid_api_key",
+    "password",
+    "passwd",
+    "provider error",
+    "raw runtime",
+    "secret",
+    "stack trace",
+    "tool input",
+    "tool_input",
+    "traceback",
+];
+
 /// Safe summary text for tool-result transcript references.
 ///
-/// This mirrors the loop safe-summary policy because thread records can be
-/// replayed into model-visible context through the transcript adapters.
+/// Thread records can be replayed into model-visible context through transcript
+/// adapters, so this boundary rejects summaries that look like raw payloads,
+/// paths, stack traces, or credentials. The validator below is the canonical
+/// stored-content schema for this type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct ToolResultSafeSummary(String);
@@ -54,8 +80,10 @@ fn validate_tool_result_ref(value: &str) -> Result<(), String> {
     if !value.starts_with("result:") {
         return Err("tool result ref must start with result:".to_string());
     }
-    if value.len() > 512 {
-        return Err("tool result ref exceeds 512 bytes".to_string());
+    if value.len() > MAX_TOOL_RESULT_REF_BYTES {
+        return Err(format!(
+            "tool result ref exceeds {MAX_TOOL_RESULT_REF_BYTES} bytes"
+        ));
     }
     if !value.chars().all(|character| {
         character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
@@ -71,8 +99,10 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
     if value.is_empty() {
         return Err("tool result summary must not be empty".to_string());
     }
-    if value.len() > 512 {
-        return Err("tool result summary exceeds 512 bytes".to_string());
+    if value.len() > MAX_TOOL_RESULT_SUMMARY_BYTES {
+        return Err(format!(
+            "tool result summary exceeds {MAX_TOOL_RESULT_SUMMARY_BYTES} bytes"
+        ));
     }
     if value
         .chars()
@@ -80,44 +110,25 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
     {
         return Err("tool result summary must not contain NUL/control characters".to_string());
     }
-    if value.chars().any(|character| {
-        matches!(
-            character,
-            '{' | '}' | '[' | ']' | '`' | '<' | '>' | '/' | '\\'
-        )
-    }) {
+    if value
+        .chars()
+        .any(|character| RAW_PAYLOAD_OR_PATH_DELIMITERS.contains(&character))
+    {
         return Err(
             "tool result summary must not contain raw payload or path delimiters".to_string(),
         );
     }
 
     let lower = value.to_ascii_lowercase();
-    for forbidden in [
-        "access token",
-        "api key",
-        "api_key",
-        "apikey",
-        "authorization:",
-        "bearer ",
-        "host path",
-        "invalid api key",
-        "invalid_api_key",
-        "password",
-        "passwd",
-        "provider error",
-        "raw runtime",
-        "secret",
-        "stack trace",
-        "tool input",
-        "tool_input",
-        "traceback",
-    ] {
+    for forbidden in SENSITIVE_SUMMARY_MARKERS {
         if lower.contains(forbidden) {
             return Err(format!(
                 "tool result summary must not contain sensitive marker `{forbidden}`"
             ));
         }
     }
+    // Intentionally over-reject short `sk-...` tokens: opaque tool summaries
+    // are cheap to rephrase, while credential-shaped text is costly to persist.
     if lower
         .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
         .any(|token| token.starts_with("sk-"))
