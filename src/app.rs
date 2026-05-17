@@ -16,14 +16,14 @@ use crate::context::ContextManager;
 use crate::db::{Database, UserStore};
 use crate::extensions::ExtensionManager;
 use crate::hooks::HookRegistry;
-use crate::llm::recording::HttpInterceptor;
-use crate::llm::{LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager};
 use crate::secrets::SecretsStore;
 use crate::tools::ToolRegistry;
 use crate::tools::mcp::{McpProcessManager, McpSessionManager};
 use crate::tools::wasm::SharedCredentialRegistry;
 use crate::tools::wasm::WasmToolRuntime;
 use crate::workspace::{EmbeddingCacheConfig, EmbeddingProvider, Workspace};
+use ironclaw_llm::recording::HttpInterceptor;
+use ironclaw_llm::{LlmProvider, LlmReloadHandle, RecordingLlm, SessionManager};
 use ironclaw_safety::SafetyLayer;
 use ironclaw_skills::SkillRegistry;
 use ironclaw_skills::catalog::SkillCatalog;
@@ -229,8 +229,10 @@ impl AppBuilder {
             }
         }
 
+        let session_db: ironclaw_llm::host::SharedSessionDb =
+            std::sync::Arc::new(crate::llm_host::DatabaseSessionDb::new(db.clone()));
         self.session
-            .attach_store(db.clone(), &self.config.owner_id)
+            .attach_store(session_db, &self.config.owner_id)
             .await;
 
         // Fire-and-forget housekeeping — no need to block startup.
@@ -413,7 +415,10 @@ impl AppBuilder {
 
             // Wire the secrets store into the session manager so future
             // token saves go to encrypted storage.
-            self.session.attach_secrets(Arc::clone(secrets)).await;
+            let session_secrets: ironclaw_llm::host::SharedSessionSecrets = Arc::new(
+                crate::llm_host::SecretsStoreSessionSecrets::new(Arc::clone(secrets)),
+            );
+            self.session.attach_secrets(session_secrets).await;
         }
 
         self.secrets_store = store;
@@ -484,7 +489,7 @@ impl AppBuilder {
         anyhow::Error,
     > {
         let (llm, cheap_llm, recording_handle, reload_handle) =
-            crate::llm::build_provider_chain(&self.config.llm, self.session.clone()).await?;
+            ironclaw_llm::build_provider_chain(&self.config.llm, self.session.clone()).await?;
         Ok((llm, cheap_llm, recording_handle, reload_handle))
     }
 
@@ -651,13 +656,13 @@ impl AppBuilder {
                     .map(|p| p.model.clone())
                     .unwrap_or_else(|| self.config.llm.nearai.model.clone());
                 let models = vec![model_name.clone()];
-                let gen_model = crate::llm::image_models::suggest_image_model(&models)
+                let gen_model = ironclaw_llm::image_models::suggest_image_model(&models)
                     .unwrap_or("black-forest-labs/FLUX.2-klein-4B")
                     .to_string();
                 tools.register_image_tools(api_base.clone(), api_key.clone(), gen_model, None);
 
                 // Check for vision models
-                let vision_model = crate::llm::vision_models::suggest_vision_model(&models)
+                let vision_model = ironclaw_llm::vision_models::suggest_vision_model(&models)
                     .unwrap_or(&model_name)
                     .to_string();
                 tools.register_vision_tools(api_base, api_key, vision_model, None);
@@ -695,6 +700,7 @@ impl AppBuilder {
         tools: &Arc<ToolRegistry>,
         hooks: &Arc<HookRegistry>,
         settings_store_override: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
+        ownership_cache: Arc<crate::ownership::OwnershipCache>,
     ) -> Result<
         (
             Arc<McpSessionManager>,
@@ -989,6 +995,18 @@ impl AppBuilder {
             if let Some(ref ss) = settings_store_override {
                 em = em.with_settings_store(Arc::clone(ss));
             }
+            if let Some(ref db) = self.db {
+                let ps = Arc::new(crate::pairing::PairingStore::new(
+                    Arc::clone(db),
+                    Arc::clone(&ownership_cache),
+                ));
+                em = em.with_pairing_store(ps);
+            }
+            // Wire the Reborn Telegram v2 feature flag so the manager
+            // can reject hot-activation of the legacy `telegram` WASM
+            // channel when v2 owns the webhook installation (Henry's
+            // review on PR #3356 — startup guard alone is not enough).
+            em.set_reborn_telegram_v2_enabled(self.config.channels.reborn_telegram_v2_enabled);
             let manager = Arc::new(em);
             tools.register_extension_tools(Arc::clone(&manager));
 
@@ -1181,6 +1199,7 @@ impl AppBuilder {
             _ => (None, None),
         };
 
+        let ownership_cache = Arc::new(crate::ownership::OwnershipCache::new());
         let (
             mcp_session_manager,
             mcp_process_manager,
@@ -1189,7 +1208,12 @@ impl AppBuilder {
             catalog_entries,
             dev_loaded_tool_names,
         ) = self
-            .init_extensions(&tools, &hooks, settings_store.clone())
+            .init_extensions(
+                &tools,
+                &hooks,
+                settings_store.clone(),
+                Arc::clone(&ownership_cache),
+            )
             .await?;
 
         // Load bootstrap-completed flag from settings so that existing users
@@ -1333,7 +1357,7 @@ impl AppBuilder {
             catalog_entries,
             dev_loaded_tool_names,
             builder,
-            ownership_cache: Arc::new(crate::ownership::OwnershipCache::new()),
+            ownership_cache,
         })
     }
 }
@@ -1493,18 +1517,11 @@ async fn migrate_session_credential(
     }
 }
 
-/// Seed tool permission defaults into the database for every registered tool
-/// that has no explicit user override yet.
-///
-/// This is called once at startup after the full tool registry is built.
-/// It is idempotent: existing entries in `tool_permissions.*` are never touched.
 async fn seed_tool_permissions(
     tools: &crate::tools::ToolRegistry,
     db: Option<&Arc<dyn Database>>,
     owner_id: &str,
 ) {
-    use crate::tools::permissions::{TOOL_RISK_DEFAULTS, effective_permission};
-
     let db = match db {
         Some(db) => db,
         None => {
@@ -1532,11 +1549,9 @@ async fn seed_tool_permissions(
             continue;
         }
 
-        // Only insert if the tool appears in the static defaults table.
-        // Unknown/dynamic tools stay absent (they will fall back to AskEachTime
-        // at runtime via effective_permission) to avoid polluting the DB.
-        if TOOL_RISK_DEFAULTS.contains_key(name.as_str()) {
-            let default_state = effective_permission(name, &existing);
+        // Only insert seed defaults for known built-ins. Unknown/dynamic tools
+        // stay absent and fall back to AskEachTime at runtime.
+        if let Some(default_state) = crate::tools::permissions::seeded_default_permission(name) {
             let json_value = match serde_json::to_value(default_state) {
                 Ok(v) => v,
                 Err(e) => {

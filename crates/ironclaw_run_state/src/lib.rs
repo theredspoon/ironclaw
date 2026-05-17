@@ -3,10 +3,21 @@
 //! `ironclaw_run_state` stores the current lifecycle state for host-managed
 //! invocations. It is separate from runtime events: events are append-only
 //! history, while run state answers "what is this invocation waiting on now?".
+//! Feature-gated PostgreSQL and libSQL stores provide transactional durable
+//! backends for production composition; in-memory and filesystem stores remain
+//! useful for tests, local demos, and single-process profiles.
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod db;
+
+#[cfg(feature = "libsql")]
+pub use db::{LibSqlApprovalRequestStore, LibSqlRunStateApprovalStore, LibSqlRunStateStore};
+#[cfg(feature = "postgres")]
+pub use db::{PostgresApprovalRequestStore, PostgresRunStateApprovalStore, PostgresRunStateStore};
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 use async_trait::async_trait;
@@ -140,6 +151,8 @@ pub enum RunStateError {
     Serialization(String),
     #[error("deserialization error: {0}")]
     Deserialization(String),
+    #[error("run-state backend error: {0}")]
+    Backend(String),
 }
 
 impl From<FilesystemError> for RunStateError {
@@ -248,6 +261,22 @@ pub trait ApprovalRequestStore: Send + Sync {
         &self,
         scope: &ResourceScope,
     ) -> Result<Vec<ApprovalRecord>, RunStateError>;
+}
+
+/// Combined run-state + approval request store with an atomic approval-block transition.
+///
+/// Production composition should prefer this interface when the same durable backend
+/// owns both invocation state and approval records. It prevents a crash between
+/// `ApprovalRequestStore::save_pending` and `RunStateStore::block_approval` from
+/// leaving a user-actionable approval disconnected from a blocked run.
+#[async_trait]
+pub trait RunStateApprovalStore: RunStateStore + ApprovalRequestStore {
+    async fn save_pending_and_block_approval(
+        &self,
+        scope: ResourceScope,
+        invocation_id: InvocationId,
+        approval: ApprovalRequest,
+    ) -> Result<RunRecord, RunStateError>;
 }
 
 /// In-memory run-state store for tests and early host wiring.
@@ -512,7 +541,6 @@ where
     F: RootFilesystem,
 {
     filesystem: &'a F,
-    lock: tokio::sync::Mutex<()>,
 }
 
 impl<'a, F> FilesystemRunStateStore<'a, F>
@@ -520,10 +548,7 @@ where
     F: RootFilesystem,
 {
     pub fn new(filesystem: &'a F) -> Self {
-        Self {
-            filesystem,
-            lock: tokio::sync::Mutex::new(()),
-        }
+        Self { filesystem }
     }
 
     async fn write_record(&self, record: &RunRecord) -> Result<(), RunStateError> {
@@ -540,7 +565,9 @@ where
     F: RootFilesystem,
 {
     async fn start(&self, start: RunStart) -> Result<RunRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = run_record_path(&start.scope, start.invocation_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         if self.get(&start.scope, start.invocation_id).await?.is_some() {
             return Err(RunStateError::InvocationAlreadyExists {
                 invocation_id: start.invocation_id,
@@ -564,7 +591,9 @@ where
         invocation_id: InvocationId,
         approval: ApprovalRequest,
     ) -> Result<RunRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = run_record_path(scope, invocation_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         let mut record = self
             .get(scope, invocation_id)
             .await?
@@ -582,7 +611,9 @@ where
         invocation_id: InvocationId,
         error_kind: String,
     ) -> Result<RunRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = run_record_path(scope, invocation_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         let mut record = self
             .get(scope, invocation_id)
             .await?
@@ -599,7 +630,9 @@ where
         scope: &ResourceScope,
         invocation_id: InvocationId,
     ) -> Result<RunRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = run_record_path(scope, invocation_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         let mut record = self
             .get(scope, invocation_id)
             .await?
@@ -617,7 +650,9 @@ where
         invocation_id: InvocationId,
         error_kind: String,
     ) -> Result<RunRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = run_record_path(scope, invocation_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         let mut record = self
             .get(scope, invocation_id)
             .await?
@@ -683,7 +718,6 @@ where
     F: RootFilesystem,
 {
     filesystem: &'a F,
-    lock: tokio::sync::Mutex<()>,
 }
 
 impl<'a, F> FilesystemApprovalRequestStore<'a, F>
@@ -691,10 +725,7 @@ where
     F: RootFilesystem,
 {
     pub fn new(filesystem: &'a F) -> Self {
-        Self {
-            filesystem,
-            lock: tokio::sync::Mutex::new(()),
-        }
+        Self { filesystem }
     }
 
     async fn update_status(
@@ -703,7 +734,9 @@ where
         request_id: ApprovalRequestId,
         status: ApprovalStatus,
     ) -> Result<ApprovalRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = approval_record_path(scope, request_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         let mut record = self
             .get(scope, request_id)
             .await?
@@ -737,7 +770,9 @@ where
         scope: ResourceScope,
         request: ApprovalRequest,
     ) -> Result<ApprovalRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = approval_record_path(&scope, request.id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         if self.get(&scope, request.id).await?.is_some() {
             return Err(RunStateError::ApprovalRequestAlreadyExists {
                 request_id: request.id,
@@ -794,7 +829,9 @@ where
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        let _guard = self.lock.lock().await;
+        let path = approval_record_path(scope, request_id)?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
         let record = self
             .get(scope, request_id)
             .await?
@@ -867,6 +904,23 @@ fn approval_record_path(
 
 fn approval_records_root(scope: &ResourceScope) -> Result<VirtualPath, RunStateError> {
     VirtualPath::new(format!("{}/approvals", tenant_user_root(scope))).map_err(invalid_path)
+}
+
+type FilesystemRecordLock = Arc<tokio::sync::Mutex<()>>;
+
+static FILESYSTEM_RECORD_LOCKS: OnceLock<Mutex<HashMap<String, FilesystemRecordLock>>> =
+    OnceLock::new();
+
+fn filesystem_record_lock(path: &VirtualPath) -> FilesystemRecordLock {
+    let locks = FILESYSTEM_RECORD_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        guard
+            .entry(path.as_str().to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
 }
 
 fn tenant_user_root(scope: &ResourceScope) -> String {

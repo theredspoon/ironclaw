@@ -3212,7 +3212,7 @@ async fn preview_recorded_trace(options: PreviewOptions) -> anyhow::Result<()> {
             e
         )
     })?;
-    let recorded_trace: crate::llm::recording::TraceFile = serde_json::from_str(&raw_json)
+    let recorded_trace: ironclaw_llm::recording::TraceFile = serde_json::from_str(&raw_json)
         .map_err(|e| {
             anyhow::anyhow!(
                 "failed to parse recorded trace {}: {}",

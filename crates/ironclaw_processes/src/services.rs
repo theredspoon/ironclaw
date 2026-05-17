@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::FutureExt;
+use ironclaw_events::sanitize_error_kind;
 use ironclaw_filesystem::RootFilesystem;
-use ironclaw_host_api::{ProcessId, ResourceEstimate, ResourceScope};
+use ironclaw_host_api::{ProcessId, ResourceReservation, ResourceScope};
 
 use crate::cancellation::ProcessCancellationRegistry;
 use crate::filesystem_store::{FilesystemProcessResultStore, FilesystemProcessStore};
@@ -243,11 +244,13 @@ impl ProcessManager for BackgroundProcessManager {
             .as_ref()
             .map(|registry| registry.register(&record.scope, record.process_id))
             .unwrap_or_default();
-        let dispatch_estimate = if record.resource_reservation_id.is_some() {
-            ResourceEstimate::default()
-        } else {
-            record.estimated_resources.clone()
-        };
+        let resource_reservation = record
+            .resource_reservation_id
+            .map(|id| ResourceReservation {
+                id,
+                scope: record.scope.clone(),
+                estimate: record.estimated_resources.clone(),
+            });
         let request = ProcessExecutionRequest {
             process_id: record.process_id,
             invocation_id: record.invocation_id,
@@ -255,7 +258,9 @@ impl ProcessManager for BackgroundProcessManager {
             extension_id: record.extension_id.clone(),
             capability_id: record.capability_id.clone(),
             runtime: record.runtime,
-            estimate: dispatch_estimate,
+            estimate: record.estimated_resources.clone(),
+            mounts: record.mounts.clone(),
+            resource_reservation,
             input,
             cancellation,
         };
@@ -311,7 +316,7 @@ impl ProcessManager for BackgroundProcessManager {
                         }
                     }
                     Ok(Err(error)) => {
-                        let error_kind = error.kind;
+                        let error_kind = sanitize_error_kind(error.kind);
                         let result_persisted = if let Some(result_store) = &result_store {
                             match result_store
                                 .fail(&scope, process_id, error_kind.clone())

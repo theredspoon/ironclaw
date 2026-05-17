@@ -1,5 +1,12 @@
 use std::sync::{Arc, Mutex};
 
+use ironclaw_host_api::{
+    CapabilityId, NetworkMethod, NetworkPolicy, ResourceScope, RuntimeCredentialInjection,
+    RuntimeCredentialSource, RuntimeCredentialTarget, RuntimeHttpEgress, RuntimeHttpEgressError,
+    RuntimeHttpEgressRequest, RuntimeKind, SecretHandle, is_sensitive_runtime_response_header,
+};
+use serde_json::{Map, Value};
+
 use crate::WasmHostError;
 
 /// HTTP request shape exposed through the WIT `host.http-request` import.
@@ -83,6 +90,368 @@ impl WasmHostHttp for RecordingWasmHostHttp {
             .push(request);
         self.response.clone()
     }
+}
+
+/// Thin adapter from the WASM WIT HTTP import to the shared Reborn runtime
+/// egress service.
+///
+/// Host composition supplies scope, network policy, and a request-scoped
+/// credential provider. The WASM guest supplies only native request fields; this
+/// adapter does not create HTTP clients, resolve DNS, apply ad-hoc network
+/// policy, or inject credentials itself.
+#[derive(Debug, Clone)]
+pub struct WasmRuntimeHttpAdapter<E> {
+    egress: E,
+    scope: ResourceScope,
+    capability_id: CapabilityId,
+    network_policy: NetworkPolicy,
+    credential_provider: Arc<dyn WasmRuntimeCredentialProvider>,
+    policy_discarder: Arc<dyn WasmRuntimePolicyDiscarder>,
+    response_body_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmRuntimeCredentialRequest {
+    pub scope: ResourceScope,
+    pub capability_id: CapabilityId,
+    pub method: NetworkMethod,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+pub trait WasmRuntimeCredentialProvider: Send + Sync + std::fmt::Debug {
+    fn credential_injections(
+        &self,
+        request: &WasmRuntimeCredentialRequest,
+    ) -> Result<Vec<RuntimeCredentialInjection>, WasmHostError>;
+}
+
+pub trait WasmRuntimePolicyDiscarder: Send + Sync + std::fmt::Debug {
+    fn discard(&self, scope: &ResourceScope, capability_id: &CapabilityId);
+}
+
+#[derive(Debug, Default)]
+struct NoopWasmRuntimePolicyDiscarder;
+
+impl WasmRuntimePolicyDiscarder for NoopWasmRuntimePolicyDiscarder {
+    fn discard(&self, _scope: &ResourceScope, _capability_id: &CapabilityId) {}
+}
+
+#[derive(Debug, Default)]
+pub struct EmptyWasmRuntimeCredentials;
+
+impl WasmRuntimeCredentialProvider for EmptyWasmRuntimeCredentials {
+    fn credential_injections(
+        &self,
+        _request: &WasmRuntimeCredentialRequest,
+    ) -> Result<Vec<RuntimeCredentialInjection>, WasmHostError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Host-approved staged credential rule for one WASM HTTP request.
+///
+/// This type does not grant secret authority by itself. Host composition should
+/// build it only from already-authorized `InjectSecretOnce` obligations and
+/// destination/injection metadata that was validated outside the guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmStagedRuntimeCredential {
+    pub handle: SecretHandle,
+    pub target: RuntimeCredentialTarget,
+    pub required: bool,
+    exact_url: Option<String>,
+}
+
+impl WasmStagedRuntimeCredential {
+    pub fn for_any_request(
+        handle: SecretHandle,
+        target: RuntimeCredentialTarget,
+        required: bool,
+    ) -> Self {
+        Self {
+            handle,
+            target,
+            required,
+            exact_url: None,
+        }
+    }
+
+    pub fn for_exact_url(
+        handle: SecretHandle,
+        target: RuntimeCredentialTarget,
+        required: bool,
+        exact_url: String,
+    ) -> Self {
+        Self {
+            handle,
+            target,
+            required,
+            exact_url: Some(exact_url),
+        }
+    }
+
+    fn matches_request(&self, request: &WasmRuntimeCredentialRequest) -> bool {
+        match &self.exact_url {
+            Some(exact_url) => exact_url == &request.url,
+            None => true,
+        }
+    }
+}
+
+/// Concrete WASM credential provider for `InjectSecretOnce` handoffs.
+///
+/// The provider converts host-approved rules into staged-obligation runtime
+/// credential injections using the capability id attached to the adapter.
+#[derive(Debug, Clone, Default)]
+pub struct WasmStagedRuntimeCredentials {
+    credentials: Vec<WasmStagedRuntimeCredential>,
+}
+
+impl WasmStagedRuntimeCredentials {
+    pub fn new(credentials: Vec<WasmStagedRuntimeCredential>) -> Self {
+        Self { credentials }
+    }
+
+    pub fn credentials(&self) -> &[WasmStagedRuntimeCredential] {
+        &self.credentials
+    }
+}
+
+impl WasmRuntimeCredentialProvider for WasmStagedRuntimeCredentials {
+    fn credential_injections(
+        &self,
+        request: &WasmRuntimeCredentialRequest,
+    ) -> Result<Vec<RuntimeCredentialInjection>, WasmHostError> {
+        let matched = self
+            .credentials
+            .iter()
+            .filter(|credential| credential.matches_request(request))
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        Ok(matched
+            .into_iter()
+            .map(|credential| RuntimeCredentialInjection {
+                handle: credential.handle.clone(),
+                source: RuntimeCredentialSource::StagedObligation {
+                    capability_id: request.capability_id.clone(),
+                },
+                target: credential.target.clone(),
+                required: credential.required,
+            })
+            .collect())
+    }
+}
+
+impl<E> WasmRuntimeHttpAdapter<E>
+where
+    E: RuntimeHttpEgress,
+{
+    pub fn new(
+        egress: E,
+        scope: ResourceScope,
+        capability_id: CapabilityId,
+        network_policy: NetworkPolicy,
+    ) -> Self {
+        Self {
+            egress,
+            scope,
+            capability_id,
+            network_policy,
+            credential_provider: Arc::new(EmptyWasmRuntimeCredentials),
+            policy_discarder: Arc::new(NoopWasmRuntimePolicyDiscarder),
+            response_body_limit: None,
+        }
+    }
+
+    pub fn with_capability_id(mut self, capability_id: CapabilityId) -> Self {
+        self.capability_id = capability_id;
+        self
+    }
+
+    pub fn with_credential_provider(
+        mut self,
+        credential_provider: Arc<dyn WasmRuntimeCredentialProvider>,
+    ) -> Self {
+        self.credential_provider = credential_provider;
+        self
+    }
+
+    pub fn with_policy_discarder(
+        mut self,
+        policy_discarder: Arc<dyn WasmRuntimePolicyDiscarder>,
+    ) -> Self {
+        self.policy_discarder = policy_discarder;
+        self
+    }
+
+    pub fn with_response_body_limit(mut self, response_body_limit: Option<u64>) -> Self {
+        self.response_body_limit = response_body_limit;
+        self
+    }
+
+    fn discard_staged_policy(&self) {
+        self.policy_discarder
+            .discard(&self.scope, &self.capability_id);
+    }
+}
+
+impl<E> WasmHostHttp for WasmRuntimeHttpAdapter<E>
+where
+    E: RuntimeHttpEgress,
+{
+    fn request(&self, request: WasmHttpRequest) -> Result<WasmHttpResponse, WasmHostError> {
+        let method = match wasm_network_method(&request.method) {
+            Ok(method) => method,
+            Err(error) => {
+                self.discard_staged_policy();
+                return Err(error);
+            }
+        };
+        let headers = match decode_wasm_headers(&request.headers_json) {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.discard_staged_policy();
+                return Err(error);
+            }
+        };
+        let body = request.body.unwrap_or_default();
+        let credential_injections =
+            match self
+                .credential_provider
+                .credential_injections(&WasmRuntimeCredentialRequest {
+                    scope: self.scope.clone(),
+                    capability_id: self.capability_id.clone(),
+                    method,
+                    url: request.url.clone(),
+                    headers: headers.clone(),
+                }) {
+                Ok(injections) => injections,
+                Err(error) => {
+                    self.discard_staged_policy();
+                    return Err(wasm_credential_provider_error(error));
+                }
+            };
+
+        let response = self
+            .egress
+            .execute(RuntimeHttpEgressRequest {
+                runtime: RuntimeKind::Wasm,
+                scope: self.scope.clone(),
+                capability_id: self.capability_id.clone(),
+                method,
+                url: request.url,
+                headers,
+                body,
+                network_policy: self.network_policy.clone(),
+                credential_injections,
+                response_body_limit: self.response_body_limit,
+                timeout_ms: request.timeout_ms,
+            })
+            .map_err(wasm_http_error)?;
+
+        Ok(WasmHttpResponse {
+            status: response.status,
+            headers_json: encode_wasm_headers(response.headers)?,
+            body: response.body,
+        })
+    }
+}
+
+fn wasm_network_method(method: &str) -> Result<NetworkMethod, WasmHostError> {
+    match method.trim().to_ascii_uppercase().as_str() {
+        "GET" => Ok(NetworkMethod::Get),
+        "POST" => Ok(NetworkMethod::Post),
+        "PUT" => Ok(NetworkMethod::Put),
+        "PATCH" => Ok(NetworkMethod::Patch),
+        "DELETE" => Ok(NetworkMethod::Delete),
+        "HEAD" => Ok(NetworkMethod::Head),
+        _ => Err(WasmHostError::Denied(
+            "unsupported WASM HTTP method".to_string(),
+        )),
+    }
+}
+
+fn decode_wasm_headers(headers_json: &str) -> Result<Vec<(String, String)>, WasmHostError> {
+    let value = serde_json::from_str::<Value>(headers_json).map_err(|_| {
+        WasmHostError::Denied("WASM HTTP headers must be a JSON object".to_string())
+    })?;
+    let Some(headers) = value.as_object() else {
+        return Err(WasmHostError::Denied(
+            "WASM HTTP headers must be a JSON object".to_string(),
+        ));
+    };
+
+    let mut decoded = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let Some(value) = value.as_str() else {
+            return Err(WasmHostError::Denied(
+                "WASM HTTP header values must be strings".to_string(),
+            ));
+        };
+        decoded.push((name.clone(), value.to_string()));
+    }
+    Ok(decoded)
+}
+
+fn encode_wasm_headers(headers: Vec<(String, String)>) -> Result<String, WasmHostError> {
+    let mut encoded = Map::new();
+    for (name, value) in headers {
+        if is_sensitive_runtime_response_header(&name) {
+            continue;
+        }
+        if let Some(existing_name) = encoded
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(&name))
+            .cloned()
+            && let Some(Value::String(existing_value)) = encoded.get_mut(&existing_name)
+        {
+            existing_value.push_str(", ");
+            existing_value.push_str(&value);
+        } else {
+            encoded.insert(name, Value::String(value));
+        }
+    }
+    serde_json::to_string(&encoded)
+        .map_err(|_| WasmHostError::Failed("failed to encode WASM HTTP headers".to_string()))
+}
+
+fn wasm_http_error(error: RuntimeHttpEgressError) -> WasmHostError {
+    let request_was_sent = wasm_http_request_was_sent(&error);
+    let reason = wasm_http_error_reason(&error).to_string();
+    if request_was_sent {
+        return WasmHostError::FailedAfterRequestSent(reason);
+    }
+
+    match error {
+        RuntimeHttpEgressError::Credential { .. } => WasmHostError::Unavailable(reason),
+        RuntimeHttpEgressError::Request { .. } | RuntimeHttpEgressError::Network { .. } => {
+            WasmHostError::Denied(reason)
+        }
+        RuntimeHttpEgressError::Response { .. } => WasmHostError::Failed(reason),
+    }
+}
+
+fn wasm_http_request_was_sent(error: &RuntimeHttpEgressError) -> bool {
+    match error {
+        RuntimeHttpEgressError::Credential { .. } | RuntimeHttpEgressError::Request { .. } => false,
+        RuntimeHttpEgressError::Network {
+            request_bytes,
+            response_bytes,
+            ..
+        } => *request_bytes > 0 || *response_bytes > 0,
+        RuntimeHttpEgressError::Response { .. } => true,
+    }
+}
+
+fn wasm_http_error_reason(error: &RuntimeHttpEgressError) -> &'static str {
+    error.stable_runtime_reason()
+}
+
+fn wasm_credential_provider_error(_error: WasmHostError) -> WasmHostError {
+    WasmHostError::Unavailable("credential_unavailable".to_string())
 }
 
 pub trait WasmHostWorkspace: Send + Sync {

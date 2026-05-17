@@ -18,15 +18,17 @@ fn script_runtime_reserves_executes_and_reconciles_success() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_concurrency_slots: Some(1),
-            max_process_count: Some(10),
-            max_output_bytes: Some(10_000),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                max_process_count: Some(10),
+                max_output_bytes: Some(10_000),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let capability_id = CapabilityId::new("script.echo").unwrap();
 
     let execution = runtime
@@ -42,6 +44,7 @@ fn script_runtime_reserves_executes_and_reconciles_success() {
                     output_bytes: Some(10_000),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation {
                     input: json!({"message":"hello script", "command":"malicious override"}),
@@ -86,13 +89,15 @@ fn script_runtime_denies_budget_before_backend_execution() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_output_bytes: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_output_bytes: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let capability_id = CapabilityId::new("script.echo").unwrap();
 
     let err = runtime
@@ -106,6 +111,7 @@ fn script_runtime_denies_budget_before_backend_execution() {
                     output_bytes: Some(10_000),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation { input: json!({}) },
             },
@@ -130,13 +136,15 @@ fn script_runtime_releases_reservation_when_backend_exits_nonzero() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_concurrency_slots: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let capability_id = CapabilityId::new("script.echo").unwrap();
 
     let err = runtime
@@ -150,6 +158,7 @@ fn script_runtime_releases_reservation_when_backend_exits_nonzero() {
                     concurrency_slots: Some(1),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation { input: json!({}) },
             },
@@ -179,6 +188,7 @@ fn script_runtime_preserves_backend_error_when_release_cleanup_fails() {
                     concurrency_slots: Some(1),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation { input: json!({}) },
             },
@@ -206,13 +216,15 @@ fn script_runtime_releases_reservation_when_output_limit_fails() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_concurrency_slots: Some(1),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let capability_id = CapabilityId::new("script.echo").unwrap();
 
     let err = runtime
@@ -226,6 +238,7 @@ fn script_runtime_releases_reservation_when_output_limit_fails() {
                     concurrency_slots: Some(1),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation { input: json!({}) },
             },
@@ -244,13 +257,15 @@ fn script_runtime_rejects_non_script_package_before_reserving() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_concurrency_slots: Some(0),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(0),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let capability_id = CapabilityId::new("echo.say").unwrap();
 
     let err = runtime
@@ -264,6 +279,7 @@ fn script_runtime_rejects_non_script_package_before_reserving() {
                     concurrency_slots: Some(1),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation { input: json!({}) },
             },
@@ -282,13 +298,15 @@ fn script_runtime_rejects_undeclared_capability_before_reserving() {
     let governor = InMemoryResourceGovernor::new();
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_concurrency_slots: Some(0),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_concurrency_slots: Some(0),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let capability_id = CapabilityId::new("script.missing").unwrap();
 
     let err = runtime
@@ -302,6 +320,7 @@ fn script_runtime_rejects_undeclared_capability_before_reserving() {
                     concurrency_slots: Some(1),
                     ..ResourceEstimate::default()
                 },
+                mounts: None,
                 resource_reservation: None,
                 invocation: ScriptInvocation { input: json!({}) },
             },
@@ -355,8 +374,12 @@ impl ReleaseFailingGovernor {
 }
 
 impl ResourceGovernor for ReleaseFailingGovernor {
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits) {
-        self.inner.set_limit(account, limits);
+    fn set_limit(
+        &self,
+        account: ResourceAccount,
+        limits: ResourceLimits,
+    ) -> Result<(), ResourceError> {
+        self.inner.set_limit(account, limits)
     }
 
     fn reserve(

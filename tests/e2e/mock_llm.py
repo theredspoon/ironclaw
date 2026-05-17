@@ -147,6 +147,249 @@ TOOL_CALL_PATTERNS = [
             "body": {"label": m.group("label")},
         },
     ),
+    # Workflow-canary NL-driven routine creation: when a chat message
+    # carries the [CANARY-WORKFLOW-NL-CREATE] sentinel, emit a
+    # routine_create tool call so the canary can verify the agent's
+    # NL → tool dispatch → routine row pipeline.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-NL-CREATE\]", re.IGNORECASE),
+        "routine_create",
+        lambda _: {
+            "name": "canary-nl-created",
+            "prompt": (
+                "send a Telegram acknowledgement\n\n"
+                "[CANARY-WORKFLOW-nl_create] inner-prompt"
+            ),
+            "trigger_type": "cron",
+            "schedule": "0 */1 * * *",
+            "description": "canary: NL-driven routine creation",
+        },
+    ),
+    # Workflow-canary NL-driven schedule update: when a chat message
+    # carries [CANARY-WORKFLOW-NL-UPDATE], emit a routine_update tool
+    # call retargeting the canary's pre-seeded routine.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-NL-UPDATE\]", re.IGNORECASE),
+        "routine_update",
+        lambda _: {
+            "name": "canary-nl-update-target",
+            "schedule": "0 */6 * * *",
+        },
+    ),
+    # Workflow-canary Sheet-write side-effect probe. When a routine's
+    # Lightweight prompt carries [CANARY-WORKFLOW-SHEET-APPEND], emit
+    # an http POST to the mock Google Sheets API's values:append
+    # endpoint. The IRONCLAW_TEST_HTTP_REMAP set in
+    # run_workflow_canary.py routes sheets.googleapis.com to the local
+    # sheets_mock subprocess, which records the captured row for the
+    # scenario's assertion.
+    #
+    # Spreadsheet ID is hardcoded; the scenario pre-seeds the sheet
+    # with that ID + headers via /__mock/seed_spreadsheet.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-SHEET-APPEND\]", re.IGNORECASE),
+        "http",
+        lambda _: {
+            "method": "POST",
+            "url": (
+                "https://sheets.googleapis.com/v4/spreadsheets/"
+                "canary-bug-logger/values/Sheet1:append"
+                "?valueInputOption=USER_ENTERED"
+            ),
+            "body": {
+                "range": "Sheet1",
+                "majorDimension": "ROWS",
+                "values": [
+                    [
+                        "2026-04-28T00:00:00Z",
+                        "login button is unresponsive on mobile",
+                        "telegram",
+                    ]
+                ],
+            },
+        },
+    ),
+    # Workflow-canary Calendar events.list + prep summary. When a
+    # routine's Lightweight prompt carries [CANARY-WORKFLOW-CAL-LIST],
+    # emit a PARALLEL pair of http tool calls in one response:
+    #   1. GET events.list against the mock Calendar API
+    #   2. POST sendMessage with a prep briefing referencing the seeded
+    #      event title.
+    # IRONCLAW_TEST_HTTP_REMAP routes both: www.googleapis.com →
+    # calendar_mock, api.telegram.org → telegram_mock. Parallel emit is
+    # required because the engine's lightweight loop dedup
+    # (match_tool_call:1178-1179) skips re-dispatching the same tool —
+    # so a multi-step flow has to fan out in one response.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-CAL-LIST\]", re.IGNORECASE),
+        "http",
+        lambda _: [
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "GET",
+                    "url": (
+                        "https://www.googleapis.com/calendar/v3/calendars/"
+                        "primary/events?maxResults=10"
+                    ),
+                },
+            },
+            # Web-search lookup for the meeting attendee's company.
+            # Routes to web_search_mock via
+            # IRONCLAW_TEST_HTTP_REMAP=api.search.brave.com=<mock>.
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "GET",
+                    "url": (
+                        "https://api.search.brave.com/res/v1/web/search"
+                        "?q=Acme%20Corp%20company%20background"
+                    ),
+                },
+            },
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "POST",
+                    "url": (
+                        "https://api.telegram.org/bot111222333:CANARY/sendMessage"
+                    ),
+                    "body": {
+                        "chat_id": 8800800800,
+                        "text": (
+                            "[canary-workflow:calendar_prep] prep for "
+                            "'Canary kickoff with Acme' — Acme Corp is "
+                            "a fintech in Series B."
+                        ),
+                    },
+                },
+            },
+        ],
+    ),
+    # Workflow-canary Hacker News fetch + summary. [CANARY-WORKFLOW-HN-FETCH]
+    # emits a parallel pair: GET /newest (hn_mock returns deterministic
+    # HTML) + POST sendMessage with the canary post summary.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-HN-FETCH\]", re.IGNORECASE),
+        "http",
+        lambda _: [
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "GET",
+                    "url": "https://news.ycombinator.com/newest",
+                },
+            },
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "POST",
+                    "url": (
+                        "https://api.telegram.org/bot111222333:CANARY/sendMessage"
+                    ),
+                    "body": {
+                        "chat_id": 8800800800,
+                        "text": (
+                            "[canary-workflow:hn_monitor] new Show HN posts: "
+                            "Show HN: Canary Post Alpha "
+                            "(https://example.com/alpha by canary_alpha); "
+                            "Show HN: Canary Post Beta "
+                            "(https://example.com/beta by canary_beta)"
+                        ),
+                    },
+                },
+            },
+        ],
+    ),
+    # Workflow-canary CRM tracker: gmail unread → classify → append
+    # only sales leads to Sheets. [CANARY-WORKFLOW-CRM-CLASSIFY] emits
+    # a parallel triplet: mock Gmail GET messages, mock Sheets POST
+    # values:append for the lead, telegram sendMessage acking the run.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-CRM-CLASSIFY\]", re.IGNORECASE),
+        "http",
+        lambda _: [
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "GET",
+                    "url": (
+                        "https://gmail.googleapis.com/gmail/v1/users/me/"
+                        "messages?q=is:unread"
+                    ),
+                },
+            },
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "POST",
+                    "url": (
+                        "https://sheets.googleapis.com/v4/spreadsheets/"
+                        "canary-crm-tracker/values/Sheet1:append"
+                        "?valueInputOption=USER_ENTERED"
+                    ),
+                    "body": {
+                        "range": "Sheet1",
+                        "majorDimension": "ROWS",
+                        "values": [
+                            [
+                                "Acme Corp",
+                                "Jane Lead",
+                                "jane.lead@acme.example",
+                                "new",
+                                "Inbound interest in enterprise tier",
+                                "schedule discovery call",
+                            ]
+                        ],
+                    },
+                },
+            },
+            {
+                "tool_name": "http",
+                "arguments": {
+                    "method": "POST",
+                    "url": (
+                        "https://api.telegram.org/bot111222333:CANARY/sendMessage"
+                    ),
+                    "body": {
+                        "chat_id": 8800800800,
+                        "text": (
+                            "[canary-workflow:crm_tracker] logged 1 new "
+                            "lead from Acme Corp"
+                        ),
+                    },
+                },
+            },
+        ],
+    ),
+    # Default workflow-canary scenarios tag their routine prompt with
+    # [CANARY-WORKFLOW-<key>] so this matcher emits a deterministic
+    # `http` tool call that reaches mock_telegram via
+    # IRONCLAW_TEST_HTTP_REMAP=api.telegram.org=<mock>. The chat_id is
+    # the canary's simulated test user (mock_telegram DEFAULT_USER_ID).
+    # The text echoes the scenario key so the scenario can disambiguate
+    # which message belongs to it when the mock_telegram is shared
+    # across the workflow-canary lane's probes.
+    #
+    # Important: this generic matcher must come AFTER the specific
+    # NL-CREATE / NL-UPDATE matchers above. mock_llm.py iterates
+    # TOOL_CALL_PATTERNS in order and stops at the first match —
+    # without ordering, [CANARY-WORKFLOW-nl_create] inside a routine
+    # PROMPT would emit an http tool call instead of routine_create.
+    (
+        re.compile(r"\[CANARY-WORKFLOW-(?P<key>[a-z_0-9]+)\]", re.IGNORECASE),
+        "http",
+        lambda m: {
+            "method": "POST",
+            "url": (
+                "https://api.telegram.org/bot111222333:CANARY/sendMessage"
+            ),
+            "body": {
+                "chat_id": 8800800800,
+                "text": f"[canary-workflow:{m.group('key').lower()}] ack",
+            },
+        },
+    ),
     (
         re.compile(r"check gmail unread|gmail unread", re.IGNORECASE),
         "gmail",
@@ -2094,6 +2337,111 @@ async def mcp_oauth_token(request: web.Request) -> web.Response:
     })
 
 
+# ── Gmail API mocks (#3133 / #3166) ──────────────────────────────────────
+#
+# Per-app counters that the e2e test for the mission auto-resume path
+# inspects to confirm the gmail WASM tool actually fired against this
+# mock (rather than hitting the real Gmail API or silently no-oping).
+# Stored in `app["gmail_state"]` so each mock_llm instance owns its own
+# counters.
+
+
+def _new_gmail_state() -> dict:
+    return {
+        "drafts_created": 0,
+        "messages_sent": 0,
+        "messages_listed": 0,
+        "last_draft": None,
+        "last_send": None,
+    }
+
+
+async def gmail_create_draft(request: web.Request) -> web.Response:
+    """POST /gmail/v1/users/me/drafts — minimal create-draft mock.
+
+    Maps from the gmail WASM tool's `create_draft` action. The request
+    body shape mirrors the real Gmail API: `{"message": {"raw": "..."}}`.
+    Returns a deterministic draft id so the agent can quote it back.
+    """
+    body = await request.json()
+    state = request.app["gmail_state"]
+    state["drafts_created"] += 1
+    state["last_draft"] = body
+    draft_id = f"mock-draft-{state['drafts_created']}"
+    return web.json_response({
+        "id": draft_id,
+        "message": {
+            "id": f"mock-msg-{state['drafts_created']}",
+            "threadId": f"mock-thread-{state['drafts_created']}",
+            "labelIds": ["DRAFT"],
+        },
+    })
+
+
+async def gmail_send_message(request: web.Request) -> web.Response:
+    """POST /gmail/v1/users/me/messages/send — minimal send mock.
+
+    Maps from the gmail WASM tool's `send_message` and `reply_to_message`
+    actions. Returns the same shape Google does: `{id, threadId, labelIds}`.
+    """
+    body = await request.json()
+    state = request.app["gmail_state"]
+    state["messages_sent"] += 1
+    state["last_send"] = body
+    msg_id = f"mock-msg-{state['messages_sent']}"
+    return web.json_response({
+        "id": msg_id,
+        "threadId": body.get("threadId") or f"mock-thread-{state['messages_sent']}",
+        "labelIds": ["SENT"],
+    })
+
+
+async def gmail_list_messages(request: web.Request) -> web.Response:
+    """GET /gmail/v1/users/me/messages — minimal list mock.
+
+    Returns one canned message id so the agent has something to quote
+    back. The list endpoint only returns ids; the gmail WASM tool then
+    fetches metadata for each, which we serve from `gmail_get_message`.
+    """
+    state = request.app["gmail_state"]
+    state["messages_listed"] += 1
+    return web.json_response({
+        "messages": [{"id": "mock-canned-msg-1", "threadId": "mock-canned-thread-1"}],
+        "resultSizeEstimate": 1,
+    })
+
+
+async def gmail_get_message(request: web.Request) -> web.Response:
+    """GET /gmail/v1/users/me/messages/{id} — minimal get-message mock."""
+    msg_id = request.match_info["id"]
+    return web.json_response({
+        "id": msg_id,
+        "threadId": "mock-canned-thread-1",
+        "labelIds": ["INBOX", "UNREAD"],
+        "snippet": "Mock canned snippet for the e2e test",
+        "payload": {
+            "headers": [
+                {"name": "From", "value": "test@example.com"},
+                {"name": "To", "value": "owner@example.com"},
+                {"name": "Subject", "value": "Mock canned subject"},
+                {"name": "Date", "value": "Mon, 1 Jan 2026 00:00:00 +0000"},
+            ],
+            "body": {"data": ""},
+        },
+    })
+
+
+async def gmail_state_handler(request: web.Request) -> web.Response:
+    """GET /__mock/gmail/state — read the gmail counters in tests."""
+    return web.json_response(request.app["gmail_state"])
+
+
+async def gmail_state_reset(request: web.Request) -> web.Response:
+    """POST /__mock/gmail/reset — clear counters between tests."""
+    request.app["gmail_state"] = _new_gmail_state()
+    return web.json_response({"ok": True})
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=0)
@@ -2101,6 +2449,7 @@ def main():
     app = web.Application()
     app["oauth_state"] = _new_oauth_state()
     app["mcp_state"] = _new_mcp_state()
+    app["gmail_state"] = _new_gmail_state()
     # Register both /v1/ and non-/v1/ paths (rig-core omits the /v1/ prefix)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_post("/chat/completions", chat_completions)
@@ -2137,6 +2486,14 @@ def main():
     app.router.add_get("/.well-known/oauth-authorization-server/{tail:.*}", mcp_auth_server_metadata)
     app.router.add_post("/oauth/register", mcp_oauth_register)
     app.router.add_post("/oauth/token", mcp_oauth_token)
+    # Gmail API mocks (consumed by the WASM gmail tool when
+    # IRONCLAW_TEST_HTTP_REWRITE_MAP routes gmail.googleapis.com here).
+    app.router.add_post("/gmail/v1/users/me/drafts", gmail_create_draft)
+    app.router.add_post("/gmail/v1/users/me/messages/send", gmail_send_message)
+    app.router.add_get("/gmail/v1/users/me/messages", gmail_list_messages)
+    app.router.add_get("/gmail/v1/users/me/messages/{id}", gmail_get_message)
+    app.router.add_get("/__mock/gmail/state", gmail_state_handler)
+    app.router.add_post("/__mock/gmail/reset", gmail_state_reset)
 
     async def start():
         runner = web.AppRunner(app)

@@ -38,6 +38,8 @@ SecretLease
 SecretStoreError
 SecretStore
 InMemorySecretStore
+LibSqlSecretsStore     // durable backend when the libsql feature is enabled
+PostgresSecretsStore   // durable backend when the postgres feature is enabled
 ```
 
 `SecretMaterial` is backed by `secrecy::SecretString`, so access to raw values is explicit through `ExposeSecret`. Metadata, lease records, and errors never contain raw values.
@@ -48,8 +50,8 @@ Ownership remains:
 host_api       -> opaque SecretHandle and Action::UseSecret shapes
 secrets        -> scoped storage, metadata, and one-shot leases
 authorization  -> whether a caller may use a SecretHandle
-capabilities   -> caller-facing workflow; currently fails closed on InjectSecretOnce obligations
-host_runtime   -> shared runtime HTTP egress composition that leases, injects, and redacts secrets for host-mediated requests
+capabilities   -> caller-facing workflow; fails closed on InjectSecretOnce unless an obligation handler is configured
+host_runtime   -> built-in obligation handler leases/stages one-shot secret material and shared runtime HTTP egress injects/redacts secrets for host-mediated requests
 runtimes        -> consume injected values only after host-side authorization and lease handling
 ```
 
@@ -87,6 +89,8 @@ let material = secrets.consume(&scope, lease.id).await?;
 
 `SecretStore::put(...)` is for trusted setup, composition, migration, or storage-code paths that are already allowed to manage secret material. It is not a runtime/plugin API, and it intentionally does not perform authorization itself.
 
+Durable libSQL/PostgreSQL stores persist only encrypted values and per-row salts in `reborn_secret_records`; names, providers, expiry, and usage metadata remain queryable. Store readiness must fail closed when the configured master key is missing, malformed, cannot decrypt existing rows, or loses a first-boot key-check race to another process with a different key. Bootstrap inserts of the `reborn_secret_store_key_check` sentinel must re-read and decrypt the committed row before reporting ready.
+
 The shared Reborn runtime HTTP egress service uses this surface to:
 
 - check metadata for required or optional credential handles
@@ -109,11 +113,25 @@ must derive it only after proving:
 - the final request still passes the network policy boundary
 
 The shared egress service intentionally does not perform that authorization
-decision; it consumes the already-approved injection plan, leases the material
-once, injects it, redacts it, and fails closed when a required credential is
-unavailable. Runtime callers must not supply their own `Authorization`, cookie,
-or API-key-style headers; those values must come from the host-approved
-injection plan.
+decision; it consumes the already-approved injection plan, injects it, redacts
+it, and fails closed when a required credential is unavailable. Injection plans
+also declare a material source: `SecretStoreLease` leases and consumes directly
+from `SecretStore`, while `StagedObligation { capability_id }` consumes material
+that `BuiltinObligationHandler` already leased, consumed, and staged in
+`RuntimeSecretInjectionStore`. Runtime adapters that use the staged source must
+not lease the same handle independently; `HostHttpEgressService` removes staged
+material with `take(scope, capability_id, handle)` before outbound transport so
+the value cannot be reused after success, failure, or runtime-visible errors.
+Staged entries also expire after the store TTL (five minutes by default) and
+expired material is pruned during insertion, `take(...)`, and explicit
+`prune_expired(...)` calls. If one approved request plan injects the same
+source+handle into multiple targets, the egress service consumes or leases the
+material once and reuses it only within that request. Runtime callers must not
+supply their own `Authorization`, cookie, or API-key-style headers; those values
+must come from the host-approved injection plan. WASM host-mediated HTTP
+composition can construct staged plans with `WasmStagedRuntimeCredentials` after
+attaching the invoking capability id to the adapter; exact-url rules should be
+preferred when a credential is only valid for specific destinations.
 
 ---
 
@@ -121,7 +139,6 @@ injection plan.
 
 This slice does not implement:
 
-- durable encrypted secret persistence
 - platform keychain integration
 - secret rotation/versioning
 - secret audit emission
@@ -145,4 +162,6 @@ The crate tests cover:
 - consumed and revoked lease records drop retained secret material
 - revoked leases cannot be consumed
 - missing secrets fail without creating leases
+- durable libSQL/PostgreSQL stores keep raw material encrypted at rest
+- durable key-check readiness rejects wrong, malformed, or concurrently conflicting master keys
 - crate boundary remains low-level and does not depend on workflow/runtime/observability crates

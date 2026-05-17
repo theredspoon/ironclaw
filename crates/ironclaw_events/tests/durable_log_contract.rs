@@ -6,10 +6,10 @@
 //! constructors, and best-effort sink delivery.
 
 use ironclaw_events::{
-    AuditSink, DurableAuditLog, DurableEventLog, EventCursor, EventError, EventSink,
-    EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog, InMemoryDurableEventLog,
-    InMemoryEventSink, ReadScope, RuntimeEvent, RuntimeEventKind, parse_jsonl, replay_jsonl,
-    sanitize_error_kind,
+    AuditSink, DurableAuditLog, DurableAuditSink, DurableEventLog, DurableEventSink, EventCursor,
+    EventError, EventSink, EventStreamKey, InMemoryAuditSink, InMemoryDurableAuditLog,
+    InMemoryDurableEventLog, InMemoryEventSink, ReadScope, RuntimeEvent, RuntimeEventKind,
+    parse_jsonl, replay_jsonl, sanitize_error_kind,
 };
 use ironclaw_host_api::{
     Action, ActionSummary, AgentId, ApprovalRequest, ApprovalRequestId, AuditEnvelope,
@@ -550,6 +550,36 @@ async fn best_effort_event_sink_records_emit_calls() {
 }
 
 #[tokio::test]
+async fn durable_event_sink_appends_emit_calls_to_durable_log() {
+    let log = std::sync::Arc::new(InMemoryDurableEventLog::new());
+    let sink = DurableEventSink::new(log.clone());
+    let scope = local_scope("alice", Some("default"));
+
+    sink.emit(RuntimeEvent::dispatch_requested(
+        scope.clone(),
+        capability_id(),
+    ))
+    .await
+    .expect("emit through durable sink");
+
+    let replay = log
+        .read_after_cursor(
+            &EventStreamKey::from_scope(&scope),
+            &ReadScope::any(),
+            None,
+            10,
+        )
+        .await
+        .expect("replay durable event sink append");
+    assert_eq!(replay.entries.len(), 1);
+    assert_eq!(replay.entries[0].cursor, EventCursor::new(1));
+    assert_eq!(
+        replay.entries[0].record.kind,
+        RuntimeEventKind::DispatchRequested
+    );
+}
+
+#[tokio::test]
 async fn durable_audit_log_appends_and_replays() {
     let log = InMemoryDurableAuditLog::new();
     let scope = local_scope("alice", Some("default"));
@@ -731,6 +761,48 @@ async fn best_effort_audit_sink_captures_records() {
 }
 
 #[tokio::test]
+async fn durable_audit_sink_appends_records_to_durable_log() {
+    let log = std::sync::Arc::new(InMemoryDurableAuditLog::new());
+    let sink = DurableAuditSink::new(log.clone());
+    let scope = local_scope("alice", Some("default"));
+    let ctx = ExecutionContext::local_default(
+        scope.user_id.clone(),
+        extension_id(),
+        RuntimeKind::Wasm,
+        ironclaw_host_api::TrustClass::FirstParty,
+        Default::default(),
+        MountView::default(),
+    )
+    .expect("local default execution context");
+    let record = AuditEnvelope::denied(
+        &ctx,
+        ironclaw_host_api::AuditStage::Denied,
+        ActionSummary::from_action(&Action::Dispatch {
+            capability: capability_id(),
+            estimated_resources: ResourceEstimate::default(),
+        }),
+        DenyReason::PolicyDenied,
+    );
+
+    sink.emit_audit(record)
+        .await
+        .expect("audit emit through durable sink");
+
+    let replay = log
+        .read_after_cursor(
+            &EventStreamKey::from_scope(&scope),
+            &ReadScope::any(),
+            None,
+            10,
+        )
+        .await
+        .expect("replay durable audit sink append");
+    assert_eq!(replay.entries.len(), 1);
+    assert_eq!(replay.entries[0].cursor, EventCursor::new(1));
+    assert_eq!(replay.entries[0].record.decision.kind, "deny");
+}
+
+#[tokio::test]
 async fn parse_jsonl_round_trips_runtime_events() {
     let scope = local_scope("alice", Some("default"));
     let event = RuntimeEvent::dispatch_requested(scope, capability_id());
@@ -780,6 +852,19 @@ async fn replay_jsonl_with_zero_limit_is_rejected() {
         result,
         Err(EventError::InvalidReplayRequest { .. })
     ));
+}
+
+#[tokio::test]
+async fn replay_jsonl_rejects_malformed_line_rather_than_silently_skipping() {
+    let scope = local_scope("alice", Some("default"));
+    let event = RuntimeEvent::dispatch_requested(scope, capability_id());
+    let mut bytes = serde_json::to_vec(&event).expect("serialize event");
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"something not even json\n");
+
+    let result: Result<ironclaw_events::EventReplay<RuntimeEvent>, _> =
+        replay_jsonl(&bytes, None, 1);
+    assert!(matches!(result, Err(EventError::Serialize { .. })));
 }
 
 #[tokio::test]

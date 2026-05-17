@@ -28,13 +28,13 @@ mod tests {
     use ironclaw::db::{Database, libsql::LibSqlBackend};
     use ironclaw::extensions::ExtensionManager;
     use ironclaw::hooks::HookRegistry;
-    use ironclaw::llm::LlmProvider;
     use ironclaw::secrets::{InMemorySecretsStore, SecretsCrypto, SecretsStore};
     use ironclaw::tools::builtin::routine::RoutineUpdateTool;
     use ironclaw::tools::mcp::{McpProcessManager, McpSessionManager};
     use ironclaw::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput, ToolRegistry};
     use ironclaw::workspace::Workspace;
     use ironclaw::workspace::hygiene::HygieneConfig;
+    use ironclaw_llm::LlmProvider;
     use ironclaw_safety::SafetyLayer;
 
     use crate::support::trace_llm::{LlmTrace, TraceLlm, TraceResponse, TraceStep, TraceToolCall};
@@ -358,6 +358,7 @@ mod tests {
             registry,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ))
     }
 
@@ -489,6 +490,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert a cron routine with next_fire_at in the past.
@@ -568,6 +570,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert an event routine matching "deploy.*production".
@@ -648,6 +651,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         let routine = make_routine(
@@ -755,6 +759,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         let mut filters = std::collections::HashMap::new();
@@ -898,6 +903,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert an event routine with 1-hour cooldown.
@@ -1073,6 +1079,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         (engine, db, dir)
@@ -1195,6 +1202,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Create a full_job routine with max_concurrent = 1
@@ -1303,6 +1311,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert a due cron routine

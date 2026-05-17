@@ -8,12 +8,13 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{NetworkMethod, NetworkPolicy, ResourceScope, RuntimeKind, SecretHandle};
+use crate::{CapabilityId, NetworkMethod, NetworkPolicy, ResourceScope, RuntimeKind, SecretHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpEgressRequest {
     pub runtime: RuntimeKind,
     pub scope: ResourceScope,
+    pub capability_id: CapabilityId,
     pub method: NetworkMethod,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -28,6 +29,9 @@ pub struct RuntimeHttpEgressRequest {
     /// shape before this request reaches [`RuntimeHttpEgress`].
     pub credential_injections: Vec<RuntimeCredentialInjection>,
     pub response_body_limit: Option<u64>,
+    /// Host-call timeout in milliseconds, already capped by the invoking
+    /// runtime to its remaining execution deadline when applicable.
+    pub timeout_ms: Option<u32>,
 }
 
 /// One host-approved credential injection.
@@ -39,8 +43,27 @@ pub struct RuntimeHttpEgressRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCredentialInjection {
     pub handle: SecretHandle,
+    #[serde(default)]
+    pub source: RuntimeCredentialSource,
     pub target: RuntimeCredentialTarget,
     pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum RuntimeCredentialSource {
+    /// Lease and consume material directly from the scoped secret store.
+    ///
+    /// This remains the compatibility path for host-derived credentials that
+    /// are not backed by an already-satisfied authorization obligation.
+    #[default]
+    SecretStoreLease,
+    /// Consume material staged by an `InjectSecretOnce` obligation handler.
+    ///
+    /// The host egress service must call `RuntimeSecretInjectionStore::take`
+    /// with the request scope, this capability id, and the credential handle;
+    /// it must not lease the same secret independently from the secret store.
+    StagedObligation { capability_id: CapabilityId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +130,74 @@ impl RuntimeHttpEgressError {
             | Self::Response { response_bytes, .. } => *response_bytes,
         }
     }
+
+    /// Stable reason token safe to expose to runtime/plugin callers.
+    pub fn stable_runtime_reason(&self) -> &'static str {
+        match self {
+            Self::Credential { .. } => "credential_unavailable",
+            Self::Request { .. } => "request_denied",
+            Self::Network { .. } => "network_error",
+            Self::Response { .. } => "response_error",
+        }
+    }
+}
+
+pub fn is_sensitive_runtime_request_header(name: &str) -> bool {
+    const SENSITIVE_REQUEST_HEADERS: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-token",
+        "x-access-token",
+        "x-session-token",
+        "x-csrf-token",
+        "x-secret",
+        "x-api-secret",
+    ];
+    SENSITIVE_REQUEST_HEADERS
+        .iter()
+        .any(|header| name.trim().eq_ignore_ascii_case(header))
+}
+
+pub fn is_sensitive_runtime_response_header(name: &str) -> bool {
+    const SENSITIVE_RESPONSE_HEADERS: &[&str] = &[
+        "authorization",
+        "www-authenticate",
+        "set-cookie",
+        "cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-token",
+        "x-access-token",
+        "x-session-token",
+        "x-csrf-token",
+        "x-secret",
+        "x-api-secret",
+        "proxy-authenticate",
+        "proxy-authorization",
+    ];
+    const SENSITIVE_RESPONSE_HEADER_MARKERS: &[&str] = &[
+        "auth",
+        "token",
+        "secret",
+        "credential",
+        "password",
+        "cookie",
+        "api-key",
+        "apikey",
+        "api_key",
+    ];
+    let normalized = name.trim().to_ascii_lowercase();
+    SENSITIVE_RESPONSE_HEADERS
+        .iter()
+        .any(|header| normalized == *header)
+        || SENSITIVE_RESPONSE_HEADER_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
 }
 
 pub trait RuntimeHttpEgress: Send + Sync {

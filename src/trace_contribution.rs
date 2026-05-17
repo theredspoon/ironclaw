@@ -26,8 +26,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
-use crate::llm::recording::{TraceFile, TraceResponse};
 use crate::tools::redaction::redact_sensitive_json;
+use ironclaw_llm::recording::{TraceFile, TraceResponse};
 
 pub const TRACE_CONTRIBUTION_SCHEMA_VERSION: &str = "ironclaw.trace_contribution.v1";
 pub const TRACE_CONTRIBUTION_POLICY_VERSION: &str = "2026-04-24";
@@ -7060,7 +7060,7 @@ fn trace_queue_telemetry_failure_kind(error: &anyhow::Error) -> TraceQueueTeleme
         if let Some(remote_failure) = cause.downcast_ref::<TraceRemoteRequestFailure>() {
             return remote_failure.kind;
         }
-        if let Some(llm_error) = cause.downcast_ref::<crate::llm::error::LlmError>()
+        if let Some(llm_error) = cause.downcast_ref::<ironclaw_llm::error::LlmError>()
             && let Some(kind) = trace_queue_telemetry_failure_kind_for_llm_error(llm_error)
         {
             return kind;
@@ -7124,18 +7124,18 @@ fn trace_queue_telemetry_failure_kind(error: &anyhow::Error) -> TraceQueueTeleme
 }
 
 fn trace_queue_telemetry_failure_kind_for_llm_error(
-    error: &crate::llm::error::LlmError,
+    error: &ironclaw_llm::error::LlmError,
 ) -> Option<TraceQueueTelemetryFailureKind> {
     match error {
-        crate::llm::error::LlmError::AuthFailed { .. }
-        | crate::llm::error::LlmError::SessionExpired { .. }
-        | crate::llm::error::LlmError::SessionRenewalFailed { .. } => {
+        ironclaw_llm::error::LlmError::AuthFailed { .. }
+        | ironclaw_llm::error::LlmError::SessionExpired { .. }
+        | ironclaw_llm::error::LlmError::SessionRenewalFailed { .. } => {
             Some(TraceQueueTelemetryFailureKind::Credential)
         }
-        crate::llm::error::LlmError::RateLimited { .. } => {
+        ironclaw_llm::error::LlmError::RateLimited { .. } => {
             Some(TraceQueueTelemetryFailureKind::HttpRejection)
         }
-        crate::llm::error::LlmError::RequestFailed { .. } => {
+        ironclaw_llm::error::LlmError::RequestFailed { .. } => {
             Some(TraceQueueTelemetryFailureKind::Network)
         }
         _ => None,
@@ -7543,8 +7543,8 @@ fn scope_hash(scope: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::recording::{TraceStep, TraceToolCall};
     use base64::Engine;
+    use ironclaw_llm::recording::{TraceStep, TraceToolCall};
 
     #[test]
     fn trace_policy_preflight_gates_queue_and_submit_intents() {
@@ -11463,13 +11463,13 @@ mod tests {
         let now = Utc::now();
         let cases = [
             (
-                anyhow::Error::from(crate::llm::error::LlmError::AuthFailed {
+                anyhow::Error::from(ironclaw_llm::error::LlmError::AuthFailed {
                     provider: "trace-secret-provider".to_string(),
                 }),
                 TraceQueueTelemetryFailureKind::Credential,
             ),
             (
-                anyhow::Error::from(crate::llm::error::LlmError::SessionExpired {
+                anyhow::Error::from(ironclaw_llm::error::LlmError::SessionExpired {
                     provider: "trace-secret-provider".to_string(),
                 }),
                 TraceQueueTelemetryFailureKind::Credential,

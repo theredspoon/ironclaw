@@ -235,6 +235,42 @@ async fn background_process_manager_stores_success_output_result() {
 }
 
 #[tokio::test]
+async fn process_stores_sanitize_failure_error_kind_before_persistence() {
+    let scope = sample_scope(InvocationId::new(), "tenant1", "user1");
+    let process_id = ProcessId::new();
+    let lifecycle_store = InMemoryProcessStore::new();
+    lifecycle_store
+        .start(process_start(
+            process_id,
+            scope.invocation_id,
+            scope.clone(),
+        ))
+        .await
+        .unwrap();
+
+    let failed = lifecycle_store
+        .fail(
+            &scope,
+            process_id,
+            "RAW_PROCESS_ERROR_SENTINEL_3022 /tmp/private-process sk_live".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.error_kind.as_deref(), Some("Unclassified"));
+
+    let result_store = InMemoryProcessResultStore::new();
+    let result = result_store
+        .fail(
+            &scope,
+            process_id,
+            "RAW_PROCESS_RESULT_SENTINEL_3022 /tmp/private-result sk_live".to_string(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.error_kind.as_deref(), Some("Unclassified"));
+}
+
+#[tokio::test]
 async fn background_process_manager_stores_failure_error_result() {
     let store = Arc::new(InMemoryProcessStore::new());
     let result_store = Arc::new(InMemoryProcessResultStore::new());
@@ -670,13 +706,15 @@ async fn resource_managed_store_denies_before_process_record_creation() {
     let invocation_id = InvocationId::new();
     let process_id = ProcessId::new();
     let scope = sample_scope(invocation_id, "tenant1", "user1");
-    governor.set_limit(
-        ResourceAccount::tenant(scope.tenant_id.clone()),
-        ResourceLimits {
-            max_process_count: Some(0),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            ResourceAccount::tenant(scope.tenant_id.clone()),
+            ResourceLimits {
+                max_process_count: Some(0),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let store = ResourceManagedProcessStore::new(InMemoryProcessStore::new(), governor.clone());
 
     let err = store
@@ -1498,13 +1536,15 @@ async fn assert_unowned_process_reservation_rejected(transition: UnownedTransiti
     let invocation_id = InvocationId::new();
     let scope = sample_scope(invocation_id, "tenant1", "user1");
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
-    governor.set_limit(
-        account.clone(),
-        ResourceLimits {
-            max_process_count: Some(2),
-            ..ResourceLimits::default()
-        },
-    );
+    governor
+        .set_limit(
+            account.clone(),
+            ResourceLimits {
+                max_process_count: Some(2),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
     let estimate = ResourceEstimate {
         process_count: Some(1),
         ..ResourceEstimate::default()
@@ -1726,8 +1766,12 @@ struct ReleaseFailingGovernor {
 }
 
 impl ResourceGovernor for ReleaseFailingGovernor {
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits) {
-        self.inner.set_limit(account, limits);
+    fn set_limit(
+        &self,
+        account: ResourceAccount,
+        limits: ResourceLimits,
+    ) -> Result<(), ResourceError> {
+        self.inner.set_limit(account, limits)
     }
 
     fn reserve(
@@ -1769,8 +1813,12 @@ struct ReconcileFailingGovernor {
 }
 
 impl ResourceGovernor for ReconcileFailingGovernor {
-    fn set_limit(&self, account: ResourceAccount, limits: ResourceLimits) {
-        self.inner.set_limit(account, limits);
+    fn set_limit(
+        &self,
+        account: ResourceAccount,
+        limits: ResourceLimits,
+    ) -> Result<(), ResourceError> {
+        self.inner.set_limit(account, limits)
     }
 
     fn reserve(

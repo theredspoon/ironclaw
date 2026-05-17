@@ -9,13 +9,13 @@
 use std::path::PathBuf;
 
 use crate::history::ConversationMessage;
-use crate::llm::recording::TraceFile;
 use crate::trace_contribution::{
     self as trace, LocalTraceSubmissionRecord, OutcomeMetadata, RawTraceCaptureTurn,
     TraceContributionEnvelope, TraceFailureMode, TraceQueueFlushReport, TraceQueueWorkerReport,
     TraceRedactor as _,
 };
 use anyhow::Context;
+use ironclaw_llm::recording::TraceFile;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TraceClientScope(String);

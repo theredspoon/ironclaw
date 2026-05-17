@@ -102,6 +102,91 @@ fn local_default_resource_scope_uses_default_agent_and_bootstrap_project() {
 }
 
 #[test]
+fn dispatch_errors_preserve_typed_failure_kind() {
+    let capability = CapabilityId::new("test.cap").unwrap();
+    let provider = ExtensionId::new("test").unwrap();
+
+    assert_eq!(
+        DispatchError::UnknownCapability {
+            capability: capability.clone(),
+        }
+        .failure_kind(),
+        DispatchFailureKind::UnknownCapability
+    );
+    assert_eq!(
+        DispatchError::UnknownProvider {
+            capability: capability.clone(),
+            provider,
+        }
+        .failure_kind(),
+        DispatchFailureKind::UnknownProvider
+    );
+    assert_eq!(
+        DispatchError::RuntimeMismatch {
+            capability: capability.clone(),
+            descriptor_runtime: RuntimeKind::Wasm,
+            package_runtime: RuntimeKind::Mcp,
+        }
+        .failure_kind(),
+        DispatchFailureKind::RuntimeMismatch
+    );
+    assert_eq!(
+        DispatchError::MissingRuntimeBackend {
+            runtime: RuntimeKind::Script,
+        }
+        .failure_kind(),
+        DispatchFailureKind::MissingRuntimeBackend
+    );
+    assert_eq!(
+        DispatchError::UnsupportedRuntime {
+            capability,
+            runtime: RuntimeKind::Wasm,
+        }
+        .failure_kind(),
+        DispatchFailureKind::UnsupportedRuntime
+    );
+    assert_eq!(
+        DispatchError::Wasm {
+            kind: RuntimeDispatchErrorKind::Guest,
+        }
+        .failure_kind(),
+        DispatchFailureKind::Runtime(RuntimeDispatchErrorKind::Guest)
+    );
+}
+
+#[test]
+fn dispatch_failure_kind_display_preserves_stable_literals() {
+    assert_eq!(
+        DispatchFailureKind::UnknownCapability.as_str(),
+        "UnknownCapability"
+    );
+    assert_eq!(
+        DispatchFailureKind::UnknownProvider.as_str(),
+        "UnknownProvider"
+    );
+    assert_eq!(
+        DispatchFailureKind::RuntimeMismatch.as_str(),
+        "RuntimeMismatch"
+    );
+    assert_eq!(
+        DispatchFailureKind::MissingRuntimeBackend.as_str(),
+        "MissingRuntimeBackend"
+    );
+    assert_eq!(
+        DispatchFailureKind::UnsupportedRuntime.as_str(),
+        "UnsupportedRuntime"
+    );
+    assert_eq!(
+        DispatchFailureKind::Runtime(RuntimeDispatchErrorKind::NetworkDenied).as_str(),
+        "NetworkDenied"
+    );
+    assert_eq!(
+        DispatchFailureKind::Runtime(RuntimeDispatchErrorKind::NetworkDenied).to_string(),
+        "NetworkDenied"
+    );
+}
+
+#[test]
 fn runtime_dispatch_error_kinds_have_safe_event_tokens() {
     for (kind, token) in [
         (RuntimeDispatchErrorKind::Backend, "backend"),
@@ -227,6 +312,62 @@ fn scoped_path_rejects_raw_host_paths_urls_and_traversal() {
         assert!(
             ScopedPath::new(invalid).is_err(),
             "{invalid:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn scoped_path_redacts_all_rejected_values_in_error_display() {
+    for invalid in [
+        "",
+        "relative/path",
+        "/workspace/../../secret",
+        "/workspace/has\0nul",
+        "\\server\\share\\private.txt",
+        "\\\\server\\share\\private.txt",
+        "file:///etc/passwd",
+        "https://example.com/private/file",
+        "/Users/alice/project/private.txt",
+        "/opt/ironclaw/project/private.txt",
+        "/tmp/ironclaw/project/private.txt",
+        "C:\\Users\\alice\\project\\private.txt",
+        "C:/Users/alice/project/private.txt",
+    ] {
+        let message = ScopedPath::new(invalid).unwrap_err().to_string();
+        assert!(
+            invalid.is_empty() || !message.contains(invalid),
+            "{invalid:?} must not be echoed in {message:?}"
+        );
+        assert!(
+            message.contains("<redacted path>"),
+            "{invalid:?} should use redacted placeholder in {message:?}"
+        );
+    }
+}
+
+#[test]
+fn virtual_path_accepts_all_frozen_v1_roots() {
+    for root in [
+        "/engine",
+        "/system/settings",
+        "/system/extensions",
+        "/system/skills",
+        "/users",
+        "/projects",
+        "/memory",
+        "/artifacts",
+        "/tmp",
+        "/secrets",
+        "/events",
+    ] {
+        assert!(
+            VirtualPath::new(root).is_ok(),
+            "frozen V1 root {root:?} should be accepted"
+        );
+        let child = format!("{root}/child");
+        assert!(
+            VirtualPath::new(child).is_ok(),
+            "children of frozen V1 root {root:?} should be accepted"
         );
     }
 }
@@ -774,6 +915,404 @@ fn audit_envelope_serializes_redacted_summary_shape() {
     assert_eq!(json["stage"], "denied");
     assert_eq!(json["decision"]["reason"], "missing_grant");
     assert!(json.get("host_path").is_none());
+}
+
+#[test]
+fn host_port_ids_are_host_namespaced_and_serializable() {
+    let id = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    assert_eq!(id.as_str(), "host.storage.sql_transaction.first_party");
+    assert_eq!(serde_json::to_value(&id).unwrap(), json!(id.as_str()));
+    assert_eq!(
+        serde_json::from_value::<HostPortId>(json!(id.as_str())).unwrap(),
+        id
+    );
+
+    for invalid in [
+        "",
+        "storage.sql_transaction",
+        "host",
+        "host.",
+        "host..storage",
+        "Host.storage",
+        "host/storage",
+        "host.storage\ntransaction",
+        "host.x",
+        "host.1.foo",
+        "host.storage.1tier",
+    ] {
+        assert!(
+            HostPortId::new(invalid).is_err(),
+            "{invalid:?} should be rejected"
+        );
+        assert!(
+            serde_json::from_value::<HostPortId>(json!(invalid)).is_err(),
+            "{invalid:?} should also be rejected when deserialized"
+        );
+    }
+}
+
+#[test]
+fn host_port_view_rejects_duplicate_ports_and_answers_membership() {
+    let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    let audit = HostPortId::new("host.events.audit").unwrap();
+    let network = HostPortId::new("host.network.http").unwrap();
+
+    let view = HostPortView::new(vec![
+        HostPortGrant::new(storage.clone()),
+        HostPortGrant::new(audit.clone()),
+    ])
+    .unwrap();
+
+    assert!(view.allows(&storage));
+    assert!(view.allows(&audit));
+    assert!(!view.allows(&network));
+    assert!(view.allows_all([&storage, &audit]));
+    assert!(!view.allows_all([&storage, &network]));
+    assert_eq!(view.grants()[0].id(), &audit);
+    assert_eq!(view.grants()[1].id(), &storage);
+
+    assert!(
+        HostPortView::new(vec![
+            HostPortGrant::new(storage.clone()),
+            HostPortGrant::new(storage),
+        ])
+        .is_err(),
+        "duplicate host port grants must fail closed"
+    );
+}
+
+#[test]
+fn host_port_catalog_equality_is_order_independent() {
+    let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    let audit = HostPortId::new("host.events.audit").unwrap();
+
+    let a = HostPortCatalog::new(vec![
+        HostPortCatalogEntry::new(storage.clone()),
+        HostPortCatalogEntry::new(audit.clone()),
+    ])
+    .unwrap();
+    let b = HostPortCatalog::new(vec![
+        HostPortCatalogEntry::new(audit),
+        HostPortCatalogEntry::new(storage),
+    ])
+    .unwrap();
+
+    assert_eq!(a, b);
+    assert_eq!(
+        serde_json::to_value(&a).unwrap(),
+        serde_json::to_value(&b).unwrap(),
+    );
+}
+
+#[test]
+fn capability_profile_contract_equality_is_order_independent() {
+    let profile_id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
+    let op1 = CapabilityProfileOperationContract::new(
+        CapabilityProfileOperationId::new("memory.context.retrieve.v1").unwrap(),
+        "schemas/memory/context-retrieve.input.v1.json",
+        "schemas/memory/context-retrieve.output.v1.json",
+    )
+    .unwrap();
+    let op2 = CapabilityProfileOperationContract::new(
+        CapabilityProfileOperationId::new("memory.context.touch.v1").unwrap(),
+        "schemas/memory/context-touch.input.v1.json",
+        "schemas/memory/context-touch.output.v1.json",
+    )
+    .unwrap();
+
+    let a =
+        CapabilityProfileContract::new(profile_id.clone(), vec![op1.clone(), op2.clone()]).unwrap();
+    let b = CapabilityProfileContract::new(profile_id, vec![op2, op1]).unwrap();
+
+    assert_eq!(a, b);
+    assert_eq!(
+        serde_json::to_value(&a).unwrap(),
+        serde_json::to_value(&b).unwrap(),
+    );
+}
+
+#[test]
+fn host_api_contract_types_reject_unknown_fields_on_deserialize() {
+    let storage = "host.storage.sql_transaction.first_party";
+    let op_id = "memory.context.retrieve.v1";
+    let profile_id = "memory.context_retrieval.v1";
+    let in_ref = "schemas/memory/context-retrieve.input.v1.json";
+    let out_ref = "schemas/memory/context-retrieve.output.v1.json";
+    let ingress_policy = json!({
+        "listener_class": "local_gateway",
+        "auth": {
+            "type": "required",
+            "schemes": ["bearer_token"],
+        },
+        "scope_source": "authenticated_caller",
+        "body_limit": {
+            "type": "limited",
+            "max_bytes": 16384,
+        },
+        "rate_limit": {
+            "type": "limited",
+            "scope": "per_caller",
+            "max_requests": 30,
+            "window_seconds": 60,
+        },
+        "cors": "same_origin_only",
+        "websocket_origin": "not_applicable",
+        "streaming": "none",
+        "audit": "user_action",
+        "effect_path": {
+            "type": "product_workflow",
+        },
+    });
+
+    // Happy paths still parse.
+    assert!(serde_json::from_value::<HostPortGrant>(json!({ "id": storage })).is_ok());
+    assert!(serde_json::from_value::<HostPortCatalogEntry>(json!({ "id": storage })).is_ok());
+    assert!(
+        serde_json::from_value::<HostPortCatalog>(json!({ "entries": [{ "id": storage }] }))
+            .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<HostPortView>(json!({ "grants": [{ "id": storage }] })).is_ok()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileOperationContract>(json!({
+            "id": op_id,
+            "input_schema_ref": in_ref,
+            "output_schema_ref": out_ref,
+        }))
+        .is_ok()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileContract>(json!({
+            "id": profile_id,
+            "required_operations": [{
+                "id": op_id,
+                "input_schema_ref": in_ref,
+                "output_schema_ref": out_ref,
+            }],
+        }))
+        .is_ok()
+    );
+    assert!(serde_json::from_value::<IngressPolicy>(ingress_policy.clone()).is_ok());
+    assert!(
+        serde_json::from_value::<IngressRouteDescriptor>(json!({
+            "route_id": "web_chat.send",
+            "method": "post",
+            "route_pattern": "/api/chat/v2/messages",
+            "policy": ingress_policy.clone(),
+        }))
+        .is_ok()
+    );
+    let mut ingress_policy_with_unknown = ingress_policy.clone();
+    ingress_policy_with_unknown["oops"] = json!(1);
+
+    // Unknown fields must fail closed at the wire boundary.
+    assert!(serde_json::from_value::<HostPortGrant>(json!({ "id": storage, "oops": 1 })).is_err());
+    assert!(
+        serde_json::from_value::<HostPortCatalogEntry>(json!({ "id": storage, "oops": 1 }))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortCatalog>(json!({
+            "entries": [{ "id": storage }],
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortCatalog>(
+            json!({ "entries": [{ "id": storage, "oops": 1 }] })
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortView>(json!({
+            "grants": [{ "id": storage }],
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<HostPortView>(json!({ "grants": [{ "id": storage, "oops": 1 }] }))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileOperationContract>(json!({
+            "id": op_id,
+            "input_schema_ref": in_ref,
+            "output_schema_ref": out_ref,
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<CapabilityProfileContract>(json!({
+            "id": profile_id,
+            "required_operations": [{
+                "id": op_id,
+                "input_schema_ref": in_ref,
+                "output_schema_ref": out_ref,
+            }],
+            "oops": 1,
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<IngressPolicy>(ingress_policy_with_unknown).is_err());
+    assert!(
+        serde_json::from_value::<IngressRouteDescriptor>(json!({
+            "route_id": "web_chat.send",
+            "method": "post",
+            "route_pattern": "/api/chat/v2/messages",
+            "policy": ingress_policy,
+            "oops": 1,
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn host_port_catalog_validates_required_ports_without_creating_implementations() {
+    let storage = HostPortId::new("host.storage.sql_transaction.first_party").unwrap();
+    let audit = HostPortId::new("host.events.audit").unwrap();
+    let network = HostPortId::new("host.network.http").unwrap();
+
+    let catalog = HostPortCatalog::new(vec![
+        HostPortCatalogEntry::new(storage.clone()),
+        HostPortCatalogEntry::new(audit.clone()),
+    ])
+    .unwrap();
+
+    assert!(catalog.contains(&storage));
+    assert!(catalog.contains(&audit));
+    assert!(!catalog.contains(&network));
+    catalog.validate_required([&storage, &audit]).unwrap();
+
+    let missing = catalog.validate_required([&storage, &network]).unwrap_err();
+    assert_eq!(
+        missing,
+        HostApiError::InvariantViolation {
+            reason: "unknown host ports host.network.http".to_string()
+        }
+    );
+
+    let inspector = HostPortId::new("host.network.inspector").unwrap();
+    let aggregated = catalog
+        .validate_required([&network, &inspector, &network])
+        .unwrap_err();
+    assert_eq!(
+        aggregated,
+        HostApiError::InvariantViolation {
+            reason: "unknown host ports host.network.http, host.network.inspector".to_string()
+        }
+    );
+    assert_eq!(
+        catalog.missing_required([&network, &inspector, &network]),
+        vec![network.clone(), inspector.clone()]
+    );
+
+    assert!(
+        HostPortCatalog::new(vec![
+            HostPortCatalogEntry::new(storage.clone()),
+            HostPortCatalogEntry::new(storage),
+        ])
+        .is_err(),
+        "duplicate host port catalog entries must fail closed"
+    );
+}
+
+#[test]
+fn capability_profile_ids_are_versioned_portable_contract_names() {
+    let id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
+    assert_eq!(id.as_str(), "memory.context_retrieval.v1");
+    assert_eq!(serde_json::to_value(&id).unwrap(), json!(id.as_str()));
+    assert_eq!(
+        serde_json::from_value::<CapabilityProfileId>(json!(id.as_str())).unwrap(),
+        id
+    );
+
+    for invalid in [
+        "",
+        "memory",
+        "memory.context_retrieval",
+        "memory.context_retrieval.version1",
+        "Memory.context_retrieval.v1",
+        "memory/context_retrieval/v1",
+        "memory..context_retrieval.v1",
+        "memory.context_retrieval.v1\n",
+        "1memory.context_retrieval.v1",
+        "memory.2context_retrieval.v1",
+    ] {
+        assert!(
+            CapabilityProfileId::new(invalid).is_err(),
+            "{invalid:?} should be rejected"
+        );
+        assert!(
+            serde_json::from_value::<CapabilityProfileId>(json!(invalid)).is_err(),
+            "{invalid:?} should also be rejected when deserialized"
+        );
+    }
+}
+
+#[test]
+fn capability_profile_contract_rejects_empty_or_duplicate_operations() {
+    let profile_id = CapabilityProfileId::new("memory.context_retrieval.v1").unwrap();
+    let operation = CapabilityProfileOperationContract::new(
+        CapabilityProfileOperationId::new("memory.context.retrieve.v1").unwrap(),
+        "schemas/memory/context-retrieve.input.v1.json",
+        "schemas/memory/context-retrieve.output.v1.json",
+    )
+    .unwrap();
+
+    let contract = CapabilityProfileContract::new(profile_id.clone(), vec![operation.clone()])
+        .expect("single-operation profile is valid");
+    assert_eq!(contract.id(), &profile_id);
+    assert_eq!(
+        contract.required_operations(),
+        std::slice::from_ref(&operation)
+    );
+
+    assert!(
+        CapabilityProfileContract::new(profile_id.clone(), Vec::new()).is_err(),
+        "profiles without required operations should fail closed"
+    );
+    assert!(
+        CapabilityProfileContract::new(profile_id, vec![operation.clone(), operation]).is_err(),
+        "duplicate profile operation contracts should fail closed"
+    );
+}
+
+#[test]
+fn capability_profile_schema_refs_are_relative_repository_paths() {
+    for valid in [
+        "schemas/memory/context-retrieve.input.v1.json",
+        "schemas/echo.output.v1.json",
+    ] {
+        assert!(
+            CapabilityProfileSchemaRef::new(valid).is_ok(),
+            "{valid:?} should be accepted"
+        );
+    }
+
+    for invalid in [
+        "",
+        "/schemas/memory/context.json",
+        "../schemas/memory/context.json",
+        "schemas/../context.json",
+        "https://example.com/schema.json",
+        "file:///tmp/schema.json",
+        "schemas/memory/context.json\n",
+        "data:text/plain,evil",
+        "mailto:foo",
+        "javascript:alert(1)",
+        "schemas/memory/with:colon.json",
+        "c:/win/schema.json",
+        "schemas/memory/contains space.json",
+    ] {
+        assert!(
+            CapabilityProfileSchemaRef::new(invalid).is_err(),
+            "{invalid:?} should be rejected"
+        );
+    }
 }
 
 fn sample_context_with_agent(agent: Option<&str>) -> ExecutionContext {

@@ -641,7 +641,6 @@ fn trace_policy_rejection(rejection: TraceContributionPolicyRejection) -> (Statu
 mod tests {
     use super::*;
     use crate::channels::web::auth::UserIdentity;
-    use crate::llm::recording::{TraceFile, TraceResponse, TraceStep, TraceToolCall};
     use crate::trace_contribution::{
         DeterministicTraceRedactor, LocalTraceSubmissionStatus, RawTraceContribution,
         TraceCreditEvent, TraceCreditEventKind, TraceQueueWarningKind, TraceRedactor,
@@ -649,6 +648,7 @@ mod tests {
         write_trace_policy_for_scope,
     };
     use chrono::Utc;
+    use ironclaw_llm::recording::{TraceFile, TraceResponse, TraceStep, TraceToolCall};
     use std::collections::BTreeSet;
 
     fn write_trace_records(scope: &str, records: &[LocalTraceSubmissionRecord]) {

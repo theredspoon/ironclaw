@@ -10,12 +10,16 @@ The `reborn-integration` branch currently exposes Reborn structure primarily thr
 
 | Need | Start with |
 | --- | --- |
+| Standalone Reborn binary | `docs/reborn-binary.md` |
+| Porting v1 channels to Reborn surfaces/ProductAdapters | `docs/reborn/how-to-port-channel-to-reborn.md` |
 | Host API vocabulary | `crates/ironclaw_host_api/` |
 | Host API local rules | `crates/ironclaw_host_api/CLAUDE.md` |
 | Host/runtime composition and shared runtime HTTP egress | `crates/ironclaw_host_runtime/` |
 | Architecture dependency guardrails | `crates/ironclaw_architecture/` |
 | Reborn dependency-boundary tests | `crates/ironclaw_architecture/tests/reborn_dependency_boundaries.rs` |
 | Events substrate | `crates/ironclaw_events/` |
+| Event projection read models | `crates/ironclaw_event_projections/` |
+| Standalone durable event/audit stores | `crates/ironclaw_reborn_event_store/` |
 | Filesystem substrate | `crates/ironclaw_filesystem/` |
 | Network policy and HTTP transport substrate | `crates/ironclaw_network/` |
 | Secrets metadata and one-shot leases | `crates/ironclaw_secrets/` |

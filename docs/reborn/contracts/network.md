@@ -64,8 +64,8 @@ Ownership remains:
 host_api       -> NetworkPolicy, NetworkTarget, NetworkMethod shapes
 network        -> scoped policy evaluation, DNS/private-IP checks, bounded HTTP transport
 authorization  -> whether a caller has a grant with network authority
-capabilities   -> caller-facing workflow; currently fails closed on ApplyNetworkPolicy obligations
-host_runtime   -> shared runtime HTTP egress composition with secrets and runtime adapters
+capabilities   -> caller-facing workflow; fails closed on ApplyNetworkPolicy unless an obligation handler is configured
+host_runtime   -> built-in obligation handler validates/stages scoped network policy and shared runtime HTTP egress enforces policy
 runtimes        -> translate native HTTP calls into host-mediated egress requests
 ```
 
@@ -134,7 +134,7 @@ This slice does not implement:
 - per-tenant persisted policy stores
 - OAuth/token refresh flows
 
-Those should be added as separate service/composition slices without moving runtime execution or product workflow semantics into this crate. Runtime adapters that wrap external protocol clients, such as MCP HTTP/SSE, must fail closed unless the host-selected client explicitly uses this host-mediated egress boundary rather than ambient direct HTTP.
+Those should be added as separate service/composition slices without moving runtime execution or product workflow semantics into this crate. Runtime adapters that wrap external protocol clients must fail closed unless the host-selected client explicitly uses this host-mediated egress boundary rather than ambient direct HTTP. Reborn MCP HTTP/SSE uses `ironclaw_mcp::McpHostHttpClient` with `McpRuntimeHttpAdapter<RuntimeHttpEgress>` plus a host-owned egress planner; only that fully host-mediated client may report `uses_host_mediated_http_egress() == true`. Reborn script execution remains ambient-network-disabled by default; any future script HTTP surface must translate into `ScriptRuntimeHttpAdapter<RuntimeHttpEgress>` requests instead of adding direct HTTP/DNS/private-IP logic to `ironclaw_scripts`.
 
 ---
 
