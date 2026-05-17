@@ -156,7 +156,7 @@ impl ProductWorkflow for DefaultProductWorkflow {
         };
         let binding = self
             .binding_service
-            .resolve_binding(resolve_binding_request(&envelope))
+            .lookup_binding(resolve_binding_request(&envelope))
             .await
             .map_err(ProductAdapterError::from)?;
         let thread_id =

@@ -350,6 +350,56 @@ async fn projection_subscription_rejects_mismatched_thread_hint() {
 }
 
 #[tokio::test]
+async fn projection_subscription_requires_existing_conversation_binding() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(
+        conversations,
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            Some("project:alpha"),
+        )],
+    );
+    let workflow = DefaultProductWorkflow::new(
+        Arc::new(FakeInboundTurnService::new()),
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+    let envelope = sample_envelope_with_payload(
+        "projection-missing-binding",
+        ProductInboundPayload::SubscriptionRequest(
+            ProjectionSubscriptionPayload::new(None, None).expect("valid subscription"),
+        ),
+    );
+
+    let err = workflow
+        .resolve_projection_subscription(envelope)
+        .await
+        .expect_err("subscription must not create a missing binding");
+
+    assert!(matches!(
+        err,
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::ScopeNotFound,
+            status_code: 404,
+            retryable: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn concrete_product_workflow_accepts_user_message_for_trusted_installation() {
     let conversations = Arc::new(InMemoryConversationServices::default());
     conversations
@@ -411,6 +461,81 @@ async fn concrete_product_workflow_accepts_user_message_for_trusted_installation
         Some("project:alpha")
     );
     assert_eq!(submissions[0].actor.user_id.as_str(), "user:alice");
+}
+
+#[tokio::test]
+async fn concrete_product_workflow_persists_first_bind_default_scope() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    let binding_alpha = product_binding_service(
+        conversations.clone(),
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            Some("project:alpha"),
+        )],
+    );
+    let workflow_alpha = DefaultProductWorkflow::new(
+        Arc::new(DefaultInboundTurnService::new(
+            binding_alpha.clone(),
+            InMemorySessionThreadService::default(),
+            Arc::new(RecordingTurnCoordinator::default()),
+        )),
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding_alpha),
+    );
+    workflow_alpha
+        .accept_inbound(sample_envelope("persisted-default-scope"))
+        .await
+        .expect("first bind accepted");
+
+    let binding_beta = product_binding_service(
+        conversations,
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:beta",
+            Some("project:beta"),
+        )],
+    );
+    let workflow_beta = DefaultProductWorkflow::new(
+        Arc::new(FakeInboundTurnService::new()),
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding_beta),
+    );
+    let subscription = workflow_beta
+        .resolve_projection_subscription(sample_envelope_with_payload(
+            "projection-existing-scope",
+            ProductInboundPayload::SubscriptionRequest(
+                ProjectionSubscriptionPayload::new(None, None).expect("valid subscription"),
+            ),
+        ))
+        .await
+        .expect("existing binding resolves");
+
+    assert_eq!(
+        subscription.scope.agent_id.as_ref().map(AgentId::as_str),
+        Some("agent:alpha")
+    );
+    assert_eq!(
+        subscription
+            .scope
+            .project_id
+            .as_ref()
+            .map(ProjectId::as_str),
+        Some("project:alpha")
+    );
 }
 
 #[tokio::test]
@@ -657,10 +782,11 @@ async fn in_memory_idempotency_ledger_ignores_stale_releases_after_reclaim() {
 
     let mut stale_settle = first;
     stale_settle.settle(ProductInboundAck::NoOp);
-    ledger
+    let stale_settle_err = ledger
         .settle(stale_settle)
         .await
-        .expect("stale settle is ignored");
+        .expect_err("stale settle fails loudly");
+    assert!(stale_settle_err.to_string().contains("superseded"));
     assert!(
         ledger
             .begin_or_replay(fingerprint.clone(), received_at + Duration::seconds(12))
@@ -683,6 +809,41 @@ async fn in_memory_idempotency_ledger_ignores_stale_releases_after_reclaim() {
             .expect("settled action replays"),
         IdempotencyDecision::Replay(_)
     ));
+}
+
+#[tokio::test]
+async fn in_memory_idempotency_ledger_rejects_settle_after_expiry_without_reclaim() {
+    let ledger = InMemoryIdempotencyLedger::with_in_flight_lease(Duration::seconds(10));
+    let received_at = Utc::now();
+    let fingerprint = ActionFingerprintKey::new(
+        ProductAdapterId::new("test_adapter").expect("valid"),
+        AdapterInstallationId::new("install_alpha").expect("valid"),
+        SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
+            .expect("valid source binding key"),
+        ExternalEventId::new("evt:lease-missing").expect("valid"),
+    );
+
+    let mut action = match ledger
+        .begin_or_replay(fingerprint, received_at)
+        .await
+        .expect("first reservation")
+    {
+        IdempotencyDecision::New(action) => action,
+        IdempotencyDecision::Replay(_) => panic!("expected first reservation"),
+    };
+    assert_eq!(
+        ledger
+            .expire_in_flight_before(received_at + Duration::seconds(11))
+            .expect("expired"),
+        1
+    );
+    action.settle(ProductInboundAck::NoOp);
+
+    let err = ledger
+        .settle(action)
+        .await
+        .expect_err("terminal outcome must not report durable success after expiry");
+    assert!(err.to_string().contains("reservation missing"));
 }
 
 fn product_binding_service(

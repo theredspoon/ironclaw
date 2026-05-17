@@ -108,10 +108,14 @@ impl IdempotencyLedger for InMemoryIdempotencyLedger {
             return Ok(());
         }
         let Some(current) = state.in_flight.get(&action.fingerprint) else {
-            return Ok(());
+            return Err(ProductWorkflowError::Transient {
+                reason: "idempotency reservation missing before terminal settle".into(),
+            });
         };
         if current.action_id != action.action_id {
-            return Ok(());
+            return Err(ProductWorkflowError::Transient {
+                reason: "idempotency reservation was superseded before terminal settle".into(),
+            });
         }
         state.in_flight.remove(&action.fingerprint);
         state.settled.insert(action.fingerprint.clone(), action);

@@ -235,108 +235,66 @@ impl ConversationBindingService for InMemoryConversationServices {
         &self,
         request: ResolveConversationRequest,
     ) -> Result<ConversationBindingResolution, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
-        let _mutation = self.mutation_lock.lock().await;
+        self.resolve_or_create_binding_inner(request, None, None)
+            .await
+    }
+
+    async fn resolve_or_create_binding_with_trusted_scope(
+        &self,
+        request: ResolveConversationRequest,
+        trusted_agent_id: Option<AgentId>,
+        trusted_project_id: Option<ProjectId>,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
+        self.resolve_or_create_binding_inner(request, trusted_agent_id, trusted_project_id)
+            .await
+    }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveConversationRequest,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
-        let old_state = self.lock_state()?.clone();
-        let (resolution, snapshot) = {
-            let mut state = self.lock_state()?;
-            let actor_user_id = state.resolve_actor(
-                &request.tenant_id,
-                &request.adapter_kind,
-                &request.adapter_installation_id,
-                &request.external_actor_ref,
-            )?;
-            let binding_key = BindingKey::from_request(&request);
-            let external_conversation_identity = request.external_conversation_ref.identity();
-            state.ensure_external_event_route(
-                &request.tenant_id,
-                &request.adapter_kind,
-                &request.adapter_installation_id,
-                &request.external_event_id,
-                &external_conversation_identity,
-                &actor_user_id,
-            )?;
-            let route_actor_key = ActorKey::new(
-                &request.tenant_id,
-                &request.adapter_kind,
-                &request.adapter_installation_id,
-                &request.external_actor_ref,
-            );
-
-            if state.bindings.contains_key(&binding_key) {
-                let binding = state
-                    .bindings
-                    .get(&binding_key)
-                    .cloned()
-                    .ok_or(InboundTurnError::StatePoisoned)?;
-                state.ensure_participant(&request.tenant_id, &actor_user_id, &binding.thread_id)?;
-                if !binding
-                    .route_access
-                    .allows(&route_actor_key, request.route_kind)
-                {
-                    return Err(InboundTurnError::AccessDenied {
-                        actor_id: actor_user_id.to_string(),
-                        thread_id: binding.thread_id.to_string(),
-                    });
-                }
-                if request.route_kind == ConversationRouteKind::Shared {
-                    state.widen_binding_route_access(&binding_key)?;
-                }
-                state.record_external_event_route(
-                    &request.tenant_id,
-                    &request.adapter_kind,
-                    &request.adapter_installation_id,
-                    &request.external_event_id,
-                    &external_conversation_identity,
-                    &actor_user_id,
-                )?;
-                let binding = state
-                    .bindings
-                    .get(&binding_key)
-                    .cloned()
-                    .ok_or(InboundTurnError::StatePoisoned)?;
-                let resolution = binding.resolution(actor_user_id, request.tenant_id);
-                (resolution, state.clone())
-            } else {
-                let thread_id = ThreadId::new(Uuid::new_v4().to_string()).map_err(|error| {
-                    InboundTurnError::InvalidCanonicalRef {
-                        reason: error.to_string(),
-                    }
-                })?;
-                let thread = ThreadRecord {
-                    agent_id: None,
-                    project_id: None,
-                    participants: HashSet::from([actor_user_id.clone()]),
-                };
-                state
-                    .threads
-                    .insert(ThreadKey::new(&request.tenant_id, &thread_id), thread);
-                let binding = BindingRecord::new(
-                    request.tenant_id.clone(),
-                    request.adapter_kind.clone(),
-                    request.adapter_installation_id.clone(),
-                    request.external_conversation_ref,
-                    ReplyRouteAccess::new(route_actor_key, request.route_kind),
-                    BindingTarget::new(thread_id, None, None),
-                )?;
-                let resolution =
-                    binding.resolution(actor_user_id.clone(), request.tenant_id.clone());
-                state.store_binding(binding_key, binding);
-                state.record_external_event_route(
-                    &request.tenant_id,
-                    &request.adapter_kind,
-                    &request.adapter_installation_id,
-                    &request.external_event_id,
-                    &external_conversation_identity,
-                    &actor_user_id,
-                )?;
-                (resolution, state.clone())
+        let state = self.lock_state()?;
+        let actor_user_id = state.resolve_actor(
+            &request.tenant_id,
+            &request.adapter_kind,
+            &request.adapter_installation_id,
+            &request.external_actor_ref,
+        )?;
+        let binding_key = BindingKey::from_request(&request);
+        let external_conversation_identity = request.external_conversation_ref.identity();
+        state.ensure_external_event_route(
+            &request.tenant_id,
+            &request.adapter_kind,
+            &request.adapter_installation_id,
+            &request.external_event_id,
+            &external_conversation_identity,
+            &actor_user_id,
+        )?;
+        let route_actor_key = ActorKey::new(
+            &request.tenant_id,
+            &request.adapter_kind,
+            &request.adapter_installation_id,
+            &request.external_actor_ref,
+        );
+        let binding = state.bindings.get(&binding_key).cloned().ok_or_else(|| {
+            InboundTurnError::BindingRequired {
+                adapter_kind: request.adapter_kind.as_str().to_string(),
+                external_actor_id: request.external_actor_ref.id().to_string(),
             }
-        };
-        self.persist_state(old_state, snapshot).await?;
-        Ok(resolution)
+        })?;
+        state.ensure_participant(&request.tenant_id, &actor_user_id, &binding.thread_id)?;
+        if !binding
+            .route_access
+            .allows(&route_actor_key, request.route_kind)
+        {
+            return Err(InboundTurnError::AccessDenied {
+                actor_id: actor_user_id.to_string(),
+                thread_id: binding.thread_id.to_string(),
+            });
+        }
+        Ok(binding.resolution(actor_user_id, request.tenant_id))
     }
 
     async fn link_conversation_to_thread(
@@ -498,6 +456,124 @@ impl ConversationBindingService for InMemoryConversationServices {
             adapter_installation_id: binding.adapter_installation_id,
             external_conversation_ref: binding.external_conversation_ref,
         })
+    }
+}
+
+impl InMemoryConversationServices {
+    async fn resolve_or_create_binding_inner(
+        &self,
+        request: ResolveConversationRequest,
+        trusted_agent_id: Option<AgentId>,
+        trusted_project_id: Option<ProjectId>,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        let _mutation = self.mutation_lock.lock().await;
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        self.refresh_state_from_repository().await?;
+        let old_state = self.lock_state()?.clone();
+        let (resolution, snapshot) = {
+            let mut state = self.lock_state()?;
+            let actor_user_id = state.resolve_actor(
+                &request.tenant_id,
+                &request.adapter_kind,
+                &request.adapter_installation_id,
+                &request.external_actor_ref,
+            )?;
+            let binding_key = BindingKey::from_request(&request);
+            let external_conversation_identity = request.external_conversation_ref.identity();
+            state.ensure_external_event_route(
+                &request.tenant_id,
+                &request.adapter_kind,
+                &request.adapter_installation_id,
+                &request.external_event_id,
+                &external_conversation_identity,
+                &actor_user_id,
+            )?;
+            let route_actor_key = ActorKey::new(
+                &request.tenant_id,
+                &request.adapter_kind,
+                &request.adapter_installation_id,
+                &request.external_actor_ref,
+            );
+
+            if state.bindings.contains_key(&binding_key) {
+                let binding = state
+                    .bindings
+                    .get(&binding_key)
+                    .cloned()
+                    .ok_or(InboundTurnError::StatePoisoned)?;
+                state.ensure_participant(&request.tenant_id, &actor_user_id, &binding.thread_id)?;
+                if !binding
+                    .route_access
+                    .allows(&route_actor_key, request.route_kind)
+                {
+                    return Err(InboundTurnError::AccessDenied {
+                        actor_id: actor_user_id.to_string(),
+                        thread_id: binding.thread_id.to_string(),
+                    });
+                }
+                if request.route_kind == ConversationRouteKind::Shared {
+                    state.widen_binding_route_access(&binding_key)?;
+                }
+                state.apply_trusted_scope(
+                    &request.tenant_id,
+                    &binding_key,
+                    trusted_agent_id.clone(),
+                    trusted_project_id.clone(),
+                )?;
+                state.record_external_event_route(
+                    &request.tenant_id,
+                    &request.adapter_kind,
+                    &request.adapter_installation_id,
+                    &request.external_event_id,
+                    &external_conversation_identity,
+                    &actor_user_id,
+                )?;
+                let binding = state
+                    .bindings
+                    .get(&binding_key)
+                    .cloned()
+                    .ok_or(InboundTurnError::StatePoisoned)?;
+                let resolution = binding.resolution(actor_user_id, request.tenant_id);
+                (resolution, state.clone())
+            } else {
+                let thread_id = ThreadId::new(Uuid::new_v4().to_string()).map_err(|error| {
+                    InboundTurnError::InvalidCanonicalRef {
+                        reason: error.to_string(),
+                    }
+                })?;
+                let thread = ThreadRecord {
+                    agent_id: trusted_agent_id.clone(),
+                    project_id: trusted_project_id.clone(),
+                    participants: HashSet::from([actor_user_id.clone()]),
+                };
+                state
+                    .threads
+                    .insert(ThreadKey::new(&request.tenant_id, &thread_id), thread);
+                let binding = BindingRecord::new(
+                    request.tenant_id.clone(),
+                    request.adapter_kind.clone(),
+                    request.adapter_installation_id.clone(),
+                    request.external_conversation_ref,
+                    ReplyRouteAccess::new(route_actor_key, request.route_kind),
+                    BindingTarget::new(thread_id, trusted_agent_id, trusted_project_id),
+                )?;
+                let resolution =
+                    binding.resolution(actor_user_id.clone(), request.tenant_id.clone());
+                state.store_binding(binding_key, binding);
+                state.record_external_event_route(
+                    &request.tenant_id,
+                    &request.adapter_kind,
+                    &request.adapter_installation_id,
+                    &request.external_event_id,
+                    &external_conversation_identity,
+                    &actor_user_id,
+                )?;
+                (resolution, state.clone())
+            }
+        };
+        self.persist_state(old_state, snapshot).await?;
+        Ok(resolution)
     }
 }
 
@@ -822,6 +898,56 @@ impl InMemoryState {
             .get_mut(binding.reply_target_binding_ref.as_str())
         {
             reply_target.route_access.allow_shared();
+        }
+        Ok(())
+    }
+
+    fn apply_trusted_scope(
+        &mut self,
+        tenant_id: &TenantId,
+        binding_key: &BindingKey,
+        trusted_agent_id: Option<AgentId>,
+        trusted_project_id: Option<ProjectId>,
+    ) -> Result<(), InboundTurnError> {
+        let Some(binding) = self.bindings.get_mut(binding_key) else {
+            return Err(InboundTurnError::StatePoisoned);
+        };
+
+        let mut changed = false;
+        if binding.agent_id.is_none() && trusted_agent_id.is_some() {
+            binding.agent_id = trusted_agent_id;
+            changed = true;
+        }
+        if binding.project_id.is_none() && trusted_project_id.is_some() {
+            binding.project_id = trusted_project_id;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+
+        let binding = self
+            .bindings
+            .get(binding_key)
+            .cloned()
+            .ok_or(InboundTurnError::StatePoisoned)?;
+        if let Some(source_binding) = self
+            .source_bindings
+            .get_mut(binding.source_binding_ref.as_str())
+        {
+            source_binding.agent_id = binding.agent_id.clone();
+            source_binding.project_id = binding.project_id.clone();
+        }
+        if let Some(thread) = self
+            .threads
+            .get_mut(&ThreadKey::new(tenant_id, &binding.thread_id))
+        {
+            if thread.agent_id.is_none() {
+                thread.agent_id = binding.agent_id.clone();
+            }
+            if thread.project_id.is_none() {
+                thread.project_id = binding.project_id.clone();
+            }
         }
         Ok(())
     }

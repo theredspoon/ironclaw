@@ -51,9 +51,12 @@ must not implicitly create missing threads.
 Product adapter bindings must choose `TenantId` only from trusted host
 installation configuration, never from inbound adapter payloads. Default
 `AgentId`/`ProjectId` for first-contact product turns are also trusted
-installation configuration, not external hints. Thread hints in subscription
-requests may narrow to the already-resolved binding only; they are not authority
-to switch threads or tenants.
+installation configuration, not external hints, and must be persisted into the
+canonical conversation binding on first bind rather than overlaid on every
+resolve. Thread hints in subscription requests may narrow to the already
+resolved binding only; they are not authority to switch threads or tenants.
+Projection/subscription resolution is lookup-only and must not create bindings,
+threads, or external-event route reservations.
 
 ## Test support
 

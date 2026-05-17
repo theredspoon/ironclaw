@@ -60,6 +60,12 @@ pub trait ConversationBindingService: Send + Sync {
         &self,
         request: ResolveBindingRequest,
     ) -> Result<ResolvedBinding, ProductWorkflowError>;
+
+    /// Look up an existing binding without creating conversation/thread state.
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError>;
 }
 
 #[async_trait]
@@ -72,5 +78,12 @@ where
         request: ResolveBindingRequest,
     ) -> Result<ResolvedBinding, ProductWorkflowError> {
         self.as_ref().resolve_binding(request).await
+    }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        self.as_ref().lookup_binding(request).await
     }
 }

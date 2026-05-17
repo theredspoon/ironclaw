@@ -123,36 +123,66 @@ impl ConversationBindingService for ProductConversationBindingService {
             .resolve(&request.adapter_id, &request.installation_id)?;
         let resolution = self
             .conversations
-            .resolve_or_create_binding(ironclaw_conversations::ResolveConversationRequest {
-                tenant_id: installation_scope.tenant_id,
-                adapter_kind: conversation_adapter_kind(&request.adapter_id)?,
-                adapter_installation_id: conversation_installation_id(&request.installation_id)?,
-                external_actor_ref: conversation_actor_ref(&request.external_actor_ref)?,
-                external_conversation_ref: conversation_conversation_ref(
-                    &request.external_conversation_ref,
-                )?,
-                external_event_id: conversation_event_id(&request.external_event_id)?,
-                route_kind: conversation_route_kind(request.route_kind),
-                requested_agent_id: None,
-                requested_project_id: None,
-            })
+            .resolve_or_create_binding_with_trusted_scope(
+                conversation_request(&request, installation_scope.tenant_id.clone())?,
+                installation_scope.default_agent_id.clone(),
+                installation_scope.default_project_id.clone(),
+            )
             .await
             .map_err(map_conversation_error)?;
 
-        Ok(ResolvedBinding {
-            tenant_id: resolution.tenant_id,
-            user_id: resolution.actor.user_id,
-            thread_id: resolution.turn_scope.thread_id,
-            agent_id: resolution
-                .turn_scope
-                .agent_id
-                .or(installation_scope.default_agent_id),
-            project_id: resolution
-                .turn_scope
-                .project_id
-                .or(installation_scope.default_project_id),
-        })
+        Ok(resolved_binding_from_resolution(resolution))
     }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        let installation_scope = self
+            .installations
+            .resolve(&request.adapter_id, &request.installation_id)?;
+        let resolution = self
+            .conversations
+            .lookup_binding(conversation_request(
+                &request,
+                installation_scope.tenant_id,
+            )?)
+            .await
+            .map_err(map_conversation_error)?;
+
+        Ok(resolved_binding_from_resolution(resolution))
+    }
+}
+
+fn resolved_binding_from_resolution(
+    resolution: ironclaw_conversations::ConversationBindingResolution,
+) -> ResolvedBinding {
+    ResolvedBinding {
+        tenant_id: resolution.tenant_id,
+        user_id: resolution.actor.user_id,
+        thread_id: resolution.turn_scope.thread_id,
+        agent_id: resolution.turn_scope.agent_id,
+        project_id: resolution.turn_scope.project_id,
+    }
+}
+
+fn conversation_request(
+    request: &ResolveBindingRequest,
+    tenant_id: TenantId,
+) -> Result<ironclaw_conversations::ResolveConversationRequest, ProductWorkflowError> {
+    Ok(ironclaw_conversations::ResolveConversationRequest {
+        tenant_id,
+        adapter_kind: conversation_adapter_kind(&request.adapter_id)?,
+        adapter_installation_id: conversation_installation_id(&request.installation_id)?,
+        external_actor_ref: conversation_actor_ref(&request.external_actor_ref)?,
+        external_conversation_ref: conversation_conversation_ref(
+            &request.external_conversation_ref,
+        )?,
+        external_event_id: conversation_event_id(&request.external_event_id)?,
+        route_kind: conversation_route_kind(request.route_kind),
+        requested_agent_id: None,
+        requested_project_id: None,
+    })
 }
 
 fn conversation_adapter_kind(

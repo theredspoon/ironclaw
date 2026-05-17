@@ -71,6 +71,22 @@ impl ConversationBindingService for FakeConversationBindingService {
         &self,
         request: ResolveBindingRequest,
     ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        self.resolve_programmed_or_default(request)
+    }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        self.resolve_programmed_or_default(request)
+    }
+}
+
+impl FakeConversationBindingService {
+    fn resolve_programmed_or_default(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
         let mut state = self.state.lock().expect("fake binding state lock poisoned"); // safety: test-support fake
         state.resolve_count += 1;
         if let Some(error) = state.fail_with.clone() {
