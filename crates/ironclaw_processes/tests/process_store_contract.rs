@@ -1409,7 +1409,7 @@ async fn background_process_manager_stores_filesystem_output_ref() {
 }
 
 #[tokio::test]
-async fn filesystem_process_store_propagates_backend_errors_that_mention_not_found() {
+async fn filesystem_process_store_preserves_typed_backend_errors_that_mention_not_found() {
     let fs = scoped_processes_filesystem(
         Arc::new(BackendErrorFilesystem),
         &default_mount_target_string(),
@@ -1422,9 +1422,28 @@ async fn filesystem_process_store_propagates_backend_errors_that_mention_not_fou
     let err = store.get(&scope, process_id).await.unwrap_err();
 
     assert!(matches!(
-        err,
-        ProcessError::Filesystem(reason) if reason.contains("database index not found")
+        &err,
+        ProcessError::Filesystem(FilesystemError::Backend { reason, .. })
+            if reason.contains("database index not found")
     ));
+    assert!(!err.is_filesystem_not_found());
+}
+
+#[test]
+fn process_error_filesystem_not_found_predicate_distinguishes_backend_errors() {
+    let path = VirtualPath::new("/users/user1/processes/missing.json").unwrap();
+    let not_found = ProcessError::from(FilesystemError::NotFound {
+        path: path.clone(),
+        operation: FilesystemOperation::ReadFile,
+    });
+    let backend = ProcessError::from(FilesystemError::Backend {
+        path,
+        operation: FilesystemOperation::ReadFile,
+        reason: "database index not found while backend is unavailable".to_string(),
+    });
+
+    assert!(not_found.is_filesystem_not_found());
+    assert!(!backend.is_filesystem_not_found());
 }
 
 #[tokio::test]
