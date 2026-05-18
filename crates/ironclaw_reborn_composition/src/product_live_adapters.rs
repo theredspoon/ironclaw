@@ -55,24 +55,29 @@ pub enum ProductLivePlannedRuntimeAdapterError {
 /// In-memory capability I/O staging used by the product-live planned runtime adapters.
 ///
 /// Inputs and results are keyed by run-scoped refs so provider tool-call payloads and
-/// runtime outputs cannot be read across loop runs. Callers should prune entries when
-/// a run completes to bound process-local memory use.
+/// runtime outputs cannot be read across loop runs. Each store is capped at 1024 staged refs
+/// and 4 MiB of serialized JSON; callers should still prune entries when a run completes.
 #[derive(Default)]
 pub struct ProductLiveCapabilityIo {
     inputs: Mutex<HashMap<String, StagedCapabilityInput>>,
     results: Mutex<HashMap<String, StagedCapabilityResult>>,
 }
 
+const PRODUCT_LIVE_CAPABILITY_IO_MAX_STAGED_REFS: usize = 1024;
+const PRODUCT_LIVE_CAPABILITY_IO_MAX_STAGED_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Clone)]
 struct StagedCapabilityInput {
     run_id: String,
     payload: serde_json::Value,
+    byte_len: usize,
 }
 
 #[derive(Clone)]
 struct StagedCapabilityResult {
     run_id: String,
     output: serde_json::Value,
+    byte_len: usize,
 }
 
 impl ProductLiveCapabilityIo {
@@ -82,6 +87,7 @@ impl ProductLiveCapabilityIo {
         run_context: &LoopRunContext,
         payload: serde_json::Value,
     ) -> Result<CapabilityInputRef, AgentLoopHostError> {
+        let byte_len = serialized_json_len(&payload, "capability input")?;
         let input_ref =
             CapabilityInputRef::new(format!("input:{}:{}", run_context.run_id, Uuid::new_v4()))
                 .map_err(|_| {
@@ -90,16 +96,24 @@ impl ProductLiveCapabilityIo {
                         "capability input ref could not be represented",
                     )
                 })?;
-        self.inputs
+        let mut inputs = self
+            .inputs
             .lock()
-            .map_err(|_| capability_io_internal_error())?
-            .insert(
-                input_ref.as_str().to_string(),
-                StagedCapabilityInput {
-                    run_id: run_context.run_id.to_string(),
-                    payload,
-                },
-            );
+            .map_err(|_| capability_io_internal_error())?;
+        ensure_staging_capacity(
+            "capability input",
+            inputs.len(),
+            inputs.values().map(|input| input.byte_len).sum(),
+            byte_len,
+        )?;
+        inputs.insert(
+            input_ref.as_str().to_string(),
+            StagedCapabilityInput {
+                run_id: run_context.run_id.to_string(),
+                payload,
+                byte_len,
+            },
+        );
         Ok(input_ref)
     }
 
@@ -186,6 +200,7 @@ impl LoopCapabilityResultWriter for ProductLiveCapabilityIo {
         _capability_id: &CapabilityId,
         output: serde_json::Value,
     ) -> Result<LoopResultRef, AgentLoopHostError> {
+        let byte_len = serialized_json_len(&output, "capability result")?;
         let result_ref =
             LoopResultRef::new(format!("result:{}.{}", run_context.run_id, Uuid::new_v4()))
                 .map_err(|_| {
@@ -194,18 +209,74 @@ impl LoopCapabilityResultWriter for ProductLiveCapabilityIo {
                         "capability result ref could not be represented",
                     )
                 })?;
-        self.results
+        let mut results = self
+            .results
             .lock()
-            .map_err(|_| capability_io_internal_error())?
-            .insert(
-                result_ref.as_str().to_string(),
-                StagedCapabilityResult {
-                    run_id: run_context.run_id.to_string(),
-                    output,
-                },
-            );
+            .map_err(|_| capability_io_internal_error())?;
+        ensure_staging_capacity(
+            "capability result",
+            results.len(),
+            results.values().map(|result| result.byte_len).sum(),
+            byte_len,
+        )?;
+        results.insert(
+            result_ref.as_str().to_string(),
+            StagedCapabilityResult {
+                run_id: run_context.run_id.to_string(),
+                output,
+                byte_len,
+            },
+        );
         Ok(result_ref)
     }
+}
+
+fn serialized_json_len(
+    value: &serde_json::Value,
+    label: &'static str,
+) -> Result<usize, AgentLoopHostError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|error| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                format!("{label} could not be serialized: {error}"),
+            )
+        })
+}
+
+fn ensure_staging_capacity(
+    label: &'static str,
+    current_entries: usize,
+    current_bytes: usize,
+    new_bytes: usize,
+) -> Result<(), AgentLoopHostError> {
+    if current_entries >= PRODUCT_LIVE_CAPABILITY_IO_MAX_STAGED_REFS {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::BudgetExceeded,
+            format!(
+                "{label} staging exceeds {} staged refs",
+                PRODUCT_LIVE_CAPABILITY_IO_MAX_STAGED_REFS
+            ),
+        ));
+    }
+    let Some(total_bytes) = current_bytes.checked_add(new_bytes) else {
+        return Err(capability_io_capacity_error(label));
+    };
+    if total_bytes > PRODUCT_LIVE_CAPABILITY_IO_MAX_STAGED_BYTES {
+        return Err(capability_io_capacity_error(label));
+    }
+    Ok(())
+}
+
+fn capability_io_capacity_error(label: &'static str) -> AgentLoopHostError {
+    AgentLoopHostError::new(
+        AgentLoopHostErrorKind::BudgetExceeded,
+        format!(
+            "{label} staging exceeds {} serialized bytes",
+            PRODUCT_LIVE_CAPABILITY_IO_MAX_STAGED_BYTES
+        ),
+    )
 }
 
 fn ensure_ref_scoped_to_run(
@@ -261,7 +332,6 @@ impl ProductLiveVisibleCapabilityRequestConfig {
     /// Creates base visible-request config for the user, runtime, trust, surface, and policy.
     pub fn new(
         user_id: UserId,
-        _extension_id: ExtensionId,
         runtime: RuntimeKind,
         trust: TrustClass,
         surface_kind: SurfaceKind,

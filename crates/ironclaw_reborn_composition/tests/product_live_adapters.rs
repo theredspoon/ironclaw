@@ -165,13 +165,66 @@ async fn capability_io_prunes_refs_for_terminal_runs_without_cross_run_loss() {
 }
 
 #[tokio::test]
+async fn capability_io_rejects_unstaged_run_scoped_refs() {
+    let io = ProductLiveCapabilityIo::default();
+    let run_context = loop_run_context("capability-io-unstaged").await;
+    let input_ref =
+        CapabilityInputRef::new(format!("input:{}:missing", run_context.run_id)).unwrap();
+    let result_ref = LoopResultRef::new(format!("result:{}.missing", run_context.run_id)).unwrap();
+
+    let input_error = io
+        .resolve_capability_input(&run_context, &input_ref)
+        .await
+        .expect_err("unstaged same-run input refs must fail closed");
+    assert_eq!(
+        input_error.kind,
+        ironclaw_turns::run_profile::AgentLoopHostErrorKind::InvalidInvocation
+    );
+
+    let result_error = io
+        .result_for_ref(&run_context, &result_ref)
+        .expect_err("unstaged same-run result refs must fail closed");
+    assert_eq!(
+        result_error.kind,
+        ironclaw_turns::run_profile::AgentLoopHostErrorKind::InvalidInvocation
+    );
+}
+
+#[tokio::test]
+async fn capability_io_enforces_staging_entry_and_byte_caps() {
+    let io = ProductLiveCapabilityIo::default();
+    let run_context = loop_run_context("capability-io-bounds").await;
+
+    for index in 0..1024 {
+        io.stage_input(&run_context, serde_json::json!({ "index": index }))
+            .unwrap();
+    }
+    let entry_error = io
+        .stage_input(&run_context, serde_json::json!({ "overflow": true }))
+        .expect_err("staging must enforce an entry cap");
+    assert_eq!(
+        entry_error.kind,
+        ironclaw_turns::run_profile::AgentLoopHostErrorKind::BudgetExceeded
+    );
+
+    let oversized_result = serde_json::json!("x".repeat(4 * 1024 * 1024));
+    let byte_error = ProductLiveCapabilityIo::default()
+        .write_capability_result(&run_context, &capability_id("demo.echo"), oversized_result)
+        .await
+        .expect_err("staging must enforce a serialized-byte cap");
+    assert_eq!(
+        byte_error.kind,
+        ironclaw_turns::run_profile::AgentLoopHostErrorKind::BudgetExceeded
+    );
+}
+
+#[tokio::test]
 async fn visible_capability_request_builder_scopes_context_to_loop_run() {
     let run_context = loop_run_context("visible-builder").await;
     let request = visible_capability_request_for_run(
         &run_context,
         ProductLiveVisibleCapabilityRequestConfig::new(
             UserId::new("user-visible-builder").unwrap(),
-            ExtensionId::new("planned-driver").unwrap(),
             RuntimeKind::FirstParty,
             TrustClass::System,
             SurfaceKind::new("agent_loop").unwrap(),
@@ -232,7 +285,6 @@ async fn local_dev_adapter_invokes_builtin_echo_through_host_runtime_port() {
             capability_authority_resolver: authority_resolver(
                 ProductLiveVisibleCapabilityRequestConfig::new(
                     UserId::new("user-builtin-echo").unwrap(),
-                    ExtensionId::new("planned-driver").unwrap(),
                     RuntimeKind::FirstParty,
                     TrustClass::FirstParty,
                     SurfaceKind::new("agent_loop").unwrap(),
@@ -317,7 +369,6 @@ async fn local_dev_adapter_invokes_extension_scoped_grants_with_loop_driver_prin
             capability_authority_resolver: authority_resolver(
                 ProductLiveVisibleCapabilityRequestConfig::new(
                     UserId::new("user-extension-grant").unwrap(),
-                    ExtensionId::new("ignored-configured-driver").unwrap(),
                     RuntimeKind::FirstParty,
                     TrustClass::FirstParty,
                     SurfaceKind::new("agent_loop").unwrap(),
@@ -393,7 +444,6 @@ async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() 
             capability_authority_resolver: authority_resolver(
                 ProductLiveVisibleCapabilityRequestConfig::new(
                     UserId::new("user-provider-tool").unwrap(),
-                    ExtensionId::new("planned-driver").unwrap(),
                     RuntimeKind::FirstParty,
                     TrustClass::FirstParty,
                     SurfaceKind::new("agent_loop").unwrap(),
@@ -502,7 +552,6 @@ async fn adapter_config_can_authorize_non_dispatch_provider_trust_effects() {
             capability_authority_resolver: authority_resolver(
                 ProductLiveVisibleCapabilityRequestConfig::new(
                     UserId::new("user-read-effect").unwrap(),
-                    ExtensionId::new("planned-driver").unwrap(),
                     RuntimeKind::FirstParty,
                     TrustClass::FirstParty,
                     SurfaceKind::new("agent_loop").unwrap(),
@@ -571,7 +620,6 @@ async fn local_dev_adapter_invokes_read_file_with_configured_mounts() {
             capability_authority_resolver: authority_resolver(
                 ProductLiveVisibleCapabilityRequestConfig::new(
                     UserId::new("user-read-file").unwrap(),
-                    ExtensionId::new("planned-driver").unwrap(),
                     RuntimeKind::FirstParty,
                     TrustClass::FirstParty,
                     SurfaceKind::new("agent_loop").unwrap(),
@@ -642,6 +690,47 @@ async fn adapter_bundle_requires_host_runtime_facade() {
         result,
         Err(ProductLivePlannedRuntimeAdapterError::MissingHostRuntime)
     ));
+}
+
+#[tokio::test]
+async fn adapter_bundle_maps_authority_resolution_failure_to_host_error() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "authority-failure-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: Arc::new(FailingAuthorityResolver),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let context = loop_run_context("authority-failure").await;
+
+    let error = match adapters
+        .capability_factory
+        .create_capability_port(&context)
+        .await
+    {
+        Ok(_) => panic!("authority resolver failures must map to host errors"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.kind,
+        ironclaw_turns::run_profile::AgentLoopHostErrorKind::InvalidInvocation
+    );
+    assert!(
+        error
+            .safe_summary
+            .contains("product-live capability execution scope is invalid"),
+        "unexpected error summary: {}",
+        error.safe_summary
+    );
 }
 
 #[tokio::test]
@@ -892,7 +981,6 @@ fn adapter_config() -> ProductLivePlannedRuntimeAdapterConfig {
 fn visible_capability_request_config(label: &str) -> ProductLiveVisibleCapabilityRequestConfig {
     ProductLiveVisibleCapabilityRequestConfig::new(
         UserId::new(format!("user-{label}")).unwrap(),
-        ExtensionId::new("adapter-test").unwrap(),
         RuntimeKind::Wasm,
         TrustClass::UserTrusted,
         SurfaceKind::new("agent_loop").unwrap(),
@@ -921,6 +1009,23 @@ impl ProductLiveCapabilityAuthorityResolver for StaticAuthorityResolver {
     }
 }
 
+struct FailingAuthorityResolver;
+
+#[async_trait]
+impl ProductLiveCapabilityAuthorityResolver for FailingAuthorityResolver {
+    async fn resolve_capability_authority(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>
+    {
+        Err(
+            ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                reason: "authority unavailable".to_string(),
+            },
+        )
+    }
+}
+
 struct RecordingAuthorityResolver {
     calls: Arc<Mutex<Vec<TurnRunId>>>,
 }
@@ -940,7 +1045,6 @@ impl ProductLiveCapabilityAuthorityResolver for RecordingAuthorityResolver {
         let user_id = UserId::new(format!("user-run-authority-{call_index}")).unwrap();
         Ok(ProductLiveVisibleCapabilityRequestConfig::new(
             user_id.clone(),
-            ExtensionId::new("ignored-configured-driver").unwrap(),
             RuntimeKind::FirstParty,
             TrustClass::FirstParty,
             SurfaceKind::new("agent_loop").unwrap(),

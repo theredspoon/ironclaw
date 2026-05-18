@@ -590,7 +590,6 @@ impl LoopCapabilityPortFactory for ProductLiveHostRuntimeCapabilityFactory {
             .insert(run_context.run_id, input_ref);
         let visible_capability_request = ProductLiveVisibleCapabilityRequestConfig::new(
             self.user_id.clone(),
-            ExtensionId::new("planned-driver").expect("valid planned driver extension"),
             RuntimeKind::FirstParty,
             TrustClass::FirstParty,
             SurfaceKind::new("agent_loop").expect("valid surface kind"),
