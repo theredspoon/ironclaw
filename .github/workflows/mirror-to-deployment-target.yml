@@ -2,6 +2,9 @@ name: Mirror to deployment target
 
 on:
   push:
+    branches:
+      - main
+      - native-matrix-channel-pilot
 
 jobs:
   mirror:
