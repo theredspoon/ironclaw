@@ -171,6 +171,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
             messages: prompt_bundle.messages,
             surface_version: Some(surface.version.clone()),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -275,6 +276,7 @@ async fn text_only_host_factory_sanitizes_gateway_error_summaries() {
             messages: prompt_bundle.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -329,6 +331,7 @@ async fn text_only_host_factory_invokes_model_budget_accountant() {
         messages: prompt_bundle.messages,
         surface_version: None,
         model_preference: None,
+        capability_view: None,
     })
     .await
     .unwrap();
@@ -718,6 +721,7 @@ async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
             messages: prompt_bundle.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -1580,6 +1584,7 @@ async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
             messages: prompt_bundle.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2319,6 +2324,7 @@ async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
                 .messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2582,6 +2588,7 @@ async fn text_only_host_e2e_flow_persists_checkpoint_mapping_in_turn_state_store
             messages: prompt_bundle.messages,
             surface_version: Some(surface_version.clone()),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2898,6 +2905,7 @@ async fn text_only_host_factory_threads_identity_source_to_prompt_and_model() {
             messages: prompt_bundle.messages,
             surface_version: Some(surface.version),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -3516,6 +3524,7 @@ async fn text_only_host_prompt_bundle_includes_surface_metadata_and_still_stream
         messages: prompt_bundle.messages,
         surface_version: Some(surface.version),
         model_preference: None,
+        capability_view: None,
     })
     .await
     .unwrap();
@@ -5802,6 +5811,7 @@ impl AgentLoopDriver for ScriptCapabilityFinalReplyDriver {
                 messages: prompt_bundle.messages,
                 surface_version: Some(surface.version),
                 model_preference: None,
+                capability_view: None,
             })
             .await
             .map_err(driver_host_error)?;
@@ -5922,6 +5932,7 @@ impl AgentLoopDriver for TextOnlyFinalReplyDriver {
                 messages: prompt_bundle.messages,
                 surface_version: Some(surface.version),
                 model_preference: None,
+                capability_view: None,
             })
             .await
             .map_err(driver_host_error)?;

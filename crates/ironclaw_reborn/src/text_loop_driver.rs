@@ -79,6 +79,7 @@ impl AgentLoopDriver for TextOnlyModelReplyDriver {
                 messages: prompt_bundle.messages,
                 surface_version: prompt_bundle.surface_version,
                 model_preference: None,
+                capability_view: None,
             })
             .await
             .map_err(|error| map_host_error("model", error))?;

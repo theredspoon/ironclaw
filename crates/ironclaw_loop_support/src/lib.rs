@@ -33,7 +33,9 @@ pub use capability_port::{
     HostRuntimeLoopCapabilityPort, HostRuntimeLoopCapabilityPortFactory,
     LoopCapabilityInputResolver, LoopCapabilityResultWriter, concurrency_hint_from_effects,
 };
-pub use capability_surface_filter::CapabilitySurfaceProfileFilter;
+pub use capability_surface_filter::{
+    CapabilitySurfaceProfileFilter, CapabilitySurfaceVisibleFilter,
+};
 pub use identity_context::{
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
     HostIdentityMessageContent, IdentityApplicability, IdentityBudget, IdentityFileName,
@@ -721,8 +723,17 @@ where
             turn_id: self.run_context.turn_id,
         };
         let gateway_response = match if let Some(capabilities) = self.capabilities.as_ref() {
+            let capabilities: Arc<dyn LoopCapabilityPort> =
+                if let Some(capability_view) = request.capability_view {
+                    Arc::new(CapabilitySurfaceVisibleFilter::new(
+                        Arc::clone(capabilities),
+                        capability_view.visible_capability_ids,
+                    ))
+                } else {
+                    Arc::clone(capabilities)
+                };
             self.gateway
-                .stream_model_with_capabilities(host_request, Arc::clone(capabilities))
+                .stream_model_with_capabilities(host_request, capabilities)
                 .await
         } else {
             self.gateway.stream_model(host_request).await

@@ -332,6 +332,7 @@ async fn drive_model_reply_milestones_and_assert_projection(
             messages: success_prompt.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -405,6 +406,7 @@ async fn drive_model_reply_milestones_and_assert_projection(
             messages: failure_prompt.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap_err();

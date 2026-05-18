@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
+use ironclaw_host_api::CapabilityId;
 use ironclaw_turns::run_profile::{
     AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation, CapabilityBatchOutcome,
-    CapabilityDenied, CapabilityDeniedReasonKind, CapabilityInvocation, CapabilityOutcome,
-    LoopCapabilityPort, ProviderToolCall, ProviderToolDefinition, VisibleCapabilityRequest,
-    VisibleCapabilitySurface,
+    CapabilityCallCandidate, CapabilityDenied, CapabilityDeniedReasonKind, CapabilityInvocation,
+    CapabilityOutcome, LoopCapabilityPort, ProviderToolCall, ProviderToolDefinition,
+    VisibleCapabilityRequest, VisibleCapabilitySurface,
 };
 
 use crate::CapabilityAllowSet;
@@ -16,9 +17,103 @@ pub struct CapabilitySurfaceProfileFilter {
     allow_set: Arc<CapabilityAllowSet>,
 }
 
+#[derive(Clone)]
+pub struct CapabilitySurfaceVisibleFilter {
+    inner: Arc<dyn LoopCapabilityPort>,
+    visible_capability_ids: Arc<HashSet<CapabilityId>>,
+}
+
 impl CapabilitySurfaceProfileFilter {
     pub fn new(inner: Arc<dyn LoopCapabilityPort>, allow_set: Arc<CapabilityAllowSet>) -> Self {
         Self { inner, allow_set }
+    }
+}
+
+impl CapabilitySurfaceVisibleFilter {
+    pub fn new(
+        inner: Arc<dyn LoopCapabilityPort>,
+        visible_capability_ids: impl IntoIterator<Item = CapabilityId>,
+    ) -> Self {
+        Self {
+            inner,
+            visible_capability_ids: Arc::new(visible_capability_ids.into_iter().collect()),
+        }
+    }
+
+    fn permits(&self, capability_id: &CapabilityId) -> bool {
+        self.visible_capability_ids.contains(capability_id)
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityPort for CapabilitySurfaceVisibleFilter {
+    fn tool_definitions(&self) -> Result<Vec<ProviderToolDefinition>, AgentLoopHostError> {
+        let mut definitions = self.inner.tool_definitions()?;
+        definitions.retain(|definition| self.permits(&definition.capability_id));
+        Ok(definitions)
+    }
+
+    async fn register_provider_tool_call(
+        &self,
+        tool_call: ProviderToolCall,
+    ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
+        let Some(definition) = self
+            .inner
+            .tool_definitions()?
+            .into_iter()
+            .find(|definition| definition.name == tool_call.name)
+        else {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "provider tool call is outside the visible capability surface",
+            ));
+        };
+        if !self.permits(&definition.capability_id) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "provider tool call is outside the model-visible capability view",
+            ));
+        }
+        let candidate = self.inner.register_provider_tool_call(tool_call).await?;
+        if !self.permits(&candidate.capability_id) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "provider tool call is outside the model-visible capability view",
+            ));
+        }
+        Ok(candidate)
+    }
+
+    async fn visible_capabilities(
+        &self,
+        request: VisibleCapabilityRequest,
+    ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        let mut surface = self.inner.visible_capabilities(request).await?;
+        apply_visible_filter_to_surface(&mut surface, &self.visible_capability_ids);
+        Ok(surface)
+    }
+
+    async fn invoke_capability(
+        &self,
+        request: CapabilityInvocation,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        if !self.permits(&request.capability_id) {
+            return Ok(model_view_denied_outcome());
+        }
+        self.inner.invoke_capability(request).await
+    }
+
+    async fn invoke_capability_batch(
+        &self,
+        request: CapabilityBatchInvocation,
+    ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+        invoke_filtered_batch(
+            &*self.inner,
+            request,
+            |invocation| self.permits(&invocation.capability_id),
+            model_view_denied_outcome,
+        )
+        .await
     }
 }
 
@@ -36,7 +131,7 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
     async fn register_provider_tool_call(
         &self,
         tool_call: ProviderToolCall,
-    ) -> Result<ironclaw_turns::run_profile::CapabilityCallCandidate, AgentLoopHostError> {
+    ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
         if !matches!(self.allow_set.as_ref(), CapabilityAllowSet::All) {
             let Some(definition) = self
                 .inner
@@ -97,76 +192,118 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
             return self.inner.invoke_capability_batch(request).await;
         }
 
-        let mut slots = Vec::with_capacity(request.invocations.len());
-        let mut allowed = Vec::new();
-        let mut allowed_idx = Vec::new();
+        invoke_filtered_batch(
+            &*self.inner,
+            request,
+            |invocation| self.allow_set.permits(&invocation.capability_id),
+            surface_profile_denied_outcome,
+        )
+        .await
+    }
+}
 
-        for (index, invocation) in request.invocations.iter().enumerate() {
-            if self.allow_set.permits(&invocation.capability_id) {
-                allowed.push(invocation.clone());
-                allowed_idx.push(index);
-                slots.push(None);
-            } else {
-                slots.push(Some(surface_profile_denied_outcome()));
-            }
-        }
+async fn invoke_filtered_batch(
+    inner: &(dyn LoopCapabilityPort + Send + Sync),
+    request: CapabilityBatchInvocation,
+    permits: impl Fn(&CapabilityInvocation) -> bool,
+    denied_outcome: fn() -> CapabilityOutcome,
+) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+    let mut slots = Vec::with_capacity(request.invocations.len());
+    let mut allowed = Vec::new();
+    let mut allowed_idx = Vec::new();
 
-        let (inner_outcomes, stopped_on_suspension) = if allowed.is_empty() {
-            (Vec::new(), false)
+    for (index, invocation) in request.invocations.iter().enumerate() {
+        if permits(invocation) {
+            allowed.push(invocation.clone());
+            allowed_idx.push(index);
+            slots.push(None);
         } else {
-            let inner_batch = self
-                .inner
-                .invoke_capability_batch(CapabilityBatchInvocation {
-                    invocations: allowed,
-                    stop_on_first_suspension: request.stop_on_first_suspension,
-                })
-                .await?;
-            (inner_batch.outcomes, inner_batch.stopped_on_suspension)
-        };
+            slots.push(Some(denied_outcome()));
+        }
+    }
 
-        if inner_outcomes.len() > allowed_idx.len() {
-            return Err(AgentLoopHostError::new(
+    let (inner_outcomes, stopped_on_suspension) = if allowed.is_empty() {
+        (Vec::new(), false)
+    } else {
+        let inner_batch = inner
+            .invoke_capability_batch(CapabilityBatchInvocation {
+                invocations: allowed,
+                stop_on_first_suspension: request.stop_on_first_suspension,
+            })
+            .await?;
+        (inner_batch.outcomes, inner_batch.stopped_on_suspension)
+    };
+
+    if inner_outcomes.len() > allowed_idx.len() {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "capability surface filter received too many inner outcomes",
+        ));
+    }
+
+    let n_inner = inner_outcomes.len();
+    for (outcome, original_index) in inner_outcomes
+        .into_iter()
+        .zip(allowed_idx.iter().copied().take(n_inner))
+    {
+        slots[original_index] = Some(outcome);
+    }
+
+    let truncate_to = if stopped_on_suspension && n_inner > 0 {
+        allowed_idx[n_inner - 1] + 1
+    } else if n_inner == allowed_idx.len() {
+        slots.len()
+    } else if n_inner == 0 {
+        allowed_idx.first().copied().unwrap_or(slots.len())
+    } else {
+        allowed_idx[n_inner - 1] + 1
+    };
+    slots.truncate(truncate_to);
+
+    let mut outcomes = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let outcome = slot.ok_or_else(|| {
+            AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Internal,
-                "capability surface filter received too many inner outcomes",
-            ));
+                "capability surface filter retained an unpopulated outcome slot",
+            )
+        })?;
+        outcomes.push(outcome);
+    }
+
+    Ok(CapabilityBatchOutcome {
+        outcomes,
+        stopped_on_suspension,
+    })
+}
+
+fn apply_visible_filter_to_surface(
+    surface: &mut VisibleCapabilitySurface,
+    visible_capability_ids: &HashSet<CapabilityId>,
+) {
+    surface
+        .descriptors
+        .retain(|descriptor| visible_capability_ids.contains(&descriptor.capability_id));
+}
+
+fn model_view_denied_outcome() -> CapabilityOutcome {
+    CapabilityOutcome::Denied(CapabilityDenied {
+        reason_kind: model_view_denied_kind(),
+        safe_summary: "capability outside the model-visible view".to_string(),
+    })
+}
+
+fn model_view_denied_kind() -> CapabilityDeniedReasonKind {
+    match CapabilityDeniedReasonKind::unknown("model_view_denied") {
+        Ok(kind) => kind,
+        Err(_) => {
+            debug_assert!(
+                false,
+                "model_view_denied_kind() fallback reached - this is a contract bug: \
+                 'model_view_denied' must be a valid reason kind value"
+            );
+            CapabilityDeniedReasonKind::EmptySurface
         }
-
-        let n_inner = inner_outcomes.len();
-        for (outcome, original_index) in inner_outcomes
-            .into_iter()
-            .zip(allowed_idx.iter().copied().take(n_inner))
-        {
-            slots[original_index] = Some(outcome);
-        }
-
-        // Truncate to the slot position after the last returned allowed outcome,
-        // preserving interleaved denials up to that point.
-        let truncate_to = if stopped_on_suspension && n_inner > 0 {
-            allowed_idx[n_inner - 1] + 1
-        } else if n_inner == allowed_idx.len() {
-            slots.len()
-        } else if n_inner == 0 {
-            allowed_idx.first().copied().unwrap_or(slots.len())
-        } else {
-            allowed_idx[n_inner - 1] + 1
-        };
-        slots.truncate(truncate_to);
-
-        let mut outcomes = Vec::with_capacity(slots.len());
-        for slot in slots {
-            let outcome = slot.ok_or_else(|| {
-                AgentLoopHostError::new(
-                    AgentLoopHostErrorKind::Internal,
-                    "capability surface filter retained an unpopulated outcome slot",
-                )
-            })?;
-            outcomes.push(outcome);
-        }
-
-        Ok(CapabilityBatchOutcome {
-            outcomes,
-            stopped_on_suspension,
-        })
     }
 }
 
@@ -183,7 +320,7 @@ fn surface_profile_denied_kind() -> CapabilityDeniedReasonKind {
         Err(_) => {
             debug_assert!(
                 false,
-                "surface_profile_denied_kind() fallback reached — this is a contract bug: \
+                "surface_profile_denied_kind() fallback reached - this is a contract bug: \
                  'surface_profile_denied' must be a valid reason kind value"
             );
             CapabilityDeniedReasonKind::EmptySurface

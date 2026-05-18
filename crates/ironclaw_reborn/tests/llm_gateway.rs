@@ -559,6 +559,7 @@ async fn production_loop_model_gateway_resolves_thread_refs_and_emits_milestones
             }],
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -620,6 +621,7 @@ async fn production_loop_model_gateway_sanitizes_provider_output_before_public_c
             }],
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -681,6 +683,7 @@ async fn production_loop_model_gateway_maps_provider_auth_and_session_to_credent
                 }],
                 surface_version: None,
                 model_preference: None,
+                capability_view: None,
             })
             .await
             .unwrap_err();
@@ -729,6 +732,7 @@ async fn production_loop_model_gateway_fails_closed_before_provider_call() {
             }],
             surface_version: None,
             model_preference: Some(ModelProfileId::new("mission_model").unwrap()),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -775,6 +779,7 @@ async fn production_loop_model_gateway_rejects_forged_context_summary_before_pro
             }],
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -821,6 +826,7 @@ async fn production_loop_model_gateway_rejects_unvalidated_surface_before_provid
             }],
             surface_version: Some(CapabilitySurfaceVersion::new("surface-stale").unwrap()),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -861,6 +867,7 @@ async fn production_loop_model_gateway_preserves_error_kind_when_summary_is_resa
             }],
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap_err();

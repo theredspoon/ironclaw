@@ -15,8 +15,9 @@ use ironclaw_turns::{
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
         LoopCancelReasonKind, LoopCancellationSignal, LoopCheckpointKind, LoopCheckpointRequest,
         LoopDriverNoteKind, LoopGateKind, LoopInput, LoopInputAckToken, LoopInputBatch,
-        LoopModelRequest, LoopProgressEvent, ParentLoopOutput, ProviderToolCallReference,
-        StageCheckpointPayloadRequest, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopModelCapabilityView, LoopModelRequest, LoopProgressEvent, ParentLoopOutput,
+        ProviderToolCallReference, StageCheckpointPayloadRequest, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
 };
 
@@ -248,6 +249,13 @@ impl CanonicalAgentLoopExecutor {
                     stage: HostStage::Capability,
                 })?;
             apply_capability_filter(&mut surface, &surface_filter);
+            let capability_view = LoopModelCapabilityView {
+                visible_capability_ids: surface
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.capability_id.clone())
+                    .collect(),
+            };
             state.surface_version = Some(surface.version.clone());
             state = match self
                 .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
@@ -331,6 +339,7 @@ impl CanonicalAgentLoopExecutor {
                         messages: prompt_bundle.messages,
                         surface_version: Some(surface.version.clone()),
                         model_preference,
+                        capability_view: Some(capability_view),
                     },
                 )
                 .await?
@@ -1634,19 +1643,9 @@ fn capability_is_visible(
 }
 
 fn apply_capability_filter(surface: &mut VisibleCapabilitySurface, filter: &CapabilityFilter) {
-    match filter {
-        CapabilityFilter::All => {}
-        CapabilityFilter::AllowOnly(allowed) => {
-            surface
-                .descriptors
-                .retain(|descriptor| allowed.contains(&descriptor.capability_id));
-        }
-        CapabilityFilter::Deny(denied) => {
-            surface
-                .descriptors
-                .retain(|descriptor| !denied.contains(&descriptor.capability_id));
-        }
-    }
+    surface
+        .descriptors
+        .retain(|descriptor| filter.permits(&descriptor.capability_id));
 }
 
 fn push_call_signature_once(
@@ -1805,10 +1804,11 @@ mod tests {
             LoopInputAck, LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
             LoopInterruptKind, LoopModelMessage, LoopModelResponse, LoopProcessRef,
             LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopRunContext,
-            ProcessHandleSummary, ProviderToolCallReplay, RedactedRunProfileProvenance,
-            ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier, RunClassId,
-            RunProfileFingerprint, RuntimeProfileConstraints, SchedulingClass,
-            StageCheckpointPayloadRequest, SteeringPolicy,
+            LoopRunInfoPort, ModelProfileId, ModelStreamChunk, ProcessHandleSummary,
+            ProviderToolCallReplay, RedactedRunProfileProvenance, ResolvedRunProfile,
+            ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
+            RuntimeProfileConstraints, SchedulingClass, StageCheckpointPayloadRequest,
+            SteeringPolicy,
         },
     };
 
@@ -2485,6 +2485,14 @@ mod tests {
         assert!(matches!(exit, LoopExit::Completed(_)));
         assert!(host.batch_invocations().is_empty());
         assert!(host.single_invocations().is_empty());
+        assert!(
+            host.model_requests()[0]
+                .capability_view
+                .as_ref()
+                .expect("model capability view")
+                .visible_capability_ids
+                .is_empty()
+        );
 
         let staged_states = host
             .staged_payloads()
