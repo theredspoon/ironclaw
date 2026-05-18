@@ -1,12 +1,14 @@
 #![cfg(any(feature = "libsql", feature = "postgres"))]
 
 use futures::future::join_all;
-use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AppendAssistantDraftRequest, AppendToolResultReferenceRequest,
-    CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, RedactMessageRequest, SessionThreadService, ThreadHistoryRequest,
-    ThreadScope, ToolResultReferenceEnvelope, ToolResultSafeSummary, UpdateAssistantDraftRequest,
+    CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextMessagesRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
+    ProviderToolCallReferenceEnvelope, RedactMessageRequest, SessionThreadService,
+    ThreadHistoryRequest, ThreadScope, ToolResultReferenceEnvelope, ToolResultSafeSummary,
+    UpdateAssistantDraftRequest,
 };
 
 #[cfg(feature = "libsql")]
@@ -220,6 +222,18 @@ async fn durable_history_flow(service: &impl SessionThreadService, label: &str) 
         .await
         .unwrap();
 
+    let provider_call = ProviderToolCallReferenceEnvelope {
+        provider_id: "test-provider".to_string(),
+        provider_model_id: "test-model".to_string(),
+        provider_turn_id: "turn_1".to_string(),
+        provider_call_id: "call_1".to_string(),
+        provider_tool_name: "demo__echo".to_string(),
+        capability_id: CapabilityId::new("demo.echo").unwrap(),
+        arguments: serde_json::json!({"message":"hello"}),
+        response_reasoning: Some("provider response reasoning".to_string()),
+        reasoning: Some("provider call reasoning".to_string()),
+        signature: Some("sig-1".to_string()),
+    };
     let tool_result = service
         .append_tool_result_reference(AppendToolResultReferenceRequest {
             scope: scope.clone(),
@@ -227,6 +241,7 @@ async fn durable_history_flow(service: &impl SessionThreadService, label: &str) 
             turn_run_id: "run-1".into(),
             result_ref: "result:durable-demo".into(),
             safe_summary: ToolResultSafeSummary::new("safe durable tool result").unwrap(),
+            provider_call: None,
         })
         .await
         .unwrap();
@@ -238,10 +253,19 @@ async fn durable_history_flow(service: &impl SessionThreadService, label: &str) 
             result_ref: "result:durable-demo".into(),
             safe_summary: ToolResultSafeSummary::new("retry safe durable tool result ignored")
                 .unwrap(),
+            provider_call: Some(provider_call),
         })
         .await
         .unwrap();
     assert_eq!(tool_result.message_id, duplicate_tool_result.message_id);
+    assert_eq!(
+        duplicate_tool_result
+            .tool_result_provider_call
+            .as_ref()
+            .expect("provider metadata backfilled")
+            .provider_call_id,
+        "call_1"
+    );
 
     service
         .finalize_assistant_message(
@@ -287,12 +311,13 @@ async fn assert_reopened_history(
         history.messages[3].tool_result_ref.as_deref(),
         Some("result:durable-demo")
     );
+    assert!(history.messages[3].tool_result_provider_call.is_none());
     assert_eq!(history.summary_artifacts.len(), 1);
     assert_eq!(history.summary_artifacts[0].content, "[redacted]");
 
     let context = service
         .load_context_window(LoadContextWindowRequest {
-            scope: thread_scope,
+            scope: thread_scope.clone(),
             thread_id: thread_id.clone(),
             max_messages: 16,
         })
@@ -306,6 +331,43 @@ async fn assert_reopened_history(
     assert_eq!(envelope.version, 1);
     assert_eq!(envelope.result_ref, "result:durable-demo");
     assert_eq!(envelope.safe_summary.as_str(), "safe durable tool result");
+    let provider_call = context.messages[2]
+        .tool_result_provider_call
+        .as_ref()
+        .expect("provider metadata survives durable reload in model context");
+    assert_eq!(provider_call.provider_turn_id, "turn_1");
+    assert_eq!(provider_call.provider_call_id, "call_1");
+    assert_eq!(provider_call.provider_tool_name, "demo__echo");
+    assert_eq!(provider_call.capability_id.as_str(), "demo.echo");
+    assert_eq!(
+        provider_call.arguments,
+        serde_json::json!({"message":"hello"})
+    );
+    assert_eq!(
+        provider_call.response_reasoning.as_deref(),
+        Some("provider response reasoning")
+    );
+    assert_eq!(
+        provider_call.reasoning.as_deref(),
+        Some("provider call reasoning")
+    );
+    assert_eq!(provider_call.signature.as_deref(), Some("sig-1"));
+
+    let exact_context = service
+        .load_context_messages(LoadContextMessagesRequest {
+            scope: thread_scope.clone(),
+            thread_id: thread_id.clone(),
+            message_ids: vec![history.messages[3].message_id],
+        })
+        .await
+        .unwrap();
+    let exact_provider_call = exact_context.messages[0]
+        .tool_result_provider_call
+        .as_ref()
+        .expect("exact context lookup preserves provider metadata");
+    assert_eq!(exact_provider_call.provider_turn_id, "turn_1");
+    assert_eq!(exact_provider_call.provider_call_id, "call_1");
+    assert_eq!(exact_provider_call.provider_tool_name, "demo__echo");
 
     let wrong_scope = service
         .list_thread_history(ThreadHistoryRequest {

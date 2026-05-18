@@ -168,6 +168,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -179,6 +180,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
             messages: prompt_bundle.messages,
             surface_version: Some(surface.version.clone()),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -274,6 +276,7 @@ async fn text_only_host_factory_sanitizes_gateway_error_summaries() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -283,6 +286,7 @@ async fn text_only_host_factory_sanitizes_gateway_error_summaries() {
             messages: prompt_bundle.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -329,6 +333,7 @@ async fn text_only_host_factory_invokes_model_budget_accountant() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -337,6 +342,7 @@ async fn text_only_host_factory_invokes_model_budget_accountant() {
         messages: prompt_bundle.messages,
         surface_version: None,
         model_preference: None,
+        capability_view: None,
     })
     .await
     .unwrap();
@@ -451,6 +457,7 @@ async fn progress_port_prompt_bundle_built_does_not_double_emit() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -718,6 +725,7 @@ async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -726,6 +734,7 @@ async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
             messages: prompt_bundle.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -1580,6 +1589,7 @@ async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -1588,6 +1598,7 @@ async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
             messages: prompt_bundle.messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2321,12 +2332,14 @@ async fn text_only_host_factory_threads_model_route_snapshot_to_gateway() {
                     checkpoint_state_ref: None,
                     max_messages: Some(8),
                     inline_messages: Vec::new(),
+                    capability_view: None,
                 })
                 .await
                 .unwrap()
                 .messages,
             surface_version: None,
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2582,6 +2595,7 @@ async fn text_only_host_e2e_flow_persists_checkpoint_mapping_in_turn_state_store
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2590,6 +2604,7 @@ async fn text_only_host_e2e_flow_persists_checkpoint_mapping_in_turn_state_store
             messages: prompt_bundle.messages,
             surface_version: Some(surface_version.clone()),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2671,6 +2686,7 @@ async fn text_only_host_prompt_accepts_empty_surface_version() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2691,6 +2707,7 @@ async fn text_only_host_prompt_rejects_stale_surface_version() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -2711,6 +2728,7 @@ async fn text_only_host_prompt_rejects_codeact_mode_and_zero_budget() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -2724,6 +2742,7 @@ async fn text_only_host_prompt_rejects_codeact_mode_and_zero_budget() {
             checkpoint_state_ref: None,
             max_messages: Some(0),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -2742,6 +2761,7 @@ async fn text_only_host_prompt_rejects_inline_messages() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: Some(8),
+            capability_view: None,
             inline_messages: vec![LoopInlineMessage {
                 role: LoopInlineMessageRole::User,
                 safe_body: LoopSafeSummary::new("safe inline nudge").unwrap(),
@@ -2781,6 +2801,7 @@ async fn text_only_host_prompt_rejects_foreign_context_and_checkpoint_refs() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -2794,6 +2815,7 @@ async fn text_only_host_prompt_rejects_foreign_context_and_checkpoint_refs() {
             checkpoint_state_ref: Some(LoopCheckpointStateRef::new("checkpoint:foreign").unwrap()),
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -2813,6 +2835,7 @@ async fn text_only_host_prompt_rejects_foreign_context_and_checkpoint_refs() {
             ),
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap_err();
@@ -2889,6 +2912,7 @@ async fn text_only_host_factory_threads_identity_source_to_prompt_and_model() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -2906,6 +2930,7 @@ async fn text_only_host_factory_threads_identity_source_to_prompt_and_model() {
             messages: prompt_bundle.messages,
             surface_version: Some(surface.version),
             model_preference: None,
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -3446,6 +3471,7 @@ async fn text_only_host_skill_context_does_not_expand_capability_surface() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -3512,6 +3538,7 @@ async fn text_only_host_prompt_bundle_includes_surface_metadata_and_still_stream
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -3524,6 +3551,7 @@ async fn text_only_host_prompt_bundle_includes_surface_metadata_and_still_stream
         messages: prompt_bundle.messages,
         surface_version: Some(surface.version),
         model_preference: None,
+        capability_view: None,
     })
     .await
     .unwrap();
@@ -4387,6 +4415,7 @@ async fn text_only_host_prompt_accepts_refetched_surface_version() {
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -5802,6 +5831,7 @@ impl AgentLoopDriver for ScriptCapabilityFinalReplyDriver {
                 checkpoint_state_ref: None,
                 max_messages: Some(8),
                 inline_messages: Vec::new(),
+                capability_view: None,
             })
             .await
             .map_err(driver_host_error)?;
@@ -5810,6 +5840,7 @@ impl AgentLoopDriver for ScriptCapabilityFinalReplyDriver {
                 messages: prompt_bundle.messages,
                 surface_version: Some(surface.version),
                 model_preference: None,
+                capability_view: None,
             })
             .await
             .map_err(driver_host_error)?;
@@ -5922,6 +5953,7 @@ impl AgentLoopDriver for TextOnlyFinalReplyDriver {
                 checkpoint_state_ref: None,
                 max_messages: Some(8),
                 inline_messages: Vec::new(),
+                capability_view: None,
             })
             .await
             .map_err(driver_host_error)?;
@@ -5930,6 +5962,7 @@ impl AgentLoopDriver for TextOnlyFinalReplyDriver {
                 messages: prompt_bundle.messages,
                 surface_version: Some(surface.version),
                 model_preference: None,
+                capability_view: None,
             })
             .await
             .map_err(driver_host_error)?;
@@ -6438,6 +6471,7 @@ impl RecordingGateway {
                     surface_version: CapabilitySurfaceVersion::new("empty:v1").unwrap(),
                     capability_id: CapabilityId::new("demo.echo").unwrap(),
                     input_ref: CapabilityInputRef::new("input:opaque-tool-call").unwrap(),
+                    provider_replay: None,
                 },
             ]),
         });
