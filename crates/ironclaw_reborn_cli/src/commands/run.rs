@@ -7,7 +7,7 @@ use ironclaw_reborn_composition::{
     PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings,
     build_reborn_runtime, reborn_runtime_readiness_snapshot,
 };
-use ironclaw_reborn_config::{RebornBootConfig, RebornProfile};
+use ironclaw_reborn_config::{REBORN_PROFILE_ENV, RebornBootConfig, RebornProfile};
 use tokio_util::sync::CancellationToken;
 
 use crate::context::RebornCliContext;
@@ -224,10 +224,23 @@ fn install_ctrl_c_cancellation() -> CancellationToken {
 fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntimeInput> {
     use ironclaw_reborn_composition::RebornBuildInput;
 
-    let owner_id = "reborn-cli";
+    // Read the operator's boot TOML if present. Missing file is OK
+    // (operator may not have run `ironclaw-reborn config init` yet);
+    // sparse fields are OK (each absent field falls back to the
+    // CLI-shaped default baked into composition).
+    let config_file = read_config_file(config)?;
+
+    reject_unsupported_runtime_sections(config_file.as_ref())?;
+
+    let owner_id = config_file
+        .as_ref()
+        .and_then(|file| file.identity.as_ref())
+        .and_then(|identity| identity.default_owner.as_deref())
+        .unwrap_or("reborn-cli");
+
     let local_dev_root: PathBuf = config.home().path().join("local-dev");
 
-    match config.profile() {
+    match effective_profile(config, config_file.as_ref())? {
         RebornProfile::LocalDev => {}
         other => {
             anyhow::bail!(
@@ -239,12 +252,9 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
 
     let services_input = RebornBuildInput::local_dev(owner_id, local_dev_root);
 
-    #[allow(unused_mut)] // mutated only when `root-llm-provider` is enabled
+    #[allow(unused_mut)]
     let mut runtime_input = RebornRuntimeInput::from_services(services_input)
-        .with_runner_settings(TurnRunnerSettings {
-            heartbeat_interval: Duration::from_secs(5),
-            poll_interval: Duration::from_millis(200),
-        })
+        .with_runner_settings(runner_settings(config_file.as_ref())?)
         .with_poll_settings(PollSettings {
             interval: Duration::from_millis(200),
             max_total: Duration::from_secs(180),
@@ -253,17 +263,172 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
 
     #[cfg(feature = "root-llm-provider")]
     {
-        if let Some(llm) = resolve_llm_config_from_env()? {
-            runtime_input = runtime_input.with_llm(llm);
-        } else {
-            tracing::warn!(
-                "no LLM provider env vars detected; runs will fail until you set \
-                 OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_BASE_URL / etc."
-            );
+        match resolve_llm_config(config, config_file.as_ref())? {
+            LlmResolutionOutcome::Resolved(llm) => {
+                runtime_input = runtime_input.with_llm(llm);
+            }
+            LlmResolutionOutcome::NoSelectionConfigured => {
+                tracing::warn!(
+                    "no LLM selection configured; set `[llm.default]` in {} or export \
+                     OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_BASE_URL. \
+                     Runs will fail until an LLM is wired.",
+                    config.home().config_file_path().display()
+                );
+            }
         }
     }
 
     Ok(runtime_input)
+}
+
+fn read_config_file(
+    config: &RebornBootConfig,
+) -> anyhow::Result<Option<ironclaw_reborn_config::RebornConfigFile>> {
+    use ironclaw_reborn_config::RebornConfigFile;
+    let path = config.home().config_file_path();
+    let file = RebornConfigFile::load(&path).map_err(anyhow::Error::from)?;
+    if let Some(parsed) = &file {
+        tracing::debug!(
+            path = %path.display(),
+            api_version = ?parsed.api_version,
+            "loaded boot config TOML"
+        );
+    }
+    Ok(file)
+}
+
+fn effective_profile(
+    config: &RebornBootConfig,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<RebornProfile> {
+    // Env wins over file. `RebornBootConfig` already parsed/validated env,
+    // so if the variable is present we keep that value.
+    if std::env::var_os(REBORN_PROFILE_ENV).is_some() {
+        return Ok(config.profile());
+    }
+
+    let Some(profile) = config_file
+        .and_then(|file| file.boot.as_ref())
+        .and_then(|boot| boot.profile.as_deref())
+    else {
+        return Ok(config.profile());
+    };
+
+    profile.parse::<RebornProfile>().map_err(|error| {
+        anyhow::anyhow!("config file [boot].profile `{profile}` is invalid: {error}")
+    })
+}
+
+fn reject_unsupported_runtime_sections(
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<()> {
+    let Some(file) = config_file else {
+        return Ok(());
+    };
+
+    if let Some(identity) = file.identity.as_ref() {
+        let mut unsupported = Vec::new();
+        if identity.tenant.is_some() {
+            unsupported.push("tenant");
+        }
+        if identity.default_agent.is_some() {
+            unsupported.push("default_agent");
+        }
+        if identity.default_project.is_some() {
+            unsupported.push("default_project");
+        }
+        if !unsupported.is_empty() {
+            anyhow::bail!(
+                "config file [identity] field(s) {} are parsed but not wired in this runtime slice; \
+                 leave them commented until identity-scope wiring lands (default_owner is supported)",
+                unsupported.join(", ")
+            );
+        }
+    }
+
+    let mut sections = Vec::new();
+    if file.policy.is_some() {
+        sections.push("[policy]");
+    }
+    if file.drivers.is_some() {
+        sections.push("[drivers]");
+    }
+    if file.harness.is_some() {
+        sections.push("[harness]");
+    }
+    if sections.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "config file section(s) {} are parsed but not wired in this runtime slice; \
+             leave them commented until epic #3036 substrate lands",
+            sections.join(", ")
+        )
+    }
+}
+
+fn runner_settings(
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<TurnRunnerSettings> {
+    let mut settings = TurnRunnerSettings::default();
+    if let Some(runner) = config_file.and_then(|file| file.runner.as_ref()) {
+        if let Some(secs) = runner.heartbeat_interval_secs {
+            if secs == 0 {
+                anyhow::bail!(
+                    "config file [runner].heartbeat_interval_secs must be greater than 0"
+                );
+            }
+            settings.heartbeat_interval = Duration::from_secs(secs);
+        }
+        if let Some(ms) = runner.poll_interval_ms {
+            if ms == 0 {
+                anyhow::bail!("config file [runner].poll_interval_ms must be greater than 0");
+            }
+            settings.poll_interval = Duration::from_millis(ms);
+        }
+    }
+    Ok(settings)
+}
+
+#[cfg(feature = "root-llm-provider")]
+enum LlmResolutionOutcome {
+    Resolved(ironclaw_reborn_composition::RebornLlmConfig),
+    NoSelectionConfigured,
+}
+
+#[cfg(feature = "root-llm-provider")]
+fn resolve_llm_config(
+    boot: &RebornBootConfig,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> anyhow::Result<LlmResolutionOutcome> {
+    // Preference order:
+    //   1. boot TOML [llm.default] (catalog-driven via providers.json)
+    //   2. env-only fallback (legacy: OPENAI_API_KEY etc.) for ergonomics
+    //   3. no LLM configured -> stub gateway, send fails at first message
+    if let Some(selection) = config_file.and_then(|file| file.default_llm_slot()) {
+        let providers_path = boot.home().providers_file_path();
+        let llm = ironclaw_reborn_composition::resolve_llm_selection_against_catalog(
+            selection,
+            Some(providers_path.as_path()),
+        )?;
+        tracing::info!(
+            provider_id = %llm.provider_id,
+            model = %llm.model,
+            "resolved LLM selection from config.toml against provider catalog"
+        );
+        return Ok(LlmResolutionOutcome::Resolved(llm));
+    }
+
+    if let Some(llm) = resolve_llm_config_from_env()? {
+        tracing::info!(
+            provider_id = %llm.provider_id,
+            model = %llm.model,
+            "resolved LLM selection from environment (no [llm.default] in config.toml)"
+        );
+        return Ok(LlmResolutionOutcome::Resolved(llm));
+    }
+
+    Ok(LlmResolutionOutcome::NoSelectionConfigured)
 }
 
 #[cfg(feature = "root-llm-provider")]
