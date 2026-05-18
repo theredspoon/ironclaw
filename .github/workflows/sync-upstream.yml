@@ -2,7 +2,7 @@ name: Sync upstream
 
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -22,7 +22,17 @@ jobs:
           git remote add upstream https://github.com/nearai/ironclaw.git
           git fetch upstream main --tags
 
+      - name: Check if upstream has new commits
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Attempt fast-forward merge
+        if: steps.check.outputs.skip == 'false'
         id: ff
         run: |
           if git merge --ff-only upstream/main; then
@@ -34,6 +44,12 @@ jobs:
       - name: Push if fast-forwarded
         if: steps.ff.outputs.result == 'fast-forward'
         run: git push origin main --tags
+
+      - name: Push to enjimi mirror
+        if: steps.ff.outputs.result == 'fast-forward'
+        run: |
+          git remote add enjimi https://x-access-token:${{ secrets.ENJIMI_PAT }}@github.com/enjimi/ironclaw.git
+          git push enjimi main --tags
 
       - name: Open PR if diverged
         if: steps.ff.outputs.result == 'diverged'
