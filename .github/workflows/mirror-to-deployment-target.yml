@@ -1,0 +1,17 @@
+name: Mirror to deployment target
+
+on:
+  push:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to deployment mirror
+        run: |
+          git remote add deployment_mirror https://x-access-token:${{ secrets.DEPLOYMENT_MIRROR_PAT }}@github.com/${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}.git
+          git push deployment_mirror "$GITHUB_REF" --tags --force

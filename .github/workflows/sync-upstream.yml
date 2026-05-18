@@ -45,12 +45,6 @@ jobs:
         if: steps.ff.outputs.result == 'fast-forward'
         run: git push origin main --tags
 
-      - name: Push to deployment mirror mirror
-        if: steps.ff.outputs.result == 'fast-forward'
-        run: |
-          git remote add deployment_mirror https://x-access-token:${{ secrets.DEPLOYMENT_MIRROR_PAT }}@github.com/${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}.git
-          git push deployment_mirror main --tags
-
       - name: Open PR if diverged
         if: steps.ff.outputs.result == 'diverged'
         env:
