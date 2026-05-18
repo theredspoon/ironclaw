@@ -14,7 +14,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Push to deployment mirror
+      - name: Verify token
+        env:
+          DEPLOYMENT_MIRROR_PAT: ${{ secrets.DEPLOYMENT_MIRROR_PAT }}
         run: |
-          git remote add deployment_mirror https://x-access-token:${{ secrets.DEPLOYMENT_MIRROR_PAT }}@github.com/${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}.git
+          if [ -z "$DEPLOYMENT_MIRROR_PAT" ]; then
+            echo "::error::DEPLOYMENT_MIRROR_PAT secret is empty"
+            exit 1
+          fi
+          echo "Token length: ${#DEPLOYMENT_MIRROR_PAT}"
+          curl -sf -o /dev/null -w "API status: %{http_code}\n" \
+            -H "Authorization: token $DEPLOYMENT_MIRROR_PAT" \
+            https://api.github.com/repos/${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}
+
+      - name: Push to deployment mirror
+        env:
+          DEPLOYMENT_MIRROR_PAT: ${{ secrets.DEPLOYMENT_MIRROR_PAT }}
+        run: |
+          git remote add deployment_mirror https://x-access-token:${DEPLOYMENT_MIRROR_PAT}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git
           git push deployment_mirror "$GITHUB_REF" --tags --force
