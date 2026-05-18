@@ -95,6 +95,28 @@ async fn no_reply_completion_requires_profile_permission() {
 }
 
 #[tokio::test]
+async fn result_only_completion_uses_verified_result_refs_without_no_reply_permission() {
+    let evidence = InMemoryLoopExitEvidencePort::all_verified();
+    let fixture = Fixture::new(evidence);
+    let exit = LoopExit::Completed(LoopCompleted {
+        completion_kind: LoopCompletionKind::ResultOnly,
+        reply_message_refs: vec![],
+        result_refs: vec![LoopResultRef::new("result:tool-output").expect("valid")],
+        final_checkpoint_id: None,
+        usage_summary_ref: None,
+        exit_id: test_exit_id(),
+    });
+
+    let state = fixture
+        .applier
+        .apply(&fixture.claimed, exit)
+        .await
+        .expect("applied");
+
+    assert_eq!(state.status, TurnStatus::Completed);
+}
+
+#[tokio::test]
 async fn production_completed_exit_requires_final_checkpoint() {
     let mut claimed = claimed_run();
     claimed

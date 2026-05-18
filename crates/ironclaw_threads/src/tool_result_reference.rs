@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-const MAX_TOOL_RESULT_REF_BYTES: usize = 512;
+// Mirrors `ironclaw_turns::LoopResultRef` without adding a threads -> turns
+// dependency: `result:` plus a non-empty 256-byte opaque id made from
+// ASCII letters, digits, `_`, `-`, or `.`.
+const MAX_TOOL_RESULT_REF_BYTES: usize = 256;
 const MAX_TOOL_RESULT_SUMMARY_BYTES: usize = 512;
 const RAW_PAYLOAD_OR_PATH_DELIMITERS: [char; 9] = ['{', '}', '[', ']', '`', '<', '>', '/', '\\'];
 const SENSITIVE_SUMMARY_MARKERS: [&str; 18] = [
@@ -77,19 +80,24 @@ impl ToolResultReferenceEnvelope {
 }
 
 fn validate_tool_result_ref(value: &str) -> Result<(), String> {
-    if !value.starts_with("result:") {
+    let Some(suffix) = value.strip_prefix("result:") else {
         return Err("tool result ref must start with result:".to_string());
+    };
+    if suffix.is_empty() {
+        return Err("tool result ref must include an opaque id after result:".to_string());
     }
     if value.len() > MAX_TOOL_RESULT_REF_BYTES {
         return Err(format!(
             "tool result ref exceeds {MAX_TOOL_RESULT_REF_BYTES} bytes"
         ));
     }
-    if !value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-    }) {
+    if !suffix
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
         return Err(
-            "tool result ref must contain only ASCII letters, digits, _, -, ., or :".to_string(),
+            "tool result ref opaque id must contain only ASCII letters, digits, _, -, or ."
+                .to_string(),
         );
     }
     Ok(())
@@ -140,7 +148,7 @@ fn validate_tool_result_safe_summary(value: String) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolResultSafeSummary;
+    use super::{ToolResultReferenceEnvelope, ToolResultSafeSummary};
 
     #[test]
     fn safe_summary_rejects_control_characters() {
@@ -152,5 +160,34 @@ mod tests {
     fn safe_summary_api_key_check_is_token_based() {
         assert!(ToolResultSafeSummary::new("sky-high confidence").is_ok());
         assert!(ToolResultSafeSummary::new("completed with sk-live-token").is_err());
+    }
+
+    #[test]
+    fn tool_result_ref_uses_loop_result_ref_shape() {
+        let summary = ToolResultSafeSummary::new("tool completed").expect("summary");
+        assert!(
+            ToolResultReferenceEnvelope::new("result:tool-output_1.2", summary.clone()).is_ok()
+        );
+
+        for invalid_ref in [
+            "result:",
+            "result:foo:bar",
+            "result:contains/slash",
+            "result:contains space",
+            "result:contains\ncontrol",
+        ] {
+            assert!(
+                ToolResultReferenceEnvelope::new(invalid_ref, summary.clone()).is_err(),
+                "accepted invalid result ref {invalid_ref:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_ref_rejects_over_256_bytes() {
+        let summary = ToolResultSafeSummary::new("tool completed").expect("summary");
+        let too_long = format!("result:{}", "a".repeat(250));
+
+        assert!(ToolResultReferenceEnvelope::new(too_long, summary).is_err());
     }
 }

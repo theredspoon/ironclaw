@@ -1315,12 +1315,15 @@ fn completed_exit(
     state: LoopExecutionState,
     final_checkpoint_id: Option<ironclaw_turns::TurnCheckpointId>,
 ) -> Result<LoopExit, AgentLoopExecutorError> {
+    let completion_kind = if !state.assistant_refs.is_empty() {
+        LoopCompletionKind::FinalReply
+    } else if !state.result_refs.is_empty() {
+        LoopCompletionKind::ResultOnly
+    } else {
+        LoopCompletionKind::NoReply
+    };
     Ok(LoopExit::Completed(LoopCompleted {
-        completion_kind: if state.assistant_refs.is_empty() {
-            LoopCompletionKind::NoReply
-        } else {
-            LoopCompletionKind::FinalReply
-        },
+        completion_kind,
         reply_message_refs: state.assistant_refs,
         result_refs: state.result_refs,
         final_checkpoint_id,
@@ -1649,19 +1652,19 @@ mod tests {
         AgentLoopDriverDescriptor, LoopGateRef, LoopMessageRef, LoopResultRef, RunProfileId,
         RunProfileVersion, TurnCheckpointId, TurnId, TurnRunId, TurnScope,
         run_profile::{
-            AgentLoopHostError, AgentLoopHostErrorKind, CancellationPolicy,
-            CapabilityDescriptorView, CapabilityInputRef, CapabilitySurfaceProfileId,
-            CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass,
-            ContextProfileId, LoopCancelReasonKind, LoopCancellationPort, LoopCancellationSignal,
-            LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextBundle, LoopContextRequest,
-            LoopDriverId, LoopInputAck, LoopInputAckToken, LoopInputBatch, LoopInputCursor,
-            LoopInputCursorToken, LoopInterruptKind, LoopModelMessage, LoopModelResponse,
-            LoopProcessRef, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
-            LoopRunContext, LoopRunInfoPort, ModelProfileId, ModelStreamChunk,
-            ProcessHandleSummary, RedactedRunProfileProvenance, ResolvedRunProfile,
-            ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
-            RuntimeProfileConstraints, SchedulingClass, StageCheckpointPayloadRequest,
-            SteeringPolicy,
+            AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef,
+            CancellationPolicy, CapabilityDescriptorView, CapabilityInputRef,
+            CapabilitySurfaceProfileId, CapabilitySurfaceVersion, CheckpointPolicy,
+            CheckpointSchemaId, ConcurrencyClass, ContextProfileId, LoopCancelReasonKind,
+            LoopCancellationPort, LoopCancellationSignal, LoopCheckpointRequest,
+            LoopCheckpointStateRef, LoopContextBundle, LoopContextRequest, LoopDriverId,
+            LoopInputAck, LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
+            LoopInterruptKind, LoopModelMessage, LoopModelResponse, LoopProcessRef,
+            LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopRunContext,
+            LoopRunInfoPort, ModelProfileId, ModelStreamChunk, ProcessHandleSummary,
+            RedactedRunProfileProvenance, ResolvedRunProfile, ResourceBudgetPolicy,
+            ResourceBudgetTier, RunClassId, RunProfileFingerprint, RuntimeProfileConstraints,
+            SchedulingClass, StageCheckpointPayloadRequest, SteeringPolicy,
         },
     };
 
@@ -2042,6 +2045,13 @@ mod tests {
             _request: FinalizeAssistantMessage,
         ) -> Result<LoopMessageRef, AgentLoopHostError> {
             Ok(LoopMessageRef::new("msg:assistant").expect("valid"))
+        }
+
+        async fn append_capability_result_ref(
+            &self,
+            _request: AppendCapabilityResultRef,
+        ) -> Result<LoopMessageRef, AgentLoopHostError> {
+            Ok(LoopMessageRef::new("msg:tool-result").expect("valid"))
         }
     }
 
@@ -2900,7 +2910,17 @@ mod tests {
             .await
             .expect("execute");
 
-        assert!(matches!(exit, LoopExit::Completed(_)));
+        match exit {
+            LoopExit::Completed(completed) => {
+                assert_eq!(completed.completion_kind, LoopCompletionKind::ResultOnly);
+                assert!(completed.reply_message_refs.is_empty());
+                assert_eq!(
+                    completed.result_refs,
+                    vec![LoopResultRef::new("result:visible").expect("valid")]
+                );
+            }
+            other => panic!("expected completed, got {other:?}"),
+        }
         assert_eq!(host.model_requests().len(), 1);
 
         let batch_invocations = host.batch_invocations();

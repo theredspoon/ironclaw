@@ -360,10 +360,16 @@ impl LoopCompleted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopCompletionKind {
+    /// A finalized assistant reply is the user-visible completion artifact.
     FinalReply,
+    /// The loop stopped to ask the user for input.
     AskUserReply,
+    /// The loop completed without durable reply/result evidence; profile-gated.
     NoReply,
+    /// A delegated subtask result is the durable completion artifact.
     DelegatedResult,
+    /// One or more durable result refs are the completion artifact.
+    ResultOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
