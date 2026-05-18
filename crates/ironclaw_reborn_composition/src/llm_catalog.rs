@@ -132,6 +132,8 @@ pub fn resolve_against_registry(
     selection: &LlmSlotSelection,
     registry: &ProviderRegistry,
 ) -> Result<RebornLlmConfig, RebornLlmCatalogError> {
+    validate_catalog(registry)?;
+
     let provider_id = selection
         .provider_id
         .as_deref()
@@ -156,8 +158,6 @@ pub fn resolve_against_registry(
         .position(|candidate| std::ptr::eq(candidate, provider))
         .unwrap_or(0);
 
-    validate_catalog_provider(provider, catalog_index)?;
-
     // API key resolution.
     let api_key = read_api_key(selection, provider)?;
 
@@ -180,6 +180,13 @@ pub fn resolve_against_registry(
         request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
         extra_headers,
     })
+}
+
+fn validate_catalog(registry: &ProviderRegistry) -> Result<(), RebornLlmCatalogError> {
+    for (catalog_index, provider) in registry.all().iter().enumerate() {
+        validate_catalog_provider(provider, catalog_index)?;
+    }
+    Ok(())
 }
 
 fn validate_catalog_provider(
@@ -644,6 +651,40 @@ mod tests {
                 field: "default_base_url",
                 ..
             }
+        ));
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(&pasted_secret),
+            "error must not echo pasted secret: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unused_secret_shaped_catalog_entry_fails_closed() {
+        let pasted_secret = format!(
+            "https://proxy.example/v1?key={}{}",
+            "s", "k-proj-1234567890abcdef1234567890"
+        );
+        let unused_provider = ProviderDefinition {
+            default_base_url: Some(pasted_secret.clone()),
+            ..provider_no_key_required("unused")
+        };
+        let registry =
+            ProviderRegistry::new(vec![unused_provider, provider_no_key_required("selected")]);
+        let selection = LlmSlotSelection {
+            provider_id: Some("selected".to_string()),
+            ..Default::default()
+        };
+
+        let err = resolve_against_registry(&selection, &registry)
+            .expect_err("unused secret-shaped catalog entry must fail closed");
+        assert!(matches!(
+            err,
+            RebornLlmCatalogError::CatalogFieldInvalid {
+                ref provider,
+                catalog_index: 0,
+                field: "default_base_url",
+            } if provider == "unused"
         ));
         let rendered = err.to_string();
         assert!(
