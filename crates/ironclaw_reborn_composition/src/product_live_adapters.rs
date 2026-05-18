@@ -52,6 +52,11 @@ pub enum ProductLivePlannedRuntimeAdapterError {
     InvalidCapabilityScope { reason: String },
 }
 
+/// In-memory capability I/O staging used by the product-live planned runtime adapters.
+///
+/// Inputs and results are keyed by run-scoped refs so provider tool-call payloads and
+/// runtime outputs cannot be read across loop runs. Callers should prune entries when
+/// a run completes to bound process-local memory use.
 #[derive(Default)]
 pub struct ProductLiveCapabilityIo {
     inputs: Mutex<HashMap<String, StagedCapabilityInput>>,
@@ -71,6 +76,7 @@ struct StagedCapabilityResult {
 }
 
 impl ProductLiveCapabilityIo {
+    /// Stages provider tool-call input for one loop run and returns its run-scoped ref.
     pub fn stage_input(
         &self,
         run_context: &LoopRunContext,
@@ -97,6 +103,7 @@ impl ProductLiveCapabilityIo {
         Ok(input_ref)
     }
 
+    /// Returns a staged capability result after verifying the ref belongs to the run.
     pub fn result_for_ref(
         &self,
         run_context: &LoopRunContext,
@@ -119,10 +126,12 @@ impl ProductLiveCapabilityIo {
         Ok(result.output.clone())
     }
 
+    /// Drops all staged inputs and results for the supplied loop run.
     pub fn prune_run(&self, run_context: &LoopRunContext) -> Result<(), AgentLoopHostError> {
         self.prune_run_id(&run_context.run_id.to_string())
     }
 
+    /// Drops all staged inputs and results whose stored run id matches `run_id`.
     pub fn prune_run_id(&self, run_id: &str) -> Result<(), AgentLoopHostError> {
         self.inputs
             .lock()
@@ -231,6 +240,11 @@ fn capability_io_internal_error() -> AgentLoopHostError {
     )
 }
 
+/// Configuration used to build the visible capability request for a product-live loop run.
+///
+/// The request context is scoped to the run and intentionally starts with no caller-supplied
+/// mounts. Execution mounts are passed separately by the authority resolver and applied only
+/// when invoking a selected capability.
 #[derive(Clone)]
 pub struct ProductLiveVisibleCapabilityRequestConfig {
     user_id: UserId,
@@ -244,6 +258,7 @@ pub struct ProductLiveVisibleCapabilityRequestConfig {
 }
 
 impl ProductLiveVisibleCapabilityRequestConfig {
+    /// Creates base visible-request config for the user, runtime, trust, surface, and policy.
     pub fn new(
         user_id: UserId,
         _extension_id: ExtensionId,
@@ -264,16 +279,19 @@ impl ProductLiveVisibleCapabilityRequestConfig {
         }
     }
 
+    /// Replaces capability grants made visible to the loop driver.
     pub fn with_grants(mut self, grants: CapabilitySet) -> Self {
         self.grants = grants;
         self
     }
 
+    /// Stores host-authorized execution mounts to pass to capability invocations.
     pub fn with_mounts(mut self, mounts: MountView) -> Self {
         self.mounts = mounts;
         self
     }
 
+    /// Grants one provider dispatch authority using the default dispatch-capability effect.
     pub fn with_provider_trust(
         mut self,
         provider: ExtensionId,
@@ -287,6 +305,7 @@ impl ProductLiveVisibleCapabilityRequestConfig {
         self
     }
 
+    /// Grants one provider dispatch authority constrained to the supplied allowed effects.
     pub fn with_provider_trust_for_effects(
         mut self,
         provider: ExtensionId,
@@ -308,6 +327,7 @@ impl ProductLiveVisibleCapabilityRequestConfig {
         self
     }
 
+    /// Inserts a precomputed trust decision for one capability provider.
     pub fn with_provider_trust_decision(
         mut self,
         provider: ExtensionId,
@@ -318,6 +338,11 @@ impl ProductLiveVisibleCapabilityRequestConfig {
     }
 }
 
+/// Builds the host-runtime visible capability request for one loop run.
+///
+/// The loop driver id is converted into the execution extension id, run scope fields are copied
+/// into both context and resource scope, and invalid loop-driver ids or execution scopes are
+/// reported as `InvalidCapabilityScope` errors.
 pub fn visible_capability_request_for_run(
     run_context: &LoopRunContext,
     config: ProductLiveVisibleCapabilityRequestConfig,
@@ -358,14 +383,20 @@ pub fn visible_capability_request_for_run(
         .with_provider_trust(config.provider_trust))
 }
 
+/// Resolves run-scoped capability authority for the product-live loop driver.
 #[async_trait]
 pub trait ProductLiveCapabilityAuthorityResolver: Send + Sync {
+    /// Returns visible capability request config and execution mounts for one loop run.
     async fn resolve_capability_authority(
         &self,
         run_context: &LoopRunContext,
     ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>;
 }
 
+/// Model route configuration for the product-live planned runtime.
+///
+/// The default route is always approved and used for the default slot; an optional mission route
+/// can be approved and bound to the mission slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductLiveModelRouteSettings {
     selection_mode: ModelSelectionMode,
@@ -374,6 +405,7 @@ pub struct ProductLiveModelRouteSettings {
 }
 
 impl ProductLiveModelRouteSettings {
+    /// Creates managed-only model routing with one approved default route.
     pub fn new(
         provider_id: impl Into<String>,
         model_id: impl Into<String>,
@@ -385,11 +417,13 @@ impl ProductLiveModelRouteSettings {
         })
     }
 
+    /// Replaces model-selection mode for the generated static route policy.
     pub fn with_selection_mode(mut self, selection_mode: ModelSelectionMode) -> Self {
         self.selection_mode = selection_mode;
         self
     }
 
+    /// Adds an approved mission-slot route.
     pub fn with_mission_route(
         mut self,
         provider_id: impl Into<String>,
@@ -415,35 +449,61 @@ impl ProductLiveModelRouteSettings {
     }
 }
 
+/// Adapter dependencies required to assemble the product-live planned runtime.
 pub struct ProductLivePlannedRuntimeAdapterConfig {
+    /// Resolves run-scoped capability authority and execution mounts.
     pub capability_authority_resolver: Arc<dyn ProductLiveCapabilityAuthorityResolver>,
+    /// Resolves staged capability inputs from loop refs.
     pub capability_input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+    /// Persists capability outputs and returns loop result refs.
     pub capability_result_writer: Arc<dyn LoopCapabilityResultWriter>,
+    /// Static allow-set exposed by the capability surface resolver.
     pub capability_allow_set: CapabilityAllowSet,
+    /// Static model routing config for default and optional mission slots.
     pub model_routes: ProductLiveModelRouteSettings,
+    /// Factory used to create cancellation handles for loop runs.
     pub cancellation_factory: Arc<dyn RunCancellationFactory>,
+    /// Host input queue used by the planned runtime.
     pub input_queue: Arc<dyn HostInputQueue>,
+    /// Source for host identity context.
     pub identity_context_source: Arc<dyn HostIdentityContextSource>,
+    /// Policy guard for loop model use.
     pub model_policy_guard: Arc<dyn LoopModelPolicyGuard>,
+    /// Budget accountant for loop model use.
     pub model_budget_accountant: Arc<dyn LoopModelBudgetAccountant>,
+    /// Instruction-safety context passed into the planned runtime.
     pub safety_context: InstructionSafetyContext,
+    /// Optional sink for capability invocation milestones.
     pub milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
 }
 
+/// Adapter bundle consumed by `build_product_live_planned_runtime`.
 #[derive(Clone)]
 pub struct ProductLivePlannedRuntimeAdapters {
+    /// Capability port factory backed by the host runtime facade.
     pub capability_factory: Arc<dyn LoopCapabilityPortFactory>,
+    /// Capability surface resolver exposing the configured allow-set.
     pub capability_surface_resolver: Arc<dyn CapabilitySurfaceProfileResolver>,
+    /// Model route resolver generated from product-live route settings.
     pub model_route_resolver: Arc<dyn ModelRouteResolver>,
+    /// Factory used to create cancellation handles for loop runs.
     pub cancellation_factory: Arc<dyn RunCancellationFactory>,
+    /// Host input queue used by the planned runtime.
     pub input_queue: Arc<dyn HostInputQueue>,
+    /// Source for host identity context.
     pub identity_context_source: Arc<dyn HostIdentityContextSource>,
+    /// Policy guard for loop model use.
     pub model_policy_guard: Arc<dyn LoopModelPolicyGuard>,
+    /// Budget accountant for loop model use.
     pub model_budget_accountant: Arc<dyn LoopModelBudgetAccountant>,
+    /// Instruction-safety context passed into the planned runtime.
     pub safety_context: InstructionSafetyContext,
 }
 
 impl ProductLivePlannedRuntimeAdapters {
+    /// Builds the adapter bundle from `RebornServices` and explicit product-live dependencies.
+    ///
+    /// Returns `MissingHostRuntime` when the service graph has no host runtime facade.
     pub fn from_services(
         services: &RebornServices,
         config: ProductLivePlannedRuntimeAdapterConfig,
@@ -556,6 +616,7 @@ impl CapabilitySurfaceProfileResolver for StaticCapabilitySurfaceResolver {
     }
 }
 
+/// Convenience constructor for a capability allow-set.
 pub fn capability_allowlist(ids: impl IntoIterator<Item = CapabilityId>) -> CapabilityAllowSet {
     CapabilityAllowSet::allowlist(ids)
 }

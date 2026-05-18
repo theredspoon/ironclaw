@@ -111,6 +111,10 @@ impl HostRuntimeLoopCapabilityPortFactory {
     }
 
     pub fn for_run_context(&self, run_context: LoopRunContext) -> Arc<dyn LoopCapabilityPort> {
+        Arc::new(self.port_for_run_context(run_context))
+    }
+
+    fn port_for_run_context(&self, run_context: LoopRunContext) -> HostRuntimeLoopCapabilityPort {
         let mut port = HostRuntimeLoopCapabilityPort::new(
             Arc::clone(&self.runtime),
             run_context,
@@ -121,8 +125,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
         if let Some(sink) = &self.milestone_sink {
             port = port.with_milestone_sink(Arc::clone(sink));
         }
-        port = port.with_execution_mounts(self.execution_mounts.clone());
-        Arc::new(port)
+        port.with_execution_mounts(self.execution_mounts.clone())
     }
 }
 
@@ -883,28 +886,24 @@ fn validate_provider_identity(
     label: &'static str,
     max_len: usize,
 ) -> Result<(), AgentLoopHostError> {
-    if value.trim().is_empty() {
-        return Err(AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            format!("{label} must not be empty"),
-        ));
-    }
-    if value.len() > max_len {
-        return Err(AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            format!("{label} exceeds {max_len} bytes"),
-        ));
-    }
-    if value
-        .chars()
-        .any(|character| character == '\0' || character.is_control())
-    {
-        return Err(AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            format!("{label} must not contain NUL/control characters"),
-        ));
-    }
-    Ok(())
+    validate_provider_field(
+        value,
+        label,
+        max_len,
+        |value| !value.trim().is_empty(),
+        || format!("{label} must not be empty"),
+    )?;
+    validate_provider_field(
+        value,
+        label,
+        max_len,
+        |value| {
+            !value
+                .chars()
+                .any(|character| character == '\0' || character.is_control())
+        },
+        || format!("{label} must not contain NUL/control characters"),
+    )
 }
 
 fn validate_provider_token(
@@ -912,24 +911,43 @@ fn validate_provider_token(
     label: &'static str,
     max_len: usize,
 ) -> Result<(), AgentLoopHostError> {
-    if value.is_empty() {
+    validate_provider_field(
+        value,
+        label,
+        max_len,
+        |value| !value.is_empty(),
+        || format!("{label} must not be empty"),
+    )?;
+    validate_provider_field(
+        value,
+        label,
+        max_len,
+        |value| {
+            value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
+            })
+        },
+        || format!("{label} must contain only ASCII letters, digits, _, -, ., or :"),
+    )
+}
+
+fn validate_provider_field(
+    value: &str,
+    label: &'static str,
+    max_len: usize,
+    predicate: impl FnOnce(&str) -> bool,
+    invalid_message: impl FnOnce() -> String,
+) -> Result<(), AgentLoopHostError> {
+    if !predicate(value) {
         return Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::InvalidInvocation,
-            format!("{label} must not be empty"),
+            invalid_message(),
         ));
     }
     if value.len() > max_len {
         return Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::InvalidInvocation,
             format!("{label} exceeds {max_len} bytes"),
-        ));
-    }
-    if !value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':')
-    }) {
-        return Err(AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            format!("{label} must contain only ASCII letters, digits, _, -, ., or :"),
         ));
     }
     Ok(())
@@ -1002,6 +1020,9 @@ fn invocation_context_from_visible(
         &loop_driver_extension,
         allowed_effects,
     )?;
+    // Mount propagation is host-authority only: visible-request contexts must arrive with no
+    // caller-supplied mounts, while this invocation context receives the execution mounts that the
+    // authority resolver selected for the run and capability dispatch.
     context.mounts = execution_mounts.clone();
     let invocation_id = InvocationId::new();
     context.invocation_id = invocation_id;
@@ -1018,6 +1039,11 @@ fn invocation_context_from_visible(
     Ok(context)
 }
 
+/// Derives the execution extension id for a loop driver.
+///
+/// Valid extension ids are preserved as-is. Other loop-driver ids are sanitized into a lowercase
+/// slug, truncated to leave room for entropy, and suffixed with a digest fragment so separators,
+/// case changes, non-ASCII input, and other slug collisions remain distinct.
 pub fn loop_driver_execution_extension_id(
     run_context: &LoopRunContext,
 ) -> Result<ExtensionId, AgentLoopHostError> {
@@ -1354,9 +1380,15 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use ironclaw_host_api::{
         AgentId, CapabilityGrant, CapabilityGrantId, GrantConstraints, MountAlias, MountGrant,
         MountPermissions, NetworkPolicy, ProjectId, TenantId, TrustClass, UserId, VirtualPath,
+    };
+    use ironclaw_host_runtime::{
+        CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, HostRuntimeHealth, HostRuntimeStatus,
+        RuntimeCapabilityResumeRequest, RuntimeStatusRequest, SurfaceKind,
+        VisibleCapabilitySurface,
     };
     use ironclaw_turns::{
         InMemoryRunProfileResolver, LoopDriverId, RunProfileResolutionRequest, RunProfileResolver,
@@ -1489,6 +1521,53 @@ mod tests {
                 .chars()
                 .all(|character| character.is_ascii_hexdigit())
         );
+    }
+
+    #[tokio::test]
+    async fn factory_with_execution_mounts_propagates_to_port() {
+        let context = execution_context("thread-factory-mounts");
+        let run_context = loop_run_context(&context).await;
+        let execution_mounts = execution_mounts();
+        let factory = HostRuntimeLoopCapabilityPortFactory::new(
+            dummy_runtime(),
+            visible_request(context),
+            dummy_input_resolver(),
+            dummy_result_writer(),
+            None,
+        )
+        .with_execution_mounts(execution_mounts.clone());
+
+        let port = factory.port_for_run_context(run_context);
+
+        assert_eq!(port.execution_mounts, execution_mounts);
+    }
+
+    #[tokio::test]
+    async fn port_with_execution_mounts_sets_field() {
+        let context = execution_context("thread-port-mounts");
+        let run_context = loop_run_context(&context).await;
+        let execution_mounts = execution_mounts();
+        let port = HostRuntimeLoopCapabilityPort::new(
+            dummy_runtime(),
+            run_context,
+            visible_request(context),
+            dummy_input_resolver(),
+            dummy_result_writer(),
+        )
+        .with_execution_mounts(execution_mounts.clone());
+
+        assert_eq!(port.execution_mounts, execution_mounts);
+    }
+
+    #[test]
+    fn extension_id_slug_covers_edge_cases() {
+        assert_eq!(extension_id_slug(""), "driver");
+        assert_eq!(
+            extension_id_slug("Reborn:Planned_Default"),
+            "reborn-planned-default"
+        );
+        assert_eq!(extension_id_slug("..alpha--beta__"), "alpha-beta");
+        assert_eq!(extension_id_slug("非"), "driver");
     }
 
     #[tokio::test]
@@ -1768,6 +1847,105 @@ mod tests {
         assert_eq!(invocation_context.trust, TrustClass::UserTrusted);
         assert_eq!(invocation_context.mounts, MountView::default());
         assert_eq!(invocation_context.grants.grants.len(), 1);
+    }
+
+    fn visible_request(
+        context: ExecutionContext,
+    ) -> ironclaw_host_runtime::VisibleCapabilityRequest {
+        ironclaw_host_runtime::VisibleCapabilityRequest::new(
+            context,
+            SurfaceKind::new("test").expect("valid surface kind"),
+        )
+    }
+
+    fn execution_mounts() -> MountView {
+        MountView::new(vec![MountGrant::new(
+            MountAlias::new("/execution").expect("valid mount alias"),
+            VirtualPath::new("/projects/execution").expect("valid virtual path"),
+            MountPermissions::read_only(),
+        )])
+        .expect("valid mount view")
+    }
+
+    fn dummy_runtime() -> Arc<dyn HostRuntime> {
+        Arc::new(NoopHostRuntime)
+    }
+
+    fn dummy_input_resolver() -> Arc<dyn LoopCapabilityInputResolver> {
+        Arc::new(NoopCapabilityIo)
+    }
+
+    fn dummy_result_writer() -> Arc<dyn LoopCapabilityResultWriter> {
+        Arc::new(NoopCapabilityIo)
+    }
+
+    struct NoopHostRuntime;
+
+    #[async_trait]
+    impl HostRuntime for NoopHostRuntime {
+        async fn invoke_capability(
+            &self,
+            _request: RuntimeCapabilityRequest,
+        ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn resume_capability(
+            &self,
+            _request: RuntimeCapabilityResumeRequest,
+        ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn visible_capabilities(
+            &self,
+            _request: ironclaw_host_runtime::VisibleCapabilityRequest,
+        ) -> Result<VisibleCapabilitySurface, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn cancel_work(
+            &self,
+            _request: CancelRuntimeWorkRequest,
+        ) -> Result<CancelRuntimeWorkOutcome, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn runtime_status(
+            &self,
+            _request: RuntimeStatusRequest,
+        ) -> Result<HostRuntimeStatus, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn health(&self) -> Result<HostRuntimeHealth, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+    }
+
+    struct NoopCapabilityIo;
+
+    #[async_trait]
+    impl LoopCapabilityInputResolver for NoopCapabilityIo {
+        async fn resolve_capability_input(
+            &self,
+            _run_context: &LoopRunContext,
+            _input_ref: &CapabilityInputRef,
+        ) -> Result<serde_json::Value, AgentLoopHostError> {
+            unreachable!("noop capability io should not be called")
+        }
+    }
+
+    #[async_trait]
+    impl LoopCapabilityResultWriter for NoopCapabilityIo {
+        async fn write_capability_result(
+            &self,
+            _run_context: &LoopRunContext,
+            _capability_id: &CapabilityId,
+            _output: serde_json::Value,
+        ) -> Result<LoopResultRef, AgentLoopHostError> {
+            unreachable!("noop capability io should not be called")
+        }
     }
 
     fn execution_context(thread: &str) -> ExecutionContext {
