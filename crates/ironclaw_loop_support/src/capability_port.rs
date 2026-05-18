@@ -133,6 +133,7 @@ pub struct HostRuntimeLoopCapabilityPortFactory {
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    execution_mounts: MountView,
 }
 
 impl HostRuntimeLoopCapabilityPortFactory {
@@ -149,6 +150,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
             input_resolver,
             result_writer,
             milestone_sink,
+            execution_mounts: MountView::default(),
         }
     }
 
@@ -172,7 +174,16 @@ impl HostRuntimeLoopCapabilityPortFactory {
         self
     }
 
+    pub fn with_execution_mounts(mut self, mounts: MountView) -> Self {
+        self.execution_mounts = mounts;
+        self
+    }
+
     pub fn for_run_context(&self, run_context: LoopRunContext) -> Arc<dyn LoopCapabilityPort> {
+        Arc::new(self.port_for_run_context(run_context))
+    }
+
+    fn port_for_run_context(&self, run_context: LoopRunContext) -> HostRuntimeLoopCapabilityPort {
         let mut port = HostRuntimeLoopCapabilityPort::new(
             Arc::clone(&self.runtime),
             run_context,
@@ -183,7 +194,7 @@ impl HostRuntimeLoopCapabilityPortFactory {
         if let Some(sink) = &self.milestone_sink {
             port = port.with_milestone_sink(Arc::clone(sink));
         }
-        Arc::new(port)
+        port.with_execution_mounts(self.execution_mounts.clone())
     }
 }
 
@@ -355,6 +366,7 @@ pub struct HostRuntimeLoopCapabilityPort {
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
+    execution_mounts: MountView,
     snapshots: Mutex<HashMap<String, SurfaceSnapshot>>,
     current_surface_version: Mutex<Option<String>>,
     dispatch_records: Mutex<DispatchRecordStore>,
@@ -377,6 +389,7 @@ impl HostRuntimeLoopCapabilityPort {
             input_resolver,
             result_writer,
             milestone_sink: None,
+            execution_mounts: MountView::default(),
             snapshots: Mutex::new(HashMap::new()),
             current_surface_version: Mutex::new(None),
             dispatch_records: Mutex::new(DispatchRecordStore::default()),
@@ -385,6 +398,11 @@ impl HostRuntimeLoopCapabilityPort {
 
     pub fn with_milestone_sink(mut self, sink: Arc<dyn LoopHostMilestoneSink>) -> Self {
         self.milestone_sink = Some(sink);
+        self
+    }
+
+    pub fn with_execution_mounts(mut self, mounts: MountView) -> Self {
+        self.execution_mounts = mounts;
         self
     }
 
@@ -867,6 +885,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                         &capability,
                         trust_decision.effective_trust.class(),
                         &trust_decision.authority_ceiling.allowed_effects,
+                        &self.execution_mounts,
                     )?,
                     request.capability_id,
                     capability.estimate,
@@ -955,7 +974,7 @@ fn provider_tool_name_with_digest(
     };
     let digest = sha256_digest_token(digest_input.as_bytes());
     let suffix = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let suffix = &suffix[..PROVIDER_TOOL_NAME_DIGEST_BYTES];
+    let suffix = &suffix[..PROVIDER_TOOL_NAME_DIGEST_BYTES]; // safety: sha256 hex digest is ASCII and longer than the fixed suffix.
     let prefix_len = PROVIDER_TOOL_NAME_MAX_BYTES.saturating_sub("__".len() + suffix.len());
     let prefix = if base.len() <= prefix_len {
         base
@@ -966,7 +985,7 @@ fn provider_tool_name_with_digest(
             .take_while(|index| *index <= prefix_len)
             .last()
             .unwrap_or(0);
-        &base[..prefix_end]
+        &base[..prefix_end] // safety: prefix_end comes from char_indices(), so it is a UTF-8 boundary.
     };
     let candidate = format!("{prefix}__{suffix}");
     if existing
@@ -1250,15 +1269,10 @@ fn invocation_context_from_visible(
     capability: &SurfaceCapabilitySnapshot,
     trust: ironclaw_host_api::TrustClass,
     allowed_effects: &[EffectKind],
+    execution_mounts: &MountView,
 ) -> Result<ExecutionContext, AgentLoopHostError> {
     let mut context = base.clone();
-    let loop_driver_extension =
-        ExtensionId::new(run_context.loop_driver_id.as_str()).map_err(|_| {
-            AgentLoopHostError::new(
-                AgentLoopHostErrorKind::Internal,
-                "loop driver id could not be represented as an execution extension",
-            )
-        })?;
+    let loop_driver_extension = loop_driver_execution_extension_id(run_context)?;
     context.extension_id = loop_driver_extension.clone();
     context.runtime = capability.runtime;
     context.trust = trust;
@@ -1268,7 +1282,10 @@ fn invocation_context_from_visible(
         &loop_driver_extension,
         allowed_effects,
     )?;
-    context.mounts = MountView::default();
+    // Mount propagation is host-authority only: visible-request contexts must arrive with no
+    // caller-supplied mounts, while this invocation context receives the execution mounts that the
+    // authority resolver selected for the run and capability dispatch.
+    context.mounts = execution_mounts.clone();
     let invocation_id = InvocationId::new();
     context.invocation_id = invocation_id;
     context.correlation_id = CorrelationId::new();
@@ -1282,6 +1299,88 @@ fn invocation_context_from_visible(
         )
     })?;
     Ok(context)
+}
+
+/// Derives the execution extension id for a loop driver.
+///
+/// Valid extension ids are preserved as-is. Other loop-driver ids are sanitized into a lowercase
+/// slug, truncated to leave room for entropy, and suffixed with a digest fragment so separators,
+/// case changes, non-ASCII input, and other slug collisions remain distinct.
+pub fn loop_driver_execution_extension_id(
+    run_context: &LoopRunContext,
+) -> Result<ExtensionId, AgentLoopHostError> {
+    let raw = run_context.loop_driver_id.as_str();
+    if let Ok(extension_id) = ExtensionId::new(raw) {
+        return Ok(extension_id);
+    }
+
+    let digest = sha256_digest_token(raw.as_bytes());
+    let digest_hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    let slug = extension_id_slug(raw);
+    let prefix_budget = 128usize
+        .saturating_sub("loop-driver-".len())
+        .saturating_sub("-".len())
+        .saturating_sub(16);
+    let mut candidate = slug.chars().take(prefix_budget).collect::<String>();
+    if candidate.is_empty() {
+        candidate.push_str("driver");
+    }
+    ExtensionId::new(format!("loop-driver-{candidate}-{}", &digest_hex[..16])).map_err(|_| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Internal,
+            "loop driver id could not be represented as an execution extension",
+        )
+    })
+}
+
+fn extension_id_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_separator = false;
+    for byte in value.bytes() {
+        let next = match byte {
+            b'a'..=b'z' | b'0'..=b'9' => {
+                last_separator = false;
+                byte as char
+            }
+            b'A'..=b'Z' => {
+                last_separator = false;
+                byte.to_ascii_lowercase() as char
+            }
+            b'_' | b'-' => {
+                if last_separator {
+                    continue;
+                }
+                last_separator = true;
+                '-'
+            }
+            b'.' => {
+                if slug.is_empty() || last_separator {
+                    continue;
+                }
+                last_separator = true;
+                '.'
+            }
+            _ => {
+                if last_separator {
+                    continue;
+                }
+                last_separator = true;
+                '-'
+            }
+        };
+        slug.push(next);
+    }
+    while slug.ends_with(['-', '.']) {
+        slug.pop();
+    }
+    if slug
+        .as_bytes()
+        .first()
+        .is_none_or(|first| !(first.is_ascii_lowercase() || first.is_ascii_digit()))
+    {
+        slug.insert_str(0, "driver");
+    }
+    slug
 }
 
 fn invocation_grants_from_visible(
@@ -1576,13 +1675,19 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use ironclaw_host_api::{
         AgentId, CapabilityGrant, CapabilityGrantId, GrantConstraints, MountAlias, MountGrant,
         MountPermissions, NetworkPolicy, ProjectId, TenantId, TrustClass, UserId, VirtualPath,
     };
+    use ironclaw_host_runtime::{
+        CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, HostRuntimeHealth, HostRuntimeStatus,
+        RuntimeCapabilityResumeRequest, RuntimeStatusRequest, SurfaceKind,
+        VisibleCapabilitySurface,
+    };
     use ironclaw_turns::{
-        InMemoryRunProfileResolver, RunProfileResolutionRequest, RunProfileResolver, TurnId,
-        TurnRunId, TurnScope,
+        InMemoryRunProfileResolver, LoopDriverId, RunProfileResolutionRequest, RunProfileResolver,
+        TurnId, TurnRunId, TurnScope,
     };
 
     #[test]
@@ -1806,6 +1911,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn factory_with_execution_mounts_propagates_to_port() {
+        let context = execution_context("thread-factory-mounts");
+        let run_context = loop_run_context(&context).await;
+        let execution_mounts = execution_mounts();
+        let factory = HostRuntimeLoopCapabilityPortFactory::new(
+            dummy_runtime(),
+            visible_request(context),
+            dummy_input_resolver(),
+            dummy_result_writer(),
+            None,
+        )
+        .with_execution_mounts(execution_mounts.clone());
+
+        let port = factory.port_for_run_context(run_context);
+
+        assert_eq!(port.execution_mounts, execution_mounts);
+    }
+
+    #[tokio::test]
+    async fn port_with_execution_mounts_sets_field() {
+        let context = execution_context("thread-port-mounts");
+        let run_context = loop_run_context(&context).await;
+        let execution_mounts = execution_mounts();
+        let port = HostRuntimeLoopCapabilityPort::new(
+            dummy_runtime(),
+            run_context,
+            visible_request(context),
+            dummy_input_resolver(),
+            dummy_result_writer(),
+        )
+        .with_execution_mounts(execution_mounts.clone());
+
+        assert_eq!(port.execution_mounts, execution_mounts);
+    }
+
+    #[tokio::test]
     async fn invocation_context_rejects_same_scope_elevated_grant() {
         let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
         let mut context = execution_context("thread-elevated-grant");
@@ -1843,6 +1984,7 @@ mod tests {
             &capability,
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
+            &MountView::default(),
         )
         .expect_err("elevated grant must be rejected");
 
@@ -1893,10 +2035,11 @@ mod tests {
             &capability,
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
+            &grant_mounts,
         )
         .expect("host-issued mount grant should be preserved");
 
-        assert_eq!(invocation_context.mounts, MountView::default());
+        assert_eq!(invocation_context.mounts, grant_mounts);
         assert_eq!(invocation_context.grants.grants.len(), 1);
         assert_eq!(
             invocation_context.grants.grants[0].constraints.mounts,
@@ -1940,6 +2083,7 @@ mod tests {
             &capability,
             TrustClass::Sandbox,
             &[EffectKind::ReadFilesystem],
+            &MountView::default(),
         )
         .expect("matching host scope grant should be preserved");
 
@@ -1948,6 +2092,79 @@ mod tests {
             &invocation_context.grants.grants[0].grantee,
             Principal::Thread(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn invocation_context_derives_extension_id_for_planned_driver_namespaced_id() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-planned-driver-id");
+        let mut run_context = loop_run_context(&context).await;
+        run_context.loop_driver_id =
+            LoopDriverId::new("reborn:planned-default").expect("valid loop driver id");
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::User(context.user_id.clone()),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::DispatchCapability],
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::FirstParty,
+            estimate: ResourceEstimate::default(),
+            safe_description: "demo echo".to_string(),
+            parameters_schema: serde_json::json!({ "type": "object" }),
+            provider_tool_name: "demo_echo".to_string(),
+        };
+
+        let invocation_context = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::FirstParty,
+            &[EffectKind::DispatchCapability],
+            &MountView::default(),
+        )
+        .expect("planned driver id should derive a valid execution principal");
+
+        assert_eq!(
+            invocation_context.extension_id,
+            loop_driver_execution_extension_id(&run_context).expect("valid extension")
+        );
+        assert_eq!(invocation_context.grants.grants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_driver_execution_extension_id_includes_digest_to_avoid_slug_collisions() {
+        let context = execution_context("thread-planned-driver-collisions");
+        let mut colon_context = loop_run_context(&context).await;
+        colon_context.loop_driver_id =
+            LoopDriverId::new("reborn:planned-default").expect("valid loop driver id");
+        let mut dash_context = loop_run_context(&context).await;
+        dash_context.loop_driver_id =
+            LoopDriverId::new("reborn-planned-default").expect("valid loop driver id");
+
+        let colon_id =
+            loop_driver_execution_extension_id(&colon_context).expect("valid extension id");
+        let dash_id =
+            loop_driver_execution_extension_id(&dash_context).expect("valid extension id");
+
+        assert_ne!(colon_id, dash_id);
+        assert!(
+            colon_id
+                .as_str()
+                .starts_with("loop-driver-reborn-planned-default-")
+        );
+        assert_eq!(dash_id.as_str(), "reborn-planned-default");
     }
 
     #[tokio::test]
@@ -1997,6 +2214,7 @@ mod tests {
             &capability,
             TrustClass::UserTrusted,
             &[EffectKind::DispatchCapability],
+            &MountView::default(),
         )
         .expect("context");
 
@@ -2005,6 +2223,105 @@ mod tests {
         assert_eq!(invocation_context.trust, TrustClass::UserTrusted);
         assert_eq!(invocation_context.mounts, MountView::default());
         assert_eq!(invocation_context.grants.grants.len(), 1);
+    }
+
+    fn visible_request(
+        context: ExecutionContext,
+    ) -> ironclaw_host_runtime::VisibleCapabilityRequest {
+        ironclaw_host_runtime::VisibleCapabilityRequest::new(
+            context,
+            SurfaceKind::new("test").expect("valid surface kind"),
+        )
+    }
+
+    fn execution_mounts() -> MountView {
+        MountView::new(vec![MountGrant::new(
+            MountAlias::new("/execution").expect("valid mount alias"),
+            VirtualPath::new("/projects/execution").expect("valid virtual path"),
+            MountPermissions::read_only(),
+        )])
+        .expect("valid mount view")
+    }
+
+    fn dummy_runtime() -> Arc<dyn HostRuntime> {
+        Arc::new(NoopHostRuntime)
+    }
+
+    fn dummy_input_resolver() -> Arc<dyn LoopCapabilityInputResolver> {
+        Arc::new(NoopCapabilityIo)
+    }
+
+    fn dummy_result_writer() -> Arc<dyn LoopCapabilityResultWriter> {
+        Arc::new(NoopCapabilityIo)
+    }
+
+    struct NoopHostRuntime;
+
+    #[async_trait]
+    impl HostRuntime for NoopHostRuntime {
+        async fn invoke_capability(
+            &self,
+            _request: RuntimeCapabilityRequest,
+        ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn resume_capability(
+            &self,
+            _request: RuntimeCapabilityResumeRequest,
+        ) -> Result<RuntimeCapabilityOutcome, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn visible_capabilities(
+            &self,
+            _request: ironclaw_host_runtime::VisibleCapabilityRequest,
+        ) -> Result<VisibleCapabilitySurface, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn cancel_work(
+            &self,
+            _request: CancelRuntimeWorkRequest,
+        ) -> Result<CancelRuntimeWorkOutcome, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn runtime_status(
+            &self,
+            _request: RuntimeStatusRequest,
+        ) -> Result<HostRuntimeStatus, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+
+        async fn health(&self) -> Result<HostRuntimeHealth, HostRuntimeError> {
+            unreachable!("noop host runtime should not be called")
+        }
+    }
+
+    struct NoopCapabilityIo;
+
+    #[async_trait]
+    impl LoopCapabilityInputResolver for NoopCapabilityIo {
+        async fn resolve_capability_input(
+            &self,
+            _run_context: &LoopRunContext,
+            _input_ref: &CapabilityInputRef,
+        ) -> Result<serde_json::Value, AgentLoopHostError> {
+            unreachable!("noop capability io should not be called")
+        }
+    }
+
+    #[async_trait]
+    impl LoopCapabilityResultWriter for NoopCapabilityIo {
+        async fn write_capability_result(
+            &self,
+            _run_context: &LoopRunContext,
+            _capability_id: &CapabilityId,
+            _output: serde_json::Value,
+        ) -> Result<LoopResultRef, AgentLoopHostError> {
+            unreachable!("noop capability io should not be called")
+        }
     }
 
     fn execution_context(thread: &str) -> ExecutionContext {

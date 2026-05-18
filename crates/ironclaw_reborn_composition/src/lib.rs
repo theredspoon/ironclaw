@@ -23,6 +23,7 @@ mod factory;
 mod input;
 #[cfg(feature = "root-llm-provider")]
 mod llm_catalog;
+mod product_live_adapters;
 mod profile;
 mod readiness;
 mod runtime;
@@ -34,6 +35,12 @@ pub use input::RebornBuildInput;
 #[cfg(feature = "root-llm-provider")]
 pub use llm_catalog::{
     RebornLlmCatalogError, resolve_against_registry, resolve_llm_selection_against_catalog,
+};
+pub use product_live_adapters::{
+    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
+    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
+    ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig,
+    capability_allowlist, visible_capability_request_for_run,
 };
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};

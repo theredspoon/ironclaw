@@ -32,6 +32,7 @@ pub use capability_allow_set::{
 pub use capability_port::{
     HostRuntimeLoopCapabilityPort, HostRuntimeLoopCapabilityPortFactory,
     LoopCapabilityInputResolver, LoopCapabilityResultWriter, concurrency_hint_from_effects,
+    loop_driver_execution_extension_id,
 };
 pub use capability_surface_filter::{
     CapabilitySurfaceProfileFilter, CapabilitySurfaceVisibleFilter,
