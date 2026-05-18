@@ -231,11 +231,11 @@ fn production_wiring(
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 fn planned_run_profile_resolver() -> Result<Arc<InMemoryRunProfileResolver>, RebornBuildError> {
     Ok(Arc::new(
-        ironclaw_reborn::default_planned_run_profile_resolver().map_err(|error| {
-            RebornBuildError::PlannedRunProfileResolver {
+        ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver().map_err(
+            |error| RebornBuildError::PlannedRunProfileResolver {
                 reason: error.to_string(),
-            }
-        })?,
+            },
+        )?,
     ))
 }
 

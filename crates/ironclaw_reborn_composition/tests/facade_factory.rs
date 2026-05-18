@@ -13,7 +13,7 @@ use ironclaw_host_runtime::{
     TurnRunSchedulerConfig, TurnRunSchedulerHandle,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_reborn::PLANNED_DEFAULT_PROFILE_ID;
+use ironclaw_reborn::planned_driver_factory::PLANNED_DEFAULT_PROFILE_ID;
 #[cfg(all(feature = "postgres", not(feature = "libsql")))]
 use ironclaw_reborn_composition::RebornCompositionProfile;
 #[cfg(feature = "libsql")]

@@ -4331,6 +4331,7 @@ name = "ironclaw_host_runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "chrono-tz",
@@ -4624,10 +4625,15 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
- "ironclaw_reborn",
+ "ironclaw_reborn_composition",
  "ironclaw_reborn_config",
+ "secrecy",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4642,6 +4648,8 @@ dependencies = [
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_host_runtime",
+ "ironclaw_llm",
+ "ironclaw_loop_support",
  "ironclaw_network",
  "ironclaw_processes",
  "ironclaw_reborn",
@@ -4649,6 +4657,7 @@ dependencies = [
  "ironclaw_resources",
  "ironclaw_run_state",
  "ironclaw_secrets",
+ "ironclaw_threads",
  "ironclaw_trust",
  "ironclaw_turns",
  "libsql",
@@ -4659,7 +4668,9 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
