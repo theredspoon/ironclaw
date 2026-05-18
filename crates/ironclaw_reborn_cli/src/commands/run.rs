@@ -3,8 +3,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Args;
-use ironclaw_reborn_composition::{RebornRuntimeInput, TurnRunnerSettings, build_reborn_runtime};
+use ironclaw_reborn_composition::{
+    PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TurnRunnerSettings,
+    build_reborn_runtime, reborn_runtime_readiness_snapshot,
+};
 use ironclaw_reborn_config::{REBORN_PROFILE_ENV, RebornBootConfig, RebornProfile};
+use tokio_util::sync::CancellationToken;
 
 use crate::context::RebornCliContext;
 
@@ -26,7 +30,7 @@ pub(crate) struct RunCommand {
 
 impl RunCommand {
     pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
-        let _ = init_tracing();
+        init_tracing();
         if self.dry_run {
             return run_dry(context);
         }
@@ -42,11 +46,12 @@ impl RunCommand {
             print_runtime_banner(context.boot_config());
 
             let conversation = runtime.new_conversation().await?;
+            let cancellation = install_ctrl_c_cancellation();
 
             let outcome = if let Some(text) = message {
-                send_once(&runtime, &conversation, &text).await
+                send_once(&runtime, &conversation, &text, cancellation).await
             } else {
-                run_repl(&runtime, &conversation).await
+                run_repl(&runtime, &conversation, cancellation).await
             };
 
             runtime.shutdown().await?;
@@ -58,14 +63,45 @@ impl RunCommand {
 
 fn run_dry(context: RebornCliContext) -> anyhow::Result<()> {
     let config = context.boot_config();
-    println!("IronClaw Reborn runtime shell");
+    let readiness = reborn_runtime_readiness_snapshot();
+    let driver_registry_initialized =
+        readiness.text_only_driver.is_initialized() && readiness.planned_driver.is_initialized();
+    println!("IronClaw Reborn runtime readiness snapshot");
     println!("binary: ironclaw-reborn");
     println!("version: {}", env!("CARGO_PKG_VERSION"));
     println!("reborn_home: {}", config.home().path().display());
     println!("home_source: {}", config.home().source_label());
     println!("profile: {}", config.profile());
     println!("v1_state: not-used");
-    println!("runtime_shell: initialized (dry-run)");
+    println!("runtime_driver: planned-agent-loop");
+    println!(
+        "text_only_driver: {}",
+        readiness.text_only_driver.render("initialized")
+    );
+    println!(
+        "planned_driver: {}",
+        readiness.planned_driver.render("initialized")
+    );
+    println!(
+        "driver_registry: {}",
+        if driver_registry_initialized {
+            "initialized"
+        } else {
+            "unavailable"
+        }
+    );
+    println!(
+        "local_runtime_shell_readiness: {}",
+        if driver_registry_initialized && readiness.planned_default_profile.is_initialized() {
+            "ready"
+        } else {
+            "unavailable"
+        }
+    );
+    println!(
+        "planned_default_profile: {}",
+        readiness.planned_default_profile.render("available")
+    );
     Ok(())
 }
 
@@ -80,8 +116,18 @@ async fn send_once(
     runtime: &ironclaw_reborn_composition::RebornRuntime,
     conversation: &ironclaw_reborn_composition::ConversationId,
     text: &str,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
-    let reply = runtime.send_user_message(conversation, text).await?;
+    let reply = runtime
+        .send_user_message_with_cancellation(conversation, text, cancellation)
+        .await?;
+    if !reply.is_successful_final_reply() {
+        anyhow::bail!(
+            "reborn run did not produce an assistant reply (status={:?}, run_id={})",
+            reply.status,
+            reply.run_id
+        );
+    }
     print_reply(&reply);
     Ok(())
 }
@@ -89,6 +135,7 @@ async fn send_once(
 async fn run_repl(
     runtime: &ironclaw_reborn_composition::RebornRuntime,
     conversation: &ironclaw_reborn_composition::ConversationId,
+    cancellation: CancellationToken,
 ) -> anyhow::Result<()> {
     let stdin_is_tty = std::io::stdin().is_terminal();
     if stdin_is_tty {
@@ -98,9 +145,6 @@ async fn run_repl(
     let reader = tokio::io::BufReader::new(stdin);
     use tokio::io::AsyncBufReadExt;
     let mut lines = reader.lines();
-
-    let cancel = tokio::signal::ctrl_c();
-    tokio::pin!(cancel);
 
     loop {
         if stdin_is_tty {
@@ -113,9 +157,30 @@ async fn run_repl(
                 match line? {
                     Some(text) if text.trim().is_empty() => continue,
                     Some(text) => {
-                        match runtime.send_user_message(conversation, text.trim()).await {
-                            Ok(reply) => print_reply(&reply),
-                            Err(error) => eprintln!("error: {error}"),
+                        match runtime
+                            .send_user_message_with_cancellation(
+                                conversation,
+                                &text,
+                                cancellation.clone(),
+                            )
+                            .await
+                        {
+                            Ok(reply) if reply.is_successful_final_reply() => print_reply(&reply),
+                            Ok(reply) if stdin_is_tty => print_reply(&reply),
+                            Ok(reply) => {
+                                anyhow::bail!(
+                                    "reborn run did not produce an assistant reply (status={:?}, run_id={})",
+                                    reply.status,
+                                    reply.run_id
+                                );
+                            }
+                            Err(error) if stdin_is_tty => {
+                                eprintln!("error: {error}");
+                                if cancellation.is_cancelled() {
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) => return Err(error.into()),
                         }
                     }
                     None => {
@@ -126,7 +191,7 @@ async fn run_repl(
                     }
                 }
             }
-            _ = &mut cancel => {
+            _ = cancellation.cancelled() => {
                 eprintln!();
                 eprintln!("(repl) caught ctrl-c, shutting down");
                 return Ok(());
@@ -138,11 +203,22 @@ async fn run_repl(
 fn print_reply(reply: &ironclaw_reborn_composition::AssistantReply) {
     match reply.text.as_deref() {
         Some(text) => println!("{text}"),
-        None => println!(
+        None => eprintln!(
             "(no assistant text; status={:?}, run_id={})",
             reply.status, reply.run_id
         ),
     }
+}
+
+fn install_ctrl_c_cancellation() -> CancellationToken {
+    let cancellation = CancellationToken::new();
+    let ctrl_c_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            ctrl_c_cancellation.cancel();
+        }
+    });
+    cancellation
 }
 
 fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntimeInput> {
@@ -178,7 +254,12 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
 
     #[allow(unused_mut)]
     let mut runtime_input = RebornRuntimeInput::from_services(services_input)
-        .with_runner_settings(runner_settings(config_file.as_ref())?);
+        .with_runner_settings(runner_settings(config_file.as_ref())?)
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(200),
+            max_total: Duration::from_secs(180),
+        })
+        .with_identity(RebornRuntimeIdentity::reborn_cli());
 
     #[cfg(feature = "root-llm-provider")]
     {
@@ -399,15 +480,14 @@ fn resolve_llm_config_from_env()
     Ok(None)
 }
 
-fn init_tracing() -> Result<(), ()> {
+fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
     let filter = EnvFilter::try_from_env("IRONCLAW_REBORN_LOG").unwrap_or_else(|_| {
         EnvFilter::new("info,ironclaw_reborn=info,ironclaw_reborn_composition=info")
     });
-    fmt()
+    let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .try_init()
-        .map_err(|_| ())
+        .try_init();
 }

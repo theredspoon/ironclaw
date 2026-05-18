@@ -1,7 +1,6 @@
 //! Canonical agent-loop executor.
 //!
 //! The executor owns loop mechanics. Loop families own strategy composition.
-//! See `docs/reborn/agent-loop-skeleton.md` section 8 for the canonical tick.
 
 use std::collections::HashSet;
 
@@ -229,7 +228,40 @@ impl CanonicalAgentLoopExecutor {
                 CancelCheck::Exit(exit) => return Ok(exit),
             };
 
-            let context_request = planner.context().plan_context_request(&state).await;
+            let surface_filter = planner.capability().filter(&state).await;
+            state = match self
+                .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
+                    host,
+                    state,
+                    &mut pending_input_ack,
+                )
+                .await?
+            {
+                CancelCheck::Continue(state) => *state,
+                CancelCheck::Exit(exit) => return Ok(exit),
+            };
+            let mut surface = host
+                .visible_capabilities(VisibleCapabilityRequest)
+                .await
+                .map_err(|_| AgentLoopExecutorError::HostUnavailable {
+                    stage: HostStage::Capability,
+                })?;
+            apply_capability_filter(&mut surface, &surface_filter);
+            state.surface_version = Some(surface.version.clone());
+            state = match self
+                .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
+                    host,
+                    state,
+                    &mut pending_input_ack,
+                )
+                .await?
+            {
+                CancelCheck::Continue(state) => *state,
+                CancelCheck::Exit(exit) => return Ok(exit),
+            };
+
+            let mut context_request = planner.context().plan_context_request(&state).await;
+            context_request.surface_version = Some(surface.version.clone());
             let prompt_mode = context_request.mode;
             state = match self
                 .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
@@ -261,38 +293,6 @@ impl CanonicalAgentLoopExecutor {
                 },
             )
             .await;
-            state = match self
-                .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
-                    host,
-                    state,
-                    &mut pending_input_ack,
-                )
-                .await?
-            {
-                CancelCheck::Continue(state) => *state,
-                CancelCheck::Exit(exit) => return Ok(exit),
-            };
-
-            let surface_filter = planner.capability().filter(&state).await;
-            state = match self
-                .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
-                    host,
-                    state,
-                    &mut pending_input_ack,
-                )
-                .await?
-            {
-                CancelCheck::Continue(state) => *state,
-                CancelCheck::Exit(exit) => return Ok(exit),
-            };
-            let mut surface = host
-                .visible_capabilities(VisibleCapabilityRequest)
-                .await
-                .map_err(|_| AgentLoopExecutorError::HostUnavailable {
-                    stage: HostStage::Capability,
-                })?;
-            apply_capability_filter(&mut surface, &surface_filter);
-            state.surface_version = Some(surface.version.clone());
             state = match self
                 .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
                     host,
@@ -1085,8 +1085,7 @@ impl CanonicalAgentLoopExecutor {
     }
 
     // Cancellation is checked cooperatively at N boundary points between external calls.
-    // A macro refactor was considered but deferred; the explicit sites are self-documenting
-    // and the boundary count is stable for this workstream.
+    // A macro refactor was considered but deferred; the explicit sites are self-documenting.
     async fn checkpoint_and_exit_if_cancelled(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),

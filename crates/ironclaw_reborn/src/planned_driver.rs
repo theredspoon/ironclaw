@@ -338,7 +338,7 @@ mod tests {
                     crate::planned_driver_factory::PLANNED_DRIVER_CHECKPOINT_SCHEMA_ID,
                 )
                 .expect("valid"),
-            ),
+            )
         );
         assert_eq!(
             descriptor.checkpoint_schema_version,
@@ -859,7 +859,6 @@ mod tests {
             self.inner.emit_loop_progress(event).await
         }
     }
-
     // Note: a duplicate `impl LoopCancellationPort for ResumePayloadHost`
     // existed here on baseline and broke `cargo test --no-run` for this crate.
     // The earlier delegating impl (a few hundred lines above) is the

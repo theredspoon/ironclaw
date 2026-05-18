@@ -4331,6 +4331,7 @@ name = "ironclaw_host_runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "chrono-tz",
@@ -4532,9 +4533,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "ironclaw_extensions",
  "ironclaw_host_api",
  "ironclaw_product_adapters",
- "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4565,14 +4566,17 @@ dependencies = [
  "async-trait",
  "chrono",
  "ironclaw_host_api",
+ "ironclaw_loop_support",
  "ironclaw_product_adapters",
  "ironclaw_product_workflow",
+ "ironclaw_reborn",
  "ironclaw_threads",
  "ironclaw_turns",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -4627,6 +4631,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -8,13 +8,52 @@
 //!   that satisfies the loop-support `HostManagedModelGateway` contract.
 //! - **Turn-runner configuration** — poll/heartbeat intervals for the worker
 //!   loop.
+//! - **Completion polling configuration** — interval/timeout policy for
+//!   waiting on submitted turns to finish.
+//! - **Runtime identity** — tenant/agent and source/reply binding identifiers
+//!   supplied by the caller so this composition root stays channel-agnostic.
 //!
 //! The CLI builds this struct from env vars / config; it does not call into
 //! `ironclaw_reborn` or `ironclaw_llm` directly.
 
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use ironclaw_loop_support::HostManagedModelGateway;
+
 use crate::input::RebornBuildInput;
+
+/// Caller-owned identity for an assembled Reborn runtime.
+///
+/// The CLI uses the `reborn-cli` values, but future ingress adapters should
+/// pass their own tenant/agent and binding identifiers instead of inheriting
+/// CLI-specific labels from the composition root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebornRuntimeIdentity {
+    pub tenant_id: String,
+    pub agent_id: String,
+    pub source_binding_id: String,
+    pub reply_target_binding_id: String,
+}
+
+impl RebornRuntimeIdentity {
+    pub fn reborn_cli() -> Self {
+        Self {
+            tenant_id: "reborn-cli".to_string(),
+            agent_id: "reborn-cli-agent".to_string(),
+            source_binding_id: "reborn-cli".to_string(),
+            reply_target_binding_id: "reborn-cli".to_string(),
+        }
+    }
+}
+
+impl Default for RebornRuntimeIdentity {
+    fn default() -> Self {
+        Self::reborn_cli()
+    }
+}
 
 /// Configuration for the host-managed LLM model gateway wired into the
 /// composed Reborn runtime.
@@ -42,10 +81,11 @@ pub struct RebornLlmConfig {
     /// like Ollama.
     pub api_key: Option<secrecy::SecretString>,
     /// API protocol identifier — maps onto
-    /// `ironclaw_llm::ProviderProtocol`. Canonical values follow
-    /// `ProviderProtocol`'s serde `snake_case` names:
+    /// `ironclaw_llm::ProviderProtocol`. Canonical accepted values:
     /// `"open_ai_completions"`, `"anthropic"`, `"ollama"`, `"deep_seek"`,
     /// `"gemini"`, `"open_router"`, `"github_copilot"`.
+    /// Legacy aliases `"openai"`, `"openai_completions"`, `"deepseek"`,
+    /// and `"openrouter"` are also accepted.
     pub protocol: String,
     /// Request timeout in seconds passed to the underlying HTTP client.
     pub request_timeout_secs: u64,
@@ -90,6 +130,22 @@ impl Default for TurnRunnerSettings {
     }
 }
 
+/// Completion polling policy for `RebornRuntime::send_user_message`.
+#[derive(Debug, Clone)]
+pub struct PollSettings {
+    pub interval: Duration,
+    pub max_total: Duration,
+}
+
+impl Default for PollSettings {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(100),
+            max_total: Duration::from_secs(180),
+        }
+    }
+}
+
 /// Full input for `build_reborn_runtime` — substrate config plus the extras
 /// needed to assemble a runnable Reborn agent.
 #[derive(Default)]
@@ -98,6 +154,10 @@ pub struct RebornRuntimeInput {
     #[cfg(feature = "root-llm-provider")]
     pub llm: Option<RebornLlmConfig>,
     pub runner: TurnRunnerSettings,
+    pub poll: PollSettings,
+    pub identity: RebornRuntimeIdentity,
+    #[cfg(test)]
+    pub(crate) model_gateway_override: Option<Arc<dyn HostManagedModelGateway>>,
 }
 
 impl RebornRuntimeInput {
@@ -111,6 +171,10 @@ impl RebornRuntimeInput {
             #[cfg(feature = "root-llm-provider")]
             llm: None,
             runner: TurnRunnerSettings::default(),
+            poll: PollSettings::default(),
+            identity: RebornRuntimeIdentity::default(),
+            #[cfg(test)]
+            model_gateway_override: None,
         }
     }
 
@@ -122,6 +186,25 @@ impl RebornRuntimeInput {
 
     pub fn with_runner_settings(mut self, runner: TurnRunnerSettings) -> Self {
         self.runner = runner;
+        self
+    }
+
+    pub fn with_poll_settings(mut self, poll: PollSettings) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    pub fn with_identity(mut self, identity: RebornRuntimeIdentity) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_model_gateway_override(
+        mut self,
+        gateway: Arc<dyn HostManagedModelGateway>,
+    ) -> Self {
+        self.model_gateway_override = Some(gateway);
         self
     }
 }
