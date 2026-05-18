@@ -104,8 +104,13 @@ impl IdempotencyLedger for InMemoryIdempotencyLedger {
 
     async fn settle(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
         let mut state = self.lock_state()?;
-        if state.settled.contains_key(&action.fingerprint) {
-            return Ok(());
+        if let Some(prior) = state.settled.get(&action.fingerprint) {
+            if prior.action_id == action.action_id {
+                return Ok(());
+            }
+            return Err(ProductWorkflowError::Transient {
+                reason: "idempotency reservation was superseded before terminal settle".into(),
+            });
         }
         let Some(current) = state.in_flight.get(&action.fingerprint) else {
             return Err(ProductWorkflowError::Transient {

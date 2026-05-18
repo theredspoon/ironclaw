@@ -254,6 +254,8 @@ impl ConversationBindingService for InMemoryConversationServices {
         request: ResolveConversationRequest,
     ) -> Result<ConversationBindingResolution, InboundTurnError> {
         #[cfg(any(feature = "libsql", feature = "postgres"))]
+        let _mutation = self.mutation_lock.lock().await;
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let state = self.lock_state()?;
         let actor_user_id = state.resolve_actor(
@@ -515,11 +517,10 @@ impl InMemoryConversationServices {
                 if request.route_kind == ConversationRouteKind::Shared {
                     state.widen_binding_route_access(&binding_key)?;
                 }
-                state.apply_trusted_scope(
-                    &request.tenant_id,
-                    &binding_key,
-                    trusted_agent_id.clone(),
-                    trusted_project_id.clone(),
+                state.ensure_trusted_scope_not_reinterpreted(
+                    &binding,
+                    trusted_agent_id.as_ref(),
+                    trusted_project_id.as_ref(),
                 )?;
                 state.record_external_event_route(
                     &request.tenant_id,
@@ -902,52 +903,18 @@ impl InMemoryState {
         Ok(())
     }
 
-    fn apply_trusted_scope(
-        &mut self,
-        tenant_id: &TenantId,
-        binding_key: &BindingKey,
-        trusted_agent_id: Option<AgentId>,
-        trusted_project_id: Option<ProjectId>,
+    fn ensure_trusted_scope_not_reinterpreted(
+        &self,
+        binding: &BindingRecord,
+        trusted_agent_id: Option<&AgentId>,
+        trusted_project_id: Option<&ProjectId>,
     ) -> Result<(), InboundTurnError> {
-        let Some(binding) = self.bindings.get_mut(binding_key) else {
-            return Err(InboundTurnError::StatePoisoned);
-        };
-
-        let mut changed = false;
-        if binding.agent_id.is_none() && trusted_agent_id.is_some() {
-            binding.agent_id = trusted_agent_id;
-            changed = true;
-        }
-        if binding.project_id.is_none() && trusted_project_id.is_some() {
-            binding.project_id = trusted_project_id;
-            changed = true;
-        }
-        if !changed {
-            return Ok(());
-        }
-
-        let binding = self
-            .bindings
-            .get(binding_key)
-            .cloned()
-            .ok_or(InboundTurnError::StatePoisoned)?;
-        if let Some(source_binding) = self
-            .source_bindings
-            .get_mut(binding.source_binding_ref.as_str())
+        if (binding.agent_id.is_none() && trusted_agent_id.is_some())
+            || (binding.project_id.is_none() && trusted_project_id.is_some())
         {
-            source_binding.agent_id = binding.agent_id.clone();
-            source_binding.project_id = binding.project_id.clone();
-        }
-        if let Some(thread) = self
-            .threads
-            .get_mut(&ThreadKey::new(tenant_id, &binding.thread_id))
-        {
-            if thread.agent_id.is_none() {
-                thread.agent_id = binding.agent_id.clone();
-            }
-            if thread.project_id.is_none() {
-                thread.project_id = binding.project_id.clone();
-            }
+            return Err(InboundTurnError::BindingConflict {
+                thread_id: binding.thread_id.to_string(),
+            });
         }
         Ok(())
     }

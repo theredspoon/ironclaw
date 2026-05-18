@@ -28,10 +28,7 @@ pub trait ConversationBindingService: Send + Sync {
         request: ResolveConversationRequest,
         trusted_agent_id: Option<ironclaw_host_api::AgentId>,
         trusted_project_id: Option<ironclaw_host_api::ProjectId>,
-    ) -> Result<ConversationBindingResolution, InboundTurnError> {
-        let _ = (trusted_agent_id, trusted_project_id);
-        self.resolve_or_create_binding(request).await
-    }
+    ) -> Result<ConversationBindingResolution, InboundTurnError>;
 
     /// Look up an existing binding without creating or widening binding state.
     async fn lookup_binding(

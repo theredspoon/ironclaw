@@ -317,6 +317,21 @@ async fn projection_subscription_resolves_through_binding_service() {
 }
 
 #[tokio::test]
+async fn projection_subscription_rejects_non_subscription_payload() {
+    let (workflow, _inbound, _ledger, _binding_service) = build_workflow_with_binding();
+
+    let err = workflow
+        .resolve_projection_subscription(sample_envelope("projection-non-subscription"))
+        .await
+        .expect_err("non-subscription payload rejects");
+
+    assert!(matches!(
+        err,
+        ProductAdapterError::MalformedInboundPayload { .. }
+    ));
+}
+
+#[tokio::test]
 async fn projection_subscription_rejects_mismatched_thread_hint() {
     let (workflow, _inbound, _ledger, binding_service) = build_workflow_with_binding();
     let binding = fake_binding();
@@ -347,6 +362,30 @@ async fn projection_subscription_rejects_mismatched_thread_hint() {
         }
         other => panic!("expected workflow rejection, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn projection_subscription_rejects_malformed_thread_hint() {
+    let (workflow, _inbound, _ledger, binding_service) = build_workflow_with_binding();
+    let binding = fake_binding();
+    let envelope = sample_envelope_with_payload(
+        "projection-malformed-hint",
+        ProductInboundPayload::SubscriptionRequest(
+            ProjectionSubscriptionPayload::new(Some("thread/invalid".into()), None)
+                .expect("adapter accepts opaque hint"),
+        ),
+    );
+    binding_service.program_binding(envelope.source_binding_key(), binding);
+
+    let err = workflow
+        .resolve_projection_subscription(envelope)
+        .await
+        .expect_err("malformed hint rejects");
+
+    assert!(matches!(
+        err,
+        ProductAdapterError::MalformedInboundPayload { .. }
+    ));
 }
 
 #[tokio::test]
@@ -618,6 +657,40 @@ async fn concrete_product_workflow_keeps_installations_tenant_isolated() {
 }
 
 #[tokio::test]
+async fn concrete_product_workflow_bot_mention_uses_shared_route() {
+    let binding = Arc::new(FakeConversationBindingService::new());
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        binding.clone(),
+    );
+
+    workflow
+        .accept_inbound(sample_envelope_with_payload(
+            "shared-owner",
+            ProductInboundPayload::UserMessage(
+                UserMessagePayload::new("hello shared", vec![], ProductTriggerReason::BotMention)
+                    .expect("message"),
+            ),
+        ))
+        .await
+        .expect("bot mention accepted");
+
+    let submissions = coordinator.submissions();
+    assert_eq!(submissions.len(), 1);
+    assert_eq!(
+        binding.route_kinds(),
+        vec![ironclaw_product_workflow::ProductConversationRouteKind::Shared]
+    );
+}
+
+#[tokio::test]
 async fn concrete_product_workflow_rejects_unknown_installation_as_terminal() {
     let conversations = Arc::new(InMemoryConversationServices::default());
     conversations
@@ -689,8 +762,9 @@ async fn concrete_product_workflow_rejects_unpaired_actor_before_turn_submission
         Arc::new(binding),
     );
 
+    let envelope = sample_envelope("unpaired");
     let err = workflow
-        .accept_inbound(sample_envelope("unpaired"))
+        .accept_inbound(envelope.clone())
         .await
         .expect_err("unpaired actor rejected");
     assert!(matches!(
@@ -703,6 +777,104 @@ async fn concrete_product_workflow_rejects_unpaired_actor_before_turn_submission
         }
     ));
     assert!(coordinator.submissions().is_empty());
+
+    let duplicate = workflow
+        .accept_inbound(envelope)
+        .await
+        .expect("terminal rejection replays");
+    assert!(matches!(duplicate, ProductInboundAck::Duplicate { .. }));
+}
+
+#[tokio::test]
+async fn concrete_product_workflow_replays_binding_access_denied_rejection() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(
+        conversations.clone(),
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            None,
+        )],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+    workflow
+        .accept_inbound(sample_envelope("direct-owner"))
+        .await
+        .expect("owner accepted");
+    let direct_thread = coordinator.submissions()[0].scope.thread_id.clone();
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user2").expect("actor"),
+            UserId::new("user:bob").expect("user"),
+        )
+        .await;
+    conversations
+        .add_thread_participant(
+            &TenantId::new("tenant:alpha").expect("tenant"),
+            &direct_thread,
+            UserId::new("user:bob").expect("user"),
+        )
+        .await
+        .expect("participant added");
+    let denied = sample_envelope_with_context(
+        ProductAdapterId::new("test_adapter").expect("adapter"),
+        AdapterInstallationId::new("install_alpha").expect("install"),
+        ExternalEventId::new("evt:direct-participant-denied").expect("event"),
+        ExternalActorRef::new("test", "user2", Option::<String>::None).expect("actor"),
+        ExternalConversationRef::new(None, "conv1", None, None).expect("conversation"),
+        ProductInboundPayload::UserMessage(
+            UserMessagePayload::new(
+                "direct from participant",
+                vec![],
+                ProductTriggerReason::DirectChat,
+            )
+            .expect("message"),
+        ),
+    );
+
+    let err = workflow
+        .accept_inbound(denied.clone())
+        .await
+        .expect_err("direct participant rejected");
+    assert!(matches!(
+        err,
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::Unauthorized,
+            status_code: 403,
+            retryable: false,
+            ..
+        }
+    ));
+    let duplicate = workflow
+        .accept_inbound(denied)
+        .await
+        .expect("terminal rejection replays");
+    assert!(matches!(duplicate, ProductInboundAck::Duplicate { .. }));
+    assert_eq!(coordinator.submissions().len(), 1);
 }
 
 #[tokio::test]
@@ -736,6 +908,60 @@ async fn in_memory_idempotency_ledger_reclaims_expired_in_flight_actions() {
             .expect("expired reservation is reclaimed"),
         IdempotencyDecision::New(_)
     ));
+}
+
+#[tokio::test]
+async fn in_memory_idempotency_ledger_allows_only_one_concurrent_reservation() {
+    let ledger = Arc::new(InMemoryIdempotencyLedger::with_in_flight_lease(
+        Duration::seconds(10),
+    ));
+    let received_at = Utc::now();
+    let fingerprint = ActionFingerprintKey::new(
+        ProductAdapterId::new("test_adapter").expect("valid"),
+        AdapterInstallationId::new("install_alpha").expect("valid"),
+        SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
+            .expect("valid source binding key"),
+        ExternalEventId::new("evt:lease-concurrent").expect("valid"),
+    );
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let first = {
+        let ledger = ledger.clone();
+        let fingerprint = fingerprint.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            ledger.begin_or_replay(fingerprint, received_at).await
+        })
+    };
+    let second = {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            ledger.begin_or_replay(fingerprint, received_at).await
+        })
+    };
+
+    barrier.wait().await;
+    let results = [
+        first.await.expect("first task"),
+        second.await.expect("second task"),
+    ];
+
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Ok(IdempotencyDecision::New(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(ProductWorkflowError::Transient { .. })))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -780,7 +1006,7 @@ async fn in_memory_idempotency_ledger_ignores_stale_releases_after_reclaim() {
             .contains("in flight")
     );
 
-    let mut stale_settle = first;
+    let mut stale_settle = first.clone();
     stale_settle.settle(ProductInboundAck::NoOp);
     let stale_settle_err = ledger
         .settle(stale_settle)
@@ -802,6 +1028,13 @@ async fn in_memory_idempotency_ledger_ignores_stale_releases_after_reclaim() {
         .settle(current_settle)
         .await
         .expect("current reservation settles");
+    let mut stale_after_current_settle = first;
+    stale_after_current_settle.settle(ProductInboundAck::NoOp);
+    let stale_after_current_err = ledger
+        .settle(stale_after_current_settle)
+        .await
+        .expect_err("stale settle remains rejected after current settle");
+    assert!(stale_after_current_err.to_string().contains("superseded"));
     assert!(matches!(
         ledger
             .begin_or_replay(fingerprint, received_at + Duration::seconds(12))

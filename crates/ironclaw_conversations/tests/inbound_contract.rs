@@ -181,6 +181,48 @@ async fn trusted_scope_is_persisted_on_first_bind() {
 }
 
 #[tokio::test]
+async fn trusted_scope_rejects_existing_unscoped_binding() {
+    let services = InMemoryConversationServices::default();
+    services
+        .pair_external_actor(
+            tenant(),
+            telegram(),
+            default_installation(),
+            external_actor("telegram-user-1"),
+            user("alice"),
+        )
+        .await;
+
+    let legacy = services
+        .resolve_or_create_binding(resolve_request(
+            telegram(),
+            external_actor("telegram-user-1"),
+            external_conversation("chat-legacy-unscoped", None),
+            "telegram-event-legacy-unscoped",
+        ))
+        .await
+        .expect("legacy unscoped bind");
+    assert_eq!(legacy.turn_scope.agent_id, None);
+    assert_eq!(legacy.turn_scope.project_id, None);
+
+    let err = services
+        .resolve_or_create_binding_with_trusted_scope(
+            resolve_request(
+                telegram(),
+                external_actor("telegram-user-1"),
+                external_conversation("chat-legacy-unscoped", None),
+                "telegram-event-legacy-trusted-scope",
+            ),
+            Some(AgentId::new("agent-alpha").unwrap()),
+            Some(ProjectId::new("project-alpha").unwrap()),
+        )
+        .await
+        .expect_err("trusted scope must not reinterpret legacy bindings");
+
+    assert!(matches!(err, InboundTurnError::BindingConflict { .. }));
+}
+
+#[tokio::test]
 async fn pairing_is_scoped_by_tenant_and_adapter_installation() {
     let services = InMemoryConversationServices::default();
     services
@@ -2777,6 +2819,15 @@ impl ConversationBindingService for DriftBindingService {
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply:shared").unwrap(),
             access: ThreadAccessDecision::Allowed,
         })
+    }
+
+    async fn resolve_or_create_binding_with_trusted_scope(
+        &self,
+        request: ironclaw_conversations::ResolveConversationRequest,
+        _trusted_agent_id: Option<AgentId>,
+        _trusted_project_id: Option<ProjectId>,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
+        self.resolve_or_create_binding(request).await
     }
 
     async fn lookup_binding(

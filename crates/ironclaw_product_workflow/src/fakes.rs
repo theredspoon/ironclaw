@@ -10,7 +10,10 @@ use ironclaw_product_adapters::ProductInboundEnvelope;
 use ironclaw_turns::{AcceptedMessageRef, TurnRunId};
 
 use crate::action::{ActionFingerprintKey, ProductInboundAction};
-use crate::binding::{ConversationBindingService, ResolveBindingRequest, ResolvedBinding};
+use crate::binding::{
+    ConversationBindingService, ProductConversationRouteKind, ResolveBindingRequest,
+    ResolvedBinding,
+};
 use crate::error::ProductWorkflowError;
 use crate::inbound_turn::{InboundTurnOutcome, InboundTurnService};
 use crate::ledger::{IdempotencyDecision, IdempotencyLedger};
@@ -31,6 +34,7 @@ struct FakeBindingState {
     programmed: HashMap<String, ResolvedBinding>,
     fail_with: Option<ProductWorkflowError>,
     resolve_count: usize,
+    route_kinds: Vec<ProductConversationRouteKind>,
 }
 
 impl FakeConversationBindingService {
@@ -56,6 +60,12 @@ impl FakeConversationBindingService {
     pub fn resolve_count(&self) -> usize {
         let state = self.state.lock().expect("fake binding state lock poisoned"); // safety: test-support fake
         state.resolve_count
+    }
+
+    /// Route kinds observed during binding resolution.
+    pub fn route_kinds(&self) -> Vec<ProductConversationRouteKind> {
+        let state = self.state.lock().expect("fake binding state lock poisoned"); // safety: test-support fake
+        state.route_kinds.clone()
     }
 }
 
@@ -89,6 +99,7 @@ impl FakeConversationBindingService {
     ) -> Result<ResolvedBinding, ProductWorkflowError> {
         let mut state = self.state.lock().expect("fake binding state lock poisoned"); // safety: test-support fake
         state.resolve_count += 1;
+        state.route_kinds.push(request.route_kind);
         if let Some(error) = state.fail_with.clone() {
             return Err(error);
         }
