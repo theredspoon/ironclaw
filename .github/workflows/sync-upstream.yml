@@ -45,12 +45,6 @@ jobs:
         if: steps.ff.outputs.result == 'fast-forward'
         run: git push origin main --tags
 
-      - name: Push to enjimi mirror
-        if: steps.ff.outputs.result == 'fast-forward'
-        run: |
-          git remote add enjimi https://x-access-token:${{ secrets.ENJIMI_PAT }}@github.com/enjimi/ironclaw.git
-          git push enjimi main --tags
-
       - name: Open PR if diverged
         if: steps.ff.outputs.result == 'diverged'
         env:
