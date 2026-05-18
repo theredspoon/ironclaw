@@ -211,6 +211,13 @@ pub struct LoadContextWindowRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadContextMessagesRequest {
+    pub scope: ThreadScope,
+    pub thread_id: ThreadId,
+    pub message_ids: Vec<ThreadMessageId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMessage {
     pub message_id: Option<ThreadMessageId>,
     pub summary_id: Option<SummaryArtifactId>,
@@ -222,6 +229,12 @@ pub struct ContextMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextWindow {
+    pub thread_id: ThreadId,
+    pub messages: Vec<ContextMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextMessages {
     pub thread_id: ThreadId,
     pub messages: Vec<ContextMessage>,
 }

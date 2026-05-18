@@ -17,12 +17,13 @@ use ironclaw_loop_support::{
 use ironclaw_skills::SkillTrust;
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
-    AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage, ContextWindow,
-    CreateSummaryArtifactRequest, EnsureThreadRequest, InMemorySessionThreadService,
-    MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
-    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
-    SessionThreadService, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageId,
-    ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
+    AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage, ContextMessages,
+    ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest, InMemorySessionThreadService,
+    LoadContextMessagesRequest, MessageContent, MessageKind, MessageStatus,
+    ProviderToolCallReferenceEnvelope, RedactMessageRequest, ReplayAcceptedInboundMessageRequest,
+    SessionThreadError, SessionThreadRecord, SessionThreadService, SummaryArtifact, ThreadHistory,
+    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
+    ToolResultReferenceEnvelope, ToolResultSafeSummary, UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef, LoopResultRef, RunProfileResolutionRequest, RunProfileResolver, TurnActor,
@@ -1702,6 +1703,80 @@ async fn model_port_resolves_explicit_refs_that_fall_outside_context_window() {
 }
 
 #[tokio::test]
+async fn model_port_preserves_provider_metadata_for_explicit_refs_outside_context_window() {
+    let fixture = ThreadFixture::new().await;
+    let tool_result = fixture
+        .thread_service
+        .append_tool_result_reference(AppendToolResultReferenceRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+            turn_run_id: fixture.run_context.run_id.to_string(),
+            result_ref: "result:old-provider-tool".to_string(),
+            safe_summary: ToolResultSafeSummary::new("old provider tool completed").unwrap(),
+            provider_call: Some(ProviderToolCallReferenceEnvelope {
+                provider_id: "test-provider".to_string(),
+                provider_model_id: "test-model".to_string(),
+                provider_turn_id: "turn_1".to_string(),
+                provider_call_id: "call_1".to_string(),
+                provider_tool_name: "demo__echo".to_string(),
+                capability_id: CapabilityId::new("demo.echo").unwrap(),
+                arguments: serde_json::json!({"message":"hello"}),
+                response_reasoning: Some("provider response reasoning".to_string()),
+                reasoning: Some("provider call reasoning".to_string()),
+                signature: Some("sig-1".to_string()),
+            }),
+        })
+        .await
+        .unwrap();
+    for index in 0..3 {
+        fixture
+            .thread_service
+            .accept_inbound_message(AcceptInboundMessageRequest {
+                scope: fixture.thread_scope.clone(),
+                thread_id: fixture.thread_id.clone(),
+                actor_id: "user-loop-support".to_string(),
+                source_binding_id: Some("source-web".to_string()),
+                reply_target_binding_id: Some("reply-web".to_string()),
+                external_event_id: Some(format!("event-after-tool-{index}")),
+                content: MessageContent::text(format!("newer message {index}")),
+            })
+            .await
+            .unwrap();
+    }
+    let gateway = Arc::new(RecordingGateway::reply("model says hi"));
+    let port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway.clone(),
+        1,
+    );
+    let messages = vec![LoopModelMessage {
+        role: "tool_result_reference".to_string(),
+        content_ref: LoopMessageRef::new(format!("msg:{}", tool_result.message_id)).unwrap(),
+    }];
+    issue_prompt_grant(&fixture.run_context, &messages);
+
+    port.stream_model(LoopModelRequest {
+        messages,
+        surface_version: None,
+        model_preference: None,
+    })
+    .await
+    .unwrap();
+
+    let calls = gateway.calls.lock().unwrap();
+    let provider_call = calls[0].messages[0]
+        .tool_result_provider_call
+        .as_ref()
+        .expect("model fallback preserves provider metadata");
+    assert_eq!(provider_call.provider_id, "test-provider");
+    assert_eq!(provider_call.provider_model_id, "test-model");
+    assert_eq!(provider_call.provider_call_id, "call_1");
+    assert_eq!(provider_call.provider_tool_name, "demo__echo");
+}
+
+#[tokio::test]
 async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
     let fixture = ThreadFixture::new().await;
     let tool_result_ref = LoopMessageRef::new("msg:11111111-1111-1111-1111-111111111111").unwrap();
@@ -2501,6 +2576,13 @@ impl SessionThreadService for GatedFinalizeThreadService {
         self.inner.load_context_window(request).await
     }
 
+    async fn load_context_messages(
+        &self,
+        request: LoadContextMessagesRequest,
+    ) -> Result<ContextMessages, SessionThreadError> {
+        self.inner.load_context_messages(request).await
+    }
+
     async fn list_thread_history(
         &self,
         request: ThreadHistoryRequest,
@@ -2612,6 +2694,16 @@ impl SessionThreadService for StaticContextThreadService {
         request: ironclaw_threads::LoadContextWindowRequest,
     ) -> Result<ContextWindow, SessionThreadError> {
         Ok(ContextWindow {
+            thread_id: request.thread_id,
+            messages: vec![self.context_message.clone()],
+        })
+    }
+
+    async fn load_context_messages(
+        &self,
+        request: LoadContextMessagesRequest,
+    ) -> Result<ContextMessages, SessionThreadError> {
+        Ok(ContextMessages {
             thread_id: request.thread_id,
             messages: vec![self.context_message.clone()],
         })

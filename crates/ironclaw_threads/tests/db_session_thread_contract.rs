@@ -4,10 +4,11 @@ use futures::future::join_all;
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AppendAssistantDraftRequest, AppendToolResultReferenceRequest,
-    CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, ProviderToolCallReferenceEnvelope, RedactMessageRequest,
-    SessionThreadService, ThreadHistoryRequest, ThreadScope, ToolResultReferenceEnvelope,
-    ToolResultSafeSummary, UpdateAssistantDraftRequest,
+    CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextMessagesRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
+    ProviderToolCallReferenceEnvelope, RedactMessageRequest, SessionThreadService,
+    ThreadHistoryRequest, ThreadScope, ToolResultReferenceEnvelope, ToolResultSafeSummary,
+    UpdateAssistantDraftRequest,
 };
 
 #[cfg(feature = "libsql")]
@@ -307,7 +308,7 @@ async fn assert_reopened_history(
 
     let context = service
         .load_context_window(LoadContextWindowRequest {
-            scope: thread_scope,
+            scope: thread_scope.clone(),
             thread_id: thread_id.clone(),
             max_messages: 16,
         })
@@ -342,6 +343,22 @@ async fn assert_reopened_history(
         Some("provider call reasoning")
     );
     assert_eq!(provider_call.signature.as_deref(), Some("sig-1"));
+
+    let exact_context = service
+        .load_context_messages(LoadContextMessagesRequest {
+            scope: thread_scope.clone(),
+            thread_id: thread_id.clone(),
+            message_ids: vec![history.messages[3].message_id],
+        })
+        .await
+        .unwrap();
+    let exact_provider_call = exact_context.messages[0]
+        .tool_result_provider_call
+        .as_ref()
+        .expect("exact context lookup preserves provider metadata");
+    assert_eq!(exact_provider_call.provider_turn_id, "turn_1");
+    assert_eq!(exact_provider_call.provider_call_id, "call_1");
+    assert_eq!(exact_provider_call.provider_tool_name, "demo__echo");
 
     let wrong_scope = service
         .list_thread_history(ThreadHistoryRequest {

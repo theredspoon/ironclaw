@@ -21,11 +21,11 @@ pub use db::PostgresSessionThreadService;
 
 pub use contract::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
-    AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage, ContextWindow,
-    CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, RedactMessageRequest, ReplayAcceptedInboundMessageRequest,
-    SessionThreadRecord, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageRecord,
-    ThreadScope, UpdateAssistantDraftRequest,
+    AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage, ContextMessages,
+    ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextMessagesRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadRecord, SummaryArtifact, ThreadHistory,
+    ThreadHistoryRequest, ThreadMessageRecord, ThreadScope, UpdateAssistantDraftRequest,
 };
 pub use error::SessionThreadError;
 pub use identifiers::ThreadMessageId;

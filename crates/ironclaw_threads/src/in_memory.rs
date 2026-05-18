@@ -8,12 +8,12 @@ use uuid::Uuid;
 use crate::identifiers::SummaryArtifactId;
 use crate::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
-    AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage, ContextWindow,
-    CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, RedactMessageRequest, ReplayAcceptedInboundMessageRequest,
-    SessionThreadError, SessionThreadRecord, SessionThreadService, SummaryArtifact, ThreadHistory,
-    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
-    ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
+    AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage, ContextMessages,
+    ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest, LoadContextMessagesRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
+    SessionThreadService, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageId,
+    ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -374,6 +374,18 @@ impl SessionThreadService for InMemorySessionThreadService {
         })
     }
 
+    async fn load_context_messages(
+        &self,
+        request: LoadContextMessagesRequest,
+    ) -> Result<ContextMessages, SessionThreadError> {
+        let state = self.state.lock().await;
+        let thread = get_thread(&state, &request.scope, &request.thread_id)?;
+        Ok(ContextMessages {
+            thread_id: request.thread_id,
+            messages: context_messages_by_id(thread, &request.message_ids),
+        })
+    }
+
     async fn list_thread_history(
         &self,
         request: ThreadHistoryRequest,
@@ -582,6 +594,28 @@ fn context_messages_with_summary_replacements(thread: &StoredThread) -> Vec<Cont
         }
     }
     context
+}
+
+fn context_messages_by_id(
+    thread: &StoredThread,
+    message_ids: &[ThreadMessageId],
+) -> Vec<ContextMessage> {
+    message_ids
+        .iter()
+        .filter_map(|message_id| {
+            let message = thread.messages.iter().find(|message| {
+                message.message_id == *message_id && is_model_visible(message.status)
+            })?;
+            Some(ContextMessage {
+                message_id: Some(message.message_id),
+                summary_id: None,
+                sequence: message.sequence,
+                kind: message.kind,
+                tool_result_provider_call: message.tool_result_provider_call.clone(),
+                content: message.content.clone()?,
+            })
+        })
+        .collect()
 }
 
 const REDACTED_SUMMARY_CONTENT: &str = "[redacted]";

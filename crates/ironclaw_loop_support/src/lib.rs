@@ -51,10 +51,10 @@ use tokio::sync::{Mutex, OnceCell};
 use async_trait::async_trait;
 use ironclaw_threads::{
     AppendAssistantDraftRequest, AppendToolResultReferenceRequest, ContextMessage,
-    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
-    ProviderToolCallReferenceEnvelope, SessionThreadError, SessionThreadService, SummaryArtifact,
-    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope, ToolResultSafeSummary,
-    UpdateAssistantDraftRequest,
+    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
+    MessageStatus, ProviderToolCallReferenceEnvelope, SessionThreadError, SessionThreadService,
+    SummaryArtifact, ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
+    ToolResultSafeSummary, UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef, TurnId, TurnRunId,
@@ -830,7 +830,8 @@ where
         }
 
         let mut messages_by_ref = context_messages_by_ref(context.messages);
-        let mut needs_history_lookup = false;
+        let mut missing_message_ids = Vec::new();
+        let mut needs_summary_history_lookup = false;
         for message in &requested_messages {
             if messages_by_ref.contains_key(message.content_ref.as_str()) {
                 continue;
@@ -845,8 +846,16 @@ where
             if identity_context::is_identity_model_message_ref(&message.content_ref) {
                 continue;
             }
-            needs_history_lookup = true;
-            break;
+            if skill_context::is_snippet_model_message_ref(&message.content_ref) {
+                continue;
+            }
+            if is_summary_model_message_ref(&message.content_ref) {
+                needs_summary_history_lookup = true;
+                continue;
+            }
+            if let Ok(message_id) = message_id_from_ref(&message.content_ref) {
+                missing_message_ids.push(message_id);
+            }
         }
         let snippet_messages_by_ref = if requested_messages
             .iter()
@@ -856,7 +865,19 @@ where
         } else {
             HashMap::new()
         };
-        if needs_history_lookup {
+        if !missing_message_ids.is_empty() {
+            let context_messages = self
+                .thread_service
+                .load_context_messages(LoadContextMessagesRequest {
+                    scope: self.thread_scope.clone(),
+                    thread_id: self.run_context.thread_id.clone(),
+                    message_ids: missing_message_ids,
+                })
+                .await
+                .map_err(context_read_error)?;
+            messages_by_ref.extend(context_messages_by_ref(context_messages.messages));
+        }
+        if needs_summary_history_lookup {
             let history = self
                 .thread_service
                 .list_thread_history(ThreadHistoryRequest {
@@ -865,7 +886,6 @@ where
                 })
                 .await
                 .map_err(context_read_error)?;
-            messages_by_ref.extend(history_messages_by_ref(history.messages));
             messages_by_ref.extend(history_summaries_by_ref(history.summary_artifacts));
         }
         let mut resolved = Vec::with_capacity(requested_messages.len());
@@ -1186,26 +1206,6 @@ fn context_messages_by_ref(messages: Vec<ContextMessage>) -> HashMap<String, Con
         .collect()
 }
 
-fn history_messages_by_ref(messages: Vec<ThreadMessageRecord>) -> HashMap<String, ContextMessage> {
-    messages
-        .into_iter()
-        .filter(|message| model_visible_status(message.status))
-        .filter_map(|message| {
-            let content = message.content?;
-            let context_message = ContextMessage {
-                message_id: Some(message.message_id),
-                summary_id: None,
-                sequence: message.sequence,
-                kind: message.kind,
-                tool_result_provider_call: message.tool_result_provider_call,
-                content,
-            };
-            message_ref_from_context(&context_message)
-                .map(|message_ref| (message_ref.as_str().to_string(), context_message))
-        })
-        .collect()
-}
-
 fn history_summaries_by_ref(summaries: Vec<SummaryArtifact>) -> HashMap<String, ContextMessage> {
     summaries
         .into_iter()
@@ -1222,13 +1222,6 @@ fn history_summaries_by_ref(summaries: Vec<SummaryArtifact>) -> HashMap<String, 
                 .map(|message_ref| (message_ref.as_str().to_string(), context_message))
         })
         .collect()
-}
-
-fn model_visible_status(status: MessageStatus) -> bool {
-    matches!(
-        status,
-        MessageStatus::Accepted | MessageStatus::Submitted | MessageStatus::Finalized
-    )
 }
 
 fn context_message_to_loop_message(message: ContextMessage) -> Option<LoopContextMessage> {
@@ -1258,6 +1251,10 @@ fn message_ref(message_id: ThreadMessageId) -> Result<LoopMessageRef, AgentLoopH
             "thread message reference could not be represented",
         )
     })
+}
+
+fn is_summary_model_message_ref(message_ref: &LoopMessageRef) -> bool {
+    message_ref.as_str().starts_with("msg:summary-")
 }
 
 fn message_id_from_ref(
