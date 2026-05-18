@@ -226,6 +226,8 @@ pub enum RebornCompositionError {
     EventStore(#[from] RebornEventStoreError),
     #[error("reborn turn substrate failed: {0}")]
     Turn(#[from] TurnError),
+    #[error("reborn run-profile resolver substrate failed: {0}")]
+    RunProfile(#[from] ironclaw_turns::run_profile::RunProfileRegistryError),
 }
 
 /// Build production-wired host-runtime services over libSQL-backed substrates.
@@ -274,6 +276,9 @@ where
     .with_capability_leases(capability_leases)
     .with_secret_store(Arc::clone(&secret_store))
     .with_turn_run_wake_notifier(config.turn_run_wake_notifier)
+    .with_run_profile_resolver(Arc::new(
+        ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver()?,
+    ))
     .with_libsql_run_state_approval_store(Arc::clone(&config.database))
     .await?
     .with_libsql_turn_state_store(Arc::clone(&config.database))
@@ -337,6 +342,9 @@ where
     .with_capability_leases(capability_leases)
     .with_secret_store(Arc::clone(&secret_store))
     .with_turn_run_wake_notifier(config.turn_run_wake_notifier)
+    .with_run_profile_resolver(Arc::new(
+        ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver()?,
+    ))
     .with_postgres_run_state_approval_store(config.pool.clone())
     .await?
     .with_postgres_turn_state_store(config.pool.clone())
