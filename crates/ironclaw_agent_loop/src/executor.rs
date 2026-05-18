@@ -1,7 +1,6 @@
 //! Canonical agent-loop executor.
 //!
 //! The executor owns loop mechanics. Loop families own strategy composition.
-//! See `docs/reborn/agent-loop-skeleton.md` section 8 for the canonical tick.
 
 use std::collections::HashSet;
 
@@ -271,6 +270,7 @@ impl CanonicalAgentLoopExecutor {
 
             let mut context_request = planner.context().plan_context_request(&state).await;
             context_request.surface_version = Some(surface.version.clone());
+            context_request.capability_view = Some(capability_view.clone());
             let prompt_mode = context_request.mode;
             state = match self
                 .checkpoint_and_exit_if_cancelled_after_pending_input_ack(
@@ -788,7 +788,7 @@ impl CanonicalAgentLoopExecutor {
             {
                 RecoveryOutcome::SkipResult { recovery } => {
                     state.recovery_state = recovery;
-                    append_capability_error_ref(host, &call, &summary).await?;
+                    append_capability_error_ref(host, &mut state, &call, &summary).await?;
                     match self.checkpoint_and_exit_if_cancelled(host, state).await? {
                         CancelCheck::Continue(next) => state = *next,
                         CancelCheck::Exit(exit) => return Ok(BatchStep::Exit(exit)),
@@ -800,7 +800,7 @@ impl CanonicalAgentLoopExecutor {
                     failure_kind,
                 } => {
                     state.recovery_state = recovery;
-                    append_capability_error_ref(host, &call, &summary).await?;
+                    append_capability_error_ref(host, &mut state, &call, &summary).await?;
                     match self.checkpoint_and_exit_if_cancelled(host, state).await? {
                         CancelCheck::Continue(next) => state = *next,
                         CancelCheck::Exit(exit) => return Ok(BatchStep::Exit(exit)),
@@ -818,7 +818,7 @@ impl CanonicalAgentLoopExecutor {
                 } => {
                     if matches!(summary.class, CapabilityErrorClass::PolicyDenied) {
                         state.recovery_state = recovery;
-                        append_capability_error_ref(host, &call, &summary).await?;
+                        append_capability_error_ref(host, &mut state, &call, &summary).await?;
                         match self.checkpoint_and_exit_if_cancelled(host, state).await? {
                             CancelCheck::Continue(next) => state = *next,
                             CancelCheck::Exit(exit) => return Ok(BatchStep::Exit(exit)),
@@ -934,7 +934,7 @@ impl CanonicalAgentLoopExecutor {
             }
         }
 
-        append_capability_error_ref(host, &call, &summary).await?;
+        append_capability_error_ref(host, &mut state, &call, &summary).await?;
         let checked = self.checkpoint(host, state, CheckpointKind::Final).await?;
         Ok(BatchStep::Exit(failed_exit(
             host,
@@ -988,6 +988,7 @@ impl CanonicalAgentLoopExecutor {
                 state.gate_state = gate;
                 append_capability_safe_summary_ref(
                     host,
+                    &mut state,
                     &call,
                     gate_tool_result_summary(kind, "skipped"),
                 )
@@ -1002,6 +1003,7 @@ impl CanonicalAgentLoopExecutor {
                 state.gate_state = gate;
                 append_capability_safe_summary_ref(
                     host,
+                    &mut state,
                     &call,
                     gate_tool_result_summary(kind, "aborted"),
                 )
@@ -1024,12 +1026,13 @@ impl CanonicalAgentLoopExecutor {
     async fn fail_unsupported_process_wait(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
-        state: LoopExecutionState,
+        mut state: LoopExecutionState,
         call: &CapabilityCallCandidate,
         _process_ref: &ironclaw_turns::run_profile::LoopProcessRef,
     ) -> Result<BatchStep, AgentLoopExecutorError> {
         append_capability_safe_summary_ref(
             host,
+            &mut state,
             call,
             "capability process wait is not supported".to_string(),
         )
@@ -1147,8 +1150,7 @@ impl CanonicalAgentLoopExecutor {
     }
 
     // Cancellation is checked cooperatively at N boundary points between external calls.
-    // A macro refactor was considered but deferred; the explicit sites are self-documenting
-    // and the boundary count is stable for this workstream.
+    // A macro refactor was considered but deferred; the explicit sites are self-documenting.
     async fn checkpoint_and_exit_if_cancelled(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
@@ -1701,27 +1703,32 @@ fn provider_tool_call_reference(
 
 async fn append_capability_error_ref(
     host: &(dyn AgentLoopDriverHost + Send + Sync),
+    state: &mut LoopExecutionState,
     call: &CapabilityCallCandidate,
     summary: &CapabilityErrorSummary,
 ) -> Result<(), AgentLoopExecutorError> {
-    append_capability_safe_summary_ref(host, call, summary.safe_summary.as_str().to_string()).await
+    append_capability_safe_summary_ref(host, state, call, summary.safe_summary.as_str().to_string())
+        .await
 }
 
 async fn append_capability_safe_summary_ref(
     host: &(dyn AgentLoopDriverHost + Send + Sync),
+    state: &mut LoopExecutionState,
     call: &CapabilityCallCandidate,
     safe_summary: String,
 ) -> Result<(), AgentLoopExecutorError> {
     if call.provider_replay.is_none() {
         return Ok(());
     }
+    let result_ref = synthetic_provider_error_result_ref(call)?;
     host.append_capability_result_ref(AppendCapabilityResultRef {
-        result_ref: synthetic_provider_error_result_ref(call)?,
+        result_ref: result_ref.clone(),
         safe_summary,
         provider_call: provider_tool_call_reference(call),
     })
     .await
     .map_err(capability_host_error)?;
+    state.result_refs.push(result_ref);
     Ok(())
 }
 
@@ -1827,6 +1834,7 @@ mod tests {
         model_responses: Arc<Mutex<VecDeque<LoopModelResponse>>>,
         model_errors: Arc<Mutex<VecDeque<AgentLoopHostError>>>,
         model_requests: Arc<Mutex<Vec<LoopModelRequest>>>,
+        prompt_requests: Arc<Mutex<Vec<LoopPromptBundleRequest>>>,
         input_batches: Arc<Mutex<VecDeque<LoopInputBatch>>>,
         acked_input_tokens: Arc<Mutex<Vec<LoopInputAckToken>>>,
         batch_outcomes: Arc<Mutex<VecDeque<ironclaw_turns::run_profile::CapabilityBatchOutcome>>>,
@@ -1856,6 +1864,7 @@ mod tests {
                 model_responses: Arc::new(Mutex::new(model_responses.into())),
                 model_errors: Arc::new(Mutex::new(VecDeque::new())),
                 model_requests: Arc::new(Mutex::new(Vec::new())),
+                prompt_requests: Arc::new(Mutex::new(Vec::new())),
                 input_batches: Arc::new(Mutex::new(VecDeque::new())),
                 acked_input_tokens: Arc::new(Mutex::new(Vec::new())),
                 batch_outcomes: Arc::new(Mutex::new(VecDeque::new())),
@@ -1929,6 +1938,10 @@ mod tests {
 
         fn model_requests(&self) -> Vec<LoopModelRequest> {
             self.model_requests.lock().expect("lock").clone()
+        }
+
+        fn prompt_requests(&self) -> Vec<LoopPromptBundleRequest> {
+            self.prompt_requests.lock().expect("lock").clone()
         }
 
         fn acked_input_tokens(&self) -> Vec<LoopInputAckToken> {
@@ -2051,8 +2064,9 @@ mod tests {
     impl ironclaw_turns::run_profile::LoopPromptPort for MockHost {
         async fn build_prompt_bundle(
             &self,
-            _request: LoopPromptBundleRequest,
+            request: LoopPromptBundleRequest,
         ) -> Result<LoopPromptBundle, AgentLoopHostError> {
+            self.prompt_requests.lock().expect("lock").push(request);
             Ok(LoopPromptBundle {
                 bundle_ref: LoopPromptBundleRef::for_run(&self.context, "bundle").expect("valid"),
                 messages: vec![LoopModelMessage {
@@ -2490,6 +2504,14 @@ mod tests {
                 .capability_view
                 .as_ref()
                 .expect("model capability view")
+                .visible_capability_ids
+                .is_empty()
+        );
+        assert!(
+            host.prompt_requests()[0]
+                .capability_view
+                .as_ref()
+                .expect("prompt capability view")
                 .visible_capability_ids
                 .is_empty()
         );
@@ -3359,8 +3381,8 @@ mod tests {
     #[tokio::test]
     async fn denied_provider_call_appends_failure_tool_result_for_replay() {
         let result_ref = LoopResultRef::new("result:provider-call").expect("valid");
-        let host = MockHost::new(vec![provider_two_calls_response()]).with_batch_outcomes(vec![
-            ironclaw_turns::run_profile::CapabilityBatchOutcome {
+        let host = MockHost::new(vec![provider_two_calls_response(), reply_response()])
+            .with_batch_outcomes(vec![ironclaw_turns::run_profile::CapabilityBatchOutcome {
                 outcomes: vec![
                     CapabilityOutcome::Completed(CapabilityResultMessage {
                         result_ref: result_ref.clone(),
@@ -3374,12 +3396,11 @@ mod tests {
                     }),
                 ],
                 stopped_on_suspension: false,
-            },
-        ]);
+            }]);
         let executor = CanonicalAgentLoopExecutor;
         let state = LoopExecutionState::initial_for_run(host.run_context());
 
-        executor
+        let exit = executor
             .execute_family(&crate::families::default(), &host, state)
             .await
             .expect("execute");
@@ -3402,6 +3423,19 @@ mod tests {
         assert_eq!(denied_provider_call.provider_turn_id, "turn_1");
         assert_eq!(denied_provider_call.provider_call_id, "call_2");
         assert_eq!(denied_provider_call.provider_tool_name, "demo__echo");
+        match exit {
+            LoopExit::Completed(completed) => {
+                assert_eq!(
+                    completed.result_refs,
+                    vec![result_ref.clone(), appended[1].result_ref.clone()]
+                );
+            }
+            other => panic!("expected completed, got {other:?}"),
+        }
+        assert_eq!(
+            final_staged_state(&host).result_refs,
+            vec![result_ref, appended[1].result_ref.clone()]
+        );
     }
 
     #[tokio::test]

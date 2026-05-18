@@ -27,8 +27,11 @@ use ironclaw_loop_support::{
     loop_driver_execution_extension_id,
 };
 use ironclaw_reborn::{
-    LoopCapabilityPortFactory, ModelRoute, ModelRouteError, ModelRoutePolicy, ModelRouteResolver,
-    ModelSelectionMode, ModelSlot, StaticModelRouteResolver,
+    loop_driver_host::LoopCapabilityPortFactory,
+    model_routes::{
+        ModelRoute, ModelRouteError, ModelRoutePolicy, ModelRouteResolver, ModelSelectionMode,
+        ModelSlot, StaticModelRouteResolver,
+    },
 };
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 use ironclaw_turns::{

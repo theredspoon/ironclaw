@@ -443,14 +443,13 @@ pub enum LoopFailureKind {
     DriverBug,
     InterruptedUnexpectedly,
     /// Emitted by `DefaultStopConditionStrategy` when repetition or
-    /// repeated-same-error escapes fire. See agent-loop-skeleton.md §10.
+    /// repeated-same-error escapes fire.
     NoProgressDetected,
     /// Emitted when a `CapabilityOutcome::Denied` reaches the recovery path
     /// with no further retry possible. Distinct from `CapabilityProtocolError`
     /// so the no-progress detector can count repeated denials without
     /// conflating them with transport faults. Hook-induced denials (via the
-    /// middleware composition seam — see master doc §9.1 scenario A)
-    /// accumulate through this variant. See agent-loop-skeleton.md §9, §10.
+    /// middleware composition seam) accumulate through this variant.
     PolicyDenied,
 }
 
@@ -720,6 +719,7 @@ impl LoopExitViolation {
 #[serde(rename_all = "snake_case")]
 pub enum LoopExitViolationKind {
     MissingCompletionReference,
+    MismatchedCompletionReferenceKind,
     UnverifiedCompletionReference,
     MissingFinalCheckpoint,
     UnverifiedBlockedEvidence,
@@ -732,6 +732,7 @@ impl LoopExitViolationKind {
     fn category(self) -> &'static str {
         match self {
             Self::MissingCompletionReference => "missing_completion_reference",
+            Self::MismatchedCompletionReferenceKind => "mismatched_completion_reference_kind",
             Self::UnverifiedCompletionReference => "unverified_completion_reference",
             Self::MissingFinalCheckpoint => "missing_final_checkpoint",
             Self::UnverifiedBlockedEvidence => "unverified_blocked_evidence",
@@ -745,6 +746,7 @@ impl LoopExitViolationKind {
         match self {
             Self::CancellationNotObserved => "interrupted_unexpectedly",
             Self::MissingCompletionReference
+            | Self::MismatchedCompletionReferenceKind
             | Self::UnverifiedCompletionReference
             | Self::MissingFinalCheckpoint
             | Self::UnverifiedBlockedEvidence
@@ -784,20 +786,8 @@ fn validate_completed_exit(
     exit: LoopCompleted,
     policy: LoopExitValidationPolicy,
 ) -> LoopExitValidationDecision {
-    if exit.completion_kind == LoopCompletionKind::NoReply {
-        if !policy.allow_no_reply_completion {
-            return invalid_exit_decision(
-                exit_id,
-                LoopExitViolationKind::NoReplyNotAllowed,
-                policy.invalid_handling,
-            );
-        }
-    } else if !exit.has_durable_completion_ref() {
-        return invalid_exit_decision(
-            exit_id,
-            LoopExitViolationKind::MissingCompletionReference,
-            policy.invalid_handling,
-        );
+    if let Some(kind_violation) = completion_kind_ref_violation(&exit, policy) {
+        return invalid_exit_decision(exit_id, kind_violation, policy.invalid_handling);
     }
 
     if exit.has_durable_completion_ref() && !policy.completion_refs_verified {
@@ -819,6 +809,39 @@ fn validate_completed_exit(
     }
 
     LoopExitValidationDecision::trusted(exit_id, TurnRunnerOutcome::Completed)
+}
+
+fn completion_kind_ref_violation(
+    exit: &LoopCompleted,
+    policy: LoopExitValidationPolicy,
+) -> Option<LoopExitViolationKind> {
+    match exit.completion_kind {
+        LoopCompletionKind::FinalReply | LoopCompletionKind::AskUserReply => {
+            if exit.reply_message_refs.is_empty() {
+                Some(LoopExitViolationKind::MissingCompletionReference)
+            } else {
+                None
+            }
+        }
+        LoopCompletionKind::DelegatedResult | LoopCompletionKind::ResultOnly => {
+            if exit.result_refs.is_empty() {
+                Some(LoopExitViolationKind::MissingCompletionReference)
+            } else if !exit.reply_message_refs.is_empty() {
+                Some(LoopExitViolationKind::MismatchedCompletionReferenceKind)
+            } else {
+                None
+            }
+        }
+        LoopCompletionKind::NoReply => {
+            if exit.has_durable_completion_ref() {
+                Some(LoopExitViolationKind::MismatchedCompletionReferenceKind)
+            } else if !policy.allow_no_reply_completion {
+                Some(LoopExitViolationKind::NoReplyNotAllowed)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 fn validate_cancelled_exit(

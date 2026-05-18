@@ -22,9 +22,12 @@ use ironclaw_loop_support::{
     loop_driver_execution_extension_id, verify_product_live_cancellation_probe,
 };
 use ironclaw_reborn::{
-    DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, ModelSelectionMode, ModelSlot,
-    build_product_live_planned_runtime, default_planned_run_profile_resolver,
     loop_exit_applier::ThreadCheckpointLoopExitEvidencePort,
+    model_routes::{ModelSelectionMode, ModelSlot},
+    planned_driver_factory::default_planned_run_profile_resolver,
+    runtime::{
+        DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, build_product_live_planned_runtime,
+    },
 };
 use ironclaw_reborn_composition::{
     ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
@@ -534,18 +537,19 @@ async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() 
         .find(|definition| definition.capability_id == capability_id)
         .expect("builtin echo should be advertised as a provider tool");
 
+    let provider_tool_call = ProviderToolCall {
+        provider_id: "nearai".to_string(),
+        provider_model_id: "qwen3-coder".to_string(),
+        turn_id: Some("provider-turn:provider-tool".to_string()),
+        id: "call_provider_echo".to_string(),
+        name: tool_definition.name,
+        arguments: serde_json::json!({ "message": "hello from provider tool" }),
+        response_reasoning: Some("model selected echo".to_string()),
+        reasoning: None,
+        signature: Some("sig-provider-tool".to_string()),
+    };
     let candidate = capability_port
-        .register_provider_tool_call(ProviderToolCall {
-            provider_id: "nearai".to_string(),
-            provider_model_id: "qwen3-coder".to_string(),
-            turn_id: Some("provider-turn:provider-tool".to_string()),
-            id: "call_provider_echo".to_string(),
-            name: tool_definition.name,
-            arguments: serde_json::json!({ "message": "hello from provider tool" }),
-            response_reasoning: Some("model selected echo".to_string()),
-            reasoning: None,
-            signature: Some("sig-provider-tool".to_string()),
-        })
+        .register_provider_tool_call(provider_tool_call.clone())
         .await
         .unwrap();
 
@@ -554,9 +558,27 @@ async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() 
         candidate
             .input_ref
             .as_str()
-            .starts_with(&format!("input:{}:", run_context.run_id)),
-        "provider tool inputs must be scoped to the loop run: {}",
+            .starts_with("input:provider-tool-"),
+        "provider tool inputs should use opaque provider-tool refs: {}",
         candidate.input_ref.as_str()
+    );
+    let other_run_context = loop_run_context("provider-tool-other-run").await;
+    let other_capability_port = adapters
+        .capability_factory
+        .create_capability_port(&other_run_context)
+        .await
+        .unwrap();
+    other_capability_port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    let other_candidate = other_capability_port
+        .register_provider_tool_call(provider_tool_call)
+        .await
+        .unwrap();
+    assert_ne!(
+        candidate.input_ref, other_candidate.input_ref,
+        "provider tool input refs must remain scoped by loop run even when the ref is opaque"
     );
     assert!(
         candidate.provider_replay.is_some(),

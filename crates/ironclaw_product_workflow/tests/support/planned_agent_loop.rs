@@ -30,10 +30,15 @@ use ironclaw_product_workflow::{
     InboundTurnService, ResolvedBinding,
 };
 use ironclaw_reborn::{
-    DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, LoopCapabilityPortFactory, ModelRoute,
-    ModelRoutePolicy, ModelSelectionMode, ModelSlot, RebornRuntimeLoopComposition,
-    StaticModelRouteResolver, build_product_live_planned_runtime,
+    loop_driver_host::LoopCapabilityPortFactory,
     loop_exit_applier::ThreadCheckpointLoopExitEvidencePort,
+    model_routes::{
+        ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, StaticModelRouteResolver,
+    },
+    runtime::{
+        DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, RebornRuntimeLoopComposition,
+        build_product_live_planned_runtime,
+    },
 };
 use ironclaw_reborn_composition::{
     ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
@@ -871,12 +876,17 @@ struct ReadyRunCancellationFactory {
 }
 
 impl ReadyRunCancellationFactory {
-    fn product_cancellation_observed(&self, run_id: TurnRunId) -> bool {
+    fn handle_for(&self, run_id: TurnRunId) -> Option<RunCancellationHandle> {
         self.handles
             .lock()
             .expect("ready cancellation lock poisoned")
             .get(&run_id)
-            .map(RunCancellationHandle::is_requested)
+            .cloned()
+    }
+
+    fn product_cancellation_observed(&self, run_id: TurnRunId) -> bool {
+        self.handle_for(run_id)
+            .map(|handle| handle.is_requested())
             .unwrap_or(false)
     }
 }
@@ -900,20 +910,21 @@ impl RunCancellationFactory for ReadyRunCancellationFactory {
         if wake.status != TurnStatus::CancelRequested {
             return;
         }
-        if let Some(handle) = self
-            .handles
-            .lock()
-            .expect("ready cancellation lock poisoned")
-            .get(&wake.run_id)
-            .cloned()
-        {
+        if let Some(handle) = self.handle_for(wake.run_id) {
             handle.request(LoopCancelReasonKind::UserRequested);
         }
     }
 
     fn product_live_cancellation_probe(&self) -> Option<Box<dyn ProductLiveCancellationProbe>> {
+        let run_id = TurnRunId::new();
+        let handle = RunCancellationHandle::default();
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .insert(run_id, handle);
         Some(Box::new(ReadyRunCancellationProbe {
-            handle: RunCancellationHandle::default(),
+            handles: Arc::clone(&self.handles),
+            run_id,
         }))
     }
 
@@ -921,18 +932,33 @@ impl RunCancellationFactory for ReadyRunCancellationFactory {
         &self,
         run_id: TurnRunId,
     ) -> Result<bool, AgentLoopHostError> {
-        Ok(self
-            .handles
-            .lock()
-            .expect("ready cancellation lock poisoned")
-            .get(&run_id)
-            .map(RunCancellationHandle::is_requested)
-            .unwrap_or(false))
+        Ok(self.product_cancellation_observed(run_id))
     }
 }
 
 struct ReadyRunCancellationProbe {
-    handle: RunCancellationHandle,
+    handles: Arc<Mutex<HashMap<TurnRunId, RunCancellationHandle>>>,
+    run_id: TurnRunId,
+}
+
+impl ReadyRunCancellationProbe {
+    fn handle(&self) -> RunCancellationHandle {
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .get(&self.run_id)
+            .cloned()
+            .expect("probe handle retained for readiness check")
+    }
+}
+
+impl Drop for ReadyRunCancellationProbe {
+    fn drop(&mut self) {
+        self.handles
+            .lock()
+            .expect("ready cancellation lock poisoned")
+            .remove(&self.run_id);
+    }
 }
 
 impl ProductLiveCancellationProbe for ReadyRunCancellationProbe {
@@ -940,12 +966,12 @@ impl ProductLiveCancellationProbe for ReadyRunCancellationProbe {
         &self,
         reason_kind: LoopCancelReasonKind,
     ) -> Result<(), AgentLoopHostError> {
-        self.handle.request(reason_kind);
+        self.handle().request(reason_kind);
         Ok(())
     }
 
     fn is_cancellation_observed(&self) -> Result<bool, AgentLoopHostError> {
-        Ok(self.handle.is_requested())
+        Ok(self.handle().is_requested())
     }
 }
 

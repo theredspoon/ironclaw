@@ -19,9 +19,12 @@ use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelRequest, HostManagedModelResponse,
 };
-use ironclaw_reborn::{
-    DurableLoopHostMilestoneScope, DurableLoopHostMilestoneSink, RebornLoopDriverHostFactory,
-    RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
+use ironclaw_reborn::loop_driver_host::{
+    RebornLoopDriverHost, RebornLoopDriverHostFactory, RebornLoopDriverHostRequest,
+    TextOnlyLoopHostConfig,
+};
+use ironclaw_reborn::milestone_events::{
+    DurableLoopHostMilestoneScope, DurableLoopHostMilestoneSink,
 };
 use ironclaw_reborn_event_store::{
     RebornEventStoreConfig, RebornProfile, build_reborn_event_stores,
@@ -324,6 +327,7 @@ async fn drive_model_reply_milestones_and_assert_projection(
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -398,6 +402,7 @@ async fn drive_model_reply_milestones_and_assert_projection(
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),
+            capability_view: None,
         })
         .await
         .unwrap();
@@ -820,7 +825,7 @@ impl HostFixture {
         }
     }
 
-    async fn build_host(&self) -> ironclaw_reborn::RebornLoopDriverHost {
+    async fn build_host(&self) -> RebornLoopDriverHost {
         RebornLoopDriverHostFactory::new(
             Arc::clone(&self.thread_service),
             self.thread_scope.clone(),

@@ -618,8 +618,6 @@ pub struct LoopContextMessage {
     /// `None` means "summary-only entry; prompt port MUST NOT resolve content —
     /// use `safe_summary` verbatim instead." Mirrors the
     /// `SkillTrustLevel::Installed` carrying `prompt_content: None` pattern.
-    /// See `docs/reborn/agent-loop-briefs/prompt-context-assembly.md` §3.2 for
-    /// the upstream invariant this enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_ref: Option<LoopMessageRef>,
     pub role: String,
@@ -849,6 +847,8 @@ pub struct LoopPromptBundleRequest {
     pub mode: PromptMode,
     pub context_cursor: Option<LoopInputCursor>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_view: Option<LoopModelCapabilityView>,
     pub checkpoint_state_ref: Option<LoopCheckpointStateRef>,
     pub max_messages: Option<u32>,
     #[serde(default)]
@@ -1061,18 +1061,28 @@ pub struct CapabilityCallCandidate {
     pub provider_replay: Option<ProviderToolCallReplay>,
 }
 
+/// Provider-originated tool-call metadata needed to replay tool results back to the same provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCallReplay {
+    /// Provider identity selected by the host route.
     pub provider_id: String,
+    /// Concrete provider model selected by the host route.
     pub provider_model_id: String,
+    /// Provider turn grouping token for reconstructing assistant tool calls.
     pub provider_turn_id: String,
+    /// Provider call id referenced by the matching tool result.
     pub provider_call_id: String,
+    /// Provider-facing tool name advertised to the model.
     pub provider_tool_name: String,
+    /// Provider-facing tool arguments captured from the model tool call.
     pub arguments: serde_json::Value,
+    /// Provider response-level reasoning attached to the tool-call batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_reasoning: Option<String>,
+    /// Provider call-level reasoning attached to this tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque provider thought-signature metadata, not an IronClaw auth signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
@@ -1096,11 +1106,10 @@ pub struct VisibleCapabilitySurface {
 
 /// Concurrency hint for a capability surfaced to an agent loop driver.
 ///
-/// Derived at the adapter boundary in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`)
-/// from the underlying `CapabilityDescriptor.effects` Vec. The lower-layer
-/// `CapabilityDescriptor` is NOT modified; `effects` remains the source of
-/// truth and the hint is a computed projection. See WS-9 §3.2a for the
-/// per-`EffectKind` mapping table.
+/// Derived at the adapter boundary from the underlying
+/// `CapabilityDescriptor.effects` Vec. The lower-layer `CapabilityDescriptor`
+/// is NOT modified; `effects` remains the source of truth and the hint is a
+/// computed projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConcurrencyHint {
@@ -1124,44 +1133,70 @@ pub struct CapabilityDescriptorView {
     pub parameters_schema: serde_json::Value,
 }
 
+/// Provider-facing tool definition derived from a visible IronClaw capability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolDefinition {
+    /// Canonical IronClaw capability id backing this provider tool.
     pub capability_id: CapabilityId,
+    /// Provider-safe tool name sent to the model.
     pub name: String,
+    /// Provider-safe tool description sent to the model.
     pub description: String,
+    /// JSON object schema for provider tool arguments.
     pub parameters: serde_json::Value,
 }
 
+/// Tool call emitted by a provider-backed model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCall {
+    /// Provider identity selected by the host route.
     pub provider_id: String,
+    /// Concrete provider model selected by the host route.
     pub provider_model_id: String,
+    /// Provider turn grouping token for reconstructing assistant tool calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// Provider call id referenced by the matching tool result.
     pub id: String,
+    /// Provider-facing tool name returned by the model.
     pub name: String,
+    /// Provider-facing tool arguments returned by the model.
     pub arguments: serde_json::Value,
+    /// Provider response-level reasoning attached to the tool-call batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_reasoning: Option<String>,
+    /// Provider call-level reasoning attached to this tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque provider thought-signature metadata, not an IronClaw auth signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
 
+/// Durable reference to provider tool-call metadata for tool-result replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCallReference {
+    /// Provider identity selected by the host route.
     pub provider_id: String,
+    /// Concrete provider model selected by the host route.
     pub provider_model_id: String,
+    /// Provider turn grouping token for reconstructing assistant tool calls.
     pub provider_turn_id: String,
+    /// Provider call id referenced by the matching tool result.
     pub provider_call_id: String,
+    /// Provider-facing tool name returned by the model.
     pub provider_tool_name: String,
+    /// Canonical IronClaw capability id backing this provider tool.
     pub capability_id: CapabilityId,
+    /// Provider-facing tool arguments returned by the model.
     pub arguments: serde_json::Value,
+    /// Provider response-level reasoning attached to the tool-call batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_reasoning: Option<String>,
+    /// Provider call-level reasoning attached to this tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque provider thought-signature metadata, not an IronClaw auth signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
@@ -1224,7 +1259,7 @@ pub struct CapabilityResultMessage {
     pub safe_summary: String,
     /// Host hint that this completed capability result should end the loop
     /// naturally after the current batch. Defaults to false for compatibility
-    /// with pre-WS-6 hosts.
+    /// with older hosts.
     #[serde(default)]
     pub terminate_hint: bool,
 }
@@ -1417,6 +1452,13 @@ pub trait LoopCapabilityPort: Send + Sync {
         Ok(Vec::new())
     }
 
+    fn validate_provider_tool_call(
+        &self,
+        _tool_call: &ProviderToolCall,
+    ) -> Result<(), AgentLoopHostError> {
+        Ok(())
+    }
+
     async fn register_provider_tool_call(
         &self,
         _tool_call: ProviderToolCall,
@@ -1518,8 +1560,7 @@ pub struct LoadedCheckpointPayload {
 /// [`LoopCheckpointPort::checkpoint`] with the resulting state ref.
 ///
 /// The two-step write keeps byte-storage and metadata-write responsibilities
-/// cleanly split. See `docs/reborn/agent-loop-briefs/state-and-checkpoints.md`
-/// §2 for the rationale and WS-10 for the read-side counterpart.
+/// cleanly split.
 ///
 /// `kind` is required so adapters that bridge to
 /// `CheckpointStateStore::put_checkpoint_state` can persist the correct kind
@@ -1574,9 +1615,9 @@ pub trait LoopCheckpointPort: Send + Sync {
     /// can reference. The default impl fails closed; concrete impls live in
     /// `ironclaw_loop_support` and wrap the host's `CheckpointStateStore`.
     ///
-    /// The executor's `checkpoint(...)` helper (WS-6 §3.4) calls this method
-    /// before invoking `LoopCheckpointPort::checkpoint(...)` so the metadata
-    /// write references a payload that's already durably stored.
+    /// The executor's checkpoint helper calls this method before invoking
+    /// `LoopCheckpointPort::checkpoint(...)` so the metadata write references
+    /// a payload that's already durably stored.
     async fn stage_checkpoint_payload(
         &self,
         _request: StageCheckpointPayloadRequest,

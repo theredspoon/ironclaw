@@ -53,6 +53,30 @@ impl LoopCapabilityPort for CapabilitySurfaceVisibleFilter {
         Ok(definitions)
     }
 
+    fn validate_provider_tool_call(
+        &self,
+        tool_call: &ProviderToolCall,
+    ) -> Result<(), AgentLoopHostError> {
+        let Some(definition) = self
+            .inner
+            .tool_definitions()?
+            .into_iter()
+            .find(|definition| definition.name == tool_call.name)
+        else {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "provider tool call is outside the visible capability surface",
+            ));
+        };
+        if !self.permits(&definition.capability_id) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "provider tool call is outside the model-visible capability view",
+            ));
+        }
+        self.inner.validate_provider_tool_call(tool_call)
+    }
+
     async fn register_provider_tool_call(
         &self,
         tool_call: ProviderToolCall,
@@ -126,6 +150,32 @@ impl LoopCapabilityPort for CapabilitySurfaceProfileFilter {
         let mut definitions = self.inner.tool_definitions()?;
         definitions.retain(|definition| self.allow_set.permits(&definition.capability_id));
         Ok(definitions)
+    }
+
+    fn validate_provider_tool_call(
+        &self,
+        tool_call: &ProviderToolCall,
+    ) -> Result<(), AgentLoopHostError> {
+        if !matches!(self.allow_set.as_ref(), CapabilityAllowSet::All) {
+            let Some(definition) = self
+                .inner
+                .tool_definitions()?
+                .into_iter()
+                .find(|definition| definition.name == tool_call.name)
+            else {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "provider tool call is outside the visible capability surface",
+                ));
+            };
+            if !self.allow_set.permits(&definition.capability_id) {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "provider tool call is outside the run-profile surface",
+                ));
+            }
+        }
+        self.inner.validate_provider_tool_call(tool_call)
     }
 
     async fn register_provider_tool_call(
@@ -531,6 +581,39 @@ mod tests {
                 .map(|descriptor| descriptor.capability_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["demo.b", "demo.d"]
+        );
+    }
+
+    #[test]
+    fn tool_definitions_filters_provider_tools_to_allowlist() {
+        let inner = Arc::new(SpyPort::default());
+        *inner
+            .tool_definitions
+            .lock()
+            .expect("tool definitions lock") = vec![
+            provider_definition("demo.allowed", "demo__allowed"),
+            provider_definition("demo.denied", "demo__denied"),
+            provider_definition("demo.other_allowed", "demo__other_allowed"),
+        ];
+        let filter = CapabilitySurfaceProfileFilter::new(
+            inner,
+            Arc::new(CapabilityAllowSet::allowlist([
+                capability_id("demo.allowed"),
+                capability_id("demo.other_allowed"),
+            ])),
+        );
+
+        let definitions = filter.tool_definitions().expect("tool definitions");
+
+        assert_eq!(
+            definitions
+                .iter()
+                .map(|definition| (definition.capability_id.as_str(), definition.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("demo.allowed", "demo__allowed"),
+                ("demo.other_allowed", "demo__other_allowed"),
+            ]
         );
     }
 
