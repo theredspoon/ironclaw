@@ -233,7 +233,25 @@ fn capability_provider_host_api_contract_accepts_valid_manifest() {
         manifest.host_apis[0].section.as_str(),
         CAPABILITY_PROVIDER_SECTION
     );
-    assert_eq!(manifest.capabilities.len(), 0);
+    assert_eq!(manifest.capabilities.len(), 1);
+    assert_eq!(
+        manifest.capabilities[0].id.as_str(),
+        "telegram.send_message"
+    );
+
+    let package = package_from_manifest(manifest, "telegram");
+    assert_eq!(package.capabilities.len(), 1);
+    let descriptor = &package.capabilities[0];
+    assert_eq!(descriptor.id.as_str(), "telegram.send_message");
+    assert_eq!(descriptor.provider.as_str(), "telegram");
+    assert_eq!(descriptor.runtime, RuntimeKind::Wasm);
+    assert_eq!(descriptor.trust_ceiling, TrustClass::UserTrusted);
+    assert_eq!(descriptor.default_permission, PermissionMode::Ask);
+    assert_eq!(descriptor.effects, vec![EffectKind::Network]);
+    assert_eq!(
+        descriptor.parameters_schema,
+        serde_json::json!({"$ref": "schemas/telegram/send_message.input.v1.json"})
+    );
 }
 
 #[test]

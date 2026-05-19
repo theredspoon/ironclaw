@@ -174,6 +174,16 @@ pub struct HostApiManifestContext<'a> {
     pub host_port_catalog: &'a HostPortCatalog,
 }
 
+/// Neutral manifest projection produced by host API contract validators.
+///
+/// Projections keep host API section parsing separate from runtime publication:
+/// contracts can publish already-validated manifest declarations without wiring
+/// hot descriptors, dispatch, or domain-specific read models.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostApiManifestProjection {
+    pub capabilities: Vec<CapabilityDeclV2>,
+}
+
 /// Host API contract validator registered by composition.
 ///
 /// `ironclaw_extensions` owns the generic envelope and section dispatch. Domain
@@ -203,6 +213,16 @@ pub trait HostApiManifestContract: Send + Sync {
         let _ = context;
         self.validate_section(host_api, section)
     }
+
+    fn project_section_with_context(
+        &self,
+        context: &HostApiManifestContext<'_>,
+        host_api: &HostApiRefV2,
+        section: &toml::Value,
+    ) -> Result<HostApiManifestProjection, String> {
+        self.validate_section_with_context(context, host_api, section)?;
+        Ok(HostApiManifestProjection::default())
+    }
 }
 
 /// Composition-wired registry of host API manifest contracts.
@@ -229,13 +249,15 @@ impl HostApiContractRegistry {
         Ok(())
     }
 
-    fn validate_manifest(
+    fn project_manifest(
         &self,
         manifest: &ExtensionManifestV2,
         sections: &ManifestSectionsV2,
         host_port_catalog: &HostPortCatalog,
-    ) -> Result<(), ManifestV2Error> {
+    ) -> Result<HostApiManifestProjection, ManifestV2Error> {
         let mut counts: BTreeMap<&HostApiId, usize> = BTreeMap::new();
+        let mut projected = HostApiManifestProjection::default();
+        let mut seen_capabilities = BTreeSet::new();
         for host_api in &manifest.host_apis {
             let contract = self.contracts.get(&host_api.id).ok_or_else(|| {
                 ManifestV2Error::UnknownHostApi {
@@ -261,16 +283,22 @@ impl HostApiContractRegistry {
                 extension_id: &manifest.id,
                 host_port_catalog,
             };
-            contract
-                .validate_section_with_context(&context, host_api, section)
+            let section_projection = contract
+                .project_section_with_context(&context, host_api, section)
                 .map_err(|reason| ManifestV2Error::HostApiSectionRejected {
                     id: host_api.id.clone(),
                     section: host_api.section.clone(),
                     reason,
                 })?;
+            for capability in section_projection.capabilities {
+                if !seen_capabilities.insert(capability.id.clone()) {
+                    return Err(ManifestV2Error::DuplicateCapability { id: capability.id });
+                }
+                projected.capabilities.push(capability);
+            }
         }
         sections.reject_unreferenced_operational_sections(&manifest.host_apis)?;
-        Ok(())
+        Ok(projected)
     }
 }
 
@@ -531,8 +559,11 @@ impl ExtensionManifestV2 {
             });
         }
         let document = RawManifestDocumentV2::parse(input)?;
-        let manifest = Self::from_raw(document.raw, source, host_port_catalog, &document.sections)?;
-        registry.validate_manifest(&manifest, &document.sections, host_port_catalog)?;
+        let mut manifest =
+            Self::from_raw(document.raw, source, host_port_catalog, &document.sections)?;
+        let projection =
+            registry.project_manifest(&manifest, &document.sections, host_port_catalog)?;
+        manifest.capabilities.extend(projection.capabilities);
         Ok(manifest)
     }
 
@@ -554,7 +585,8 @@ impl ExtensionManifestV2 {
             });
         }
         let document = RawManifestDocumentV2::parse(input)?;
-        let manifest = Self::from_raw(document.raw, source, host_port_catalog, &document.sections)?;
+        let mut manifest =
+            Self::from_raw(document.raw, source, host_port_catalog, &document.sections)?;
         if manifest.host_apis.is_empty() {
             if let Some(key) = document.sections.first_non_envelope_top_level_key() {
                 return Err(ManifestV2Error::Parse {
@@ -562,7 +594,9 @@ impl ExtensionManifestV2 {
                 });
             }
         } else {
-            registry.validate_manifest(&manifest, &document.sections, host_port_catalog)?;
+            let projection =
+                registry.project_manifest(&manifest, &document.sections, host_port_catalog)?;
+            manifest.capabilities.extend(projection.capabilities);
         }
         Ok(manifest)
     }
