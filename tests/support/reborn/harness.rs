@@ -56,10 +56,11 @@ use ironclaw_threads::{
     ThreadMessageRecord, ThreadScope,
 };
 use ironclaw_turns::{
-    DefaultTurnCoordinator, FilesystemTurnStateStore, GateRef, GetRunStateRequest, IdempotencyKey,
-    InMemoryCheckpointStateStore, LoopCheckpointStore, LoopGateRef, ReplyTargetBindingRef,
-    ResumeTurnRequest, SourceBindingRef, TurnActor, TurnCoordinator, TurnError, TurnRunId,
-    TurnRunState, TurnScope, TurnStateStore, TurnStatus,
+    DefaultTurnCoordinator, FilesystemTurnStateStore, GateRef, GetLoopCheckpointRequest,
+    GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, LoopBlockedKind,
+    LoopCheckpointKind, LoopCheckpointStore, LoopGateRef, ReplyTargetBindingRef, ResumeTurnRequest,
+    SourceBindingRef, TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnRunState, TurnScope,
+    TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopHostError, CapabilityBatchInvocation, CapabilityBatchOutcome,
         CapabilityCallCandidate, CapabilityDescriptorView, CapabilityInputRef,
@@ -141,7 +142,7 @@ impl RebornBinaryE2EHarness {
             .await
     }
 
-    pub async fn with_trusted_blocked_evidence(
+    pub async fn with_harness_blocked_evidence(
         conversation_id: &str,
         model_gateway: RebornTraceReplayModelGateway,
         capability_port: RecordingTestCapabilityPort,
@@ -154,7 +155,7 @@ impl RebornBinaryE2EHarness {
         conversation_id: &str,
         model_gateway: RebornTraceReplayModelGateway,
         capability_port: RecordingTestCapabilityPort,
-        trust_blocked_evidence: bool,
+        accept_harness_blocked_evidence: bool,
     ) -> HarnessResult<Self> {
         let adapter = RebornTestProductAdapter::new("reborn-test", "install-1")?;
         let ingress = RebornTestIngress::new(adapter);
@@ -195,7 +196,8 @@ impl RebornBinaryE2EHarness {
                 Arc::clone(&loop_checkpoint_store),
                 thread_scope.clone(),
             ),
-            trust_blocked_evidence,
+            loop_checkpoint_store: Arc::clone(&loop_checkpoint_store),
+            accept_harness_blocked_evidence,
         });
         let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
             turn_state: Arc::clone(&turn_store),
@@ -446,7 +448,8 @@ impl Drop for RebornBinaryE2EHarness {
 
 struct HarnessLoopExitEvidencePort {
     inner: ThreadCheckpointLoopExitEvidencePort<FilesystemSessionThreadService<LocalFilesystem>>,
-    trust_blocked_evidence: bool,
+    loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
+    accept_harness_blocked_evidence: bool,
 }
 
 #[async_trait]
@@ -469,10 +472,32 @@ impl LoopExitEvidencePort for HarnessLoopExitEvidencePort {
         &self,
         request: BlockedEvidenceRequest<'_>,
     ) -> Result<bool, TurnError> {
-        if self.trust_blocked_evidence {
+        if self.inner.verify_blocked_evidence(request.clone()).await? {
             return Ok(true);
         }
-        self.inner.verify_blocked_evidence(request).await
+        if !self.accept_harness_blocked_evidence {
+            return Ok(false);
+        }
+        if request.blocked.kind != LoopBlockedKind::Approval
+            || GateRef::new(request.blocked.gate_ref.as_str()).is_err()
+        {
+            return Ok(false);
+        }
+        let checkpoint = self
+            .loop_checkpoint_store
+            .get_loop_checkpoint(GetLoopCheckpointRequest {
+                scope: request.scope.clone(),
+                turn_id: request.turn_id,
+                run_id: request.run_id,
+                checkpoint_id: request.blocked.checkpoint_id,
+            })
+            .await?;
+        Ok(checkpoint
+            .map(|record| {
+                record.kind == LoopCheckpointKind::BeforeBlock
+                    && record.state_ref == request.blocked.state_ref
+            })
+            .unwrap_or(false))
     }
 
     async fn verify_failure_evidence(

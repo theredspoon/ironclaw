@@ -19,7 +19,7 @@ async fn reborn_approval_traces_parity() {
         trace_tool_call_response(),
         HostManagedModelResponse::assistant_reply("approval resumed reply"),
     ]);
-    let mut harness = RebornBinaryE2EHarness::with_trusted_blocked_evidence(
+    let mut harness = RebornBinaryE2EHarness::with_harness_blocked_evidence(
         "room-approval-trace",
         model_gateway,
         RecordingTestCapabilityPort::approval_then_echo(),
