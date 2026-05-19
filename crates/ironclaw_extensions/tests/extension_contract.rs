@@ -346,6 +346,51 @@ fn capability_provider_host_api_reuses_capability_validation() {
 }
 
 #[test]
+fn capability_provider_host_api_rejects_duplicate_capability_ids() {
+    let manifest = CAPABILITY_PROVIDER_MANIFEST.replace(
+        "[[capability_provider.tools.capabilities]]",
+        r#"[[capability_provider.tools.capabilities]]
+id = "telegram.send_message"
+description = "Send a duplicate Telegram message"
+effects = ["network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/telegram/send_message.input.v1.json"
+output_schema_ref = "schemas/telegram/send_message.output.v1.json"
+prompt_doc_ref = "prompts/telegram/send_message.md"
+
+[[capability_provider.tools.capabilities]]"#,
+    );
+    let err = ExtensionManifest::parse_with_host_api_contracts(
+        &manifest,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+        &capability_provider_contracts(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ExtensionError::ManifestV2(ManifestV2Error::HostApiSectionRejected { reason, .. })
+            if reason.contains("duplicate capability id")
+    ));
+}
+
+#[test]
+fn capability_provider_host_api_rejects_contextless_validation() {
+    let contract = CapabilityProviderHostApiContract::new().unwrap();
+    let host_api = HostApiRefV2 {
+        id: HostApiId::new(CAPABILITY_PROVIDER_HOST_API_ID).unwrap(),
+        section: ManifestSectionPath::new(CAPABILITY_PROVIDER_SECTION).unwrap(),
+    };
+    let section = toml::Value::Table(toml::map::Map::new());
+
+    let err = contract.validate_section(&host_api, &section).unwrap_err();
+
+    assert!(err.contains("requires manifest context"));
+}
+
+#[test]
 fn capability_provider_host_api_validates_required_host_ports() {
     let manifest = CAPABILITY_PROVIDER_MANIFEST.replace(
         "prompt_doc_ref = \"prompts/telegram/send_message.md\"\n",
