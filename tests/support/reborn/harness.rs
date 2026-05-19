@@ -47,7 +47,10 @@ use ironclaw_loop_support::{
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
     HostManagedModelRequest, HostRuntimeLoopCapabilityPortFactory, LoopCapabilityResultWriter,
 };
-use ironclaw_product_adapters::{ProductInboundAck, ProductInboundEnvelope, ProductWorkflow};
+use ironclaw_product_adapters::{
+    ProductInboundAck, ProductInboundEnvelope, ProductInboundPayload, ProductTriggerReason,
+    ProductWorkflow,
+};
 use ironclaw_product_workflow::{
     ConversationBindingService, DefaultInboundTurnService, DefaultProductWorkflow,
     IdempotencyLedger, InboundTurnService, ProductConversationRouteKind, ResolveBindingRequest,
@@ -142,6 +145,7 @@ pub struct SubmittedTurn {
     pub ack: ProductInboundAck,
     pub run_id: TurnRunId,
     pub thread_id: ThreadId,
+    pub thread_scope: ThreadScope,
     pub scope: TurnScope,
 }
 
@@ -516,11 +520,13 @@ impl RebornBinaryE2EHarness {
             self.ingress
                 .verified_text_envelope(event_id, actor_id, conversation_id, text)?;
         let binding_request = binding_request_from_envelope(&envelope);
+        let route_kind = binding_request.route_kind;
         let binding = self
             ._product_harness
             .binding_service()?
             .resolve_binding(binding_request)
             .await?;
+        let thread_scope = thread_scope_from_binding_with_route_kind(&binding, route_kind)?;
         let turn_scope = TurnScope::new(
             binding.tenant_id.clone(),
             binding.agent_id.clone(),
@@ -540,6 +546,7 @@ impl RebornBinaryE2EHarness {
             ack,
             run_id,
             thread_id: binding.thread_id,
+            thread_scope,
             scope: turn_scope,
         })
     }
@@ -670,17 +677,34 @@ impl RebornBinaryE2EHarness {
             .await
     }
 
+    pub async fn history_for_submitted_thread(
+        &self,
+        submitted: &SubmittedTurn,
+    ) -> HarnessResult<Vec<ThreadMessageRecord>> {
+        self.history_for_thread_in_scope(
+            submitted.thread_scope.clone(),
+            submitted.thread_id.clone(),
+        )
+        .await
+    }
+
     pub async fn history_for_thread(
         &self,
+        thread_id: ThreadId,
+    ) -> HarnessResult<Vec<ThreadMessageRecord>> {
+        self.history_for_thread_in_scope(self.thread_scope.clone(), thread_id)
+            .await
+    }
+
+    pub async fn history_for_thread_in_scope(
+        &self,
+        scope: ThreadScope,
         thread_id: ThreadId,
     ) -> HarnessResult<Vec<ThreadMessageRecord>> {
         Ok(self
             .thread_harness
             .service
-            .list_thread_history(ThreadHistoryRequest {
-                scope: self.thread_scope.clone(),
-                thread_id,
-            })
+            .list_thread_history(ThreadHistoryRequest { scope, thread_id })
             .await?
             .messages)
     }
@@ -1454,12 +1478,19 @@ fn binding_request_from_envelope(envelope: &ProductInboundEnvelope) -> ResolveBi
         external_actor_ref: envelope.external_actor_ref().clone(),
         external_conversation_ref: envelope.external_conversation_ref().clone(),
         external_event_id: envelope.external_event_id().clone(),
-        route_kind: ProductConversationRouteKind::Direct,
+        route_kind: route_kind_for_envelope(envelope),
         auth_claim: envelope.auth_claim().clone(),
     }
 }
 
 fn thread_scope_from_binding(binding: &ResolvedBinding) -> HarnessResult<ThreadScope> {
+    thread_scope_from_binding_with_route_kind(binding, ProductConversationRouteKind::Direct)
+}
+
+fn thread_scope_from_binding_with_route_kind(
+    binding: &ResolvedBinding,
+    route_kind: ProductConversationRouteKind,
+) -> HarnessResult<ThreadScope> {
     Ok(ThreadScope {
         tenant_id: binding.tenant_id.clone(),
         agent_id: binding
@@ -1467,9 +1498,30 @@ fn thread_scope_from_binding(binding: &ResolvedBinding) -> HarnessResult<ThreadS
             .clone()
             .ok_or("resolved binding missing agent id")?,
         project_id: binding.project_id.clone(),
-        owner_user_id: Some(binding.user_id.clone()),
+        owner_user_id: match route_kind {
+            ProductConversationRouteKind::Direct => Some(binding.user_id.clone()),
+            ProductConversationRouteKind::Shared => None,
+        },
         mission_id: None,
     })
+}
+
+fn route_kind_for_envelope(envelope: &ProductInboundEnvelope) -> ProductConversationRouteKind {
+    match envelope.payload() {
+        ProductInboundPayload::UserMessage(message) => route_kind_for_trigger(message.trigger),
+        ProductInboundPayload::Command(command) => route_kind_for_trigger(command.trigger),
+        _ => ProductConversationRouteKind::Direct,
+    }
+}
+
+fn route_kind_for_trigger(trigger: ProductTriggerReason) -> ProductConversationRouteKind {
+    match trigger {
+        ProductTriggerReason::DirectChat => ProductConversationRouteKind::Direct,
+        ProductTriggerReason::BotMention
+        | ProductTriggerReason::ReplyToBot
+        | ProductTriggerReason::BotCommand
+        | ProductTriggerReason::LinkedThreadAction => ProductConversationRouteKind::Shared,
+    }
 }
 
 fn scoped_turns_fs<F>(

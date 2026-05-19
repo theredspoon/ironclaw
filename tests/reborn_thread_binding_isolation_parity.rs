@@ -62,11 +62,11 @@ async fn reborn_thread_binding_isolation_parity() {
     );
 
     let alpha_history = harness
-        .history_for_thread(alpha.thread_id.clone())
+        .history_for_submitted_thread(&alpha)
         .await
         .expect("alpha history");
     let beta_history = harness
-        .history_for_thread(beta.thread_id.clone())
+        .history_for_submitted_thread(&beta)
         .await
         .expect("beta history");
 
