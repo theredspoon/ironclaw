@@ -972,6 +972,9 @@ fn normalize_provider_value(
     if schema_type_matches(schema, "object") {
         let object_value = coerce_json_string(value, label)?;
         let Some(object) = object_value.as_object() else {
+            if is_json_container_string(value) {
+                return Err(provider_coercion_error(label, "object"));
+            }
             return Ok(object_value);
         };
         let Some(properties) = schema
@@ -998,6 +1001,9 @@ fn normalize_provider_value(
             return Ok(array_value);
         };
         let Some(array) = array_value.as_array() else {
+            if is_json_container_string(value) {
+                return Err(provider_coercion_error(label, "array"));
+            }
             return Ok(array_value);
         };
         return array
@@ -1030,6 +1036,13 @@ fn schema_type_matches(schema: &serde_json::Value, expected: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_json_container_string(value: &serde_json::Value) -> bool {
+    value
+        .as_str()
+        .map(str::trim)
+        .is_some_and(|text| text.starts_with('{') || text.starts_with('['))
 }
 
 fn coerce_json_string(
@@ -2104,6 +2117,57 @@ mod tests {
             "provider arguments",
         )
         .expect_err("invalid integer should fail closed");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    }
+
+    #[test]
+    fn provider_argument_normalization_rejects_mismatched_stringified_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean" }
+                    }
+                }
+            }
+        });
+
+        let error = normalize_provider_arguments(
+            &serde_json::json!({ "options": "[{\"enabled\":\"true\"}]" }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("stringified array should not satisfy object schema");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    }
+
+    #[test]
+    fn provider_argument_normalization_rejects_mismatched_stringified_array() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": { "type": "integer" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let error = normalize_provider_arguments(
+            &serde_json::json!({ "rows": "{\"index\":\"1\"}" }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("stringified object should not satisfy array schema");
 
         assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
     }
