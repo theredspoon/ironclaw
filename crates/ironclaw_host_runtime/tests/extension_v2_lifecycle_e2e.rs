@@ -10,8 +10,9 @@ use ironclaw_extensions::{
 };
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{
-    CapabilityId, ExtensionId, HostPath, ReservationStatus, ResourceEstimate, ResourceScope,
-    ResourceUsage, RuntimeKind, TenantId, UserId, VirtualPath,
+    CapabilityId, ExtensionId, HostPath, ReservationStatus, ResourceEstimate,
+    ResourceReservationId, ResourceScope, ResourceUsage, RuntimeKind, TenantId, UserId,
+    VirtualPath,
 };
 use ironclaw_host_runtime::{
     discover_extensions_with_default_host_api_contracts, publish_hot_capability_catalog,
@@ -64,6 +65,12 @@ async fn extension_v2_lifecycle_discovers_installs_publishes_and_dispatches_host
     let governor = Arc::new(InMemoryResourceGovernor::new());
     let scope = sample_scope();
     let account = ResourceAccount::tenant(scope.tenant_id.clone());
+    let estimate = ResourceEstimate {
+        concurrency_slots: Some(1),
+        process_count: Some(1),
+        output_bytes: Some(10_000),
+        ..ResourceEstimate::default()
+    };
     governor
         .set_limit(
             account.clone(),
@@ -83,25 +90,24 @@ async fn extension_v2_lifecycle_discovers_installs_publishes_and_dispatches_host
         RuntimeDispatcher::from_arcs(Arc::new(discovered), Arc::new(fs), Arc::clone(&governor))
             .with_runtime_adapter_arc(RuntimeKind::Script, Arc::clone(&adapter));
     let dispatch_port: &dyn CapabilityDispatcher = &dispatcher;
+    let reservation = governor.reserve(scope.clone(), estimate.clone()).unwrap();
+    let reservation_id = reservation.id;
+    assert_eq!(governor.reserved_for(&account).concurrency_slots, 1);
 
     let result = dispatch_port
         .dispatch_json(ironclaw_host_api::CapabilityDispatchRequest {
             capability_id: CapabilityId::new("script.echo").unwrap(),
             scope: scope.clone(),
-            estimate: ResourceEstimate {
-                concurrency_slots: Some(1),
-                process_count: Some(1),
-                output_bytes: Some(10_000),
-                ..ResourceEstimate::default()
-            },
+            estimate,
             mounts: None,
-            resource_reservation: None,
+            resource_reservation: Some(reservation),
             input: json!({"message":"hello"}),
         })
         .await
         .unwrap();
 
     assert_eq!(result.output, json!({"message":"script ok"}));
+    assert_eq!(result.receipt.id, reservation_id);
     assert_eq!(result.receipt.status, ReservationStatus::Reconciled);
     assert_eq!(governor.reserved_for(&account), ResourceTally::default());
     assert!(governor.usage_for(&account).output_bytes > 0);
@@ -115,6 +121,7 @@ async fn extension_v2_lifecycle_discovers_installs_publishes_and_dispatches_host
     );
     assert_eq!(requests[0].runtime, RuntimeKind::Script);
     assert_eq!(requests[0].scope, scope);
+    assert_eq!(requests[0].resource_reservation_id, Some(reservation_id));
     assert_eq!(requests[0].input, json!({"message":"hello"}));
 }
 
@@ -170,6 +177,7 @@ struct RecordedAdapterRequest {
     capability_id: CapabilityId,
     runtime: RuntimeKind,
     scope: ResourceScope,
+    resource_reservation_id: Option<ResourceReservationId>,
     input: Value,
 }
 
@@ -184,6 +192,10 @@ impl RuntimeAdapter<LocalFilesystem, InMemoryResourceGovernor> for RecordingAdap
             capability_id: request.capability_id.clone(),
             runtime: request.descriptor.runtime,
             scope: request.scope.clone(),
+            resource_reservation_id: request
+                .resource_reservation
+                .as_ref()
+                .map(|reservation| reservation.id),
             input: request.input.clone(),
         });
 
@@ -196,17 +208,20 @@ impl RuntimeAdapter<LocalFilesystem, InMemoryResourceGovernor> for RecordingAdap
             )),
             ..ResourceUsage::default()
         };
-        let reservation = request
-            .governor
-            .reserve(request.scope, request.estimate)
-            .map_err(|_| DispatchError::Script {
-                kind: RuntimeDispatchErrorKind::Resource,
-            })?;
+        let reservation = match request.resource_reservation {
+            Some(reservation) => reservation,
+            None => request
+                .governor
+                .reserve(request.scope, request.estimate)
+                .map_err(|_| {
+                    dispatch_error_for_runtime(self.runtime, RuntimeDispatchErrorKind::Resource)
+                })?,
+        };
         let receipt = request
             .governor
             .reconcile(reservation.id, usage.clone())
-            .map_err(|_| DispatchError::Script {
-                kind: RuntimeDispatchErrorKind::Resource,
+            .map_err(|_| {
+                dispatch_error_for_runtime(self.runtime, RuntimeDispatchErrorKind::Resource)
             })?;
 
         Ok(RuntimeAdapterResult {
@@ -215,6 +230,21 @@ impl RuntimeAdapter<LocalFilesystem, InMemoryResourceGovernor> for RecordingAdap
             receipt,
             output_bytes,
         })
+    }
+}
+
+fn dispatch_error_for_runtime(
+    runtime: RuntimeKind,
+    kind: RuntimeDispatchErrorKind,
+) -> DispatchError {
+    match runtime {
+        RuntimeKind::Script => DispatchError::Script { kind },
+        RuntimeKind::Wasm => DispatchError::Wasm { kind },
+        RuntimeKind::Mcp => DispatchError::Mcp { kind },
+        RuntimeKind::FirstParty | RuntimeKind::System => DispatchError::UnsupportedRuntime {
+            capability: CapabilityId::new("system.unsupported").unwrap(),
+            runtime,
+        },
     }
 }
 
