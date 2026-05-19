@@ -27,6 +27,8 @@ use crate::{
 ///   (`put` + `CasExpectation::Version`) as the floor.
 /// - **Event plane** — [`append`](Self::append) / [`tail`](Self::tail) for
 ///   log-shaped mounts.
+/// - **Bounded bytes reads** — [`read_file_bounded`](Self::read_file_bounded)
+///   for callers that must reject oversized assets before publication.
 /// - **Legacy bytes plane** — [`read_file`](Self::read_file) /
 ///   [`write_file`](Self::write_file) / [`append_file`](Self::append_file) /
 ///   [`list_dir_bytes`](Self::list_dir_bytes) / [`create_dir_all`](Self::create_dir_all).
@@ -154,6 +156,27 @@ pub trait RootFilesystem: Send + Sync {
         _from: SeqNo,
     ) -> Result<Vec<EventRecord>, FilesystemError> {
         unsupported(path, FilesystemOperation::Tail)
+    }
+
+    /// Read at most `max_bytes` from a canonical virtual file.
+    ///
+    /// Returns `Ok(None)` when the file exceeds the caller's limit. Backends with
+    /// native streaming reads should override this so hostile files cannot force
+    /// full allocation before the limit is enforced.
+    async fn read_file_bounded(
+        &self,
+        path: &VirtualPath,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, FilesystemError> {
+        let stat = self.stat(path).await?;
+        if stat.len > max_bytes as u64 {
+            return Ok(None);
+        }
+        let bytes = self.read_file(path).await?;
+        if bytes.len() > max_bytes {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
     }
 
     // ─── Legacy bytes plane (DEPRECATED — removed after consumer migration) ─

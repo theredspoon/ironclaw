@@ -122,12 +122,19 @@ where
 {
     let path = resolve_under_root(root, reference)?;
     let bytes = read_bounded(fs, &path, MAX_HOT_SCHEMA_BYTES, field).await?;
-    serde_json::from_slice(&bytes).map_err(|error| {
+    let schema = serde_json::from_slice(&bytes).map_err(|error| {
         HostRuntimeError::invalid_request(format!(
             "{field} {} must contain valid JSON schema: {error}",
             reference.as_str()
         ))
-    })
+    })?;
+    jsonschema::validator_for(&schema).map_err(|error| {
+        HostRuntimeError::invalid_request(format!(
+            "{field} {} must contain valid JSON schema: {error}",
+            reference.as_str()
+        ))
+    })?;
+    Ok(schema)
 }
 
 async fn read_text_ref<F>(
@@ -157,16 +164,20 @@ async fn read_bounded<F>(
 where
     F: RootFilesystem,
 {
-    let bytes = fs.read_file(path).await.map_err(|_error| {
-        HostRuntimeError::invalid_request(format!("failed to read {field} at {}", path.as_str()))
-    })?;
-    if bytes.len() > max_bytes {
-        return Err(HostRuntimeError::invalid_request(format!(
-            "{field} at {} exceeds {max_bytes} bytes",
-            path.as_str()
-        )));
-    }
-    Ok(bytes)
+    fs.read_file_bounded(path, max_bytes)
+        .await
+        .map_err(|_error| {
+            HostRuntimeError::invalid_request(format!(
+                "failed to read {field} at {}",
+                path.as_str()
+            ))
+        })?
+        .ok_or_else(|| {
+            HostRuntimeError::invalid_request(format!(
+                "{field} at {} exceeds {max_bytes} bytes",
+                path.as_str()
+            ))
+        })
 }
 
 fn resolve_under_root(
