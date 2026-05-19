@@ -213,6 +213,45 @@ async fn discovery_validates_host_api_manifest_with_supplied_contracts() {
     assert_eq!(package.manifest.host_apis.len(), 1);
 }
 
+#[tokio::test]
+async fn discovery_registers_capability_provider_projected_capabilities() {
+    let storage = tempdir().unwrap();
+    std::fs::create_dir_all(storage.path().join("telegram")).unwrap();
+    std::fs::write(
+        storage.path().join("telegram/manifest.toml"),
+        CAPABILITY_PROVIDER_MANIFEST,
+    )
+    .unwrap();
+
+    let mut fs = LocalFilesystem::new();
+    fs.mount_local(
+        VirtualPath::new("/system/extensions").unwrap(),
+        HostPath::from_path_buf(storage.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let registry = ExtensionDiscovery::discover_with_manifest_contracts(
+        &fs,
+        &VirtualPath::new("/system/extensions").unwrap(),
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+        &capability_provider_contracts(),
+    )
+    .await
+    .unwrap();
+
+    let package = registry
+        .get_extension(&ExtensionId::new("telegram").unwrap())
+        .unwrap();
+    assert_eq!(package.capabilities.len(), 1);
+    assert_eq!(package.capabilities[0].id.as_str(), "telegram.send_message");
+    assert!(
+        registry
+            .get_capability(&CapabilityId::new("telegram.send_message").unwrap())
+            .is_some()
+    );
+}
+
 #[test]
 fn capability_provider_host_api_contract_accepts_valid_manifest() {
     let manifest = ExtensionManifest::parse_with_host_api_contracts(
