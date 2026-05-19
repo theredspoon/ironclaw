@@ -122,6 +122,15 @@ where
         &self,
     ) -> Result<(TurnPersistenceSnapshot, Option<RecordVersion>), TurnError> {
         let path = snapshot_path()?;
+        let record_lock = filesystem_record_lock(&path);
+        let _guard = record_lock.lock().await;
+        self.read_snapshot_unlocked().await
+    }
+
+    async fn read_snapshot_unlocked(
+        &self,
+    ) -> Result<(TurnPersistenceSnapshot, Option<RecordVersion>), TurnError> {
+        let path = snapshot_path()?;
         // Turn persistence is a single process-wide snapshot covering all
         // tenants; the per-tenant rewrite isn't needed because the
         // snapshot keys turns by their full scope internally. Use the
@@ -164,7 +173,7 @@ where
         let record_lock = filesystem_record_lock(&path);
         let _guard = record_lock.lock().await;
         for _ in 0..FILESYSTEM_CAS_RETRIES {
-            let (snapshot, version) = self.read_snapshot().await?;
+            let (snapshot, version) = self.read_snapshot_unlocked().await?;
             let store = self.build_in_memory_store(snapshot)?;
             let (outcome, store) = apply(store).await;
             let new_snapshot = store.persistence_snapshot();

@@ -376,8 +376,11 @@ mod reborn_support_tests {
         PolicyNetworkHttpEgress,
     };
     use ironclaw_product_adapters::{
-        AuthRequirement, DeliveryStatus, OutboundDeliverySink, ProductAdapter, ProductInboundAck,
-        ProductWorkflow, ProtocolAuthEvidence,
+        AuthRequirement, DeliveryStatus, EgressRequest, EgressResponse, ExternalConversationRef,
+        FinalReplyView, OutboundDeliverySink, ProductAdapter, ProductInboundAck,
+        ProductOutboundEnvelope, ProductOutboundPayload, ProductOutboundTarget,
+        ProductRenderOutcome, ProductWorkflow, ProjectionCursor, ProtocolAuthEvidence,
+        ProtocolHttpEgress, ProtocolHttpEgressError,
     };
     use ironclaw_product_workflow::{
         ActionDispatchKind, ActionFingerprintKey, ConversationBindingService,
@@ -723,6 +726,27 @@ mod reborn_support_tests {
         assert!(execute_recorded_get(&transport).is_err());
         assert_eq!(execute_recorded_get(&transport).expect("third").status, 202);
         assert_eq!(transport.requests().len(), 3);
+    }
+
+    #[test]
+    fn network_transport_execute_with_empty_queue_errors() {
+        let transport = RecordingNetworkHttpTransport::new();
+
+        let error = execute_recorded_get(&transport).expect_err("unexpected request error");
+
+        match error {
+            NetworkHttpError::Transport {
+                reason,
+                request_bytes,
+                response_bytes,
+            } => {
+                assert_eq!(reason, "unexpected HTTP request");
+                assert_eq!(request_bytes, 0);
+                assert_eq!(response_bytes, 0);
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert_eq!(transport.requests().len(), 1);
     }
 
     #[test]
@@ -1229,6 +1253,44 @@ mod reborn_support_tests {
         assert!(ingress.failed_auth_payload(&raw).is_err());
     }
 
+    #[tokio::test]
+    async fn test_adapter_render_outbound_records_delivery() {
+        let adapter = RebornTestProductAdapter::new("reborn-test", "install-1").expect("adapter");
+        let reply_target = ReplyTargetBindingRef::new("reply:render-test").expect("reply target");
+        let envelope = ProductOutboundEnvelope::new(
+            adapter.adapter_id().clone(),
+            adapter.installation_id().clone(),
+            ProductOutboundTarget::new(
+                reply_target.clone(),
+                ExternalConversationRef::new(None, "thread-render", None, None)
+                    .expect("conversation ref"),
+                None,
+            ),
+            ProjectionCursor::new("cursor:render-test").expect("cursor"),
+            ProductOutboundPayload::FinalReply(FinalReplyView {
+                turn_run_id: TurnRunId::new(),
+                text: "rendered reply".to_string(),
+                generated_at: chrono::Utc::now(),
+            }),
+        );
+        let attempt_id = envelope.delivery_attempt_id;
+        let sink = RecordingOutboundDeliverySink::new();
+        let outcome = adapter
+            .render_outbound(envelope, &NoopProtocolHttpEgress, &sink)
+            .await
+            .expect("render outbound");
+
+        assert!(matches!(outcome, ProductRenderOutcome::DeliveryRecorded));
+        assert_eq!(
+            sink.statuses(),
+            vec![DeliveryStatus::Delivered {
+                attempt_id,
+                target: reply_target,
+                run_id: None,
+            }]
+        );
+    }
+
     fn model_request(messages: Vec<HostManagedModelMessage>) -> HostManagedModelRequest {
         HostManagedModelRequest {
             model_profile_id: ModelProfileId::new("test_model").expect("model profile"),
@@ -1252,6 +1314,18 @@ mod reborn_support_tests {
             response_body_limit: None,
             timeout_ms: None,
         })
+    }
+
+    struct NoopProtocolHttpEgress;
+
+    #[async_trait]
+    impl ProtocolHttpEgress for NoopProtocolHttpEgress {
+        async fn send(
+            &self,
+            _request: EgressRequest,
+        ) -> Result<EgressResponse, ProtocolHttpEgressError> {
+            panic!("test adapter render path should not perform HTTP egress")
+        }
     }
 
     fn tool_result_message(
