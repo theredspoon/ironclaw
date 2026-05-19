@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ironclaw_extensions::{CapabilityVisibility, ExtensionPackage, ExtensionRegistry};
-use ironclaw_filesystem::RootFilesystem;
+use ironclaw_filesystem::{FilesystemError, RootFilesystem};
 use ironclaw_host_api::{
     CapabilityDescriptor, CapabilityId, CapabilityProfileSchemaRef, VirtualPath,
 };
@@ -81,6 +81,9 @@ where
                     descriptor.id
                 ))
             })?;
+        if declaration.visibility != CapabilityVisibility::Model {
+            continue;
+        }
 
         let input_schema = read_json_ref(
             fs,
@@ -171,25 +174,16 @@ async fn read_bounded<F>(
 where
     F: RootFilesystem,
 {
-    let stat = fs.stat(path).await.map_err(|error| {
-        HostRuntimeError::invalid_request(format!(
-            "failed to stat {field} at {}: {error}",
-            path.as_str()
-        ))
-    })?;
-    if stat.len > max_bytes as u64 {
-        return Err(HostRuntimeError::invalid_request(format!(
-            "{field} at {} exceeds {max_bytes} bytes",
-            path.as_str()
-        )));
-    }
-
-    let bytes = fs.read_file(path).await.map_err(|error| {
-        HostRuntimeError::invalid_request(format!(
-            "failed to read {field} at {}: {error}",
-            path.as_str()
-        ))
-    })?;
+    let bytes = fs
+        .read_file_bounded(path, max_bytes)
+        .await
+        .map_err(|error| map_read_error(path, field, error))?
+        .ok_or_else(|| {
+            HostRuntimeError::invalid_request(format!(
+                "{field} at {} exceeds {max_bytes} bytes",
+                path.as_str()
+            ))
+        })?;
     if bytes.len() > max_bytes {
         return Err(HostRuntimeError::invalid_request(format!(
             "{field} at {} exceeds {max_bytes} bytes",
@@ -197,6 +191,20 @@ where
         )));
     }
     Ok(bytes)
+}
+
+fn map_read_error(
+    path: &VirtualPath,
+    field: &'static str,
+    error: FilesystemError,
+) -> HostRuntimeError {
+    let message = match error {
+        FilesystemError::NotFound { .. } => {
+            format!("missing {field} at {}", path.as_str())
+        }
+        _ => format!("failed to read {field} at {}", path.as_str()),
+    };
+    HostRuntimeError::invalid_request(message)
 }
 
 fn resolve_under_root(
