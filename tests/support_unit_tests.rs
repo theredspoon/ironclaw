@@ -369,8 +369,8 @@ mod reborn_support_tests {
         ThreadId, UserId, VirtualPath,
     };
     use ironclaw_loop_support::{
-        HostManagedModelGateway, HostManagedModelMessage, HostManagedModelMessageRole,
-        HostManagedModelRequest, HostManagedModelResponse,
+        HostManagedModelErrorKind, HostManagedModelGateway, HostManagedModelMessage,
+        HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
     };
     use ironclaw_network::{
         NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse,
@@ -411,8 +411,8 @@ mod reborn_support_tests {
     use crate::reborn_support::filesystem::local_filesystem;
     use crate::reborn_support::harness::RecordingTestCapabilityPort;
     use crate::reborn_support::model_replay::{
-        RebornTraceReplayError, RebornTraceReplayModelGateway,
-        capability_call_from_trace_with_surface,
+        RebornModelReplayStep, RebornScriptedProviderToolCall, RebornTraceReplayError,
+        RebornTraceReplayModelGateway, capability_call_from_trace_with_surface,
     };
     use crate::reborn_support::network::RecordingNetworkHttpTransport;
     use crate::reborn_support::product_workflow::{
@@ -563,6 +563,40 @@ mod reborn_support_tests {
     }
 
     #[tokio::test]
+    async fn trace_replay_rejects_scripted_capability_not_advertised_by_surface() {
+        let missing_capability =
+            CapabilityId::new("test.missing").expect("valid missing capability id");
+        let gateway = RebornTraceReplayModelGateway::with_scripted_steps([
+            RebornModelReplayStep::ProviderToolCalls {
+                calls: vec![RebornScriptedProviderToolCall::new(
+                    missing_capability,
+                    "call-missing",
+                    serde_json::json!({"message": "hi"}),
+                )],
+                expected_tool_results: Vec::new(),
+            },
+        ]);
+
+        let error = gateway
+            .stream_model_with_capabilities(
+                model_request(Vec::new()),
+                Arc::new(RecordingTestCapabilityPort::echo()),
+            )
+            .await
+            .expect_err("unadvertised scripted capability should fail");
+
+        assert_eq!(error.kind, HostManagedModelErrorKind::InvalidRequest);
+        assert!(
+            error
+                .safe_summary
+                .contains("scripted capability test.missing was not advertised to the model"),
+            "unexpected error summary: {}",
+            error.safe_summary
+        );
+        assert_eq!(gateway.remaining_responses(), 0);
+    }
+
+    #[tokio::test]
     async fn trace_replay_fails_when_exhausted() {
         let gateway = RebornTraceReplayModelGateway::with_responses(Vec::new());
         let error = gateway
@@ -640,6 +674,97 @@ mod reborn_support_tests {
             .await
             .expect("matching tool result");
         assert_eq!(matched.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scripted_response_step_validates_expected_tool_results() {
+        let gateway =
+            RebornTraceReplayModelGateway::with_scripted_steps([RebornModelReplayStep::Response {
+                response: HostManagedModelResponse::assistant_reply("after tool"),
+                expected_tool_results: vec![ExpectedToolResult {
+                    tool_call_id: "call-scripted".to_string(),
+                    name: "builtin.write_file".to_string(),
+                    content: "result:ref-123".to_string(),
+                }],
+            }]);
+
+        assert!(
+            gateway
+                .stream_model(model_request(Vec::new()))
+                .await
+                .is_err(),
+            "scripted response step must reject missing expected tool result"
+        );
+        assert!(gateway.requests().is_empty());
+        assert_eq!(gateway.remaining_responses(), 1);
+
+        gateway
+            .stream_model(model_request(vec![tool_result_message(
+                "call-scripted",
+                "builtin.write_file",
+                "result:ref-123",
+            )]))
+            .await
+            .expect("matching scripted tool result");
+        assert_eq!(gateway.requests().len(), 1);
+        gateway.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn scripted_provider_tool_call_flow_validates_follow_up_tool_result() {
+        let gateway = RebornTraceReplayModelGateway::with_scripted_steps([
+            RebornModelReplayStep::ProviderToolCalls {
+                calls: vec![RebornScriptedProviderToolCall::new(
+                    CapabilityId::new("test.echo").expect("valid capability id"),
+                    "call-scripted",
+                    serde_json::json!({"message": "hi"}),
+                )],
+                expected_tool_results: Vec::new(),
+            },
+            RebornModelReplayStep::Response {
+                response: HostManagedModelResponse::assistant_reply("after tool"),
+                expected_tool_results: vec![ExpectedToolResult {
+                    tool_call_id: "call-scripted".to_string(),
+                    name: "test_echo".to_string(),
+                    content: "echo: hi".to_string(),
+                }],
+            },
+        ]);
+
+        gateway
+            .stream_model_with_capabilities(
+                model_request(Vec::new()),
+                Arc::new(RecordingTestCapabilityPort::echo()),
+            )
+            .await
+            .expect("scripted provider tool call");
+        assert_eq!(gateway.remaining_responses(), 1);
+
+        assert!(
+            gateway
+                .stream_model(model_request(vec![tool_result_message_with_capability_id(
+                    "call-scripted",
+                    "test_echo",
+                    "test.echo",
+                    "echo: hi with suffix",
+                )]))
+                .await
+                .is_err(),
+            "scripted follow-up must reject mismatched tool result content"
+        );
+        assert_eq!(gateway.remaining_responses(), 1);
+
+        gateway
+            .stream_model(model_request(vec![tool_result_message_with_capability_id(
+                "call-scripted",
+                "test_echo",
+                "test.echo",
+                "echo: hi",
+            )]))
+            .await
+            .expect("matching scripted follow-up tool result");
+        assert_eq!(gateway.requests().len(), 2);
+        gateway.assert_exhausted();
     }
 
     #[test]
@@ -1738,6 +1863,20 @@ mod reborn_support_tests {
         provider_tool_name: &str,
         content: &str,
     ) -> HostManagedModelMessage {
+        tool_result_message_with_capability_id(
+            provider_call_id,
+            provider_tool_name,
+            provider_tool_name,
+            content,
+        )
+    }
+
+    fn tool_result_message_with_capability_id(
+        provider_call_id: &str,
+        provider_tool_name: &str,
+        capability_id: &str,
+        content: &str,
+    ) -> HostManagedModelMessage {
         HostManagedModelMessage {
             role: HostManagedModelMessageRole::ToolResult,
             content: content.to_string(),
@@ -1748,7 +1887,7 @@ mod reborn_support_tests {
                 provider_turn_id: "trace-turn".to_string(),
                 provider_call_id: provider_call_id.to_string(),
                 provider_tool_name: provider_tool_name.to_string(),
-                capability_id: CapabilityId::new(provider_tool_name).expect("capability id"),
+                capability_id: CapabilityId::new(capability_id).expect("capability id"),
                 arguments: serde_json::json!({}),
                 response_reasoning: None,
                 reasoning: None,
