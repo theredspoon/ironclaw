@@ -4003,14 +4003,23 @@ dependencies = [
  "insta",
  "ironclaw_common",
  "ironclaw_engine",
+ "ironclaw_filesystem",
  "ironclaw_gateway",
  "ironclaw_host_api",
+ "ironclaw_host_runtime",
  "ironclaw_llm",
  "ironclaw_loop_support",
  "ironclaw_memory",
+ "ironclaw_network",
+ "ironclaw_product_adapters",
+ "ironclaw_product_workflow",
+ "ironclaw_reborn",
+ "ironclaw_reborn_composition",
  "ironclaw_runtime_policy",
  "ironclaw_safety",
  "ironclaw_skills",
+ "ironclaw_threads",
+ "ironclaw_trust",
  "ironclaw_tui",
  "ironclaw_turns",
  "json5",
@@ -4122,18 +4131,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "deadpool-postgres",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_trust",
- "libsql",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-postgres",
- "tracing",
 ]
 
 [[package]]
@@ -4177,17 +4182,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "deadpool-postgres",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_turns",
- "libsql",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-postgres",
  "uuid",
 ]
 
@@ -4242,7 +4244,6 @@ dependencies = [
  "ironclaw_host_api",
  "ironclaw_memory",
  "ironclaw_reborn_event_store",
- "libsql",
  "serde",
  "serde_json",
  "tempfile",
@@ -4286,6 +4287,7 @@ name = "ironclaw_filesystem"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "deadpool-postgres",
  "ironclaw_host_api",
  "ironclaw_safety",
@@ -4331,6 +4333,7 @@ name = "ironclaw_host_runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "chrono-tz",
@@ -4455,19 +4458,15 @@ name = "ironclaw_memory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "deadpool-postgres",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_safety",
  "jsonschema",
- "libsql",
- "pgvector",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
- "tokio-postgres",
  "tracing",
  "uuid",
 ]
@@ -4491,14 +4490,16 @@ dependencies = [
  "async-trait",
  "chrono",
  "deadpool-postgres",
+ "hex",
  "ironclaw_event_projections",
  "ironclaw_events",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
- "ironclaw_storage",
  "ironclaw_turns",
  "libsql",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4566,14 +4567,18 @@ dependencies = [
  "chrono",
  "ironclaw_conversations",
  "ironclaw_host_api",
+ "ironclaw_host_runtime",
  "ironclaw_loop_support",
  "ironclaw_product_adapters",
  "ironclaw_product_workflow",
  "ironclaw_reborn",
+ "ironclaw_reborn_composition",
  "ironclaw_threads",
+ "ironclaw_trust",
  "ironclaw_turns",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -4625,10 +4630,15 @@ dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
- "ironclaw_reborn",
+ "ironclaw_reborn_composition",
  "ironclaw_reborn_config",
+ "secrecy",
  "serde_json",
  "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4636,18 +4646,24 @@ name = "ironclaw_reborn_composition"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "deadpool-postgres",
  "ironclaw_authorization",
  "ironclaw_extensions",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_host_runtime",
+ "ironclaw_llm",
+ "ironclaw_loop_support",
  "ironclaw_network",
  "ironclaw_processes",
+ "ironclaw_reborn",
+ "ironclaw_reborn_config",
  "ironclaw_reborn_event_store",
  "ironclaw_resources",
  "ironclaw_run_state",
  "ironclaw_secrets",
+ "ironclaw_threads",
  "ironclaw_trust",
  "ironclaw_turns",
  "libsql",
@@ -4658,14 +4674,19 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
 name = "ironclaw_reborn_config"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -4677,6 +4698,7 @@ dependencies = [
  "deadpool-postgres",
  "hex",
  "ironclaw_events",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
  "libsql",
  "rustls 0.23.40",
@@ -4691,9 +4713,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tracing",
- "url",
  "urlencoding",
- "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -4703,6 +4723,7 @@ version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
  "fs2",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
  "libsql",
  "rust_decimal",
@@ -4778,19 +4799,18 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "chrono",
- "deadpool-postgres",
  "hkdf",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
- "libsql",
  "rand 0.8.6",
  "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-postgres",
  "url",
  "uuid",
 ]
@@ -4815,18 +4835,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironclaw_storage"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "ironclaw_telegram_v2_adapter"
 version = "0.1.0"
 dependencies = [
@@ -4846,18 +4854,14 @@ name = "ironclaw_threads"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "deadpool-postgres",
  "futures",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
- "libsql",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-postgres",
- "tracing",
  "uuid",
 ]
 
@@ -4898,10 +4902,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "deadpool-postgres",
  "hex",
+ "ironclaw_filesystem",
  "ironclaw_host_api",
- "libsql",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4909,7 +4912,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-postgres",
  "tracing",
  "uuid",
 ]

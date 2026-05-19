@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[cfg(any(feature = "libsql", feature = "postgres"))]
 use tokio::sync::Mutex as AsyncMutex;
 
 use async_trait::async_trait;
@@ -28,9 +27,7 @@ use crate::{
 #[derive(Clone)]
 pub struct InMemoryConversationServices {
     state: Arc<Mutex<InMemoryState>>,
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
     state_repository: Option<Arc<dyn crate::state_store::ConversationStateRepository>>,
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
     mutation_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -38,16 +35,13 @@ impl Default for InMemoryConversationServices {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(InMemoryState::default())),
-            #[cfg(any(feature = "libsql", feature = "postgres"))]
             state_repository: None,
-            #[cfg(any(feature = "libsql", feature = "postgres"))]
             mutation_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 }
 
 impl InMemoryConversationServices {
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
     pub(crate) async fn with_state_repository(
         state_repository: Arc<dyn crate::state_store::ConversationStateRepository>,
     ) -> Result<Self, InboundTurnError> {
@@ -61,7 +55,6 @@ impl InMemoryConversationServices {
         })
     }
 
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
     async fn refresh_state_from_repository(&self) -> Result<(), InboundTurnError> {
         let Some(state_repository) = &self.state_repository else {
             return Ok(());
@@ -78,32 +71,23 @@ impl InMemoryConversationServices {
         old_state: InMemoryState,
         new_state: InMemoryState,
     ) -> Result<(), InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        let mut new_state = new_state;
+        let Some(state_repository) = &self.state_repository else {
+            return Ok(());
+        };
+        match state_repository
+            .save_state(new_state.persistence_revision, &new_state)
+            .await
         {
-            let mut new_state = new_state;
-            let Some(state_repository) = &self.state_repository else {
-                return Ok(());
-            };
-            match state_repository
-                .save_state(new_state.persistence_revision, &new_state)
-                .await
-            {
-                Ok(revision) => {
-                    new_state.persistence_revision = revision;
-                    *self.lock_state()? = new_state;
-                    Ok(())
-                }
-                Err(error) => {
-                    *self.lock_state()? = old_state;
-                    Err(error)
-                }
+            Ok(revision) => {
+                new_state.persistence_revision = revision;
+                *self.lock_state()? = new_state;
+                Ok(())
             }
-        }
-        #[cfg(not(any(feature = "libsql", feature = "postgres")))]
-        {
-            let _ = old_state;
-            let _ = new_state;
-            Ok(())
+            Err(error) => {
+                *self.lock_state()? = old_state;
+                Err(error)
+            }
         }
     }
     pub async fn pair_external_actor(
@@ -133,9 +117,7 @@ impl InMemoryConversationServices {
         external_actor_ref: ExternalActorRef,
         user_id: UserId,
     ) -> Result<(), InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let snapshot = {
@@ -185,9 +167,7 @@ impl InMemoryConversationServices {
         adapter_installation_id: &AdapterInstallationId,
         external_actor_ref: &ExternalActorRef,
     ) -> Result<(), InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let snapshot = {
@@ -209,9 +189,7 @@ impl InMemoryConversationServices {
         thread_id: &ThreadId,
         user_id: UserId,
     ) -> Result<(), InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let snapshot = {
@@ -253,9 +231,7 @@ impl ConversationBindingService for InMemoryConversationServices {
         &self,
         request: ResolveConversationRequest,
     ) -> Result<ConversationBindingResolution, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let state = self.lock_state()?;
         let actor_user_id = state.resolve_actor(
@@ -303,9 +279,7 @@ impl ConversationBindingService for InMemoryConversationServices {
         &self,
         request: LinkConversationRequest,
     ) -> Result<LinkedConversationBinding, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let (linked, snapshot) = {
@@ -404,9 +378,7 @@ impl ConversationBindingService for InMemoryConversationServices {
         &self,
         request: ValidateReplyTargetRequest,
     ) -> Result<ReplyTargetBinding, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let state = self.lock_state()?;
         let Some(binding) = state
@@ -468,9 +440,7 @@ impl InMemoryConversationServices {
         trusted_agent_id: Option<AgentId>,
         trusted_project_id: Option<ProjectId>,
     ) -> Result<ConversationBindingResolution, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let (resolution, snapshot) = {
@@ -584,9 +554,7 @@ impl SessionThreadService for InMemoryConversationServices {
         &self,
         request: AcceptInboundMessageRequest,
     ) -> Result<AcceptedInboundMessage, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let (accepted, snapshot) = {
@@ -729,9 +697,7 @@ impl SessionThreadService for InMemoryConversationServices {
         &self,
         lookup: AcceptedInboundMessageLookup,
     ) -> Result<Option<AcceptedInboundMessageReplay>, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let state = self.lock_state()?;
         let key = AcceptedMessageReplayKey::new(
@@ -759,9 +725,7 @@ impl SessionThreadService for InMemoryConversationServices {
         &self,
         message_ref: &AcceptedMessageRef,
     ) -> Result<Option<SubmitTurnResponse>, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let state = self.lock_state()?;
         Ok(state.submitted_message_responses.get(message_ref).cloned())
@@ -771,9 +735,7 @@ impl SessionThreadService for InMemoryConversationServices {
         &self,
         message_ref: &AcceptedMessageRef,
     ) -> Result<IdempotencyKey, InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let maybe_key_and_snapshot = {
@@ -797,9 +759,7 @@ impl SessionThreadService for InMemoryConversationServices {
         &self,
         message_ref: &AcceptedMessageRef,
     ) -> Result<(), InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let snapshot = {
@@ -818,9 +778,7 @@ impl SessionThreadService for InMemoryConversationServices {
         message_ref: &AcceptedMessageRef,
         response: SubmitTurnResponse,
     ) -> Result<(), InboundTurnError> {
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         let _mutation = self.mutation_lock.lock().await;
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         self.refresh_state_from_repository().await?;
         let old_state = self.lock_state()?.clone();
         let snapshot = {
@@ -850,7 +808,6 @@ impl InMemoryConversationServices {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct InMemoryState {
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
     #[serde(default, skip)]
     pub(crate) persistence_revision: i64,
     pub(crate) pairings: HashMap<ActorKey, UserId>,
