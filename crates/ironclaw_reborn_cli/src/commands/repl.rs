@@ -8,6 +8,7 @@ pub(crate) struct ReplCommand;
 
 impl ReplCommand {
     pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
-        crate::commands::run::execute_repl(context)
+        crate::runtime::init_tracing();
+        crate::runtime::execute(context, None)
     }
 }
