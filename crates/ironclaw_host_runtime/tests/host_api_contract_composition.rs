@@ -2,6 +2,7 @@ use ironclaw_extensions::{CAPABILITY_PROVIDER_HOST_API_ID, CAPABILITY_PROVIDER_S
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{CapabilityId, ExtensionId, HostPath, HostPortCatalog, VirtualPath};
 use ironclaw_host_runtime::discover_extensions_with_default_host_api_contracts;
+use ironclaw_product_adapter_registry::PRODUCT_ADAPTER_HOST_API_ID;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -50,6 +51,46 @@ async fn default_host_api_contracts_discover_capability_provider_manifest() {
     assert_eq!(capability.description, "Send a Telegram message");
 }
 
+#[tokio::test]
+async fn default_host_api_contracts_discover_product_adapter_manifest() {
+    let storage = tempdir().unwrap();
+    std::fs::create_dir_all(storage.path().join("telegram-v2")).unwrap();
+    std::fs::write(
+        storage.path().join("telegram-v2/manifest.toml"),
+        PRODUCT_ADAPTER_MANIFEST,
+    )
+    .unwrap();
+
+    let mut fs = LocalFilesystem::new();
+    fs.mount_local(
+        VirtualPath::new("/system/extensions").unwrap(),
+        HostPath::from_path_buf(storage.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let registry = discover_extensions_with_default_host_api_contracts(
+        &fs,
+        &VirtualPath::new("/system/extensions").unwrap(),
+        &HostPortCatalog::empty(),
+    )
+    .await
+    .unwrap();
+
+    let package = registry
+        .get_extension(&ExtensionId::new("telegram-v2").unwrap())
+        .unwrap();
+    assert_eq!(package.manifest.host_apis.len(), 1);
+    assert_eq!(
+        package.manifest.host_apis[0].id.as_str(),
+        PRODUCT_ADAPTER_HOST_API_ID
+    );
+    assert_eq!(
+        package.manifest.host_apis[0].section.as_str(),
+        "product_adapter.inbound"
+    );
+    assert!(package.capabilities.is_empty());
+}
+
 const CAPABILITY_PROVIDER_MANIFEST: &str = r#"schema_version = "reborn.extension_manifest.v2"
 id = "telegram"
 name = "Telegram"
@@ -76,4 +117,37 @@ visibility = "model"
 input_schema_ref = "schemas/telegram/send_message.input.v1.json"
 output_schema_ref = "schemas/telegram/send_message.output.v1.json"
 prompt_doc_ref = "prompts/telegram/send_message.md"
+"#;
+
+const PRODUCT_ADAPTER_MANIFEST: &str = r#"schema_version = "reborn.extension_manifest.v2"
+id = "telegram-v2"
+name = "Telegram"
+version = "0.1.0"
+description = "Telegram product adapter"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "adapters/telegram-v2.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "shared_secret_header"
+header_name = "X-Telegram-Bot-Api-Secret-Token"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages", "external_final_reply_push"]
+
+[[product_adapter.inbound.required_credentials]]
+handle = "telegram_bot_token"
+
+[[product_adapter.inbound.egress]]
+host = "api.telegram.org"
+credential_handle = "telegram_bot_token"
 "#;
