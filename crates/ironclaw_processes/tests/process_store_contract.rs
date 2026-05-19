@@ -10,8 +10,8 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_events::{InMemoryEventSink, RuntimeEventKind};
 use ironclaw_filesystem::{
-    DirEntry, FileStat, FilesystemError, FilesystemOperation, InMemoryBackend, LocalFilesystem,
-    RootFilesystem, ScopedFilesystem,
+    CasExpectation, DirEntry, Entry, FileStat, FilesystemError, FilesystemOperation,
+    InMemoryBackend, LocalFilesystem, RecordVersion, RootFilesystem, ScopedFilesystem,
 };
 use ironclaw_host_api::*;
 use ironclaw_processes::*;
@@ -1431,8 +1431,11 @@ async fn filesystem_process_store_preserves_typed_backend_errors_that_mention_no
 
 #[tokio::test]
 async fn filesystem_process_result_store_preserves_typed_backend_write_errors() {
-    let fs = BackendErrorFilesystem;
-    let store = FilesystemProcessResultStore::new(&fs);
+    let fs = scoped_processes_filesystem(
+        Arc::new(BackendErrorFilesystem),
+        &default_mount_target_string(),
+    );
+    let store = FilesystemProcessResultStore::new(fs);
     let invocation_id = InvocationId::new();
     let process_id = ProcessId::new();
     let scope = sample_scope(invocation_id, "tenant1", "user1");
@@ -2114,6 +2117,15 @@ struct BackendErrorFilesystem;
 
 #[async_trait]
 impl RootFilesystem for BackendErrorFilesystem {
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        _entry: Entry,
+        _cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        Err(backend_error(path, FilesystemOperation::WriteFile))
+    }
+
     async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
         Err(backend_error(path, FilesystemOperation::ReadFile))
     }
