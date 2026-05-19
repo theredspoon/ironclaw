@@ -303,10 +303,9 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
             }
             None => {
                 tracing::warn!(
-                    "no LLM selection configured; set `[llm.default]` in {}, export \
-                     OPENAI_API_KEY / ANTHROPIC_API_KEY / OLLAMA_BASE_URL, or set \
-                     LLM_BACKEND=openai_codex with LLM_USE_CODEX_AUTH=true. \
-                     Runs will fail until an LLM is wired.",
+                    "no LLM selection configured; set `[llm.default]` in {} or configure \
+                     LLM_BACKEND / provider environment variables. Runs will fail until an \
+                     LLM is wired.",
                     config.home().config_file_path().display()
                 );
             }

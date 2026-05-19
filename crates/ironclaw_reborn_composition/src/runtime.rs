@@ -701,7 +701,7 @@ impl HostIdentityContextSource for EmptyIdentityContextSource {
 fn build_llm_gateway(
     llm: ResolvedRebornLlm,
 ) -> Result<Arc<dyn ironclaw_loop_support::HostManagedModelGateway>, RebornRuntimeError> {
-    use ironclaw_llm::{RegistryProviderConfig, config::CacheRetention};
+    use ironclaw_llm::RegistryProviderConfig;
     use ironclaw_reborn::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
     use ironclaw_turns::run_profile::ModelProfileId;
 
@@ -709,20 +709,14 @@ fn build_llm_gateway(
     let provider = match llm.source {
         ResolvedRebornLlmSource::Catalog(cfg) => {
             let protocol = parse_provider_protocol(&cfg.protocol)?;
-            let registry_config = RegistryProviderConfig {
+            let registry_config = RegistryProviderConfig::generic(
                 protocol,
-                provider_id: cfg.provider_id.clone(),
-                api_key: cfg.api_key.clone(),
-                base_url: cfg.base_url.clone(),
-                model: cfg.model.clone(),
-                extra_headers: cfg.extra_headers.clone(),
-                oauth_token: None,
-                is_codex_chatgpt: false,
-                refresh_token: None,
-                auth_path: None,
-                cache_retention: CacheRetention::None,
-                unsupported_params: Vec::new(),
-            };
+                cfg.provider_id.clone(),
+                cfg.api_key.clone(),
+                cfg.base_url.clone(),
+                cfg.model.clone(),
+            )
+            .with_extra_headers(cfg.extra_headers.clone());
             ironclaw_llm::create_registry_provider(&registry_config, cfg.request_timeout_secs)
         }
         ResolvedRebornLlmSource::RegistryProvider {

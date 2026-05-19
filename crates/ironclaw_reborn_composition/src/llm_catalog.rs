@@ -26,15 +26,11 @@
 //! transition unchanged — the only thing that changes is whether the
 //! `LlmSlotSelection` input came from a TOML reader or a repo read.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use secrecy::SecretString;
 use thiserror::Error;
 
-use ironclaw_llm::{
-    CacheRetention, ProviderProtocol, ProviderRegistry, RegistryProviderConfig,
-    registry::ProviderDefinition,
-};
+use ironclaw_llm::{ProviderRegistry, registry::ProviderDefinition};
 use ironclaw_reborn_config::{
     LlmSlotSelection, RebornBootConfig, RebornConfigFile, reject_inline_secret,
 };
@@ -110,14 +106,12 @@ pub enum RebornLlmCatalogError {
         env: String,
         reason: String,
     },
-    /// Codex backend was explicitly selected without enabling the Codex auth bridge.
-    #[error("LLM_BACKEND=openai_codex requires LLM_USE_CODEX_AUTH=true for Reborn runtime wiring")]
-    CodexAuthNotEnabled,
-    /// Codex auth bridge was enabled but the configured auth file contained no usable credentials.
-    #[error(
-        "LLM_USE_CODEX_AUTH=true but no usable Codex credentials were found at `{path}`; run Codex login or set CODEX_AUTH_PATH"
-    )]
-    CodexAuthUnavailable { path: String },
+    /// Environment fallback could not be resolved by the LLM provider layer.
+    #[error("could not resolve LLM environment fallback: {source}")]
+    EnvResolution {
+        #[source]
+        source: ironclaw_llm::LlmError,
+    },
 }
 
 /// Resolve the default Reborn runtime LLM from boot config, TOML selection,
@@ -139,118 +133,21 @@ pub fn resolve_reborn_runtime_llm(
         .map(Some);
     }
 
-    resolve_llm_from_env()
+    resolve_llm_from_env(boot)
 }
 
-fn resolve_llm_from_env() -> Result<Option<ResolvedRebornLlm>, RebornLlmCatalogError> {
-    if codex_auth_enabled() || codex_backend_selected() {
-        if !codex_auth_enabled() {
-            return Err(RebornLlmCatalogError::CodexAuthNotEnabled);
-        }
-        return resolve_codex_auth_from_env().map(Some);
-    }
-
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        let model =
-            nonempty_env("IRONCLAW_REBORN_MODEL").unwrap_or_else(|| "gpt-4o-mini".to_string());
-        let base_url = nonempty_env("OPENAI_BASE_URL")
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        return Ok(Some(ResolvedRebornLlm::from_catalog(
-            RebornLlmConfig::openai_compat("openai", base_url, model, SecretString::from(key)),
-        )));
-    }
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        let model = nonempty_env("IRONCLAW_REBORN_MODEL")
-            .unwrap_or_else(|| "claude-3-5-sonnet-latest".to_string());
-        let base_url = nonempty_env("ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string());
-        return Ok(Some(ResolvedRebornLlm::from_catalog(RebornLlmConfig {
-            provider_id: "anthropic".to_string(),
-            model,
-            base_url,
-            api_key: Some(SecretString::from(key)),
-            protocol: "anthropic".to_string(),
-            request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
-            extra_headers: Vec::new(),
-        })));
-    }
-    if let Ok(base_url) = std::env::var("OLLAMA_BASE_URL") {
-        let model = nonempty_env("IRONCLAW_REBORN_MODEL").unwrap_or_else(|| "llama3.2".to_string());
-        return Ok(Some(ResolvedRebornLlm::from_catalog(RebornLlmConfig {
-            provider_id: "ollama".to_string(),
-            model,
-            base_url,
-            api_key: None,
-            protocol: "ollama".to_string(),
-            request_timeout_secs: DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
-            extra_headers: Vec::new(),
-        })));
-    }
-
-    Ok(None)
-}
-
-fn resolve_codex_auth_from_env() -> Result<ResolvedRebornLlm, RebornLlmCatalogError> {
-    let auth_path = codex_auth_path_from_env();
-    let credentials =
-        ironclaw_llm::codex_auth::load_codex_credentials(&auth_path).ok_or_else(|| {
-            RebornLlmCatalogError::CodexAuthUnavailable {
-                path: auth_path.display().to_string(),
-            }
-        })?;
-    let model = nonempty_env("OPENAI_CODEX_MODEL")
-        .or_else(|| nonempty_env("IRONCLAW_REBORN_MODEL"))
-        .unwrap_or_else(|| {
-            if credentials.is_chatgpt_mode {
-                "gpt-5.3-codex".to_string()
-            } else {
-                "gpt-4o-mini".to_string()
-            }
-        });
-    let base_url = credentials.base_url().to_string();
-
-    if credentials.is_chatgpt_mode {
-        let registry_config = RegistryProviderConfig {
-            protocol: ProviderProtocol::OpenAiCompletions,
-            provider_id: "codex_chatgpt".to_string(),
-            api_key: Some(credentials.token),
-            base_url,
-            model,
-            extra_headers: Vec::new(),
-            oauth_token: None,
-            is_codex_chatgpt: true,
-            refresh_token: credentials.refresh_token,
-            auth_path: Some(auth_path),
-            cache_retention: CacheRetention::None,
-            unsupported_params: Vec::new(),
-        };
-        Ok(ResolvedRebornLlm::from_registry_provider(
-            registry_config,
-            DEFAULT_LLM_REQUEST_TIMEOUT_SECS,
-        ))
-    } else {
-        Ok(ResolvedRebornLlm::from_catalog(
-            RebornLlmConfig::openai_compat("openai", base_url, model, credentials.token),
-        ))
-    }
-}
-
-fn codex_auth_path_from_env() -> PathBuf {
-    std::env::var_os("CODEX_AUTH_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(ironclaw_llm::codex_auth::default_codex_auth_path)
-}
-
-fn codex_auth_enabled() -> bool {
-    std::env::var("LLM_USE_CODEX_AUTH")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn codex_backend_selected() -> bool {
-    std::env::var("LLM_BACKEND")
-        .map(|value| matches!(value.as_str(), "openai_codex" | "openai-codex" | "codex"))
-        .unwrap_or(false)
+fn resolve_llm_from_env(
+    boot: &RebornBootConfig,
+) -> Result<Option<ResolvedRebornLlm>, RebornLlmCatalogError> {
+    ironclaw_llm::resolve_registry_provider_from_env(Some(
+        boot.home().providers_file_path().as_path(),
+    ))
+    .map(|maybe_config| {
+        maybe_config.map(|config| {
+            ResolvedRebornLlm::from_registry_provider(config, DEFAULT_LLM_REQUEST_TIMEOUT_SECS)
+        })
+    })
+    .map_err(|source| RebornLlmCatalogError::EnvResolution { source })
 }
 
 /// Resolve an `LlmSlotSelection` against the merged provider catalog.
