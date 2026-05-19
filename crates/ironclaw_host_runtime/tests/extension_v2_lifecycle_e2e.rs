@@ -10,7 +10,7 @@ use ironclaw_extensions::{
 };
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{
-    CapabilityId, ExtensionId, HostPath, ReservationStatus, ResourceEstimate,
+    CapabilityId, ExtensionId, HostPath, MountView, ReservationStatus, ResourceEstimate,
     ResourceReservationId, ResourceScope, ResourceUsage, RuntimeKind, TenantId, UserId,
     VirtualPath,
 };
@@ -98,7 +98,7 @@ async fn extension_v2_lifecycle_discovers_installs_publishes_and_dispatches_host
         .dispatch_json(ironclaw_host_api::CapabilityDispatchRequest {
             capability_id: CapabilityId::new("script.echo").unwrap(),
             scope: scope.clone(),
-            estimate,
+            estimate: estimate.clone(),
             mounts: None,
             resource_reservation: Some(reservation),
             input: json!({"message":"hello"}),
@@ -121,6 +121,8 @@ async fn extension_v2_lifecycle_discovers_installs_publishes_and_dispatches_host
     );
     assert_eq!(requests[0].runtime, RuntimeKind::Script);
     assert_eq!(requests[0].scope, scope);
+    assert_eq!(requests[0].estimate, estimate);
+    assert_eq!(requests[0].mounts, None);
     assert_eq!(requests[0].resource_reservation_id, Some(reservation_id));
     assert_eq!(requests[0].input, json!({"message":"hello"}));
 }
@@ -177,6 +179,8 @@ struct RecordedAdapterRequest {
     capability_id: CapabilityId,
     runtime: RuntimeKind,
     scope: ResourceScope,
+    estimate: ResourceEstimate,
+    mounts: Option<MountView>,
     resource_reservation_id: Option<ResourceReservationId>,
     input: Value,
 }
@@ -192,6 +196,8 @@ impl RuntimeAdapter<LocalFilesystem, InMemoryResourceGovernor> for RecordingAdap
             capability_id: request.capability_id.clone(),
             runtime: request.descriptor.runtime,
             scope: request.scope.clone(),
+            estimate: request.estimate.clone(),
+            mounts: request.mounts.clone(),
             resource_reservation_id: request
                 .resource_reservation
                 .as_ref()
