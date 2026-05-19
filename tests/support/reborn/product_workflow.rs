@@ -15,6 +15,7 @@ use ironclaw_product_workflow::{
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Error)]
 pub enum RebornProductWorkflowHarnessError {
@@ -33,6 +34,7 @@ pub struct RebornProductWorkflowHarness {
     filesystem: Arc<ScopedFilesystem<LocalFilesystem>>,
     backend: Arc<LocalFilesystem>,
     root: Arc<tempfile::TempDir>,
+    idempotency_lock: Arc<Mutex<()>>,
 }
 
 impl RebornProductWorkflowHarness {
@@ -49,20 +51,31 @@ impl RebornProductWorkflowHarness {
         backend: Arc<LocalFilesystem>,
         root: Arc<tempfile::TempDir>,
     ) -> Result<Self, RebornProductWorkflowHarnessError> {
+        Self::filesystem_shared_backend_with_lock(scope, backend, root, Arc::new(Mutex::new(())))
+    }
+
+    fn filesystem_shared_backend_with_lock(
+        scope: ResourceScope,
+        backend: Arc<LocalFilesystem>,
+        root: Arc<tempfile::TempDir>,
+        idempotency_lock: Arc<Mutex<()>>,
+    ) -> Result<Self, RebornProductWorkflowHarnessError> {
         let filesystem = scoped_product_workflow_fs_at(Arc::clone(&backend), &scope)?;
         Ok(Self {
             scope,
             filesystem,
             backend,
             root,
+            idempotency_lock,
         })
     }
 
     pub fn reopened(&self) -> Result<Self, RebornProductWorkflowHarnessError> {
-        Self::filesystem_shared_backend(
+        Self::filesystem_shared_backend_with_lock(
             self.scope.clone(),
             Arc::clone(&self.backend),
             Arc::clone(&self.root),
+            Arc::clone(&self.idempotency_lock),
         )
     }
 
@@ -70,7 +83,12 @@ impl RebornProductWorkflowHarness {
         &self,
         scope: ResourceScope,
     ) -> Result<Self, RebornProductWorkflowHarnessError> {
-        Self::filesystem_shared_backend(scope, Arc::clone(&self.backend), Arc::clone(&self.root))
+        Self::filesystem_shared_backend_with_lock(
+            scope,
+            Arc::clone(&self.backend),
+            Arc::clone(&self.root),
+            Arc::clone(&self.idempotency_lock),
+        )
     }
 
     pub fn binding_service(
@@ -93,10 +111,11 @@ impl RebornProductWorkflowHarness {
     }
 
     pub fn idempotency_ledger(&self) -> FilesystemIdempotencyLedger<LocalFilesystem> {
-        FilesystemIdempotencyLedger::new(
+        FilesystemIdempotencyLedger::new_with_lock(
             Arc::clone(&self.filesystem),
             self.scope.clone(),
             Duration::from_secs(60),
+            Arc::clone(&self.idempotency_lock),
         )
     }
 
@@ -104,10 +123,11 @@ impl RebornProductWorkflowHarness {
         &self,
         lease_ttl: Duration,
     ) -> FilesystemIdempotencyLedger<LocalFilesystem> {
-        FilesystemIdempotencyLedger::new(
+        FilesystemIdempotencyLedger::new_with_lock(
             Arc::clone(&self.filesystem),
             self.scope.clone(),
             lease_ttl,
+            Arc::clone(&self.idempotency_lock),
         )
     }
 }
@@ -124,6 +144,7 @@ impl<F> FilesystemConversationBindingService<F>
 where
     F: RootFilesystem,
 {
+    #[allow(dead_code)] // Convenience constructor for standalone test-support ledgers.
     pub fn new(
         filesystem: Arc<ScopedFilesystem<F>>,
         scope: ResourceScope,
@@ -178,25 +199,38 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct FilesystemIdempotencyLedger<F> {
     filesystem: Arc<ScopedFilesystem<F>>,
     scope: ResourceScope,
     lease_ttl: Duration,
+    lock: Arc<Mutex<()>>,
 }
 
 impl<F> FilesystemIdempotencyLedger<F>
 where
     F: RootFilesystem,
 {
+    #[allow(dead_code)] // Convenience constructor for standalone test-support ledgers.
     pub fn new(
         filesystem: Arc<ScopedFilesystem<F>>,
         scope: ResourceScope,
         lease_ttl: Duration,
     ) -> Self {
+        Self::new_with_lock(filesystem, scope, lease_ttl, Arc::new(Mutex::new(())))
+    }
+
+    pub fn new_with_lock(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        scope: ResourceScope,
+        lease_ttl: Duration,
+        lock: Arc<Mutex<()>>,
+    ) -> Self {
         Self {
             filesystem,
             scope,
             lease_ttl,
+            lock,
         }
     }
 }
@@ -212,6 +246,7 @@ where
         received_at: DateTime<Utc>,
     ) -> Result<IdempotencyDecision, ProductWorkflowError> {
         let path = ledger_path(&fingerprint)?;
+        let _guard = self.lock.lock().await;
         let Some(stored) =
             read_json::<F, StoredIdempotencyAction>(&self.filesystem, &self.scope, &path).await?
         else {
@@ -238,6 +273,7 @@ where
 
     async fn settle(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
         let path = ledger_path(&action.fingerprint)?;
+        let _guard = self.lock.lock().await;
         let Some(stored) =
             read_json::<F, StoredIdempotencyAction>(&self.filesystem, &self.scope, &path).await?
         else {
@@ -261,6 +297,7 @@ where
 
     async fn release(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
         let path = ledger_path(&action.fingerprint)?;
+        let _guard = self.lock.lock().await;
         let Some(stored) =
             read_json::<F, StoredIdempotencyAction>(&self.filesystem, &self.scope, &path).await?
         else {

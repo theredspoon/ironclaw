@@ -382,7 +382,7 @@ mod reborn_support_tests {
     use ironclaw_product_workflow::{
         ActionDispatchKind, ActionFingerprintKey, ConversationBindingService,
         DefaultInboundTurnService, DefaultProductWorkflow, IdempotencyDecision, IdempotencyLedger,
-        InboundTurnService, ResolveBindingRequest, SourceBindingKey,
+        InboundTurnService, ProductWorkflowError, ResolveBindingRequest, SourceBindingKey,
     };
     use ironclaw_threads::ProviderToolCallReferenceEnvelope;
     use ironclaw_threads::{
@@ -397,6 +397,7 @@ mod reborn_support_tests {
         events::EventCursor,
         run_profile::{ModelProfileId, ParentLoopOutput},
     };
+    use tokio::sync::Barrier;
 
     use crate::reborn_support::delivery::RecordingOutboundDeliverySink;
     use crate::reborn_support::model_replay::{
@@ -953,6 +954,48 @@ mod reborn_support_tests {
             panic!("expired reservation should produce a new action");
         };
         assert_ne!(first_expiring.action_id, second_expiring.action_id);
+    }
+
+    #[tokio::test]
+    async fn filesystem_idempotency_ledger_serializes_concurrent_begin() {
+        let harness = RebornProductWorkflowHarness::filesystem_temp(product_scope("tenant-race"))
+            .expect("product workflow harness");
+        let fingerprint = fingerprint_for("event-race", "alice", "room-1");
+        let received_at = chrono::Utc::now();
+        let start = Arc::new(Barrier::new(2));
+
+        let first_ledger = harness.idempotency_ledger();
+        let first_start = Arc::clone(&start);
+        let first_fingerprint = fingerprint.clone();
+        let first = async move {
+            first_start.wait().await;
+            first_ledger
+                .begin_or_replay(first_fingerprint, received_at)
+                .await
+        };
+
+        let second_ledger = harness.idempotency_ledger();
+        let second_start = Arc::clone(&start);
+        let second = async move {
+            second_start.wait().await;
+            second_ledger
+                .begin_or_replay(fingerprint, received_at)
+                .await
+        };
+
+        let (first_result, second_result) = tokio::join!(first, second);
+        let mut new_count = 0;
+        let mut rejected_count = 0;
+        for result in [first_result, second_result] {
+            match result {
+                Ok(IdempotencyDecision::New(_)) => new_count += 1,
+                Err(ProductWorkflowError::Transient { .. }) => rejected_count += 1,
+                other => panic!("unexpected concurrent idempotency result: {other:?}"),
+            }
+        }
+
+        assert_eq!(new_count, 1);
+        assert_eq!(rejected_count, 1);
     }
 
     #[tokio::test]
