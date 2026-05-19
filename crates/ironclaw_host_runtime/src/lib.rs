@@ -45,6 +45,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
+mod capability_catalog;
 mod extension_contracts;
 mod first_party;
 mod first_party_tools;
@@ -56,6 +57,10 @@ mod services;
 mod surface;
 mod turn_scheduler;
 
+pub use capability_catalog::{
+    HotCapabilityCatalog, HotCapabilityRecord, MAX_HOT_PROMPT_BYTES, MAX_HOT_SCHEMA_BYTES,
+    publish_hot_capability_catalog,
+};
 pub use extension_contracts::{
     default_host_api_contract_registry, default_host_port_catalog,
     discover_extensions_with_default_host_api_contracts,

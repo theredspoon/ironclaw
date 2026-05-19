@@ -14,17 +14,82 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_authorization::{GrantAuthorizer, TrustAwareCapabilityDispatchAuthorizer};
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry, ManifestSource};
+use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     CapabilitySurfacePolicy, CapabilitySurfaceVersion, DefaultHostRuntime, HostRuntime,
     RuntimeCapabilityOutcome, RuntimeCapabilityRequest, SurfaceKind, VisibleCapabilityAccess,
-    VisibleCapabilityRequest, VisibleCapabilitySurface,
+    VisibleCapabilityRequest, VisibleCapabilitySurface, publish_hot_capability_catalog,
 };
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
     HostTrustPolicy, TrustDecision, TrustError, TrustPolicy, TrustPolicyInput, TrustProvenance,
 };
 use serde_json::json;
+use tempfile::tempdir;
+
+#[tokio::test]
+async fn hot_capability_catalog_resolves_schema_and_prompt_refs() {
+    let (_storage, fs, registry) = hot_catalog_fixture(
+        Some(r#"{"type":"object","properties":{"message":{"type":"string"}}}"#),
+        r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+        "Use this tool to echo user text.",
+    );
+
+    let catalog = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap();
+
+    let record = catalog.get(&capability_id("echo.say")).unwrap();
+    assert_eq!(record.descriptor.id, capability_id("echo.say"));
+    assert_eq!(
+        record.descriptor.parameters_schema,
+        json!({"type":"object","properties":{"message":{"type":"string"}}})
+    );
+    assert_eq!(
+        record.output_schema,
+        json!({"type":"object","properties":{"ok":{"type":"boolean"}}})
+    );
+    assert_eq!(
+        record.prompt_doc.as_deref(),
+        Some("Use this tool to echo user text.")
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_missing_schema_file() {
+    let (_storage, fs, registry) =
+        hot_catalog_fixture(None, r#"{"type":"object"}"#, "Prompt docs exist.");
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("failed to read input_schema_ref")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_invalid_json_schema_file() {
+    let (_storage, fs, registry) = hot_catalog_fixture(
+        Some("not-json"),
+        r#"{"type":"object"}"#,
+        "Prompt docs exist.",
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("input_schema_ref") && reason.contains("valid JSON schema")),
+        "unexpected error: {err:?}"
+    );
+}
 
 #[tokio::test]
 async fn visible_surface_empty_registry_returns_deterministic_empty_version() {
@@ -715,6 +780,53 @@ fn visible_ids(surface: &VisibleCapabilitySurface) -> Vec<CapabilityId> {
         .collect()
 }
 
+fn hot_catalog_fixture(
+    input_schema: Option<&str>,
+    output_schema: &str,
+    prompt_doc: &str,
+) -> (tempfile::TempDir, LocalFilesystem, ExtensionRegistry) {
+    let storage = tempdir().unwrap();
+    let extension_root = storage.path().join("echo");
+    std::fs::create_dir_all(extension_root.join("schemas/echo")).unwrap();
+    std::fs::create_dir_all(extension_root.join("prompts/echo")).unwrap();
+    if let Some(input_schema) = input_schema {
+        std::fs::write(
+            extension_root.join("schemas/echo/say.input.v1.json"),
+            input_schema,
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        extension_root.join("schemas/echo/say.output.v1.json"),
+        output_schema,
+    )
+    .unwrap();
+    std::fs::write(extension_root.join("prompts/echo/say.md"), prompt_doc).unwrap();
+
+    let mut fs = LocalFilesystem::new();
+    fs.mount_local(
+        VirtualPath::new("/system/extensions").unwrap(),
+        HostPath::from_path_buf(storage.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let manifest = ExtensionManifest::parse(
+        HOT_CAPABILITY_MANIFEST,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+    )
+    .unwrap();
+    let package = ExtensionPackage::from_manifest(
+        manifest,
+        VirtualPath::new("/system/extensions/echo").unwrap(),
+    )
+    .unwrap();
+    let mut registry = ExtensionRegistry::new();
+    registry.insert(package).unwrap();
+
+    (storage, fs, registry)
+}
+
 fn runtime_with(
     registry: ExtensionRegistry,
     authorizer: Arc<dyn TrustAwareCapabilityDispatchAuthorizer>,
@@ -954,6 +1066,28 @@ impl TrustAwareCapabilityDispatchAuthorizer for PanicAuthorizer {
         }
     }
 }
+
+const HOT_CAPABILITY_MANIFEST: &str = r#"schema_version = "reborn.extension_manifest.v2"
+id = "echo"
+name = "Echo"
+version = "0.1.0"
+description = "Echo test extension"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "echo.wasm"
+
+[[capabilities]]
+id = "echo.say"
+description = "Echoes input"
+effects = ["dispatch_capability"]
+default_permission = "allow"
+visibility = "model"
+input_schema_ref = "schemas/echo/say.input.v1.json"
+output_schema_ref = "schemas/echo/say.output.v1.json"
+prompt_doc_ref = "prompts/echo/say.md"
+"#;
 
 const ECHO_MANIFEST: &str = r#"
 id = "echo"
