@@ -229,6 +229,26 @@ async fn hot_capability_catalog_fails_closed_for_oversized_prompt_doc() {
     );
 }
 
+#[test]
+fn hot_capability_manifest_rejects_traversal_schema_ref_at_parse_boundary() {
+    let manifest = HOT_CAPABILITY_MANIFEST.replace(
+        r#"input_schema_ref = "schemas/echo/say.input.v1.json""#,
+        r#"input_schema_ref = "../secrets/schema.json""#,
+    );
+
+    let err = ExtensionManifest::parse(
+        &manifest,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+    )
+    .unwrap_err();
+
+    assert!(
+        err.to_string().contains("..") || err.to_string().contains("dot path segments"),
+        "unexpected error: {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn visible_surface_empty_registry_returns_deterministic_empty_version() {
     let runtime = runtime_with(ExtensionRegistry::new(), Arc::new(GrantAuthorizer));

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ironclaw_extensions::{CapabilityVisibility, ExtensionPackage, ExtensionRegistry};
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
@@ -62,12 +64,17 @@ async fn publish_package_capabilities<F>(
 where
     F: RootFilesystem,
 {
+    let declarations_by_id: HashMap<_, _> = package
+        .manifest
+        .capabilities
+        .iter()
+        .map(|declaration| (&declaration.id, declaration))
+        .collect();
+
     for descriptor in &package.capabilities {
-        let declaration = package
-            .manifest
-            .capabilities
-            .iter()
-            .find(|declaration| declaration.id == descriptor.id)
+        let declaration = declarations_by_id
+            .get(&descriptor.id)
+            .copied()
             .ok_or_else(|| {
                 HostRuntimeError::invalid_request(format!(
                     "capability {} is missing manifest declaration",
@@ -166,9 +173,9 @@ where
 {
     fs.read_file_bounded(path, max_bytes)
         .await
-        .map_err(|_error| {
+        .map_err(|error| {
             HostRuntimeError::invalid_request(format!(
-                "failed to read {field} at {}",
+                "failed to read {field} at {}: {error}",
                 path.as_str()
             ))
         })?
@@ -184,6 +191,7 @@ fn resolve_under_root(
     root: &VirtualPath,
     reference: &CapabilityProfileSchemaRef,
 ) -> Result<VirtualPath, HostRuntimeError> {
+    validate_relative_manifest_asset_ref(reference)?;
     VirtualPath::new(format!(
         "{}/{}",
         root.as_str().trim_end_matches('/'),
@@ -196,4 +204,22 @@ fn resolve_under_root(
             root.as_str()
         ))
     })
+}
+
+fn validate_relative_manifest_asset_ref(
+    reference: &CapabilityProfileSchemaRef,
+) -> Result<(), HostRuntimeError> {
+    let value = reference.as_str();
+    if value.starts_with('/')
+        || value.contains('\\')
+        || value.chars().any(|ch| ch == '\0' || ch.is_control())
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(HostRuntimeError::invalid_request(format!(
+            "invalid manifest asset ref {value}: path traversal characters are not allowed"
+        )));
+    }
+    Ok(())
 }
