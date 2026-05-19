@@ -92,8 +92,7 @@ async fn reborn_trace_file_tools_parity() {
         |kind| matches!(kind, LoopHostMilestoneKind::CapabilityBatchCompleted { .. }),
         |kind| matches!(kind, LoopHostMilestoneKind::AssistantReplyFinalized { .. }),
     );
+    harness.assert_model_exhausted();
 
-    // Let the worker observe the terminal run before cancellation tears down the loop.
-    tokio::task::yield_now().await;
     harness.shutdown().await;
 }
