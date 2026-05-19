@@ -1193,7 +1193,7 @@ provider_id = " {secret} "
 }
 
 #[test]
-fn run_rejects_unsupported_identity_scope_fields() {
+fn run_accepts_configured_cli_tenant_and_agent_identity() {
     let temp = tempfile::tempdir().expect("tempdir");
     let reborn_home = temp.path().join("reborn-home");
     std::fs::create_dir_all(&reborn_home).expect("mkdir");
@@ -1201,7 +1201,8 @@ fn run_rejects_unsupported_identity_scope_fields() {
         reborn_home.join("config.toml"),
         r#"
 [identity]
-tenant = "acme"
+tenant = "reborn-cli"
+default_agent = "reborn-cli-agent"
 default_owner = "operator"
 "#,
     )
@@ -1213,11 +1214,54 @@ default_owner = "operator"
         .env("IRONCLAW_REBORN_HOME", &reborn_home)
         .output()
         .expect("ironclaw-reborn run should not crash");
-    assert!(!output.status.success(), "unsupported identity must fail");
+    assert!(
+        !output.status.success(),
+        "run should still fail without a model gateway"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[identity]") && stderr.contains("tenant") && stderr.contains("not wired"),
-        "stderr should explain unsupported identity scope; got: {stderr}"
+        stderr.contains("reborn run did not produce an assistant reply"),
+        "stderr should reach normal runtime failure; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tenant") && !stderr.contains("default_agent"),
+        "tenant/default_agent should be accepted by CLI identity wiring; got: {stderr}"
+    );
+}
+
+#[test]
+fn run_rejects_unsupported_identity_project_scope_field() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("mkdir");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[identity]
+tenant = "reborn-cli"
+default_agent = "reborn-cli-agent"
+default_owner = "operator"
+default_project = "project-alpha"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(reborn_bin())
+        .args(["run", "-m", "ping"])
+        .env_remove("USERPROFILE")
+        .env("IRONCLAW_REBORN_HOME", &reborn_home)
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(
+        !output.status.success(),
+        "unsupported project scope must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[identity]")
+            && stderr.contains("default_project")
+            && stderr.contains("not wired"),
+        "stderr should explain unsupported project scope; got: {stderr}"
     );
 }
 
