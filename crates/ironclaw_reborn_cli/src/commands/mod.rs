@@ -9,6 +9,7 @@ pub(crate) mod logs;
 pub(crate) mod models;
 pub(crate) mod profile;
 pub(crate) mod run;
+pub(crate) mod serve;
 pub(crate) mod skills;
 
 #[derive(Debug, Subcommand)]
@@ -31,6 +32,8 @@ pub(crate) enum Command {
     Profile(profile::ProfileCommand),
     /// Initialize the minimal Reborn runtime shell and exit.
     Run(run::RunCommand),
+    /// Start the Reborn WebUI service.
+    Serve(serve::ServeCommand),
     /// Inspect configured Reborn skills.
     Skills(skills::SkillsCommand),
 }
@@ -51,6 +54,9 @@ impl Command {
             Self::Models(command) => command.execute(),
             Self::Profile(command) => command.execute(),
             Self::Run(command) => {
+                command.execute(crate::context::RebornCliContext::resolve_from_env()?)
+            }
+            Self::Serve(command) => {
                 command.execute(crate::context::RebornCliContext::resolve_from_env()?)
             }
             Self::Skills(command) => command.execute(),
