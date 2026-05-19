@@ -217,7 +217,7 @@ where
             .await?
             .map(|stored| stored.binding)
             .ok_or_else(|| ProductWorkflowError::BindingRequired {
-                reason: "conversation binding not found".to_string(),
+                reason: "product conversation binding not found".to_string(),
             })
     }
 }
@@ -488,6 +488,8 @@ fn ledger_path(fingerprint: &ActionFingerprintKey) -> Result<ScopedPath, Product
         &[
             fingerprint.adapter_id.as_str(),
             fingerprint.installation_id.as_str(),
+            fingerprint.external_actor_ref.kind(),
+            fingerprint.external_actor_ref.id(),
             fingerprint.source_binding_key.as_str(),
             fingerprint.external_event_id.as_str(),
         ],

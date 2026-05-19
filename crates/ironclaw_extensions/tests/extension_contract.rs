@@ -213,6 +213,45 @@ async fn discovery_validates_host_api_manifest_with_supplied_contracts() {
     assert_eq!(package.manifest.host_apis.len(), 1);
 }
 
+#[tokio::test]
+async fn discovery_registers_capability_provider_projected_capabilities() {
+    let storage = tempdir().unwrap();
+    std::fs::create_dir_all(storage.path().join("telegram")).unwrap();
+    std::fs::write(
+        storage.path().join("telegram/manifest.toml"),
+        CAPABILITY_PROVIDER_MANIFEST,
+    )
+    .unwrap();
+
+    let mut fs = LocalFilesystem::new();
+    fs.mount_local(
+        VirtualPath::new("/system/extensions").unwrap(),
+        HostPath::from_path_buf(storage.path().to_path_buf()),
+    )
+    .unwrap();
+
+    let registry = ExtensionDiscovery::discover_with_manifest_contracts(
+        &fs,
+        &VirtualPath::new("/system/extensions").unwrap(),
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+        &capability_provider_contracts(),
+    )
+    .await
+    .unwrap();
+
+    let package = registry
+        .get_extension(&ExtensionId::new("telegram").unwrap())
+        .unwrap();
+    assert_eq!(package.capabilities.len(), 1);
+    assert_eq!(package.capabilities[0].id.as_str(), "telegram.send_message");
+    assert!(
+        registry
+            .get_capability(&CapabilityId::new("telegram.send_message").unwrap())
+            .is_some()
+    );
+}
+
 #[test]
 fn capability_provider_host_api_contract_accepts_valid_manifest() {
     let manifest = ExtensionManifest::parse_with_host_api_contracts(
@@ -361,6 +400,51 @@ fn capability_provider_host_api_reuses_capability_validation() {
             "expected reason containing {expected:?}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn capability_provider_host_api_rejects_duplicate_capability_ids() {
+    let manifest = CAPABILITY_PROVIDER_MANIFEST.replace(
+        "[[capability_provider.tools.capabilities]]",
+        r#"[[capability_provider.tools.capabilities]]
+id = "telegram.send_message"
+description = "Send a duplicate Telegram message"
+effects = ["network"]
+default_permission = "ask"
+visibility = "model"
+input_schema_ref = "schemas/telegram/send_message.input.v1.json"
+output_schema_ref = "schemas/telegram/send_message.output.v1.json"
+prompt_doc_ref = "prompts/telegram/send_message.md"
+
+[[capability_provider.tools.capabilities]]"#,
+    );
+    let err = ExtensionManifest::parse_with_host_api_contracts(
+        &manifest,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+        &capability_provider_contracts(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ExtensionError::ManifestV2(ManifestV2Error::HostApiSectionRejected { reason, .. })
+            if reason.contains("duplicate capability id")
+    ));
+}
+
+#[test]
+fn capability_provider_host_api_rejects_contextless_validation() {
+    let contract = CapabilityProviderHostApiContract::new().unwrap();
+    let host_api = HostApiRefV2 {
+        id: HostApiId::new(CAPABILITY_PROVIDER_HOST_API_ID).unwrap(),
+        section: ManifestSectionPath::new(CAPABILITY_PROVIDER_SECTION).unwrap(),
+    };
+    let section = toml::Value::Table(toml::map::Map::new());
+
+    let err = contract.validate_section(&host_api, &section).unwrap_err();
+
+    assert!(err.contains("requires manifest context"));
 }
 
 #[test]

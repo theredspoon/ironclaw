@@ -561,9 +561,11 @@ impl ExtensionManifestV2 {
         let document = RawManifestDocumentV2::parse(input)?;
         let mut manifest =
             Self::from_raw(document.raw, source, host_port_catalog, &document.sections)?;
-        let projection =
-            registry.project_manifest(&manifest, &document.sections, host_port_catalog)?;
-        manifest.capabilities.extend(projection.capabilities);
+        manifest.project_and_extend_capabilities(
+            &document.sections,
+            host_port_catalog,
+            registry,
+        )?;
         Ok(manifest)
     }
 
@@ -594,11 +596,24 @@ impl ExtensionManifestV2 {
                 });
             }
         } else {
-            let projection =
-                registry.project_manifest(&manifest, &document.sections, host_port_catalog)?;
-            manifest.capabilities.extend(projection.capabilities);
+            manifest.project_and_extend_capabilities(
+                &document.sections,
+                host_port_catalog,
+                registry,
+            )?;
         }
         Ok(manifest)
+    }
+
+    fn project_and_extend_capabilities(
+        &mut self,
+        sections: &ManifestSectionsV2,
+        host_port_catalog: &HostPortCatalog,
+        registry: &HostApiContractRegistry,
+    ) -> Result<(), ManifestV2Error> {
+        let projection = registry.project_manifest(self, sections, host_port_catalog)?;
+        self.capabilities.extend(projection.capabilities);
+        Ok(())
     }
 
     /// Construct a manifest from an already-deserialized raw representation.
