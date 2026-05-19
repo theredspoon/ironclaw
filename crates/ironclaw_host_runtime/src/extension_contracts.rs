@@ -5,7 +5,10 @@ use ironclaw_extensions::{
     HostApiContractRegistry, ManifestV2Error,
 };
 use ironclaw_filesystem::RootFilesystem;
-use ironclaw_host_api::{HostPortCatalog, VirtualPath};
+use ironclaw_host_api::{
+    HOST_RUNTIME_HTTP_EGRESS_PORT_ID, HostApiError, HostPortCatalog, HostPortCatalogEntry,
+    HostPortId, VirtualPath,
+};
 use ironclaw_product_adapter_registry::ProductAdapterHostApiContract;
 
 /// Build the host-runtime default set of Extension Manifest v2 host API contracts.
@@ -23,11 +26,33 @@ pub fn default_host_api_contract_registry() -> Result<HostApiContractRegistry, M
     Ok(registry)
 }
 
-/// Discover installed extensions through host-runtime's default host API contracts.
+/// Build the host-runtime default host-port validation catalog.
 ///
-/// Callers still own the supported [`HostPortCatalog`]; PR3 intentionally keeps
-/// that catalog empty unless composition supplies real host ports in a later slice.
+/// The catalog is validation vocabulary only. It does not grant authority or
+/// construct the concrete runtime HTTP egress adapter.
+pub fn default_host_port_catalog() -> Result<HostPortCatalog, HostApiError> {
+    HostPortCatalog::new(vec![HostPortCatalogEntry::new(HostPortId::new(
+        HOST_RUNTIME_HTTP_EGRESS_PORT_ID,
+    )?)])
+}
+
+/// Discover installed extensions through host-runtime's default host API
+/// contracts and default host-port validation catalog.
 pub async fn discover_extensions_with_default_host_api_contracts<F>(
+    fs: &F,
+    root: &VirtualPath,
+) -> Result<ExtensionRegistry, ExtensionError>
+where
+    F: RootFilesystem,
+{
+    let host_port_catalog = default_host_port_catalog()?;
+    discover_extensions_with_default_host_api_contracts_and_catalog(fs, root, &host_port_catalog)
+        .await
+}
+
+/// Discover installed extensions through host-runtime's default host API
+/// contracts and caller-supplied host-port validation catalog.
+pub async fn discover_extensions_with_default_host_api_contracts_and_catalog<F>(
     fs: &F,
     root: &VirtualPath,
     host_port_catalog: &HostPortCatalog,

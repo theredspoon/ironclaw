@@ -57,7 +57,9 @@ mod surface;
 mod turn_scheduler;
 
 pub use extension_contracts::{
-    default_host_api_contract_registry, discover_extensions_with_default_host_api_contracts,
+    default_host_api_contract_registry, default_host_port_catalog,
+    discover_extensions_with_default_host_api_contracts,
+    discover_extensions_with_default_host_api_contracts_and_catalog,
 };
 pub use first_party::{
     FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
