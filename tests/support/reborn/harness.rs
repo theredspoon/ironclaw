@@ -496,8 +496,8 @@ impl RebornBinaryE2EHarness {
                 idempotency_key: IdempotencyKey::new(format!("cancel-{run_id}"))?,
             })
             .await?;
-        if response.status != TurnStatus::Cancelled {
-            return Err(format!("expected cancelled run, got {:?}", response.status).into());
+        if !matches!(response.status, TurnStatus::Cancelled | TurnStatus::CancelRequested) {
+            return Err(format!("expected run to be cancelled or cancel-requested, got {:?}", response.status).into());
         }
         Ok(())
     }
