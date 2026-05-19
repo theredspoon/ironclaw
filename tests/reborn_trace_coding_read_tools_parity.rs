@@ -30,6 +30,8 @@ async fn reborn_trace_coding_read_tools_parity() {
                     "call_list_dir_notes",
                     serde_json::json!({
                         "path": "/workspace/notes",
+                        "recursive": "true",
+                        "max_depth": "1",
                     }),
                 ),
                 RebornScriptedProviderToolCall::new(
@@ -38,6 +40,7 @@ async fn reborn_trace_coding_read_tools_parity() {
                     serde_json::json!({
                         "path": "/workspace",
                         "pattern": "notes/*.md",
+                        "max_results": "5",
                     }),
                 ),
                 RebornScriptedProviderToolCall::new(
@@ -45,9 +48,11 @@ async fn reborn_trace_coding_read_tools_parity() {
                     "call_grep_marker",
                     serde_json::json!({
                         "path": "/workspace",
-                        "pattern": "DETERMINISTIC_MARKER_3702",
+                        "pattern": "deterministic_marker_3702",
                         "glob": "notes/*.md",
                         "output_mode": "content",
+                        "case_insensitive": "true",
+                        "head_limit": "5",
                     }),
                 ),
             ],
