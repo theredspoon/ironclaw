@@ -514,14 +514,14 @@ impl InMemoryConversationServices {
                         thread_id: binding.thread_id.to_string(),
                     });
                 }
-                if request.route_kind == ConversationRouteKind::Shared {
-                    state.widen_binding_route_access(&binding_key)?;
-                }
                 state.ensure_trusted_scope_not_reinterpreted(
                     &binding,
                     trusted_agent_id.as_ref(),
                     trusted_project_id.as_ref(),
                 )?;
+                if request.route_kind == ConversationRouteKind::Shared {
+                    state.widen_binding_route_access(&binding_key)?;
+                }
                 state.record_external_event_route(
                     &request.tenant_id,
                     &request.adapter_kind,

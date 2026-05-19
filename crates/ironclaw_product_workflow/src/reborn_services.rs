@@ -127,6 +127,8 @@ impl RebornServicesApi for RebornServices {
         let handoff = if let Some(replay) = self
             .thread_service
             .replay_accepted_inbound_message(ReplayAcceptedInboundMessageRequest {
+                scope: thread_scope.clone(),
+                actor_id: actor.user_id.as_str().to_string(),
                 source_binding_id: source_binding_id.clone(),
                 external_event_id: external_event_id.clone(),
             })

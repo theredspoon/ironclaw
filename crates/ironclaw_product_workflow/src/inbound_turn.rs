@@ -125,9 +125,25 @@ where
         let source_binding_id = product_source_binding_id(envelope);
         let submit_idempotency_key = submit_idempotency_key(envelope);
 
+        let binding = self
+            .binding_service
+            .resolve_binding(ResolveBindingRequest {
+                adapter_id: envelope.adapter_id().clone(),
+                installation_id: envelope.installation_id().clone(),
+                external_actor_ref: envelope.external_actor_ref().clone(),
+                external_conversation_ref: envelope.external_conversation_ref().clone(),
+                external_event_id: envelope.external_event_id().clone(),
+                route_kind: route_kind_for_user_message(payload.trigger),
+                auth_claim: envelope.auth_claim().clone(),
+            })
+            .await?;
+        let thread_scope = thread_scope_from_binding(&binding)?;
+
         if let Some(replay) = self
             .thread_service
             .replay_accepted_inbound_message(ReplayAcceptedInboundMessageRequest {
+                scope: thread_scope.clone(),
+                actor_id: binding.user_id.as_str().to_string(),
                 source_binding_id: source_binding_id.clone(),
                 external_event_id: envelope.external_event_id().as_str().to_string(),
             })
@@ -146,20 +162,6 @@ where
             .await;
         }
 
-        let binding = self
-            .binding_service
-            .resolve_binding(ResolveBindingRequest {
-                adapter_id: envelope.adapter_id().clone(),
-                installation_id: envelope.installation_id().clone(),
-                external_actor_ref: envelope.external_actor_ref().clone(),
-                external_conversation_ref: envelope.external_conversation_ref().clone(),
-                external_event_id: envelope.external_event_id().clone(),
-                route_kind: route_kind_for_user_message(payload.trigger),
-                auth_claim: envelope.auth_claim().clone(),
-            })
-            .await?;
-
-        let thread_scope = thread_scope_from_binding(&binding)?;
         self.thread_service
             .ensure_thread(EnsureThreadRequest {
                 scope: thread_scope.clone(),

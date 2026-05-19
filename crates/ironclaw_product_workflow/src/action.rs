@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use ironclaw_product_adapters::{
-    AdapterInstallationId, ExternalEventId, ProductAdapterId, ProductInboundAck,
+    AdapterInstallationId, ExternalActorRef, ExternalEventId, ProductAdapterId, ProductInboundAck,
     ProductInboundPayload,
 };
 use ironclaw_turns::{LoopGateRef, TurnRunId};
@@ -137,6 +137,7 @@ typed_token!(
 pub struct ActionFingerprintKey {
     pub adapter_id: ProductAdapterId,
     pub installation_id: AdapterInstallationId,
+    pub external_actor_ref: ExternalActorRef,
     pub source_binding_key: SourceBindingKey,
     pub external_event_id: ExternalEventId,
 }
@@ -145,12 +146,14 @@ impl ActionFingerprintKey {
     pub fn new(
         adapter_id: ProductAdapterId,
         installation_id: AdapterInstallationId,
+        external_actor_ref: ExternalActorRef,
         source_binding_key: SourceBindingKey,
         external_event_id: ExternalEventId,
     ) -> Self {
         Self {
             adapter_id,
             installation_id,
+            external_actor_ref,
             source_binding_key,
             external_event_id,
         }

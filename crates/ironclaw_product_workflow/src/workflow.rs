@@ -61,6 +61,7 @@ impl ProductWorkflow for DefaultProductWorkflow {
         let fingerprint = ActionFingerprintKey::new(
             envelope.adapter_id().clone(),
             envelope.installation_id().clone(),
+            envelope.external_actor_ref().clone(),
             source_binding_key,
             envelope.external_event_id().clone(),
         );

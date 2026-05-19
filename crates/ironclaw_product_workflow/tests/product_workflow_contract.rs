@@ -27,8 +27,8 @@ use ironclaw_threads::InMemorySessionThreadService;
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, EventCursor, GetRunStateRequest,
     LoopGateRef, ResumeTurnRequest, ResumeTurnResponse, RunProfileId, RunProfileVersion,
-    SubmitTurnRequest, SubmitTurnResponse, TurnCoordinator, TurnError, TurnId, TurnRunId,
-    TurnRunState, TurnStatus,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnCoordinator, TurnError, TurnId,
+    TurnRunId, TurnRunState, TurnStatus,
 };
 
 fn sample_envelope(event_suffix: &str) -> ProductInboundEnvelope {
@@ -95,11 +95,16 @@ fn sample_envelope_with_context(
 #[derive(Default)]
 struct RecordingTurnCoordinator {
     submissions: Mutex<Vec<SubmitTurnRequest>>,
+    busy_once: Mutex<Option<TurnRunId>>,
 }
 
 impl RecordingTurnCoordinator {
     fn submissions(&self) -> Vec<SubmitTurnRequest> {
         self.submissions.lock().expect("lock").clone()
+    }
+
+    fn force_thread_busy_once(&self, active_run_id: TurnRunId) {
+        *self.busy_once.lock().expect("lock") = Some(active_run_id);
     }
 }
 
@@ -109,6 +114,13 @@ impl TurnCoordinator for RecordingTurnCoordinator {
         &self,
         request: SubmitTurnRequest,
     ) -> Result<SubmitTurnResponse, TurnError> {
+        if let Some(active_run_id) = self.busy_once.lock().expect("lock").take() {
+            return Err(TurnError::ThreadBusy(ThreadBusy {
+                active_run_id,
+                status: TurnStatus::Running,
+                event_cursor: EventCursor::default(),
+            }));
+        }
         let response = SubmitTurnResponse::Accepted {
             turn_id: TurnId::new(),
             run_id: TurnRunId::new(),
@@ -143,6 +155,8 @@ impl TurnCoordinator for RecordingTurnCoordinator {
 fn action_fingerprint_retains_typed_identifiers() {
     let adapter_id = ProductAdapterId::new("test_adapter").expect("valid");
     let installation_id = AdapterInstallationId::new("install_alpha").expect("valid");
+    let external_actor_ref =
+        ExternalActorRef::new("test", "user1", Option::<String>::None).expect("valid actor");
     let source_binding_key = SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
         .expect("valid source binding key");
     let external_event_id = ExternalEventId::new("evt:typed").expect("valid");
@@ -150,12 +164,14 @@ fn action_fingerprint_retains_typed_identifiers() {
     let fingerprint = ActionFingerprintKey::new(
         adapter_id.clone(),
         installation_id.clone(),
+        external_actor_ref.clone(),
         source_binding_key.clone(),
         external_event_id.clone(),
     );
 
     assert_eq!(fingerprint.adapter_id, adapter_id);
     assert_eq!(fingerprint.installation_id, installation_id);
+    assert_eq!(fingerprint.external_actor_ref, external_actor_ref);
     assert_eq!(fingerprint.source_binding_key, source_binding_key);
     assert_eq!(fingerprint.external_event_id, external_event_id);
 }
@@ -233,6 +249,10 @@ fn fake_binding() -> ResolvedBinding {
         agent_id: Some(AgentId::new("agent:fake").expect("valid agent")),
         project_id: None,
     }
+}
+
+fn fingerprint_actor() -> ExternalActorRef {
+    ExternalActorRef::new("test", "user1", Option::<String>::None).expect("valid actor")
 }
 
 fn build_workflow() -> (
@@ -786,6 +806,146 @@ async fn concrete_product_workflow_rejects_unpaired_actor_before_turn_submission
 }
 
 #[tokio::test]
+async fn terminal_rejection_for_unpaired_actor_does_not_poison_other_actor_event() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user2").expect("actor"),
+            UserId::new("user:bob").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(
+        conversations,
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            None,
+        )],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+
+    let unpaired = sample_envelope_with_context(
+        ProductAdapterId::new("test_adapter").expect("adapter"),
+        AdapterInstallationId::new("install_alpha").expect("install"),
+        ExternalEventId::new("evt:shared-event").expect("event"),
+        ExternalActorRef::new("test", "user1", Option::<String>::None).expect("actor"),
+        ExternalConversationRef::new(None, "conv1", None, None).expect("conversation"),
+        ProductInboundPayload::UserMessage(
+            UserMessagePayload::new("hello", vec![], ProductTriggerReason::DirectChat)
+                .expect("message"),
+        ),
+    );
+    let err = workflow
+        .accept_inbound(unpaired)
+        .await
+        .expect_err("unpaired actor rejected");
+    assert!(matches!(
+        err,
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::ScopeNotFound,
+            ..
+        }
+    ));
+
+    let valid_other_actor = sample_envelope_with_context(
+        ProductAdapterId::new("test_adapter").expect("adapter"),
+        AdapterInstallationId::new("install_alpha").expect("install"),
+        ExternalEventId::new("evt:shared-event").expect("event"),
+        ExternalActorRef::new("test", "user2", Option::<String>::None).expect("actor"),
+        ExternalConversationRef::new(None, "conv1", None, None).expect("conversation"),
+        ProductInboundPayload::UserMessage(
+            UserMessagePayload::new("hello", vec![], ProductTriggerReason::DirectChat)
+                .expect("message"),
+        ),
+    );
+    let accepted = workflow
+        .accept_inbound(valid_other_actor)
+        .await
+        .expect("different actor with same event should not replay rejection");
+    assert!(matches!(accepted, ProductInboundAck::Accepted { .. }));
+    assert_eq!(coordinator.submissions().len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_message_replay_validates_current_actor_before_submit() {
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            TenantId::new("tenant:alpha").expect("tenant"),
+            ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter"),
+            ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install"),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(
+        conversations,
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            None,
+        )],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    coordinator.force_thread_busy_once(TurnRunId::new());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+
+    let first = sample_envelope("accepted-replay-actor-check");
+    let busy = workflow.accept_inbound(first).await.expect("busy ack");
+    assert!(matches!(busy, ProductInboundAck::DeferredBusy { .. }));
+
+    let unpaired_retry = sample_envelope_with_context(
+        ProductAdapterId::new("test_adapter").expect("adapter"),
+        AdapterInstallationId::new("install_alpha").expect("install"),
+        ExternalEventId::new("evt:accepted-replay-actor-check").expect("event"),
+        ExternalActorRef::new("test", "user2", Option::<String>::None).expect("actor"),
+        ExternalConversationRef::new(None, "conv1", None, None).expect("conversation"),
+        ProductInboundPayload::UserMessage(
+            UserMessagePayload::new("hello", vec![], ProductTriggerReason::DirectChat)
+                .expect("message"),
+        ),
+    );
+    let err = workflow
+        .accept_inbound(unpaired_retry)
+        .await
+        .expect_err("unpaired retry must not replay accepted message");
+    assert!(matches!(
+        err,
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::ScopeNotFound,
+            ..
+        }
+    ));
+    assert!(coordinator.submissions().is_empty());
+}
+
+#[tokio::test]
 async fn concrete_product_workflow_replays_binding_access_denied_rejection() {
     let conversations = Arc::new(InMemoryConversationServices::default());
     conversations
@@ -884,6 +1044,7 @@ async fn in_memory_idempotency_ledger_reclaims_expired_in_flight_actions() {
     let fingerprint = ActionFingerprintKey::new(
         ProductAdapterId::new("test_adapter").expect("valid"),
         AdapterInstallationId::new("install_alpha").expect("valid"),
+        fingerprint_actor(),
         SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
             .expect("valid source binding key"),
         ExternalEventId::new("evt:lease-memory").expect("valid"),
@@ -919,6 +1080,7 @@ async fn in_memory_idempotency_ledger_allows_only_one_concurrent_reservation() {
     let fingerprint = ActionFingerprintKey::new(
         ProductAdapterId::new("test_adapter").expect("valid"),
         AdapterInstallationId::new("install_alpha").expect("valid"),
+        fingerprint_actor(),
         SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
             .expect("valid source binding key"),
         ExternalEventId::new("evt:lease-concurrent").expect("valid"),
@@ -971,6 +1133,7 @@ async fn in_memory_idempotency_ledger_ignores_stale_releases_after_reclaim() {
     let fingerprint = ActionFingerprintKey::new(
         ProductAdapterId::new("test_adapter").expect("valid"),
         AdapterInstallationId::new("install_alpha").expect("valid"),
+        fingerprint_actor(),
         SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
             .expect("valid source binding key"),
         ExternalEventId::new("evt:lease-stale").expect("valid"),
@@ -1051,6 +1214,7 @@ async fn in_memory_idempotency_ledger_rejects_settle_after_expiry_without_reclai
     let fingerprint = ActionFingerprintKey::new(
         ProductAdapterId::new("test_adapter").expect("valid"),
         AdapterInstallationId::new("install_alpha").expect("valid"),
+        fingerprint_actor(),
         SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;")
             .expect("valid source binding key"),
         ExternalEventId::new("evt:lease-missing").expect("valid"),
@@ -1221,6 +1385,7 @@ async fn fake_ledger_expiration_reclaims_in_flight_fingerprint() {
     let fingerprint = ActionFingerprintKey::new(
         ProductAdapterId::new("test_adapter").expect("valid"),
         AdapterInstallationId::new("install_alpha").expect("valid"),
+        fingerprint_actor(),
         SourceBindingKey::new("space:0:;conversation:5:conv1;topic:0:;").expect("valid"),
         ExternalEventId::new("evt:lease").expect("valid"),
     );

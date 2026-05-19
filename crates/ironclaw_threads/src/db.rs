@@ -636,7 +636,8 @@ impl DurableState {
         request: &ReplayAcceptedInboundMessageRequest,
     ) -> Result<Option<AcceptedInboundMessageReplay>, SessionThreadError> {
         let Some(record) = self.inbound_idempotency.values().find(|record| {
-            record.source_binding_id == request.source_binding_id
+            record.scope == request.scope
+                && record.source_binding_id == request.source_binding_id
                 && record.external_event_id == request.external_event_id
         }) else {
             return Ok(None);
@@ -649,6 +650,9 @@ impl DurableState {
             .ok_or(SessionThreadError::UnknownMessage {
                 message_id: record.message_id,
             })?;
+        if message.actor_id.as_deref() != Some(request.actor_id.as_str()) {
+            return Ok(None);
+        }
         Ok(Some(AcceptedInboundMessageReplay {
             scope: record.scope.clone(),
             thread_id: record.thread_id.clone(),
