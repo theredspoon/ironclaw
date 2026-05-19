@@ -33,8 +33,8 @@ use ironclaw_host_api::{
     TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
-    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, HostRuntime, SurfaceKind,
-    WRITE_FILE_CAPABILITY_ID,
+    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, HostRuntime, READ_FILE_CAPABILITY_ID,
+    SurfaceKind, WRITE_FILE_CAPABILITY_ID,
 };
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
@@ -673,8 +673,11 @@ impl HostRuntimeCapabilityHarness {
             root,
             workspace_root,
             mounts,
-            capability_ids: vec![CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?],
-            effect_kinds: vec![EffectKind::WriteFilesystem],
+            capability_ids: vec![
+                CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?,
+                CapabilityId::new(READ_FILE_CAPABILITY_ID)?,
+            ],
+            effect_kinds: vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
             user_id: UserId::new("reborn-e2e-builtin-user")?,
             invocations: Arc::new(Mutex::new(Vec::new())),
         })
