@@ -213,14 +213,12 @@ where
         request: ResolveBindingRequest,
     ) -> Result<ResolvedBinding, ProductWorkflowError> {
         let path = binding_path(&self.scope, &request)?;
-        let Some(stored) =
-            read_json::<F, StoredConversationBinding>(&self.filesystem, &self.scope, &path).await?
-        else {
-            return Err(ProductWorkflowError::BindingRequired {
-                reason: "conversation binding not found".to_string(),
-            });
-        };
-        Ok(stored.binding)
+        read_json::<F, StoredConversationBinding>(&self.filesystem, &self.scope, &path)
+            .await?
+            .map(|stored| stored.binding)
+            .ok_or_else(|| ProductWorkflowError::BindingRequired {
+                reason: "product conversation binding not found".to_string(),
+            })
     }
 }
 
@@ -490,6 +488,8 @@ fn ledger_path(fingerprint: &ActionFingerprintKey) -> Result<ScopedPath, Product
         &[
             fingerprint.adapter_id.as_str(),
             fingerprint.installation_id.as_str(),
+            fingerprint.external_actor_ref.kind(),
+            fingerprint.external_actor_ref.id(),
             fingerprint.source_binding_key.as_str(),
             fingerprint.external_event_id.as_str(),
         ],
