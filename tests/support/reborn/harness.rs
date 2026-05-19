@@ -33,8 +33,9 @@ use ironclaw_host_api::{
     TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
-    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, HostRuntime, READ_FILE_CAPABILITY_ID,
-    SurfaceKind, WRITE_FILE_CAPABILITY_ID,
+    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID,
+    HostRuntime, LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SurfaceKind,
+    WRITE_FILE_CAPABILITY_ID,
 };
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
@@ -201,6 +202,20 @@ impl RebornBinaryE2EHarness {
         model_gateway: RebornTraceReplayModelGateway,
     ) -> HarnessResult<Self> {
         let host_runtime = Arc::new(HostRuntimeCapabilityHarness::write_only().await?);
+        Self::with_model_gateway_capability_mode(
+            conversation_id,
+            model_gateway,
+            HarnessCapabilityMode::HostRuntime(host_runtime),
+            false,
+        )
+        .await
+    }
+
+    pub async fn with_host_runtime_coding_read_capabilities(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+    ) -> HarnessResult<Self> {
+        let host_runtime = Arc::new(HostRuntimeCapabilityHarness::coding_read_tools().await?);
         Self::with_model_gateway_capability_mode(
             conversation_id,
             model_gateway,
@@ -715,6 +730,37 @@ impl HostRuntimeCapabilityHarness {
             capability_ids: vec![CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?],
             effect_kinds: vec![EffectKind::WriteFilesystem],
             user_id: UserId::new("reborn-e2e-write-only-user")?,
+            invocations: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    async fn coding_read_tools() -> HarnessResult<Self> {
+        let root = Arc::new(tempfile::tempdir()?);
+        let storage_root = root.path().join("local-dev");
+        let workspace_root = storage_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root)?;
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "reborn-e2e-coding-read-tools",
+            storage_root,
+        ))
+        .await?;
+        let runtime = services
+            .host_runtime
+            .ok_or("local-dev Reborn services missing host runtime")?;
+        let mounts = workspace_mounts(MountPermissions::read_write_list_delete())?;
+        Ok(Self {
+            runtime,
+            io: Arc::new(ProductLiveCapabilityIo::default()),
+            root,
+            workspace_root,
+            mounts,
+            capability_ids: vec![
+                CapabilityId::new(LIST_DIR_CAPABILITY_ID)?,
+                CapabilityId::new(GLOB_CAPABILITY_ID)?,
+                CapabilityId::new(GREP_CAPABILITY_ID)?,
+            ],
+            effect_kinds: vec![EffectKind::ReadFilesystem],
+            user_id: UserId::new("reborn-e2e-coding-read-user")?,
             invocations: Arc::new(Mutex::new(Vec::new())),
         })
     }

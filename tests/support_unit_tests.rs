@@ -405,7 +405,7 @@ mod reborn_support_tests {
 
     use crate::reborn_support::delivery::RecordingOutboundDeliverySink;
     use crate::reborn_support::model_replay::{
-        RebornTraceReplayError, RebornTraceReplayModelGateway,
+        RebornModelReplayStep, RebornTraceReplayError, RebornTraceReplayModelGateway,
         capability_call_from_trace_with_surface,
     };
     use crate::reborn_support::network::RecordingNetworkHttpTransport;
@@ -551,6 +551,40 @@ mod reborn_support_tests {
             .await
             .expect("matching tool result");
         assert_eq!(matched.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scripted_response_step_validates_expected_tool_results() {
+        let gateway =
+            RebornTraceReplayModelGateway::with_scripted_steps([RebornModelReplayStep::Response {
+                response: HostManagedModelResponse::assistant_reply("after tool"),
+                expected_tool_results: vec![ExpectedToolResult {
+                    tool_call_id: "call-scripted".to_string(),
+                    name: "builtin.write_file".to_string(),
+                    content: "result:ref-123".to_string(),
+                }],
+            }]);
+
+        assert!(
+            gateway
+                .stream_model(model_request(Vec::new()))
+                .await
+                .is_err(),
+            "scripted response step must reject missing expected tool result"
+        );
+        assert!(gateway.requests().is_empty());
+        assert_eq!(gateway.remaining_responses(), 1);
+
+        gateway
+            .stream_model(model_request(vec![tool_result_message(
+                "call-scripted",
+                "builtin.write_file",
+                "result:ref-123",
+            )]))
+            .await
+            .expect("matching scripted tool result");
+        assert_eq!(gateway.requests().len(), 1);
+        gateway.assert_exhausted();
     }
 
     #[test]
