@@ -97,6 +97,19 @@ async fn reborn_trace_coding_read_tools_parity() {
     assert_eq!(invocations[1].capability_id, glob);
     assert_eq!(invocations[2].capability_id, grep);
 
+    let results = harness.capability_results();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].capability_id, list_dir);
+    assert_entries_include(&results[0].output, &["alpha.md", "beta.md"]);
+    assert_eq!(results[1].capability_id, glob);
+    assert_files_include(&results[1].output, &["notes/alpha.md", "notes/beta.md"]);
+    assert_files_exclude(&results[1].output, &["README.txt"]);
+    assert_eq!(results[2].capability_id, grep);
+    assert_eq!(
+        results[2].output["content"],
+        "notes/alpha.md:1:Project Alpha contains DETERMINISTIC_MARKER_3702."
+    );
+
     let requests = harness.model_requests();
     assert_eq!(requests.len(), 2);
     let tool_results = requests[1]
@@ -135,4 +148,43 @@ fn seed_workspace(harness: &RebornBinaryE2EHarness) {
         "non-markdown file",
     )
     .expect("write readme");
+}
+
+fn assert_entries_include(output: &serde_json::Value, expected: &[&str]) {
+    let entries = output["entries"]
+        .as_array()
+        .expect("list_dir entries")
+        .iter()
+        .map(|entry| entry.as_str().expect("entry string"))
+        .collect::<Vec<_>>();
+    for expected_entry in expected {
+        assert!(
+            entries.iter().any(|entry| entry.contains(expected_entry)),
+            "expected list_dir output to include {expected_entry:?}, got {entries:?}"
+        );
+    }
+}
+
+fn assert_files_include(output: &serde_json::Value, expected: &[&str]) {
+    let files = output["files"].as_array().expect("glob files");
+    for expected_file in expected {
+        assert!(
+            files
+                .iter()
+                .any(|file| file.as_str() == Some(*expected_file)),
+            "expected glob output to include {expected_file:?}, got {files:?}"
+        );
+    }
+}
+
+fn assert_files_exclude(output: &serde_json::Value, expected: &[&str]) {
+    let files = output["files"].as_array().expect("glob files");
+    for unexpected_file in expected {
+        assert!(
+            files
+                .iter()
+                .all(|file| file.as_str() != Some(*unexpected_file)),
+            "expected glob output to exclude {unexpected_file:?}, got {files:?}"
+        );
+    }
 }
