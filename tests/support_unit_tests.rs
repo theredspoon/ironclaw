@@ -349,6 +349,525 @@ mod test_channel_tests {
 }
 
 // ---------------------------------------------------------------------------
+// reborn support
+// ---------------------------------------------------------------------------
+
+mod reborn_support_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use ironclaw_host_api::{
+        AgentId, CapabilityId, InvocationId, NetworkMethod, NetworkPolicy, NetworkTargetPattern,
+        ResourceScope, TenantId, ThreadId, UserId,
+    };
+    use ironclaw_loop_support::{
+        HostManagedModelGateway, HostManagedModelMessage, HostManagedModelMessageRole,
+        HostManagedModelRequest, HostManagedModelResponse,
+    };
+    use ironclaw_network::{
+        NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse,
+        NetworkHttpTransport, NetworkResolver, NetworkTransportRequest, NetworkUsage,
+        PolicyNetworkHttpEgress,
+    };
+    use ironclaw_product_adapters::{
+        AuthRequirement, DeliveryStatus, OutboundDeliverySink, ProductAdapter, ProtocolAuthEvidence,
+    };
+    use ironclaw_threads::ProviderToolCallReferenceEnvelope;
+    use ironclaw_threads::{
+        AcceptInboundMessageRequest, AppendAssistantDraftRequest, EnsureThreadRequest,
+        MessageContent, SessionThreadService, ThreadScope,
+    };
+    use ironclaw_turns::{
+        LoopMessageRef, ReplyTargetBindingRef, TurnId, TurnRunId,
+        run_profile::{ModelProfileId, ParentLoopOutput},
+    };
+
+    use crate::support::reborn::delivery::RecordingOutboundDeliverySink;
+    use crate::support::reborn::model_replay::RebornTraceReplayModelGateway;
+    use crate::support::reborn::network::RecordingNetworkHttpTransport;
+    use crate::support::reborn::session_thread::RebornThreadHarness;
+    use crate::support::reborn::test_adapter::{RebornTestIngress, RebornTestProductAdapter};
+    use crate::support::trace_llm::{
+        ExpectedToolResult, LlmTrace, TraceResponse, TraceStep, TraceToolCall,
+    };
+
+    #[tokio::test]
+    async fn trace_replay_records_requests_and_returns_reply() {
+        let gateway = RebornTraceReplayModelGateway::with_responses([
+            HostManagedModelResponse::assistant_reply("hello"),
+        ]);
+        let response = gateway
+            .stream_model(model_request(Vec::new()))
+            .await
+            .expect("trace response");
+
+        assert_eq!(response.safe_text_deltas, vec!["hello"]);
+        assert_eq!(gateway.requests().len(), 1);
+        gateway.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn trace_replay_returns_capability_call() {
+        let gateway = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
+            "trace",
+            "run tool",
+            vec![TraceStep {
+                request_hint: None,
+                response: TraceResponse::ToolCalls {
+                    tool_calls: vec![TraceToolCall {
+                        id: "call-1".to_string(),
+                        name: "test.echo".to_string(),
+                        arguments: serde_json::json!({"message": "hi"}),
+                    }],
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                expected_tool_results: Vec::new(),
+            }],
+        ))
+        .expect("trace gateway");
+
+        let response = gateway
+            .stream_model(model_request(Vec::new()))
+            .await
+            .expect("capability response");
+        let ParentLoopOutput::CapabilityCalls(calls) = response.output else {
+            panic!("expected capability calls");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].capability_id.as_str(), "test.echo");
+        assert_eq!(
+            calls[0]
+                .provider_replay
+                .as_ref()
+                .expect("provider replay")
+                .provider_call_id,
+            "call-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_replay_fails_when_exhausted() {
+        let gateway = RebornTraceReplayModelGateway::with_responses(Vec::new());
+        let error = gateway
+            .stream_model(model_request(Vec::new()))
+            .await
+            .expect_err("empty trace should fail");
+        assert!(error.safe_summary.contains("exhausted"));
+    }
+
+    #[tokio::test]
+    async fn trace_replay_requires_expected_tool_result_before_next_response() {
+        let trace_step = TraceStep {
+            request_hint: None,
+            response: TraceResponse::Text {
+                content: "after tool".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            expected_tool_results: vec![ExpectedToolResult {
+                tool_call_id: "call-1".to_string(),
+                name: "test.echo".to_string(),
+                content: "tool output".to_string(),
+            }],
+        };
+        let missing = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
+            "trace",
+            "run tool",
+            vec![trace_step.clone()],
+        ))
+        .expect("missing gateway");
+        assert!(
+            missing
+                .stream_model(model_request(Vec::new()))
+                .await
+                .is_err(),
+            "missing expected tool result must fail"
+        );
+
+        let matched = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
+            "trace",
+            "run tool",
+            vec![trace_step],
+        ))
+        .expect("matched gateway");
+        matched
+            .stream_model(model_request(vec![tool_result_message(
+                "call-1",
+                "test.echo",
+                "tool output",
+            )]))
+            .await
+            .expect("matching tool result");
+    }
+
+    #[tokio::test]
+    async fn trace_replay_preserves_provider_tool_call_metadata() {
+        let gateway = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
+            "trace",
+            "run tool",
+            vec![TraceStep {
+                request_hint: None,
+                response: TraceResponse::ToolCalls {
+                    tool_calls: vec![TraceToolCall {
+                        id: "provider-call-9".to_string(),
+                        name: "test.search".to_string(),
+                        arguments: serde_json::json!({"q": "near"}),
+                    }],
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                expected_tool_results: Vec::new(),
+            }],
+        ))
+        .expect("trace gateway");
+
+        let response = gateway
+            .stream_model(model_request(Vec::new()))
+            .await
+            .expect("capability response");
+        let ParentLoopOutput::CapabilityCalls(calls) = response.output else {
+            panic!("expected capability calls");
+        };
+        let replay = calls[0].provider_replay.as_ref().expect("provider replay");
+        assert_eq!(replay.provider_call_id, "provider-call-9");
+        assert_eq!(replay.provider_tool_name, "test.search");
+        assert_eq!(replay.arguments, serde_json::json!({"q": "near"}));
+    }
+
+    #[test]
+    fn recording_network_transport_records_request_and_returns_scripted_response() {
+        let transport = RecordingNetworkHttpTransport::new();
+        transport.push_response(NetworkHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: b"ok".to_vec(),
+            usage: NetworkUsage::default(),
+        });
+
+        let response = transport
+            .execute(NetworkTransportRequest {
+                method: NetworkMethod::Post,
+                url: "https://api.example.test/v1".to_string(),
+                headers: vec![("x-safe".to_string(), "yes".to_string())],
+                body: b"hello".to_vec(),
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                response_body_limit: Some(1024),
+                timeout_ms: Some(50),
+            })
+            .expect("scripted response");
+
+        assert_eq!(response.status, 200);
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body_len, 5);
+        assert_eq!(
+            requests[0].headers,
+            vec![("x-safe".to_string(), "yes".to_string())]
+        );
+
+        let failing = RecordingNetworkHttpTransport::new();
+        failing.push_error(NetworkHttpError::Transport {
+            reason: "scripted".to_string(),
+            request_bytes: 0,
+            response_bytes: 0,
+        });
+        let error = failing
+            .execute(NetworkTransportRequest {
+                method: NetworkMethod::Get,
+                url: "https://api.example.test/v1".to_string(),
+                headers: vec![],
+                body: Vec::new(),
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                response_body_limit: None,
+                timeout_ms: None,
+            })
+            .expect_err("scripted error");
+        assert!(matches!(error, NetworkHttpError::Transport { .. }));
+    }
+
+    #[test]
+    fn recording_network_transport_sanitizes_sensitive_request_data() {
+        let transport = RecordingNetworkHttpTransport::new();
+        let _ = transport.execute(NetworkTransportRequest {
+            method: NetworkMethod::Get,
+            url: "https://api.example.test/v1".to_string(),
+            headers: vec![
+                ("authorization".to_string(), "Bearer secret".to_string()),
+                ("x-api-key".to_string(), "secret-key".to_string()),
+            ],
+            body: b"secret body".to_vec(),
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            response_body_limit: None,
+            timeout_ms: None,
+        });
+
+        let request = transport.requests().pop().expect("recorded request");
+        assert_eq!(
+            request.headers,
+            vec![
+                ("authorization".to_string(), "<redacted>".to_string()),
+                ("x-api-key".to_string(), "<redacted>".to_string()),
+            ]
+        );
+        assert_eq!(request.body_len, 11);
+        assert_ne!(request.body_sha256, "secret body");
+    }
+
+    #[test]
+    fn policy_network_egress_blocks_private_ip_before_transport() {
+        let transport = RecordingNetworkHttpTransport::new();
+        let _default_policy_egress = transport.into_policy_egress();
+        let egress = PolicyNetworkHttpEgress::new_with_resolver(
+            transport.clone(),
+            StaticResolver(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]),
+        );
+
+        let error = egress
+            .execute(NetworkHttpRequest {
+                scope: sample_scope(),
+                method: NetworkMethod::Post,
+                url: "https://api.example.test/v1".to_string(),
+                headers: vec![],
+                body: b"hello".to_vec(),
+                policy: policy("api.example.test", Some(443), true, Some(1024)),
+                response_body_limit: Some(1024),
+                timeout_ms: None,
+            })
+            .expect_err("private IP should be denied before transport");
+
+        assert!(matches!(error, NetworkHttpError::PolicyDenied { .. }));
+        assert!(transport.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recording_delivery_sink_records_statuses() {
+        let sink = RecordingOutboundDeliverySink::new();
+        let target = ReplyTargetBindingRef::new("reply-target").expect("reply target");
+        sink.record(DeliveryStatus::Delivered {
+            attempt_id: uuid::Uuid::new_v4(),
+            target: target.clone(),
+            run_id: None,
+        })
+        .await;
+
+        let statuses = sink.statuses();
+        assert_eq!(statuses.len(), 1);
+        assert!(
+            matches!(&statuses[0], DeliveryStatus::Delivered { target: actual, .. } if actual == &target)
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_thread_harness_round_trips_history() {
+        let harness = RebornThreadHarness::filesystem_temp(thread_scope("round-trip"))
+            .expect("thread harness");
+        let thread_id = write_thread_history(&harness).await;
+        let history = harness.history(thread_id).await.expect("history");
+        assert_eq!(history.len(), 2);
+        harness
+            .assert_final_reply(ThreadId::new("thread-round-trip").unwrap(), "assistant")
+            .await
+            .expect("final reply");
+    }
+
+    #[tokio::test]
+    async fn filesystem_thread_harness_reopens_temp_backend_history() {
+        let harness =
+            RebornThreadHarness::filesystem_temp(thread_scope("reopen")).expect("thread harness");
+        let thread_id = write_thread_history(&harness).await;
+        let reopened = harness.reopened().expect("reopened harness");
+        let history = reopened.history(thread_id).await.expect("reopened history");
+        assert_eq!(history.len(), 2);
+        reopened
+            .assert_final_reply(ThreadId::new("thread-reopen").unwrap(), "assistant")
+            .await
+            .expect("reopened final reply");
+    }
+
+    #[test]
+    fn test_adapter_parses_payload_without_minting_trusted_context() {
+        let adapter = RebornTestProductAdapter::new("reborn-test", "install-1").expect("adapter");
+        let evidence = ProtocolAuthEvidence::test_verified(AuthRequirement::BearerToken, "alice");
+        let raw = RebornTestProductAdapter::text_payload("event-1", "alice", "thread-1", "hi")
+            .expect("payload");
+        let parsed = adapter
+            .parse_inbound(&raw, &evidence)
+            .expect("parsed inbound");
+        assert_eq!(parsed.external_event_id.as_str(), "event-1");
+
+        let failed =
+            ProtocolAuthEvidence::failed(ironclaw_product_adapters::ProtocolAuthFailure::Missing);
+        assert!(adapter.parse_inbound(&raw, &failed).is_err());
+    }
+
+    #[test]
+    fn test_ingress_stamps_trusted_context_outside_adapter() {
+        let adapter = RebornTestProductAdapter::new("reborn-test", "install-1").expect("adapter");
+        let ingress = RebornTestIngress::new(adapter);
+        assert_eq!(ingress.adapter().adapter_id().as_str(), "reborn-test");
+        let envelope = ingress
+            .verified_text_envelope("event-1", "alice", "thread-1", "hi")
+            .expect("trusted envelope");
+        assert_eq!(envelope.external_event_id().as_str(), "event-1");
+        assert_eq!(envelope.adapter_id().as_str(), "reborn-test");
+
+        let raw = RebornTestProductAdapter::text_payload("event-2", "alice", "thread-1", "hi")
+            .expect("payload");
+        assert!(ingress.failed_auth_payload(&raw).is_err());
+    }
+
+    fn model_request(messages: Vec<HostManagedModelMessage>) -> HostManagedModelRequest {
+        HostManagedModelRequest {
+            model_profile_id: ModelProfileId::new("test_model").expect("model profile"),
+            messages,
+            surface_version: None,
+            resolved_model_route: None,
+            run_id: TurnRunId::new(),
+            turn_id: TurnId::new(),
+        }
+    }
+
+    fn tool_result_message(
+        provider_call_id: &str,
+        provider_tool_name: &str,
+        content: &str,
+    ) -> HostManagedModelMessage {
+        HostManagedModelMessage {
+            role: HostManagedModelMessageRole::ToolResult,
+            content: content.to_string(),
+            content_ref: LoopMessageRef::new("msg:tool.result.1").expect("message ref"),
+            tool_result_provider_call: Some(ProviderToolCallReferenceEnvelope {
+                provider_id: "trace_replay".to_string(),
+                provider_model_id: "trace_replay".to_string(),
+                provider_turn_id: "trace-turn".to_string(),
+                provider_call_id: provider_call_id.to_string(),
+                provider_tool_name: provider_tool_name.to_string(),
+                capability_id: CapabilityId::new(provider_tool_name).expect("capability id"),
+                arguments: serde_json::json!({}),
+                response_reasoning: None,
+                reasoning: None,
+                signature: None,
+            }),
+        }
+    }
+
+    fn thread_scope(label: &str) -> ThreadScope {
+        ThreadScope {
+            tenant_id: TenantId::new("tenant-reborn-support").unwrap(),
+            agent_id: AgentId::new("agent-reborn-support").unwrap(),
+            project_id: None,
+            owner_user_id: Some(UserId::new("user-reborn-support").unwrap()),
+            mission_id: None,
+        }
+        .with_thread_label(label)
+    }
+
+    async fn write_thread_history(harness: &RebornThreadHarness) -> ThreadId {
+        let suffix = harness
+            .scope
+            .agent_id
+            .as_str()
+            .strip_prefix("agent-")
+            .unwrap_or("support");
+        let thread_id = ThreadId::new(format!("thread-{suffix}")).unwrap();
+        harness
+            .service
+            .ensure_thread(EnsureThreadRequest {
+                scope: harness.scope.clone(),
+                thread_id: Some(thread_id.clone()),
+                created_by_actor_id: "alice".to_string(),
+                title: Some("Reborn support".to_string()),
+                metadata_json: None,
+            })
+            .await
+            .expect("ensure thread");
+        harness
+            .service
+            .accept_inbound_message(AcceptInboundMessageRequest {
+                scope: harness.scope.clone(),
+                thread_id: thread_id.clone(),
+                actor_id: "alice".to_string(),
+                source_binding_id: Some("source".to_string()),
+                reply_target_binding_id: Some("reply".to_string()),
+                external_event_id: Some(format!("event-{suffix}")),
+                content: MessageContent::text("hello"),
+            })
+            .await
+            .expect("accept inbound");
+        let draft = harness
+            .service
+            .append_assistant_draft(AppendAssistantDraftRequest {
+                scope: harness.scope.clone(),
+                thread_id: thread_id.clone(),
+                turn_run_id: "run-1".to_string(),
+                content: MessageContent::text("draft"),
+            })
+            .await
+            .expect("append draft");
+        harness
+            .service
+            .finalize_assistant_message(
+                &harness.scope,
+                &thread_id,
+                draft.message_id,
+                MessageContent::text("assistant reply"),
+            )
+            .await
+            .expect("finalize draft");
+        thread_id
+    }
+
+    trait ThreadScopeLabelExt {
+        fn with_thread_label(self, label: &str) -> Self;
+    }
+
+    impl ThreadScopeLabelExt for ThreadScope {
+        fn with_thread_label(mut self, label: &str) -> Self {
+            self.agent_id = AgentId::new(format!("agent-{label}")).unwrap();
+            self
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticResolver(Vec<IpAddr>);
+
+    impl NetworkResolver for StaticResolver {
+        fn resolve_ips(&self, _host: &str, _port: u16) -> Result<Vec<IpAddr>, NetworkHttpError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn policy(
+        host_pattern: &str,
+        port: Option<u16>,
+        deny_private_ip_ranges: bool,
+        max_egress_bytes: Option<u64>,
+    ) -> NetworkPolicy {
+        NetworkPolicy {
+            allowed_targets: vec![NetworkTargetPattern {
+                scheme: None,
+                host_pattern: host_pattern.to_string(),
+                port,
+            }],
+            deny_private_ip_ranges,
+            max_egress_bytes,
+        }
+    }
+
+    fn sample_scope() -> ResourceScope {
+        ResourceScope {
+            tenant_id: TenantId::new("tenant1").unwrap(),
+            user_id: UserId::new("user1").unwrap(),
+            agent_id: None,
+            project_id: None,
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // trace_llm
 // ---------------------------------------------------------------------------
 
