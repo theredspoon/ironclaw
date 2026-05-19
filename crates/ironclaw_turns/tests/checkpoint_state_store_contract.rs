@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId};
+use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_turns::{
     AcceptedMessageRef, CheckpointSchemaId, CheckpointStateRecord, CheckpointStateStore,
     EventCursor, GateRef, GetCheckpointStateRequest, GetLoopCheckpointRequest,
@@ -8,7 +8,7 @@ use ironclaw_turns::{
     InMemoryTurnStateStoreLimits, LoopCheckpointStateRef, LoopCheckpointStore,
     MAX_CHECKPOINT_STATE_PAYLOAD_BYTES, PutCheckpointStateRequest, PutLoopCheckpointRequest,
     RedactedCheckpointPayload, ReplyTargetBindingRef, RunProfileId, RunProfileVersion,
-    SourceBindingRef, TurnCheckpointId, TurnCheckpointRecord, TurnEventKind, TurnId,
+    SourceBindingRef, TurnActor, TurnCheckpointId, TurnCheckpointRecord, TurnEventKind, TurnId,
     TurnLifecycleEvent, TurnPersistenceSnapshot, TurnRunId, TurnRunState, TurnScope, TurnStatus,
     TurnTimestamp, run_profile::LoopCheckpointKind,
 };
@@ -419,6 +419,9 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
 
     let state = TurnRunState {
         scope: scope.clone(),
+        actor: Some(TurnActor::new(
+            UserId::new("user-checkpoint-public").unwrap(),
+        )),
         turn_id: TurnId::new(),
         run_id,
         status: TurnStatus::BlockedApproval,

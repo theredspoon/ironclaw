@@ -1434,6 +1434,7 @@ async fn loop_prompt_bundle_public_serialization_hides_raw_content() {
 
     let status = TurnRunState {
         scope: host.context.scope.clone(),
+        actor: Some(TurnActor::new(UserId::new("user-loop-host").unwrap())),
         turn_id: host.context.turn_id,
         run_id: host.context.run_id,
         status: TurnStatus::Running,
