@@ -523,6 +523,98 @@ async fn concrete_product_workflow_accepts_user_message_for_trusted_installation
 }
 
 #[tokio::test]
+async fn concrete_product_workflow_accepts_shared_route_participant_on_existing_thread() {
+    let tenant_id = TenantId::new("tenant:alpha").expect("tenant");
+    let adapter_kind = ironclaw_conversations::AdapterKind::new("test_adapter").expect("adapter");
+    let installation_id =
+        ironclaw_conversations::AdapterInstallationId::new("install_alpha").expect("install");
+    let conversations = Arc::new(InMemoryConversationServices::default());
+    conversations
+        .pair_external_actor(
+            tenant_id.clone(),
+            adapter_kind.clone(),
+            installation_id.clone(),
+            ironclaw_conversations::ExternalActorRef::new("test", "user1").expect("actor"),
+            UserId::new("user:alice").expect("user"),
+        )
+        .await;
+    conversations
+        .pair_external_actor(
+            tenant_id.clone(),
+            adapter_kind,
+            installation_id,
+            ironclaw_conversations::ExternalActorRef::new("test", "user2").expect("actor"),
+            UserId::new("user:bob").expect("user"),
+        )
+        .await;
+    let binding = product_binding_service(
+        conversations.clone(),
+        vec![(
+            "test_adapter",
+            "install_alpha",
+            "tenant:alpha",
+            "agent:alpha",
+            Some("project:alpha"),
+        )],
+    );
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = Arc::new(DefaultInboundTurnService::new(
+        binding.clone(),
+        InMemorySessionThreadService::default(),
+        coordinator.clone(),
+    ));
+    let workflow = DefaultProductWorkflow::new(
+        inbound,
+        Arc::new(InMemoryIdempotencyLedger::new()),
+        Arc::new(binding),
+    );
+
+    workflow
+        .accept_inbound(sample_envelope_with_payload(
+            "shared-alice",
+            ProductInboundPayload::UserMessage(
+                UserMessagePayload::new("hello shared", vec![], ProductTriggerReason::BotMention)
+                    .expect("message"),
+            ),
+        ))
+        .await
+        .expect("alice shared message accepted");
+    let shared_thread_id = coordinator.submissions()[0].scope.thread_id.clone();
+    conversations
+        .add_thread_participant(
+            &tenant_id,
+            &shared_thread_id,
+            UserId::new("user:bob").expect("user"),
+        )
+        .await
+        .expect("bob participant added");
+
+    workflow
+        .accept_inbound(sample_envelope_with_context(
+            ProductAdapterId::new("test_adapter").expect("adapter"),
+            AdapterInstallationId::new("install_alpha").expect("install"),
+            ExternalEventId::new("evt:shared-bob").expect("event"),
+            ExternalActorRef::new("test", "user2", Option::<String>::None).expect("actor"),
+            ExternalConversationRef::new(None, "conv1", None, None).expect("conversation"),
+            ProductInboundPayload::UserMessage(
+                UserMessagePayload::new("hello from bob", vec![], ProductTriggerReason::BotMention)
+                    .expect("message"),
+            ),
+        ))
+        .await
+        .expect("shared participant accepted on existing thread");
+
+    let submissions = coordinator.submissions();
+    assert_eq!(submissions.len(), 2);
+    assert_eq!(
+        submissions[0].scope.thread_id,
+        submissions[1].scope.thread_id
+    );
+    assert_eq!(submissions[0].actor.user_id.as_str(), "user:alice");
+    assert_eq!(submissions[1].actor.user_id.as_str(), "user:bob");
+}
+
+#[tokio::test]
 async fn concrete_product_workflow_persists_first_bind_default_scope() {
     let conversations = Arc::new(InMemoryConversationServices::default());
     conversations

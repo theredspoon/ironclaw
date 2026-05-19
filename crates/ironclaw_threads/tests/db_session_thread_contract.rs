@@ -5,8 +5,8 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AppendAssistantDraftRequest, CreateSummaryArtifactRequest,
     EnsureThreadRequest, LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
-    RedactMessageRequest, SessionThreadService, ThreadHistoryRequest, ThreadScope,
-    UpdateAssistantDraftRequest,
+    RedactMessageRequest, SessionThreadError, SessionThreadService, ThreadHistoryRequest,
+    ThreadScope, UpdateAssistantDraftRequest,
 };
 
 #[cfg(feature = "libsql")]
@@ -56,6 +56,16 @@ async fn libsql_accepts_long_external_event_ids_without_index_key_bloat() {
     let service = LibSqlSessionThreadService::new(db);
     service.run_migrations().await.unwrap();
     durable_long_external_event_flow(&service, "libsql-long-id").await;
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_rejects_cross_actor_duplicate_external_event_replay() {
+    let (db_path, _dir) = libsql_db_path();
+    let db = Arc::new(libsql::Builder::new_local(db_path).build().await.unwrap());
+    let service = LibSqlSessionThreadService::new(db);
+    service.run_migrations().await.unwrap();
+    durable_cross_actor_duplicate_event_rejects(&service, "libsql-actor-replay").await;
 }
 
 #[cfg(feature = "postgres")]
@@ -113,6 +123,18 @@ async fn postgres_accepts_long_external_event_ids_without_index_key_bloat_when_c
     service.run_migrations().await.unwrap();
     let label = format!("pg-long-id-{}", unique_suffix());
     durable_long_external_event_flow(&service, &label).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_rejects_cross_actor_duplicate_external_event_replay_when_configured() {
+    let Some(pool) = postgres_pool().await else {
+        return;
+    };
+    let service = PostgresSessionThreadService::new(pool);
+    service.run_migrations().await.unwrap();
+    let label = format!("pg-actor-replay-{}", uuid::Uuid::new_v4());
+    durable_cross_actor_duplicate_event_rejects(&service, &label).await;
 }
 
 async fn durable_history_flow(service: &impl SessionThreadService, label: &str) -> ThreadId {
@@ -403,6 +425,51 @@ async fn durable_long_external_event_flow(service: &impl SessionThreadService, l
         history.messages[0].content.as_deref(),
         Some("large id event")
     );
+}
+
+async fn durable_cross_actor_duplicate_event_rejects(
+    service: &impl SessionThreadService,
+    label: &str,
+) {
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope(label),
+            thread_id: Some(ThreadId::new(format!("thread-{label}")).unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope(label),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: Some("web-client".into()),
+            reply_target_binding_id: None,
+            external_event_id: Some("event-actor-check".into()),
+            content: MessageContent::text("actor a event"),
+        })
+        .await
+        .unwrap();
+
+    let replay = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope(label),
+            thread_id: thread.thread_id,
+            actor_id: "actor-b".into(),
+            source_binding_id: Some("web-client".into()),
+            reply_target_binding_id: None,
+            external_event_id: Some("event-actor-check".into()),
+            content: MessageContent::text("actor b must not replay actor a"),
+        })
+        .await;
+
+    assert!(matches!(
+        replay,
+        Err(SessionThreadError::IdempotentReplayActorMismatch { .. })
+    ));
 }
 
 async fn assert_concurrent_history(service: &impl SessionThreadService, label: &str) {

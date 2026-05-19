@@ -3,8 +3,8 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AppendAssistantDraftRequest, CreateSummaryArtifactRequest,
     EnsureThreadRequest, InMemorySessionThreadService, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, RedactMessageRequest, SessionThreadService, ThreadHistoryRequest,
-    ThreadMessageId, ThreadScope, UpdateAssistantDraftRequest,
+    MessageKind, MessageStatus, RedactMessageRequest, SessionThreadError, SessionThreadService,
+    ThreadHistoryRequest, ThreadMessageId, ThreadScope, UpdateAssistantDraftRequest,
 };
 
 fn scope(label: &str) -> ThreadScope {
@@ -191,6 +191,51 @@ async fn duplicate_external_event_with_wrong_thread_does_not_replay_cross_thread
         .await;
 
     assert!(replay.is_err());
+}
+
+#[tokio::test]
+async fn duplicate_external_event_with_wrong_actor_does_not_replay_cross_actor_message() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: Some("telegram-thread-1".into()),
+            reply_target_binding_id: Some("telegram-thread-1".into()),
+            external_event_id: Some("telegram-event-actor-check".into()),
+            content: user_message("first actor only"),
+        })
+        .await
+        .unwrap();
+
+    let replay = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+            actor_id: "actor-b".into(),
+            source_binding_id: Some("telegram-thread-1".into()),
+            reply_target_binding_id: Some("telegram-thread-1".into()),
+            external_event_id: Some("telegram-event-actor-check".into()),
+            content: user_message("must not replay first actor"),
+        })
+        .await;
+
+    assert!(matches!(
+        replay,
+        Err(SessionThreadError::IdempotentReplayActorMismatch { .. })
+    ));
 }
 
 #[tokio::test]
