@@ -115,12 +115,22 @@ fn sanitize_request(request: &NetworkTransportRequest) -> SanitizedNetworkTransp
 
 fn is_sensitive_header(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
-    normalized == "authorization"
-        || normalized == "cookie"
-        || normalized == "set-cookie"
-        || normalized == "proxy-authorization"
-        || normalized.contains("api-key")
-        || normalized.contains("apikey")
-        || normalized.contains("token")
-        || normalized.contains("secret")
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "cookie"
+            | "set-cookie"
+            | "proxy-authorization"
+            | "api-key"
+            | "apikey"
+            | "x-api-key"
+            | "x-auth-token"
+            | "x-access-token"
+            | "x-csrf-token"
+            | "csrf-token"
+            | "secret"
+            | "x-secret"
+            | "client-secret"
+            | "x-client-secret"
+    )
 }

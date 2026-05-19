@@ -18,6 +18,8 @@ use crate::support::trace_llm::{
     ExpectedToolResult, LlmTrace, TraceResponse, TraceStep, TraceToolCall,
 };
 
+const TRACE_REPLAY_SURFACE_VERSION: &str = "trace_replay_v1";
+
 #[derive(Debug, Error)]
 pub enum RebornTraceReplayError {
     #[error("trace response variant cannot be replayed by the Reborn model gateway")]
@@ -112,7 +114,6 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
                 "trace replay lock poisoned",
             )
         })?;
-        state.requests.push(request.clone());
         let Some(step) = state.steps.front().cloned() else {
             return Err(HostManagedModelError::safe(
                 HostManagedModelErrorKind::Unavailable,
@@ -120,6 +121,7 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
             ));
         };
         validate_expected_tool_results(&request, &step.expected_tool_results)?;
+        state.requests.push(request);
         state.steps.pop_front();
         Ok(step.response)
     }
@@ -155,7 +157,14 @@ fn response_from_trace(
 fn capability_call_from_trace(
     call: TraceToolCall,
 ) -> Result<CapabilityCallCandidate, RebornTraceReplayError> {
-    let surface_version = CapabilitySurfaceVersion::new("trace_replay_v1")
+    capability_call_from_trace_with_surface(call, TRACE_REPLAY_SURFACE_VERSION)
+}
+
+pub(crate) fn capability_call_from_trace_with_surface(
+    call: TraceToolCall,
+    surface_version: &str,
+) -> Result<CapabilityCallCandidate, RebornTraceReplayError> {
+    let surface_version = CapabilitySurfaceVersion::new(surface_version)
         .map_err(RebornTraceReplayError::InvalidSurfaceVersion)?;
     let capability_name = if call.name.contains('.') {
         call.name.clone()
@@ -200,7 +209,7 @@ fn validate_expected_tool_results(
     for expected_result in expected {
         let matched = request.messages.iter().any(|message| {
             message.role == HostManagedModelMessageRole::ToolResult
-                && message.content.contains(&expected_result.content)
+                && message.content == expected_result.content
                 && message
                     .tool_result_provider_call
                     .as_ref()

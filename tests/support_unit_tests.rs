@@ -399,7 +399,10 @@ mod reborn_support_tests {
     };
 
     use crate::reborn_support::delivery::RecordingOutboundDeliverySink;
-    use crate::reborn_support::model_replay::RebornTraceReplayModelGateway;
+    use crate::reborn_support::model_replay::{
+        RebornTraceReplayError, RebornTraceReplayModelGateway,
+        capability_call_from_trace_with_surface,
+    };
     use crate::reborn_support::network::RecordingNetworkHttpTransport;
     use crate::reborn_support::product_workflow::{RebornProductWorkflowHarness, resource_scope};
     use crate::reborn_support::session_thread::RebornThreadHarness;
@@ -501,6 +504,30 @@ mod reborn_support_tests {
                 .is_err(),
             "missing expected tool result must fail"
         );
+        assert!(
+            missing.requests().is_empty(),
+            "failed validations should not record successful model requests"
+        );
+        assert_eq!(missing.remaining_responses(), 1);
+
+        let substring = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
+            "trace",
+            "run tool",
+            vec![trace_step.clone()],
+        ))
+        .expect("substring gateway");
+        assert!(
+            substring
+                .stream_model(model_request(vec![tool_result_message(
+                    "call-1",
+                    "test.echo",
+                    "tool output with suffix",
+                )]))
+                .await
+                .is_err(),
+            "tool result validation must require exact content equality"
+        );
+        assert!(substring.requests().is_empty());
 
         let matched = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
             "trace",
@@ -516,6 +543,70 @@ mod reborn_support_tests {
             )]))
             .await
             .expect("matching tool result");
+        assert_eq!(matched.requests().len(), 1);
+    }
+
+    #[test]
+    fn trace_replay_rejects_user_input_response() {
+        let error = RebornTraceReplayModelGateway::from_trace(LlmTrace::single_turn(
+            "trace",
+            "user marker",
+            vec![TraceStep {
+                request_hint: None,
+                response: TraceResponse::UserInput {
+                    content: "hello".to_string(),
+                },
+                expected_tool_results: Vec::new(),
+            }],
+        ))
+        .expect_err("user input response is not replayable");
+
+        assert!(matches!(error, RebornTraceReplayError::UnsupportedResponse));
+    }
+
+    #[test]
+    fn capability_call_from_trace_rejects_invalid_inputs() {
+        let invalid_surface = capability_call_from_trace_with_surface(
+            TraceToolCall {
+                id: "call-1".to_string(),
+                name: "test.echo".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "invalid surface!",
+        )
+        .expect_err("invalid surface version");
+        assert!(matches!(
+            invalid_surface,
+            RebornTraceReplayError::InvalidSurfaceVersion(_)
+        ));
+
+        let invalid_capability = capability_call_from_trace_with_surface(
+            TraceToolCall {
+                id: "call-1".to_string(),
+                name: "Bad Name".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "trace_replay_v1",
+        )
+        .expect_err("invalid capability id");
+        assert!(matches!(
+            invalid_capability,
+            RebornTraceReplayError::InvalidCapabilityId { .. }
+        ));
+
+        let invalid_input_ref = capability_call_from_trace_with_surface(
+            TraceToolCall {
+                id: "bad\nid".to_string(),
+                name: "test.echo".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            "trace_replay_v1",
+        )
+        .expect_err("invalid input ref");
+        assert!(matches!(
+            invalid_input_ref,
+            RebornTraceReplayError::InvalidInputRef { .. }
+        ));
     }
 
     #[tokio::test]
@@ -612,6 +703,8 @@ mod reborn_support_tests {
             headers: vec![
                 ("authorization".to_string(), "Bearer secret".to_string()),
                 ("x-api-key".to_string(), "secret-key".to_string()),
+                ("x-token-type".to_string(), "Bearer".to_string()),
+                ("x-secret-hash-algorithm".to_string(), "sha256".to_string()),
             ],
             body: b"secret body".to_vec(),
             resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
@@ -625,6 +718,8 @@ mod reborn_support_tests {
             vec![
                 ("authorization".to_string(), "<redacted>".to_string()),
                 ("x-api-key".to_string(), "<redacted>".to_string()),
+                ("x-token-type".to_string(), "Bearer".to_string()),
+                ("x-secret-hash-algorithm".to_string(), "sha256".to_string()),
             ]
         );
         assert_eq!(request.body_len, 11);
@@ -867,7 +962,7 @@ mod reborn_support_tests {
                 .expect("product workflow harness");
         let thread_harness =
             RebornThreadHarness::filesystem_temp(thread_scope("workflow")).expect("thread harness");
-        let coordinator = CapturingTurnCoordinator::default();
+        let coordinator = DryRunCapturingTurnCoordinator::default();
         let inbound: Arc<dyn InboundTurnService> = Arc::new(DefaultInboundTurnService::new(
             product_harness.binding_service().expect("binding service"),
             thread_harness.service_instance().expect("thread service"),
@@ -1115,12 +1210,16 @@ mod reborn_support_tests {
         )
     }
 
+    /// Documented dry-run substitution: this test exercises the real product
+    /// workflow, binding service, idempotency ledger, and thread service while
+    /// capturing the final turn submission instead of starting the Reborn
+    /// runtime loop or routing product traffic.
     #[derive(Clone, Default)]
-    struct CapturingTurnCoordinator {
+    struct DryRunCapturingTurnCoordinator {
         submissions: Arc<Mutex<Vec<SubmitTurnRequest>>>,
     }
 
-    impl CapturingTurnCoordinator {
+    impl DryRunCapturingTurnCoordinator {
         fn submission_count(&self) -> usize {
             self.submissions
                 .lock()
@@ -1130,7 +1229,7 @@ mod reborn_support_tests {
     }
 
     #[async_trait]
-    impl TurnCoordinator for CapturingTurnCoordinator {
+    impl TurnCoordinator for DryRunCapturingTurnCoordinator {
         async fn submit_turn(
             &self,
             request: SubmitTurnRequest,

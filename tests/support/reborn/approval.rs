@@ -4,21 +4,8 @@
 //! authorization stores. Full approval helpers are added with the runtime
 //! harness that drives the real blocked/resume path.
 
-#![allow(dead_code)]
+#![allow(dead_code)] // External-boundary shims consumed by future binary-E2E tests.
 
-use std::time::Duration;
+use super::config::WaitConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApprovalWaitConfig {
-    pub timeout: Duration,
-    pub poll_interval: Duration,
-}
-
-impl Default for ApprovalWaitConfig {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(3),
-            poll_interval: Duration::from_millis(10),
-        }
-    }
-}
+pub type ApprovalWaitConfig = WaitConfig;

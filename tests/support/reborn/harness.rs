@@ -11,21 +11,8 @@
 //! harness itself; tests must not fall back to product-workflow fakes when
 //! claiming #3702 parity.
 
-#![allow(dead_code)]
+#![allow(dead_code)] // Test-only harness skeleton consumed by future binary-E2E tests.
 
-use std::time::Duration;
+use super::config::WaitConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HarnessWaitConfig {
-    pub timeout: Duration,
-    pub poll_interval: Duration,
-}
-
-impl Default for HarnessWaitConfig {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(3),
-            poll_interval: Duration::from_millis(10),
-        }
-    }
-}
+pub type HarnessWaitConfig = WaitConfig;

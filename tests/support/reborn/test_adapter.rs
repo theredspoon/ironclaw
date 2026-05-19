@@ -4,9 +4,9 @@ use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeliveryStatus, ExternalActorRef,
     ExternalConversationRef, ExternalEventId, OutboundDeliverySink, ParsedProductInbound,
     ProductAdapter, ProductAdapterCapabilities, ProductAdapterError, ProductAdapterHealth,
-    ProductInboundEnvelope, ProductInboundPayload, ProductOutboundEnvelope, ProductRenderOutcome,
-    ProductSurfaceKind, ProductTriggerReason, ProtocolAuthEvidence, ProtocolAuthFailure,
-    ProtocolHttpEgress, TrustedInboundContext, UserMessagePayload,
+    ProductAdapterId, ProductInboundEnvelope, ProductInboundPayload, ProductOutboundEnvelope,
+    ProductRenderOutcome, ProductSurfaceKind, ProductTriggerReason, ProtocolAuthEvidence,
+    ProtocolAuthFailure, ProtocolHttpEgress, TrustedInboundContext, UserMessagePayload,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,8 +17,6 @@ pub struct RebornTestProductAdapter {
     capabilities: ProductAdapterCapabilities,
     auth_requirement: AuthRequirement,
 }
-
-use ironclaw_product_adapters::ProductAdapterId;
 
 impl RebornTestProductAdapter {
     pub fn new(
