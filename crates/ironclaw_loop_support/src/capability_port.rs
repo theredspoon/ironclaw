@@ -997,13 +997,13 @@ fn normalize_provider_value(
 
     if schema_type_matches(schema, "array") {
         let array_value = coerce_json_string(value, label)?;
-        let Some(items) = schema.get("items") else {
-            return Ok(array_value);
-        };
         let Some(array) = array_value.as_array() else {
             if is_json_container_string(value) {
                 return Err(provider_coercion_error(label, "array"));
             }
+            return Ok(array_value);
+        };
+        let Some(items) = schema.get("items") else {
             return Ok(array_value);
         };
         return array
@@ -2168,6 +2168,25 @@ mod tests {
             "provider arguments",
         )
         .expect_err("stringified object should not satisfy array schema");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    }
+
+    #[test]
+    fn provider_argument_normalization_rejects_mismatched_stringified_array_without_items() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "rows": { "type": "array" }
+            }
+        });
+
+        let error = normalize_provider_arguments(
+            &serde_json::json!({ "rows": "{\"index\":\"1\"}" }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("stringified object should not satisfy array schema without items");
 
         assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
     }
