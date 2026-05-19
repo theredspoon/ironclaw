@@ -45,6 +45,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
+mod extension_contracts;
 mod first_party;
 mod first_party_tools;
 pub mod memory_context;
@@ -55,6 +56,11 @@ mod services;
 mod surface;
 mod turn_scheduler;
 
+pub use extension_contracts::{
+    default_host_api_contract_registry, default_host_port_catalog,
+    discover_extensions_with_default_host_api_contracts,
+    discover_extensions_with_default_host_api_contracts_and_catalog,
+};
 pub use first_party::{
     FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
     FirstPartyCapabilityRequest, FirstPartyCapabilityResult,

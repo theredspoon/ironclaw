@@ -839,6 +839,43 @@ fn repl_help_command_prints_repl_commands_and_exits_on_exit() {
 }
 
 #[test]
+fn run_help_command_prints_repl_commands_and_exits_on_quit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let mut child = Command::new(reborn_bin())
+        .arg("run")
+        .env_clear()
+        .env("IRONCLAW_REBORN_HOME", temp.path().join("reborn-home"))
+        .env("HOME", temp.path().join("home"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ironclaw-reborn run should start");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(b"/help\n/quit\n")
+        .expect("run repl commands should be written");
+    let output = child
+        .wait_with_output()
+        .expect("ironclaw-reborn run should finish");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.is_empty(), "stdout should stay reply-only: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Reborn REPL commands:"), "stderr: {stderr}");
+    assert!(stderr.contains("/exit"), "stderr: {stderr}");
+    assert!(stderr.contains("/quit"), "stderr: {stderr}");
+}
+
+#[test]
 fn repl_piped_message_exits_nonzero_when_runtime_does_not_produce_reply() {
     let temp = tempfile::tempdir().expect("tempdir");
 
