@@ -33,18 +33,20 @@ use ironclaw_host_api::{
     TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
-    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, HostRuntime, READ_FILE_CAPABILITY_ID,
-    SurfaceKind, WRITE_FILE_CAPABILITY_ID,
+    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID,
+    HostRuntime, LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SurfaceKind,
+    WRITE_FILE_CAPABILITY_ID,
 };
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
-    HostManagedModelRequest, HostRuntimeLoopCapabilityPortFactory,
+    HostManagedModelRequest, HostRuntimeLoopCapabilityPortFactory, LoopCapabilityResultWriter,
 };
 use ironclaw_product_adapters::{ProductInboundAck, ProductWorkflow};
 use ironclaw_product_workflow::{
     ConversationBindingService, DefaultInboundTurnService, DefaultProductWorkflow,
-    IdempotencyLedger, InboundTurnService, ResolveBindingRequest, ResolvedBinding,
+    IdempotencyLedger, InboundTurnService, ProductConversationRouteKind, ResolveBindingRequest,
+    ResolvedBinding,
 };
 use ironclaw_reborn::{
     loop_driver_host::LoopCapabilityPortFactory,
@@ -70,9 +72,9 @@ use ironclaw_trust::EffectiveTrustClass;
 use ironclaw_turns::{
     DefaultTurnCoordinator, FilesystemTurnStateStore, GateRef, GetLoopCheckpointRequest,
     GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore, LoopBlockedKind,
-    LoopCheckpointKind, LoopCheckpointStore, LoopGateRef, ReplyTargetBindingRef, ResumeTurnRequest,
-    SourceBindingRef, TurnActor, TurnCoordinator, TurnError, TurnRunId, TurnRunState, TurnScope,
-    TurnStateStore, TurnStatus,
+    LoopCheckpointKind, LoopCheckpointStore, LoopGateRef, LoopResultRef, ReplyTargetBindingRef,
+    ResumeTurnRequest, SourceBindingRef, TurnActor, TurnCoordinator, TurnError, TurnRunId,
+    TurnRunState, TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
         CapabilityBatchOutcome, CapabilityCallCandidate, CapabilityDescriptorView,
@@ -136,6 +138,12 @@ pub struct SubmittedTurn {
     pub scope: TurnScope,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordedCapabilityResult {
+    pub capability_id: CapabilityId,
+    pub output: serde_json::Value,
+}
+
 enum HarnessCapabilityMode {
     Recording(RecordingTestCapabilityPort),
     HostRuntime(Arc<HostRuntimeCapabilityHarness>),
@@ -159,6 +167,13 @@ impl HarnessCapabilityRecorder {
         match self {
             Self::Recording(_) => None,
             Self::HostRuntime(harness) => Some(harness.workspace_file_path(relative)),
+        }
+    }
+
+    fn capability_results(&self) -> Vec<RecordedCapabilityResult> {
+        match self {
+            Self::Recording(_) => Vec::new(),
+            Self::HostRuntime(harness) => harness.capability_results(),
         }
     }
 }
@@ -192,6 +207,34 @@ impl RebornBinaryE2EHarness {
         model_gateway: RebornTraceReplayModelGateway,
     ) -> HarnessResult<Self> {
         let host_runtime = Arc::new(HostRuntimeCapabilityHarness::file_tools().await?);
+        Self::with_model_gateway_capability_mode(
+            conversation_id,
+            model_gateway,
+            HarnessCapabilityMode::HostRuntime(host_runtime),
+            false,
+        )
+        .await
+    }
+
+    pub async fn with_host_runtime_write_only(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+    ) -> HarnessResult<Self> {
+        let host_runtime = Arc::new(HostRuntimeCapabilityHarness::write_only().await?);
+        Self::with_model_gateway_capability_mode(
+            conversation_id,
+            model_gateway,
+            HarnessCapabilityMode::HostRuntime(host_runtime),
+            false,
+        )
+        .await
+    }
+
+    pub async fn with_host_runtime_coding_read_capabilities(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+    ) -> HarnessResult<Self> {
+        let host_runtime = Arc::new(HostRuntimeCapabilityHarness::coding_read_tools().await?);
         Self::with_model_gateway_capability_mode(
             conversation_id,
             model_gateway,
@@ -296,13 +339,15 @@ impl RebornBinaryE2EHarness {
             model_budget_accountant: None,
             safety_context: None,
         })?;
+        let binding_service: Arc<dyn ConversationBindingService> =
+            Arc::new(product_harness.binding_service()?);
         let inbound: Arc<dyn InboundTurnService> = Arc::new(DefaultInboundTurnService::new(
-            product_harness.binding_service()?,
+            Arc::clone(&binding_service),
             thread_harness.service_instance()?,
             composition.coordinator.clone(),
         ));
         let ledger: Arc<dyn IdempotencyLedger> = Arc::new(product_harness.idempotency_ledger());
-        let workflow = DefaultProductWorkflow::new(inbound, ledger);
+        let workflow = DefaultProductWorkflow::new(inbound, ledger, binding_service);
 
         Ok(Self::from_composition(
             ingress,
@@ -508,6 +553,10 @@ impl RebornBinaryE2EHarness {
         self.capability_recorder.invocations()
     }
 
+    pub fn capability_results(&self) -> Vec<RecordedCapabilityResult> {
+        self.capability_recorder.capability_results()
+    }
+
     pub fn host_workspace_file_path(&self, relative: &str) -> HarnessResult<PathBuf> {
         self.capability_recorder
             .workspace_file_path(relative)
@@ -650,19 +699,59 @@ struct HostRuntimeCapabilityHarness {
     effect_kinds: Vec<EffectKind>,
     user_id: UserId,
     invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
+    results: Arc<Mutex<Vec<RecordedCapabilityResult>>>,
 }
 
 impl HostRuntimeCapabilityHarness {
     async fn file_tools() -> HarnessResult<Self> {
+        Self::new(
+            "reborn-e2e-builtin-tools",
+            vec![
+                CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?,
+                CapabilityId::new(READ_FILE_CAPABILITY_ID)?,
+            ],
+            vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+            UserId::new("reborn-e2e-builtin-user")?,
+        )
+        .await
+    }
+
+    async fn write_only() -> HarnessResult<Self> {
+        Self::new(
+            "reborn-e2e-write-only",
+            vec![CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?],
+            vec![EffectKind::WriteFilesystem],
+            UserId::new("reborn-e2e-write-only-user")?,
+        )
+        .await
+    }
+
+    async fn coding_read_tools() -> HarnessResult<Self> {
+        Self::new(
+            "reborn-e2e-coding-read-tools",
+            vec![
+                CapabilityId::new(LIST_DIR_CAPABILITY_ID)?,
+                CapabilityId::new(GLOB_CAPABILITY_ID)?,
+                CapabilityId::new(GREP_CAPABILITY_ID)?,
+            ],
+            vec![EffectKind::ReadFilesystem],
+            UserId::new("reborn-e2e-coding-read-user")?,
+        )
+        .await
+    }
+
+    async fn new(
+        service_label: &'static str,
+        capability_ids: Vec<CapabilityId>,
+        effect_kinds: Vec<EffectKind>,
+        user_id: UserId,
+    ) -> HarnessResult<Self> {
         let root = Arc::new(tempfile::tempdir()?);
         let storage_root = root.path().join("local-dev");
         let workspace_root = storage_root.join("workspace");
         std::fs::create_dir_all(&workspace_root)?;
-        let services = build_reborn_services(RebornBuildInput::local_dev(
-            "reborn-e2e-builtin-tools",
-            storage_root,
-        ))
-        .await?;
+        let services =
+            build_reborn_services(RebornBuildInput::local_dev(service_label, storage_root)).await?;
         let runtime = services
             .host_runtime
             .ok_or("local-dev Reborn services missing host runtime")?;
@@ -673,13 +762,11 @@ impl HostRuntimeCapabilityHarness {
             root,
             workspace_root,
             mounts,
-            capability_ids: vec![
-                CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?,
-                CapabilityId::new(READ_FILE_CAPABILITY_ID)?,
-            ],
-            effect_kinds: vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
-            user_id: UserId::new("reborn-e2e-builtin-user")?,
+            capability_ids,
+            effect_kinds,
+            user_id,
             invocations: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -695,6 +782,10 @@ impl HostRuntimeCapabilityHarness {
 
     fn invocations(&self) -> Vec<CapabilityInvocation> {
         self.invocations.lock().unwrap().clone()
+    }
+
+    fn capability_results(&self) -> Vec<RecordedCapabilityResult> {
+        self.results.lock().unwrap().clone()
     }
 
     fn workspace_file_path(&self, relative: &str) -> PathBuf {
@@ -736,11 +827,15 @@ impl LoopCapabilityPortFactory for HostRuntimeHarnessCapabilityPortFactory {
         let visible_request = visible_capability_request_for_run(run_context, authority)
             .map_err(host_runtime_harness_error)?;
         let milestone_sink: Arc<dyn LoopHostMilestoneSink> = self.milestone_sink.clone();
+        let result_writer = Arc::new(RecordingCapabilityResultWriter {
+            inner: self.harness.io.clone(),
+            results: Arc::clone(&self.harness.results),
+        });
         let port = HostRuntimeLoopCapabilityPortFactory::new(
             Arc::clone(&self.harness.runtime),
             visible_request,
             self.harness.io.clone(),
-            self.harness.io.clone(),
+            result_writer,
             Some(milestone_sink),
         )
         .with_execution_mounts(execution_mounts)
@@ -801,6 +896,31 @@ impl LoopCapabilityPort for RecordingDelegatingCapabilityPort {
             .unwrap()
             .extend(request.invocations.iter().cloned());
         self.inner.invoke_capability_batch(request).await
+    }
+}
+
+struct RecordingCapabilityResultWriter {
+    inner: Arc<ProductLiveCapabilityIo>,
+    results: Arc<Mutex<Vec<RecordedCapabilityResult>>>,
+}
+
+#[async_trait]
+impl LoopCapabilityResultWriter for RecordingCapabilityResultWriter {
+    async fn write_capability_result(
+        &self,
+        run_context: &LoopRunContext,
+        capability_id: &CapabilityId,
+        output: serde_json::Value,
+    ) -> Result<LoopResultRef, AgentLoopHostError> {
+        let result_ref = self
+            .inner
+            .write_capability_result(run_context, capability_id, output.clone())
+            .await?;
+        self.results.lock().unwrap().push(RecordedCapabilityResult {
+            capability_id: capability_id.clone(),
+            output,
+        });
+        Ok(result_ref)
     }
 }
 
@@ -1054,6 +1174,8 @@ fn binding_request(
         installation_id: envelope.installation_id().clone(),
         external_actor_ref: envelope.external_actor_ref().clone(),
         external_conversation_ref: envelope.external_conversation_ref().clone(),
+        external_event_id: envelope.external_event_id().clone(),
+        route_kind: ProductConversationRouteKind::Direct,
         auth_claim: envelope.auth_claim().clone(),
     })
 }
