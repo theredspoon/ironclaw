@@ -207,6 +207,19 @@ where
         write_json(&self.filesystem, &self.scope, &path, &stored).await?;
         Ok(binding)
     }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        let path = binding_path(&self.scope, &request)?;
+        read_json::<F, StoredConversationBinding>(&self.filesystem, &self.scope, &path)
+            .await?
+            .map(|stored| stored.binding)
+            .ok_or_else(|| ProductWorkflowError::BindingRequired {
+                reason: "conversation binding not found".to_string(),
+            })
+    }
 }
 
 #[derive(Clone)]
