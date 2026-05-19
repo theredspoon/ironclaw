@@ -173,7 +173,11 @@ pub(crate) fn invalid_path(error: HostApiError) -> ProcessError {
 impl ProcessError {
     /// Returns true when the process failure wraps a typed filesystem NotFound.
     pub fn is_filesystem_not_found(&self) -> bool {
-        matches!(self, Self::Filesystem(FilesystemError::NotFound { .. }))
+        match self {
+            Self::Filesystem(FilesystemError::NotFound { .. }) => true,
+            Self::ResourceCleanupFailed { original, .. } => original.is_filesystem_not_found(),
+            _ => false,
+        }
     }
 }
 

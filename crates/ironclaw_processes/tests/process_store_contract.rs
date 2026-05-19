@@ -1429,6 +1429,28 @@ async fn filesystem_process_store_preserves_typed_backend_errors_that_mention_no
     assert!(!err.is_filesystem_not_found());
 }
 
+#[tokio::test]
+async fn filesystem_process_result_store_preserves_typed_backend_write_errors() {
+    let fs = BackendErrorFilesystem;
+    let store = FilesystemProcessResultStore::new(&fs);
+    let invocation_id = InvocationId::new();
+    let process_id = ProcessId::new();
+    let scope = sample_scope(invocation_id, "tenant1", "user1");
+
+    let err = store
+        .complete(&scope, process_id, serde_json::json!({"ok": true}))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        &err,
+        ProcessError::Filesystem(FilesystemError::Backend { operation, reason, .. })
+            if *operation == FilesystemOperation::WriteFile
+                && reason.contains("database index not found")
+    ));
+    assert!(!err.is_filesystem_not_found());
+}
+
 #[test]
 fn process_error_filesystem_not_found_predicate_distinguishes_backend_errors() {
     let path = VirtualPath::new("/users/user1/processes/missing.json").unwrap();
@@ -1444,6 +1466,15 @@ fn process_error_filesystem_not_found_predicate_distinguishes_backend_errors() {
 
     assert!(not_found.is_filesystem_not_found());
     assert!(!backend.is_filesystem_not_found());
+
+    let wrapped_not_found = ProcessError::ResourceCleanupFailed {
+        original: Box::new(not_found),
+        cleanup: ResourceError::UnknownReservation {
+            id: ResourceReservationId::new(),
+        },
+    };
+
+    assert!(wrapped_not_found.is_filesystem_not_found());
 }
 
 #[tokio::test]
