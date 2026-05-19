@@ -1,11 +1,11 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_filesystem::{FilesystemError, LocalFilesystem, RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
-    AgentId, HostApiError, HostPath, MountAlias, MountGrant, MountPermissions, MountView,
-    ProjectId, ResourceScope, ScopedPath, TenantId, ThreadId, UserId, VirtualPath,
+    AgentId, HostApiError, MountAlias, MountGrant, MountPermissions, MountView, ProjectId,
+    ResourceScope, ScopedPath, TenantId, ThreadId, UserId, VirtualPath,
 };
 use ironclaw_product_workflow::{
     ActionFingerprintKey, ActionPhase, ConversationBindingService, IdempotencyDecision,
@@ -16,6 +16,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+use super::filesystem::local_filesystem;
 
 #[derive(Debug, Error)]
 pub enum RebornProductWorkflowHarnessError {
@@ -130,6 +132,18 @@ impl RebornProductWorkflowHarness {
             Arc::clone(&self.idempotency_lock),
         )
     }
+
+    pub async fn corrupt_binding_record_for_test(
+        &self,
+        request: &ResolveBindingRequest,
+        bytes: Vec<u8>,
+    ) -> Result<(), ProductWorkflowError> {
+        let path = binding_path(request)?;
+        self.filesystem
+            .write_bytes(&self.scope, &path, bytes)
+            .await
+            .map_err(|error| fs_error("write malformed product workflow record", error))
+    }
 }
 
 #[derive(Clone)]
@@ -144,7 +158,6 @@ impl<F> FilesystemConversationBindingService<F>
 where
     F: RootFilesystem,
 {
-    #[allow(dead_code)] // Convenience constructor for standalone test-support ledgers.
     pub fn new(
         filesystem: Arc<ScopedFilesystem<F>>,
         scope: ResourceScope,
@@ -184,14 +197,6 @@ where
             project_id: self.project_id.clone(),
         };
         let stored = StoredConversationBinding {
-            adapter_id: request.adapter_id.as_str().to_string(),
-            installation_id: request.installation_id.as_str().to_string(),
-            external_actor_kind: request.external_actor_ref.kind().to_string(),
-            external_actor_id: request.external_actor_ref.id().to_string(),
-            external_conversation_fingerprint: request
-                .external_conversation_ref
-                .conversation_fingerprint(),
-            auth_subject: request.auth_claim.subject().to_string(),
             binding: binding.clone(),
         };
         write_json(&self.filesystem, &self.scope, &path, &stored).await?;
@@ -303,7 +308,8 @@ where
         else {
             return Ok(());
         };
-        if stored.action.phase == ActionPhase::Settled
+        if action.phase != ActionPhase::Received
+            || stored.action.phase == ActionPhase::Settled
             || stored.action.action_id != action.action_id
         {
             return Ok(());
@@ -318,12 +324,6 @@ where
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct StoredConversationBinding {
-    adapter_id: String,
-    installation_id: String,
-    external_actor_kind: String,
-    external_actor_id: String,
-    external_conversation_fingerprint: String,
-    auth_subject: String,
     binding: ResolvedBinding,
 }
 
@@ -492,15 +492,6 @@ fn scoped_id<T>(
             reason: format!("invalid derived {prefix} id: {error}"),
         }
     })
-}
-
-fn local_filesystem(root: &Path) -> Result<LocalFilesystem, FilesystemError> {
-    let mut fs = LocalFilesystem::new();
-    fs.mount_local(
-        VirtualPath::new("/engine").expect("valid test virtual path"),
-        HostPath::from_path_buf(root.to_path_buf()),
-    )?;
-    Ok(fs)
 }
 
 fn scoped_product_workflow_fs_at<F>(

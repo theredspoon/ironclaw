@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod config;
 pub mod delivery;
+pub mod filesystem;
 pub mod harness;
 pub mod model_replay;
 pub mod network;

@@ -382,7 +382,8 @@ mod reborn_support_tests {
     use ironclaw_product_workflow::{
         ActionDispatchKind, ActionFingerprintKey, ConversationBindingService,
         DefaultInboundTurnService, DefaultProductWorkflow, IdempotencyDecision, IdempotencyLedger,
-        InboundTurnService, ProductWorkflowError, ResolveBindingRequest, SourceBindingKey,
+        InboundTurnService, ProductActionId, ProductWorkflowError, ResolveBindingRequest,
+        SourceBindingKey,
     };
     use ironclaw_threads::ProviderToolCallReferenceEnvelope;
     use ironclaw_threads::{
@@ -405,8 +406,10 @@ mod reborn_support_tests {
         capability_call_from_trace_with_surface,
     };
     use crate::reborn_support::network::RecordingNetworkHttpTransport;
-    use crate::reborn_support::product_workflow::{RebornProductWorkflowHarness, resource_scope};
-    use crate::reborn_support::session_thread::RebornThreadHarness;
+    use crate::reborn_support::product_workflow::{
+        RebornProductWorkflowHarness, RebornProductWorkflowHarnessError, resource_scope,
+    };
+    use crate::reborn_support::session_thread::{RebornThreadHarness, RebornThreadHarnessError};
     use crate::reborn_support::test_adapter::{RebornTestIngress, RebornTestProductAdapter};
     use crate::support::trace_llm::{
         ExpectedToolResult, LlmTrace, TraceResponse, TraceStep, TraceToolCall,
@@ -696,6 +699,33 @@ mod reborn_support_tests {
     }
 
     #[test]
+    fn network_transport_mixed_results() {
+        let transport = RecordingNetworkHttpTransport::new();
+        transport.push_response(NetworkHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: b"first".to_vec(),
+            usage: NetworkUsage::default(),
+        });
+        transport.push_error(NetworkHttpError::Transport {
+            reason: "scripted failure".to_string(),
+            request_bytes: 0,
+            response_bytes: 0,
+        });
+        transport.push_response(NetworkHttpResponse {
+            status: 202,
+            headers: vec![],
+            body: b"third".to_vec(),
+            usage: NetworkUsage::default(),
+        });
+
+        assert_eq!(execute_recorded_get(&transport).expect("first").status, 200);
+        assert!(execute_recorded_get(&transport).is_err());
+        assert_eq!(execute_recorded_get(&transport).expect("third").status, 202);
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    #[test]
     fn recording_network_transport_sanitizes_sensitive_request_data() {
         let transport = RecordingNetworkHttpTransport::new();
         let _ = transport.execute(NetworkTransportRequest {
@@ -848,6 +878,33 @@ mod reborn_support_tests {
     }
 
     #[tokio::test]
+    async fn thread_harness_assert_final_reply_missing() {
+        let harness =
+            RebornThreadHarness::filesystem_temp(thread_scope("missing")).expect("thread harness");
+        let thread_id = ThreadId::new("thread-missing").unwrap();
+        harness
+            .service
+            .ensure_thread(EnsureThreadRequest {
+                scope: harness.scope.clone(),
+                thread_id: Some(thread_id.clone()),
+                created_by_actor_id: "alice".to_string(),
+                title: Some("Missing reply".to_string()),
+                metadata_json: None,
+            })
+            .await
+            .expect("ensure thread");
+
+        let error = harness
+            .assert_final_reply(thread_id, "assistant")
+            .await
+            .expect_err("missing final reply");
+        assert!(matches!(
+            error,
+            RebornThreadHarnessError::MissingFinalReply(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn filesystem_binding_service_reopens_and_isolates_tenants() {
         let harness = RebornProductWorkflowHarness::filesystem_temp(product_scope("tenant-a"))
             .expect("product workflow harness");
@@ -886,6 +943,44 @@ mod reborn_support_tests {
         assert_eq!(tenant_b_binding.tenant_id.as_str(), "tenant-b");
         assert_ne!(tenant_b_binding.user_id, binding.user_id);
         assert_ne!(tenant_b_binding.thread_id, binding.thread_id);
+    }
+
+    #[test]
+    fn binding_service_missing_agent_scope() {
+        let mut scope = product_scope("tenant-no-agent");
+        scope.agent_id = None;
+        let harness =
+            RebornProductWorkflowHarness::filesystem_temp(scope).expect("product workflow harness");
+        let Err(error) = harness.binding_service() else {
+            panic!("missing agent id should fail");
+        };
+        assert!(matches!(
+            error,
+            RebornProductWorkflowHarnessError::MissingAgentScope
+        ));
+    }
+
+    #[tokio::test]
+    async fn product_workflow_malformed_json() {
+        let harness =
+            RebornProductWorkflowHarness::filesystem_temp(product_scope("tenant-corrupt"))
+                .expect("product workflow harness");
+        let request = binding_request("event-corrupt", "alice", "room-1");
+        harness
+            .corrupt_binding_record_for_test(&request, b"not valid json".to_vec())
+            .await
+            .expect("corrupt binding record");
+
+        let error = harness
+            .binding_service()
+            .expect("binding service")
+            .resolve_binding(request)
+            .await
+            .expect_err("corrupt binding JSON should fail");
+        assert!(
+            matches!(error, ProductWorkflowError::Transient { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -954,6 +1049,79 @@ mod reborn_support_tests {
             panic!("expired reservation should produce a new action");
         };
         assert_ne!(first_expiring.action_id, second_expiring.action_id);
+    }
+
+    #[tokio::test]
+    async fn idempotency_settle_errors() {
+        let harness =
+            RebornProductWorkflowHarness::filesystem_temp(product_scope("tenant-settle-errors"))
+                .expect("product workflow harness");
+        let ledger = harness.idempotency_ledger();
+        let received_at = chrono::Utc::now();
+
+        let missing = ironclaw_product_workflow::ProductInboundAction::begin(
+            fingerprint_for("event-missing", "alice", "room-1"),
+            received_at,
+        );
+        assert!(ledger.settle(missing).await.is_err());
+
+        let fingerprint = fingerprint_for("event-stale", "alice", "room-1");
+        let IdempotencyDecision::New(action) = ledger
+            .begin_or_replay(fingerprint, received_at)
+            .await
+            .expect("reserve action")
+        else {
+            panic!("first begin should reserve a new action");
+        };
+        let mut stale = action.clone();
+        stale.action_id = ProductActionId::new();
+        assert!(ledger.settle(stale).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn idempotency_release_preserves_dispatched_reservation() {
+        let harness =
+            RebornProductWorkflowHarness::filesystem_temp(product_scope("tenant-release"))
+                .expect("product workflow harness");
+        let ledger = harness.idempotency_ledger();
+        let fingerprint = fingerprint_for("event-release", "alice", "room-1");
+        let received_at = chrono::Utc::now();
+        let IdempotencyDecision::New(mut action) = ledger
+            .begin_or_replay(fingerprint.clone(), received_at)
+            .await
+            .expect("reserve action")
+        else {
+            panic!("first begin should reserve a new action");
+        };
+        action.mark_dispatched(ActionDispatchKind::NoOp);
+        ledger.release(action).await.expect("release dispatched");
+
+        assert!(
+            ledger
+                .begin_or_replay(fingerprint, received_at)
+                .await
+                .is_err(),
+            "dispatched reservations must not be released for duplicate processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_ledger_invalid_lease_ttl() {
+        let harness =
+            RebornProductWorkflowHarness::filesystem_temp(product_scope("tenant-invalid-ttl"))
+                .expect("product workflow harness");
+        let ledger = harness.idempotency_ledger_with_ttl(Duration::MAX);
+        let error = ledger
+            .begin_or_replay(
+                fingerprint_for("event-invalid-ttl", "alice", "room-1"),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect_err("invalid ttl should fail");
+        assert!(
+            matches!(error, ProductWorkflowError::Transient { .. }),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -1070,6 +1238,20 @@ mod reborn_support_tests {
             run_id: TurnRunId::new(),
             turn_id: TurnId::new(),
         }
+    }
+
+    fn execute_recorded_get(
+        transport: &RecordingNetworkHttpTransport,
+    ) -> Result<NetworkHttpResponse, NetworkHttpError> {
+        transport.execute(NetworkTransportRequest {
+            method: NetworkMethod::Get,
+            url: "https://api.example.test/v1".to_string(),
+            headers: vec![],
+            body: Vec::new(),
+            resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            response_body_limit: None,
+            timeout_ms: None,
+        })
     }
 
     fn tool_result_message(

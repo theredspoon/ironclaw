@@ -1,14 +1,16 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use ironclaw_filesystem::{LocalFilesystem, RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
-    HostPath, MountAlias, MountGrant, MountPermissions, MountView, ThreadId, VirtualPath,
+    MountAlias, MountGrant, MountPermissions, MountView, ThreadId, VirtualPath,
 };
 use ironclaw_threads::{
     FilesystemSessionThreadService, SessionThreadService, ThreadHistoryRequest,
     ThreadMessageRecord, ThreadScope,
 };
 use thiserror::Error;
+
+use super::filesystem::local_filesystem;
 
 #[derive(Debug, Error)]
 pub enum RebornThreadHarnessError {
@@ -109,15 +111,6 @@ impl RebornThreadHarness {
             ))
         }
     }
-}
-
-fn local_filesystem(root: &Path) -> Result<LocalFilesystem, ironclaw_filesystem::FilesystemError> {
-    let mut fs = LocalFilesystem::new();
-    fs.mount_local(
-        VirtualPath::new("/engine").expect("valid test virtual path"),
-        HostPath::from_path_buf(root.to_path_buf()),
-    )?;
-    Ok(fs)
 }
 
 fn scoped_threads_fs_at<F>(
