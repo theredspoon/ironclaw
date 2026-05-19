@@ -1646,11 +1646,8 @@ mod reborn_support_tests {
         let thread_harness =
             RebornThreadHarness::filesystem_temp(thread_scope("workflow")).expect("thread harness");
         let coordinator = DryRunCapturingTurnCoordinator::default();
-        let binding_service: Arc<dyn ConversationBindingService> = Arc::new(
-            product_harness
-                .binding_service()
-                .expect("binding service"),
-        );
+        let binding_service: Arc<dyn ConversationBindingService> =
+            Arc::new(product_harness.binding_service().expect("binding service"));
         let inbound: Arc<dyn InboundTurnService> = Arc::new(DefaultInboundTurnService::new(
             Arc::clone(&binding_service),
             thread_harness.service_instance().expect("thread service"),
@@ -1683,11 +1680,8 @@ mod reborn_support_tests {
             .expect("thread harness");
         let coordinator = DryRunCapturingTurnCoordinator::default();
         coordinator.set_busy(TurnRunId::new());
-        let binding_service: Arc<dyn ConversationBindingService> = Arc::new(
-            product_harness
-                .binding_service()
-                .expect("binding service"),
-        );
+        let binding_service: Arc<dyn ConversationBindingService> =
+            Arc::new(product_harness.binding_service().expect("binding service"));
         let inbound: Arc<dyn InboundTurnService> = Arc::new(DefaultInboundTurnService::new(
             Arc::clone(&binding_service),
             thread_harness.service_instance().expect("thread service"),
