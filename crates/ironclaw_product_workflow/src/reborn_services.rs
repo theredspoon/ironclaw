@@ -131,9 +131,14 @@ impl RebornServicesApi for RebornServices {
         let source_binding_id = webui_source_binding_id(&scope, &actor);
         let external_event_id = client_action_id.as_str().to_string();
 
-        let handoff = if let Some((replay, replay_source_binding_id)) =
-            replay_webui_send_message(&*self.thread_service, &scope, &actor, &external_event_id)
-                .await?
+        let handoff = if let Some((replay, replay_source_binding_id)) = replay_webui_send_message(
+            &*self.thread_service,
+            &thread_scope,
+            &scope,
+            &actor,
+            &external_event_id,
+        )
+        .await?
         {
             if replay.thread_id != scope.thread_id {
                 return Err(RebornServicesError::from_status(
@@ -164,6 +169,7 @@ impl RebornServicesApi for RebornServices {
                 MessageStatus::Accepted | MessageStatus::DeferredBusy => AcceptedWebUiMessage {
                     thread_id: replay.thread_id,
                     message_id: replay.message_id,
+                    actor_id: actor.user_id.as_str().to_string(),
                     source_binding_id: replay
                         .source_binding_id
                         .unwrap_or_else(|| replay_source_binding_id.clone()),
@@ -196,6 +202,7 @@ impl RebornServicesApi for RebornServices {
             AcceptedWebUiMessage {
                 thread_id: accepted.thread_id,
                 message_id: accepted.message_id,
+                actor_id: actor.user_id.as_str().to_string(),
                 source_binding_id: source_binding_id.clone(),
                 reply_target_binding_id: source_binding_id.clone(),
             }
@@ -438,6 +445,7 @@ impl RebornServicesApi for RebornServices {
 struct AcceptedWebUiMessage {
     thread_id: ThreadId,
     message_id: ThreadMessageId,
+    actor_id: String,
     source_binding_id: String,
     reply_target_binding_id: String,
 }
@@ -470,6 +478,7 @@ async fn mark_message_submitted_or_replay(
         Err(error) => {
             reconcile_terminal_duplicate(
                 thread_service,
+                thread_scope,
                 handoff,
                 client_action_id,
                 |replay| {
@@ -496,6 +505,7 @@ async fn mark_message_deferred_busy_or_replay(
         Err(error) => {
             reconcile_terminal_duplicate(
                 thread_service,
+                thread_scope,
                 handoff,
                 client_action_id,
                 |replay| replay.status == MessageStatus::DeferredBusy,
@@ -508,6 +518,7 @@ async fn mark_message_deferred_busy_or_replay(
 
 async fn reconcile_terminal_duplicate(
     thread_service: &dyn SessionThreadService,
+    thread_scope: &ThreadScope,
     handoff: &AcceptedWebUiMessage,
     client_action_id: &IdempotencyKey,
     matches_replay: impl FnOnce(&AcceptedInboundMessageReplay) -> bool,
@@ -515,6 +526,8 @@ async fn reconcile_terminal_duplicate(
 ) -> Result<(), RebornServicesError> {
     let replay = thread_service
         .replay_accepted_inbound_message(ReplayAcceptedInboundMessageRequest {
+            scope: thread_scope.clone(),
+            actor_id: handoff.actor_id.clone(),
             source_binding_id: handoff.source_binding_id.clone(),
             external_event_id: client_action_id.as_str().to_string(),
         })
@@ -534,30 +547,47 @@ async fn reconcile_terminal_duplicate(
 
 async fn replay_webui_send_message(
     thread_service: &dyn SessionThreadService,
+    thread_scope: &ThreadScope,
     scope: &TurnScope,
     actor: &TurnActor,
     external_event_id: &str,
 ) -> Result<Option<(AcceptedInboundMessageReplay, String)>, RebornServicesError> {
     let source_binding_id = webui_source_binding_id(scope, actor);
-    if let Some(replay) =
-        replay_accepted_message(thread_service, &source_binding_id, external_event_id).await?
+    if let Some(replay) = replay_accepted_message(
+        thread_service,
+        thread_scope,
+        actor,
+        &source_binding_id,
+        external_event_id,
+    )
+    .await?
     {
         return Ok(Some((replay, source_binding_id)));
     }
 
     let legacy_source_binding_id = legacy_webui_source_binding_id(scope, actor);
-    replay_accepted_message(thread_service, &legacy_source_binding_id, external_event_id)
-        .await
-        .map(|replay| replay.map(|replay| (replay, legacy_source_binding_id)))
+    replay_accepted_message(
+        thread_service,
+        thread_scope,
+        actor,
+        &legacy_source_binding_id,
+        external_event_id,
+    )
+    .await
+    .map(|replay| replay.map(|replay| (replay, legacy_source_binding_id)))
 }
 
 async fn replay_accepted_message(
     thread_service: &dyn SessionThreadService,
+    thread_scope: &ThreadScope,
+    actor: &TurnActor,
     source_binding_id: &str,
     external_event_id: &str,
 ) -> Result<Option<AcceptedInboundMessageReplay>, RebornServicesError> {
     thread_service
         .replay_accepted_inbound_message(ReplayAcceptedInboundMessageRequest {
+            scope: thread_scope.clone(),
+            actor_id: actor.user_id.as_str().to_string(),
             source_binding_id: source_binding_id.to_string(),
             external_event_id: external_event_id.to_string(),
         })
@@ -834,6 +864,7 @@ fn map_thread_error(error: SessionThreadError) -> RebornServicesError {
         }
         SessionThreadError::ThreadScopeMismatch { .. }
         | SessionThreadError::IdempotentReplayThreadMismatch { .. }
+        | SessionThreadError::IdempotentReplayActorMismatch { .. }
         | SessionThreadError::InvalidMessageTransition { .. }
         | SessionThreadError::MessageNotDraft { .. }
         | SessionThreadError::InvalidSummaryRange { .. }
