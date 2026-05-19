@@ -294,7 +294,7 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
         match ironclaw_reborn_composition::resolve_reborn_runtime_llm(config, config_file.as_ref())?
         {
             Some(llm) => {
-                tracing::info!(
+                tracing::debug!(
                     provider_id = %llm.provider_id(),
                     model = %llm.model(),
                     "resolved LLM selection for Reborn runtime"
