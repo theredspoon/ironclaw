@@ -171,20 +171,32 @@ async fn read_bounded<F>(
 where
     F: RootFilesystem,
 {
-    fs.read_file_bounded(path, max_bytes)
-        .await
-        .map_err(|error| {
-            HostRuntimeError::invalid_request(format!(
-                "failed to read {field} at {}: {error}",
-                path.as_str()
-            ))
-        })?
-        .ok_or_else(|| {
-            HostRuntimeError::invalid_request(format!(
-                "{field} at {} exceeds {max_bytes} bytes",
-                path.as_str()
-            ))
-        })
+    let stat = fs.stat(path).await.map_err(|error| {
+        HostRuntimeError::invalid_request(format!(
+            "failed to stat {field} at {}: {error}",
+            path.as_str()
+        ))
+    })?;
+    if stat.len > max_bytes as u64 {
+        return Err(HostRuntimeError::invalid_request(format!(
+            "{field} at {} exceeds {max_bytes} bytes",
+            path.as_str()
+        )));
+    }
+
+    let bytes = fs.read_file(path).await.map_err(|error| {
+        HostRuntimeError::invalid_request(format!(
+            "failed to read {field} at {}: {error}",
+            path.as_str()
+        ))
+    })?;
+    if bytes.len() > max_bytes {
+        return Err(HostRuntimeError::invalid_request(format!(
+            "{field} at {} exceeds {max_bytes} bytes",
+            path.as_str()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn resolve_under_root(

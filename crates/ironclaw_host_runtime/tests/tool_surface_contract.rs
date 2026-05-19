@@ -68,7 +68,7 @@ async fn hot_capability_catalog_fails_closed_for_missing_schema_file() {
 
     assert!(
         matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
-            if reason.contains("failed to read input_schema_ref")),
+            if reason.contains("failed to stat input_schema_ref")),
         "unexpected error: {err:?}"
     );
 }
@@ -145,7 +145,7 @@ async fn hot_capability_catalog_fails_closed_for_missing_prompt_doc_file() {
 
     assert!(
         matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
-            if reason.contains("failed to read prompt_doc_ref")),
+            if reason.contains("failed to stat prompt_doc_ref")),
         "unexpected error: {err:?}"
     );
 }
