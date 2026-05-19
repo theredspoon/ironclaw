@@ -33,8 +33,8 @@ use ironclaw_host_api::{
     TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
-    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, HostRuntime, SurfaceKind,
-    WRITE_FILE_CAPABILITY_ID,
+    BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy, HostRuntime, READ_FILE_CAPABILITY_ID,
+    SurfaceKind, WRITE_FILE_CAPABILITY_ID,
 };
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
@@ -187,6 +187,20 @@ impl RebornBinaryE2EHarness {
         model_gateway: RebornTraceReplayModelGateway,
     ) -> HarnessResult<Self> {
         let host_runtime = Arc::new(HostRuntimeCapabilityHarness::file_tools().await?);
+        Self::with_model_gateway_capability_mode(
+            conversation_id,
+            model_gateway,
+            HarnessCapabilityMode::HostRuntime(host_runtime),
+            false,
+        )
+        .await
+    }
+
+    pub async fn with_host_runtime_write_only(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+    ) -> HarnessResult<Self> {
+        let host_runtime = Arc::new(HostRuntimeCapabilityHarness::write_only().await?);
         Self::with_model_gateway_capability_mode(
             conversation_id,
             model_gateway,
@@ -668,9 +682,39 @@ impl HostRuntimeCapabilityHarness {
             root,
             workspace_root,
             mounts,
+            capability_ids: vec![
+                CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?,
+                CapabilityId::new(READ_FILE_CAPABILITY_ID)?,
+            ],
+            effect_kinds: vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+            user_id: UserId::new("reborn-e2e-builtin-user")?,
+            invocations: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    async fn write_only() -> HarnessResult<Self> {
+        let root = Arc::new(tempfile::tempdir()?);
+        let storage_root = root.path().join("local-dev");
+        let workspace_root = storage_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root)?;
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "reborn-e2e-write-only",
+            storage_root,
+        ))
+        .await?;
+        let runtime = services
+            .host_runtime
+            .ok_or("local-dev Reborn services missing host runtime")?;
+        let mounts = workspace_mounts(MountPermissions::read_write_list_delete())?;
+        Ok(Self {
+            runtime,
+            io: Arc::new(ProductLiveCapabilityIo::default()),
+            root,
+            workspace_root,
+            mounts,
             capability_ids: vec![CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?],
             effect_kinds: vec![EffectKind::WriteFilesystem],
-            user_id: UserId::new("reborn-e2e-builtin-user")?,
+            user_id: UserId::new("reborn-e2e-write-only-user")?,
             invocations: Arc::new(Mutex::new(Vec::new())),
         })
     }

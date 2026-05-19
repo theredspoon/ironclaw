@@ -42,7 +42,10 @@ pub struct RebornTraceReplayModelGateway {
 #[derive(Debug, Clone)]
 pub enum RebornModelReplayStep {
     Response(HostManagedModelResponse),
-    ProviderToolCalls(Vec<RebornScriptedProviderToolCall>),
+    ProviderToolCalls {
+        calls: Vec<RebornScriptedProviderToolCall>,
+        expected_tool_results: Vec<ExpectedToolResult>,
+    },
 }
 
 #[allow(dead_code)]
@@ -116,15 +119,21 @@ impl RebornTraceReplayModelGateway {
             steps
                 .into_iter()
                 .map(|step| ReplayStep {
-                    output: match step {
+                    output: match &step {
                         RebornModelReplayStep::Response(response) => {
-                            ReplayOutput::Response(response)
+                            ReplayOutput::Response(response.clone())
                         }
-                        RebornModelReplayStep::ProviderToolCalls(calls) => {
-                            ReplayOutput::ProviderToolCalls(calls)
+                        RebornModelReplayStep::ProviderToolCalls { calls, .. } => {
+                            ReplayOutput::ProviderToolCalls(calls.clone())
                         }
                     },
-                    expected_tool_results: Vec::new(),
+                    expected_tool_results: match step {
+                        RebornModelReplayStep::ProviderToolCalls {
+                            expected_tool_results,
+                            ..
+                        } => expected_tool_results,
+                        RebornModelReplayStep::Response(_) => Vec::new(),
+                    },
                 })
                 .collect(),
         )

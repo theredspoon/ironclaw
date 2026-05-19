@@ -4,7 +4,7 @@ mod reborn_support;
 mod support;
 
 use ironclaw_host_api::CapabilityId;
-use ironclaw_host_runtime::WRITE_FILE_CAPABILITY_ID;
+use ironclaw_host_runtime::{READ_FILE_CAPABILITY_ID, WRITE_FILE_CAPABILITY_ID};
 use ironclaw_loop_support::{HostManagedModelMessageRole, HostManagedModelResponse};
 use ironclaw_turns::{TurnStatus, run_profile::LoopHostMilestoneKind};
 use reborn_support::{
@@ -19,15 +19,29 @@ const EXPECTED_CONTENT: &str = "Hello, E2E test!";
 #[tokio::test]
 async fn reborn_trace_file_tools_parity() {
     let write_file = CapabilityId::new(WRITE_FILE_CAPABILITY_ID).expect("valid capability id");
+    let read_file = CapabilityId::new(READ_FILE_CAPABILITY_ID).expect("valid capability id");
     let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
-        RebornModelReplayStep::ProviderToolCalls(vec![RebornScriptedProviderToolCall::new(
-            write_file.clone(),
-            "call_write_file_1",
-            serde_json::json!({
-                "path": "/workspace/generated/hello.txt",
-                "content": EXPECTED_CONTENT,
-            }),
-        )]),
+        RebornModelReplayStep::ProviderToolCalls {
+            calls: vec![RebornScriptedProviderToolCall::new(
+                write_file.clone(),
+                "call_write_file_1",
+                serde_json::json!({
+                    "path": "/workspace/generated/hello.txt",
+                    "content": EXPECTED_CONTENT,
+                }),
+            )],
+            expected_tool_results: Vec::new(),
+        },
+        RebornModelReplayStep::ProviderToolCalls {
+            calls: vec![RebornScriptedProviderToolCall::new(
+                read_file.clone(),
+                "call_read_file_1",
+                serde_json::json!({
+                    "path": "/workspace/generated/hello.txt",
+                }),
+            )],
+            expected_tool_results: Vec::new(),
+        },
         RebornModelReplayStep::Response(HostManagedModelResponse::assistant_reply(
             "file trace complete",
         )),
@@ -60,11 +74,12 @@ async fn reborn_trace_file_tools_parity() {
     assert_eq!(file_content, EXPECTED_CONTENT);
 
     let invocations = harness.capability_invocations();
-    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations.len(), 2);
     assert_eq!(invocations[0].capability_id, write_file);
+    assert_eq!(invocations[1].capability_id, read_file);
 
     let requests = harness.model_requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(
         requests[1].messages.iter().any(|message| message.role
             == HostManagedModelMessageRole::ToolResult
@@ -77,5 +92,7 @@ async fn reborn_trace_file_tools_parity() {
         |kind| matches!(kind, LoopHostMilestoneKind::AssistantReplyFinalized { .. }),
     );
 
+    // Let the worker observe the terminal run before cancellation tears down the loop.
+    tokio::task::yield_now().await;
     harness.shutdown().await;
 }
