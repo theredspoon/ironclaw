@@ -5,11 +5,11 @@
 //! sibling modules; the full runtime composition is intentionally implemented
 //! separately so it cannot silently fall back to internal fakes.
 //!
-//! Current blocker for strict #3702 acceptance: `ironclaw_product_workflow`
-//! exposes test-support fakes for conversation binding/idempotency, but no
-//! production filesystem-backed binding/idempotency service that this root
-//! harness can compose. Until that exists, this module must not claim binary
-//! parity by wrapping `FakeConversationBindingService` or `FakeIdempotencyLedger`.
+//! The product-workflow support module provides filesystem-backed
+//! conversation-binding and idempotency services for strict harness composition.
+//! Full runtime and approval block/resume wiring still belongs with the binary
+//! harness itself; tests must not fall back to product-workflow fakes when
+//! claiming #3702 parity.
 
 #![allow(dead_code)]
 

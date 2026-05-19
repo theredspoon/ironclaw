@@ -61,6 +61,13 @@ impl RebornThreadHarness {
         )
     }
 
+    pub fn service_instance(
+        &self,
+    ) -> Result<FilesystemSessionThreadService<LocalFilesystem>, RebornThreadHarnessError> {
+        let scoped = scoped_threads_fs_at(Arc::clone(&self.backend), &self.scope)?;
+        Ok(FilesystemSessionThreadService::new(scoped))
+    }
+
     pub async fn history(
         &self,
         thread_id: ThreadId,
@@ -80,14 +87,20 @@ impl RebornThreadHarness {
         thread_id: ThreadId,
         text: &str,
     ) -> Result<(), RebornThreadHarnessError> {
-        let found = self.history(thread_id).await?.into_iter().any(|message| {
-            message.kind == ironclaw_threads::MessageKind::Assistant
-                && message.status == ironclaw_threads::MessageStatus::Finalized
-                && message
+        let history = self.history(thread_id).await?;
+        let found = history
+            .iter()
+            .rev()
+            .find(|message| {
+                message.kind == ironclaw_threads::MessageKind::Assistant
+                    && message.status == ironclaw_threads::MessageStatus::Finalized
+            })
+            .is_some_and(|message| {
+                message
                     .content
                     .as_deref()
                     .is_some_and(|content| content.contains(text))
-        });
+            });
         if found {
             Ok(())
         } else {

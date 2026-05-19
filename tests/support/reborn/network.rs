@@ -61,7 +61,7 @@ impl RecordingNetworkHttpTransport {
             .clone()
     }
 
-    pub fn into_policy_egress(&self) -> PolicyNetworkHttpEgress<Self> {
+    pub fn policy_egress(&self) -> PolicyNetworkHttpEgress<Self> {
         PolicyNetworkHttpEgress::new(self.clone())
     }
 }
