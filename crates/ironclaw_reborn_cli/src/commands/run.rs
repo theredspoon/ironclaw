@@ -35,30 +35,38 @@ impl RunCommand {
             return run_dry(context);
         }
 
-        let runtime_input = build_runtime_input(context.boot_config())?;
-        let message = self.message.clone();
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async move {
-            let runtime = build_reborn_runtime(runtime_input).await?;
-            print_runtime_banner(context.boot_config());
-
-            let conversation = runtime.new_conversation().await?;
-            let cancellation = install_ctrl_c_cancellation();
-
-            let outcome = if let Some(text) = message {
-                send_once(&runtime, &conversation, &text, cancellation).await
-            } else {
-                run_repl(&runtime, &conversation, cancellation).await
-            };
-
-            runtime.shutdown().await?;
-            outcome
-        })?;
-        Ok(())
+        execute_runtime(context, self.message)
     }
+}
+
+pub(crate) fn execute_repl(context: RebornCliContext) -> anyhow::Result<()> {
+    init_tracing();
+    execute_runtime(context, None)
+}
+
+fn execute_runtime(context: RebornCliContext, message: Option<String>) -> anyhow::Result<()> {
+    let runtime_input = build_runtime_input(context.boot_config())?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let runtime = build_reborn_runtime(runtime_input).await?;
+        print_runtime_banner(context.boot_config());
+
+        let conversation = runtime.new_conversation().await?;
+        let cancellation = install_ctrl_c_cancellation();
+
+        let outcome = if let Some(text) = message {
+            send_once(&runtime, &conversation, &text, cancellation).await
+        } else {
+            run_repl_loop(&runtime, &conversation, cancellation).await
+        };
+
+        runtime.shutdown().await?;
+        outcome
+    })?;
+    Ok(())
 }
 
 fn run_dry(context: RebornCliContext) -> anyhow::Result<()> {
@@ -132,7 +140,7 @@ async fn send_once(
     Ok(())
 }
 
-async fn run_repl(
+async fn run_repl_loop(
     runtime: &ironclaw_reborn_composition::RebornRuntime,
     conversation: &ironclaw_reborn_composition::ConversationId,
     cancellation: CancellationToken,
@@ -156,6 +164,11 @@ async fn run_repl(
             line = lines.next_line() => {
                 match line? {
                     Some(text) if text.trim().is_empty() => continue,
+                    Some(text) if is_exit_command(&text) => return Ok(()),
+                    Some(text) if is_help_command(&text) => {
+                        print_repl_help();
+                        continue;
+                    }
                     Some(text) => {
                         match runtime
                             .send_user_message_with_cancellation(
@@ -198,6 +211,21 @@ async fn run_repl(
             }
         }
     }
+}
+
+fn is_exit_command(text: &str) -> bool {
+    matches!(text.trim(), "/exit" | "/quit")
+}
+
+fn is_help_command(text: &str) -> bool {
+    text.trim() == "/help"
+}
+
+fn print_repl_help() {
+    eprintln!("Reborn REPL commands:");
+    eprintln!("  /help  Show this help");
+    eprintln!("  /exit  Exit the REPL");
+    eprintln!("  /quit  Exit the REPL");
 }
 
 fn print_reply(reply: &ironclaw_reborn_composition::AssistantReply) {
