@@ -165,6 +165,15 @@ pub enum HostApiMultiplicity {
     Multiple,
 }
 
+/// Manifest-level context available to host API contract validators.
+///
+/// This is validation-only metadata. It must not be treated as runtime
+/// authority, and it must not trigger side effects.
+pub struct HostApiManifestContext<'a> {
+    pub extension_id: &'a ExtensionId,
+    pub host_port_catalog: &'a HostPortCatalog,
+}
+
 /// Host API contract validator registered by composition.
 ///
 /// `ironclaw_extensions` owns the generic envelope and section dispatch. Domain
@@ -184,6 +193,16 @@ pub trait HostApiManifestContract: Send + Sync {
         host_api: &HostApiRefV2,
         section: &toml::Value,
     ) -> Result<(), String>;
+
+    fn validate_section_with_context(
+        &self,
+        context: &HostApiManifestContext<'_>,
+        host_api: &HostApiRefV2,
+        section: &toml::Value,
+    ) -> Result<(), String> {
+        let _ = context;
+        self.validate_section(host_api, section)
+    }
 }
 
 /// Composition-wired registry of host API manifest contracts.
@@ -214,6 +233,7 @@ impl HostApiContractRegistry {
         &self,
         manifest: &ExtensionManifestV2,
         sections: &ManifestSectionsV2,
+        host_port_catalog: &HostPortCatalog,
     ) -> Result<(), ManifestV2Error> {
         let mut counts: BTreeMap<&HostApiId, usize> = BTreeMap::new();
         for host_api in &manifest.host_apis {
@@ -237,8 +257,12 @@ impl HostApiContractRegistry {
                 });
             }
             let section = sections.get(&host_api.section)?;
+            let context = HostApiManifestContext {
+                extension_id: &manifest.id,
+                host_port_catalog,
+            };
             contract
-                .validate_section(host_api, section)
+                .validate_section_with_context(&context, host_api, section)
                 .map_err(|reason| ManifestV2Error::HostApiSectionRejected {
                     id: host_api.id.clone(),
                     section: host_api.section.clone(),
@@ -508,7 +532,7 @@ impl ExtensionManifestV2 {
         }
         let document = RawManifestDocumentV2::parse(input)?;
         let manifest = Self::from_raw(document.raw, source, host_port_catalog, &document.sections)?;
-        registry.validate_manifest(&manifest, &document.sections)?;
+        registry.validate_manifest(&manifest, &document.sections, host_port_catalog)?;
         Ok(manifest)
     }
 
@@ -538,7 +562,7 @@ impl ExtensionManifestV2 {
                 });
             }
         } else {
-            registry.validate_manifest(&manifest, &document.sections)?;
+            registry.validate_manifest(&manifest, &document.sections, host_port_catalog)?;
         }
         Ok(manifest)
     }
@@ -649,7 +673,7 @@ impl ExtensionManifestV2 {
 }
 
 impl CapabilityDeclV2 {
-    fn from_raw(
+    pub(crate) fn from_raw(
         raw: RawCapabilityV2,
         extension_id: &ExtensionId,
         host_port_catalog: &HostPortCatalog,
@@ -1265,7 +1289,7 @@ impl RawRuntimeV2 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCapabilityV2 {
+pub(crate) struct RawCapabilityV2 {
     id: String,
     #[serde(default)]
     implements: Vec<String>,
