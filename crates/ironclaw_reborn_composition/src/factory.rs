@@ -83,7 +83,11 @@ fn production_config(
 }
 
 async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, RebornBuildError> {
-    let RebornStorageInput::LocalDev { root } = input.storage else {
+    let RebornStorageInput::LocalDev {
+        root,
+        workspace_root,
+    } = input.storage
+    else {
         return Err(RebornBuildError::InvalidConfig {
             reason: "local-dev profile requires local-dev storage input".to_string(),
         });
@@ -91,15 +95,27 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     std::fs::create_dir_all(&root).map_err(|_| RebornBuildError::InvalidConfig {
         reason: "local-dev storage root could not be initialized".to_string(),
     })?;
+    let workspace_root = workspace_root.unwrap_or_else(|| root.join("workspace"));
+    std::fs::create_dir_all(&workspace_root).map_err(|_| RebornBuildError::InvalidConfig {
+        reason: "local-dev workspace root could not be initialized".to_string(),
+    })?;
     let mut filesystem = LocalFilesystem::new();
     let projects_root = ironclaw_host_api::VirtualPath::new("/projects").map_err(|error| {
         RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         }
     })?;
+    let workspace_virtual_root = ironclaw_host_api::VirtualPath::new("/projects/workspace")
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        })?;
     filesystem.mount_local(
         projects_root,
         ironclaw_host_api::HostPath::from_path_buf(root),
+    )?;
+    filesystem.mount_local(
+        workspace_virtual_root,
+        ironclaw_host_api::HostPath::from_path_buf(workspace_root),
     )?;
 
     let run_state = Arc::new(InMemoryRunStateStore::new());

@@ -32,6 +32,37 @@ use super::provider::{
     Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
 
+/// Sanitize a tool name to match the Responses API pattern `^[a-zA-Z0-9_-]+$`.
+fn sanitize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn convert_tool_definition(tool: &ToolDefinition) -> Value {
+    use crate::tool_schema::{ToolSchemaPolicy, shape_tool_schema};
+
+    let mut description = tool.description.clone();
+    let parameters = shape_tool_schema(
+        ToolSchemaPolicy::StrictOpenAi,
+        &tool.parameters,
+        &mut description,
+    );
+
+    json!({
+        "type": "function",
+        "name": sanitize_tool_name(&tool.name),
+        "description": description,
+        "parameters": parameters,
+    })
+}
+
 /// Provider that speaks the Responses API protocol against the ChatGPT backend.
 pub(crate) struct CodexChatGptProvider {
     client: Client,
@@ -222,18 +253,11 @@ impl CodexChatGptProvider {
             .flat_map(Self::message_to_input_items)
             .collect();
 
-        // Convert tool definitions
-        let api_tools: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                })
-            })
-            .collect();
+        // Convert tool definitions. Responses API function names allow only
+        // `[a-zA-Z0-9_-]`, while host capability ids can contain dots
+        // (`builtin.echo`, MCP ids, etc.). Keep provider-facing names sanitized
+        // and map them back to original names after the response is parsed.
+        let api_tools: Vec<Value> = tools.iter().map(convert_tool_definition).collect();
 
         let mut body = json!({
             "model": model,
@@ -309,7 +333,7 @@ impl CodexChatGptProvider {
                         };
                         items.push(json!({
                             "type": "function_call",
-                            "name": tc.name,
+                            "name": sanitize_tool_name(&tc.name),
                             "arguments": args,
                             "call_id": tc.id,
                         }));
@@ -692,7 +716,9 @@ impl LlmProvider for CodexChatGptProvider {
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let model = self.resolve_model().await;
-        let body = self.build_request_body(model, &request.messages, &[], None);
+        let mut messages = request.messages;
+        crate::provider::sanitize_tool_messages(&mut messages);
+        let body = self.build_request_body(model, &messages, &[], None);
         let result = self.send_request(body).await?;
 
         Ok(CompletionResponse {
@@ -710,9 +736,23 @@ impl LlmProvider for CodexChatGptProvider {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let model = self.resolve_model().await;
+        let mut messages = request.messages;
+        crate::provider::sanitize_tool_messages(&mut messages);
+        let name_map: std::collections::HashMap<String, String> = request
+            .tools
+            .iter()
+            .filter_map(|tool| {
+                let sanitized = sanitize_tool_name(&tool.name);
+                if sanitized == tool.name {
+                    None
+                } else {
+                    Some((sanitized, tool.name.clone()))
+                }
+            })
+            .collect();
         let body = self.build_request_body(
             model,
-            &request.messages,
+            &messages,
             &request.tools,
             request.tool_choice.as_deref(),
         );
@@ -722,6 +762,11 @@ impl LlmProvider for CodexChatGptProvider {
             .pending_tool_calls
             .into_values()
             .map(|tc| {
+                let returned_name = tc.name;
+                let name = name_map
+                    .get(&returned_name)
+                    .cloned()
+                    .unwrap_or(returned_name);
                 let args: Value =
                     serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!(tc.arguments));
                 // gpt-5.2-codex fills optional parameters with empty strings (e.g.
@@ -730,7 +775,7 @@ impl LlmProvider for CodexChatGptProvider {
                 let args = Self::strip_empty_string_values(args);
                 ToolCall {
                     id: tc.call_id,
-                    name: tc.name,
+                    name,
                     arguments: args,
                     reasoning: None,
                     signature: None,
@@ -842,6 +887,22 @@ mod tests {
     }
 
     #[test]
+    fn test_message_conversion_sanitizes_tool_call_name() {
+        let tc = ToolCall {
+            id: "call_1".to_string(),
+            name: "builtin.echo".to_string(),
+            arguments: json!({"input": "hello"}),
+            reasoning: None,
+            signature: None,
+        };
+        let msg = ChatMessage::assistant_with_tool_calls(None, vec![tc]);
+        let items = CodexChatGptProvider::message_to_input_items(&msg);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["name"], "builtin_echo");
+    }
+
+    #[test]
     fn test_build_request_extracts_system_as_instructions() {
         let provider = CodexChatGptProvider::new("https://example.com", "key", "gpt-4o");
         let messages = vec![
@@ -854,6 +915,33 @@ mod tests {
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         // store must be false for ChatGPT backend
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn test_build_request_sanitizes_tool_definition_names() {
+        let provider = CodexChatGptProvider::new("https://example.com", "key", "gpt-4o");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolDefinition {
+            name: "builtin.echo".to_string(),
+            description: "Echo input".to_string(),
+            parameters: json!({"type": "object"}),
+        }];
+        let body = provider.build_request_body("gpt-4o", &messages, &tools, None);
+        assert_eq!(body["tools"][0]["name"], "builtin_echo");
+    }
+
+    #[test]
+    fn test_build_request_flattens_ref_tool_schema() {
+        let provider = CodexChatGptProvider::new("https://example.com", "key", "gpt-4o");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolDefinition {
+            name: "builtin__apply_patch".to_string(),
+            description: "Apply a patch".to_string(),
+            parameters: json!({"$ref": "schemas/builtin/apply-patch.input.v1.json"}),
+        }];
+        let body = provider.build_request_body("gpt-4o", &messages, &tools, None);
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+        assert!(body["tools"][0]["parameters"].get("properties").is_some());
     }
 
     #[test]
