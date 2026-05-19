@@ -4364,6 +4364,7 @@ dependencies = [
  "ironclaw_trust",
  "ironclaw_turns",
  "ironclaw_wasm",
+ "jsonschema",
  "libsql",
  "regex",
  "rust_decimal",

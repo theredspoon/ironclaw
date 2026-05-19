@@ -18,8 +18,9 @@ use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     CapabilitySurfacePolicy, CapabilitySurfaceVersion, DefaultHostRuntime, HostRuntime,
-    RuntimeCapabilityOutcome, RuntimeCapabilityRequest, SurfaceKind, VisibleCapabilityAccess,
-    VisibleCapabilityRequest, VisibleCapabilitySurface, publish_hot_capability_catalog,
+    MAX_HOT_PROMPT_BYTES, MAX_HOT_SCHEMA_BYTES, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
+    SurfaceKind, VisibleCapabilityAccess, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    publish_hot_capability_catalog,
 };
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
@@ -87,6 +88,143 @@ async fn hot_capability_catalog_fails_closed_for_invalid_json_schema_file() {
     assert!(
         matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
             if reason.contains("input_schema_ref") && reason.contains("valid JSON schema")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_invalid_json_schema_semantics() {
+    let (_storage, fs, registry) = hot_catalog_fixture(
+        Some(r#"{"type":"not-a-json-schema-type"}"#),
+        r#"{"type":"object"}"#,
+        "Prompt docs exist.",
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("input_schema_ref") && reason.contains("valid JSON schema")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_invalid_output_schema_file() {
+    let (_storage, fs, registry) = hot_catalog_fixture(
+        Some(r#"{"type":"object"}"#),
+        "not-json",
+        "Prompt docs exist.",
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("output_schema_ref") && reason.contains("valid JSON schema")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_missing_prompt_doc_file() {
+    let (storage, fs, registry) = hot_catalog_fixture(
+        Some(r#"{"type":"object"}"#),
+        r#"{"type":"object"}"#,
+        "Prompt docs exist.",
+    );
+    std::fs::remove_file(storage.path().join("echo/prompts/echo/say.md")).unwrap();
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("failed to read prompt_doc_ref")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_model_visible_capability_without_prompt_doc_ref() {
+    let (_storage, fs, registry) = hot_catalog_fixture_with_manifest(
+        Some(r#"{"type":"object"}"#),
+        r#"{"type":"object"}"#,
+        b"Prompt docs exist.",
+        manifest_without_prompt_doc_ref(),
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("model-visible capability echo.say is missing prompt_doc_ref")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_invalid_utf8_prompt_doc() {
+    let (_storage, fs, registry) = hot_catalog_fixture_with_prompt_bytes(
+        Some(r#"{"type":"object"}"#),
+        r#"{"type":"object"}"#,
+        &[0xff, 0xfe, 0xfd],
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("prompt_doc_ref") && reason.contains("valid UTF-8")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_oversized_schema_file() {
+    let oversized_schema = " ".repeat(MAX_HOT_SCHEMA_BYTES + 1);
+    let (_storage, fs, registry) = hot_catalog_fixture(
+        Some(&oversized_schema),
+        r#"{"type":"object"}"#,
+        "Prompt docs exist.",
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("input_schema_ref") && reason.contains("exceeds")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn hot_capability_catalog_fails_closed_for_oversized_prompt_doc() {
+    let oversized_prompt = vec![b'a'; MAX_HOT_PROMPT_BYTES + 1];
+    let (_storage, fs, registry) = hot_catalog_fixture_with_prompt_bytes(
+        Some(r#"{"type":"object"}"#),
+        r#"{"type":"object"}"#,
+        &oversized_prompt,
+    );
+
+    let err = publish_hot_capability_catalog(&fs, &registry)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ironclaw_host_runtime::HostRuntimeError::InvalidRequest { ref reason }
+            if reason.contains("prompt_doc_ref") && reason.contains("exceeds")),
         "unexpected error: {err:?}"
     );
 }
@@ -785,6 +923,29 @@ fn hot_catalog_fixture(
     output_schema: &str,
     prompt_doc: &str,
 ) -> (tempfile::TempDir, LocalFilesystem, ExtensionRegistry) {
+    hot_catalog_fixture_with_prompt_bytes(input_schema, output_schema, prompt_doc.as_bytes())
+}
+
+fn hot_catalog_fixture_with_prompt_bytes(
+    input_schema: Option<&str>,
+    output_schema: &str,
+    prompt_doc: &[u8],
+) -> (tempfile::TempDir, LocalFilesystem, ExtensionRegistry) {
+    let manifest = ExtensionManifest::parse(
+        HOT_CAPABILITY_MANIFEST,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+    )
+    .unwrap();
+    hot_catalog_fixture_with_manifest(input_schema, output_schema, prompt_doc, manifest)
+}
+
+fn hot_catalog_fixture_with_manifest(
+    input_schema: Option<&str>,
+    output_schema: &str,
+    prompt_doc: &[u8],
+    manifest: ExtensionManifest,
+) -> (tempfile::TempDir, LocalFilesystem, ExtensionRegistry) {
     let storage = tempdir().unwrap();
     let extension_root = storage.path().join("echo");
     std::fs::create_dir_all(extension_root.join("schemas/echo")).unwrap();
@@ -810,12 +971,6 @@ fn hot_catalog_fixture(
     )
     .unwrap();
 
-    let manifest = ExtensionManifest::parse(
-        HOT_CAPABILITY_MANIFEST,
-        ManifestSource::InstalledLocal,
-        &HostPortCatalog::empty(),
-    )
-    .unwrap();
     let package = ExtensionPackage::from_manifest(
         manifest,
         VirtualPath::new("/system/extensions/echo").unwrap(),
@@ -825,6 +980,17 @@ fn hot_catalog_fixture(
     registry.insert(package).unwrap();
 
     (storage, fs, registry)
+}
+
+fn manifest_without_prompt_doc_ref() -> ExtensionManifest {
+    let mut manifest = ExtensionManifest::parse(
+        HOT_CAPABILITY_MANIFEST,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+    )
+    .unwrap();
+    manifest.capabilities[0].prompt_doc_ref = None;
+    manifest
 }
 
 fn runtime_with(
