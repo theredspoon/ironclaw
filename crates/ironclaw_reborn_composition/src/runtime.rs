@@ -1264,28 +1264,26 @@ mod tests {
 
         assert_eq!(reply.status, TurnStatus::Completed);
         assert_eq!(reply.text.as_deref(), Some("skill context ok"));
-        let requests = requests
-            .lock()
-            .expect("recording gateway requests lock poisoned");
-        assert_eq!(requests.len(), 1);
-        let skill_message = requests[0]
-            .messages
-            .iter()
-            .find(|message| {
-                message.role == HostManagedModelMessageRole::System
-                    && message
-                        .content_ref
-                        .as_str()
-                        .starts_with("msg:snippet.skill.review-helper.")
-            })
-            .expect("model request should include skill-context system message");
-        assert!(skill_message.content.contains("review helper description"));
-        assert!(
-            skill_message
-                .content
-                .contains("Use review helper prompt content.")
-        );
-        drop(requests);
+        let (request_count, skill_message_content) = {
+            let requests = requests
+                .lock()
+                .expect("recording gateway requests lock poisoned");
+            let skill_message = requests[0]
+                .messages
+                .iter()
+                .find(|message| {
+                    message.role == HostManagedModelMessageRole::System
+                        && message
+                            .content_ref
+                            .as_str()
+                            .starts_with("msg:snippet.skill.review-helper.")
+                })
+                .expect("model request should include skill-context system message");
+            (requests.len(), skill_message.content.clone())
+        };
+        assert_eq!(request_count, 1);
+        assert!(skill_message_content.contains("review helper description"));
+        assert!(skill_message_content.contains("Use review helper prompt content."));
 
         runtime.shutdown().await.expect("runtime shutdown");
     }
