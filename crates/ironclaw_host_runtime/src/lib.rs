@@ -848,15 +848,25 @@ impl<N, S> HostHttpEgressService<N, S> {
             return Ok(());
         }
 
-        let uses_direct_secret_store_lease = request
-            .credential_injections
-            .iter()
-            .any(|injection| matches!(injection.source, RuntimeCredentialSource::SecretStoreLease));
-        if uses_direct_secret_store_lease {
-            return Err(RuntimeHttpEgressError::Credential {
-                reason: "direct secret-store leases are unavailable for production runtime egress"
-                    .to_string(),
-            });
+        for injection in &request.credential_injections {
+            match &injection.source {
+                RuntimeCredentialSource::SecretStoreLease => {
+                    return Err(RuntimeHttpEgressError::Credential {
+                        reason:
+                            "direct secret-store leases are unavailable for production runtime egress"
+                                .to_string(),
+                    });
+                }
+                RuntimeCredentialSource::StagedObligation { capability_id }
+                    if capability_id != &request.capability_id =>
+                {
+                    return Err(RuntimeHttpEgressError::Credential {
+                        reason: "staged credential capability does not match request capability"
+                            .to_string(),
+                    });
+                }
+                RuntimeCredentialSource::StagedObligation { .. } => {}
+            }
         }
 
         Ok(())

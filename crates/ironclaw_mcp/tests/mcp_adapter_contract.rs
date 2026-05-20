@@ -188,9 +188,13 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
             .all(|request| request.network_policy == plan.network_policy)
     );
     assert!(
-        requests
+        requests[..2]
             .iter()
-            .all(|request| request.credential_injections == plan.credential_injections)
+            .all(|request| request.credential_injections.is_empty())
+    );
+    assert_eq!(
+        requests[2].credential_injections,
+        plan.credential_injections
     );
     assert!(
         requests
