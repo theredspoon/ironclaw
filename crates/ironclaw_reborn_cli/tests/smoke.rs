@@ -558,6 +558,51 @@ fn serve_resolves_context_and_fails_closed_until_webui_is_linked() {
 }
 
 #[test]
+fn serve_formats_ipv6_listen_url_with_socket_addr_brackets() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::new(reborn_bin())
+        .arg("serve")
+        .arg("--host")
+        .arg("::1")
+        .arg("--port")
+        .arg("3000")
+        .env("IRONCLAW_REBORN_HOME", temp.path().join("reborn-home"))
+        .output()
+        .expect("ironclaw-reborn serve should run");
+
+    assert!(
+        !output.status.success(),
+        "serve should fail closed until WebUI composition is linked"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("listen_url: http://[::1]:3000"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn serve_rejects_malformed_host_before_webui_handoff() {
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let output = Command::new(reborn_bin())
+        .arg("serve")
+        .arg("--host")
+        .arg("localhost:3000")
+        .env("IRONCLAW_REBORN_HOME", temp.path().join("reborn-home"))
+        .output()
+        .expect("ironclaw-reborn serve should run");
+
+    assert!(
+        !output.status.success(),
+        "serve should reject malformed host"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid value"), "stderr: {stderr}");
+}
+
+#[test]
 fn serve_rejects_zero_port_before_webui_handoff() {
     let temp = tempfile::tempdir().expect("tempdir");
 

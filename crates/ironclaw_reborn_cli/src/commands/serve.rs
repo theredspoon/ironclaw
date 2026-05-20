@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+
 use clap::Args;
 
 use crate::context::RebornCliContext;
@@ -9,7 +11,7 @@ const DEFAULT_SERVE_PORT: u16 = 3000;
 pub(crate) struct ServeCommand {
     /// Host interface for the future Reborn WebUI HTTP listener.
     #[arg(long, default_value = DEFAULT_SERVE_HOST)]
-    host: String,
+    host: IpAddr,
 
     /// Port for the future Reborn WebUI HTTP listener.
     #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
@@ -29,11 +31,10 @@ impl ServeCommand {
         println!("reborn_home: {}", boot_config.home().path().display());
         println!("home_source: {}", boot_config.home().source_label());
         println!("profile: {}", boot_config.profile());
-        println!("listen_url: http://{}:{}", self.host, self.port);
+        let listen_addr = SocketAddr::new(self.host, self.port);
+        println!("listen_url: http://{listen_addr}");
         println!("v1_state: not-used");
 
-        anyhow::bail!(
-            "Reborn WebUI server composition is not linked yet; next slice must wire ironclaw_reborn_composition and ironclaw_webui_v2"
-        );
+        anyhow::bail!("Reborn WebUI server composition is not linked yet");
     }
 }
