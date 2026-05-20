@@ -10,7 +10,10 @@ use serde_json::{Value, json};
 use crate::{FirstPartyCapabilityError, FirstPartyCapabilityRequest};
 
 use super::{
-    config::{DEFAULT_LINE_LIMIT, MAX_DIR_ENTRIES, MAX_PATCH_SIZE, MAX_READ_SIZE, MAX_WRITE_SIZE},
+    config::{
+        DEFAULT_LINE_LIMIT, MAX_DIR_ENTRIES, MAX_PATCH_SIZE, MAX_READ_SIZE, MAX_VISITED_ENTRIES,
+        MAX_WRITE_SIZE,
+    },
     guest_error, input_error,
     inputs::{optional_usize, required_str},
     paths::{
@@ -165,6 +168,7 @@ async fn collect_list_entries(
 ) -> Result<Vec<ListEntry>, FirstPartyCapabilityError> {
     let mut output = Vec::new();
     let mut stack = vec![(root.virtual_path.clone(), 0usize)];
+    let mut visited = 0usize;
     while let Some((dir, depth)) = stack.pop() {
         let entries = request
             .filesystem
@@ -172,6 +176,12 @@ async fn collect_list_entries(
             .await
             .map_err(filesystem_error)?;
         for entry in entries {
+            visited += 1;
+            if visited > MAX_VISITED_ENTRIES {
+                return Err(FirstPartyCapabilityError::new(
+                    RuntimeDispatchErrorKind::Resource,
+                ));
+            }
             let relative = virtual_to_relative(&root.virtual_path, &entry.path)?;
             let is_dir = entry.file_type == FileType::Directory;
             let scoped_path = scoped_child_path(&root.scoped_path, &relative);
@@ -181,6 +191,7 @@ async fn collect_list_entries(
             } else if is_dir {
                 format!("{relative}/")
             } else {
+                // silent-ok: list_dir is best-effort for entries that disappear or fail stat.
                 let Ok(stat) = request.filesystem.stat(&entry.path).await else {
                     tracing::debug!(
                         path = entry.path.as_str(),

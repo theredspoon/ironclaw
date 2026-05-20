@@ -1,8 +1,9 @@
 //! First-party coding capability handlers.
 //!
-//! Keep each capability in its own module. Shared path/text/input/state helpers
-//! preserve the Reborn host contract: capabilities receive scoped paths and use
-//! `RootFilesystem` only; local kernel access stays inside filesystem backends.
+//! Keep v1-compatible coding families in narrow modules. Shared
+//! path/text/input/state helpers preserve the Reborn host contract:
+//! capabilities receive scoped paths and use `RootFilesystem` only; local
+//! kernel access stays inside filesystem backends.
 
 mod config;
 mod file;

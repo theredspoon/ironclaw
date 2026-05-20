@@ -14,7 +14,8 @@ use ironclaw_extensions::ExtensionRegistry;
 #[cfg(feature = "libsql")]
 use ironclaw_filesystem::LibSqlRootFilesystem;
 use ironclaw_filesystem::{
-    DirEntry, FileStat, FilesystemError, FilesystemOperation, LocalFilesystem, RootFilesystem,
+    DirEntry, FileStat, FileType, FilesystemError, FilesystemOperation, LocalFilesystem,
+    RootFilesystem,
 };
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
@@ -1221,6 +1222,33 @@ async fn builtin_coding_grep_skips_oversized_files_like_resilient_v1_search() {
 }
 
 #[tokio::test]
+async fn builtin_coding_grep_fails_when_aggregate_scan_budget_is_exceeded() {
+    let temp = tempfile::tempdir().unwrap();
+    for index in 0..50 {
+        std::fs::write(temp.path().join(format!("file-{index:02}.rs")), "needle\n").unwrap();
+    }
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(StatLenOverrideFilesystem {
+        inner: filesystem,
+        suffix: ".rs",
+        len: 10 * 1024 * 1024,
+    });
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let error = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::Resource);
+}
+
+#[tokio::test]
 async fn builtin_coding_list_and_grep_skip_entries_when_stat_fails() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("ok.rs"), "needle\n").unwrap();
@@ -1252,6 +1280,30 @@ async fn builtin_coding_list_and_grep_skip_entries_when_stat_fails() {
     .await
     .unwrap();
     assert_eq!(grepped["files"], json!(["ok.rs"]));
+}
+
+#[tokio::test]
+async fn builtin_coding_grep_fails_on_explicit_file_read_error() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("fail.rs"), "needle\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(ReadFailureFilesystem {
+        inner: filesystem,
+        fail_suffix: "/fail.rs",
+    });
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let error = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace/fail.rs", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::Backend);
 }
 
 #[tokio::test]
@@ -1468,6 +1520,24 @@ async fn builtin_coding_list_truncates_like_v1_after_500_entries() {
     assert_eq!(listed["count"], json!(500));
     assert_eq!(listed["truncated"], json!(true));
     assert_eq!(listed["entries"].as_array().unwrap().len(), 500);
+}
+
+#[tokio::test]
+async fn builtin_coding_list_fails_when_visited_entry_budget_is_exceeded() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(ManySkippedEntriesFilesystem);
+
+    let error = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace"}),
+        execution_context_with_mounts(all_builtin_capability_ids(), mounts),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error, RuntimeFailureKind::Resource);
 }
 
 #[tokio::test]
@@ -1836,6 +1906,121 @@ impl RootFilesystem for StatFailureFilesystem {
 
     async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
         self.inner.create_dir_all(path).await
+    }
+}
+
+struct StatLenOverrideFilesystem {
+    inner: LocalFilesystem,
+    suffix: &'static str,
+    len: u64,
+}
+
+#[async_trait]
+impl RootFilesystem for StatLenOverrideFilesystem {
+    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+        let mut stat = self.inner.stat(path).await?;
+        if path.as_str().ends_with(self.suffix) {
+            stat.len = self.len;
+        }
+        Ok(stat)
+    }
+
+    async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
+        self.inner.read_file(path).await
+    }
+
+    async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.inner.write_file(path, bytes).await
+    }
+
+    async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        self.inner.create_dir_all(path).await
+    }
+}
+
+struct ReadFailureFilesystem {
+    inner: LocalFilesystem,
+    fail_suffix: &'static str,
+}
+
+#[async_trait]
+impl RootFilesystem for ReadFailureFilesystem {
+    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+        self.inner.stat(path).await
+    }
+
+    async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
+        if path.as_str().ends_with(self.fail_suffix) {
+            return Err(FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::ReadFile,
+                reason: "injected read failure".to_string(),
+            });
+        }
+        self.inner.read_file(path).await
+    }
+
+    async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.inner.write_file(path, bytes).await
+    }
+
+    async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        self.inner.create_dir_all(path).await
+    }
+}
+
+struct ManySkippedEntriesFilesystem;
+
+#[async_trait]
+impl RootFilesystem for ManySkippedEntriesFilesystem {
+    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+        Ok((0..50_001)
+            .map(|index| DirEntry {
+                name: format!("skip-{index:05}.rs"),
+                path: VirtualPath::new(format!("{}/skip-{index:05}.rs", path.as_str())).unwrap(),
+                file_type: FileType::File,
+            })
+            .collect())
+    }
+
+    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+        Err(FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::Stat,
+            reason: "injected stat failure".to_string(),
+        })
+    }
+
+    async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
+        Err(FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::ReadFile,
+            reason: "unexpected read".to_string(),
+        })
+    }
+
+    async fn write_file(&self, path: &VirtualPath, _bytes: &[u8]) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::WriteFile,
+            reason: "unexpected write".to_string(),
+        })
+    }
+
+    async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        Err(FilesystemError::Backend {
+            path: path.clone(),
+            operation: FilesystemOperation::CreateDirAll,
+            reason: "unexpected mkdir".to_string(),
+        })
     }
 }
 

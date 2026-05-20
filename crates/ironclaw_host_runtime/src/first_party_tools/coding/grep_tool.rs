@@ -185,6 +185,7 @@ async fn walk_files(
                 root_stat,
                 &mut total_bytes,
                 &mut visit,
+                false,
             )
             .await?
         {
@@ -223,6 +224,7 @@ async fn walk_files(
                     if !include(&relative) {
                         continue;
                     }
+                    // silent-ok: grep directory search skips entries that disappear or fail stat.
                     let Ok(stat) = request.filesystem.stat(&entry.path).await else {
                         tracing::debug!(
                             path = entry.path.as_str(),
@@ -240,6 +242,7 @@ async fn walk_files(
                         stat,
                         &mut total_bytes,
                         &mut visit,
+                        true,
                     )
                     .await?
                     {
@@ -260,6 +263,7 @@ async fn visit_file(
     stat: FileStat,
     total_bytes: &mut u64,
     visit: &mut impl FnMut(&str, &[u8], Option<SystemTime>) -> Result<bool, FirstPartyCapabilityError>,
+    skip_read_errors: bool,
 ) -> Result<bool, FirstPartyCapabilityError> {
     if stat.len > MAX_READ_SIZE {
         tracing::debug!(
@@ -279,12 +283,19 @@ async fn visit_file(
             max_total_bytes = GREP_MAX_TOTAL_BYTES,
             "stopping grep after aggregate scan budget"
         );
-        return Ok(false);
+        return Err(FirstPartyCapabilityError::new(
+            RuntimeDispatchErrorKind::Resource,
+        ));
     }
     *total_bytes = next_total;
-    let Ok(bytes) = request.filesystem.read_file(path).await else {
-        tracing::debug!(path = path.as_str(), "skipping grep file after read failed");
-        return Ok(true);
+    let bytes = match request.filesystem.read_file(path).await {
+        Ok(bytes) => bytes,
+        Err(_error) if skip_read_errors => {
+            // silent-ok: grep directory search skips files that disappear or fail read.
+            tracing::debug!(path = path.as_str(), "skipping grep file after read failed");
+            return Ok(true);
+        }
+        Err(error) => return Err(filesystem_error(error)),
     };
     visit(relative, &bytes, stat.modified)
 }
