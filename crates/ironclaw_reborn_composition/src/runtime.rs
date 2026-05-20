@@ -1224,13 +1224,15 @@ mod tests {
 
         assert_eq!(reply.status, TurnStatus::Completed);
         assert_eq!(reply.text.as_deref(), Some("workspace ok"));
-        assert_eq!(
-            gateway
+        let request_count = {
+            let requests = gateway
                 .requests
                 .lock()
-                .expect("workspace gateway requests lock poisoned")
-                .len(),
-            2,
+                .expect("workspace gateway requests lock poisoned");
+            requests.len()
+        };
+        assert_eq!(
+            request_count, 2,
             "workspace listing should require initial request plus tool-result follow-up"
         );
 
