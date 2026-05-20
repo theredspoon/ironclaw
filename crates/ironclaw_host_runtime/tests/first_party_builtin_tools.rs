@@ -7,12 +7,15 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
 #[cfg(feature = "libsql")]
 use ironclaw_filesystem::LibSqlRootFilesystem;
-use ironclaw_filesystem::{LocalFilesystem, RootFilesystem};
+use ironclaw_filesystem::{
+    DirEntry, FileStat, FilesystemError, FilesystemOperation, LocalFilesystem, RootFilesystem,
+};
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
     APPLY_PATCH_CAPABILITY_ID, CapabilitySurfacePolicy, CapabilitySurfaceVersion,
@@ -1179,6 +1182,66 @@ async fn builtin_coding_grep_applies_filters_before_loading_large_files() {
 }
 
 #[tokio::test]
+async fn builtin_coding_grep_skips_oversized_files_like_resilient_v1_search() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("ok.rs"), "needle\n").unwrap();
+    std::fs::write(
+        temp.path().join("huge.txt"),
+        vec![b'x'; 10 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(grepped["files"], json!(["ok.rs"]));
+}
+
+#[tokio::test]
+async fn builtin_coding_list_and_grep_skip_entries_when_stat_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("ok.rs"), "needle\n").unwrap();
+    std::fs::write(temp.path().join("skip.rs"), "needle\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_only());
+    let runtime = runtime_with_filesystem(StatFailureFilesystem {
+        inner: filesystem,
+        fail_suffix: "/skip.rs",
+    });
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    let listed = invoke_with_context(
+        &runtime,
+        LIST_DIR_CAPABILITY_ID,
+        json!({"path": "/workspace"}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed["entries"], json!(["ok.rs (7B)"]));
+
+    let grepped = invoke_with_context(
+        &runtime,
+        GREP_CAPABILITY_ID,
+        json!({"path": "/workspace", "pattern": "needle"}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(grepped["files"], json!(["ok.rs"]));
+}
+
+#[tokio::test]
 async fn builtin_coding_grep_multiline_reports_matched_lines_and_count() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("doc.txt"), "alpha\nbeta\ngamma\n").unwrap();
@@ -1726,6 +1789,41 @@ fn mounted_filesystem(path: &Path, permissions: MountPermissions) -> (LocalFiles
     )])
     .unwrap();
     (filesystem, mounts)
+}
+
+struct StatFailureFilesystem {
+    inner: LocalFilesystem,
+    fail_suffix: &'static str,
+}
+
+#[async_trait]
+impl RootFilesystem for StatFailureFilesystem {
+    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+        if path.as_str().ends_with(self.fail_suffix) {
+            return Err(FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::Stat,
+                reason: "injected stat failure".to_string(),
+            });
+        }
+        self.inner.stat(path).await
+    }
+
+    async fn read_file(&self, path: &VirtualPath) -> Result<Vec<u8>, FilesystemError> {
+        self.inner.read_file(path).await
+    }
+
+    async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError> {
+        self.inner.write_file(path, bytes).await
+    }
+
+    async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        self.inner.create_dir_all(path).await
+    }
 }
 
 #[derive(Debug, Clone, Default)]

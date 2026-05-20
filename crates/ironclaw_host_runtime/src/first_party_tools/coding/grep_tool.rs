@@ -15,7 +15,10 @@ use serde_json::{Value, json};
 use crate::{FirstPartyCapabilityError, FirstPartyCapabilityRequest};
 
 use super::{
-    config::{DEFAULT_HEAD_LIMIT, MAX_OUTPUT_SIZE, MAX_READ_SIZE, MAX_VISITED_ENTRIES},
+    config::{
+        DEFAULT_HEAD_LIMIT, GREP_MAX_TOTAL_BYTES, MAX_OUTPUT_SIZE, MAX_READ_SIZE,
+        MAX_VISITED_ENTRIES,
+    },
     input_error,
     inputs::{optional_usize, optional_usize_allow_zero, required_str},
     paths::{
@@ -220,11 +223,13 @@ async fn walk_files(
                     if !include(&relative) {
                         continue;
                     }
-                    let stat = request
-                        .filesystem
-                        .stat(&entry.path)
-                        .await
-                        .map_err(filesystem_error)?;
+                    let Ok(stat) = request.filesystem.stat(&entry.path).await else {
+                        tracing::debug!(
+                            path = entry.path.as_str(),
+                            "skipping grep file after stat failed"
+                        );
+                        continue;
+                    };
                     if stat.sensitive {
                         continue;
                     }
@@ -257,21 +262,30 @@ async fn visit_file(
     visit: &mut impl FnMut(&str, &[u8], Option<SystemTime>) -> Result<bool, FirstPartyCapabilityError>,
 ) -> Result<bool, FirstPartyCapabilityError> {
     if stat.len > MAX_READ_SIZE {
-        return Err(FirstPartyCapabilityError::new(
-            RuntimeDispatchErrorKind::Resource,
-        ));
+        tracing::debug!(
+            path = path.as_str(),
+            len = stat.len,
+            max_read_size = MAX_READ_SIZE,
+            "skipping oversized grep file"
+        );
+        return Ok(true);
     }
-    *total_bytes = total_bytes.saturating_add(stat.len);
-    if *total_bytes > 16 * 1024 * 1024 {
-        return Err(FirstPartyCapabilityError::new(
-            RuntimeDispatchErrorKind::Resource,
-        ));
+    let next_total = total_bytes.saturating_add(stat.len);
+    if next_total > GREP_MAX_TOTAL_BYTES {
+        tracing::debug!(
+            path = path.as_str(),
+            total_bytes = *total_bytes,
+            next_file_bytes = stat.len,
+            max_total_bytes = GREP_MAX_TOTAL_BYTES,
+            "stopping grep after aggregate scan budget"
+        );
+        return Ok(false);
     }
-    let bytes = request
-        .filesystem
-        .read_file(path)
-        .await
-        .map_err(filesystem_error)?;
+    *total_bytes = next_total;
+    let Ok(bytes) = request.filesystem.read_file(path).await else {
+        tracing::debug!(path = path.as_str(), "skipping grep file after read failed");
+        return Ok(true);
+    };
     visit(relative, &bytes, stat.modified)
 }
 

@@ -181,11 +181,13 @@ async fn collect_list_entries(
             } else if is_dir {
                 format!("{relative}/")
             } else {
-                let stat = request
-                    .filesystem
-                    .stat(&entry.path)
-                    .await
-                    .map_err(filesystem_error)?;
+                let Ok(stat) = request.filesystem.stat(&entry.path).await else {
+                    tracing::debug!(
+                        path = entry.path.as_str(),
+                        "skipping list_dir entry after stat failed"
+                    );
+                    continue;
+                };
                 if is_sensitive || stat.sensitive {
                     continue;
                 }
