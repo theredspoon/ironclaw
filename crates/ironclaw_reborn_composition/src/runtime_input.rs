@@ -12,6 +12,9 @@
 //!   waiting on submitted turns to finish.
 //! - **Runtime identity** — tenant/agent and source/reply binding identifiers
 //!   supplied by the caller so this composition root stays channel-agnostic.
+//! - **Skill context source** — optional caller-supplied source for
+//!   model-visible skill instructions, preserving the no-skill behavior when
+//!   absent.
 //!
 //! The CLI builds this struct from env vars / config; it does not call into
 //! `ironclaw_reborn` or `ironclaw_llm` directly.
