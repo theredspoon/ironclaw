@@ -2500,7 +2500,7 @@ mod tests {
     };
     use ironclaw_processes::{InMemoryProcessResultStore, InMemoryProcessStore, ProcessServices};
     use ironclaw_resources::InMemoryResourceGovernor;
-    use ironclaw_secrets::{InMemorySecretStore, SecretMaterial, SecretStore};
+    use ironclaw_secrets::{InMemorySecretStore, SecretMaterial};
 
     use super::*;
 
@@ -2537,36 +2537,34 @@ mod tests {
     }
 
     #[test]
-    fn host_http_egress_helper_leases_secret_store_credentials_from_graph_store() {
-        let graph_secret_store = Arc::new(InMemorySecretStore::new());
+    fn host_http_egress_helper_injects_staged_credentials_from_handoff_store() {
         let scope = sample_scope();
         let capability_id = sample_capability_id();
         let handle = SecretHandle::new("api-token").unwrap();
-        block_on_secret_store(graph_secret_store.put(
-            scope.clone(),
-            handle.clone(),
-            SecretMaterial::from("graph-secret"),
-        ))
-        .expect("graph secret should be seeded");
 
         let network = RecordingNetwork::ok();
         let recorded_requests = Arc::clone(&network.requests);
         let services = test_services()
-            .with_secret_store(Arc::clone(&graph_secret_store))
+            .with_secret_store(Arc::new(InMemorySecretStore::new()))
             .try_with_host_http_egress(network)
             .expect("host HTTP egress should wire with graph secret store");
         services
             .network_policy_store
             .insert(&scope, &capability_id, staged_policy());
+        services
+            .secret_injection_store
+            .insert(
+                &scope,
+                &capability_id,
+                &handle,
+                SecretMaterial::from("staged-secret"),
+            )
+            .expect("staged credential should be seeded");
         let egress = configured_egress(&services);
 
         egress
-            .execute(request_with_secret_store_lease(
-                scope,
-                capability_id,
-                handle,
-            ))
-            .expect("SecretStoreLease should lease from graph-owned secret store");
+            .execute(request_with_staged_credential(scope, capability_id, handle))
+            .expect("StagedObligation should inject from handoff store");
 
         let requests = recorded_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
@@ -2577,7 +2575,7 @@ mod tests {
                 .find(|(name, _)| name == "authorization"),
             Some(&(
                 "authorization".to_string(),
-                "Bearer graph-secret".to_string()
+                "Bearer staged-secret".to_string()
             ))
         );
     }
@@ -2634,7 +2632,7 @@ mod tests {
         }
     }
 
-    fn request_with_secret_store_lease(
+    fn request_with_staged_credential(
         scope: ResourceScope,
         capability_id: CapabilityId,
         handle: SecretHandle,
@@ -2642,7 +2640,9 @@ mod tests {
         RuntimeHttpEgressRequest {
             credential_injections: vec![RuntimeCredentialInjection {
                 handle,
-                source: RuntimeCredentialSource::SecretStoreLease,
+                source: RuntimeCredentialSource::StagedObligation {
+                    capability_id: capability_id.clone(),
+                },
                 target: RuntimeCredentialTarget::Header {
                     name: "authorization".to_string(),
                     prefix: Some("Bearer ".to_string()),
@@ -2691,14 +2691,6 @@ mod tests {
             deny_private_ip_ranges: false,
             max_egress_bytes: Some(1),
         }
-    }
-
-    fn block_on_secret_store<T>(future: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(future)
     }
 
     #[derive(Clone)]
