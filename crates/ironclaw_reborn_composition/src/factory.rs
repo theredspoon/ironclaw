@@ -11,10 +11,14 @@ use ironclaw_host_runtime::{
 use ironclaw_processes::ProcessServices;
 use ironclaw_resources::InMemoryResourceGovernor;
 use ironclaw_run_state::{InMemoryApprovalRequestStore, InMemoryRunStateStore};
+use ironclaw_threads::InMemorySessionThreadService;
 use ironclaw_trust::{AdminConfig, AdminEntry, HostTrustAssignment, HostTrustPolicy};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_turns::InMemoryRunProfileResolver;
-use ironclaw_turns::{DefaultTurnCoordinator, InMemoryTurnStateStore};
+use ironclaw_turns::{
+    DefaultTurnCoordinator, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
+    InMemoryTurnStateStore,
+};
 
 use crate::input::RebornStorageInput;
 use crate::{
@@ -26,6 +30,14 @@ pub struct RebornServices {
     pub host_runtime: Option<Arc<dyn ironclaw_host_runtime::HostRuntime>>,
     pub turn_coordinator: Option<Arc<dyn ironclaw_turns::TurnCoordinator>>,
     pub readiness: RebornReadiness,
+    pub(crate) local_runtime: Option<Arc<RebornLocalRuntimeServices>>,
+}
+
+pub(crate) struct RebornLocalRuntimeServices {
+    pub(crate) turn_state: Arc<InMemoryTurnStateStore>,
+    pub(crate) checkpoint_state_store: Arc<InMemoryCheckpointStateStore>,
+    pub(crate) loop_checkpoint_store: Arc<InMemoryLoopCheckpointStore>,
+    pub(crate) thread_service: Arc<InMemorySessionThreadService>,
 }
 
 impl std::fmt::Debug for RebornServices {
@@ -35,6 +47,7 @@ impl std::fmt::Debug for RebornServices {
             .field("host_runtime", &self.host_runtime.is_some())
             .field("turn_coordinator", &self.turn_coordinator.is_some())
             .field("readiness", &self.readiness)
+            .field("local_runtime", &self.local_runtime.is_some())
             .finish()
     }
 }
@@ -45,6 +58,7 @@ impl RebornServices {
             host_runtime: None,
             turn_coordinator: None,
             readiness: RebornReadiness::disabled(),
+            local_runtime: None,
         }
     }
 }
@@ -121,6 +135,12 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     let run_state = Arc::new(InMemoryRunStateStore::new());
     let approval_requests = Arc::new(InMemoryApprovalRequestStore::new());
     let turn_state = Arc::new(InMemoryTurnStateStore::default());
+    let local_runtime = Arc::new(RebornLocalRuntimeServices {
+        turn_state: Arc::clone(&turn_state),
+        checkpoint_state_store: Arc::new(InMemoryCheckpointStateStore::default()),
+        loop_checkpoint_store: Arc::new(InMemoryLoopCheckpointStore::default()),
+        thread_service: Arc::new(InMemorySessionThreadService::default()),
+    });
 
     let services = HostRuntimeServices::new(
         Arc::new(local_dev_extension_registry()?),
@@ -145,6 +165,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         host_runtime: Some(host_runtime),
         turn_coordinator: Some(turn_coordinator),
         readiness: readiness_for(input.profile, true, true),
+        local_runtime: Some(local_runtime),
     })
 }
 
@@ -365,6 +386,7 @@ async fn build_libsql_production(
         host_runtime: Some(host_runtime),
         turn_coordinator: Some(turn_coordinator),
         readiness: readiness_for(profile, true, true),
+        local_runtime: None,
     })
 }
 
@@ -427,6 +449,7 @@ async fn build_postgres_production(
         host_runtime: Some(host_runtime),
         turn_coordinator: Some(turn_coordinator),
         readiness: readiness_for(profile, true, true),
+        local_runtime: None,
     })
 }
 

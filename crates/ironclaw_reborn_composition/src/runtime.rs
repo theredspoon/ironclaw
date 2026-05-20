@@ -48,7 +48,6 @@ use ironclaw_threads::{
 };
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
-    InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
     ReplyTargetBindingRef, RunProfileResolutionRequest, SanitizedCancelReason, SourceBindingRef,
     SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId,
     TurnScope, TurnStatus,
@@ -483,16 +482,19 @@ pub async fn build_reborn_runtime(
     }
 
     let owner_id = services_input.owner_id().to_string();
-    let services = build_reborn_services(services_input).await?;
+    let mut services = build_reborn_services(services_input).await?;
 
-    // For local-dev, we synthesize substrate handles the composition root
-    // owns directly. These intentionally do not flow out of the runtime
-    // facade — they're an implementation detail of how the runtime stitches
-    // the worker to the thread service.
-    let turn_state_store = Arc::new(InMemoryTurnStateStore::default());
-    let checkpoint_state_store = Arc::new(InMemoryCheckpointStateStore::default());
-    let loop_checkpoint_store = Arc::new(InMemoryLoopCheckpointStore::default());
-    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let local_runtime =
+        services
+            .local_runtime
+            .as_ref()
+            .ok_or(RebornRuntimeError::InvalidArgument {
+                reason: "local-dev RebornServices did not provide runtime substrate".to_string(),
+            })?;
+    let turn_state_store = Arc::clone(&local_runtime.turn_state);
+    let checkpoint_state_store = Arc::clone(&local_runtime.checkpoint_state_store);
+    let loop_checkpoint_store = Arc::clone(&local_runtime.loop_checkpoint_store);
+    let thread_service = Arc::clone(&local_runtime.thread_service);
 
     let validated_identity = validate_runtime_identity(identity)?;
 
@@ -552,17 +554,14 @@ pub async fn build_reborn_runtime(
         Arc::clone(&loop_checkpoint_store) as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
         thread_scope.clone(),
     ));
-    let host_runtime = services
-        .host_runtime
-        .clone()
-        .ok_or(RebornRuntimeError::HostRuntimeUnavailable)?;
     let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
     let local_dev_capabilities = local_dev::capability_wiring(
-        host_runtime,
+        &services,
         actor_user_id.clone(),
         model_gateway,
         Some(milestone_sink.clone()),
-    );
+    )
+    .ok_or(RebornRuntimeError::HostRuntimeUnavailable)?;
     let capability_factory = local_dev_capabilities.capability_factory;
     let model_gateway = local_dev_capabilities.model_gateway;
 
@@ -606,6 +605,8 @@ pub async fn build_reborn_runtime(
         .profile_id
         .as_str()
         .to_string();
+    let planned_turn_coordinator: Arc<dyn TurnCoordinator> = composition.coordinator.clone();
+    services.turn_coordinator = Some(Arc::clone(&planned_turn_coordinator));
 
     let worker_cancel = CancellationToken::new();
     let worker = Arc::clone(&composition.worker);
@@ -613,7 +614,7 @@ pub async fn build_reborn_runtime(
     let worker_handle = tokio::spawn(async move {
         worker.run(worker_cancel_clone).await;
     });
-    let turn_coordinator: Arc<dyn TurnCoordinator> = composition.coordinator;
+    let turn_coordinator = planned_turn_coordinator;
     let wake_sender = composition.wake_sender;
 
     Ok(RebornRuntime {
@@ -1035,6 +1036,26 @@ mod tests {
         .with_model_gateway_override(gateway);
 
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let local_runtime = runtime
+            .services
+            .local_runtime
+            .as_ref()
+            .expect("runtime should use local-dev RebornServices substrate");
+        assert!(
+            Arc::ptr_eq(&runtime.thread_service, &local_runtime.thread_service),
+            "REPL runtime should use the thread service owned by RebornServices"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &runtime.turn_coordinator,
+                runtime
+                    .services
+                    .turn_coordinator
+                    .as_ref()
+                    .expect("RebornServices turn coordinator")
+            ),
+            "REPL runtime should drive turns through RebornServices"
+        );
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
             Duration::from_secs(3),

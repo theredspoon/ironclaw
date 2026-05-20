@@ -32,17 +32,20 @@ use ironclaw_turns::{
     },
 };
 
+use crate::RebornServices;
+
 pub(super) struct LocalDevCapabilityWiring {
     pub(super) capability_factory: Arc<dyn LoopCapabilityPortFactory>,
     pub(super) model_gateway: Arc<dyn HostManagedModelGateway>,
 }
 
 pub(super) fn capability_wiring(
-    runtime: Arc<dyn HostRuntime>,
+    services: &RebornServices,
     user_id: UserId,
     model_gateway: Arc<dyn HostManagedModelGateway>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
-) -> LocalDevCapabilityWiring {
+) -> Option<LocalDevCapabilityWiring> {
+    let runtime = services.host_runtime.clone()?;
     let capability_io = Arc::new(LocalDevCapabilityIo::default());
     let capability_input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
     let capability_result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
@@ -58,10 +61,10 @@ pub(super) fn capability_wiring(
         LocalDevResultHydratingModelGateway::new(model_gateway, capability_io),
     );
 
-    LocalDevCapabilityWiring {
+    Some(LocalDevCapabilityWiring {
         capability_factory,
         model_gateway,
-    }
+    })
 }
 
 #[derive(Clone)]
