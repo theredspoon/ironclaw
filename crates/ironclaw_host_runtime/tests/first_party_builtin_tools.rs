@@ -1919,7 +1919,14 @@ fn dispatch_grant_with_mounts_and_network(
         id: CapabilityGrantId::new(),
         capability: capability_id(capability),
         grantee: Principal::Extension(ExtensionId::new("caller").unwrap()),
-        issued_by: Principal::HostRuntime,
+        issued_by: if matches!(
+            capability,
+            HTTP_CAPABILITY_ID | WRITE_FILE_CAPABILITY_ID | APPLY_PATCH_CAPABILITY_ID
+        ) {
+            Principal::User(UserId::new("user").unwrap())
+        } else {
+            Principal::HostRuntime
+        },
         constraints: GrantConstraints {
             allowed_effects: builtin_effects(),
             mounts,

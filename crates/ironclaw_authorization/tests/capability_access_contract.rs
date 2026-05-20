@@ -52,6 +52,55 @@ async fn capability_access_allows_matching_extension_grant() {
 }
 
 #[tokio::test]
+async fn capability_access_requires_approval_for_ask_permission_until_lease_grant() {
+    let descriptor = CapabilityDescriptor {
+        default_permission: PermissionMode::Ask,
+        ..wasm_descriptor()
+    };
+    let base_grant = grant_for(
+        descriptor.id.clone(),
+        Principal::Extension(ExtensionId::new("caller").unwrap()),
+        vec![EffectKind::DispatchCapability],
+    );
+    let context = execution_context(CapabilitySet {
+        grants: vec![base_grant.clone()],
+    });
+
+    let decision = GrantAuthorizer::new()
+        .authorize_dispatch(&context, &descriptor, &ResourceEstimate::default())
+        .await;
+
+    let Decision::RequireApproval { request } = decision else {
+        panic!("expected approval requirement");
+    };
+    assert_eq!(
+        request.requested_by,
+        Principal::Extension(context.extension_id)
+    );
+    assert!(matches!(
+        request.action.as_ref(),
+        Action::Dispatch { capability, .. } if capability == &descriptor.id
+    ));
+
+    let mut lease_grant = base_grant;
+    lease_grant.issued_by = Principal::User(UserId::new("user1").unwrap());
+    let context = execution_context(CapabilitySet {
+        grants: vec![lease_grant],
+    });
+
+    let decision = GrantAuthorizer::new()
+        .authorize_dispatch(&context, &descriptor, &ResourceEstimate::default())
+        .await;
+
+    assert_eq!(
+        decision,
+        Decision::Allow {
+            obligations: Default::default()
+        }
+    );
+}
+
+#[tokio::test]
 async fn capability_access_returns_grant_constraints_as_runtime_obligations() {
     let descriptor = CapabilityDescriptor {
         effects: vec![

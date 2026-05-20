@@ -46,7 +46,7 @@ pub(super) fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
             WRITE_FILE_CAPABILITY_ID,
             "Write content through scoped mounts with v1 write_file output shape",
             vec![EffectKind::WriteFilesystem],
-            PermissionMode::Allow,
+            PermissionMode::Ask,
         )?,
         manifest(
             LIST_DIR_CAPABILITY_ID,
@@ -70,7 +70,7 @@ pub(super) fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
             APPLY_PATCH_CAPABILITY_ID,
             "Apply exact/fuzzy search-replace edits through scoped mounts",
             vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
-            PermissionMode::Allow,
+            PermissionMode::Ask,
         )?,
     ])
 }

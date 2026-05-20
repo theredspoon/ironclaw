@@ -811,8 +811,6 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::stream;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     #[test]
     fn test_message_conversion_user() {
@@ -1015,7 +1013,7 @@ data: {"response":{"usage":{"input_tokens":20,"output_tokens":15}}}
 
     #[tokio::test]
     async fn complete_with_tools_remaps_sanitized_response_tool_names() {
-        let base_url = spawn_responses_api_server(
+        let base_url = responses_api_test_server::spawn(
             r#"event: response.output_item.added
 data: {"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"builtin_echo"}}
 
@@ -1068,46 +1066,54 @@ data: {"response":{"usage":{"input_tokens":3,"output_tokens":2}}}
         assert_eq!(cleaned, json!({"format": "%Y-%m-%d", "operation": "now"}));
     }
 
-    async fn spawn_responses_api_server(sse_body: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            for _ in 0..2 {
-                let (mut socket, _) = listener.accept().await.expect("accept request");
-                let mut request = [0u8; 4096];
-                let bytes_read = socket.read(&mut request).await.expect("read request");
-                let request = String::from_utf8_lossy(&request[..bytes_read]);
-                if request.starts_with("GET /models") {
-                    write_http_response(
-                        &mut socket,
-                        "application/json",
-                        r#"{"models":[{"slug":"gpt-4o"}]}"#,
-                    )
-                    .await;
-                } else if request.starts_with("POST /responses") {
-                    write_http_response(&mut socket, "text/event-stream", sse_body).await;
-                } else {
-                    write_http_response(&mut socket, "text/plain", "not found").await;
-                }
-            }
-        });
-        format!("http://{addr}")
-    }
+    mod responses_api_test_server {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
-    async fn write_http_response(
-        socket: &mut tokio::net::TcpStream,
-        content_type: &str,
-        body: &str,
-    ) {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        socket
-            .write_all(response.as_bytes())
-            .await
-            .expect("write response");
+        /// Tiny in-process Responses API fixture for caller-level provider tests.
+        /// The test must exercise model resolution plus `/responses`, so a real
+        /// loopback HTTP boundary is intentional here.
+        pub(super) async fn spawn(sse_body: &'static str) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.expect("accept request");
+                    let mut request = [0u8; 4096];
+                    let bytes_read = socket.read(&mut request).await.expect("read request");
+                    let request = String::from_utf8_lossy(&request[..bytes_read]);
+                    if request.starts_with("GET /models") {
+                        write_response(
+                            &mut socket,
+                            "application/json",
+                            r#"{"models":[{"slug":"gpt-4o"}]}"#,
+                        )
+                        .await;
+                    } else if request.starts_with("POST /responses") {
+                        write_response(&mut socket, "text/event-stream", sse_body).await;
+                    } else {
+                        write_response(&mut socket, "text/plain", "not found").await;
+                    }
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        async fn write_response(
+            socket: &mut tokio::net::TcpStream,
+            content_type: &str,
+            body: &str,
+        ) {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
     }
 }

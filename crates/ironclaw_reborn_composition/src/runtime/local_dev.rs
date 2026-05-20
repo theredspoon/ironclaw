@@ -140,9 +140,9 @@ impl LocalDevCapabilityIo {
 #[derive(Default)]
 struct StagedValueStore {
     values: HashMap<String, StagedValue>,
-    // Results evict oldest entries under byte pressure; inputs fail closed so
-    // active tool-call arguments are never silently dropped before invocation.
-    order: VecDeque<String>,
+    // Eviction index only, not an execution queue. Inputs fail closed and never
+    // evict; results use this to drop oldest staged refs under byte pressure.
+    oldest_refs: VecDeque<String>,
     total_bytes: usize,
 }
 
@@ -198,15 +198,15 @@ impl StagedValueStore {
     fn insert_measured(&mut self, reference: String, value: serde_json::Value, bytes: usize) {
         if let Some(previous) = self.values.remove(&reference) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
-            self.order.retain(|candidate| candidate != &reference);
+            self.oldest_refs.retain(|candidate| candidate != &reference);
         }
         self.total_bytes = self.total_bytes.saturating_add(bytes);
-        self.order.push_back(reference.clone());
+        self.oldest_refs.push_back(reference.clone());
         self.values.insert(reference, StagedValue { value, bytes });
     }
 
     fn evict_oldest(&mut self) {
-        while let Some(reference) = self.order.pop_front() {
+        while let Some(reference) = self.oldest_refs.pop_front() {
             if let Some(previous) = self.values.remove(&reference) {
                 self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
                 return;
@@ -517,27 +517,33 @@ fn local_dev_builtin_grants(
     Ok(CapabilitySet { grants })
 }
 
-fn local_dev_builtin_capability_ids() -> [&'static str; 7] {
+fn local_dev_builtin_capability_ids() -> [&'static str; 9] {
     [
         "builtin.echo",
         "builtin.time",
         "builtin.json",
         "builtin.read_file",
+        "builtin.write_file",
         "builtin.list_dir",
         "builtin.glob",
         "builtin.grep",
+        "builtin.apply_patch",
     ]
 }
 
 fn local_dev_allowed_effects() -> Vec<EffectKind> {
-    vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
+    vec![
+        EffectKind::DispatchCapability,
+        EffectKind::ReadFilesystem,
+        EffectKind::WriteFilesystem,
+    ]
 }
 
 fn local_dev_workspace_mounts() -> Result<MountView, AgentLoopHostError> {
     MountView::new(vec![MountGrant::new(
         MountAlias::new("/workspace").map_err(host_api_agent_loop_error)?,
         VirtualPath::new("/projects/workspace").map_err(host_api_agent_loop_error)?,
-        MountPermissions::read_only(),
+        MountPermissions::read_write(),
     )])
     .map_err(host_api_agent_loop_error)
 }
@@ -687,14 +693,18 @@ mod tests {
     }
 
     #[test]
-    fn local_dev_builtin_surface_is_read_only() {
+    fn local_dev_builtin_surface_preserves_write_capabilities() {
         let capability_ids = local_dev_builtin_capability_ids();
 
-        assert!(!capability_ids.contains(&"builtin.write_file"));
-        assert!(!capability_ids.contains(&"builtin.apply_patch"));
+        assert!(capability_ids.contains(&"builtin.write_file"));
+        assert!(capability_ids.contains(&"builtin.apply_patch"));
         assert_eq!(
             local_dev_allowed_effects(),
-            vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
+            vec![
+                EffectKind::DispatchCapability,
+                EffectKind::ReadFilesystem,
+                EffectKind::WriteFilesystem
+            ]
         );
     }
 

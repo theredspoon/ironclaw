@@ -24,10 +24,11 @@ use ironclaw_filesystem::{
 /// CAS retries until either it wins or this budget is exhausted.
 const CAS_RETRY_ATTEMPTS: usize = 3;
 use ironclaw_host_api::{
-    AgentId, CapabilityDescriptor, CapabilityGrant, CapabilityGrantId, Decision, DenyReason,
-    EffectKind, ExecutionContext, HostApiError, InvocationFingerprint, InvocationId, MissionId,
-    NetworkPolicy, Obligation, Obligations, Principal, ProjectId, ResourceCeiling,
-    ResourceEstimate, ResourceScope, SandboxQuota, ScopedPath, TenantId, ThreadId, UserId,
+    Action, AgentId, ApprovalRequest, ApprovalRequestId, CapabilityDescriptor, CapabilityGrant,
+    CapabilityGrantId, Decision, DenyReason, EffectKind, ExecutionContext, HostApiError,
+    InvocationFingerprint, InvocationId, MissionId, NetworkPolicy, Obligation, Obligations,
+    PermissionMode, Principal, ProjectId, ResourceCeiling, ResourceEstimate, ResourceScope,
+    SandboxQuota, ScopedPath, TenantId, ThreadId, UserId,
 };
 use ironclaw_trust::{AuthorityCeiling, TrustDecision};
 use serde::{Deserialize, Serialize};
@@ -1097,7 +1098,14 @@ fn authorize_from_grants_with_authority_ceiling<'a>(
         };
     }
 
+    if descriptor.default_permission == PermissionMode::Deny {
+        return Decision::Deny {
+            reason: DenyReason::PolicyDenied,
+        };
+    }
+
     let mut saw_active_matching_grant = false;
+    let mut requires_approval = false;
     for grant in grants
         .filter(|grant| grant.capability == descriptor.id)
         .filter(|grant| principal_matches_context(&grant.grantee, context))
@@ -1118,8 +1126,22 @@ fn authorize_from_grants_with_authority_ceiling<'a>(
             && let Some(obligations) =
                 obligations_for_grant(descriptor, grant, effective_resource_ceiling)
         {
+            // HostRuntime-issued grants establish that the caller may ask for
+            // this capability. Ask-mode dispatch still needs an approval lease.
+            if descriptor.default_permission == PermissionMode::Ask
+                && matches!(grant.issued_by, Principal::HostRuntime)
+            {
+                requires_approval = true;
+                continue;
+            }
             return Decision::Allow { obligations };
         }
+    }
+
+    if requires_approval {
+        return Decision::RequireApproval {
+            request: dispatch_approval_request(context, descriptor, estimate),
+        };
     }
 
     if saw_active_matching_grant {
@@ -1130,6 +1152,25 @@ fn authorize_from_grants_with_authority_ceiling<'a>(
         Decision::Deny {
             reason: DenyReason::MissingGrant,
         }
+    }
+}
+
+fn dispatch_approval_request(
+    context: &ExecutionContext,
+    descriptor: &CapabilityDescriptor,
+    estimate: &ResourceEstimate,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        id: ApprovalRequestId::new(),
+        correlation_id: context.correlation_id,
+        requested_by: Principal::Extension(context.extension_id.clone()),
+        action: Box::new(Action::Dispatch {
+            capability: descriptor.id.clone(),
+            estimated_resources: estimate.clone(),
+        }),
+        invocation_fingerprint: None,
+        reason: format!("{} requires approval", descriptor.id.as_str()),
+        reusable_scope: None,
     }
 }
 
