@@ -19,7 +19,6 @@ pub(super) const WORKSPACE_FILES: &[&str] = &[
     "SOUL.md",
     "AGENTS.md",
     "USER.md",
-    "README.md",
 ];
 
 pub(super) const GLOB_MATCH_OPTIONS: MatchOptions = MatchOptions {
