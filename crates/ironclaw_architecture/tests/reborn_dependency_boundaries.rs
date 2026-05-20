@@ -1010,6 +1010,12 @@ fn reborn_product_api_crates_do_not_bind_http_ingress() {
         "crates/ironclaw_turns/src",
         "crates/ironclaw_threads/src",
         "crates/ironclaw_loop_support/src",
+        // WebChat v2 route surface: a Product/API crate that exposes
+        // axum handler functions and `IngressRouteDescriptor`s but must
+        // never bind sockets or call `axum::serve` itself — that is
+        // host composition's job. Without this entry the contract fails
+        // open for the new route crate.
+        "crates/ironclaw_webui_v2/src",
     ];
 
     let mut violations = Vec::new();
@@ -1087,6 +1093,59 @@ fn boundary_rules() -> Vec<BoundaryRule> {
                 "ironclaw_network",
                 "ironclaw_engine",
                 "ironclaw_gateway",
+            ],
+        },
+        BoundaryRule {
+            // WebChat v2 route surface must only reach into Reborn through
+            // the host-facing facade and the ingress vocabulary; anything
+            // that lets a handler touch the dispatcher, runtime lane, run
+            // state, or a storage backend directly would defeat the
+            // single-facade discipline that this crate exists to enforce.
+            crate_name: "ironclaw_webui_v2",
+            forbidden: vec![
+                "ironclaw",
+                "ironclaw_capabilities",
+                "ironclaw_conversations",
+                "ironclaw_dispatcher",
+                "ironclaw_engine",
+                "ironclaw_event_projections",
+                "ironclaw_events",
+                "ironclaw_extensions",
+                "ironclaw_filesystem",
+                "ironclaw_gateway",
+                "ironclaw_host_runtime",
+                "ironclaw_llm",
+                "ironclaw_loop_support",
+                "ironclaw_mcp",
+                "ironclaw_memory",
+                "ironclaw_network",
+                "ironclaw_outbound",
+                "ironclaw_processes",
+                // Single-facade boundary: route handlers consume only the
+                // `ironclaw_product_workflow` facade plus the ingress + error
+                // vocabulary. Projection types are re-exported through the
+                // facade crate so handlers never reach into the adapter
+                // surface directly.
+                "ironclaw_product_adapters",
+                "ironclaw_reborn",
+                "ironclaw_reborn_cli",
+                "ironclaw_reborn_composition",
+                "ironclaw_reborn_config",
+                "ironclaw_reborn_event_store",
+                "ironclaw_resources",
+                "ironclaw_run_state",
+                "ironclaw_runtime_policy",
+                "ironclaw_safety",
+                "ironclaw_scripts",
+                "ironclaw_secrets",
+                "ironclaw_skills",
+                "ironclaw_storage",
+                "ironclaw_threads",
+                "ironclaw_trust",
+                "ironclaw_tui",
+                "ironclaw_turns",
+                "ironclaw_wasm",
+                "ironclaw_wasm_product_adapters",
             ],
         },
         BoundaryRule {
