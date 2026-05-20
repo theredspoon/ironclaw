@@ -147,6 +147,7 @@ pub struct SubmittedTurn {
     pub thread_id: ThreadId,
     pub thread_scope: ThreadScope,
     pub scope: TurnScope,
+    pub actor: TurnActor,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +225,42 @@ impl RebornBinaryE2EHarness {
             capability_port,
             false,
             false,
+        )
+        .await
+    }
+
+    pub async fn with_model_gateway_identity_source_unscoped_worker(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_port: RecordingTestCapabilityPort,
+        identity_context_source: Arc<dyn HostIdentityContextSource>,
+    ) -> HarnessResult<Self> {
+        Self::with_model_gateway_options_identity_source_trigger_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_port,
+            false,
+            false,
+            ProductTriggerReason::DirectChat,
+            identity_context_source,
+        )
+        .await
+    }
+
+    pub async fn with_model_gateway_identity_source_unscoped_shared_worker(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_port: RecordingTestCapabilityPort,
+        identity_context_source: Arc<dyn HostIdentityContextSource>,
+    ) -> HarnessResult<Self> {
+        Self::with_model_gateway_options_identity_source_trigger_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_port,
+            false,
+            false,
+            ProductTriggerReason::BotMention,
+            identity_context_source,
         )
         .await
     }
@@ -316,12 +353,54 @@ impl RebornBinaryE2EHarness {
         accept_harness_blocked_evidence: bool,
         restrict_worker_to_initial_scope: bool,
     ) -> HarnessResult<Self> {
-        Self::with_model_gateway_capability_mode_and_worker_scope(
+        Self::with_model_gateway_options_identity_source_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_port,
+            accept_harness_blocked_evidence,
+            restrict_worker_to_initial_scope,
+            Arc::new(EmptyIdentityContextSource),
+        )
+        .await
+    }
+
+    async fn with_model_gateway_options_identity_source_and_worker_scope(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_port: RecordingTestCapabilityPort,
+        accept_harness_blocked_evidence: bool,
+        restrict_worker_to_initial_scope: bool,
+        identity_context_source: Arc<dyn HostIdentityContextSource>,
+    ) -> HarnessResult<Self> {
+        Self::with_model_gateway_options_identity_source_trigger_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_port,
+            accept_harness_blocked_evidence,
+            restrict_worker_to_initial_scope,
+            ProductTriggerReason::DirectChat,
+            identity_context_source,
+        )
+        .await
+    }
+
+    async fn with_model_gateway_options_identity_source_trigger_and_worker_scope(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_port: RecordingTestCapabilityPort,
+        accept_harness_blocked_evidence: bool,
+        restrict_worker_to_initial_scope: bool,
+        initial_trigger: ProductTriggerReason,
+        identity_context_source: Arc<dyn HostIdentityContextSource>,
+    ) -> HarnessResult<Self> {
+        Self::with_model_gateway_capability_mode_identity_source_trigger_and_worker_scope(
             conversation_id,
             model_gateway,
             HarnessCapabilityMode::Recording(capability_port),
             accept_harness_blocked_evidence,
             restrict_worker_to_initial_scope,
+            initial_trigger,
+            identity_context_source,
         )
         .await
     }
@@ -349,14 +428,61 @@ impl RebornBinaryE2EHarness {
         accept_harness_blocked_evidence: bool,
         restrict_worker_to_initial_scope: bool,
     ) -> HarnessResult<Self> {
+        Self::with_model_gateway_capability_mode_identity_source_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_mode,
+            accept_harness_blocked_evidence,
+            restrict_worker_to_initial_scope,
+            Arc::new(EmptyIdentityContextSource),
+        )
+        .await
+    }
+
+    async fn with_model_gateway_capability_mode_identity_source_and_worker_scope(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_mode: HarnessCapabilityMode,
+        accept_harness_blocked_evidence: bool,
+        restrict_worker_to_initial_scope: bool,
+        identity_context_source: Arc<dyn HostIdentityContextSource>,
+    ) -> HarnessResult<Self> {
+        Self::with_model_gateway_capability_mode_identity_source_trigger_and_worker_scope(
+            conversation_id,
+            model_gateway,
+            capability_mode,
+            accept_harness_blocked_evidence,
+            restrict_worker_to_initial_scope,
+            ProductTriggerReason::DirectChat,
+            identity_context_source,
+        )
+        .await
+    }
+
+    async fn with_model_gateway_capability_mode_identity_source_trigger_and_worker_scope(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+        capability_mode: HarnessCapabilityMode,
+        accept_harness_blocked_evidence: bool,
+        restrict_worker_to_initial_scope: bool,
+        initial_trigger: ProductTriggerReason,
+        identity_context_source: Arc<dyn HostIdentityContextSource>,
+    ) -> HarnessResult<Self> {
         let adapter = RebornTestProductAdapter::new("reborn-test", "install-1")?;
         let ingress = RebornTestIngress::new(adapter);
         let product_harness = RebornProductWorkflowHarness::filesystem_temp(product_scope())?;
         let binding = product_harness
             .binding_service()?
-            .resolve_binding(binding_request(&ingress, conversation_id)?)
+            .resolve_binding(binding_request_with_trigger(
+                &ingress,
+                conversation_id,
+                initial_trigger,
+            )?)
             .await?;
-        let thread_scope = thread_scope_from_binding(&binding)?;
+        let thread_scope = thread_scope_from_binding_with_route_kind(
+            &binding,
+            route_kind_for_trigger(initial_trigger),
+        )?;
         let turn_scope = TurnScope::new(
             binding.tenant_id.clone(),
             binding.agent_id.clone(),
@@ -409,7 +535,7 @@ impl RebornBinaryE2EHarness {
             cancellation_factory: None,
             skill_context_source: None,
             input_queue: None,
-            identity_context_source: Arc::new(EmptyIdentityContextSource),
+            identity_context_source,
             model_policy_guard: None,
             model_budget_accountant: None,
             safety_context: None,
@@ -516,9 +642,31 @@ impl RebornBinaryE2EHarness {
         event_id: &str,
         text: &str,
     ) -> HarnessResult<SubmittedTurn> {
-        let envelope =
-            self.ingress
-                .verified_text_envelope(event_id, actor_id, conversation_id, text)?;
+        self.submit_text_for_with_trigger(
+            conversation_id,
+            actor_id,
+            event_id,
+            text,
+            ProductTriggerReason::DirectChat,
+        )
+        .await
+    }
+
+    pub async fn submit_text_for_with_trigger(
+        &self,
+        conversation_id: &str,
+        actor_id: &str,
+        event_id: &str,
+        text: &str,
+        trigger: ProductTriggerReason,
+    ) -> HarnessResult<SubmittedTurn> {
+        let envelope = self.ingress.verified_text_envelope_with_trigger(
+            event_id,
+            actor_id,
+            conversation_id,
+            text,
+            trigger,
+        )?;
         let binding_request = binding_request_from_envelope(&envelope);
         let route_kind = binding_request.route_kind;
         let binding = self
@@ -533,6 +681,7 @@ impl RebornBinaryE2EHarness {
             binding.project_id.clone(),
             binding.thread_id.clone(),
         );
+        let actor = TurnActor::new(binding.user_id.clone());
         let ack = self.workflow.accept_inbound(envelope).await?;
         let run_id = match &ack {
             ProductInboundAck::Accepted {
@@ -548,6 +697,7 @@ impl RebornBinaryE2EHarness {
             thread_id: binding.thread_id,
             thread_scope,
             scope: turn_scope,
+            actor,
         })
     }
 
@@ -1466,8 +1616,21 @@ fn binding_request(
     ingress: &RebornTestIngress,
     conversation_id: &str,
 ) -> HarnessResult<ResolveBindingRequest> {
-    let envelope =
-        ingress.verified_text_envelope("binding-probe", "alice", conversation_id, "hi")?;
+    binding_request_with_trigger(ingress, conversation_id, ProductTriggerReason::DirectChat)
+}
+
+fn binding_request_with_trigger(
+    ingress: &RebornTestIngress,
+    conversation_id: &str,
+    trigger: ProductTriggerReason,
+) -> HarnessResult<ResolveBindingRequest> {
+    let envelope = ingress.verified_text_envelope_with_trigger(
+        "binding-probe",
+        "alice",
+        conversation_id,
+        "hi",
+        trigger,
+    )?;
     Ok(binding_request_from_envelope(&envelope))
 }
 
