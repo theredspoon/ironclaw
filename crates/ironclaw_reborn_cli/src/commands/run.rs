@@ -507,27 +507,38 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use ironclaw_reborn_config::{IdentitySection, RebornConfigFile};
+    use ironclaw_reborn_config::RebornBootConfig;
 
-    use super::runtime_identity;
+    use super::build_runtime_input;
 
     #[test]
-    fn runtime_identity_maps_cli_tenant_and_agent_from_config() {
-        let config = RebornConfigFile {
-            identity: Some(IdentitySection {
-                tenant: Some("custom-tenant".to_string()),
-                default_agent: Some("custom-agent".to_string()),
-                default_owner: Some("custom-owner".to_string()),
-                default_project: None,
-            }),
-            ..RebornConfigFile::default()
-        };
+    fn build_runtime_input_maps_configured_cli_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reborn_home = temp.path().join("reborn-home");
+        std::fs::create_dir_all(&reborn_home).expect("mkdir");
+        std::fs::write(
+            reborn_home.join("config.toml"),
+            r#"
+[identity]
+tenant = "custom-tenant"
+default_agent = "custom-agent"
+default_owner = "custom-owner"
+"#,
+        )
+        .expect("write config");
+        let config = RebornBootConfig::resolve_from_env_parts(
+            Some(reborn_home.into_os_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("boot config");
 
-        let identity = runtime_identity(Some(&config));
+        let runtime_input = build_runtime_input(&config).expect("runtime input");
 
-        assert_eq!(identity.tenant_id, "custom-tenant");
-        assert_eq!(identity.agent_id, "custom-agent");
-        assert_eq!(identity.source_binding_id, "reborn-cli");
-        assert_eq!(identity.reply_target_binding_id, "reborn-cli");
+        assert_eq!(runtime_input.identity.tenant_id, "custom-tenant");
+        assert_eq!(runtime_input.identity.agent_id, "custom-agent");
+        assert_eq!(runtime_input.identity.source_binding_id, "reborn-cli");
+        assert_eq!(runtime_input.identity.reply_target_binding_id, "reborn-cli");
     }
 }
