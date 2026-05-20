@@ -16,12 +16,12 @@
 //! The CLI builds this struct from env vars / config; it does not call into
 //! `ironclaw_reborn` or `ironclaw_llm` directly.
 
-#[cfg(test)]
 use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
 use ironclaw_loop_support::HostManagedModelGateway;
+use ironclaw_loop_support::HostSkillContextSource;
 
 use crate::input::RebornBuildInput;
 
@@ -207,6 +207,7 @@ pub struct RebornRuntimeInput {
     pub runner: TurnRunnerSettings,
     pub poll: PollSettings,
     pub identity: RebornRuntimeIdentity,
+    pub skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     #[cfg(test)]
     pub(crate) model_gateway_override: Option<Arc<dyn HostManagedModelGateway>>,
 }
@@ -224,6 +225,7 @@ impl RebornRuntimeInput {
             runner: TurnRunnerSettings::default(),
             poll: PollSettings::default(),
             identity: RebornRuntimeIdentity::default(),
+            skill_context_source: None,
             #[cfg(test)]
             model_gateway_override: None,
         }
@@ -253,6 +255,11 @@ impl RebornRuntimeInput {
 
     pub fn with_identity(mut self, identity: RebornRuntimeIdentity) -> Self {
         self.identity = identity;
+        self
+    }
+
+    pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
+        self.skill_context_source = Some(source);
         self
     }
 
