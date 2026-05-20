@@ -134,16 +134,20 @@ pub(super) async fn grep(
             let Ok((content, _encoding, _line_ending)) = decode_text(bytes) else {
                 return Ok(true);
             };
-            if regex.is_match(&content) {
-                let (line_matches, count) =
-                    line_matches(&content, &regex, before_context, after_context, multiline);
-                search_results.push(GrepFileResult {
-                    relative: relative.to_string(),
-                    modified,
-                    count,
-                    lines: line_matches,
-                });
+            if !regex.is_match(&content) {
+                return Ok(true);
             }
+            let (line_matches, count) = match output_mode {
+                "files_with_matches" => (Vec::new(), 0),
+                "count" => (Vec::new(), count_matches_only(&content, &regex, multiline)),
+                _ => line_matches(&content, &regex, before_context, after_context, multiline),
+            };
+            search_results.push(GrepFileResult {
+                relative: relative.to_string(),
+                modified,
+                count,
+                lines: line_matches,
+            });
             Ok(true)
         },
     )
@@ -168,10 +172,16 @@ pub(super) async fn grep(
     ))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct WalkFilesResult {
-    scan_truncated: bool,
+    scan_limit: Option<ScanLimit>,
     bytes_scanned: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScanLimit {
+    AggregateBytes,
+    FileBytes { file_bytes: u64 },
 }
 
 async fn walk_files(
@@ -181,33 +191,30 @@ async fn walk_files(
     mut include: impl FnMut(&str) -> bool,
     mut visit: impl FnMut(&str, &[u8], Option<SystemTime>) -> Result<bool, FirstPartyCapabilityError>,
 ) -> Result<WalkFilesResult, FirstPartyCapabilityError> {
-    let mut total_bytes = 0u64;
+    let mut walk_result = WalkFilesResult::default();
     if root_stat.file_type == FileType::File {
         let relative = root_file_relative(&root.scoped_path);
-        let mut scan_truncated = false;
         if include(&relative)
             && !visit_file(
                 request,
                 &root.virtual_path,
                 &relative,
                 root_stat,
-                &mut total_bytes,
+                &mut walk_result,
                 &mut visit,
                 false,
             )
             .await?
         {
-            scan_truncated = true;
+            walk_result
+                .scan_limit
+                .get_or_insert(ScanLimit::AggregateBytes);
         }
-        return Ok(WalkFilesResult {
-            scan_truncated,
-            bytes_scanned: total_bytes,
-        });
+        return Ok(walk_result);
     }
 
     let mut stack = vec![root.virtual_path.clone()];
     let mut visited = 0usize;
-    let mut scan_truncated = false;
     while let Some(dir) = stack.pop() {
         let entries = request
             .filesystem
@@ -252,27 +259,23 @@ async fn walk_files(
                         &entry.path,
                         &relative,
                         stat,
-                        &mut total_bytes,
+                        &mut walk_result,
                         &mut visit,
                         true,
                     )
                     .await?
                     {
-                        scan_truncated = true;
-                        return Ok(WalkFilesResult {
-                            scan_truncated,
-                            bytes_scanned: total_bytes,
-                        });
+                        walk_result
+                            .scan_limit
+                            .get_or_insert(ScanLimit::AggregateBytes);
+                        return Ok(walk_result);
                     }
                 }
                 FileType::Symlink | FileType::Other => {}
             }
         }
     }
-    Ok(WalkFilesResult {
-        scan_truncated,
-        bytes_scanned: total_bytes,
-    })
+    Ok(walk_result)
 }
 
 async fn visit_file(
@@ -280,7 +283,7 @@ async fn visit_file(
     path: &VirtualPath,
     relative: &str,
     stat: FileStat,
-    total_bytes: &mut u64,
+    walk_result: &mut WalkFilesResult,
     visit: &mut impl FnMut(&str, &[u8], Option<SystemTime>) -> Result<bool, FirstPartyCapabilityError>,
     skip_read_errors: bool,
 ) -> Result<bool, FirstPartyCapabilityError> {
@@ -291,20 +294,27 @@ async fn visit_file(
             max_read_size = MAX_READ_SIZE,
             "skipping oversized grep file"
         );
+        if !skip_read_errors {
+            walk_result.scan_limit = Some(ScanLimit::FileBytes {
+                file_bytes: stat.len,
+            });
+            return Ok(false);
+        }
         return Ok(true);
     }
-    let next_total = total_bytes.saturating_add(stat.len);
+    let next_total = walk_result.bytes_scanned.saturating_add(stat.len);
     if next_total > GREP_MAX_TOTAL_BYTES {
         tracing::debug!(
             path = path.as_str(),
-            total_bytes = *total_bytes,
+            total_bytes = walk_result.bytes_scanned,
             next_file_bytes = stat.len,
             max_total_bytes = GREP_MAX_TOTAL_BYTES,
             "stopping grep after aggregate scan budget"
         );
+        walk_result.scan_limit = Some(ScanLimit::AggregateBytes);
         return Ok(false);
     }
-    *total_bytes = next_total;
+    walk_result.bytes_scanned = next_total;
     let bytes = match request.filesystem.read_file(path).await {
         Ok(bytes) => bytes,
         Err(_error) if skip_read_errors => {
@@ -351,7 +361,7 @@ fn build_grep_output(
             let mut output = json!({
                 "files": files,
                 "count": files.len(),
-                "truncated": walk_result.scan_truncated
+                "truncated": walk_result.scan_limit.is_some()
                     || total > offset.saturating_add(effective_limit)
             });
             add_scan_limit_metadata(&mut output, walk_result);
@@ -371,7 +381,7 @@ fn build_grep_output(
                     "count": result.count
                 })).collect::<Vec<_>>(),
                 "total": total,
-                "truncated": walk_result.scan_truncated
+                "truncated": walk_result.scan_limit.is_some()
                     || total_count > offset.saturating_add(effective_limit)
             });
             add_scan_limit_metadata(&mut output, walk_result);
@@ -400,7 +410,7 @@ fn build_grep_output(
                 .cloned()
                 .collect::<Vec<_>>();
             let mut content = page.join("\n");
-            let mut truncated = walk_result.scan_truncated
+            let mut truncated = walk_result.scan_limit.is_some()
                 || raw_len > MAX_OUTPUT_SIZE
                 || lines.len() > offset.saturating_add(effective_limit);
             if content.len() > MAX_OUTPUT_SIZE {
@@ -415,12 +425,27 @@ fn build_grep_output(
 }
 
 fn add_scan_limit_metadata(output: &mut Value, walk_result: WalkFilesResult) {
-    if !walk_result.scan_truncated {
-        return;
+    match walk_result.scan_limit {
+        Some(ScanLimit::AggregateBytes) => {
+            output["limit_reason"] = json!("aggregate_scan_bytes");
+            output["bytes_scanned"] = json!(walk_result.bytes_scanned);
+            output["max_scan_bytes"] = json!(GREP_MAX_TOTAL_BYTES);
+        }
+        Some(ScanLimit::FileBytes { file_bytes }) => {
+            output["limit_reason"] = json!("file_size_bytes");
+            output["file_bytes"] = json!(file_bytes);
+            output["max_file_bytes"] = json!(MAX_READ_SIZE);
+        }
+        None => {}
     }
-    output["limit_reason"] = json!("aggregate_scan_bytes");
-    output["bytes_scanned"] = json!(walk_result.bytes_scanned);
-    output["max_scan_bytes"] = json!(GREP_MAX_TOTAL_BYTES);
+}
+
+fn count_matches_only(content: &str, regex: &regex::Regex, multiline: bool) -> usize {
+    if multiline {
+        regex.find_iter(content).count()
+    } else {
+        content.lines().filter(|line| regex.is_match(line)).count()
+    }
 }
 
 fn line_matches(
