@@ -471,6 +471,7 @@ pub async fn build_reborn_runtime(
         runner,
         poll,
         identity,
+        skill_context_source,
         #[cfg(test)]
         model_gateway_override,
     } = input;
@@ -596,7 +597,7 @@ pub async fn build_reborn_runtime(
         },
         model_route_resolver: None,
         cancellation_factory: None,
-        skill_context_source: None,
+        skill_context_source,
         input_queue: None,
         identity_context_source: Arc::new(EmptyIdentityContextSource),
         model_policy_guard: None,
@@ -799,13 +800,18 @@ mod tests {
     use ironclaw_loop_support::{
         HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
         HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
+        HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
     };
+    use ironclaw_skills::SkillTrust;
     use ironclaw_threads::{
         LoadContextMessagesRequest, MessageKind, SessionThreadService, ThreadHistoryRequest,
     };
     use ironclaw_turns::{
         TurnStatus,
-        run_profile::{LoopCapabilityPort, ProviderToolCall, VisibleCapabilityRequest},
+        run_profile::{
+            LoopCapabilityPort, LoopRunContext, ProviderToolCall, SkillVisibility,
+            VisibleCapabilityRequest,
+        },
     };
 
     use crate::input::RebornBuildInput;
@@ -830,6 +836,26 @@ mod tests {
     struct WorkspaceListingGateway {
         calls: StdMutex<usize>,
         requests: StdMutex<Vec<HostManagedModelRequest>>,
+    }
+
+    struct StaticSkillContextSource {
+        candidates: Vec<HostSkillContextCandidate>,
+    }
+
+    impl StaticSkillContextSource {
+        fn new(candidates: Vec<HostSkillContextCandidate>) -> Self {
+            Self { candidates }
+        }
+    }
+
+    #[async_trait]
+    impl HostSkillContextSource for StaticSkillContextSource {
+        async fn load_skill_context_candidates(
+            &self,
+            _run_context: &LoopRunContext,
+        ) -> Result<Vec<HostSkillContextCandidate>, HostSkillContextBuildError> {
+            Ok(self.candidates.clone())
+        }
     }
 
     #[async_trait]
@@ -1022,6 +1048,10 @@ mod tests {
         HostManagedModelError::safe(HostManagedModelErrorKind::Unavailable, error.to_string())
     }
 
+    fn skill_md(name: &str, description: &str, prompt: &str) -> String {
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n{prompt}")
+    }
+
     #[tokio::test]
     async fn send_user_message_returns_completed_assistant_text_with_recording_gateway() {
         let root = tempfile::tempdir().expect("tempdir");
@@ -1181,6 +1211,81 @@ mod tests {
             provider_call.capability_id,
             CapabilityId::new("builtin.echo").unwrap()
         );
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn local_dev_runtime_wires_input_skill_context_source_to_model_calls() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let gateway = Arc::new(RecordingGateway {
+            reply: "skill context ok".to_string(),
+            requests: Arc::clone(&requests),
+        });
+        let skill_source = Arc::new(StaticSkillContextSource::new(vec![
+            HostSkillContextCandidate::new(
+                skill_md(
+                    "review-helper",
+                    "review helper description",
+                    "Use review helper prompt content.",
+                ),
+                Some(SkillTrust::Trusted),
+                Some(SkillVisibility::Visible),
+            ),
+        ]));
+        let skill_context_source: Arc<dyn HostSkillContextSource> = skill_source;
+        let input = RebornRuntimeInput::from_services(RebornBuildInput::local_dev(
+            "runtime-skill-owner",
+            root.path().join("local-dev"),
+        ))
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-skill-tenant".to_string(),
+            agent_id: "runtime-skill-agent".to_string(),
+            source_binding_id: "runtime-skill-source".to_string(),
+            reply_target_binding_id: "runtime-skill-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_skill_context_source(skill_context_source)
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let conversation = runtime.new_conversation().await.expect("conversation");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.send_user_message(&conversation, "review this"),
+        )
+        .await
+        .expect("runtime send should finish")
+        .expect("runtime send should succeed");
+
+        assert_eq!(reply.status, TurnStatus::Completed);
+        assert_eq!(reply.text.as_deref(), Some("skill context ok"));
+        let requests = requests
+            .lock()
+            .expect("recording gateway requests lock poisoned");
+        assert_eq!(requests.len(), 1);
+        let skill_message = requests[0]
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == HostManagedModelMessageRole::System
+                    && message
+                        .content_ref
+                        .as_str()
+                        .starts_with("msg:snippet.skill.review-helper.")
+            })
+            .expect("model request should include skill-context system message");
+        assert!(skill_message.content.contains("review helper description"));
+        assert!(
+            skill_message
+                .content
+                .contains("Use review helper prompt content.")
+        );
+        drop(requests);
 
         runtime.shutdown().await.expect("runtime shutdown");
     }
