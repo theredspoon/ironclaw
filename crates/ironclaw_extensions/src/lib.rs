@@ -337,8 +337,9 @@ pub use host_api::capability_provider::{
 pub use v2::{
     CapabilityDeclV2, CapabilityVisibility, ExtensionManifestV2, ExtensionRuntimeV2,
     HostApiContractRegistry, HostApiId, HostApiManifestContext, HostApiManifestContract,
-    HostApiMultiplicity, HostApiRefV2, MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_BYTES,
-    ManifestSectionPath, ManifestSource, ManifestV2Error, RESERVED_HOST_BUNDLED_ID_PREFIX,
+    HostApiManifestProjection, HostApiMultiplicity, HostApiRefV2, MANIFEST_SCHEMA_VERSION,
+    MAX_MANIFEST_BYTES, ManifestSectionPath, ManifestSource, ManifestV2Error,
+    RESERVED_HOST_BUNDLED_ID_PREFIX,
 };
 
 pub type CapabilityManifest = CapabilityDeclV2;
