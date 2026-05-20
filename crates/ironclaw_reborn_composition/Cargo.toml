@@ -74,6 +74,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+ironclaw_skills = { path = "../ironclaw_skills" }
 ironclaw_threads = { path = "../ironclaw_threads" }
 tempfile = "3"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }

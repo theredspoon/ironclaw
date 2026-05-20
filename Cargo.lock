@@ -4671,6 +4671,7 @@ dependencies = [
  "ironclaw_resources",
  "ironclaw_run_state",
  "ironclaw_secrets",
+ "ironclaw_skills",
  "ironclaw_threads",
  "ironclaw_trust",
  "ironclaw_turns",
