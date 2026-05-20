@@ -836,6 +836,31 @@ impl<N, S> HostHttpEgressService<N, S> {
             store.discard_for_capability(&request.scope, &request.capability_id);
         }
     }
+
+    fn validate_credential_sources_for_request(
+        &self,
+        request: &RuntimeHttpEgressRequest,
+    ) -> Result<(), RuntimeHttpEgressError> {
+        if matches!(
+            self.network_policy_source,
+            NetworkPolicySource::RequestPolicyFallback
+        ) {
+            return Ok(());
+        }
+
+        let uses_direct_secret_store_lease = request
+            .credential_injections
+            .iter()
+            .any(|injection| matches!(injection.source, RuntimeCredentialSource::SecretStoreLease));
+        if uses_direct_secret_store_lease {
+            return Err(RuntimeHttpEgressError::Credential {
+                reason: "direct secret-store leases are unavailable for production runtime egress"
+                    .to_string(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 impl<N, S> RuntimeHttpEgress for HostHttpEgressService<N, S>
@@ -848,6 +873,10 @@ where
         mut request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
         let network_policy = self.network_policy_for_request(&mut request)?;
+        if let Err(error) = self.validate_credential_sources_for_request(&request) {
+            self.discard_staged_policy_for_request(&request);
+            return Err(error);
+        }
         if let Err(error) = validate_runtime_request(&request) {
             self.discard_staged_policy_for_request(&request);
             return Err(error);

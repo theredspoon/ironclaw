@@ -1015,6 +1015,64 @@ fn host_http_egress_borrows_staged_network_policy_before_transport() {
 }
 
 #[test]
+fn production_host_http_egress_rejects_direct_secret_store_lease_before_transport() {
+    let network = RecordingNetwork::ok(NetworkHttpResponse {
+        status: 200,
+        headers: vec![],
+        body: br#"{\"ok\":true}"#.to_vec(),
+        usage: NetworkUsage {
+            request_bytes: 5,
+            response_bytes: 11,
+            resolved_ip: None,
+        },
+    });
+    let network_recorder = network.requests.clone();
+    let services = test_obligation_services();
+    let scope = sample_scope();
+    let capability_id = sample_capability_id();
+    let handle = SecretHandle::new("api-token").unwrap();
+    stage_policy_sync(&services, &scope, &capability_id, sample_policy());
+    block_on_test(services.secret_store().put(
+        scope.clone(),
+        handle.clone(),
+        SecretMaterial::from("sk-direct-lease"),
+    ))
+    .unwrap();
+    let service = services.host_http_egress(network);
+
+    let error = service
+        .execute(RuntimeHttpEgressRequest {
+            runtime: RuntimeKind::Mcp,
+            scope,
+            capability_id,
+            method: NetworkMethod::Post,
+            url: "https://api.example.test/v1/run".to_string(),
+            headers: vec![],
+            body: b"hello".to_vec(),
+            network_policy: caller_supplied_policy(),
+            credential_injections: vec![RuntimeCredentialInjection {
+                handle,
+                source: RuntimeCredentialSource::SecretStoreLease,
+                target: RuntimeCredentialTarget::Header {
+                    name: "authorization".to_string(),
+                    prefix: Some("Bearer ".to_string()),
+                },
+                required: true,
+            }],
+            response_body_limit: Some(4096),
+            timeout_ms: Some(1000),
+        })
+        .expect_err("production egress must require staged secret obligations");
+
+    assert!(matches!(
+        error,
+        RuntimeHttpEgressError::Credential { reason }
+            if reason == "direct secret-store leases are unavailable for production runtime egress"
+    ));
+    assert!(network_recorder.lock().unwrap().is_empty());
+}
+
+#[test]
 fn wasm_http_adapter_borrows_real_host_staged_network_policy() {
     let network = RecordingNetwork::ok(NetworkHttpResponse {
         status: 200,
@@ -1203,6 +1261,62 @@ async fn mcp_http_client_reuses_real_host_staged_network_policy_for_json_rpc_ses
             .all(|request| request.policy == staged_policy)
     );
     drop(requests);
+}
+
+#[tokio::test]
+async fn mcp_http_client_cannot_use_direct_secret_store_lease_with_production_egress() {
+    let network = JsonRpcMcpNetwork::new();
+    let network_recorder = network.requests.clone();
+    let services = test_obligation_services();
+    let scope = sample_scope();
+    let capability_id = CapabilityId::new("mcp.search").unwrap();
+    let handle = SecretHandle::new("github-token").unwrap();
+    stage_policy(&services, &scope, &capability_id, sample_policy()).await;
+    services
+        .secret_store()
+        .put(
+            scope.clone(),
+            handle.clone(),
+            SecretMaterial::from("sk-direct-lease"),
+        )
+        .await
+        .unwrap();
+    let service = services.host_http_egress(network);
+    let client = McpHostHttpClient::new(
+        McpRuntimeHttpAdapter::new(Arc::new(service)),
+        StaticMcpHostHttpEgressPlanner::new(McpHostHttpEgressPlan {
+            network_policy: caller_supplied_policy(),
+            credential_injections: vec![RuntimeCredentialInjection {
+                handle,
+                source: RuntimeCredentialSource::SecretStoreLease,
+                target: RuntimeCredentialTarget::Header {
+                    name: "authorization".to_string(),
+                    prefix: Some("Bearer ".to_string()),
+                },
+                required: true,
+            }],
+            response_body_limit: Some(4096),
+            timeout_ms: Some(1000),
+        }),
+    );
+
+    let error = client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("mcp").unwrap(),
+            capability_id,
+            scope,
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://api.example.test/v1/run".to_string()),
+            input: json!({"query": "ironclaw"}),
+            max_output_bytes: 4096,
+        })
+        .await
+        .expect_err("production MCP egress must require staged credentials");
+
+    assert_eq!(error, "credential_unavailable");
+    assert!(network_recorder.lock().unwrap().is_empty());
 }
 
 #[test]
