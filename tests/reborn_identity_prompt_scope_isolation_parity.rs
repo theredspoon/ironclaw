@@ -27,6 +27,8 @@ const BOB_IDENTITY: &str = "Bob is a marine biologist who lives in Miami.";
 
 #[tokio::test]
 async fn reborn_identity_prompt_scope_isolation_parity() {
+    const SHARED_ROOM: &str = "room-identity-shared";
+
     let identity_source = Arc::new(ScopedIdentitySource::default());
     let model_gateway = RebornTraceReplayModelGateway::with_responses([
         HostManagedModelResponse::assistant_reply("alice scoped reply"),
@@ -34,7 +36,7 @@ async fn reborn_identity_prompt_scope_isolation_parity() {
     ]);
     let mut harness =
         RebornBinaryE2EHarness::with_model_gateway_identity_source_unscoped_shared_worker(
-            "room-identity-alice",
+            SHARED_ROOM,
             model_gateway,
             RecordingTestCapabilityPort::echo(),
             identity_source.clone(),
@@ -44,7 +46,7 @@ async fn reborn_identity_prompt_scope_isolation_parity() {
 
     let alice = harness
         .submit_text_for_with_trigger(
-            "room-identity-alice",
+            SHARED_ROOM,
             "alice",
             "event-identity-alice",
             "hello from alice",
@@ -62,7 +64,7 @@ async fn reborn_identity_prompt_scope_isolation_parity() {
 
     let bob = harness
         .submit_text_for_with_trigger(
-            "room-identity-bob",
+            SHARED_ROOM,
             "bob",
             "event-identity-bob",
             "hello from bob",
@@ -73,6 +75,14 @@ async fn reborn_identity_prompt_scope_isolation_parity() {
     assert_ne!(
         alice.actor.user_id, bob.actor.user_id,
         "distinct external actors must resolve to distinct canonical users before identity can isolate"
+    );
+    assert_eq!(
+        alice.thread_id, bob.thread_id,
+        "BotMention submissions in the same shared room should bind to one shared thread"
+    );
+    assert_eq!(
+        alice.thread_scope, bob.thread_scope,
+        "shared-thread identity isolation must be exercised inside one thread scope"
     );
     identity_source.set_identity(bob.actor.user_id.as_str(), BOB_IDENTITY);
     harness

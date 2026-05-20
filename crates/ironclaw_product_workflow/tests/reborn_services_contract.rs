@@ -225,6 +225,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
         self.run_state_requests.lock().expect("lock").push(request);
         Ok(TurnRunState {
             scope,
+            actor: None,
             turn_id: TurnId::new(),
             run_id,
             status: TurnStatus::Queued,
