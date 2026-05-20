@@ -473,3 +473,34 @@ fn readiness_for(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_dev_services_include_repl_runtime_substrate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "local-dev-substrate-owner",
+            dir.path().join("local-dev"),
+        ))
+        .await
+        .expect("local-dev services build");
+
+        assert!(services.host_runtime.is_some());
+        assert!(services.turn_coordinator.is_some());
+        assert!(services.local_runtime.is_some());
+        assert_eq!(services.readiness.state, RebornReadinessState::DevOnly);
+    }
+
+    #[test]
+    fn disabled_services_do_not_include_repl_runtime_substrate() {
+        let services = RebornServices::disabled();
+
+        assert!(services.host_runtime.is_none());
+        assert!(services.turn_coordinator.is_none());
+        assert!(services.local_runtime.is_none());
+        assert_eq!(services.readiness.state, RebornReadinessState::Disabled);
+    }
+}
