@@ -11,14 +11,16 @@ use std::sync::Arc;
 
 use ironclaw_filesystem::{InMemoryBackend, RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
-    AgentId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId, TenantId, ThreadId,
-    UserId, VirtualPath,
+    AgentId, CapabilityId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId,
+    TenantId, ThreadId, UserId, VirtualPath,
 };
 use ironclaw_threads::{
-    AcceptInboundMessageRequest, AppendAssistantDraftRequest, CreateSummaryArtifactRequest,
-    EnsureThreadRequest, FilesystemSessionThreadService, LoadContextWindowRequest, MessageContent,
-    MessageKind, MessageStatus, RedactMessageRequest, SessionThreadError, SessionThreadService,
-    ThreadHistoryRequest, ThreadScope, UpdateAssistantDraftRequest,
+    AcceptInboundMessageRequest, AppendAssistantDraftRequest, AppendToolResultReferenceRequest,
+    CreateSummaryArtifactRequest, EnsureThreadRequest, FilesystemSessionThreadService,
+    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
+    MessageStatus, ProviderToolCallReferenceEnvelope, RedactMessageRequest, SessionThreadError,
+    SessionThreadService, ThreadHistoryRequest, ThreadScope, ToolResultSafeSummary,
+    UpdateAssistantDraftRequest,
 };
 
 #[tokio::test]
@@ -35,6 +37,63 @@ async fn durable_history_round_trips_through_filesystem_store() {
     let scoped = scoped_threads_fs_at(backend, "tenant-a", "alice");
     let reopened = FilesystemSessionThreadService::new(scoped);
     assert_reopened_history(&reopened, label, thread_id).await;
+}
+
+#[tokio::test]
+async fn provider_replay_metadata_survives_reopen_but_history_stays_scrubbed() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(Arc::clone(&backend), "tenant-a", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let scope = scope("provider-reopen");
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope.clone(),
+            thread_id: Some(ThreadId::new("thread-provider-reopen").unwrap()),
+            created_by_actor_id: "actor".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let tool_result = service
+        .append_tool_result_reference(AppendToolResultReferenceRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-1".into(),
+            result_ref: "result:provider-reopen-tool".into(),
+            safe_summary: ToolResultSafeSummary::new("safe tool result").unwrap(),
+            provider_call: Some(provider_call_reference()),
+        })
+        .await
+        .unwrap();
+
+    let reopened =
+        FilesystemSessionThreadService::new(scoped_threads_fs_at(backend, "tenant-a", "alice"));
+    let history = reopened
+        .list_thread_history(ThreadHistoryRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(history.messages[0].tool_result_provider_call.is_none());
+
+    let context = reopened
+        .load_context_messages(LoadContextMessagesRequest {
+            scope,
+            thread_id: thread.thread_id,
+            message_ids: vec![tool_result.message_id],
+        })
+        .await
+        .unwrap();
+    let provider_call = context.messages[0]
+        .tool_result_provider_call
+        .as_ref()
+        .expect("model context preserves provider metadata after reopen");
+    assert_eq!(provider_call.provider_id, "test-provider");
+    assert_eq!(provider_call.provider_model_id, "test-model");
+    assert_eq!(provider_call.provider_call_id, "call_1");
+    assert_eq!(provider_call.provider_tool_name, "demo__echo");
 }
 
 #[tokio::test]
@@ -392,6 +451,21 @@ fn scope(label: &str) -> ThreadScope {
         project_id: Some(ProjectId::new(format!("project-{label}")).unwrap()),
         owner_user_id: Some(UserId::new(format!("user-{label}")).unwrap()),
         mission_id: None,
+    }
+}
+
+fn provider_call_reference() -> ProviderToolCallReferenceEnvelope {
+    ProviderToolCallReferenceEnvelope {
+        provider_id: "test-provider".to_string(),
+        provider_model_id: "test-model".to_string(),
+        provider_turn_id: "turn_1".to_string(),
+        provider_call_id: "call_1".to_string(),
+        provider_tool_name: "demo__echo".to_string(),
+        capability_id: CapabilityId::new("demo.echo").unwrap(),
+        arguments: serde_json::json!({"message":"hello"}),
+        response_reasoning: Some("provider response reasoning".to_string()),
+        reasoning: Some("provider call reasoning".to_string()),
+        signature: Some("sig-1".to_string()),
     }
 }
 

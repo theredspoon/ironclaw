@@ -63,6 +63,27 @@ fn convert_tool_definition(tool: &ToolDefinition) -> Value {
     })
 }
 
+fn build_sanitized_tool_name_map(
+    tools: &[ToolDefinition],
+) -> Result<std::collections::HashMap<String, String>, LlmError> {
+    let mut name_map = std::collections::HashMap::new();
+    for tool in tools {
+        let sanitized = sanitize_tool_name(&tool.name);
+        if let Some(existing) = name_map.insert(sanitized.clone(), tool.name.clone())
+            && existing != tool.name
+        {
+            return Err(LlmError::InvalidResponse {
+                provider: "codex_chatgpt".to_string(),
+                reason: format!(
+                    "tool names `{existing}` and `{}` both map to provider name `{sanitized}`",
+                    tool.name
+                ),
+            });
+        }
+    }
+    Ok(name_map)
+}
+
 /// Provider that speaks the Responses API protocol against the ChatGPT backend.
 pub(crate) struct CodexChatGptProvider {
     client: Client,
@@ -735,21 +756,10 @@ impl LlmProvider for CodexChatGptProvider {
         &self,
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let model = self.resolve_model().await;
         let mut messages = request.messages;
         crate::provider::sanitize_tool_messages(&mut messages);
-        let name_map: std::collections::HashMap<String, String> = request
-            .tools
-            .iter()
-            .filter_map(|tool| {
-                let sanitized = sanitize_tool_name(&tool.name);
-                if sanitized == tool.name {
-                    None
-                } else {
-                    Some((sanitized, tool.name.clone()))
-                }
-            })
-            .collect();
+        let name_map = build_sanitized_tool_name_map(&request.tools)?;
+        let model = self.resolve_model().await;
         let body = self.build_request_body(
             model,
             &messages,
@@ -1051,6 +1061,38 @@ data: {"response":{"usage":{"input_tokens":3,"output_tokens":2}}}
         assert_eq!(
             response.tool_calls[0].arguments,
             json!({"message": "hello"})
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_rejects_colliding_sanitized_tool_names_before_request() {
+        let provider = CodexChatGptProvider::new("http://127.0.0.1:9", "test-key", "gpt-4o");
+        let request = ToolCompletionRequest::new(
+            vec![ChatMessage::user("use a tool")],
+            vec![
+                ToolDefinition {
+                    name: "foo.bar".to_string(),
+                    description: "First tool".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+                ToolDefinition {
+                    name: "foo_bar".to_string(),
+                    description: "Second tool".to_string(),
+                    parameters: json!({"type": "object"}),
+                },
+            ],
+        );
+
+        let error = provider
+            .complete_with_tools(request)
+            .await
+            .expect_err("colliding provider tool names must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("both map to provider name `foo_bar`"),
+            "unexpected error: {error}"
         );
     }
 
