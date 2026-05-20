@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -116,11 +116,13 @@ impl LoopCapabilityPortFactory for LocalDevLoopCapabilityPortFactory {
 }
 
 const LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS: usize = 1024;
+const LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES: usize = 4 * 1024 * 1024;
+const MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES: usize = 480;
 
 #[derive(Default)]
 struct LocalDevCapabilityIo {
-    inputs: StdMutex<HashMap<String, serde_json::Value>>,
-    results: StdMutex<HashMap<String, serde_json::Value>>,
+    inputs: StdMutex<StagedValueStore>,
+    results: StdMutex<StagedValueStore>,
 }
 
 impl LocalDevCapabilityIo {
@@ -135,6 +137,95 @@ impl LocalDevCapabilityIo {
     }
 }
 
+#[derive(Default)]
+struct StagedValueStore {
+    values: HashMap<String, StagedValue>,
+    // Results evict oldest entries under byte pressure; inputs fail closed so
+    // active tool-call arguments are never silently dropped before invocation.
+    order: VecDeque<String>,
+    total_bytes: usize,
+}
+
+struct StagedValue {
+    value: serde_json::Value,
+    bytes: usize,
+}
+
+impl StagedValueStore {
+    fn get(&self, reference: &str) -> Option<&serde_json::Value> {
+        self.values.get(reference).map(|staged| &staged.value)
+    }
+
+    fn insert_without_eviction(
+        &mut self,
+        reference: String,
+        value: serde_json::Value,
+    ) -> Result<(), AgentLoopHostError> {
+        let bytes = staged_value_bytes(&value)?;
+        if self.values.len() >= LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS
+            || self.total_bytes.saturating_add(bytes) > LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES
+        {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::BudgetExceeded,
+                "local-dev capability staging is full",
+            ));
+        }
+        self.insert_measured(reference, value, bytes);
+        Ok(())
+    }
+
+    fn insert_with_oldest_eviction(
+        &mut self,
+        reference: String,
+        value: serde_json::Value,
+    ) -> Result<(), AgentLoopHostError> {
+        let bytes = staged_value_bytes(&value)?;
+        if bytes > LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::BudgetExceeded,
+                "local-dev capability result exceeds staging budget",
+            ));
+        }
+        while self.values.len() >= LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS
+            || self.total_bytes.saturating_add(bytes) > LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES
+        {
+            self.evict_oldest();
+        }
+        self.insert_measured(reference, value, bytes);
+        Ok(())
+    }
+
+    fn insert_measured(&mut self, reference: String, value: serde_json::Value, bytes: usize) {
+        if let Some(previous) = self.values.remove(&reference) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+            self.order.retain(|candidate| candidate != &reference);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(bytes);
+        self.order.push_back(reference.clone());
+        self.values.insert(reference, StagedValue { value, bytes });
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some(reference) = self.order.pop_front() {
+            if let Some(previous) = self.values.remove(&reference) {
+                self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+                return;
+            }
+        }
+    }
+}
+
+fn staged_value_bytes(value: &serde_json::Value) -> Result<usize, AgentLoopHostError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "capability payload could not be measured",
+            )
+        })
+}
+
 #[async_trait::async_trait]
 impl LoopCapabilityInputResolver for LocalDevCapabilityIo {
     async fn resolve_capability_input(
@@ -143,8 +234,8 @@ impl LoopCapabilityInputResolver for LocalDevCapabilityIo {
         input_ref: &CapabilityInputRef,
     ) -> Result<serde_json::Value, AgentLoopHostError> {
         ensure_local_dev_ref_scope("input", input_ref.as_str(), run_context)?;
-        let mut inputs = self.inputs.lock().map_err(|_| capability_io_error())?;
-        inputs.remove(input_ref.as_str()).ok_or_else(|| {
+        let inputs = self.inputs.lock().map_err(|_| capability_io_error())?;
+        inputs.get(input_ref.as_str()).cloned().ok_or_else(|| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::InvalidInvocation,
                 "capability input ref was not staged for this loop run",
@@ -166,13 +257,8 @@ impl LoopCapabilityInputResolver for LocalDevCapabilityIo {
                     )
                 })?;
         let mut inputs = self.inputs.lock().map_err(|_| capability_io_error())?;
-        if inputs.len() >= LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS {
-            return Err(AgentLoopHostError::new(
-                AgentLoopHostErrorKind::BudgetExceeded,
-                "local-dev capability input staging is full",
-            ));
-        }
-        inputs.insert(input_ref.as_str().to_string(), tool_call.arguments.clone());
+        inputs
+            .insert_without_eviction(input_ref.as_str().to_string(), tool_call.arguments.clone())?;
         Ok(input_ref)
     }
 }
@@ -194,13 +280,7 @@ impl LoopCapabilityResultWriter for LocalDevCapabilityIo {
                     )
                 })?;
         let mut results = self.results.lock().map_err(|_| capability_io_error())?;
-        if results.len() >= LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS {
-            return Err(AgentLoopHostError::new(
-                AgentLoopHostErrorKind::BudgetExceeded,
-                "local-dev capability result staging is full",
-            ));
-        }
-        results.insert(result_ref.as_str().to_string(), output);
+        results.insert_with_oldest_eviction(result_ref.as_str().to_string(), output)?;
         Ok(result_ref)
     }
 }
@@ -299,33 +379,63 @@ fn hydrate_tool_result_messages(
 /// This is not product-live canonical result storage; it is a bounded local-dev bridge so provider
 /// follow-up calls receive useful output while preserving the transcript safe-summary contract.
 fn model_visible_tool_output(output: &serde_json::Value) -> String {
-    let raw = match output {
-        serde_json::Value::String(text) => format!("tool output {text}"),
-        value => format!("tool output {value}"),
-    };
-    let mut sanitized = raw
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '{' | '}' | '[' | ']' | '`' | '<' | '>' | '/' | '\\'
-                )
-            {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    if sanitized.len() > 480 {
-        sanitized.truncate(480);
-    }
+    let mut sanitized = String::from("tool output");
+    append_model_visible_value(output, &mut sanitized);
     let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
     if ToolResultSafeSummary::new(sanitized.clone()).is_ok() {
         sanitized
     } else {
         "tool output available".to_string()
+    }
+}
+
+fn append_model_visible_value(value: &serde_json::Value, output: &mut String) {
+    if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
+        return;
+    }
+    match value {
+        serde_json::Value::Null => append_sanitized_capped(" null", output),
+        serde_json::Value::Bool(value) => append_sanitized_capped(&format!(" {value}"), output),
+        serde_json::Value::Number(value) => append_sanitized_capped(&format!(" {value}"), output),
+        serde_json::Value::String(value) => append_sanitized_capped(&format!(" {value}"), output),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                append_model_visible_value(value, output);
+                if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                append_sanitized_capped(&format!(" {key}"), output);
+                append_model_visible_value(value, output);
+                if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn append_sanitized_capped(value: &str, output: &mut String) {
+    for character in value.chars() {
+        if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
+            break;
+        }
+        let character = if character.is_control()
+            || matches!(
+                character,
+                '{' | '}' | '[' | ']' | '`' | '<' | '>' | '/' | '\\'
+            ) {
+            ' '
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
+            break;
+        }
+        output.push(character);
     }
 }
 
@@ -407,33 +517,27 @@ fn local_dev_builtin_grants(
     Ok(CapabilitySet { grants })
 }
 
-fn local_dev_builtin_capability_ids() -> [&'static str; 9] {
+fn local_dev_builtin_capability_ids() -> [&'static str; 7] {
     [
         "builtin.echo",
         "builtin.time",
         "builtin.json",
         "builtin.read_file",
-        "builtin.write_file",
         "builtin.list_dir",
         "builtin.glob",
         "builtin.grep",
-        "builtin.apply_patch",
     ]
 }
 
 fn local_dev_allowed_effects() -> Vec<EffectKind> {
-    vec![
-        EffectKind::DispatchCapability,
-        EffectKind::ReadFilesystem,
-        EffectKind::WriteFilesystem,
-    ]
+    vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
 }
 
 fn local_dev_workspace_mounts() -> Result<MountView, AgentLoopHostError> {
     MountView::new(vec![MountGrant::new(
         MountAlias::new("/workspace").map_err(host_api_agent_loop_error)?,
         VirtualPath::new("/projects/workspace").map_err(host_api_agent_loop_error)?,
-        MountPermissions::read_write(),
+        MountPermissions::read_only(),
     )])
     .map_err(host_api_agent_loop_error)
 }
@@ -463,4 +567,145 @@ fn capability_io_error() -> AgentLoopHostError {
 
 fn host_api_agent_loop_error(error: impl std::fmt::Display) -> AgentLoopHostError {
     AgentLoopHostError::new(AgentLoopHostErrorKind::InvalidInvocation, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId};
+    use ironclaw_turns::{
+        RunProfileResolutionRequest, RunProfileResolver, TurnId, TurnRunId, TurnScope,
+        run_profile::InMemoryRunProfileResolver,
+    };
+
+    async fn run_context(label: &str) -> LoopRunContext {
+        let resolved = InMemoryRunProfileResolver::default()
+            .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+            .await
+            .expect("profile resolves");
+        LoopRunContext::new(
+            TurnScope::new(
+                TenantId::new(format!("tenant-{label}")).expect("tenant id"),
+                Some(AgentId::new(format!("agent-{label}")).expect("agent id")),
+                Some(ProjectId::new(format!("project-{label}")).expect("project id")),
+                ThreadId::new(format!("thread-{label}")).expect("thread id"),
+            ),
+            TurnId::new(),
+            TurnRunId::new(),
+            resolved,
+        )
+    }
+
+    fn provider_tool_call(arguments: serde_json::Value) -> ProviderToolCall {
+        ProviderToolCall {
+            provider_id: "test-provider".to_string(),
+            provider_model_id: "test-model".to_string(),
+            turn_id: Some("provider-turn-1".to_string()),
+            id: "call-1".to_string(),
+            name: "builtin_echo".to_string(),
+            arguments,
+            response_reasoning: None,
+            reasoning: None,
+            signature: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_io_resolves_input_refs_repeatedly() {
+        let capability_io = LocalDevCapabilityIo::default();
+        let run_context = run_context("repeat-input").await;
+        let input_ref = capability_io
+            .register_provider_tool_call_input(
+                &run_context,
+                &provider_tool_call(serde_json::json!({"message": "hello"})),
+            )
+            .await
+            .expect("input stages");
+
+        let first = capability_io
+            .resolve_capability_input(&run_context, &input_ref)
+            .await
+            .expect("first resolve succeeds");
+        let second = capability_io
+            .resolve_capability_input(&run_context, &input_ref)
+            .await
+            .expect("second resolve succeeds");
+
+        assert_eq!(first, serde_json::json!({"message": "hello"}));
+        assert_eq!(second, serde_json::json!({"message": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn capability_io_rejects_cross_run_and_unstaged_input_refs() {
+        let capability_io = LocalDevCapabilityIo::default();
+        let current_context = run_context("input-scope-a").await;
+        let other_context = run_context("input-scope-b").await;
+        let input_ref = capability_io
+            .register_provider_tool_call_input(
+                &current_context,
+                &provider_tool_call(serde_json::json!({"message": "hello"})),
+            )
+            .await
+            .expect("input stages");
+
+        let cross_run = capability_io
+            .resolve_capability_input(&other_context, &input_ref)
+            .await
+            .expect_err("foreign run should fail");
+        assert_eq!(cross_run.kind, AgentLoopHostErrorKind::ScopeMismatch);
+
+        let missing_ref =
+            CapabilityInputRef::new(format!("input:{}:missing", current_context.run_id))
+                .expect("missing ref");
+        let missing = capability_io
+            .resolve_capability_input(&current_context, &missing_ref)
+            .await
+            .expect_err("unstaged ref should fail");
+        assert_eq!(missing.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    }
+
+    #[test]
+    fn result_store_evicts_oldest_entries_to_stay_under_byte_cap() {
+        let mut store = StagedValueStore::default();
+        store
+            .insert_with_oldest_eviction(
+                "result:first".to_string(),
+                serde_json::Value::String("a".repeat(3 * 1024 * 1024)),
+            )
+            .expect("first result stages");
+        store
+            .insert_with_oldest_eviction(
+                "result:second".to_string(),
+                serde_json::Value::String("b".repeat(2 * 1024 * 1024)),
+            )
+            .expect("second result stages");
+
+        assert!(store.get("result:first").is_none());
+        assert!(store.get("result:second").is_some());
+        assert!(store.total_bytes <= LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES);
+    }
+
+    #[test]
+    fn local_dev_builtin_surface_is_read_only() {
+        let capability_ids = local_dev_builtin_capability_ids();
+
+        assert!(!capability_ids.contains(&"builtin.write_file"));
+        assert!(!capability_ids.contains(&"builtin.apply_patch"));
+        assert_eq!(
+            local_dev_allowed_effects(),
+            vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
+        );
+    }
+
+    #[test]
+    fn model_visible_tool_output_truncates_at_utf8_boundary() {
+        let output = model_visible_tool_output(&serde_json::json!({
+            "message": "é".repeat(300),
+        }));
+
+        assert!(output.len() <= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES);
+        assert!(output.is_char_boundary(output.len()));
+        ToolResultSafeSummary::new(output).expect("summary remains safe");
+    }
 }

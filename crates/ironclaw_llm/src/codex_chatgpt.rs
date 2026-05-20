@@ -811,6 +811,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use futures::stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_message_conversion_user() {
@@ -1011,6 +1013,49 @@ data: {"response":{"usage":{"input_tokens":20,"output_tokens":15}}}
         assert_eq!(result.output_tokens, 2);
     }
 
+    #[tokio::test]
+    async fn complete_with_tools_remaps_sanitized_response_tool_names() {
+        let base_url = spawn_responses_api_server(
+            r#"event: response.output_item.added
+data: {"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"builtin_echo"}}
+
+event: response.function_call_arguments.delta
+data: {"item_id":"fc_1","delta":"{\"message\":\"hello\"}"}
+
+event: response.completed
+data: {"response":{"usage":{"input_tokens":3,"output_tokens":2}}}
+
+"#,
+        )
+        .await;
+        let provider = CodexChatGptProvider::new(&base_url, "test-key", "gpt-4o");
+        let request = ToolCompletionRequest::new(
+            vec![ChatMessage::user("use echo")],
+            vec![ToolDefinition {
+                name: "builtin.echo".to_string(),
+                description: "Echo input".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string"}
+                    }
+                }),
+            }],
+        );
+
+        let response = provider
+            .complete_with_tools(request)
+            .await
+            .expect("tool completion succeeds");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "builtin.echo");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            json!({"message": "hello"})
+        );
+    }
+
     #[test]
     fn test_strip_empty_string_values() {
         let input = json!({
@@ -1021,5 +1066,48 @@ data: {"response":{"usage":{"input_tokens":20,"output_tokens":15}}}
         });
         let cleaned = CodexChatGptProvider::strip_empty_string_values(input);
         assert_eq!(cleaned, json!({"format": "%Y-%m-%d", "operation": "now"}));
+    }
+
+    async fn spawn_responses_api_server(sse_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut request = [0u8; 4096];
+                let bytes_read = socket.read(&mut request).await.expect("read request");
+                let request = String::from_utf8_lossy(&request[..bytes_read]);
+                if request.starts_with("GET /models") {
+                    write_http_response(
+                        &mut socket,
+                        "application/json",
+                        r#"{"models":[{"slug":"gpt-4o"}]}"#,
+                    )
+                    .await;
+                } else if request.starts_with("POST /responses") {
+                    write_http_response(&mut socket, "text/event-stream", sse_body).await;
+                } else {
+                    write_http_response(&mut socket, "text/plain", "not found").await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn write_http_response(
+        socket: &mut tokio::net::TcpStream,
+        content_type: &str,
+        body: &str,
+    ) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
     }
 }
