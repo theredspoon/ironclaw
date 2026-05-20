@@ -792,6 +792,9 @@ mod tests {
         HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
         HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
     };
+    use ironclaw_threads::{
+        LoadContextMessagesRequest, MessageKind, SessionThreadService, ThreadHistoryRequest,
+    };
     use ironclaw_turns::{
         TurnStatus,
         run_profile::{LoopCapabilityPort, ProviderToolCall, VisibleCapabilityRequest},
@@ -1127,6 +1130,48 @@ mod tests {
                 .len(),
             2,
             "tool call should require initial request plus tool-result follow-up"
+        );
+        let history = runtime
+            .thread_service
+            .list_thread_history(ThreadHistoryRequest {
+                scope: runtime.thread_scope.clone(),
+                thread_id: conversation.0.clone(),
+            })
+            .await
+            .expect("thread history");
+        let tool_result = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::ToolResultReference)
+            .expect("tool result reference should persist in thread history");
+        assert!(
+            tool_result
+                .tool_result_ref
+                .as_deref()
+                .is_some_and(|result_ref| result_ref.starts_with("result:")),
+            "tool result should persist a durable result ref"
+        );
+        assert!(
+            tool_result.tool_result_provider_call.is_none(),
+            "product thread history should scrub provider replay metadata"
+        );
+        let context = runtime
+            .thread_service
+            .load_context_messages(LoadContextMessagesRequest {
+                scope: runtime.thread_scope.clone(),
+                thread_id: conversation.0.clone(),
+                message_ids: vec![tool_result.message_id],
+            })
+            .await
+            .expect("tool result context");
+        let provider_call = context.messages[0]
+            .tool_result_provider_call
+            .as_ref()
+            .expect("model context should preserve provider replay metadata");
+        assert_eq!(provider_call.provider_call_id, "call-1");
+        assert_eq!(
+            provider_call.capability_id,
+            CapabilityId::new("builtin.echo").unwrap()
         );
 
         runtime.shutdown().await.expect("runtime shutdown");
