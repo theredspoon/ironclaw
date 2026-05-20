@@ -226,7 +226,7 @@ fn build_runtime_input(config: &RebornBootConfig) -> anyhow::Result<RebornRuntim
             interval: Duration::from_millis(200),
             max_total: Duration::from_secs(180),
         })
-        .with_identity(RebornRuntimeIdentity::reborn_cli());
+        .with_identity(runtime_identity(config_file.as_ref()));
 
     #[cfg(feature = "root-llm-provider")]
     {
@@ -270,6 +270,30 @@ fn read_config_file(
     Ok(file)
 }
 
+// CLI-local operator config only. Product/WebUI identity must come from
+// trusted host installation/binding resolution, not inbound payloads.
+fn runtime_identity(
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> RebornRuntimeIdentity {
+    let default = RebornRuntimeIdentity::reborn_cli();
+    let Some(identity) = config_file.and_then(|file| file.identity.as_ref()) else {
+        return default;
+    };
+
+    RebornRuntimeIdentity {
+        tenant_id: identity
+            .tenant
+            .clone()
+            .unwrap_or_else(|| default.tenant_id.clone()),
+        agent_id: identity
+            .default_agent
+            .clone()
+            .unwrap_or_else(|| default.agent_id.clone()),
+        source_binding_id: default.source_binding_id,
+        reply_target_binding_id: default.reply_target_binding_id,
+    }
+}
+
 fn effective_profile(
     config: &RebornBootConfig,
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
@@ -299,24 +323,13 @@ fn reject_unsupported_runtime_sections(
         return Ok(());
     };
 
-    if let Some(identity) = file.identity.as_ref() {
-        let mut unsupported = Vec::new();
-        if identity.tenant.is_some() {
-            unsupported.push("tenant");
-        }
-        if identity.default_agent.is_some() {
-            unsupported.push("default_agent");
-        }
-        if identity.default_project.is_some() {
-            unsupported.push("default_project");
-        }
-        if !unsupported.is_empty() {
-            anyhow::bail!(
-                "config file [identity] field(s) {} are parsed but not wired in this runtime slice; \
-                 leave them commented until identity-scope wiring lands (default_owner is supported)",
-                unsupported.join(", ")
-            );
-        }
+    if let Some(identity) = file.identity.as_ref()
+        && identity.default_project.is_some()
+    {
+        anyhow::bail!(
+            "config file [identity] field default_project is parsed but not wired in this runtime slice; \
+             leave it commented until project-scope wiring lands"
+        );
     }
 
     let mut sections = Vec::new();
@@ -361,4 +374,42 @@ fn runner_settings(
         }
     }
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use ironclaw_reborn_config::RebornBootConfig;
+
+    use super::build_runtime_input;
+
+    #[test]
+    fn build_runtime_input_maps_configured_cli_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reborn_home = temp.path().join("reborn-home");
+        std::fs::create_dir_all(&reborn_home).expect("mkdir");
+        std::fs::write(
+            reborn_home.join("config.toml"),
+            r#"
+[identity]
+tenant = "custom-tenant"
+default_agent = "custom-agent"
+default_owner = "custom-owner"
+"#,
+        )
+        .expect("write config");
+        let config = RebornBootConfig::resolve_from_env_parts(
+            Some(reborn_home.into_os_string()),
+            None,
+            None,
+            None,
+        )
+        .expect("boot config");
+
+        let runtime_input = build_runtime_input(&config).expect("runtime input");
+
+        assert_eq!(runtime_input.identity.tenant_id, "custom-tenant");
+        assert_eq!(runtime_input.identity.agent_id, "custom-agent");
+        assert_eq!(runtime_input.identity.source_binding_id, "reborn-cli");
+        assert_eq!(runtime_input.identity.reply_target_binding_id, "reborn-cli");
+    }
 }
