@@ -36,6 +36,10 @@ use ironclaw_host_api::{
     CapabilityDispatchRequest, CapabilityDispatcher, CapabilityId, DispatchError,
     ResourceReservationId, ResourceScope, ResourceUsage, RuntimeDispatchErrorKind,
     RuntimeHttpEgress, RuntimeKind,
+    runtime_policy::{
+        DeploymentMode, EffectiveRuntimePolicy, FilesystemBackendKind, NetworkMode,
+        ProcessBackendKind, RuntimeProfile, SecretMode,
+    },
 };
 use ironclaw_mcp::{McpError, McpExecutionRequest, McpExecutor, McpInvocation};
 use ironclaw_network::NetworkHttpEgress;
@@ -139,6 +143,7 @@ impl ProductionWiringConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProductionWiringComponent {
     RuntimeBackend,
+    RuntimePolicy,
     TrustPolicy,
     Filesystem,
     ResourceGovernor,
@@ -165,6 +170,7 @@ impl ProductionWiringComponent {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RuntimeBackend => "runtime_backend",
+            Self::RuntimePolicy => "runtime_policy",
             Self::TrustPolicy => "trust_policy",
             Self::Filesystem => "filesystem",
             Self::ResourceGovernor => "resource_governor",
@@ -369,6 +375,7 @@ where
     runtime_http_egress: SharedRuntimeHttpEgress,
     wasm_credential_provider: Option<Arc<dyn WasmRuntimeCredentialProvider>>,
     runtime_health: Option<Arc<dyn RuntimeBackendHealth>>,
+    runtime_policy: Option<EffectiveRuntimePolicy>,
     script_runtime: Option<Arc<dyn ScriptExecutor>>,
     mcp_runtime: Option<Arc<dyn McpExecutor>>,
     first_party_runtime: Option<Arc<FirstPartyCapabilityRegistry>>,
@@ -425,6 +432,7 @@ where
             runtime_http_egress: Arc::new(Mutex::new(None)),
             wasm_credential_provider: None,
             runtime_health: None,
+            runtime_policy: None,
             script_runtime: None,
             mcp_runtime: None,
             first_party_runtime: None,
@@ -490,6 +498,7 @@ where
             runtime_http_egress,
             wasm_credential_provider,
             runtime_health,
+            runtime_policy,
             script_runtime,
             mcp_runtime,
             first_party_runtime,
@@ -523,6 +532,7 @@ where
             runtime_http_egress,
             wasm_credential_provider,
             runtime_health,
+            runtime_policy,
             script_runtime,
             mcp_runtime,
             first_party_runtime,
@@ -577,6 +587,7 @@ where
             runtime_http_egress,
             wasm_credential_provider,
             runtime_health,
+            runtime_policy,
             script_runtime,
             mcp_runtime,
             first_party_runtime,
@@ -620,6 +631,7 @@ where
             runtime_http_egress,
             wasm_credential_provider,
             runtime_health,
+            runtime_policy,
             script_runtime,
             mcp_runtime,
             first_party_runtime,
@@ -1009,6 +1021,11 @@ where
         self
     }
 
+    pub fn with_runtime_policy(mut self, policy: EffectiveRuntimePolicy) -> Self {
+        self.runtime_policy = Some(policy);
+        self
+    }
+
     pub fn with_wasm_runtime_credential_provider<T>(mut self, provider: Arc<T>) -> Self
     where
         T: WasmRuntimeCredentialProvider + 'static,
@@ -1123,6 +1140,21 @@ where
             ProductionWiringComponent::TrustPolicy,
             self.trust_policy_configured,
         );
+        self.push_missing(
+            &mut issues,
+            ProductionWiringComponent::RuntimePolicy,
+            self.runtime_policy.is_some(),
+        );
+        if let Some(runtime_policy) = &self.runtime_policy
+            && let Some(reason) = local_only_runtime_policy_reason(runtime_policy)
+        {
+            self.push_issue(
+                &mut issues,
+                ProductionWiringComponent::RuntimePolicy,
+                ProductionWiringIssueKind::LocalOnlyImplementation,
+                Some(reason),
+            );
+        }
         self.push_missing(
             &mut issues,
             ProductionWiringComponent::RunState,
@@ -1656,12 +1688,17 @@ where
                 self.registered_runtime_backends(),
             ))
         });
+        let runtime_policy = self
+            .runtime_policy
+            .clone()
+            .unwrap_or_else(local_testing_runtime_policy);
 
         let mut runtime = DefaultHostRuntime::new(
             Arc::clone(&self.registry),
             dispatcher,
             Arc::clone(&self.authorizer),
             self.surface_version.clone(),
+            runtime_policy,
         )
         .with_trust_policy_dyn(Arc::clone(&self.trust_policy))
         .with_process_manager(process_manager)
@@ -1683,7 +1720,6 @@ where
         if let Some(capability_leases) = &self.capability_leases {
             runtime = runtime.with_capability_leases(Arc::clone(capability_leases));
         }
-
         runtime.with_obligation_handler(Arc::new(self.builtin_obligation_handler()))
     }
 
@@ -1750,6 +1786,41 @@ where
         }
         declared.all(|descriptor| first_party_runtime.contains_handler(&descriptor.id))
     }
+}
+
+fn local_testing_runtime_policy() -> EffectiveRuntimePolicy {
+    ironclaw_runtime_policy::resolve(ironclaw_runtime_policy::ResolveRequest::new(
+        DeploymentMode::LocalSingleUser,
+        RuntimeProfile::LocalDev,
+    ))
+    .unwrap_or_else(|error| {
+        panic!("LocalSingleUser + LocalDev runtime policy must resolve for local testing: {error}")
+    })
+}
+
+fn local_only_runtime_policy_reason(policy: &EffectiveRuntimePolicy) -> Option<&'static str> {
+    if matches!(policy.deployment, DeploymentMode::LocalSingleUser) {
+        return Some("local_single_user_deployment");
+    }
+    if matches!(
+        policy.filesystem_backend,
+        FilesystemBackendKind::HostWorkspace
+    ) {
+        return Some("host_workspace_filesystem");
+    }
+    if matches!(policy.process_backend, ProcessBackendKind::LocalHost) {
+        return Some("local_host_process");
+    }
+    if matches!(policy.network_mode, NetworkMode::Direct) {
+        return Some("direct_network");
+    }
+    if matches!(
+        policy.secret_mode,
+        SecretMode::ScrubbedEnv | SecretMode::InheritedEnv
+    ) {
+        return Some("local_secret_environment");
+    }
+    None
 }
 
 fn set_runtime_http_egress(
