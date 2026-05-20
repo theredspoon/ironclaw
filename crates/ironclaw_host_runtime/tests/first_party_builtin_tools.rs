@@ -1222,7 +1222,7 @@ async fn builtin_coding_grep_skips_oversized_files_like_resilient_v1_search() {
 }
 
 #[tokio::test]
-async fn builtin_coding_grep_fails_when_aggregate_scan_budget_is_exceeded() {
+async fn builtin_coding_grep_returns_partial_results_when_aggregate_scan_budget_is_exceeded() {
     let temp = tempfile::tempdir().unwrap();
     for index in 0..50 {
         std::fs::write(temp.path().join(format!("file-{index:02}.rs")), "needle\n").unwrap();
@@ -1236,16 +1236,21 @@ async fn builtin_coding_grep_fails_when_aggregate_scan_budget_is_exceeded() {
     });
     let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
 
-    let error = invoke_with_context(
+    let grepped = invoke_with_context(
         &runtime,
         GREP_CAPABILITY_ID,
         json!({"path": "/workspace", "pattern": "needle"}),
         context,
     )
     .await
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(error, RuntimeFailureKind::Resource);
+    assert_eq!(grepped["truncated"], json!(true));
+    assert_eq!(grepped["limit_reason"], json!("aggregate_scan_bytes"));
+    assert_eq!(grepped["bytes_scanned"], json!(60 * 1024 * 1024));
+    assert_eq!(grepped["max_scan_bytes"], json!(64 * 1024 * 1024));
+    assert_eq!(grepped["count"], json!(6));
+    assert_eq!(grepped["files"].as_array().unwrap().len(), 6);
 }
 
 #[tokio::test]
