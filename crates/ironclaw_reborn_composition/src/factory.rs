@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::ExtensionRegistry;
-use ironclaw_filesystem::{LocalFilesystem, ScopedFilesystem};
+use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{EffectKind, PackageId};
 use ironclaw_host_runtime::{
     CapabilitySurfaceVersion, FirstPartyCapabilityRegistry, HostRuntimeServices,
@@ -11,7 +11,7 @@ use ironclaw_host_runtime::{
 use ironclaw_processes::ProcessServices;
 use ironclaw_resources::InMemoryResourceGovernor;
 use ironclaw_run_state::{InMemoryApprovalRequestStore, InMemoryRunStateStore};
-use ironclaw_threads::{FilesystemSessionThreadService, SessionThreadService};
+use ironclaw_threads::InMemorySessionThreadService;
 use ironclaw_trust::{AdminConfig, AdminEntry, HostTrustAssignment, HostTrustPolicy};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_turns::InMemoryRunProfileResolver;
@@ -37,7 +37,7 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) turn_state: Arc<InMemoryTurnStateStore>,
     pub(crate) checkpoint_state_store: Arc<InMemoryCheckpointStateStore>,
     pub(crate) loop_checkpoint_store: Arc<InMemoryLoopCheckpointStore>,
-    pub(crate) thread_service: Arc<dyn SessionThreadService>,
+    pub(crate) thread_service: Arc<InMemorySessionThreadService>,
 }
 
 impl std::fmt::Debug for RebornServices {
@@ -113,10 +113,6 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     std::fs::create_dir_all(&workspace_root).map_err(|_| RebornBuildError::InvalidConfig {
         reason: "local-dev workspace root could not be initialized".to_string(),
     })?;
-    let threads_root = root.join("threads");
-    std::fs::create_dir_all(&threads_root).map_err(|_| RebornBuildError::InvalidConfig {
-        reason: "local-dev thread root could not be initialized".to_string(),
-    })?;
     let mut filesystem = LocalFilesystem::new();
     let projects_root = ironclaw_host_api::VirtualPath::new("/projects").map_err(|error| {
         RebornBuildError::InvalidConfig {
@@ -127,12 +123,6 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         .map_err(|error| RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         })?;
-    let threads_virtual_root =
-        ironclaw_host_api::VirtualPath::new("/threads").map_err(|error| {
-            RebornBuildError::InvalidConfig {
-                reason: error.to_string(),
-            }
-        })?;
     filesystem.mount_local(
         projects_root,
         ironclaw_host_api::HostPath::from_path_buf(root),
@@ -141,44 +131,20 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         workspace_virtual_root,
         ironclaw_host_api::HostPath::from_path_buf(workspace_root),
     )?;
-    filesystem.mount_local(
-        threads_virtual_root.clone(),
-        ironclaw_host_api::HostPath::from_path_buf(threads_root),
-    )?;
-    let filesystem = Arc::new(filesystem);
 
     let run_state = Arc::new(InMemoryRunStateStore::new());
     let approval_requests = Arc::new(InMemoryApprovalRequestStore::new());
     let turn_state = Arc::new(InMemoryTurnStateStore::default());
-    let thread_mounts =
-        ironclaw_host_api::MountView::new(vec![ironclaw_host_api::MountGrant::new(
-            ironclaw_host_api::MountAlias::new("/threads").map_err(|error| {
-                RebornBuildError::InvalidConfig {
-                    reason: error.to_string(),
-                }
-            })?,
-            threads_virtual_root,
-            ironclaw_host_api::MountPermissions::read_write_list_delete(),
-        )])
-        .map_err(|error| RebornBuildError::InvalidConfig {
-            reason: error.to_string(),
-        })?;
-    let thread_filesystem = Arc::new(ScopedFilesystem::with_fixed_view(
-        Arc::clone(&filesystem),
-        thread_mounts,
-    ));
-    let thread_service: Arc<dyn SessionThreadService> =
-        Arc::new(FilesystemSessionThreadService::new(thread_filesystem));
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         turn_state: Arc::clone(&turn_state),
         checkpoint_state_store: Arc::new(InMemoryCheckpointStateStore::default()),
         loop_checkpoint_store: Arc::new(InMemoryLoopCheckpointStore::default()),
-        thread_service,
+        thread_service: Arc::new(InMemorySessionThreadService::default()),
     });
 
     let services = HostRuntimeServices::new(
         Arc::new(local_dev_extension_registry()?),
-        filesystem,
+        Arc::new(filesystem),
         Arc::new(InMemoryResourceGovernor::new()),
         Arc::new(GrantAuthorizer::new()),
         ProcessServices::in_memory(),

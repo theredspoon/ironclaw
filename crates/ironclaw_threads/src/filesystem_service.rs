@@ -46,7 +46,6 @@ use ironclaw_host_api::{HostApiError, ResourceScope, ScopedPath, ThreadId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ProviderToolCallReferenceEnvelope;
 use crate::identifiers::SummaryArtifactId;
 use crate::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
@@ -71,36 +70,6 @@ struct StoredThreadRecord {
     #[serde(flatten)]
     record: SessionThreadRecord,
     next_sequence: u64,
-}
-
-/// On-disk transcript message record.
-///
-/// `ThreadMessageRecord` intentionally omits provider replay metadata from its
-/// public `Serialize` shape. The filesystem store still needs that metadata for
-/// model-context replay after a restart, so it persists the internal side
-/// channel separately and reattaches it only to service-returned records.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredThreadMessageRecord {
-    #[serde(flatten)]
-    record: ThreadMessageRecord,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider_call: Option<ProviderToolCallReferenceEnvelope>,
-}
-
-impl StoredThreadMessageRecord {
-    fn from_thread_message(record: &ThreadMessageRecord) -> Self {
-        let mut public_record = record.clone();
-        let provider_call = public_record.tool_result_provider_call.take();
-        Self {
-            record: public_record,
-            provider_call,
-        }
-    }
-
-    fn into_thread_message(mut self) -> ThreadMessageRecord {
-        self.record.tool_result_provider_call = self.provider_call;
-        self.record
-    }
 }
 
 /// On-disk inbound idempotency record. Includes the originating scope so
@@ -149,7 +118,7 @@ where
     }
 
     fn message_entry(record: &ThreadMessageRecord) -> Result<Entry, SessionThreadError> {
-        let body = serialize_pretty(&StoredThreadMessageRecord::from_thread_message(record))?;
+        let body = serialize_pretty(record)?;
         Ok(Entry::bytes(body).with_content_type(ContentType::json()))
     }
 
@@ -197,8 +166,7 @@ where
         else {
             return Ok(None);
         };
-        let record =
-            deserialize::<StoredThreadMessageRecord>(&versioned.entry.body)?.into_thread_message();
+        let record = deserialize::<ThreadMessageRecord>(&versioned.entry.body)?;
         if &record.thread_id != thread_id || record.message_id != message_id {
             return Ok(None);
         }
@@ -237,8 +205,7 @@ where
             else {
                 continue;
             };
-            let record = deserialize::<StoredThreadMessageRecord>(&versioned.entry.body)?
-                .into_thread_message();
+            let record = deserialize::<ThreadMessageRecord>(&versioned.entry.body)?;
             if &record.thread_id == thread_id {
                 messages.push(record);
             }

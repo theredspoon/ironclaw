@@ -43,8 +43,8 @@ use ironclaw_reborn::runtime::{
 };
 use ironclaw_reborn::turn_runner::{TurnRunnerWakeSender, TurnRunnerWorkerConfig};
 use ironclaw_threads::{
-    AcceptInboundMessageRequest, EnsureThreadRequest, MessageContent, MessageKind, MessageStatus,
-    SessionThreadService, ThreadHistoryRequest, ThreadScope,
+    AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
+    MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
@@ -137,7 +137,7 @@ impl From<DefaultPlannedRuntimeBuildError> for RebornRuntimeError {
 pub struct RebornRuntime {
     services: RebornServices,
     turn_coordinator: Arc<dyn TurnCoordinator>,
-    thread_service: Arc<dyn SessionThreadService>,
+    thread_service: Arc<InMemorySessionThreadService>,
     thread_scope: ThreadScope,
     worker_handle: JoinHandle<()>,
     worker_cancel: CancellationToken,
@@ -793,7 +793,7 @@ mod tests {
         HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
     };
     use ironclaw_threads::{
-        LoadContextMessagesRequest, MessageKind, MessageStatus, ThreadHistoryRequest,
+        LoadContextMessagesRequest, MessageKind, SessionThreadService, ThreadHistoryRequest,
     };
     use ironclaw_turns::{
         TurnStatus,
@@ -1175,60 +1175,6 @@ mod tests {
         );
 
         runtime.shutdown().await.expect("runtime shutdown");
-
-        let reopened_gateway = Arc::new(RecordingGateway {
-            reply: "unused".to_string(),
-            requests: Arc::new(StdMutex::new(Vec::new())),
-        });
-        let reopened_gateway: Arc<dyn HostManagedModelGateway> = reopened_gateway;
-        let reopened_input = RebornRuntimeInput::from_services(RebornBuildInput::local_dev(
-            "runtime-tools-owner",
-            root.path().join("local-dev"),
-        ))
-        .with_identity(RebornRuntimeIdentity {
-            tenant_id: "runtime-tools-tenant".to_string(),
-            agent_id: "runtime-tools-agent".to_string(),
-            source_binding_id: "runtime-tools-source".to_string(),
-            reply_target_binding_id: "runtime-tools-reply".to_string(),
-        })
-        .with_poll_settings(PollSettings {
-            interval: Duration::from_millis(10),
-            max_total: Duration::from_secs(3),
-        })
-        .with_model_gateway_override(reopened_gateway);
-        let reopened_runtime = build_reborn_runtime(reopened_input)
-            .await
-            .expect("reopened runtime builds");
-        let reopened_history = reopened_runtime
-            .thread_service
-            .list_thread_history(ThreadHistoryRequest {
-                scope: reopened_runtime.thread_scope.clone(),
-                thread_id: conversation.0.clone(),
-            })
-            .await
-            .expect("reopened thread history");
-        assert!(
-            reopened_history.messages.iter().any(|message| {
-                message.kind == MessageKind::ToolResultReference
-                    && message
-                        .tool_result_ref
-                        .as_deref()
-                        .is_some_and(|result_ref| result_ref.starts_with("result:"))
-            }),
-            "tool result evidence should survive runtime reopen"
-        );
-        assert!(
-            reopened_history.messages.iter().any(|message| {
-                message.kind == MessageKind::Assistant
-                    && message.status == MessageStatus::Finalized
-                    && message.content.as_deref() == Some("tool ok")
-            }),
-            "final assistant reply should survive runtime reopen"
-        );
-        reopened_runtime
-            .shutdown()
-            .await
-            .expect("reopened runtime shutdown");
     }
 
     #[tokio::test]
