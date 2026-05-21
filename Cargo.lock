@@ -4370,6 +4370,7 @@ dependencies = [
  "ironclaw_turns",
  "ironclaw_wasm",
  "jsonschema",
+ "libc",
  "libsql",
  "regex",
  "rust_decimal",
