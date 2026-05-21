@@ -134,6 +134,29 @@ jobs:
         run: |
           gh api "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" -F content=rocket
 
+      - name: Post "started" comment with link to dispatcher run
+        # Closes the gap between the 🚀 reaction and the eventual result
+        # comment (~5–10 min later from the called workflow). Gives the
+        # maintainer a clickable link straight to the Actions run.
+        if: steps.auth.outputs.authorized == 'yes' && steps.parse.outputs.suite != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          SUITE: ${{ steps.parse.outputs.suite }}
+          MODEL: ${{ steps.parse.outputs.model }}
+          HEAD_SHA: ${{ steps.parse.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          short_sha="${HEAD_SHA:0:10}"
+          model_part=""
+          if [ -n "$MODEL" ]; then
+            model_part=" (model \`$MODEL\`)"
+          fi
+          gh pr comment "$PR" --repo "$REPO" --body \
+            "🧪 Started \`$SUITE\`${model_part} against ironclaw \`$short_sha\` — [watch run]($RUN_URL)."
+
   bench:
     needs: parse
     if: needs.parse.outputs.authorized == 'yes' && needs.parse.outputs.suite != ''
