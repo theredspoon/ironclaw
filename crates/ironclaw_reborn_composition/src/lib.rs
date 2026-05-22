@@ -60,7 +60,9 @@ pub use product_live_adapters::{
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
 pub use runtime::{
-    AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, build_reborn_runtime,
+    AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, RebornSkillActivation,
+    RebornSkillActivationMode, RebornSkillAsset, RebornSkillBundle, RebornSkillExecutionPlan,
+    RebornSkillExecutionResult, RebornSkillSourceKind, build_reborn_runtime,
 };
 pub use runtime_input::{
     DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL, DEFAULT_TURN_RUNNER_POLL_INTERVAL, PollSettings,
