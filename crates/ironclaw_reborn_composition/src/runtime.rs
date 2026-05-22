@@ -31,18 +31,25 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use ironclaw_events::{DurableEventLog, InMemoryDurableEventLog, RuntimeEvent};
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_first_party_extensions::{
     FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, LoadedFirstPartyExtensions,
     SelectableSkillContextSource, SkillActivationSelectorConfig,
 };
-use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{
+    AgentId, CapabilityId, InvocationId, ResourceScope, TenantId, ThreadId, UserId,
+};
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     FilesystemSkillBundleSource, HostIdentityContextBuildError, HostIdentityContextCandidate,
     HostIdentityContextSource, HostSkillContextSource,
 };
+use ironclaw_product_adapters::ProjectionStream;
 use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
+use ironclaw_reborn::milestone_events::{
+    DurableLoopHostMilestoneScope, DurableLoopHostMilestoneSink,
+};
 use ironclaw_reborn::runtime::{
     DefaultPlannedRuntimeBuildError, DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts,
     build_default_planned_runtime,
@@ -57,9 +64,10 @@ use ironclaw_turns::{
     ReplyTargetBindingRef, RunProfileResolutionRequest, SanitizedCancelReason, SourceBindingRef,
     SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId,
     TurnScope, TurnStatus,
-    run_profile::{InMemoryLoopHostMilestoneSink, LoopRunContext, PromptMode},
+    run_profile::{LoopHostMilestoneSink, LoopRunContext, PromptMode},
 };
 
+use crate::projection::{RebornProjectionServices, build_reborn_projection_services};
 use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
 use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
@@ -151,6 +159,8 @@ pub struct RebornRuntime {
     actor_user_id: UserId,
     source_binding_ref: SourceBindingRef,
     reply_target_binding_ref: ReplyTargetBindingRef,
+    projection_services: RebornProjectionServices,
+    webui_event_log: Arc<dyn DurableEventLog>,
     default_run_profile_id: String,
     wake_sender: TurnRunnerWakeSender,
     send_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
@@ -178,6 +188,10 @@ impl RebornRuntime {
 
     pub(crate) fn webui_turn_coordinator(&self) -> Arc<dyn TurnCoordinator> {
         self.turn_coordinator.clone()
+    }
+
+    pub(crate) fn webui_event_stream(&self) -> Arc<dyn ProjectionStream> {
+        self.projection_services.webui_event_stream()
     }
 
     pub(crate) fn webui_skill_activation_source(
@@ -469,8 +483,42 @@ impl RebornRuntime {
                 .map_err(|reason| RebornRuntimeError::InvalidArgument { reason })?,
             })
             .await?;
+        if matches!(
+            response.status,
+            TurnStatus::CancelRequested | TurnStatus::Cancelled
+        ) {
+            self.append_webui_loop_cancelled(scope, run_id).await?;
+        }
         self.wake_sender.wake();
         Ok(response)
+    }
+
+    async fn append_webui_loop_cancelled(
+        &self,
+        scope: &TurnScope,
+        run_id: TurnRunId,
+    ) -> Result<(), RebornRuntimeError> {
+        let capability_id = CapabilityId::new(LOOP_RUN_CAPABILITY_ID).map_err(|reason| {
+            RebornRuntimeError::InvalidArgument {
+                reason: format!("loop-run capability id: {reason}"),
+            }
+        })?;
+        self.webui_event_log
+            .append(RuntimeEvent::loop_cancelled(
+                ResourceScope {
+                    tenant_id: scope.tenant_id.clone(),
+                    user_id: self.actor_user_id.clone(),
+                    agent_id: scope.agent_id.clone(),
+                    project_id: scope.project_id.clone(),
+                    mission_id: None,
+                    thread_id: Some(scope.thread_id.clone()),
+                    invocation_id: InvocationId::from_uuid(run_id.as_uuid()),
+                },
+                capability_id,
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|error| RebornRuntimeError::TurnCoordinator(error.to_string()))
     }
 
     async fn read_latest_assistant_text(
@@ -586,10 +634,9 @@ pub async fn build_reborn_runtime(
         tenant_id,
         agent_id,
         project_id: None,
-        // Keep this scope aligned with `ThreadCheckpointLoopExitEvidencePort`,
-        // which reconstructs thread scope from `TurnScope` for completion
-        // evidence and currently has no owner-user dimension there.
-        owner_user_id: None,
+        // Keep local-dev runtime threads aligned with WebUI's owner-scoped
+        // facade so both entrypoints drive the same runner/evidence path.
+        owner_user_id: Some(actor_user_id.clone()),
         mission_id: None,
     };
 
@@ -632,7 +679,24 @@ pub async fn build_reborn_runtime(
         Arc::clone(&loop_checkpoint_store) as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
         thread_scope.clone(),
     ));
-    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    // Local-dev WebUI projections are process-local today; production fanout
+    // will swap this for a retained durable log owned by the host runtime.
+    let event_log: Arc<dyn DurableEventLog> = Arc::new(InMemoryDurableEventLog::new());
+    let projection_services = build_reborn_projection_services(
+        Arc::clone(&event_log),
+        validated_identity.reply_target_binding_ref.clone(),
+    );
+    let milestone_thread_scope = ThreadScope {
+        owner_user_id: Some(actor_user_id.clone()),
+        ..thread_scope.clone()
+    };
+    let milestone_scope = DurableLoopHostMilestoneScope::from_thread_scope(&milestone_thread_scope)
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: error.to_string(),
+        })?;
+    let milestone_sink: Arc<dyn LoopHostMilestoneSink> = Arc::new(
+        DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope),
+    );
     let local_dev_capabilities = local_dev::capability_wiring(
         &services,
         actor_user_id.clone(),
@@ -706,12 +770,16 @@ pub async fn build_reborn_runtime(
         actor_user_id,
         source_binding_ref: validated_identity.source_binding_ref,
         reply_target_binding_ref: validated_identity.reply_target_binding_ref,
+        projection_services,
+        webui_event_log: event_log,
         default_run_profile_id,
         wake_sender,
         send_locks: Mutex::new(HashMap::new()),
         skill_activation_source,
     })
 }
+
+const LOOP_RUN_CAPABILITY_ID: &str = "loop.run";
 
 struct LocalDevSkillContextSource {
     source: Arc<dyn HostSkillContextSource>,
@@ -916,9 +984,10 @@ mod tests {
         HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
         HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
     };
+    use ironclaw_product_adapters::{ProductOutboundPayload, ProductProjectionItem};
     use ironclaw_product_workflow::{
-        RebornSubmitTurnResponse, WebUiAuthenticatedCaller, WebUiCreateThreadRequest,
-        WebUiSendMessageRequest,
+        RebornStreamEventsRequest, RebornSubmitTurnResponse, WebUiAuthenticatedCaller,
+        WebUiCreateThreadRequest, WebUiSendMessageRequest,
     };
     use ironclaw_skills::SkillTrust;
     use ironclaw_threads::{
@@ -1907,6 +1976,10 @@ mod tests {
     #[tokio::test]
     async fn local_dev_runtime_webui_bundle_reuses_thread_and_turn_facades() {
         let root = tempfile::tempdir().expect("tempdir");
+        let gateway = Arc::new(RecordingGateway {
+            reply: "webui projection ok".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
         let input = RebornRuntimeInput::from_services(
             RebornBuildInput::local_dev("runtime-webui-owner", root.path().join("local-dev"))
                 .with_runtime_policy(local_dev_runtime_policy()),
@@ -1920,17 +1993,90 @@ mod tests {
         .with_poll_settings(PollSettings {
             interval: Duration::from_millis(10),
             max_total: Duration::from_secs(3),
-        });
+        })
+        .with_model_gateway_override(gateway);
 
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let runtime_turn_coordinator = runtime.webui_turn_coordinator();
         let bundle = build_webui_services(&runtime, None).expect("webui bundle");
+        let caller = WebUiAuthenticatedCaller::new(
+            TenantId::new("runtime-webui-tenant").unwrap(),
+            UserId::new("runtime-webui-owner").unwrap(),
+            Some(AgentId::new("runtime-webui-agent").unwrap()),
+            None,
+        );
+        let created = bundle
+            .api
+            .create_thread(
+                caller.clone(),
+                WebUiCreateThreadRequest {
+                    client_action_id: Some("create-webui-stream-thread".to_string()),
+                    requested_thread_id: None,
+                },
+            )
+            .await
+            .expect("create webui thread");
+        let submitted = bundle
+            .api
+            .submit_turn(
+                caller.clone(),
+                WebUiSendMessageRequest {
+                    client_action_id: Some("send-webui-stream-message".to_string()),
+                    thread_id: Some(created.thread.thread_id.to_string()),
+                    content: Some("hello webui stream".to_string()),
+                },
+            )
+            .await
+            .expect("submit webui turn");
+        let RebornSubmitTurnResponse::Submitted { run_id, .. } = submitted else {
+            panic!("webui submit should start a run");
+        };
+        let stream = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let stream = bundle
+                    .api
+                    .stream_events(
+                        caller.clone(),
+                        RebornStreamEventsRequest {
+                            thread_id: created.thread.thread_id.to_string(),
+                            after_cursor: None,
+                        },
+                    )
+                    .await
+                    .expect("webui event stream");
+                if stream.events.iter().any(|event| {
+                    matches!(
+                        event.payload(),
+                        ProductOutboundPayload::ProjectionSnapshot { state }
+                            | ProductOutboundPayload::ProjectionUpdate { state }
+                            if state.items.iter().any(|item| matches!(
+                                item,
+                                ProductProjectionItem::RunStatus { run_id: seen, status }
+                                    if *seen == run_id && status == "completed"
+                            ))
+                    )
+                }) {
+                    break stream;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed webui projection should appear");
 
         let _api = bundle.api.clone();
         assert!(Arc::ptr_eq(
             &runtime_turn_coordinator,
             &runtime.webui_turn_coordinator()
         ));
+        assert!(
+            stream.events.iter().all(|event| matches!(
+                event.payload(),
+                ProductOutboundPayload::ProjectionSnapshot { .. }
+                    | ProductOutboundPayload::ProjectionUpdate { .. }
+            )),
+            "webui bundle should expose only projection stream events"
+        );
         assert_eq!(bundle.readiness, runtime.services().readiness);
         assert_eq!(bundle.readiness.state, RebornReadinessState::DevOnly);
 
