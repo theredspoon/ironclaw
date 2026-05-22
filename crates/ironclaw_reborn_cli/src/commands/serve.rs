@@ -46,6 +46,8 @@ pub(crate) struct ServeCommand {
 
 impl ServeCommand {
     pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
+        crate::runtime::init_tracing();
+
         // Build the runtime config from the operator's TOML.
         let runtime_input = crate::runtime::build_runtime_input(
             context.boot_config(),
