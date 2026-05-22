@@ -31,6 +31,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use ironclaw_first_party_extensions::{
+    FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, LoadedFirstPartyExtensions,
+};
 use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
@@ -43,7 +46,6 @@ use ironclaw_reborn::runtime::{
     build_default_planned_runtime,
 };
 use ironclaw_reborn::turn_runner::{TurnRunnerWakeSender, TurnRunnerWorkerConfig};
-use ironclaw_reborn_extensions::{FirstPartySkillsExtension, FirstPartySkillsExtensionHandles};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
@@ -663,7 +665,7 @@ fn local_dev_filesystem_skill_context_source(
 ) -> Result<Arc<dyn HostSkillContextSource>, RebornRuntimeError> {
     let extension = FirstPartySkillsExtension::new(
         Arc::clone(&local_runtime.skill_filesystem),
-        FirstPartySkillsExtensionHandles::reborn_default().map_err(|reason| {
+        FirstPartySkillsExtensionHandles::without_tenant_shared().map_err(|reason| {
             RebornRuntimeError::InvalidArgument {
                 reason: format!("first-party skills extension handles: {reason}"),
             }
@@ -673,7 +675,13 @@ fn local_dev_filesystem_skill_context_source(
     .map_err(|reason| RebornRuntimeError::InvalidArgument {
         reason: format!("first-party skills extension source: {reason}"),
     })?;
-    Ok(extension.host_skill_context_source())
+    let loaded_extensions = LoadedFirstPartyExtensions::new().with_skills(extension);
+    loaded_extensions
+        .skill_context_source()
+        .ok_or(RebornRuntimeError::InvalidArgument {
+            reason: "first-party skills extension did not expose a skill context source"
+                .to_string(),
+        })
 }
 
 struct ValidatedRuntimeIdentity {
@@ -1418,6 +1426,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_dev_runtime_prefers_configured_skill_context_source_over_filesystem_default() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("local-dev");
+        std::fs::create_dir_all(storage_root.join("system/skills/filesystem-helper"))
+            .expect("filesystem skill dir");
+        std::fs::write(
+            storage_root.join("system/skills/filesystem-helper/SKILL.md"),
+            skill_md(
+                "filesystem-helper",
+                "filesystem helper description",
+                "FILESYSTEM_HELPER_PROMPT_SENTINEL",
+            ),
+        )
+        .expect("write filesystem skill");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let gateway = Arc::new(RecordingGateway {
+            reply: "configured skill context ok".to_string(),
+            requests: Arc::clone(&requests),
+        });
+        let skill_source = Arc::new(StaticSkillContextSource::new(vec![
+            HostSkillContextCandidate::new(
+                skill_md(
+                    "configured-helper",
+                    "configured helper description",
+                    "CONFIGURED_HELPER_PROMPT_SENTINEL",
+                ),
+                Some(SkillTrust::Trusted),
+                Some(SkillVisibility::Visible),
+            ),
+        ]));
+        let skill_context_source: Arc<dyn HostSkillContextSource> = skill_source;
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::local_dev("runtime-skill-override-owner", storage_root)
+                .with_runtime_policy(local_dev_runtime_policy()),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-skill-override-tenant".to_string(),
+            agent_id: "runtime-skill-override-agent".to_string(),
+            source_binding_id: "runtime-skill-override-source".to_string(),
+            reply_target_binding_id: "runtime-skill-override-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_skill_context_source(skill_context_source)
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let conversation = runtime.new_conversation().await.expect("conversation");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.send_user_message(&conversation, "review this"),
+        )
+        .await
+        .expect("runtime send should finish")
+        .expect("runtime send should succeed");
+
+        assert_eq!(reply.status, TurnStatus::Completed);
+        assert_eq!(reply.text.as_deref(), Some("configured skill context ok"));
+        let combined_skill_context = {
+            let requests = requests
+                .lock()
+                .expect("recording gateway requests lock poisoned");
+            requests[0]
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == HostManagedModelMessageRole::System
+                        && message
+                            .content_ref
+                            .as_str()
+                            .starts_with("msg:snippet.skill.")
+                })
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(combined_skill_context.contains("configured helper description"));
+        assert!(combined_skill_context.contains("CONFIGURED_HELPER_PROMPT_SENTINEL"));
+        assert!(!combined_skill_context.contains("filesystem helper description"));
+        assert!(!combined_skill_context.contains("FILESYSTEM_HELPER_PROMPT_SENTINEL"));
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
     async fn local_dev_runtime_wires_filesystem_skills_by_default_to_model_calls() {
         let root = tempfile::tempdir().expect("tempdir");
         let storage_root = root.path().join("local-dev");
@@ -1504,12 +1599,12 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let combined_skill_context = skill_messages.join("\n");
-        assert_eq!(skill_messages.len(), 3);
+        assert_eq!(skill_messages.len(), 2);
         assert!(combined_skill_context.contains("system helper description"));
         assert!(combined_skill_context.contains("SYSTEM_HELPER_PROMPT_SENTINEL"));
         assert!(combined_skill_context.contains("local helper description"));
         assert!(combined_skill_context.contains("USER_HELPER_PROMPT_SENTINEL"));
-        assert!(combined_skill_context.contains("tenant shared helper description"));
+        assert!(!combined_skill_context.contains("tenant shared helper description"));
         assert!(!combined_skill_context.contains("TENANT_SHARED_PROMPT_SENTINEL"));
 
         runtime.shutdown().await.expect("runtime shutdown");

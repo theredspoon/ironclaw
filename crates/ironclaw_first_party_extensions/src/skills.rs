@@ -22,13 +22,9 @@ pub struct FirstPartySkillsExtensionHandles {
 }
 
 impl FirstPartySkillsExtensionHandles {
-    /// Handles for the standard Reborn skill roots.
+    /// Handles for the standard first-slice Reborn skill roots.
     pub fn reborn_default() -> Result<Self, FirstPartySkillsExtensionError> {
-        Ok(Self {
-            system_skills: Some(scoped_root(SYSTEM_SKILLS_ROOT)?),
-            user_skills: Some(scoped_root(USER_SKILLS_ROOT)?),
-            tenant_shared_skills: Some(scoped_root(TENANT_SHARED_SKILLS_ROOT)?),
-        })
+        Self::without_tenant_shared()
     }
 
     /// Handles for deployments that do not expose tenant-shared skills.
@@ -261,51 +257,26 @@ mod tests {
             handles.user_skills().map(ScopedPath::as_str),
             Some("/skills")
         );
-        assert_eq!(
-            handles.tenant_shared_skills().map(ScopedPath::as_str),
-            Some("/tenant-shared/skills")
-        );
+        assert_eq!(handles.tenant_shared_skills().map(ScopedPath::as_str), None);
     }
 
     #[test]
-    fn handles_reject_non_skill_roots_for_each_handle() {
-        let cases = [
-            (
-                "read_system_skills",
-                "/system/skills",
-                Some(ScopedPath::new("/workspace").unwrap()),
-                None,
-                None,
-            ),
-            (
-                "read_user_skills",
-                "/skills",
-                None,
-                Some(ScopedPath::new("/workspace").unwrap()),
-                None,
-            ),
-            (
-                "read_tenant_shared_skills",
-                "/tenant-shared/skills",
-                None,
-                None,
-                Some(ScopedPath::new("/workspace").unwrap()),
-            ),
-        ];
+    fn handles_reject_non_skill_roots() {
+        let error = FirstPartySkillsExtensionHandles::new(
+            None,
+            Some(ScopedPath::new("/workspace").unwrap()),
+            None,
+        )
+        .unwrap_err();
 
-        for (handle, expected, system, user, tenant_shared) in cases {
-            let error = FirstPartySkillsExtensionHandles::new(system, user, tenant_shared)
-                .expect_err("invalid handle should be rejected");
-
-            assert_eq!(
-                error,
-                FirstPartySkillsExtensionError::InvalidHandle {
-                    handle,
-                    expected,
-                    actual: "/workspace".to_string()
-                }
-            );
-        }
+        assert_eq!(
+            error,
+            FirstPartySkillsExtensionError::InvalidHandle {
+                handle: "read_user_skills",
+                expected: "/skills",
+                actual: "/workspace".to_string()
+            }
+        );
     }
 
     #[tokio::test]
