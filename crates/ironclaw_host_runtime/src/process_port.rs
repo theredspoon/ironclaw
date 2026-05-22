@@ -261,7 +261,7 @@ fn truncate_output(s: &str) -> String {
         let tail_start = floor_char_boundary(s, s.len() - half);
         format!(
             "{}\n\n... [truncated {} bytes] ...\n\n{}",
-            &s[..head_end],
+            &s[..head_end], // safety: head_end was clamped to a UTF-8 character boundary.
             s.len() - COMMAND_MAX_OUTPUT_SIZE,
             &s[tail_start..]
         )

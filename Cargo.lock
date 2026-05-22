@@ -4709,6 +4709,7 @@ dependencies = [
  "ironclaw_reborn",
  "ironclaw_reborn_config",
  "ironclaw_reborn_event_store",
+ "ironclaw_reborn_extensions",
  "ironclaw_resources",
  "ironclaw_run_state",
  "ironclaw_runtime_policy",
@@ -4771,6 +4772,19 @@ dependencies = [
  "tracing",
  "urlencoding",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "ironclaw_reborn_extensions"
+version = "0.1.0"
+dependencies = [
+ "ironclaw_filesystem",
+ "ironclaw_host_api",
+ "ironclaw_loop_support",
+ "ironclaw_skills",
+ "ironclaw_turns",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
