@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use ironclaw_product_adapters::ProjectionStream;
-use ironclaw_product_workflow::{RebornServices as ProductRebornServices, RebornServicesApi};
+use ironclaw_product_workflow::{
+    RebornServices as ProductRebornServices, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornServicesErrorKind,
+};
 
 use crate::{RebornBuildError, RebornReadiness, RebornRuntime};
 
@@ -45,6 +48,36 @@ pub fn build_webui_services(
         runtime.webui_thread_service(),
         runtime.webui_turn_coordinator(),
     );
+    if let Some(skill_activation_source) = runtime.webui_skill_activation_source() {
+        let activation_recorder = Arc::clone(&skill_activation_source);
+        let activation_clearer = skill_activation_source;
+        api = api.with_skill_activation_hooks(
+            move |scope, accepted_message_ref, message| {
+                activation_recorder
+                    .record_user_message(scope.clone(), accepted_message_ref.clone(), message)
+                    .map_err(|_| RebornServicesError {
+                        code: RebornServicesErrorCode::Internal,
+                        kind: RebornServicesErrorKind::Internal,
+                        status_code: 500,
+                        retryable: false,
+                        field: None,
+                        validation_code: None,
+                    })
+            },
+            move |scope, accepted_message_ref| {
+                activation_clearer
+                    .clear_accepted_message(scope, accepted_message_ref)
+                    .map_err(|_| RebornServicesError {
+                        code: RebornServicesErrorCode::Internal,
+                        kind: RebornServicesErrorKind::Internal,
+                        status_code: 500,
+                        retryable: false,
+                        field: None,
+                        validation_code: None,
+                    })
+            },
+        );
+    }
     if let Some(event_stream) = event_stream {
         api = api.with_event_stream(event_stream);
     }

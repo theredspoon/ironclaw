@@ -7,7 +7,10 @@ use ironclaw_loop_support::{
     SkillBundleContextSource,
 };
 
-use crate::error::FirstPartySkillsExtensionError;
+use crate::{
+    SelectableSkillContextSource, SkillActivationSelectorConfig,
+    error::FirstPartySkillsExtensionError,
+};
 
 const SYSTEM_SKILLS_ROOT: &str = "/system/skills";
 const USER_SKILLS_ROOT: &str = "/skills";
@@ -147,6 +150,16 @@ where
 
     pub fn host_skill_context_source(&self) -> Arc<dyn HostSkillContextSource> {
         self.context_source.clone()
+    }
+
+    pub fn selectable_skill_context_source(
+        &self,
+        config: SkillActivationSelectorConfig,
+    ) -> Arc<SelectableSkillContextSource<FilesystemSkillBundleSource<F>>> {
+        Arc::new(SelectableSkillContextSource::new(
+            Arc::clone(&self.bundle_source),
+            config,
+        ))
     }
 }
 

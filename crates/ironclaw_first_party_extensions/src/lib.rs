@@ -5,10 +5,16 @@
 //! export narrow ports back to Reborn composition.
 #![forbid(unsafe_code)]
 
+mod activation;
 mod error;
 mod loaded;
 mod skills;
 
+pub use activation::{
+    DEFAULT_MAX_ACTIVE_SKILLS, DEFAULT_MAX_SKILL_CONTEXT_TOKENS, SelectableSkillContextSource,
+    SkillActivationMode, SkillActivationRequest, SkillActivationSelection,
+    SkillActivationSelectionError, SkillActivationSelectorConfig,
+};
 pub use error::FirstPartySkillsExtensionError;
 pub use loaded::LoadedFirstPartyExtensions;
 pub use skills::{FirstPartySkillsExtension, FirstPartySkillsExtensionHandles};
