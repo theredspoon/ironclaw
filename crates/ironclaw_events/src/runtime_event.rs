@@ -518,12 +518,13 @@ impl RuntimeEvent {
         hook_id: impl Into<String>,
         point: impl Into<String>,
         trust_class: impl Into<String>,
+        owning_extension: Option<ExtensionId>,
     ) -> Self {
         Self::new(RuntimeEventPayload {
             kind: RuntimeEventKind::HookDispatched,
             scope,
             capability_id,
-            provider: None,
+            provider: owning_extension,
             runtime: None,
             process_id: None,
             output_bytes: None,
@@ -547,12 +548,13 @@ impl RuntimeEvent {
         capability_id: CapabilityId,
         hook_id: impl Into<String>,
         decision: impl Into<String>,
+        owning_extension: Option<ExtensionId>,
     ) -> Self {
         Self::new(RuntimeEventPayload {
             kind: RuntimeEventKind::HookDecisionEmitted,
             scope,
             capability_id,
-            provider: None,
+            provider: owning_extension,
             runtime: None,
             process_id: None,
             output_bytes: None,
@@ -573,12 +575,13 @@ impl RuntimeEvent {
         hook_id: impl Into<String>,
         category: impl Into<String>,
         disposition: impl Into<String>,
+        owning_extension: Option<ExtensionId>,
     ) -> Self {
         Self::new(RuntimeEventPayload {
             kind: RuntimeEventKind::HookFailed,
             scope,
             capability_id,
-            provider: None,
+            provider: owning_extension,
             runtime: None,
             process_id: None,
             output_bytes: None,
@@ -765,6 +768,7 @@ mod tests {
             hook_id_hex(),
             "before_capability",
             "builtin",
+            None,
         );
         let wire = serde_json::to_string(&event).expect("serialize hook dispatched");
         let decoded: RuntimeEvent =
@@ -786,6 +790,7 @@ mod tests {
             capability(),
             hook_id_hex(),
             "pause_approval",
+            None,
         );
         let wire = serde_json::to_string(&event).expect("serialize hook decision");
         let decoded: RuntimeEvent = serde_json::from_str(&wire).expect("deserialize hook decision");
@@ -803,6 +808,7 @@ mod tests {
             hook_id_hex(),
             "timeout",
             "fail_closed",
+            None,
         );
         let wire = serde_json::to_string(&event).expect("serialize hook failed");
         let decoded: RuntimeEvent = serde_json::from_str(&wire).expect("deserialize hook failed");
@@ -815,6 +821,55 @@ mod tests {
         );
     }
 
+    /// PR #3640 finding D10: the round-trip tests above pass `None` for the
+    /// `owning_extension` argument so they never exercise the `provider`
+    /// projection on hook-meta events. This test pins the property that
+    /// when an `owning_extension` is supplied, it appears on `event.provider`
+    /// (and survives serde) for each of the three hook-meta event kinds —
+    /// the lookup that scope filtering depends on.
+    #[test]
+    fn hook_meta_events_round_trip_owning_extension_as_provider() {
+        let owner = ExtensionId::new("ext.polymarket").expect("valid extension id");
+
+        let dispatched = RuntimeEvent::hook_dispatched(
+            scope(),
+            capability(),
+            hook_id_hex(),
+            "before_capability",
+            "installed",
+            Some(owner.clone()),
+        );
+        assert_eq!(dispatched.provider.as_ref(), Some(&owner));
+        let decoded: RuntimeEvent =
+            serde_json::from_str(&serde_json::to_string(&dispatched).expect("ser")).expect("de");
+        assert_eq!(decoded.provider, Some(owner.clone()));
+
+        let decision = RuntimeEvent::hook_decision_emitted(
+            scope(),
+            capability(),
+            hook_id_hex(),
+            "deny",
+            Some(owner.clone()),
+        );
+        assert_eq!(decision.provider.as_ref(), Some(&owner));
+        let decoded: RuntimeEvent =
+            serde_json::from_str(&serde_json::to_string(&decision).expect("ser")).expect("de");
+        assert_eq!(decoded.provider, Some(owner.clone()));
+
+        let failed = RuntimeEvent::hook_failed(
+            scope(),
+            capability(),
+            hook_id_hex(),
+            "timeout",
+            "fail_isolated",
+            Some(owner.clone()),
+        );
+        assert_eq!(failed.provider.as_ref(), Some(&owner));
+        let decoded: RuntimeEvent =
+            serde_json::from_str(&serde_json::to_string(&failed).expect("ser")).expect("de");
+        assert_eq!(decoded.provider, Some(owner));
+    }
+
     #[test]
     fn hook_label_outside_safe_shape_collapses_to_unclassified() {
         let event = RuntimeEvent::hook_dispatched(
@@ -825,6 +880,7 @@ mod tests {
             // not lower_snake_case
             "Before Capability",
             "trusted",
+            None,
         );
         let wire = serde_json::to_string(&event).expect("serialize");
         let decoded: RuntimeEvent = serde_json::from_str(&wire).expect("deserialize");

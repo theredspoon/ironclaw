@@ -3,9 +3,12 @@ use std::{
     error::Error,
     fmt,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
+use ironclaw_events::{DurableEventLog, EventCursor, EventStreamKey, ReadScope};
 use ironclaw_hooks::dispatch::{HookDispatcher, HookDispatcherBuilder};
 use ironclaw_hooks::middleware::{
     CapabilityInputResolver as HookCapabilityInputResolver,
@@ -64,6 +67,7 @@ use ironclaw_turns::{
     },
     runner::ClaimedTurnRun,
 };
+use tokio::task::JoinHandle;
 
 #[async_trait]
 pub trait LoopCapabilityPortFactory: Send + Sync {
@@ -383,6 +387,402 @@ pub type HookDispatcherFactory = Arc<dyn Fn() -> Arc<HookDispatcher> + Send + Sy
 pub type HookDispatcherBuilderFactory =
     Arc<dyn Fn() -> HookDispatcherBuilder + Send + Sync + 'static>;
 
+/// Default number of durable runtime events read per subscription poll.
+pub const DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_BATCH_LIMIT: usize = 64;
+
+/// Default delay between empty subscription polls when the durable log has
+/// just been drained. Under sustained idle, the subscription backs off
+/// exponentially up to [`DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_MAX_POLL_INTERVAL`]
+/// rather than polling at this rate forever (PR #3640 finding C5).
+/// Combined with [`DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_BATCH_LIMIT`], this
+/// is the first-line throttle for event-triggered dispatch fanout: the
+/// subscription processes at most `batch_limit` events per poll, so a storm
+/// produced by mutual recursion between two installed hooks cycles at the
+/// poll-interval rate rather than unboundedly.
+///
+/// The full per-hook DoS budget Henry flagged as required for the
+/// Installed tier (henrypark133 should-fix #4 on PR #3640, tracked as
+/// issue #3689) — a per-hook rate cap with poisoning + milestone on
+/// overrun — is tracked as a follow-up. The existing self-trigger guard
+/// catches the most common direct-recursion pattern; the throttle here
+/// bounds indirect patterns until the proper budget design lands.
+pub const DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Maximum effective poll interval under adaptive backoff. When the
+/// subscription has seen `N` consecutive empty polls it sleeps for
+/// `min(base * 2^N, MAX)` before the next poll, so an idle stream falls
+/// back to ~1Hz instead of hammering the durable log at the configured
+/// poll interval (PR #3640 finding C5). A non-empty batch resets the
+/// streak so a producer burst restores low-latency dispatch immediately.
+pub const DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_MAX_POLL_INTERVAL: Duration =
+    Duration::from_millis(1_000);
+
+/// Pull-driven durable runtime-event subscription for event-triggered hooks.
+///
+/// The subscription reads from [`DurableEventLog`] on its own tokio task and
+/// dispatches matching hooks through the per-build [`HookDispatcher`]. Because
+/// events are pulled from the durable log after append, the runtime event
+/// producer does not wait for hook execution or hook backpressure.
+/// Configuration for a single event-triggered hook subscription.
+///
+/// `Clone` is intentionally **not** derived. Cloning and spawning twice
+/// would create two consumers reading from the same `start_cursor` and
+/// dispatching each hook twice (henrypark133 should-fix #2 on PR
+/// #3640). The factory deliberately uses
+/// [`Self::clone_for_independent_spawn`] in its one call site so the
+/// dual-consumer property is visible at the seam.
+///
+/// # Replay semantics
+///
+/// The subscription is **at-least-once**. Restarting from the same
+/// `start_cursor` replays every event whose cursor is `>= start_cursor`
+/// — including events already dispatched before the prior shutdown.
+/// Cursor persistence is the caller's responsibility; for once-only
+/// delivery, the caller must commit progress at hook completion and
+/// resume from `last_committed_cursor + 1`. This is documented here
+/// (henrypark133 should-fix #6 on PR #3640) rather than only in the
+/// design doc since it's a load-bearing public-API property.
+pub struct EventTriggeredHookSubscription {
+    log: Arc<dyn DurableEventLog>,
+    stream: EventStreamKey,
+    read_scope: ReadScope,
+    start_cursor: EventCursor,
+    batch_limit: usize,
+    poll_interval: Duration,
+    /// Upper bound on the adaptive idle poll interval. See
+    /// [`DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_MAX_POLL_INTERVAL`].
+    max_poll_interval: Duration,
+}
+
+impl EventTriggeredHookSubscription {
+    /// Cheap deep-copy of the configuration so the factory can mint one
+    /// independent background task per host build. Named verbosely
+    /// because the alternative (`Clone` derive) would let external
+    /// callers create two simultaneous consumers of the same stream by
+    /// accident — see the type-level rustdoc above.
+    pub(crate) fn clone_for_independent_spawn(&self) -> Self {
+        Self {
+            log: Arc::clone(&self.log),
+            stream: self.stream.clone(),
+            read_scope: self.read_scope.clone(),
+            start_cursor: self.start_cursor,
+            batch_limit: self.batch_limit,
+            poll_interval: self.poll_interval,
+            max_poll_interval: self.max_poll_interval,
+        }
+    }
+
+    pub fn new(
+        log: Arc<dyn DurableEventLog>,
+        stream: EventStreamKey,
+        read_scope: ReadScope,
+        start_cursor: EventCursor,
+    ) -> Self {
+        Self {
+            log,
+            stream,
+            read_scope,
+            start_cursor,
+            batch_limit: DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_BATCH_LIMIT,
+            poll_interval: DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_POLL_INTERVAL,
+            max_poll_interval: DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_MAX_POLL_INTERVAL,
+        }
+    }
+
+    #[must_use]
+    pub fn with_batch_limit(mut self, batch_limit: usize) -> Self {
+        self.batch_limit = batch_limit.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval.max(Duration::from_millis(1));
+        // Keep the max never below the base interval — otherwise the
+        // adaptive backoff would clamp below the user-configured floor.
+        if self.max_poll_interval < self.poll_interval {
+            self.max_poll_interval = self.poll_interval;
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_poll_interval(mut self, max_poll_interval: Duration) -> Self {
+        self.max_poll_interval = max_poll_interval.max(self.poll_interval);
+        self
+    }
+
+    /// Verify that this subscription's stream key and read-scope filter are
+    /// consistent with the host's run scope. The subscription stream
+    /// partitions events by `(tenant, user, agent)`; `ReadScope` filters by
+    /// `(project, mission, thread, process)`. If a caller wires a host for
+    /// tenant A but supplies a subscription pointing at tenant B's stream
+    /// (or to a stream-key that names a foreign user), the host would
+    /// dispatch B's hook events into A's dispatcher with A's context tenant
+    /// — a cross-tenant trust-boundary break (NOTE(#3640)). Same for
+    /// `ReadScope` filter dimensions: any `Some(want)` in
+    /// the filter must match the corresponding value in the run scope, so
+    /// the subscription never observes events outside the host's authority.
+    fn validate_against_run_scope(
+        &self,
+        run_scope: &ironclaw_turns::TurnScope,
+        thread_scope: &ironclaw_threads::ThreadScope,
+    ) -> Result<(), String> {
+        if self.stream.tenant_id != run_scope.tenant_id {
+            return Err(format!(
+                "event subscription stream tenant_id={} does not match run scope tenant_id={}",
+                self.stream.tenant_id.as_str(),
+                run_scope.tenant_id.as_str(),
+            ));
+        }
+        if self.stream.agent_id != run_scope.agent_id {
+            return Err(format!(
+                "event subscription stream agent_id={:?} does not match run scope agent_id={:?}",
+                self.stream.agent_id.as_ref().map(|a| a.as_str()),
+                run_scope.agent_id.as_ref().map(|a| a.as_str()),
+            ));
+        }
+        // The user dimension is carried on the thread scope (owner). Treat a
+        // thread without an owner conservatively — refuse to bind the
+        // subscription since we cannot verify the stream's user matches.
+        let Some(owner) = thread_scope.owner_user_id.as_ref() else {
+            return Err(
+                "event subscription cannot bind to thread without an owner user".to_string(),
+            );
+        };
+        if &self.stream.user_id != owner {
+            return Err(format!(
+                "event subscription stream user_id={} does not match thread owner user_id={}",
+                self.stream.user_id.as_str(),
+                owner.as_str(),
+            ));
+        }
+        // ReadScope tightens the stream; any Some(want) must equal the
+        // corresponding run/thread scope value. None is permissive and is
+        // acceptable (the run scope owns the dimension authoritatively).
+        if let Some(want) = self.read_scope.project_id.as_ref()
+            && run_scope.project_id.as_ref() != Some(want)
+        {
+            return Err(format!(
+                "event subscription read_scope.project_id={} does not match run scope project_id={:?}",
+                want.as_str(),
+                run_scope.project_id.as_ref().map(|p| p.as_str()),
+            ));
+        }
+        if let Some(want) = self.read_scope.mission_id.as_ref()
+            && thread_scope.mission_id.as_ref() != Some(want)
+        {
+            return Err(format!(
+                "event subscription read_scope.mission_id={} does not match thread scope mission_id={:?}",
+                want.as_str(),
+                thread_scope.mission_id.as_ref().map(|m| m.as_str()),
+            ));
+        }
+        if let Some(want) = self.read_scope.thread_id.as_ref()
+            && &run_scope.thread_id != want
+        {
+            return Err(format!(
+                "event subscription read_scope.thread_id={} does not match run scope thread_id={}",
+                want.as_str(),
+                run_scope.thread_id.as_str(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn spawn(
+        self,
+        dispatcher: Arc<HookDispatcher>,
+        tenant_id: ironclaw_host_api::TenantId,
+        run_context: LoopRunContext,
+        milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+    ) -> EventTriggeredHookSubscriptionHandle {
+        // henrypark133 should-fix #3 on PR #3640: wrap the background
+        // task body in `catch_unwind`. Without it, a panic in `run()`
+        // terminates the task silently — no operator-visible signal.
+        // On panic, emit the same `EventSubscriptionTerminated`
+        // milestone the `ReplayGap` path already emits so audit/SSE
+        // consumers learn the subscription died and why.
+        let panic_sink = Arc::clone(&milestone_sink);
+        let panic_run_context = run_context.clone();
+        let task = tokio::spawn(async move {
+            let outcome = std::panic::AssertUnwindSafe(self.run(
+                dispatcher,
+                tenant_id,
+                run_context,
+                milestone_sink,
+            ))
+            .catch_unwind()
+            .await;
+            if outcome.is_err() {
+                tracing::error!(
+                    "event-triggered hook subscription task panicked; \
+                     emitting EventSubscriptionTerminated milestone"
+                );
+                emit_subscription_terminated_note(
+                    &panic_sink,
+                    &panic_run_context,
+                    "event subscription stopped: task panic",
+                )
+                .await;
+            }
+        });
+        EventTriggeredHookSubscriptionHandle { task }
+    }
+
+    async fn run(
+        self,
+        dispatcher: Arc<HookDispatcher>,
+        tenant_id: ironclaw_host_api::TenantId,
+        run_context: LoopRunContext,
+        milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+    ) {
+        let mut cursor = self.start_cursor;
+        // Adaptive backoff state (PR #3640 finding C5). `empty_streak`
+        // counts consecutive polls that returned no entries; the sleep on
+        // the next poll is `min(poll_interval << empty_streak, max_poll_interval)`.
+        // A non-empty batch resets the streak so producer bursts restore
+        // low-latency dispatch immediately. The shift is saturated at the
+        // first iteration where the resulting interval reaches the cap,
+        // which keeps the streak counter bounded.
+        let mut empty_streak: u32 = 0;
+        loop {
+            match self
+                .log
+                .read_after_cursor(
+                    &self.stream,
+                    &self.read_scope,
+                    Some(cursor),
+                    self.batch_limit,
+                )
+                .await
+            {
+                Ok(replay) => {
+                    if replay.entries.is_empty() {
+                        cursor = replay.next_cursor;
+                        let sleep_for = adaptive_poll_interval(
+                            self.poll_interval,
+                            self.max_poll_interval,
+                            empty_streak,
+                        );
+                        empty_streak = empty_streak.saturating_add(1);
+                        tokio::time::sleep(sleep_for).await;
+                        continue;
+                    }
+                    empty_streak = 0;
+                    for entry in replay.entries {
+                        dispatcher
+                            .dispatch_event_triggered_at(
+                                tenant_id.clone(),
+                                entry.cursor,
+                                &entry.record,
+                            )
+                            .await;
+                    }
+                    cursor = replay.next_cursor;
+                }
+                Err(ironclaw_events::EventError::ReplayGap {
+                    requested,
+                    earliest,
+                }) => {
+                    tracing::error!(
+                        ?requested,
+                        ?earliest,
+                        "event-triggered hook subscription stopped after replay gap"
+                    );
+                    // NOTE(#3640): replay gaps used to be a silent
+                    // warn+break. Surface as an operator-visible milestone
+                    // so missing hook deliveries are auditable. Fail-closed:
+                    // we break out of the loop after emitting because the
+                    // subscription's at-most-once contract is already broken
+                    // and resuming from `earliest` would silently lose the
+                    // events in the gap.
+                    emit_subscription_terminated_note(
+                        &milestone_sink,
+                        &run_context,
+                        "event subscription stopped: replay gap",
+                    )
+                    .await;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "event-triggered hook subscription poll failed; retrying"
+                    );
+                    tokio::time::sleep(self.poll_interval).await;
+                }
+            }
+        }
+    }
+}
+
+/// Compute the next idle sleep duration for the event-triggered subscription
+/// under adaptive backoff (PR #3640 finding C5).
+///
+/// - `base` is the configured `poll_interval`.
+/// - `max` is the cap (`max_poll_interval`).
+/// - `streak` is the count of consecutive empty polls observed so far.
+///
+/// Returns `min(base * 2^streak, max)`. Saturates instead of overflowing
+/// when `streak` is large.
+fn adaptive_poll_interval(base: Duration, max: Duration, streak: u32) -> Duration {
+    // Clamp shift to 30 — `1u64 << 30` is ~1B and any `base * 2^30` would
+    // dwarf any sensible `max`, so saturating at the cap is correct here.
+    let shift = streak.min(30);
+    let base_ns = base.as_nanos() as u64;
+    let scaled = base_ns.saturating_mul(1u64 << shift);
+    let capped = scaled.min(max.as_nanos() as u64);
+    Duration::from_nanos(capped)
+}
+
+async fn emit_subscription_terminated_note(
+    sink: &Arc<dyn LoopHostMilestoneSink>,
+    run_context: &LoopRunContext,
+    safe_summary: &str,
+) {
+    let summary = match ironclaw_turns::run_profile::LoopSafeSummary::new(safe_summary) {
+        Ok(s) => s,
+        Err(_) => {
+            // Should never happen for our static strings, but if a future
+            // caller passes something the validator rejects, just log and
+            // proceed without the milestone rather than panicking inside
+            // the background task.
+            tracing::error!(
+                rejected = safe_summary,
+                "subscription-terminated note rejected by LoopSafeSummary::new"
+            );
+            return;
+        }
+    };
+    let milestone = ironclaw_turns::run_profile::LoopHostMilestone {
+        scope: run_context.scope.clone(),
+        turn_id: run_context.turn_id,
+        run_id: run_context.run_id,
+        loop_driver_id: run_context.loop_driver_id.clone(),
+        kind: ironclaw_turns::run_profile::LoopHostMilestoneKind::DriverNote {
+            kind: ironclaw_turns::run_profile::LoopDriverNoteKind::EventSubscriptionTerminated,
+            safe_summary: summary,
+        },
+    };
+    if let Err(error) = sink.publish_loop_milestone(milestone).await {
+        tracing::error!(
+            error = %error,
+            "failed to emit EventSubscriptionTerminated milestone"
+        );
+    }
+}
+
+struct EventTriggeredHookSubscriptionHandle {
+    task: JoinHandle<()>,
+}
+
+impl Drop for EventTriggeredHookSubscriptionHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 pub struct RebornLoopDriverHostFactory<S, G>
 where
     S: SessionThreadService + ?Sized,
@@ -431,6 +831,9 @@ where
     /// Per-build hook-gate-factory builder. See
     /// [`Self::with_hook_gate_ref_factory_builder`].
     hook_gate_ref_factory_builder: Option<HookGateRefFactoryBuilder>,
+    /// Optional durable runtime-event subscription for event-triggered hooks.
+    /// The subscription starts only when a hook dispatcher is also installed.
+    event_subscription: Option<EventTriggeredHookSubscription>,
     safety_context: Option<InstructionSafetyContext>,
     identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
     input_queue: Option<Arc<dyn HostInputQueue>>,
@@ -489,6 +892,7 @@ where
             capability_input_resolver: None,
             hook_gate_ref_factory: None,
             hook_gate_ref_factory_builder: None,
+            event_subscription: None,
             safety_context: None,
             identity_context_source: None,
             input_queue: None,
@@ -625,6 +1029,15 @@ where
             + 'static,
     {
         self.hook_gate_ref_factory_builder = Some(Arc::new(factory_builder));
+        self
+    }
+
+    /// Install a pull-driven durable event subscription for event-triggered
+    /// hooks. The event producer path is unchanged: this consumer polls the
+    /// durable log on a background task and dispatches observer-only hooks
+    /// outside the loop's inline tick.
+    pub fn with_event_subscription(mut self, subscription: EventTriggeredHookSubscription) -> Self {
+        self.event_subscription = Some(subscription);
         self
     }
 
@@ -811,6 +1224,28 @@ where
             (None, Some(factory)) => Some(factory()),
             (None, None) => None,
         };
+        let event_subscription = match (
+            per_build_dispatcher.as_ref(),
+            self.event_subscription.as_ref(),
+        ) {
+            (Some(dispatcher), Some(subscription)) => {
+                // NOTE(#3640): bind subscription stream/read-scope to
+                // this host's run scope. Otherwise a
+                // caller wiring tenant A's host with tenant B's stream
+                // would silently dispatch B's hook events into A's
+                // dispatcher with A's context tenant.
+                subscription
+                    .validate_against_run_scope(&run_context.scope, &self.thread_scope)
+                    .map_err(|reason| RebornLoopDriverHostError::ScopeMismatch { reason })?;
+                Some(subscription.clone_for_independent_spawn().spawn(
+                    Arc::clone(dispatcher),
+                    run_context.scope.tenant_id.clone(),
+                    run_context.clone(),
+                    Arc::clone(&self.milestone_sink) as _,
+                ))
+            }
+            _ => None,
+        };
         let instruction_materialization_store: Arc<dyn InstructionMaterializationStore> =
             Arc::new(InMemoryInstructionMaterializationStore::default());
         let surface_state = Arc::new(CapabilitySurfaceState::default());
@@ -989,6 +1424,7 @@ where
             transcript,
             progress,
             cancellation,
+            _event_subscription: event_subscription,
         })
     }
 
@@ -1159,6 +1595,7 @@ pub struct RebornLoopDriverHost {
     transcript: Arc<dyn LoopTranscriptPort>,
     progress: Arc<dyn LoopProgressPort>,
     cancellation: Arc<dyn LoopCancellationPort>,
+    _event_subscription: Option<EventTriggeredHookSubscriptionHandle>,
 }
 
 impl fmt::Debug for RebornLoopDriverHost {
@@ -2344,5 +2781,51 @@ mod tests {
             .expect_err("missing state payload must reject");
 
         assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
+    }
+
+    #[test]
+    fn adaptive_poll_interval_doubles_per_streak_until_cap() {
+        // PR #3640 finding C5: empty-poll backoff should double up to a
+        // configurable cap. Streak 0 returns the base; each subsequent
+        // empty poll doubles until clamped.
+        let base = Duration::from_millis(50);
+        let cap = Duration::from_millis(1_000);
+
+        assert_eq!(
+            adaptive_poll_interval(base, cap, 0),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            adaptive_poll_interval(base, cap, 1),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            adaptive_poll_interval(base, cap, 2),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            adaptive_poll_interval(base, cap, 3),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            adaptive_poll_interval(base, cap, 4),
+            Duration::from_millis(800)
+        );
+        // Streak 5 would compute 1600ms but the cap clamps it to 1000ms.
+        assert_eq!(adaptive_poll_interval(base, cap, 5), cap);
+        assert_eq!(adaptive_poll_interval(base, cap, 100), cap);
+        // Huge streak must not overflow.
+        assert_eq!(adaptive_poll_interval(base, cap, u32::MAX), cap);
+    }
+
+    #[test]
+    fn adaptive_poll_interval_respects_cap_below_base() {
+        // If `max < base` somehow slips through (it shouldn't — `with_*`
+        // builders normalize — but defense in depth), the function still
+        // returns the cap rather than overshooting.
+        let base = Duration::from_millis(200);
+        let cap = Duration::from_millis(50);
+        assert_eq!(adaptive_poll_interval(base, cap, 0), cap);
+        assert_eq!(adaptive_poll_interval(base, cap, 10), cap);
     }
 }

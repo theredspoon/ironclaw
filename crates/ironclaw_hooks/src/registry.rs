@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use ironclaw_events::RuntimeEventKind;
 use ironclaw_host_api::ExtensionId;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,12 @@ pub struct HookBinding {
     /// implementation (the trait object) is stored separately so this type
     /// remains serializable for checkpoint payloads.
     pub point: HookPointSpec,
+    /// Runtime-event kind filter for [`HookPointSpec::EventTriggered`]
+    /// bindings. `None` for inline hook points. Defaults to `None` so
+    /// checkpoint payloads serialized before event-triggered hooks remain
+    /// readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_kind_filter: Option<RuntimeEventKind>,
     /// Extension that authored this hook. `None` for `Builtin` and `Trusted`
     /// hooks (which observe globally). `Some` for `Installed` hooks; the
     /// dispatcher consults this in combination with [`Self::scope`] to decide
@@ -122,7 +129,13 @@ fn default_priority() -> HookPriority {
 /// `HookBindingScope::OwnCapabilities`. See finding #2.
 fn point_has_capability_context(point: HookPointSpec) -> bool {
     match point {
-        HookPointSpec::BeforeCapability | HookPointSpec::AfterCapability => true,
+        // `EventTriggered` hooks see `event.provider` (and fall back to the
+        // registry-resolved owning extension for hook-lifecycle events via
+        // `scope_provider_for_runtime_event`), so `OwnCapabilities` scope is
+        // meaningful at this point.
+        HookPointSpec::BeforeCapability
+        | HookPointSpec::AfterCapability
+        | HookPointSpec::EventTriggered => true,
         HookPointSpec::BeforePrompt
         | HookPointSpec::AfterModel
         | HookPointSpec::AfterCheckpoint => false,
@@ -138,6 +151,7 @@ pub enum HookPointSpec {
     AfterModel,
     AfterCapability,
     AfterCheckpoint,
+    EventTriggered,
 }
 
 /// Bindings grouped by dispatcher point for cheap lookup during a tick.
@@ -151,6 +165,11 @@ pub enum HookPointSpec {
 pub struct HookRegistry {
     by_point: HashMap<HookPointSpec, Vec<HookBinding>>,
     hook_index: HashMap<HookId, (HookPointSpec, usize)>,
+    /// Index from event kind to the hook ids of event-triggered bindings
+    /// declaring that kind in their `event_kind_filter`. Populated at insert
+    /// time so the event dispatch path is O(matches) rather than O(all
+    /// event-triggered bindings) per event (PR #3640 finding C4).
+    event_kind_index: HashMap<RuntimeEventKind, Vec<HookId>>,
 }
 
 impl HookRegistry {
@@ -199,6 +218,29 @@ impl HookRegistry {
                 binding.point
             )));
         }
+        // henrypark133 should-fix #1 on PR #3640: event-triggered bindings
+        // are meaningless without an event-kind filter — the dispatcher
+        // matches by kind, so a missing filter silently matches nothing
+        // (a no-op binding). Conversely, only event-triggered bindings
+        // can carry an event-kind filter (other points are kind-agnostic).
+        // Enforce the biconditional at install time so misconfigured
+        // bindings fail loud.
+        let is_event_point = matches!(binding.point, HookPointSpec::EventTriggered);
+        let has_kind_filter = binding.event_kind_filter.is_some();
+        if is_event_point && !has_kind_filter {
+            return Err(HookError::RegistryConstruction(format!(
+                "event-triggered binding `{}` must declare an event_kind_filter; \
+                 without one the dispatcher would never match",
+                binding.hook_id
+            )));
+        }
+        if !is_event_point && has_kind_filter {
+            return Err(HookError::RegistryConstruction(format!(
+                "binding `{}` at point {:?} must not declare an event_kind_filter; \
+                 only EventTriggered bindings use kind filters",
+                binding.hook_id, binding.point
+            )));
+        }
         // Hook IDs must be globally unique across the registry. A duplicate
         // ID at the same point would allow the same physical hook to appear
         // twice in a single dispatch snapshot; a duplicate at a different
@@ -212,6 +254,14 @@ impl HookRegistry {
                  against the registry at most once",
                 binding.hook_id
             )));
+        }
+        if let (HookPointSpec::EventTriggered, Some(kind)) =
+            (binding.point, binding.event_kind_filter)
+        {
+            self.event_kind_index
+                .entry(kind)
+                .or_default()
+                .push(binding.hook_id);
         }
         let hook_id = binding.hook_id;
         let point = binding.point;
@@ -247,6 +297,27 @@ impl HookRegistry {
             .into_iter()
             .flat_map(|v| v.iter())
             .filter(|b| !b.poisoned)
+    }
+
+    /// Active (non-poisoned) event-triggered bindings whose
+    /// `event_kind_filter` matches `kind`. Uses the per-kind index built at
+    /// install time, so dispatch is `O(matches)` rather than scanning every
+    /// event-triggered binding for every event (PR #3640 finding C4).
+    pub fn active_for_event_kind(
+        &self,
+        kind: RuntimeEventKind,
+    ) -> impl Iterator<Item = &HookBinding> {
+        let hook_ids = self.event_kind_index.get(&kind);
+        let bindings = self.by_point.get(&HookPointSpec::EventTriggered);
+        hook_ids
+            .into_iter()
+            .flat_map(move |ids| ids.iter())
+            .filter_map(move |hook_id| {
+                bindings
+                    .into_iter()
+                    .flat_map(|v| v.iter())
+                    .find(|b| b.hook_id == *hook_id && !b.poisoned)
+            })
     }
 
     /// Count of bindings whose `owning_extension` matches `extension`,
@@ -328,6 +399,35 @@ impl HookRegistry {
         self.hook_index.contains_key(&hook_id)
     }
 
+    /// Owning extension for the binding registered under a serialized hook id.
+    ///
+    /// Hook telemetry events carry the stable [`HookId::to_hex`] wire string,
+    /// so event-triggered scope filtering uses this index to recover the
+    /// provider for `Hook*` runtime events whose `provider` field is empty.
+    pub fn owning_extension_for_hook_hex(&self, hook_id: &str) -> Option<&ExtensionId> {
+        let (point, slot) = self
+            .by_point
+            .iter()
+            .flat_map(|(point, bindings)| {
+                bindings
+                    .iter()
+                    .enumerate()
+                    .map(move |(idx, binding)| (*point, idx, binding))
+            })
+            .find_map(|(point, idx, binding)| {
+                if binding.hook_id.to_hex() == hook_id {
+                    Some((point, idx))
+                } else {
+                    None
+                }
+            })?;
+        self.by_point
+            .get(&point)?
+            .get(slot)?
+            .owning_extension
+            .as_ref()
+    }
+
     /// Total number of bindings, poisoned or not.
     pub fn len(&self) -> usize {
         self.by_point.values().map(Vec::len).sum()
@@ -357,6 +457,7 @@ mod tests {
             phase,
             priority: HookPriority::DEFAULT,
             point,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -409,6 +510,7 @@ mod tests {
             phase: HookPhase::Policy,
             priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -435,6 +537,7 @@ mod tests {
             phase: HookPhase::Telemetry,
             priority: HookPriority::DEFAULT,
             point: HookPointSpec::AfterCapability,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -510,5 +613,64 @@ mod tests {
             0
         );
         assert!(registry.is_poisoned(id));
+    }
+
+    /// PR #3640 finding D9: non-event-triggered bindings carrying an
+    /// `event_kind_filter` must be rejected at install time. The dispatcher
+    /// only consults the filter on the event-triggered path, so silently
+    /// accepting it elsewhere would let a misconfigured manifest believe
+    /// it had narrowed dispatch when in fact the filter was ignored.
+    #[test]
+    fn rejects_non_event_binding_with_event_kind_filter() {
+        let mut registry = HookRegistry::new();
+        let mut binding =
+            installed_binding("alpha", HookPhase::Policy, HookPointSpec::BeforeCapability);
+        binding.event_kind_filter = Some(RuntimeEventKind::HookFailed);
+        match registry.insert(binding) {
+            Err(HookError::RegistryConstruction(msg)) => {
+                assert!(msg.contains("event_kind_filter"), "unexpected msg: {msg}");
+                assert!(msg.contains("BeforeCapability"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+    }
+
+    /// PR #3640 finding C4: per-kind index returns only bindings whose
+    /// declared filter matches.
+    #[test]
+    fn event_kind_index_partitions_bindings_by_filter() {
+        let mut registry = HookRegistry::new();
+        let mut a = installed_binding("alpha", HookPhase::Telemetry, HookPointSpec::EventTriggered);
+        a.event_kind_filter = Some(RuntimeEventKind::HookFailed);
+        registry.insert(a).expect("alpha insert");
+        let mut b = installed_binding("beta", HookPhase::Telemetry, HookPointSpec::EventTriggered);
+        b.event_kind_filter = Some(RuntimeEventKind::DispatchSucceeded);
+        registry.insert(b).expect("beta insert");
+
+        let failed: Vec<_> = registry
+            .active_for_event_kind(RuntimeEventKind::HookFailed)
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].event_kind_filter,
+            Some(RuntimeEventKind::HookFailed)
+        );
+
+        let succeeded: Vec<_> = registry
+            .active_for_event_kind(RuntimeEventKind::DispatchSucceeded)
+            .collect();
+        assert_eq!(succeeded.len(), 1);
+        assert_eq!(
+            succeeded[0].event_kind_filter,
+            Some(RuntimeEventKind::DispatchSucceeded)
+        );
+
+        // A kind no binding declared returns empty.
+        assert_eq!(
+            registry
+                .active_for_event_kind(RuntimeEventKind::ModelStarted)
+                .count(),
+            0
+        );
     }
 }

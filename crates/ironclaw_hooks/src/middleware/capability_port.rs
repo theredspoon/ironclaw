@@ -756,6 +756,7 @@ mod tests {
             phase: HookPhase::Policy,
             priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -930,6 +931,7 @@ mod tests {
             phase: HookPhase::Policy,
             priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -1183,6 +1185,7 @@ mod tests {
                 phase: HookPhase::Telemetry,
                 priority: HookPriority::DEFAULT,
                 point: HookPointSpec::AfterCapability,
+                event_kind_filter: None,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
                 poisoned: false,
@@ -1392,6 +1395,7 @@ mod tests {
                 point: HookPointSpec::AfterCapability,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
+                event_kind_filter: None,
                 poisoned: false,
             })
             .expect("ok");
@@ -1887,6 +1891,7 @@ mod tests {
                 point: HookPointSpec::BeforeCapability,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
+                event_kind_filter: None,
                 poisoned: false,
             })
             .expect("insert no_input");
@@ -1900,6 +1905,7 @@ mod tests {
                 point: HookPointSpec::BeforeCapability,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
+                event_kind_filter: None,
                 poisoned: false,
             })
             .expect("insert needs_input");
@@ -2008,6 +2014,7 @@ mod tests {
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
+            event_kind_filter: None,
             poisoned: false,
         };
 
@@ -2021,6 +2028,7 @@ mod tests {
             point: HookPointSpec::AfterCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
+            event_kind_filter: None,
             poisoned: false,
         };
 
