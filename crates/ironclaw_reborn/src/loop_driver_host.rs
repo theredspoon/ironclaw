@@ -6,12 +6,21 @@ use std::{
 };
 
 use async_trait::async_trait;
+use ironclaw_hooks::dispatch::{HookDispatcher, HookDispatcherBuilder};
+use ironclaw_hooks::middleware::{
+    CapabilityInputResolver as HookCapabilityInputResolver,
+    CapabilityProviderResolver as HookCapabilityProviderResolver, HookPromptMaterializationSink,
+    HookedLoopCapabilityPort, HookedLoopCheckpointPort, HookedLoopModelPort, HookedLoopPromptPort,
+    HookedLoopTranscriptPort,
+};
+use ironclaw_host_api::ExtensionId;
 use ironclaw_loop_support::{
     CapabilityResolveError, CapabilitySurfaceProfileFilter, CapabilitySurfaceProfileResolver,
     EmptyLoopCapabilityPort, HostIdentityContextSource, HostInputQueue, HostManagedModelGateway,
-    HostQueueLoopInputPort, HostSkillContextSource, RunCancellationFactory,
-    RunCancellationObservationKind, RunStateLoopCancellationPort, ThreadBackedLoopContextPort,
-    ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort, TurnStateRunCancellationFactory,
+    HostQueueLoopInputPort, HostSkillContextSource, LoopCapabilityInputResolver,
+    RunCancellationFactory, RunCancellationObservationKind, RunStateLoopCancellationPort,
+    ThreadBackedLoopContextPort, ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
+    TurnStateRunCancellationFactory,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 
@@ -36,8 +45,9 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityInvocation, CapabilityOutcome,
-        FinalizeAssistantMessage, HostManagedLoopModelPort, HostManagedLoopPromptPort,
-        InMemoryInstructionMaterializationStore, InstructionMaterializationStore,
+        FinalizeAssistantMessage, HookMilestoneSink, HostManagedLoopModelPort,
+        HostManagedLoopPromptPort, InMemoryInstructionMaterializationStore,
+        InstructionBundleMaterializedMessage, InstructionMaterializationStore,
         InstructionSafetyContext, LoadCheckpointPayloadRequest, LoadedCheckpointPayload,
         LoopCancellationPort, LoopCancellationSignal, LoopCapabilityPort, LoopCheckpointPort,
         LoopCheckpointRequest, LoopContextBundle, LoopContextPort, LoopContextRequest,
@@ -47,8 +57,9 @@ use ironclaw_turns::{
         LoopModelRequest, LoopModelResponse, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
         LoopPromptBundleAuthority, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
         LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, NoOpBudgetAccountant,
-        NoOpPolicyGuard, ProviderToolCall, ProviderToolDefinition, StageCheckpointPayloadRequest,
-        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        NoOpPolicyGuard, ProviderToolCall, ProviderToolDefinition, RunScopedHookMilestoneSink,
+        StageCheckpointPayloadRequest, UpdateAssistantDraft, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -106,6 +117,60 @@ impl Error for RebornLoopDriverHostError {}
 pub struct RebornLoopDriverHostRequest {
     pub claimed_run: ClaimedTurnRun,
     pub loop_run_context: LoopRunContext,
+}
+
+/// Provider resolver that consults the current visible-capability surface
+/// to map `capability_id` → `provider: ExtensionId`. Wires the hook
+/// middleware to the same surface the inner port already tracks via
+/// `SurfaceTrackingLoopCapabilityPort`. Without this, `OwnCapabilities`-
+/// scoped hooks never fire because `ctx.provider` stays `None`
+/// (henrypark133 Critical #2).
+struct SurfaceBackedProviderResolver {
+    surface_state: Arc<CapabilitySurfaceState>,
+}
+
+#[async_trait]
+impl HookCapabilityProviderResolver for SurfaceBackedProviderResolver {
+    async fn provider_for(&self, capability_id: &str) -> Option<ExtensionId> {
+        let surface = self.surface_state.current().ok().flatten()?;
+        surface
+            .descriptors
+            .iter()
+            .find(|d| d.capability_id.as_str() == capability_id)
+            .and_then(|d| d.provider.clone())
+    }
+}
+
+/// Adapter that lets `HookedLoopPromptPort` write hook-emitted
+/// `msg:hook.*` content into the host's `InstructionMaterializationStore`
+/// so the downstream model resolver can resolve those refs. Captures the
+/// `LoopRunContext` at construction time so the hook prompt port doesn't
+/// need to know about run-profile types.
+///
+/// Threat-model + henrypark133 Critical #1: without this adapter wired
+/// through the factory, hook prompt patches produce unresolvable refs and
+/// the request fails with `model message reference is unavailable`.
+struct InstructionStoreBackedHookSink {
+    store: Arc<dyn InstructionMaterializationStore>,
+    run_context: LoopRunContext,
+}
+
+impl HookPromptMaterializationSink for InstructionStoreBackedHookSink {
+    fn put(
+        &self,
+        role: &str,
+        content_ref: &ironclaw_turns::LoopMessageRef,
+        safe_content: String,
+    ) -> Result<(), AgentLoopHostError> {
+        self.store.put_materialized_messages(
+            &self.run_context,
+            vec![InstructionBundleMaterializedMessage {
+                role: role.to_string(),
+                content_ref: content_ref.clone(),
+                safe_content,
+            }],
+        )
+    }
 }
 
 #[derive(Default)]
@@ -196,6 +261,127 @@ impl LoopCapabilityPort for SurfaceTrackingLoopCapabilityPort {
     }
 }
 
+// `LoopCapabilityInputResolver` is now defined in `ironclaw_loop_support`
+// (workspace-10 refactor); imported above.
+
+/// Default upper bound (in bytes of UTF-8 JSON-serialized form) above which
+/// [`HookCapabilityInputResolverAdapter`] refuses to forward resolved input to
+/// `before_capability` hook predicates. The hook crate's
+/// [`crate::ironclaw_hooks::points::SanitizedArguments`] already caps per-string
+/// length and nesting depth, but does not bound total byte size; the adapter
+/// rejects oversized payloads up front so an unexpectedly large blob doesn't
+/// reach predicate evaluation. The default is intentionally generous (64 KiB)
+/// to cover normal capability inputs; callers can tighten it via
+/// [`HookCapabilityInputResolverAdapter::with_max_input_bytes`].
+pub const DEFAULT_HOOK_CAPABILITY_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Adapter that exposes a [`LoopCapabilityInputResolver`] to the
+/// `ironclaw_hooks` middleware as a
+/// [`ironclaw_hooks::middleware::CapabilityInputResolver`].
+///
+/// Production capability dispatch already requires a
+/// [`LoopCapabilityInputResolver`] (used by [`HostRuntimeLoopCapabilityPort`]
+/// to convert opaque `CapabilityInputRef`s into JSON inputs for the host
+/// runtime). This adapter reuses that same resolver — and the same
+/// `LoopRunContext` it was built for — to feed sanitized arguments to hook
+/// predicate evaluators. Sharing the resolver guarantees that the hook
+/// framework and the dispatch path see the same logical input for a given
+/// `(run, input_ref)` pair.
+///
+/// Fail-closed semantics:
+///
+/// - If the inner resolver returns an error, the adapter returns `None`. The
+///   hook framework treats `None` as "unresolved" and `NumericSum`-style
+///   predicates fail closed (deny / pause) per the evaluator's existing
+///   semantics.
+/// - If the resolved JSON value exceeds the configured byte budget once
+///   serialized, the adapter returns `None`. The framework's per-string
+///   truncation and depth cap (in
+///   [`ironclaw_hooks::points::SanitizedArguments`]) apply to predicate
+///   evaluation, but the total payload size guard lives here so an oversized
+///   body cannot reach the sanitizer at all.
+pub struct HookCapabilityInputResolverAdapter {
+    inner: Arc<dyn LoopCapabilityInputResolver>,
+    run_context: LoopRunContext,
+    max_input_bytes: usize,
+}
+
+impl HookCapabilityInputResolverAdapter {
+    pub fn new(inner: Arc<dyn LoopCapabilityInputResolver>, run_context: LoopRunContext) -> Self {
+        Self {
+            inner,
+            run_context,
+            max_input_bytes: DEFAULT_HOOK_CAPABILITY_INPUT_MAX_BYTES,
+        }
+    }
+
+    /// Override the maximum serialized-byte budget. Inputs whose serialized
+    /// JSON exceeds this size resolve to `None` (predicate evaluators that
+    /// depend on argument contents fail closed).
+    #[must_use]
+    pub fn with_max_input_bytes(mut self, max_input_bytes: usize) -> Self {
+        self.max_input_bytes = max_input_bytes;
+        self
+    }
+}
+
+#[async_trait]
+impl HookCapabilityInputResolver for HookCapabilityInputResolverAdapter {
+    async fn resolve(
+        &self,
+        invocation: &ironclaw_turns::run_profile::CapabilityInvocation,
+    ) -> Option<serde_json::Value> {
+        let value = match self
+            .inner
+            .resolve_capability_input(&self.run_context, &invocation.input_ref)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::debug!(
+                    capability = %invocation.capability_id,
+                    input_ref = %invocation.input_ref,
+                    kind = ?error.kind,
+                    safe_summary = %error.safe_summary,
+                    "hook capability input resolution failed; treating as unresolved"
+                );
+                return None;
+            }
+        };
+        let serialized_len = match serde_json::to_vec(&value) {
+            Ok(bytes) => bytes.len(),
+            Err(error) => {
+                tracing::debug!(
+                    capability = %invocation.capability_id,
+                    input_ref = %invocation.input_ref,
+                    error = %error,
+                    "hook capability input could not be re-serialized; treating as unresolved"
+                );
+                return None;
+            }
+        };
+        if serialized_len > self.max_input_bytes {
+            tracing::debug!(
+                capability = %invocation.capability_id,
+                input_ref = %invocation.input_ref,
+                serialized_len,
+                max_input_bytes = self.max_input_bytes,
+                "hook capability input exceeded byte budget; treating as unresolved"
+            );
+            return None;
+        }
+        Some(value)
+    }
+}
+
+// `LoopCapabilityResultWriter` is now defined in `ironclaw_loop_support`
+// (workspace-10 refactor); imported above.
+
+pub type HookDispatcherFactory = Arc<dyn Fn() -> Arc<HookDispatcher> + Send + Sync + 'static>;
+
+pub type HookDispatcherBuilderFactory =
+    Arc<dyn Fn() -> HookDispatcherBuilder + Send + Sync + 'static>;
+
 pub struct RebornLoopDriverHostFactory<S, G>
 where
     S: SessionThreadService + ?Sized,
@@ -213,6 +399,34 @@ where
     cancellation_factory: Arc<dyn RunCancellationFactory>,
     config: TextOnlyLoopHostConfig,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    /// Optional hook dispatcher factory. When set, the factory invokes the
+    /// closure on every `build_text_only_host*` call to obtain a fresh
+    /// `HookDispatcher`, wraps it in `Arc`, and then plumbs it through
+    /// `HookedLoopCapabilityPort` / `HookedLoopPromptPort`. Building a fresh
+    /// dispatcher per host build means slot-poisoning state, the per-tenant
+    /// predicate counter, and any registry mutations done while a run is
+    /// active do not leak into the next run. Default behavior (no factory) is
+    /// unchanged from the pre-hooks shape.
+    hook_dispatcher_factory: Option<HookDispatcherFactory>,
+    /// Per-build builder factory. Preferred over `hook_dispatcher_factory`
+    /// because it lets the host factory attach the run-scoped milestone
+    /// sink internally (henrypark133 Critical #4). Exactly one of these
+    /// two should be set; if both are, the builder factory wins.
+    hook_dispatcher_builder_factory: Option<HookDispatcherBuilderFactory>,
+    /// Optional capability-input resolver. When the hook dispatcher is set
+    /// and a resolver is configured, the factory wraps it in a
+    /// [`HookCapabilityInputResolverAdapter`] (bound to the current
+    /// `LoopRunContext`) and threads it into `HookedLoopCapabilityPort` so
+    /// argument-dependent predicates (e.g., `NumericSum`) evaluate against
+    /// real capability arguments instead of failing closed.
+    capability_input_resolver: Option<Arc<dyn LoopCapabilityInputResolver>>,
+    /// Optional gate-ref factory for hook `PauseApproval` / `PauseAuth`
+    /// decisions. Default behavior (no factory) is fail-closed — the hook
+    /// suspension surfaces as `Denied`. Production deployments must install
+    /// a factory that talks to the host's approval/auth router; tests can
+    /// install `UuidHookGateRefFactory` to exercise the affirmative path.
+    /// See [`Self::with_hook_gate_ref_factory`].
+    hook_gate_ref_factory: Option<Arc<dyn ironclaw_hooks::middleware::HookGateRefFactory>>,
     safety_context: Option<InstructionSafetyContext>,
     identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
     input_queue: Option<Arc<dyn HostInputQueue>>,
@@ -252,6 +466,10 @@ where
             cancellation_factory,
             config,
             skill_context_source: None,
+            hook_dispatcher_factory: None,
+            hook_dispatcher_builder_factory: None,
+            capability_input_resolver: None,
+            hook_gate_ref_factory: None,
             safety_context: None,
             identity_context_source: None,
             input_queue: None,
@@ -272,6 +490,132 @@ where
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
         self.skill_context_source = Some(source);
         self
+    }
+
+    /// Install a hook dispatcher factory closure. The closure is invoked once
+    /// on every `build_text_only_host*` call to mint a fresh
+    /// [`HookDispatcher`], which the factory then wraps in `Arc` and threads
+    /// through `HookedLoopCapabilityPort` / `HookedLoopPromptPort`.
+    ///
+    /// This is the recommended hook installation path: per-build construction
+    /// gives each host its own dispatcher, so slot poisoning, registry
+    /// mutations, and any other dispatcher-owned state are scoped to a single
+    /// run rather than shared across every host the factory ever produces.
+    ///
+    /// **Hook telemetry**: to surface hook dispatch in the host's milestone
+    /// stream, the closure itself should attach a
+    /// [`ironclaw_turns::run_profile::HookMilestoneSink`] (typically a
+    /// [`ironclaw_turns::run_profile::RunScopedHookMilestoneSink`] wrapping
+    /// the factory's `LoopHostMilestoneSink`) before returning the
+    /// dispatcher. The wrapping happens inside the closure so each run gets a
+    /// dispatcher already configured for telemetry. Hook activity is
+    /// invisible to observers when no sink is attached.
+    pub fn with_hook_dispatcher_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Arc<HookDispatcher> + Send + Sync + 'static,
+    {
+        self.hook_dispatcher_factory = Some(Arc::new(factory));
+        self
+    }
+
+    /// Install a capability-input resolver for hook predicate evaluation.
+    /// When set alongside a hook dispatcher, hook predicates that depend on
+    /// argument contents (`ValueOrRateBound::NumericSum`, etc.) see real,
+    /// sanitized input values; otherwise they fail closed because the hooks
+    /// middleware defaults to the framework's `NullCapabilityInputResolver`.
+    ///
+    /// The resolver is the same trait used by [`HostRuntimeLoopCapabilityPort`]
+    /// to convert opaque capability input refs into JSON arguments; production
+    /// callers typically share a single implementation between dispatch and
+    /// hook evaluation so both observe the same logical input.
+    /// Install a hook dispatcher *builder* factory. **Preferred over
+    /// [`Self::with_hook_dispatcher_factory`]** because the host factory
+    /// can attach a `RunScopedHookMilestoneSink` keyed to the current
+    /// `LoopRunContext` *internally*, before the builder is sealed —
+    /// guaranteeing hook telemetry carries the right run/thread scope
+    /// without caller bookkeeping (henrypark133 Critical #4).
+    ///
+    /// The closure is invoked once per `build_text_only_host*` call. It
+    /// should construct a clean builder (no pre-attached milestone sink —
+    /// the host wires one). Manifest-driven hook installations happen
+    /// inside the closure exactly as with the legacy factory.
+    pub fn with_hook_dispatcher_builder_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> HookDispatcherBuilder + Send + Sync + 'static,
+    {
+        self.hook_dispatcher_builder_factory = Some(Arc::new(factory));
+        self
+    }
+
+    pub fn with_capability_input_resolver(
+        mut self,
+        resolver: Arc<dyn LoopCapabilityInputResolver>,
+    ) -> Self {
+        self.capability_input_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a `HookGateRefFactory` for hook-emitted `PauseApproval` /
+    /// `PauseAuth` decisions. The default (no factory) is fail-closed: the
+    /// suspension surfaces as `Denied` so the loop doesn't park on an
+    /// unresolvable ref.
+    ///
+    /// Production: install a factory that reserves a gate through the
+    /// host's real approval/auth router so the ref carries lease + one-shot
+    /// semantics. Tests/dev: install `UuidHookGateRefFactory` to exercise
+    /// the affirmative `ApprovalRequired { gate_ref }` shape (the refs are
+    /// locally unique but not router-registered — production must not use
+    /// this).
+    pub fn with_hook_gate_ref_factory(
+        mut self,
+        factory: Arc<dyn ironclaw_hooks::middleware::HookGateRefFactory>,
+    ) -> Self {
+        self.hook_gate_ref_factory = Some(factory);
+        self
+    }
+
+    /// Install a shared [`HookDispatcher`] that wraps the capability and
+    /// prompt ports for every host built by this factory.
+    ///
+    /// **Deprecated for production use.** This is preserved as a thin
+    /// backward-compat wrapper that adapts a single `Arc<HookDispatcher>`
+    /// into a factory closure cloning the same instance on every build. As a
+    /// result, dispatcher-owned mutable state (poisoned slots, predicate
+    /// counters, registry mutations) is **shared across every run** the
+    /// factory produces — a hook poisoned in run N stays poisoned for runs
+    /// N+1, N+2, …
+    ///
+    /// New callers should prefer [`Self::with_hook_dispatcher_factory`],
+    /// which mints a fresh dispatcher per host build and provides full
+    /// per-run isolation of hook state.
+    pub fn with_hook_dispatcher(self, dispatcher: Arc<HookDispatcher>) -> Self {
+        // Single-instance Arc cloning preserves the legacy shared-state shape
+        // so existing call sites and tests behave identically. New code paths
+        // should reach for `with_hook_dispatcher_factory` instead.
+        self.with_hook_dispatcher_factory(move || Arc::clone(&dispatcher))
+    }
+
+    /// **DEPRECATED.** Earlier docs claimed this would defer `.build_arc()`
+    /// until the host factory finalizes wiring, but the implementation
+    /// always called it eagerly and routed through the legacy shared-
+    /// dispatcher adapter (serrrfirat P2 #3 on PR #3573). Callers using
+    /// this path lost per-run dispatcher isolation and the run-scoped
+    /// milestone sink. Use [`Self::with_hook_dispatcher_builder_factory`]
+    /// — pass a closure that builds a fresh builder per host — for the
+    /// behavior this method's name implied, or
+    /// [`Self::with_hook_dispatcher`] if you actually want the shared
+    /// dispatcher.
+    #[deprecated(
+        since = "0.1.0",
+        note = "this method always called build_arc() eagerly and routed \
+                through the shared-dispatcher adapter, contradicting the \
+                doc-claimed deferred semantics. Use \
+                `with_hook_dispatcher_builder_factory(|| builder())` for \
+                per-build isolation, or `with_hook_dispatcher(...)` if you \
+                meant the shared adapter explicitly."
+    )]
+    pub fn with_hook_dispatcher_builder(self, builder: HookDispatcherBuilder) -> Self {
+        self.with_hook_dispatcher(builder.build_arc())
     }
 
     pub fn with_safety_context(mut self, safety_context: InstructionSafetyContext) -> Self {
@@ -385,12 +729,69 @@ where
         }
         context_adapter = context_adapter.with_milestone_sink(Arc::clone(&self.milestone_sink));
         let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
+        // Mint a fresh dispatcher per build when a factory is installed. This
+        // localizes dispatcher-owned state (slot poisoning, registry edits,
+        // predicate counters) to this one host so it cannot leak into the
+        // next run that shares this factory.
+        //
+        // Builder-factory path (preferred): the factory hands back a
+        // mutable builder; we attach a `RunScopedHookMilestoneSink` keyed
+        // to *this* run's `LoopRunContext` *before* sealing. Hook
+        // telemetry then carries the correct run/thread scope without
+        // depending on the closure capturing the right context (which
+        // would silently misattribute across reuses — henrypark133
+        // Critical #4).
+        let per_build_dispatcher = match (
+            self.hook_dispatcher_builder_factory.as_ref(),
+            self.hook_dispatcher_factory.as_ref(),
+        ) {
+            (Some(builder_factory), _) => {
+                let builder = builder_factory();
+                let run_scoped: Arc<dyn HookMilestoneSink> =
+                    Arc::new(RunScopedHookMilestoneSink::new(
+                        run_context.clone(),
+                        Arc::clone(&self.milestone_sink) as _,
+                    ));
+                Some(builder.with_milestone_sink(run_scoped).build_arc())
+            }
+            (None, Some(factory)) => Some(factory()),
+            (None, None) => None,
+        };
         let instruction_materialization_store: Arc<dyn InstructionMaterializationStore> =
             Arc::new(InMemoryInstructionMaterializationStore::default());
         let surface_state = Arc::new(CapabilitySurfaceState::default());
-        let capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
+        let mut capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
             SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
         );
+        if let Some(dispatcher) = per_build_dispatcher.as_ref() {
+            // Wire a surface-backed provider resolver so OwnCapabilities-
+            // scoped hooks can see `ctx.provider` (henrypark133 Critical #2).
+            // Without this, the middleware keeps NullCapabilityProviderResolver
+            // and every OwnCapabilities hook is inert because provider stays
+            // None.
+            let provider_resolver: Arc<dyn HookCapabilityProviderResolver> =
+                Arc::new(SurfaceBackedProviderResolver {
+                    surface_state: Arc::clone(&surface_state),
+                });
+            let mut hooked = HookedLoopCapabilityPort::new(
+                Arc::clone(&capabilities),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            )
+            .with_provider_resolver(provider_resolver);
+            if let Some(factory) = self.hook_gate_ref_factory.as_ref() {
+                hooked = hooked.with_gate_ref_factory(Arc::clone(factory));
+            }
+            if let Some(input_resolver) = self.capability_input_resolver.as_ref() {
+                let adapter: Arc<dyn HookCapabilityInputResolver> =
+                    Arc::new(HookCapabilityInputResolverAdapter::new(
+                        Arc::clone(input_resolver),
+                        run_context.clone(),
+                    ));
+                hooked = hooked.with_resolver(adapter);
+            }
+            capabilities = Arc::new(hooked);
+        }
         capabilities
             .visible_capabilities(VisibleCapabilityRequest)
             .await
@@ -411,7 +812,28 @@ where
         if let Some(safety_context) = self.safety_context.clone() {
             prompt_port = prompt_port.with_safety_context(safety_context);
         }
-        let prompt: Arc<dyn LoopPromptPort> = Arc::new(prompt_port);
+        let mut prompt: Arc<dyn LoopPromptPort> = Arc::new(prompt_port);
+        if let Some(dispatcher) = per_build_dispatcher.as_ref() {
+            // Pass a sink backed by the host's instruction materialization
+            // store so hook-emitted `msg:hook.*` refs are resolvable by the
+            // downstream model resolver. Without this the resolver fails
+            // the request with `model message reference is unavailable`
+            // (henrypark133 review Critical #1).
+            let sink: Arc<dyn HookPromptMaterializationSink> =
+                Arc::new(InstructionStoreBackedHookSink {
+                    store: Arc::clone(&instruction_materialization_store),
+                    run_context: run_context.clone(),
+                });
+            prompt = Arc::new(
+                HookedLoopPromptPort::new(
+                    Arc::clone(&prompt),
+                    Arc::clone(dispatcher),
+                    run_context.scope.tenant_id.clone(),
+                )
+                .with_materialization_sink(sink)
+                .with_bundle_authority(prompt_authority.clone(), run_context.clone()),
+            );
+        }
         let input: Arc<dyn LoopInputPort> = match self.input_queue.as_ref() {
             Some(queue) => Arc::new(HostQueueLoopInputPort::new(
                 queue.clone(),
@@ -434,26 +856,44 @@ where
                 prompt_authority,
             },
         ));
-        let model: Arc<dyn LoopModelPort> = Arc::new(HostManagedLoopModelPort::with_guards(
+        let mut model: Arc<dyn LoopModelPort> = Arc::new(HostManagedLoopModelPort::with_guards(
             run_context.clone(),
             model_gateway,
             Arc::clone(&self.milestone_sink),
             Arc::clone(&self.model_accountant),
             Arc::clone(&self.model_policy_guard),
         ));
-        let checkpoint: Arc<dyn LoopCheckpointPort> = Arc::new(HostManagedLoopCheckpointPort::new(
-            run_context.clone(),
-            Arc::clone(&self.checkpoint_state_store),
-            Arc::clone(&self.loop_checkpoint_store),
-            Arc::clone(&self.milestone_sink),
-        ));
-        let transcript: Arc<dyn LoopTranscriptPort> =
+        let mut checkpoint: Arc<dyn LoopCheckpointPort> =
+            Arc::new(HostManagedLoopCheckpointPort::new(
+                run_context.clone(),
+                Arc::clone(&self.checkpoint_state_store),
+                Arc::clone(&self.loop_checkpoint_store),
+                Arc::clone(&self.milestone_sink),
+            ));
+        let mut transcript: Arc<dyn LoopTranscriptPort> =
             Arc::new(ThreadBackedLoopTranscriptPort::with_milestone_sink(
                 Arc::clone(&self.thread_service),
                 self.thread_scope.clone(),
                 run_context.clone(),
                 Arc::clone(&self.milestone_sink),
             ));
+        if let Some(dispatcher) = per_build_dispatcher.as_ref() {
+            model = Arc::new(HookedLoopModelPort::new(
+                Arc::clone(&model),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            ));
+            transcript = Arc::new(HookedLoopTranscriptPort::new(
+                Arc::clone(&transcript),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            ));
+            checkpoint = Arc::new(HookedLoopCheckpointPort::new(
+                Arc::clone(&checkpoint),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            ));
+        }
         let progress: Arc<dyn LoopProgressPort> = Arc::new(HostManagedLoopProgressPort::new(
             run_context.clone(),
             Arc::clone(&self.milestone_sink),
@@ -1477,6 +1917,151 @@ fn turn_error_to_host_error(error: TurnError) -> AgentLoopHostError {
             AgentLoopHostErrorKind::Unavailable,
             "checkpoint state store returned unsupported turn admission status",
         ),
+    }
+}
+
+#[cfg(test)]
+mod hook_resolver_adapter_tests {
+    //! Unit coverage for [`HookCapabilityInputResolverAdapter`]. These tests
+    //! drive the adapter directly (not through the factory) so they can
+    //! exercise every error branch without standing up a full Reborn host.
+
+    use super::*;
+    use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId};
+    use ironclaw_turns::run_profile::{
+        AgentLoopHostError, AgentLoopHostErrorKind, CapabilityInputRef, CapabilityInvocation,
+        CapabilitySurfaceVersion,
+    };
+    use ironclaw_turns::{
+        InMemoryRunProfileResolver, RunProfileResolutionRequest, RunProfileResolver, TurnId,
+        TurnRunId, TurnScope,
+    };
+    use std::sync::Mutex;
+
+    fn tenant() -> TenantId {
+        TenantId::new("hook-resolver-tests").expect("tenant id literal valid")
+    }
+
+    async fn run_context() -> LoopRunContext {
+        let tenant_id = tenant();
+        let agent_id = AgentId::new("agent-hook-resolver").expect("agent id literal valid");
+        let project_id = ProjectId::new("project-hook-resolver").expect("project id literal valid");
+        let thread_id = ThreadId::new("thread-hook-resolver").expect("thread id literal valid");
+        let scope = TurnScope::new(tenant_id, Some(agent_id), Some(project_id), thread_id);
+        let resolved = InMemoryRunProfileResolver::default()
+            .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+            .await
+            .expect("interactive default run profile resolves");
+        LoopRunContext::new(scope, TurnId::new(), TurnRunId::new(), resolved)
+    }
+
+    fn invocation(input_ref: &str) -> CapabilityInvocation {
+        CapabilityInvocation {
+            surface_version: CapabilitySurfaceVersion::new("v1")
+                .expect("surface version literal valid"),
+            capability_id: CapabilityId::new("cap.test").expect("capability id literal valid"),
+            input_ref: CapabilityInputRef::new(input_ref).expect("input ref literal valid"),
+        }
+    }
+
+    /// Test double for [`LoopCapabilityInputResolver`] that returns a queued
+    /// `Result` per call; lets us cover both Ok and Err branches.
+    struct StubInputResolver {
+        responses: Mutex<Vec<Result<serde_json::Value, AgentLoopHostError>>>,
+    }
+
+    impl StubInputResolver {
+        fn new(responses: Vec<Result<serde_json::Value, AgentLoopHostError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LoopCapabilityInputResolver for StubInputResolver {
+        async fn resolve_capability_input(
+            &self,
+            _run_context: &LoopRunContext,
+            _input_ref: &CapabilityInputRef,
+        ) -> Result<serde_json::Value, AgentLoopHostError> {
+            self.responses
+                .lock()
+                .expect("stub responses mutex not poisoned")
+                .remove(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_extracts_json_body_when_inner_resolves() {
+        let inner = Arc::new(StubInputResolver::new(vec![Ok(serde_json::json!({
+            "amount": "50"
+        }))]));
+        let adapter = HookCapabilityInputResolverAdapter::new(inner, run_context().await);
+
+        let resolved = adapter.resolve(&invocation("input:cap.test")).await;
+        let value = resolved.expect("adapter returns Some when inner resolves");
+        assert_eq!(value, serde_json::json!({"amount": "50"}));
+    }
+
+    #[tokio::test]
+    async fn adapter_returns_none_when_inner_errors() {
+        let inner = Arc::new(StubInputResolver::new(vec![Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            "input ref is unknown",
+        ))]));
+        let adapter = HookCapabilityInputResolverAdapter::new(inner, run_context().await);
+
+        let resolved = adapter.resolve(&invocation("input:missing")).await;
+        assert!(
+            resolved.is_none(),
+            "adapter must fail closed when inner resolver returns an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_passes_through_non_object_json_unchanged() {
+        // The trait already returns `serde_json::Value`, so "non-JSON-shaped"
+        // input cannot reach the adapter — anything the inner returns is
+        // already typed JSON. The fail-closed case for non-JSON bodies lives
+        // in the inner resolver's implementation (it surfaces an
+        // `AgentLoopHostError` on decode failure, covered by the
+        // `returns_none_when_inner_errors` test above). This test pins down
+        // the adapter's contract for non-object inputs: it must forward them
+        // verbatim so predicate evaluators see the raw shape and decide for
+        // themselves whether to fail closed.
+        let inner = Arc::new(StubInputResolver::new(vec![Ok(serde_json::Value::String(
+            "not-an-object".to_string(),
+        ))]));
+        let adapter = HookCapabilityInputResolverAdapter::new(inner, run_context().await);
+
+        let resolved = adapter.resolve(&invocation("input:non-object")).await;
+        assert_eq!(
+            resolved,
+            Some(serde_json::Value::String("not-an-object".to_string())),
+            "adapter forwards non-object JSON verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_returns_none_when_body_exceeds_byte_budget() {
+        // Build a value whose serialized form deliberately exceeds the
+        // adapter's configured budget. The hooks crate's
+        // `SanitizedArguments::from_json` caps individual string lengths and
+        // nesting depth, but does not bound total payload bytes — this guard
+        // is the adapter's defense in depth.
+        let oversized_string = "x".repeat(2048);
+        let inner = Arc::new(StubInputResolver::new(vec![Ok(serde_json::json!({
+            "blob": oversized_string,
+        }))]));
+        let adapter = HookCapabilityInputResolverAdapter::new(inner, run_context().await)
+            .with_max_input_bytes(512);
+
+        let resolved = adapter.resolve(&invocation("input:oversized")).await;
+        assert!(
+            resolved.is_none(),
+            "adapter must refuse payloads above the configured byte budget"
+        );
     }
 }
 
