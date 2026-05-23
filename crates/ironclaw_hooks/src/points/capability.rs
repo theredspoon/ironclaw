@@ -40,6 +40,27 @@ pub struct BeforeCapabilityHookContext {
     /// `None` case conservatively: an `OwnCapabilities`-scoped Installed hook
     /// will not fire when the provider is unknown.
     pub provider: Option<ExtensionId>,
+    /// Stable per-invocation identity used by predicate state backends for
+    /// replay/idempotency dedup. The middleware threads this through from
+    /// the calling layer (e.g. a digest of the runtime event id or the
+    /// capability-invocation surface) so that retried/replayed invocations
+    /// produce the same id — letting the backend's `event_id`
+    /// UNIQUE-constraint short-circuit duplicate counter writes.
+    ///
+    /// When `None`, the evaluator synthesizes a per-call-unique id and
+    /// dedup degrades to "every evaluation counts" semantics — appropriate
+    /// for the in-memory backend without replay, but **not** for durable
+    /// backends. Durable callers MUST supply a value.
+    ///
+    /// Visibility is `pub(crate)` (henrypark133 MED on PR #3635 5-19
+    /// review): external callers must go through
+    /// [`Self::with_caller_event_id`] so the typed
+    /// [`crate::predicate_state::PredicateEventId`] boundary is the only
+    /// entry point. The previous `pub` field allowed bypassing the
+    /// setter to assign a value the validated constructor would have
+    /// rejected (e.g. via `new_unchecked`, before that constructor was
+    /// also restricted).
+    pub(crate) caller_event_id: Option<crate::predicate_state::PredicateEventId>,
 }
 
 impl BeforeCapabilityHookContext {
@@ -58,6 +79,7 @@ impl BeforeCapabilityHookContext {
             arguments_digest,
             arguments,
             provider,
+            caller_event_id: None,
         }
     }
 
@@ -76,6 +98,26 @@ impl BeforeCapabilityHookContext {
             SanitizedArguments::unresolved(),
             None,
         )
+    }
+
+    /// Builder-style setter for the stable per-invocation event id used by
+    /// predicate-state replay dedup. See [`Self::caller_event_id`].
+    ///
+    /// The non-empty / NUL-free invariant is enforced at the
+    /// [`crate::predicate_state::PredicateEventId::new`] type boundary —
+    /// any caller bypassing this setter to assign the public field
+    /// directly would still need to construct a `PredicateEventId`,
+    /// which itself validates format (serrrfirat MEDIUM on PR #3635
+    /// 5-15 review). The previous version validated only here, which a
+    /// `Some(PredicateEventId::new_unchecked(""))` direct assignment
+    /// could trivially bypass.
+    #[must_use]
+    pub fn with_caller_event_id(
+        mut self,
+        caller_event_id: crate::predicate_state::PredicateEventId,
+    ) -> Self {
+        self.caller_event_id = Some(caller_event_id);
+        self
     }
 }
 
