@@ -1152,10 +1152,16 @@ fn reborn_product_auth_contract_stays_reborn_native() {
 
     let mut violations = Vec::new();
     collect_forbidden_uses(&auth_src, &root, &forbidden, &mut violations);
+    collect_forbidden_reborn_auth_file_uses(
+        &root.join("crates/ironclaw_reborn_composition/src/auth.rs"),
+        &root,
+        &forbidden,
+        &mut violations,
+    );
 
     assert!(
         violations.is_empty(),
-        "Reborn product auth can be behavior-compatible with v1, but implementation code paths must not mingle with v1 routes, v1 extension/secrets managers, raw provider transport, or raw secret records:\n{}",
+        "Reborn product auth can be behavior-compatible with v1, but implementation and composition code paths must not mingle with v1 routes, v1 extension/secrets managers, raw provider transport, or raw secret records:\n{}",
         violations.join("\n")
     );
 }
@@ -2251,4 +2257,65 @@ fn collect_forbidden_uses(
             }
         }
     }
+}
+
+fn collect_forbidden_reborn_auth_file_uses(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    forbidden: &[ForbiddenUse],
+    violations: &mut Vec<String>,
+) {
+    let message = format!(
+        "failed to read Reborn product-auth boundary file {}",
+        path.display()
+    );
+    let contents = std::fs::read_to_string(path).expect(&message);
+    for rule in forbidden {
+        if contents.contains(rule.pattern) {
+            violations.push(format!(
+                "{} contains forbidden product-auth implementation pattern `{}`: {}",
+                path.strip_prefix(root).unwrap_or(path).display(),
+                rule.pattern,
+                rule.reason
+            ));
+        }
+    }
+}
+
+#[test]
+fn collect_forbidden_reborn_auth_file_uses_detects_violation() {
+    let root = std::env::temp_dir().join(format!(
+        "ironclaw-reborn-auth-boundary-test-{}",
+        std::process::id()
+    ));
+    let src = root.join("crates/ironclaw_reborn_composition/src");
+    std::fs::create_dir_all(&src).expect("test source directory must be created");
+    let auth_rs = src.join("auth.rs");
+    std::fs::write(&auth_rs, "fn forbidden() { let _ = \"reqwest\"; }\n")
+        .expect("test auth.rs must be written");
+
+    let mut violations = Vec::new();
+    collect_forbidden_reborn_auth_file_uses(
+        &auth_rs,
+        &root,
+        &[ForbiddenUse {
+            pattern: "reqwest",
+            reason: "provider transport must stay outside product auth composition",
+        }],
+        &mut violations,
+    );
+
+    std::fs::remove_dir_all(&root).expect("test source directory must be removed");
+
+    assert_eq!(violations.len(), 1);
+    assert!(
+        violations[0].contains("crates/ironclaw_reborn_composition/src/auth.rs"),
+        "violation should report the relative auth.rs path: {:?}",
+        violations
+    );
+    assert!(
+        violations[0].contains("provider transport must stay outside product auth composition"),
+        "violation should report the forbidden-use reason: {:?}",
+        violations
+    );
 }
