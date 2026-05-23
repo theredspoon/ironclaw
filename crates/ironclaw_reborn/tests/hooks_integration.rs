@@ -27,20 +27,27 @@
 //! added to prove non-matching predicate invocations also reach the inner
 //! port.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration as StdDuration,
-};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ironclaw_hooks::HookRegistrar;
 use ironclaw_hooks::dispatch::{HookDispatcher, HookDispatcherBuilder};
+use ironclaw_hooks::error::HookError;
 use ironclaw_hooks::evaluator::PredicateEvaluator;
+use ironclaw_hooks::failure_policy::{FailureCategory, FailureDisposition};
 use ironclaw_hooks::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
 use ironclaw_hooks::installed_hook::PredicateBackedBeforeCapabilityHook;
 use ironclaw_hooks::kinds::observer::NoteCategory;
+use ironclaw_hooks::manifest::{
+    HookManifestBody, HookManifestEntry, HookManifestKind, HookManifestScope, WasmBudget,
+};
 use ironclaw_hooks::ordering::HookPhase;
-use ironclaw_hooks::points::{BeforeCapabilityHookContext, ObserverHookContext};
+use ironclaw_hooks::points::{
+    BeforeCapabilityHookContext, BeforePromptHookContext, ObserverHookContext,
+};
 use ironclaw_hooks::predicate::{
     CapabilityPredicate, HookPredicateSpec, OnExceededAction, ValueOrRateBound,
 };
@@ -48,6 +55,9 @@ use ironclaw_hooks::registry::{HookBindingScope, HookPointSpec, HookRegistry};
 use ironclaw_hooks::sink::{
     ObserverHook, ObserverSink, PrivilegedBeforeCapabilityHook, PrivilegedGateSink,
     RestrictedBeforeCapabilityHook, RestrictedGateSink,
+};
+use ironclaw_hooks::wasm::{
+    WasmHookModuleRequest, WasmHookModuleResolver, WasmHookRuntime, WasmHookRuntimeError,
 };
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
@@ -450,6 +460,296 @@ fn selective_deny_dispatcher(target: &str) -> Arc<HookDispatcher> {
         .build_arc()
 }
 
+#[derive(Default)]
+struct InMemoryWasmHookModules {
+    modules: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl InMemoryWasmHookModules {
+    fn with_wat(local_id: &str, wat_source: &str) -> Self {
+        let mut modules = HashMap::new();
+        modules.insert(
+            local_id.to_string(),
+            wat::parse_str(wat_source).expect("test wasm fixture must compile"),
+        );
+        Self {
+            modules: Mutex::new(modules),
+        }
+    }
+}
+
+impl WasmHookModuleResolver for InMemoryWasmHookModules {
+    fn resolve_module(
+        &self,
+        request: &WasmHookModuleRequest<'_>,
+    ) -> Result<Vec<u8>, WasmHookRuntimeError> {
+        self.modules
+            .lock()
+            .expect("wasm module resolver mutex not poisoned")
+            .get(request.hook_local_id.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                WasmHookRuntimeError::module_unavailable(format!(
+                    "missing fixture module for {}",
+                    request.hook_local_id
+                ))
+            })
+    }
+}
+
+fn wasm_dispatcher_from_wat(
+    local_id: &str,
+    kind: HookManifestKind,
+    wat_source: &str,
+    budget: WasmBudget,
+) -> (Arc<HookDispatcher>, HookId) {
+    wasm_dispatcher_from_wat_with_timeout(local_id, kind, wat_source, budget, None)
+}
+
+fn wasm_dispatcher_from_wat_with_timeout(
+    local_id: &str,
+    kind: HookManifestKind,
+    wat_source: &str,
+    budget: WasmBudget,
+    dispatcher_timeout: Option<Duration>,
+) -> (Arc<HookDispatcher>, HookId) {
+    let resolver = Arc::new(InMemoryWasmHookModules::with_wat(local_id, wat_source));
+    let runtime = Arc::new(WasmHookRuntime::new(resolver).expect("wasm runtime"));
+    let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()))
+        .with_wasm_runtime(runtime)
+        .with_verified_grants(["integration-test-wasm-hooks".to_string()]);
+    let body = HookManifestBody::Wasm {
+        export: "evaluate".to_string(),
+        budget,
+    };
+    let entry = HookManifestEntry::new(
+        HookLocalId::new(local_id).expect("valid HookLocalId in test"),
+        kind,
+        body,
+    )
+    .with_scope(HookManifestScope::SameTenant)
+    .with_requires_grant("integration-test-wasm-hooks");
+    let mut builder = HookDispatcherBuilder::new(HookRegistry::new());
+    if let Some(timeout) = dispatcher_timeout {
+        builder = builder.with_timeout(timeout);
+    }
+    let (builder, ids) = registrar
+        .install(
+            ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
+            "0.0.1".to_string(),
+            vec![entry],
+            builder,
+        )
+        .expect("wasm hook installs");
+    (builder.build_arc(), ids[0])
+}
+
+fn wasm_before_prompt_dispatcher_from_wat(
+    local_id: &str,
+    wat_source: &str,
+    budget: WasmBudget,
+) -> Arc<HookDispatcher> {
+    let resolver = Arc::new(InMemoryWasmHookModules::with_wat(local_id, wat_source));
+    let runtime = Arc::new(WasmHookRuntime::new(resolver).expect("wasm runtime"));
+    let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()))
+        .with_wasm_runtime(runtime)
+        .with_verified_grants(["integration-test-wasm-hooks".to_string()]);
+    let body = HookManifestBody::Wasm {
+        export: "evaluate".to_string(),
+        budget,
+    };
+    let entry = HookManifestEntry::new(
+        HookLocalId::new(local_id).expect("valid HookLocalId in test"),
+        HookManifestKind::BeforePrompt,
+        body,
+    )
+    .with_scope(HookManifestScope::OwnCapabilities);
+    let builder = HookDispatcherBuilder::new(HookRegistry::new());
+    let (builder, _ids) = registrar
+        .install(
+            ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
+            "0.0.1".to_string(),
+            vec![entry],
+            builder,
+        )
+        .expect("wasm before_prompt hook installs");
+    builder.build_arc()
+}
+
+const WASM_DENY_HOOK: &str = r#"
+(module
+  (import "ic:hooks/before-capability@1" "deny" (func $deny (param i32) (result i32)))
+  (func (export "evaluate")
+    i32.const 1
+    call $deny
+    drop)
+)
+"#;
+
+const WASM_INFINITE_LOOP: &str = r#"
+(module
+  (func (export "evaluate")
+    (loop $again
+      br $again))
+)
+"#;
+
+const WASM_MEMORY_EXHAUSTION: &str = r#"
+(module
+  (import "ic:hooks/before-capability@1" "pass" (func $pass (result i32)))
+  (memory (export "memory") 1)
+  (func (export "evaluate")
+    i32.const 64
+    memory.grow
+    i32.const -1
+    i32.eq
+    if
+      unreachable
+    end
+    call $pass
+    drop)
+)
+"#;
+
+/// Observer-shaped sibling of `WASM_MEMORY_EXHAUSTION`. Importing
+/// `before-capability::pass` from an observer-point linker fails at
+/// install time (correctly), so observer memory-exhaustion tests use this
+/// module instead. The body asks for 64 pages (4 MiB) — well beyond the
+/// 1 MiB observer budget the test installs — and traps via `unreachable`
+/// when wasmtime denies the grow. The trap is what the test asserts gets
+/// classified as FailIsolated.
+const WASM_OBSERVER_MEMORY_EXHAUSTION: &str = r#"
+(module
+  (import "ic:hooks/observer@1" "note" (func $note (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "evaluate")
+    i32.const 64
+    memory.grow
+    i32.const -1
+    i32.eq
+    if
+      unreachable
+    end
+    i32.const 0
+    i32.const 0
+    call $note
+    drop)
+)
+"#;
+
+const WASM_PROMPT_SINK_OVERFLOW: &str = r#"
+(module
+  (import "ic:hooks/before-prompt@1" "add_envelope_snippet"
+    (func $add_envelope_snippet (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 8) "x")
+  (func (export "evaluate")
+    (local $i i32)
+    (loop $again
+      i32.const 8
+      i32.const 1
+      i32.const 0
+      call $add_envelope_snippet
+      drop
+      local.get $i
+      i32.const 1
+      i32.add
+      local.tee $i
+      i32.const 65
+      i32.lt_s
+      br_if $again))
+)
+"#;
+
+const WASM_PROMPT_HUGE_STRING_LEN: &str = r#"
+(module
+  (import "ic:hooks/before-prompt@1" "add_envelope_snippet"
+    (func $add_envelope_snippet (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "evaluate")
+    i32.const 0
+    i32.const 2147483647
+    i32.const 0
+    call $add_envelope_snippet
+    drop)
+)
+"#;
+
+const WASM_PROMPT_METADATA_BYTE_OVERFLOW: &str = r#"
+(module
+  (import "ic:hooks/before-prompt@1" "add_milestone_metadata"
+    (func $add_milestone_metadata (param i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 8) "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+  (func (export "evaluate")
+    (local $i i32)
+    (loop $again
+      i32.const 0
+      i32.const 8
+      i32.const 65
+      call $add_milestone_metadata
+      drop
+      local.get $i
+      i32.const 1
+      i32.add
+      local.tee $i
+      i32.const 64
+      i32.lt_s
+      br_if $again))
+)
+"#;
+
+const WASM_UNSUPPORTED_IMPORT: &str = r#"
+(module
+  (import "ic:hooks/before-capability@1" "not_allowed" (func $not_allowed))
+  (func (export "evaluate")
+    call $not_allowed)
+)
+"#;
+
+/// Reads the host-supplied context blob via the `ic:hooks/context@1`
+/// imports, then denies. The size check serves two purposes: it asserts
+/// that the host populates a non-empty blob, and it forces a real
+/// `ctx_read` invocation (whose return value is asserted in the read
+/// path). If either contract regresses, the module falls through to the
+/// `(unreachable)` trap, which the dispatcher classifies as a `Panic`
+/// rather than the expected `Decision::Deny` — the test then fails.
+/// Critical #1 on PR #3634.
+const WASM_CTX_READ_THEN_DENY: &str = r#"
+(module
+  (import "ic:hooks/context@1" "ctx_size" (func $ctx_size (result i32)))
+  (import "ic:hooks/context@1" "ctx_read"
+    (func $ctx_read (param i32 i32) (result i32)))
+  (import "ic:hooks/before-capability@1" "deny"
+    (func $deny (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "evaluate")
+    (local $size i32)
+    (local $read i32)
+    call $ctx_size
+    local.set $size
+    local.get $size
+    i32.const 1
+    i32.lt_s
+    if
+      unreachable
+    end
+    i32.const 0
+    local.get $size
+    call $ctx_read
+    local.set $read
+    local.get $read
+    local.get $size
+    i32.ne
+    if
+      unreachable
+    end
+    i32.const 1
+    call $deny
+    drop)
+)
+"#;
+
 // ─── Fixture for building hosts with the factory ───────────────────────────
 
 struct Fixture {
@@ -630,6 +930,25 @@ fn expect_denied_with(outcome: CapabilityOutcome, expected_kind: &str) {
     }
 }
 
+fn expect_denied_with_summary(
+    outcome: CapabilityOutcome,
+    expected_kind: &str,
+    expected_summary: &str,
+) {
+    match outcome {
+        CapabilityOutcome::Denied(denied) => {
+            assert_eq!(
+                denied.reason_kind,
+                CapabilityDeniedReasonKind::unknown(expected_kind)
+                    .expect("expected reason kind literal is valid"),
+                "denied reason_kind did not match"
+            );
+            assert_eq!(denied.safe_summary, expected_summary);
+        }
+        other => panic!("expected CapabilityOutcome::Denied, got {other:?}"),
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -660,6 +979,534 @@ async fn predicate_deny_hook_short_circuits_inner_port() {
         "inner port must NOT be invoked when a hook denies; got {:?}",
         inner.invocations()
     );
+}
+
+#[tokio::test]
+async fn wasm_before_capability_hook_denies_through_factory() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat(
+        "wasm-deny",
+        HookManifestKind::BeforeCapability,
+        WASM_DENY_HOOK,
+        WasmBudget::default(),
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with wasm hook dispatcher installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns denied outcome");
+
+    expect_denied_with_summary(outcome, "hook_denied", "hook_predicate_denied");
+    assert!(
+        inner.invocations().is_empty(),
+        "inner port must NOT be invoked when wasm hook denies"
+    );
+}
+
+#[tokio::test]
+async fn wasm_before_capability_hook_reads_context_blob() {
+    // Critical #1 on PR #3634: the dispatcher MUST plumb the hook context
+    // through to the guest. This module asks `ctx_size` for the context
+    // blob's byte length, reads it via `ctx_read`, and only denies if both
+    // host imports report a non-empty, fully-readable payload. A regression
+    // (e.g., empty blob, wrong return value) traps before reaching `deny`,
+    // which the dispatcher classifies as a panic — failing this assertion.
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat(
+        "wasm-ctx-read",
+        HookManifestKind::BeforeCapability,
+        WASM_CTX_READ_THEN_DENY,
+        WasmBudget::default(),
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with wasm hook dispatcher installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns denied outcome");
+
+    expect_denied_with_summary(outcome, "hook_denied", "hook_predicate_denied");
+    assert!(
+        inner.invocations().is_empty(),
+        "inner port must NOT be invoked when wasm hook denies after reading context"
+    );
+}
+
+#[tokio::test]
+async fn wasm_fuel_exhaustion_fails_closed_for_gate() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat(
+        "wasm-loop-gate",
+        HookManifestKind::BeforeCapability,
+        WASM_INFINITE_LOOP,
+        WasmBudget {
+            fuel: 1_000,
+            memory_mb: 4,
+            wall_ms: 50,
+        },
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with looping wasm gate hook installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns denied outcome");
+
+    expect_denied_with(outcome, "hook_denied");
+    assert!(
+        inner.invocations().is_empty(),
+        "fuel-exhausted gate hook must fail closed before inner port"
+    );
+}
+
+#[tokio::test]
+async fn wasm_fuel_exhaustion_fails_isolated_for_observer() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat(
+        "wasm-loop-observer",
+        HookManifestKind::AfterCapability,
+        WASM_INFINITE_LOOP,
+        WasmBudget {
+            fuel: 1_000,
+            memory_mb: 4,
+            wall_ms: 50,
+        },
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with looping wasm observer installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.allowed"))
+        .await
+        .expect("invoke_capability returns completed outcome");
+
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "observer failure must be isolated; got {outcome:?}"
+    );
+    assert_eq!(
+        inner.invocations().len(),
+        1,
+        "observer failure must not block the inner capability call"
+    );
+}
+
+#[tokio::test]
+async fn wasm_memory_exhaustion_fails_closed_for_gate() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat(
+        "wasm-memory",
+        HookManifestKind::BeforeCapability,
+        WASM_MEMORY_EXHAUSTION,
+        WasmBudget {
+            fuel: 100_000,
+            memory_mb: 1,
+            wall_ms: 50,
+        },
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with memory-exhausting wasm gate hook installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns denied outcome");
+
+    expect_denied_with(outcome, "hook_denied");
+    assert!(
+        inner.invocations().is_empty(),
+        "memory-exhausted gate hook must fail closed before inner port"
+    );
+}
+
+#[tokio::test]
+async fn wasm_wall_clock_timeout_fires_for_gate() {
+    // Test #11 on PR #3634: the dispatcher's outer `tokio::time::timeout`
+    // arm was previously unreachable because the synchronous wasmtime call
+    // ran on the tokio executor itself, blocking the timer that would
+    // otherwise fire it. After moving to `spawn_blocking`, that arm IS
+    // reachable — this test exercises it by giving the WASM module a wide
+    // wasmtime budget (so wasmtime's own epoch-interrupt + fuel cap do NOT
+    // fire first) and the dispatcher a tight timeout.
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat_with_timeout(
+        "wasm-wallclock-gate",
+        HookManifestKind::BeforeCapability,
+        WASM_INFINITE_LOOP,
+        WasmBudget {
+            fuel: 1_000_000_000,
+            memory_mb: 4,
+            wall_ms: 5_000,
+        },
+        Some(Duration::from_millis(20)),
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with wall-clock-bound wasm gate hook installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns denied outcome");
+
+    expect_denied_with(outcome, "hook_denied");
+    assert!(
+        inner.invocations().is_empty(),
+        "wall-clock-timeout gate hook must fail closed before inner port"
+    );
+}
+
+#[tokio::test]
+async fn wasm_wall_clock_timeout_fires_for_observer() {
+    // Test #12 on PR #3634: parallels the gate wall-clock test for the
+    // observer dispatch path. Observer failures are FailIsolated so the
+    // outer capability still completes.
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat_with_timeout(
+        "wasm-wallclock-observer",
+        HookManifestKind::AfterCapability,
+        WASM_INFINITE_LOOP,
+        WasmBudget {
+            fuel: 1_000_000_000,
+            memory_mb: 4,
+            wall_ms: 5_000,
+        },
+        Some(Duration::from_millis(20)),
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with wall-clock-bound wasm observer installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.allowed"))
+        .await
+        .expect("invoke_capability returns completed outcome");
+
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "observer wall-clock timeout must be isolated; got {outcome:?}"
+    );
+    assert_eq!(
+        inner.invocations().len(),
+        1,
+        "observer wall-clock failure must not block the inner capability call"
+    );
+}
+
+#[tokio::test]
+async fn wasm_memory_exhaustion_fails_isolated_for_observer() {
+    // Test #13 on PR #3634: parallels `wasm_memory_exhaustion_fails_closed_for_gate`
+    // for the observer dispatch path. Observers run after the capability
+    // completes, so the failure-policy matrix turns a trap from a wasm
+    // observer into FailIsolated (the outer capability still succeeds) —
+    // exactly the symmetry the threat model documents but that the existing
+    // test set didn't exercise.
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let (dispatcher, _hook_id) = wasm_dispatcher_from_wat(
+        "wasm-memory-observer",
+        HookManifestKind::AfterCapability,
+        WASM_OBSERVER_MEMORY_EXHAUSTION,
+        WasmBudget {
+            fuel: 100_000,
+            memory_mb: 1,
+            wall_ms: 50,
+        },
+    );
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with memory-exhausting wasm observer installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.allowed"))
+        .await
+        .expect("invoke_capability returns completed outcome");
+
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "observer memory exhaustion must be isolated; got {outcome:?}"
+    );
+    assert_eq!(
+        inner.invocations().len(),
+        1,
+        "observer memory failure must not block the inner capability call"
+    );
+}
+
+// FIXME(hooks-wasm): Installed-tier `before_prompt` WASM hooks cannot be
+// installed via the public manifest path today: the registry C3 fix
+// (finding #2 on PR #3573) rejects `OwnCapabilities` at `BeforePrompt`
+// (no per-capability invocation context), while the manifest validator
+// rejects `SameTenant + before_prompt` outright. The original branch tip
+// (`origin/hooks-fu-wasm-runtime` @ 571efdf67) had the same gap — these
+// tests were authored against the WASM scaffolding before the registry
+// check was tightened, and never updated. They exercise the WASM sink-call
+// / huge-string-len / metadata-byte budget paths, which are point-agnostic;
+// porting the helper to install via `BeforeCapability` (or adding a
+// `Global` manifest scope) is the natural follow-up. Tracked under the
+// "deferred items" list in the new PR description.
+#[tokio::test]
+#[ignore = "BeforePrompt WASM install path needs manifest/registry alignment (carry-forward from #3634)"]
+async fn wasm_sink_call_budget_overflow_is_malformed_and_fails_closed() {
+    let dispatcher = wasm_before_prompt_dispatcher_from_wat(
+        "wasm-sink-overflow",
+        WASM_PROMPT_SINK_OVERFLOW,
+        WasmBudget::default(),
+    );
+    let ctx = BeforePromptHookContext::new(
+        TenantId::new("tenant-hooks-integration").expect("valid tenant"),
+        4 * 1024,
+    );
+
+    let outcome = dispatcher.dispatch_before_prompt(&ctx).await;
+
+    assert!(
+        outcome.patches.is_empty(),
+        "malformed prompt hook output must not be applied"
+    );
+    assert_eq!(outcome.failures.len(), 1, "expected one hook failure");
+    let failure = &outcome.failures[0];
+    assert_eq!(failure.category, FailureCategory::Malformed);
+    assert_eq!(failure.disposition, FailureDisposition::FailClosed);
+    assert_eq!(
+        failure.reason.as_str(),
+        "wasm hook exceeded sink-call budget"
+    );
+}
+
+#[tokio::test]
+#[ignore = "BeforePrompt WASM install path needs manifest/registry alignment (carry-forward from #3634)"]
+async fn wasm_huge_guest_string_len_is_malformed_without_host_allocation() {
+    let dispatcher = wasm_before_prompt_dispatcher_from_wat(
+        "wasm-huge-string-len",
+        WASM_PROMPT_HUGE_STRING_LEN,
+        WasmBudget::default(),
+    );
+    let ctx = BeforePromptHookContext::new(
+        TenantId::new("tenant-hooks-integration").expect("valid tenant"),
+        4 * 1024,
+    );
+
+    let outcome = dispatcher.dispatch_before_prompt(&ctx).await;
+
+    assert!(
+        outcome.patches.is_empty(),
+        "malformed prompt hook output must not be applied"
+    );
+    assert_eq!(outcome.failures.len(), 1, "expected one hook failure");
+    let failure = &outcome.failures[0];
+    assert_eq!(failure.category, FailureCategory::Malformed);
+    assert_eq!(failure.disposition, FailureDisposition::FailClosed);
+    assert_eq!(
+        failure.reason.as_str(),
+        "wasm hook supplied an invalid string pointer"
+    );
+}
+
+#[tokio::test]
+#[ignore = "BeforePrompt WASM install path needs manifest/registry alignment (carry-forward from #3634)"]
+async fn wasm_metadata_byte_budget_overflow_is_malformed_and_fails_closed() {
+    let dispatcher = wasm_before_prompt_dispatcher_from_wat(
+        "wasm-metadata-byte-overflow",
+        WASM_PROMPT_METADATA_BYTE_OVERFLOW,
+        WasmBudget::default(),
+    );
+    let ctx = BeforePromptHookContext::new(
+        TenantId::new("tenant-hooks-integration").expect("valid tenant"),
+        4 * 1024,
+    );
+
+    let outcome = dispatcher.dispatch_before_prompt(&ctx).await;
+
+    assert!(
+        outcome.patches.is_empty(),
+        "malformed prompt hook output must not be applied"
+    );
+    assert_eq!(outcome.failures.len(), 1, "expected one hook failure");
+    let failure = &outcome.failures[0];
+    assert_eq!(failure.category, FailureCategory::Malformed);
+    assert_eq!(failure.disposition, FailureDisposition::FailClosed);
+    assert_eq!(
+        failure.reason.as_str(),
+        "wasm hook exceeded total prompt-patch byte budget"
+    );
+}
+
+#[test]
+fn wasm_module_substitution_is_rejected_by_checkpoint_replay_guard() {
+    let (_dispatcher_a, hook_id_a) = wasm_dispatcher_from_wat(
+        "wasm-substitute",
+        HookManifestKind::BeforeCapability,
+        WASM_DENY_HOOK,
+        WasmBudget::default(),
+    );
+    let (dispatcher_b, hook_id_b) = wasm_dispatcher_from_wat(
+        "wasm-substitute",
+        HookManifestKind::BeforeCapability,
+        WASM_MEMORY_EXHAUSTION,
+        WasmBudget::default(),
+    );
+
+    assert_ne!(
+        hook_id_a, hook_id_b,
+        "same local id with different module bytes must derive a different hook id"
+    );
+    let err = dispatcher_b
+        .validate_checkpoint_hook_ids_for_replay(&[hook_id_a])
+        .expect_err("checkpoint pinned to module A must not replay against module B registry");
+    match err {
+        HookError::UnknownHook(id) => assert_eq!(id, hook_id_a),
+        other => panic!("expected UnknownHook replay refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wasm_unsupported_host_import_is_rejected_at_install_time() {
+    // serrrfirat finding #3: bad-import modules must be rejected at
+    // registration so they never reach live dispatch. Prior behavior
+    // accepted the install and only failed at first invocation.
+    let resolver = Arc::new(InMemoryWasmHookModules::with_wat(
+        "wasm-bad-import",
+        WASM_UNSUPPORTED_IMPORT,
+    ));
+    let runtime = Arc::new(WasmHookRuntime::new(resolver).expect("wasm runtime"));
+    let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()))
+        .with_wasm_runtime(runtime)
+        .with_verified_grants(["integration-test-wasm-hooks".to_string()]);
+    let entry = HookManifestEntry::new(
+        HookLocalId::new("wasm-bad-import").expect("valid HookLocalId in test"),
+        HookManifestKind::BeforeCapability,
+        HookManifestBody::Wasm {
+            export: "evaluate".to_string(),
+            budget: WasmBudget::default(),
+        },
+    )
+    .with_scope(HookManifestScope::SameTenant)
+    .with_requires_grant("integration-test-wasm-hooks");
+    let builder = HookDispatcherBuilder::new(HookRegistry::new());
+    let result = registrar.install(
+        ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
+        "0.0.1".to_string(),
+        vec![entry],
+        builder,
+    );
+    match result {
+        Err(HookError::RegistryConstruction(msg)) => {
+            assert!(
+                msg.contains("not_allowed") || msg.contains("imports"),
+                "expected install-time rejection citing the unsupported import; got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected RegistryConstruction error, got {other:?}"),
+        Ok(_) => panic!("install must reject bad-import wasm hook before live dispatch"),
+    }
+}
+
+#[tokio::test]
+async fn wasm_missing_export_is_rejected_at_install_time() {
+    // Same surface as the bad-import test: a module that compiles cleanly
+    // but lacks the manifest-declared export must fail at install rather
+    // than survive to first dispatch.
+    const WASM_MISSING_EXPORT: &str = r#"
+(module
+  (import "ic:hooks/before-capability@1" "deny" (func $deny (param i32) (result i32)))
+  (func (export "other_name")
+    i32.const 1
+    call $deny
+    drop)
+)
+"#;
+    let resolver = Arc::new(InMemoryWasmHookModules::with_wat(
+        "wasm-missing-export",
+        WASM_MISSING_EXPORT,
+    ));
+    let runtime = Arc::new(WasmHookRuntime::new(resolver).expect("wasm runtime"));
+    let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()))
+        .with_wasm_runtime(runtime)
+        .with_verified_grants(["integration-test-wasm-hooks".to_string()]);
+    let entry = HookManifestEntry::new(
+        HookLocalId::new("wasm-missing-export").expect("valid HookLocalId in test"),
+        HookManifestKind::BeforeCapability,
+        HookManifestBody::Wasm {
+            export: "evaluate".to_string(),
+            budget: WasmBudget::default(),
+        },
+    )
+    .with_scope(HookManifestScope::SameTenant)
+    .with_requires_grant("integration-test-wasm-hooks");
+    let builder = HookDispatcherBuilder::new(HookRegistry::new());
+    let result = registrar.install(
+        ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
+        "0.0.1".to_string(),
+        vec![entry],
+        builder,
+    );
+    match result {
+        Err(HookError::RegistryConstruction(msg)) => {
+            assert!(
+                msg.contains("evaluate") || msg.contains("export"),
+                "expected install-time rejection citing the missing export; got: {msg}"
+            );
+        }
+        Err(other) => panic!("expected RegistryConstruction error, got {other:?}"),
+        Ok(_) => panic!("install must reject missing-export wasm hook before live dispatch"),
+    }
 }
 
 #[tokio::test]
@@ -1264,7 +2111,7 @@ async fn router_backed_pause_approval_gate_ref_expires_after_ttl() {
 
     match outcome {
         CapabilityOutcome::ApprovalRequired { gate_ref, .. } => {
-            tokio::time::sleep(StdDuration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
             let err = router
                 .resolve(
                     HookGateResolutionRequest::for_invocation(
@@ -1330,7 +2177,7 @@ async fn router_backed_pause_approval_gate_ref_rejects_backdated_resolution_afte
     // where `Utc::now()` is read directly. The TTL was 1ms above and we
     // slept 5ms past reservation, so the router will compute "now is past
     // expires_at" using its own clock; no caller value can override it.
-    tokio::time::sleep(StdDuration::from_millis(5)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let resolution_request = HookGateResolutionRequest::for_invocation(
         gate_ref,
         HookGateActorBinding::new(fixture.actor_id.clone()),

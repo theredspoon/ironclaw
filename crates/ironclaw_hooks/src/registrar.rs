@@ -27,6 +27,10 @@ use crate::identity::{ExtensionId, HookId, HookVersion};
 use crate::installed_hook::PredicateBackedBeforeCapabilityHook;
 use crate::manifest::{HookManifestBody, HookManifestEntry, HookManifestKind, HookManifestScope};
 use crate::registry::{HookBindingScope, HookPointSpec};
+use crate::wasm::{
+    WasmBeforeCapabilityHook, WasmBeforePromptHook, WasmHookModuleRequest, WasmHookRuntime,
+    WasmObserverHook,
+};
 
 /// Maximum number of hooks a single extension may register, summed across
 /// every attach-point kind. Prevents a malicious or buggy extension from
@@ -59,6 +63,10 @@ pub struct HookRegistrar {
     /// validated only that the field was *set*, not that the host had
     /// actually issued the grant.
     verified_grants: std::collections::HashSet<String>,
+    /// Optional WASM runtime used to instantiate Installed-tier WASM hooks
+    /// declared by `HookManifestBody::Wasm`. When absent, WASM bodies are
+    /// rejected at install time with `HookError::WasmRuntimeUnavailable`.
+    wasm_runtime: Option<Arc<WasmHookRuntime>>,
 }
 
 impl HookRegistrar {
@@ -66,6 +74,7 @@ impl HookRegistrar {
         Self {
             evaluator,
             verified_grants: std::collections::HashSet::new(),
+            wasm_runtime: None,
         }
     }
 
@@ -78,6 +87,15 @@ impl HookRegistrar {
     #[must_use]
     pub fn with_verified_grants(mut self, grants: impl IntoIterator<Item = String>) -> Self {
         self.verified_grants = grants.into_iter().collect();
+        self
+    }
+
+    /// Attach a [`WasmHookRuntime`] so the registrar can instantiate
+    /// Installed-tier WASM hook bodies. Without this, `HookManifestBody::Wasm`
+    /// entries fail at install time.
+    #[must_use]
+    pub fn with_wasm_runtime(mut self, runtime: Arc<WasmHookRuntime>) -> Self {
+        self.wasm_runtime = Some(runtime);
         self
     }
 
@@ -204,17 +222,17 @@ impl HookRegistrar {
         }
 
         let hook_version = HookVersion::ONE;
-        let hook_id = HookId::derive(
-            identity_extension,
-            extension_version,
-            &entry.id,
-            hook_version,
-        );
         let binding_scope = manifest_scope_to_binding_scope(entry.scope);
 
         match entry.body {
             HookManifestBody::Predicate { spec } => match entry.kind {
                 HookManifestKind::BeforeCapability => {
+                    let hook_id = HookId::derive(
+                        identity_extension,
+                        extension_version,
+                        &entry.id,
+                        hook_version,
+                    );
                     let hook = PredicateBackedBeforeCapabilityHook::new(
                         hook_id,
                         spec,
@@ -233,25 +251,112 @@ impl HookRegistrar {
                     // the only path that knows the manifest's `priority`
                     // field, so we set it post-insert.
                     dispatcher.set_binding_priority(hook_id, entry.priority);
+                    Ok(hook_id)
                 }
-                other => {
-                    return Err(HookError::RegistryConstruction(format!(
-                        "predicate body is only supported for `before_capability` hooks; \
+                other => Err(HookError::RegistryConstruction(format!(
+                    "predicate body is only supported for `before_capability` hooks; \
                          entry `{}` declared kind {:?}",
-                        entry.id, other
-                    )));
-                }
+                    entry.id, other
+                ))),
             },
-            HookManifestBody::Wasm { .. } => {
-                return Err(HookError::RegistryConstruction(format!(
-                    "WASM hook execution is not yet implemented; entry `{}` was \
-                     rejected by the registrar",
-                    entry.id
-                )));
+            HookManifestBody::Wasm { export, budget } => {
+                let runtime = self.wasm_runtime.as_ref().ok_or_else(|| {
+                    HookError::RegistryConstruction(format!(
+                        "WASM hook runtime is not configured; entry `{}` cannot be installed",
+                        entry.id
+                    ))
+                })?;
+                let request = WasmHookModuleRequest {
+                    extension_id: owning_extension,
+                    extension_version,
+                    hook_local_id: &entry.id,
+                    kind: entry.kind,
+                    export: &export,
+                };
+                let prepared = runtime.prepare(&request, budget).map_err(|error| {
+                    HookError::RegistryConstruction(format!(
+                        "WASM hook `{}` failed to prepare: {error}",
+                        entry.id
+                    ))
+                })?;
+                let wasm_identity_version =
+                    WasmVersionMaterial::new(extension_version, &prepared.module_digest_hex())
+                        .to_string();
+                let hook_id = HookId::derive(
+                    identity_extension,
+                    &wasm_identity_version,
+                    &entry.id,
+                    hook_version,
+                );
+                let dispatcher = builder.dispatcher_mut();
+                match entry.kind {
+                    HookManifestKind::BeforeCapability => {
+                        dispatcher.install_installed_wasm_before_capability(
+                            hook_id,
+                            entry.phase,
+                            owning_extension.clone(),
+                            binding_scope,
+                            WasmBeforeCapabilityHook::new(Arc::clone(runtime), prepared),
+                        )?;
+                    }
+                    HookManifestKind::BeforePrompt => {
+                        dispatcher.install_installed_wasm_before_prompt(
+                            hook_id,
+                            entry.phase,
+                            owning_extension.clone(),
+                            binding_scope,
+                            WasmBeforePromptHook::new(Arc::clone(runtime), prepared),
+                        )?;
+                    }
+                    HookManifestKind::AfterModel
+                    | HookManifestKind::AfterCapability
+                    | HookManifestKind::AfterCheckpoint => {
+                        let point = manifest_kind_to_point(entry.kind);
+                        dispatcher.install_installed_wasm_observer(
+                            hook_id,
+                            entry.phase,
+                            point,
+                            owning_extension.clone(),
+                            binding_scope,
+                            WasmObserverHook::new(Arc::clone(runtime), prepared, point),
+                        )?;
+                    }
+                }
+                dispatcher.set_binding_priority(hook_id, entry.priority);
+                Ok(hook_id)
             }
         }
+    }
+}
 
-        Ok(hook_id)
+/// Identity material for a WASM-bodied hook. `HookId::derive` hashes a
+/// `&str` for its version material, but the registrar always composes
+/// the extension version with the compiled module digest in a fixed
+/// shape — `"{extension_version}+wasm:{module_digest_hex}"` — so the
+/// concatenated string never floats free as a stringly-typed argument
+/// (henrypark133 LOW #20 on PR #3634).
+#[derive(Debug, Clone)]
+struct WasmVersionMaterial {
+    extension_version: String,
+    module_digest_hex: String,
+}
+
+impl WasmVersionMaterial {
+    fn new(extension_version: &str, module_digest_hex: &str) -> Self {
+        Self {
+            extension_version: extension_version.to_string(),
+            module_digest_hex: module_digest_hex.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for WasmVersionMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}+wasm:{}",
+            self.extension_version, self.module_digest_hex
+        )
     }
 }
 
@@ -344,8 +449,88 @@ mod tests {
         assert!(!outcome.decision.permits());
     }
 
+    /// Registrar happy-path test for a WASM body: a valid module that
+    /// satisfies the host-import surface installs, returns a hook id, and
+    /// places exactly one active binding into the resulting registry.
+    /// Companion to the existing `install_wasm_body_requires_runtime`
+    /// negative case. Test #16 on PR #3634.
     #[test]
-    fn install_rejects_wasm_body_for_now() {
+    fn install_wasm_body_with_runtime_succeeds_and_produces_binding() {
+        use crate::wasm::{WasmHookModuleRequest, WasmHookModuleResolver, WasmHookRuntime};
+        use std::sync::Mutex as StdMutex;
+
+        const WASM_PASS: &str = r#"
+(module
+  (import "ic:hooks/before-capability@1" "pass" (func $pass (result i32)))
+  (func (export "evaluate")
+    call $pass
+    drop)
+)
+"#;
+
+        struct StaticResolver {
+            bytes: StdMutex<Vec<u8>>,
+        }
+        impl WasmHookModuleResolver for StaticResolver {
+            fn resolve_module(
+                &self,
+                _request: &WasmHookModuleRequest<'_>,
+            ) -> Result<Vec<u8>, crate::wasm::WasmHookRuntimeError> {
+                Ok(self.bytes.lock().expect("resolver lock").clone())
+            }
+        }
+
+        let bytes = wat::parse_str(WASM_PASS).expect("wat parses");
+        let resolver = Arc::new(StaticResolver {
+            bytes: StdMutex::new(bytes),
+        });
+        let runtime = Arc::new(WasmHookRuntime::new(resolver).expect("runtime"));
+        let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()))
+            .with_wasm_runtime(runtime)
+            .with_verified_grants(["installed-wasm-happy".to_string()]);
+        let entry = HookManifestEntry {
+            id: HookLocalId::new("wasm-happy").expect("valid local id"),
+            kind: HookManifestKind::BeforeCapability,
+            scope: HookManifestScope::SameTenant,
+            phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
+            description: None,
+            requires_grant: Some("installed-wasm-happy".to_string()),
+            body: HookManifestBody::Wasm {
+                export: "evaluate".to_string(),
+                budget: WasmBudget::default(),
+            },
+        };
+        let builder = HookDispatcherBuilder::new(HookRegistry::new());
+        let (builder, ids) = registrar
+            .install(extension(), "0.1.0".to_string(), vec![entry], builder)
+            .expect("wasm install ok");
+        assert_eq!(ids.len(), 1, "exactly one binding produced");
+        let dispatcher = builder.build_arc();
+        // Round-trip the dispatcher: the installed hook is *findable* via
+        // its hook id and the binding is not yet poisoned. This proves the
+        // registrar didn't quietly drop the binding after install-time
+        // validation.
+        assert!(
+            dispatcher
+                .registry_for_test()
+                .lock()
+                .expect("registry lock")
+                .contains_hook(ids[0]),
+            "installed wasm binding must be visible in the registry"
+        );
+        assert!(
+            !dispatcher
+                .registry_for_test()
+                .lock()
+                .expect("registry lock")
+                .is_poisoned(ids[0]),
+            "fresh install must not be poisoned"
+        );
+    }
+
+    #[test]
+    fn install_wasm_body_requires_runtime() {
         let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));
         let builder = HookDispatcherBuilder::new(HookRegistry::new());
         let entry = HookManifestEntry {
@@ -363,10 +548,13 @@ mod tests {
         };
         let err = registrar
             .install(extension(), "0.1.0".to_string(), vec![entry], builder)
-            .expect_err("wasm body must be rejected");
+            .expect_err("wasm body needs a configured runtime");
         match err {
             HookError::RegistryConstruction(msg) => {
-                assert!(msg.contains("WASM"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("WASM hook runtime is not configured"),
+                    "unexpected message: {msg}"
+                );
             }
             other => panic!("expected RegistryConstruction, got {other:?}"),
         }
