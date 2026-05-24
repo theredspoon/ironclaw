@@ -578,6 +578,7 @@ pub(super) fn calls_response() -> LoopModelResponse {
             surface_version: surface_version(),
             capability_id: capability_id(),
             input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+            effective_capability_ids: vec![capability_id()],
             provider_replay: None,
         }]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
@@ -592,12 +593,14 @@ pub(super) fn two_calls_response() -> LoopModelResponse {
                 surface_version: surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:first").expect("valid"), // safety: test-only fixture
+                effective_capability_ids: vec![capability_id()],
                 provider_replay: None,
             },
             CapabilityCallCandidate {
                 surface_version: surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:second").expect("valid"), // safety: test-only fixture
+                effective_capability_ids: vec![capability_id()],
                 provider_replay: None,
             },
         ]),
@@ -612,6 +615,7 @@ pub(super) fn provider_calls_response() -> LoopModelResponse {
             surface_version: surface_version(),
             capability_id: capability_id(),
             input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+            effective_capability_ids: vec![capability_id()],
             provider_replay: Some(ProviderToolCallReplay {
                 provider_id: "test-provider".to_string(),
                 provider_model_id: "test-model".to_string(),
@@ -636,6 +640,7 @@ pub(super) fn provider_two_calls_response() -> LoopModelResponse {
                 surface_version: surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:first").expect("valid"),
+                effective_capability_ids: vec![capability_id()],
                 provider_replay: Some(ProviderToolCallReplay {
                     provider_id: "test-provider".to_string(),
                     provider_model_id: "test-model".to_string(),
@@ -652,6 +657,7 @@ pub(super) fn provider_two_calls_response() -> LoopModelResponse {
                 surface_version: surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:second").expect("valid"),
+                effective_capability_ids: vec![capability_id()],
                 provider_replay: Some(ProviderToolCallReplay {
                     provider_id: "test-provider".to_string(),
                     provider_model_id: "test-model".to_string(),
@@ -676,6 +682,7 @@ pub(super) fn stale_surface_calls_response() -> LoopModelResponse {
             surface_version: stale_surface_version(),
             capability_id: capability_id(),
             input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+            effective_capability_ids: vec![capability_id()],
             provider_replay: None,
         }]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
@@ -690,12 +697,14 @@ pub(super) fn mixed_surface_calls_response() -> LoopModelResponse {
                 surface_version: stale_surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:stale").expect("valid"),
+                effective_capability_ids: vec![capability_id()],
                 provider_replay: None,
             },
             CapabilityCallCandidate {
                 surface_version: surface_version(),
                 capability_id: capability_id(),
                 input_ref: CapabilityInputRef::new("input:visible").expect("valid"),
+                effective_capability_ids: vec![capability_id()],
                 provider_replay: None,
             },
         ]),

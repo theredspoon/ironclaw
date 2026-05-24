@@ -102,6 +102,19 @@ fn is_coding_capability_id(id: &str) -> bool {
 }
 
 #[tokio::test]
+async fn builtin_first_party_package_omits_prompt_doc_refs() {
+    let package = builtin_first_party_package().unwrap();
+
+    assert!(
+        package
+            .manifest
+            .capabilities
+            .iter()
+            .all(|capability| capability.prompt_doc_ref.is_none())
+    );
+}
+
+#[tokio::test]
 async fn builtin_first_party_surface_lists_allowed_tools_in_registry_order() {
     let runtime = runtime();
     let request = VisibleCapabilityRequest::new(

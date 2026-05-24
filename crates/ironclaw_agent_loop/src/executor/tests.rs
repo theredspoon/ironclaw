@@ -440,6 +440,7 @@ fn sanitize_result_ref_suffix_handles_empty_special_chars_and_truncation() {
         surface_version: surface_version(),
         capability_id: capability_id(),
         input_ref: CapabilityInputRef::new("input:demo").expect("valid"),
+        effective_capability_ids: vec![capability_id()],
         provider_replay: Some(ProviderToolCallReplay {
             provider_id: "test-provider".to_string(),
             provider_model_id: "test-model".to_string(),
