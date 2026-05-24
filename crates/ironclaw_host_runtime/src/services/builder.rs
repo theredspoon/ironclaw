@@ -22,6 +22,7 @@ use super::{
     WasmRuntimeCredentialProvider, WasmStagedRuntimeCredentials, WitToolHost, WitToolRuntimeConfig,
     build_reborn_event_stores, production_wiring_report, set_runtime_http_egress,
 };
+use crate::wasm_credentials::{HostWasmRuntimeCredentials, wasm_runtime_credentials_from_registry};
 
 impl<F, G, S, R> HostRuntimeServices<F, G, S, R>
 where
@@ -653,6 +654,20 @@ where
         self
     }
 
+    fn with_verified_manifest_wasm_runtime_credentials(
+        mut self,
+        provider: Arc<HostWasmRuntimeCredentials>,
+    ) -> Self {
+        self.component_types.wasm_credential_provider =
+            Some(ProductionComponentType::of::<HostWasmRuntimeCredentials>());
+        self.component_types.wasm_credential_provider_verified = !provider.credentials().is_empty();
+        let provider: Arc<dyn WasmRuntimeCredentialProvider> = provider;
+        self.wasm_credential_provider = Some(provider);
+        self.component_types
+            .wasm_runtime_credential_provider_captured = self.wasm_runtime.is_none();
+        self
+    }
+
     /// Builds and attaches production-shaped host HTTP egress using this
     /// service graph's private network-policy, secret-injection, and secret-store
     /// handles. Callers provide concrete network transport, but never receive the
@@ -712,10 +727,16 @@ where
     }
 
     pub fn try_with_wasm_runtime(
-        self,
+        mut self,
         config: WitToolRuntimeConfig,
         host: WitToolHost,
     ) -> Result<Self, WasmError> {
+        if self.wasm_credential_provider.is_none() {
+            let credentials = wasm_runtime_credentials_from_registry(&self.registry);
+            if !credentials.credentials().is_empty() {
+                self = self.with_verified_manifest_wasm_runtime_credentials(Arc::new(credentials));
+            }
+        }
         let adapter = Arc::new(WasmRuntimeAdapter::try_new(
             config,
             host,

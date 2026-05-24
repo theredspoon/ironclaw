@@ -525,6 +525,7 @@ fn test_descriptor(runtime: RuntimeKind, effects: Vec<EffectKind>) -> Capability
         parameters_schema: serde_json::Value::Null,
         effects,
         default_permission: PermissionMode::Allow,
+        runtime_credentials: Vec::new(),
         resource_profile: None,
     }
 }
