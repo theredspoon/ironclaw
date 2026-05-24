@@ -33,7 +33,8 @@ use ironclaw_host_api::{
     ExtensionId, GrantConstraints, HostPath, MountAlias, MountGrant, MountPermissions, MountView,
     NetworkPolicy, NetworkScheme, NetworkTargetPattern, PackageId, Principal, ProjectId,
     ResourceScope, RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressRequest,
-    RuntimeHttpEgressResponse, RuntimeKind, TenantId, ThreadId, TrustClass, UserId, VirtualPath,
+    RuntimeHttpEgressResponse, RuntimeKind, SecretHandle, TenantId, ThreadId, TrustClass, UserId,
+    VirtualPath,
 };
 use ironclaw_host_runtime::{
     APPLY_PATCH_CAPABILITY_ID, BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy,
@@ -102,6 +103,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     config::WaitConfig,
     filesystem::local_filesystem,
+    github as github_support,
     model_replay::RebornTraceReplayModelGateway,
     product_workflow::{RebornProductWorkflowHarness, resource_scope},
     session_thread::RebornThreadHarness,
@@ -456,6 +458,20 @@ impl RebornBinaryE2EHarness {
             HostRuntimeCapabilityHarness::core_builtin_tools_with_network_policy(network_policy)
                 .await?,
         );
+        Self::with_model_gateway_capability_mode(
+            conversation_id,
+            model_gateway,
+            HarnessCapabilityMode::HostRuntime(host_runtime),
+            false,
+        )
+        .await
+    }
+
+    pub async fn with_host_runtime_github_issue_capabilities(
+        conversation_id: &str,
+        model_gateway: RebornTraceReplayModelGateway,
+    ) -> HarnessResult<Self> {
+        let host_runtime = Arc::new(HostRuntimeCapabilityHarness::github_issue_tools().await?);
         Self::with_model_gateway_capability_mode(
             conversation_id,
             model_gateway,
@@ -1256,6 +1272,8 @@ struct HostRuntimeCapabilityHarness {
     capability_ids: Vec<CapabilityId>,
     effect_kinds: Vec<EffectKind>,
     network_policy: NetworkPolicy,
+    secrets: Vec<SecretHandle>,
+    provider_id: ExtensionId,
     user_id: UserId,
     invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
     results: Arc<Mutex<Vec<RecordedCapabilityResult>>>,
@@ -1270,6 +1288,8 @@ impl HostRuntimeCapabilityHarness {
                 CapabilityId::new(READ_FILE_CAPABILITY_ID)?,
             ],
             vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+            Vec::new(),
+            ExtensionId::new(BUILTIN_FIRST_PARTY_PROVIDER)?,
             UserId::new("reborn-e2e-builtin-user")?,
         )
         .await
@@ -1280,6 +1300,8 @@ impl HostRuntimeCapabilityHarness {
             "reborn-e2e-write-only",
             vec![CapabilityId::new(WRITE_FILE_CAPABILITY_ID)?],
             vec![EffectKind::WriteFilesystem],
+            Vec::new(),
+            ExtensionId::new(BUILTIN_FIRST_PARTY_PROVIDER)?,
             UserId::new("reborn-e2e-write-only-user")?,
         )
         .await
@@ -1294,6 +1316,8 @@ impl HostRuntimeCapabilityHarness {
                 CapabilityId::new(GREP_CAPABILITY_ID)?,
             ],
             vec![EffectKind::ReadFilesystem],
+            Vec::new(),
+            ExtensionId::new(BUILTIN_FIRST_PARTY_PROVIDER)?,
             UserId::new("reborn-e2e-coding-read-user")?,
         )
         .await
@@ -1303,6 +1327,8 @@ impl HostRuntimeCapabilityHarness {
         service_label: &'static str,
         capability_ids: Vec<CapabilityId>,
         effect_kinds: Vec<EffectKind>,
+        secrets: Vec<SecretHandle>,
+        provider_id: ExtensionId,
         user_id: UserId,
     ) -> HarnessResult<Self> {
         let root = Arc::new(tempfile::tempdir()?);
@@ -1324,6 +1350,8 @@ impl HostRuntimeCapabilityHarness {
             capability_ids,
             effect_kinds,
             network_policy: NetworkPolicy::default(),
+            secrets,
+            provider_id,
             user_id,
             invocations: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
@@ -1368,7 +1396,39 @@ impl HostRuntimeCapabilityHarness {
                 EffectKind::Network,
             ],
             network_policy,
+            secrets: Vec::new(),
+            provider_id: ExtensionId::new(BUILTIN_FIRST_PARTY_PROVIDER)?,
             user_id: UserId::new("reborn-e2e-core-builtins-user")?,
+            invocations: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    async fn github_issue_tools() -> HarnessResult<Self> {
+        let root = Arc::new(tempfile::tempdir()?);
+        let storage_root = root.path().join("local-dev");
+        let workspace_root = storage_root.join("workspace");
+        std::fs::create_dir_all(&workspace_root)?;
+        let runtime = local_dev_host_runtime_with_registry_and_http_egress(
+            storage_root.clone(),
+            github_support::extension_registry()?,
+            Arc::new(RecordingRuntimeHttpEgress::with_body(
+                github_support::search_response_body(),
+            )),
+        )?;
+        let mounts = workspace_mounts(MountPermissions::read_write_list_delete())?;
+        Ok(Self {
+            runtime,
+            io: Arc::new(ProductLiveCapabilityIo::default()),
+            root,
+            workspace_root,
+            mounts,
+            capability_ids: github_support::issue_capability_ids()?,
+            effect_kinds: github_support::issue_effect_kinds(),
+            network_policy: github_support::api_policy(),
+            secrets: github_support::secret_handles()?,
+            provider_id: github_support::provider_id()?,
+            user_id: UserId::new("reborn-e2e-github-user")?,
             invocations: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
         })
@@ -1422,9 +1482,10 @@ impl LoopCapabilityPortFactory for HostRuntimeHarnessCapabilityPortFactory {
             self.harness.effect_kinds.clone(),
             self.harness.mounts.clone(),
             self.harness.network_policy.clone(),
+            self.harness.secrets.clone(),
         ))
         .with_provider_trust_for_effects(
-            ExtensionId::new(BUILTIN_FIRST_PARTY_PROVIDER).map_err(host_runtime_harness_error)?,
+            self.harness.provider_id.clone(),
             EffectiveTrustClass::user_trusted(),
             self.harness.effect_kinds.clone(),
         );
@@ -1508,14 +1569,21 @@ fn local_dev_host_runtime_with_http_egress(
     storage_root: PathBuf,
     egress: Arc<RecordingRuntimeHttpEgress>,
 ) -> HarnessResult<Arc<dyn HostRuntime>> {
+    let mut registry = ExtensionRegistry::new();
+    registry.insert(builtin_first_party_package()?)?;
+    local_dev_host_runtime_with_registry_and_http_egress(storage_root, registry, egress)
+}
+
+fn local_dev_host_runtime_with_registry_and_http_egress(
+    storage_root: PathBuf,
+    registry: ExtensionRegistry,
+    egress: Arc<RecordingRuntimeHttpEgress>,
+) -> HarnessResult<Arc<dyn HostRuntime>> {
     let mut filesystem = LocalFilesystem::new();
     filesystem.mount_local(
         VirtualPath::new("/projects")?,
         HostPath::from_path_buf(storage_root),
     )?;
-
-    let mut registry = ExtensionRegistry::new();
-    registry.insert(builtin_first_party_package()?)?;
 
     let services = HostRuntimeServices::new(
         Arc::new(registry),
@@ -1628,6 +1696,7 @@ fn capability_grants(
     allowed_effects: Vec<EffectKind>,
     mounts: MountView,
     network: NetworkPolicy,
+    secrets: Vec<SecretHandle>,
 ) -> CapabilitySet {
     CapabilitySet {
         grants: capabilities
@@ -1641,7 +1710,7 @@ fn capability_grants(
                     allowed_effects: allowed_effects.clone(),
                     mounts: mounts.clone(),
                     network: network.clone(),
-                    secrets: Vec::new(),
+                    secrets: secrets.clone(),
                     resource_ceiling: None,
                     expires_at: None,
                     max_invocations: None,
