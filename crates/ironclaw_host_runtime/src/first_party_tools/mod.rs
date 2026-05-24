@@ -8,6 +8,7 @@
 mod echo;
 mod http;
 mod json;
+mod schemas;
 mod shell;
 mod skill_management;
 mod time;
@@ -32,6 +33,8 @@ use crate::{
     FirstPartyCapabilityError, FirstPartyCapabilityHandler, FirstPartyCapabilityRegistry,
     FirstPartyCapabilityRequest, FirstPartyCapabilityResult,
 };
+
+pub(crate) use self::schemas::resolve_builtin_input_schema_ref;
 
 pub use echo::ECHO_CAPABILITY_ID;
 pub use http::HTTP_CAPABILITY_ID;
