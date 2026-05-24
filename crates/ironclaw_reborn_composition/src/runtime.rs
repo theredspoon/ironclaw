@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use ironclaw_events::{DurableEventLog, InMemoryDurableEventLog, RuntimeEvent};
 use ironclaw_filesystem::LocalFilesystem;
-use ironclaw_first_party_extensions::{
+use ironclaw_first_party_extension_ports::{
     FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, SelectableSkillContextSource,
     SkillActivationSelectorConfig, SkillExecutionAdapter,
 };
