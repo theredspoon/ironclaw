@@ -11,17 +11,19 @@ use super::{
     DurableEventLog, DurableEventSink, EffectiveRuntimePolicy, EventSink,
     FilesystemApprovalRequestStore, FilesystemResourceGovernorStore, FilesystemRunStateStore,
     FilesystemTurnStateStore, FirstPartyCapabilityRegistry, HostRuntimeServices, McpExecutor,
-    NetworkHttpEgress, PersistentResourceGovernor, ProcessObligationLifecycleStore,
-    ProcessResultStore, ProcessStore, ProductionComponentType, ProductionImplementationReadiness,
-    ProductionWiringComponent, ProductionWiringIssueKind, ProductionWiringReport,
-    RebornEventStoreConfig, RebornEventStoreError, RebornEventStores, RebornProfile,
-    ResourceGovernor, RootFilesystem, RunProfileResolver, RunStateApprovalStore, RunStateStore,
-    RuntimeBackendHealth, RuntimeHttpEgress, RuntimeProcessPort, ScopedFilesystem, ScriptExecutor,
-    SecretStore, SharedSecretStore, TenantSandboxProcessPort, TrustPolicy, TurnRunTransitionPort,
-    TurnRunWakeNotifier, TurnStateStore, WasmError, WasmRuntimeAdapter,
-    WasmRuntimeCredentialProvider, WasmStagedRuntimeCredentials, WitToolHost, WitToolRuntimeConfig,
-    build_reborn_event_stores, production_wiring_report, set_runtime_http_egress,
+    NetworkHttpEgress, PersistentResourceGovernor, ProcessBackendKind,
+    ProcessObligationLifecycleStore, ProcessResultStore, ProcessStore, ProductionComponentType,
+    ProductionImplementationReadiness, ProductionWiringComponent, ProductionWiringIssueKind,
+    ProductionWiringReport, RebornEventStoreConfig, RebornEventStoreError, RebornEventStores,
+    RebornProfile, ResourceGovernor, RootFilesystem, RunProfileResolver, RunStateApprovalStore,
+    RunStateStore, RuntimeBackendHealth, RuntimeHttpEgress, RuntimeProcessPort, ScopedFilesystem,
+    ScriptExecutor, SecretMode, SecretStore, SharedSecretStore, TenantSandboxProcessPort,
+    TrustPolicy, TurnRunTransitionPort, TurnRunWakeNotifier, TurnStateStore, WasmError,
+    WasmRuntimeAdapter, WasmRuntimeCredentialProvider, WasmStagedRuntimeCredentials, WitToolHost,
+    WitToolRuntimeConfig, build_reborn_event_stores, production_wiring_report,
+    set_runtime_http_egress,
 };
+use crate::LocalHostProcessPort;
 use crate::wasm_credentials::{HostWasmRuntimeCredentials, wasm_runtime_credentials_from_registry};
 
 impl<F, G, S, R> HostRuntimeServices<F, G, S, R>
@@ -57,6 +59,7 @@ where
             process_lifecycle_store,
             runtime_http_egress,
             process_port,
+            managed_process_port,
             tenant_sandbox_process_port,
             wasm_credential_provider,
             runtime_health,
@@ -93,6 +96,7 @@ where
             process_lifecycle_store,
             runtime_http_egress,
             process_port,
+            managed_process_port,
             tenant_sandbox_process_port,
             wasm_credential_provider,
             runtime_health,
@@ -150,6 +154,7 @@ where
             process_lifecycle_store: _,
             runtime_http_egress,
             process_port,
+            managed_process_port,
             tenant_sandbox_process_port,
             wasm_credential_provider,
             runtime_health,
@@ -196,6 +201,7 @@ where
             process_lifecycle_store,
             runtime_http_egress,
             process_port,
+            managed_process_port,
             tenant_sandbox_process_port,
             wasm_credential_provider,
             runtime_health,
@@ -566,6 +572,7 @@ where
     {
         self.component_types.runtime_process_port = ProductionComponentType::of::<T>();
         self.process_port = process_port;
+        self.managed_process_port = false;
         self
     }
 
@@ -578,6 +585,7 @@ where
             ProductionImplementationReadiness::UnverifiedProductionImplementation,
         );
         self.process_port = process_port;
+        self.managed_process_port = false;
         self
     }
 
@@ -623,8 +631,29 @@ where
     }
 
     pub fn with_runtime_policy(mut self, policy: EffectiveRuntimePolicy) -> Self {
+        self.apply_local_process_policy(&policy);
         self.runtime_policy = Some(policy);
         self
+    }
+
+    fn apply_local_process_policy(&mut self, policy: &EffectiveRuntimePolicy) {
+        if !self.managed_process_port {
+            return;
+        }
+        if !matches!(policy.process_backend, ProcessBackendKind::LocalHost) {
+            return;
+        }
+        self.component_types.runtime_process_port =
+            ProductionComponentType::of::<LocalHostProcessPort>();
+        self.process_port = if matches!(policy.secret_mode, SecretMode::InheritedEnv) {
+            tracing::warn!(
+                host_access = "full-local",
+                "runtime policy selected inherited local host process environment"
+            );
+            Arc::new(LocalHostProcessPort::new_inherited_env())
+        } else {
+            Arc::new(LocalHostProcessPort::new())
+        };
     }
 
     pub fn with_wasm_runtime_credential_provider<T>(mut self, provider: Arc<T>) -> Self

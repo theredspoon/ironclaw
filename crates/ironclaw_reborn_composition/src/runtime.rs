@@ -656,12 +656,12 @@ impl RebornRuntime {
 /// On return, the turn-runner worker is already running in the background and
 /// the returned `RebornRuntime` is ready to accept `send_user_message` calls.
 ///
-/// **Currently supported profiles:** only `RebornCompositionProfile::LocalDev`
-/// is wired end-to-end here; production profiles will follow in a later slice
-/// (they currently return their substrate-only `RebornServices` and need
-/// durable thread/checkpoint stores wired before being driven). Passing a
-/// production profile returns a "not yet wired" error rather than partially
-/// starting an agent.
+/// **Currently supported profiles:** `RebornCompositionProfile::LocalDev` and
+/// `RebornCompositionProfile::LocalDevYolo` are wired end-to-end here;
+/// production profiles will follow in a later slice (they currently return
+/// their substrate-only `RebornServices` and need durable thread/checkpoint
+/// stores wired before being driven). Passing a production profile returns a
+/// "not yet wired" error rather than partially starting an agent.
 pub async fn build_reborn_runtime(
     input: RebornRuntimeInput,
 ) -> Result<RebornRuntime, RebornRuntimeError> {
@@ -682,11 +682,14 @@ pub async fn build_reborn_runtime(
     })?;
 
     let profile = services_input.profile();
-    if !matches!(profile, RebornCompositionProfile::LocalDev) {
+    if !matches!(
+        profile,
+        RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo
+    ) {
         return Err(RebornRuntimeError::InvalidArgument {
             reason: format!(
                 "profile={profile} is not yet wired end-to-end by build_reborn_runtime; \
-                 only local-dev is supported in this slice"
+                 only local-dev and local-dev-yolo are supported in this slice"
             ),
         });
     }
