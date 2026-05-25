@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use ironclaw_host_api::{
     CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind, ExecutionContext,
-    ExtensionId, GrantConstraints, MountView, NetworkPolicy, NetworkTargetPattern, Principal,
-    RuntimeKind, TrustClass, UserId,
+    ExtensionId, GrantConstraints, InvocationId, MountView, NetworkPolicy, NetworkTargetPattern,
+    Principal, RuntimeKind, TrustClass, UserId,
 };
 use ironclaw_host_runtime::{
     APPLY_PATCH_CAPABILITY_ID, CapabilitySurfacePolicy, ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID,
@@ -36,12 +36,16 @@ use ironclaw_turns::{
     },
 };
 
-use crate::RebornServices;
 use crate::local_dev_mounts::skill_management_mount_view;
+use crate::{
+    RebornServices,
+    projection::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore},
+};
 
 pub(super) struct LocalDevCapabilityWiring {
     pub(super) capability_factory: Arc<dyn LoopCapabilityPortFactory>,
     pub(super) model_gateway: Arc<dyn HostManagedModelGateway>,
+    pub(super) display_previews: Arc<CapabilityDisplayPreviewStore>,
 }
 
 pub(super) fn capability_wiring(
@@ -55,7 +59,8 @@ pub(super) fn capability_wiring(
         .local_runtime
         .as_ref()
         .map(|runtime| runtime.workspace_mounts.clone())?;
-    let capability_io = Arc::new(LocalDevCapabilityIo::default());
+    let display_previews = Arc::new(CapabilityDisplayPreviewStore::default());
+    let capability_io = Arc::new(LocalDevCapabilityIo::new(Arc::clone(&display_previews)));
     let capability_input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
     let capability_result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
     let capability_factory: Arc<dyn LoopCapabilityPortFactory> =
@@ -74,6 +79,7 @@ pub(super) fn capability_wiring(
     Some(LocalDevCapabilityWiring {
         capability_factory,
         model_gateway,
+        display_previews,
     })
 }
 
@@ -143,13 +149,26 @@ const LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS: usize = 1024;
 const LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES: usize = 4 * 1024 * 1024;
 const MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES: usize = 480;
 
-#[derive(Default)]
 struct LocalDevCapabilityIo {
     inputs: StdMutex<StagedValueStore>,
     results: StdMutex<StagedValueStore>,
+    display_previews: Arc<CapabilityDisplayPreviewStore>,
+}
+
+impl Default for LocalDevCapabilityIo {
+    fn default() -> Self {
+        Self::new(Arc::new(CapabilityDisplayPreviewStore::default()))
+    }
 }
 
 impl LocalDevCapabilityIo {
+    fn new(display_previews: Arc<CapabilityDisplayPreviewStore>) -> Self {
+        Self {
+            inputs: StdMutex::new(StagedValueStore::default()),
+            results: StdMutex::new(StagedValueStore::default()),
+            display_previews,
+        }
+    }
     fn result_output(
         &self,
         result_ref: &str,
@@ -286,6 +305,12 @@ impl LoopCapabilityInputResolver for LocalDevCapabilityIo {
         let mut inputs = self.inputs.lock().map_err(|_| capability_io_error())?;
         inputs
             .insert_without_eviction(input_ref.as_str().to_string(), tool_call.arguments.clone())?;
+        self.display_previews.record_input(
+            &run_context.run_id.to_string(),
+            &input_ref,
+            &tool_call.name,
+            &tool_call.arguments,
+        );
         Ok(input_ref)
     }
 }
@@ -295,6 +320,8 @@ impl LoopCapabilityResultWriter for LocalDevCapabilityIo {
     async fn write_capability_result(
         &self,
         run_context: &LoopRunContext,
+        input_ref: &CapabilityInputRef,
+        invocation_id: InvocationId,
         _capability_id: &CapabilityId,
         output: serde_json::Value,
     ) -> Result<LoopResultRef, AgentLoopHostError> {
@@ -306,8 +333,19 @@ impl LoopCapabilityResultWriter for LocalDevCapabilityIo {
                         "capability result ref could not be represented",
                     )
                 })?;
+        let output_bytes = staged_value_bytes(&output)?.try_into().unwrap_or(u64::MAX);
         let mut results = self.results.lock().map_err(|_| capability_io_error())?;
-        results.insert_with_oldest_eviction(result_ref.as_str().to_string(), output)?;
+        results.insert_with_oldest_eviction(result_ref.as_str().to_string(), output.clone())?;
+        self.display_previews
+            .record_result(CapabilityDisplayPreviewResult {
+                run_id: &run_context.run_id.to_string(),
+                input_ref,
+                invocation_id,
+                capability_id: _capability_id,
+                result_ref: result_ref.as_str(),
+                output: &output,
+                output_bytes,
+            });
         Ok(result_ref)
     }
 }
