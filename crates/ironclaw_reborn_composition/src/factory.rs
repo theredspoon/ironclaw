@@ -745,6 +745,7 @@ async fn build_production_shaped(
                 turn_run_wake_notifier,
                 runtime_process_binding,
             )?;
+            let secret_master_key = resolve_secret_master_key(secret_master_key).await?;
             let context = RebornProductionBuildContext {
                 profile,
                 wiring_config,
@@ -765,6 +766,7 @@ async fn build_production_shaped(
                 turn_run_wake_notifier,
                 runtime_process_binding,
             )?;
+            let secret_master_key = resolve_secret_master_key(secret_master_key).await?;
             let context = RebornProductionBuildContext {
                 profile,
                 wiring_config,
@@ -773,6 +775,21 @@ async fn build_production_shaped(
             };
             build_postgres_production(context, pool, url, secret_master_key).await
         }
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+async fn resolve_secret_master_key(
+    explicit: Option<ironclaw_secrets::SecretMaterial>,
+) -> Result<ironclaw_secrets::SecretMaterial, RebornBuildError> {
+    if let Some(master_key) = explicit {
+        Ok(master_key)
+    } else if let Some(master_key) =
+        ironclaw_secrets::keychain::resolve_master_key_material().await?
+    {
+        Ok(master_key)
+    } else {
+        Err(RebornBuildError::MissingSecretMasterKey)
     }
 }
 

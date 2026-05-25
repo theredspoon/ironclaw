@@ -173,7 +173,6 @@ pub fn reborn_runtime_readiness_snapshot() -> RebornRuntimeReadinessSnapshot {
     }
 }
 
-#[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -369,7 +368,9 @@ where
 
 #[derive(Debug, Error)]
 pub enum RebornCompositionError {
-    #[error("reborn production composition requires explicit secret master key")]
+    #[error(
+        "reborn production composition requires a configured or keychain-resolvable secret master key"
+    )]
     MissingSecretMasterKey,
     #[error("reborn mount view construction failed: {0}")]
     Mount(#[from] ironclaw_host_api::HostApiError),
@@ -555,7 +556,18 @@ async fn build_filesystem_secret_store<F>(
 where
     F: RootFilesystem + 'static,
 {
-    let crypto = secrets_crypto(master_key)?;
+    let crypto = secrets_crypto(master_key).await?;
+    build_filesystem_secret_store_with_crypto(scoped_filesystem, crypto)
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn build_filesystem_secret_store_with_crypto<F>(
+    scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    crypto: Arc<SecretsCrypto>,
+) -> Result<Arc<SharedSecretStore>, RebornCompositionError>
+where
+    F: RootFilesystem + 'static,
+{
     let store = FilesystemSecretStore::new(scoped_filesystem, crypto);
     // The FS-stored master-key sentinel was removed alongside the tenant-aware
     // ScopedFilesystem rework — see filesystem_store.rs. Master-key
@@ -565,11 +577,26 @@ where
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-fn secrets_crypto(
+async fn secrets_crypto(
     master_key: Option<SecretMaterial>,
 ) -> Result<Arc<SecretsCrypto>, RebornCompositionError> {
-    let master_key = master_key.ok_or(RebornCompositionError::MissingSecretMasterKey)?;
+    let master_key = resolve_composition_secret_master_key(master_key).await?;
     Ok(Arc::new(SecretsCrypto::new(master_key)?))
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+async fn resolve_composition_secret_master_key(
+    explicit: Option<SecretMaterial>,
+) -> Result<SecretMaterial, RebornCompositionError> {
+    if let Some(master_key) = explicit {
+        Ok(master_key)
+    } else if let Some(master_key) =
+        ironclaw_secrets::keychain::resolve_master_key_material().await?
+    {
+        Ok(master_key)
+    } else {
+        Err(RebornCompositionError::MissingSecretMasterKey)
+    }
 }
 
 // TODO(#3571): remove this adapter when the host-runtime services builder

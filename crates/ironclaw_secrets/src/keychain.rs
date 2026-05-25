@@ -21,6 +21,8 @@ use crate::SecretError;
 
 /// Environment variable checked before the OS keychain.
 pub const SECRETS_MASTER_KEY_ENV: &str = "SECRETS_MASTER_KEY";
+const MASTER_KEY_BYTES: usize = 32;
+const MASTER_KEY_HEX_CHARS: usize = MASTER_KEY_BYTES * 2;
 
 /// Service name for keychain entries.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -45,36 +47,93 @@ pub fn generate_master_key_hex() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Resolve an existing master key and wrap it for secret-store consumers.
+pub async fn resolve_master_key_material() -> Result<Option<crate::SecretMaterial>, SecretError> {
+    Ok(resolve_master_key_hex()
+        .await?
+        .map(crate::SecretMaterial::from))
+}
+
 /// Resolve an existing master key from the environment or OS keychain.
 ///
 /// This mirrors the v1 lookup order without auto-generating new material:
 /// an explicitly set `SECRETS_MASTER_KEY` wins, otherwise the OS keychain is
 /// consulted. Empty environment values are ignored. Callers that require
 /// production durability should fail closed when this returns `None`.
-pub async fn resolve_master_key() -> Option<String> {
-    if let Some(env_key) = std::env::var(SECRETS_MASTER_KEY_ENV)
+async fn resolve_master_key_hex() -> Result<Option<String>, SecretError> {
+    let env_key = std::env::var(SECRETS_MASTER_KEY_ENV)
         .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Some(env_key);
+        .filter(|value| !value.trim().is_empty());
+    if env_key.is_some() {
+        return resolve_master_key_from_sources(env_key, Ok(None));
     }
 
-    get_master_key()
-        .await
-        .ok()
-        .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    resolve_master_key_from_sources(None, resolve_keychain_master_key().await)
 }
 
-#[cfg(test)]
-fn resolve_master_key_inner(
+fn resolve_master_key_from_sources(
     env_key: Option<String>,
-    keychain_key: Option<Vec<u8>>,
-) -> Option<String> {
-    if let Some(env_key) = env_key.filter(|value| !value.trim().is_empty()) {
-        return Some(env_key);
+    keychain_key: Result<Option<Vec<u8>>, SecretError>,
+) -> Result<Option<String>, SecretError> {
+    let env_key = env_key.filter(|value| !value.trim().is_empty());
+    if let Some(env_key) = env_key {
+        return validate_master_key_hex(&env_key).map(Some);
     }
 
-    keychain_key.map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    let keychain_key = match keychain_key {
+        Ok(keychain_key) => keychain_key,
+        Err(SecretError::NotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(keychain_key) = keychain_key {
+        validate_master_key_bytes(&keychain_key)?;
+        return Ok(Some(bytes_to_hex(&keychain_key)));
+    }
+
+    Ok(None)
+}
+
+async fn resolve_keychain_master_key() -> Result<Option<Vec<u8>>, SecretError> {
+    let keychain_key = match get_master_key().await {
+        Ok(keychain_key) => keychain_key,
+        Err(SecretError::NotFound(_)) => return Ok(None),
+        Err(_) => {
+            tracing::warn!("failed to resolve secrets master key from OS keychain");
+            return Err(SecretError::KeychainError(
+                "failed to resolve secret master key from keychain".to_string(),
+            ));
+        }
+    };
+    if let Err(error) = validate_master_key_bytes(&keychain_key) {
+        tracing::warn!(
+            actual_len = keychain_key.len(),
+            expected_len = MASTER_KEY_BYTES,
+            "resolved secrets master key from OS keychain has invalid length"
+        );
+        return Err(error);
+    }
+    Ok(Some(keychain_key))
+}
+
+fn validate_master_key_hex(hex_key: &str) -> Result<String, SecretError> {
+    if hex_key.len() != MASTER_KEY_HEX_CHARS {
+        return Err(SecretError::InvalidMasterKey);
+    }
+    let bytes = hex_to_bytes(hex_key).map_err(|_| SecretError::InvalidMasterKey)?;
+    validate_master_key_bytes(&bytes)?;
+    Ok(bytes_to_hex(&bytes))
+}
+
+fn validate_master_key_bytes(bytes: &[u8]) -> Result<(), SecretError> {
+    if bytes.len() == MASTER_KEY_BYTES {
+        Ok(())
+    } else {
+        Err(SecretError::InvalidMasterKey)
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 // ============================================================================
@@ -89,6 +148,8 @@ mod platform {
 
     use super::*;
 
+    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
     /// Store the master key in the macOS Keychain.
     pub async fn store_master_key(key: &[u8]) -> Result<(), SecretError> {
         // Convert to hex for storage (keychain prefers strings)
@@ -100,8 +161,12 @@ mod platform {
 
     /// Retrieve the master key from the macOS Keychain.
     pub async fn get_master_key() -> Result<Vec<u8>, SecretError> {
-        let password = get_generic_password(SERVICE_NAME, MASTER_KEY_ACCOUNT).map_err(|e| {
-            SecretError::KeychainError(format!("Failed to get from keychain: {}", e))
+        let password = get_generic_password(SERVICE_NAME, MASTER_KEY_ACCOUNT).map_err(|error| {
+            if error.code() == ERR_SEC_ITEM_NOT_FOUND {
+                SecretError::NotFound("master key".to_string())
+            } else {
+                SecretError::KeychainError(format!("Failed to get from keychain: {error}"))
+            }
         })?;
 
         // Parse hex string back to bytes
@@ -194,7 +259,7 @@ mod platform {
             .unlocked
             .first()
             .or(items.locked.first())
-            .ok_or_else(|| SecretError::KeychainError("Master key not found".to_string()))?;
+            .ok_or_else(|| SecretError::NotFound("master key".to_string()))?;
 
         // Unlock if needed
         if item.is_locked().await.unwrap_or(true) {
@@ -278,9 +343,7 @@ mod platform {
     }
 
     pub async fn get_master_key() -> Result<Vec<u8>, SecretError> {
-        Err(SecretError::KeychainError(
-            "Keychain not supported on this platform. Use SECRETS_MASTER_KEY env var.".to_string(),
-        ))
+        Err(SecretError::NotFound("master key".to_string()))
     }
 
     pub async fn delete_master_key() -> Result<(), SecretError> {
@@ -298,7 +361,6 @@ mod platform {
 pub use platform::{delete_master_key, get_master_key, has_master_key, store_master_key};
 
 /// Parse a hex string to bytes.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, SecretError> {
     if !hex.len().is_multiple_of(2) {
         return Err(SecretError::KeychainError(
@@ -318,6 +380,40 @@ fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, SecretError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
+    use tokio::sync::Mutex;
+
+    static SECRETS_MASTER_KEY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests serialize process-env mutation with
+            // SECRETS_MASTER_KEY_ENV_LOCK and restore the prior value on drop.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: EnvVarGuard is only constructed while
+            // SECRETS_MASTER_KEY_ENV_LOCK is held by this test module.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_generate_master_key() {
@@ -353,31 +449,98 @@ mod tests {
 
     #[test]
     fn resolve_master_key_prefers_env_key() {
-        let env = Some("env-master-key".to_string());
-        let keychain = Some(vec![0xbb; 32]);
+        let env = Some("aa".repeat(32));
+        let keychain = Ok(Some(vec![0xbb; 32]));
 
-        let resolved = resolve_master_key_inner(env, keychain).unwrap();
+        let resolved = resolve_master_key_from_sources(env, keychain)
+            .unwrap()
+            .unwrap();
 
-        assert_eq!(resolved, "env-master-key");
+        assert_eq!(resolved, "aa".repeat(32));
     }
 
     #[test]
     fn resolve_master_key_uses_keychain_when_env_is_absent() {
-        let resolved = resolve_master_key_inner(None, Some(vec![0xbb; 32])).unwrap();
+        let resolved = resolve_master_key_from_sources(None, Ok(Some(vec![0xbb; 32])))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(resolved, "bb".repeat(32));
     }
 
     #[test]
     fn resolve_master_key_ignores_blank_env_key() {
-        let resolved = resolve_master_key_inner(Some(" \t ".to_string()), Some(vec![0xab; 32]))
-            .expect("keychain key should be used");
+        let resolved =
+            resolve_master_key_from_sources(Some(" \t ".to_string()), Ok(Some(vec![0xab; 32])))
+                .expect("keychain resolver should succeed")
+                .expect("keychain key should be used");
 
         assert_eq!(resolved, "ab".repeat(32));
     }
 
     #[test]
     fn resolve_master_key_returns_none_without_env_or_keychain() {
-        assert_eq!(resolve_master_key_inner(None, None), None);
+        assert_eq!(
+            resolve_master_key_from_sources(None, Ok(None)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_master_key_returns_none_when_keychain_reports_not_found() {
+        assert_eq!(
+            resolve_master_key_from_sources(
+                None,
+                Err(SecretError::NotFound("master key".to_string()))
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_master_key_material_uses_valid_env_key() {
+        let _guard = SECRETS_MASTER_KEY_ENV_LOCK.lock().await;
+        let key = "aa".repeat(32);
+        let _env = EnvVarGuard::set(SECRETS_MASTER_KEY_ENV, &key);
+
+        let material = resolve_master_key_material()
+            .await
+            .expect("env resolver should succeed")
+            .expect("env key should resolve");
+
+        assert_eq!(material.expose_secret(), &key);
+    }
+
+    #[test]
+    fn resolve_master_key_propagates_keychain_errors() {
+        assert!(matches!(
+            resolve_master_key_from_sources(
+                None,
+                Err(SecretError::KeychainError(
+                    "backend unavailable".to_string()
+                ))
+            ),
+            Err(SecretError::KeychainError(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_master_key_rejects_non_hex_env_key() {
+        assert!(matches!(
+            resolve_master_key_from_sources(
+                Some("correct horse battery staple pad!!".to_string()),
+                Ok(None)
+            ),
+            Err(SecretError::InvalidMasterKey)
+        ));
+    }
+
+    #[test]
+    fn resolve_master_key_rejects_short_keychain_key() {
+        assert!(matches!(
+            resolve_master_key_from_sources(None, Ok(Some(vec![0xab; 31]))),
+            Err(SecretError::InvalidMasterKey)
+        ));
     }
 }
