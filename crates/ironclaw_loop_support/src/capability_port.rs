@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_host_api::{
     CapabilityId, CapabilitySet, CorrelationId, EffectKind, ExecutionContext, ExtensionId,
-    InvocationId, MountView, Principal, sha256_digest_token,
+    InvocationId, MountView, Principal, RuntimeKind, sha256_digest_token,
 };
 use ironclaw_host_runtime::{
     CapabilityFailureDisposition, HostRuntime, HostRuntimeError, IdempotencyKey,
@@ -14,14 +14,14 @@ use ironclaw_host_runtime::{
     RuntimeCapabilityRequest, RuntimeFailureKind,
 };
 use ironclaw_turns::{
-    LoopGateRef, LoopResultRef,
+    CapabilityActivityId, LoopGateRef, LoopResultRef,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityBatchInvocation,
         CapabilityBatchOutcome, CapabilityDenied, CapabilityDeniedReasonKind,
         CapabilityDescriptorView, CapabilityFailure, CapabilityFailureKind, CapabilityInputRef,
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, ConcurrencyHint,
-        LoopCapabilityPort, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopProcessRef,
-        LoopRunContext, LoopSafeSummary, ProcessHandleSummary, ProviderToolCall,
+        LoopCapabilityPort, LoopHostMilestone, LoopHostMilestoneKind, LoopHostMilestoneSink,
+        LoopProcessRef, LoopRunContext, LoopSafeSummary, ProcessHandleSummary, ProviderToolCall,
         ProviderToolCallCapabilityIds, ProviderToolCallReplay, ProviderToolDefinition,
         VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
@@ -222,6 +222,10 @@ enum DispatchRecord {
         requested_capability_id: CapabilityId,
         outcome: RuntimeCapabilityOutcome,
     },
+    TerminalMilestonePending {
+        result: Result<CapabilityOutcome, AgentLoopHostError>,
+        milestone: LoopHostMilestoneKind,
+    },
     LoopCompleted(Result<CapabilityOutcome, AgentLoopHostError>),
 }
 
@@ -250,6 +254,15 @@ impl DispatchRecordStore {
                     requested_capability_id,
                     outcome,
                 })
+            }
+            Some(DispatchRecord::TerminalMilestonePending { result, milestone }) => {
+                self.records.insert(
+                    key_value,
+                    DispatchRecord::InFlight {
+                        notify: Arc::new(Notify::new()),
+                    },
+                );
+                Ok(DispatchReservation::TerminalMilestonePending { result, milestone })
             }
             Some(DispatchRecord::LoopCompleted(result)) => {
                 Ok(DispatchReservation::LoopCompleted(result))
@@ -305,6 +318,7 @@ impl DispatchRecordStore {
                 None => {}
                 Some(DispatchRecord::InFlight { .. }) => self.insertion_order.push_back(candidate),
                 Some(DispatchRecord::RuntimeCompleted { .. })
+                | Some(DispatchRecord::TerminalMilestonePending { .. })
                 | Some(DispatchRecord::LoopCompleted(_)) => {
                     self.records.remove(&candidate);
                 }
@@ -326,6 +340,10 @@ enum DispatchReservation {
     RuntimeCompleted {
         requested_capability_id: CapabilityId,
         outcome: RuntimeCapabilityOutcome,
+    },
+    TerminalMilestonePending {
+        result: Result<CapabilityOutcome, AgentLoopHostError>,
+        milestone: LoopHostMilestoneKind,
     },
     LoopCompleted(Result<CapabilityOutcome, AgentLoopHostError>),
 }
@@ -504,6 +522,22 @@ impl HostRuntimeLoopCapabilityPort {
         Ok(())
     }
 
+    fn record_terminal_milestone_pending(
+        &self,
+        key: &IdempotencyKey,
+        result: Result<CapabilityOutcome, AgentLoopHostError>,
+        milestone: LoopHostMilestoneKind,
+    ) -> Result<(), AgentLoopHostError> {
+        let notify = lock_mut(&self.dispatch_records, "capability dispatch record store")?.record(
+            key,
+            DispatchRecord::TerminalMilestonePending { result, milestone },
+        );
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+        Ok(())
+    }
+
     fn record_loop_completed(
         &self,
         key: &IdempotencyKey,
@@ -577,6 +611,8 @@ impl HostRuntimeLoopCapabilityPort {
         &self,
         key: &IdempotencyKey,
         requested_capability_id: &CapabilityId,
+        provider: ExtensionId,
+        runtime: RuntimeKind,
         outcome: RuntimeCapabilityOutcome,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
         let result = runtime_outcome_to_loop(
@@ -589,6 +625,36 @@ impl HostRuntimeLoopCapabilityPort {
         if should_retry_result_write(&outcome, &result) {
             self.record_runtime_completed(key, requested_capability_id.clone(), outcome)?;
             return result;
+        }
+        if result.is_err() {
+            self.record_loop_completed(key, result.clone())?;
+            return result;
+        }
+        let activity_id = capability_activity_invocation_id(key);
+        let terminal_milestone =
+            match runtime_terminal_milestone(activity_id, provider, runtime, &outcome) {
+                Ok(milestone) => milestone,
+                Err(error) => {
+                    let result = Err(error);
+                    self.record_loop_completed(key, result.clone())?;
+                    return result;
+                }
+            };
+        self.complete_terminal_milestone(key, result, terminal_milestone)
+            .await
+    }
+
+    async fn complete_terminal_milestone(
+        &self,
+        key: &IdempotencyKey,
+        result: Result<CapabilityOutcome, AgentLoopHostError>,
+        terminal_milestone: Option<LoopHostMilestoneKind>,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        if let Some(milestone) = terminal_milestone
+            && let Err(error) = self.emit_capability_milestone(milestone.clone()).await
+        {
+            self.record_terminal_milestone_pending(key, result.clone(), milestone)?;
+            return Err(error);
         }
         self.record_loop_completed(key, result.clone())?;
         result
@@ -607,15 +673,19 @@ impl HostRuntimeLoopCapabilityPort {
         Ok(())
     }
 
-    async fn emit_capability_invoked(
+    async fn emit_capability_milestone(
         &self,
-        capability_id: CapabilityId,
+        kind: LoopHostMilestoneKind,
     ) -> Result<(), AgentLoopHostError> {
-        let milestones = LoopHostMilestoneEmitter::new(
-            self.run_context.clone(),
-            Arc::clone(&self.milestone_sink),
-        );
-        milestones.capability_invoked(capability_id).await
+        self.milestone_sink
+            .publish_loop_milestone(LoopHostMilestone {
+                scope: self.run_context.scope.clone(),
+                turn_id: self.run_context.turn_id,
+                run_id: self.run_context.run_id,
+                loop_driver_id: self.run_context.loop_driver_id.clone(),
+                kind,
+            })
+            .await
     }
 
     async fn invoke_synthetic_capability(
@@ -828,8 +898,30 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                     requested_capability_id,
                     outcome,
                 } => {
+                    if let SurfaceCapabilitySnapshot::Runtime(capability) = &capability {
+                        return self
+                            .finish_runtime_outcome(
+                                &idempotency_key,
+                                &requested_capability_id,
+                                capability.provider.clone(),
+                                capability.runtime,
+                                outcome,
+                            )
+                            .await;
+                    }
+                    let result = runtime_outcome_to_loop(
+                        &self.run_context,
+                        self.result_writer.as_ref(),
+                        &requested_capability_id,
+                        outcome,
+                    )
+                    .await;
+                    self.record_loop_completed(&idempotency_key, result.clone())?;
+                    return result;
+                }
+                DispatchReservation::TerminalMilestonePending { result, milestone } => {
                     return self
-                        .finish_runtime_outcome(&idempotency_key, &requested_capability_id, outcome)
+                        .complete_terminal_milestone(&idempotency_key, result, Some(milestone))
                         .await;
                 }
                 DispatchReservation::LoopCompleted(result) => return result,
@@ -872,9 +964,15 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             .resolve_capability_input(&self.run_context, &request.input_ref)
             .await?;
         let requested_capability_id = request.capability_id.clone();
-        self.emit_capability_invoked(request.capability_id.clone())
-            .await?;
-        let outcome = self
+        let provider = capability.provider.clone();
+        let runtime = capability.runtime;
+        let capability_activity_id = capability_activity_invocation_id(&idempotency_key);
+        self.emit_capability_milestone(LoopHostMilestoneKind::CapabilityInvoked {
+            activity_id: capability_activity_id,
+            capability_id: request.capability_id.clone(),
+        })
+        .await?;
+        let outcome = match self
             .runtime
             .invoke_capability(
                 RuntimeCapabilityRequest::new(
@@ -895,11 +993,36 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                 .with_idempotency_key(idempotency_key.clone()),
             )
             .await
-            .map_err(host_runtime_error)?;
-
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let host_error = host_runtime_error(error);
+                let terminal_milestone = LoopHostMilestoneKind::CapabilityFailed {
+                    activity_id: capability_activity_id,
+                    capability_id: requested_capability_id.clone(),
+                    provider: Some(provider),
+                    runtime: Some(runtime),
+                    reason_kind: capability_failure_kind(host_error.kind.as_str())?,
+                };
+                guard.commit();
+                return self
+                    .complete_terminal_milestone(
+                        &idempotency_key,
+                        Err(host_error),
+                        Some(terminal_milestone),
+                    )
+                    .await;
+            }
+        };
         guard.commit();
-        self.finish_runtime_outcome(&idempotency_key, &requested_capability_id, outcome)
-            .await
+        self.finish_runtime_outcome(
+            &idempotency_key,
+            &requested_capability_id,
+            provider,
+            runtime,
+            outcome,
+        )
+        .await
     }
 
     async fn invoke_capability_batch(
@@ -1206,6 +1329,19 @@ fn should_retry_result_write(
         )
 }
 
+const CAPABILITY_ACTIVITY_INVOCATION_NAMESPACE: uuid::Uuid =
+    uuid::uuid!("4e42ab0b-7d09-5f1c-8c87-73436fb53a61");
+
+fn capability_activity_invocation_id(key: &IdempotencyKey) -> CapabilityActivityId {
+    // `invocation_idempotency_key` includes the loop run id, surface version,
+    // requested capability id, and input ref, so each logical capability call
+    // gets a stable activity id without colliding with sibling calls in a run.
+    CapabilityActivityId::from_uuid(uuid::Uuid::new_v5(
+        &CAPABILITY_ACTIVITY_INVOCATION_NAMESPACE,
+        key.as_str().as_bytes(),
+    ))
+}
+
 fn invocation_context_from_visible(
     base: &ExecutionContext,
     run_context: &LoopRunContext,
@@ -1501,6 +1637,47 @@ async fn runtime_outcome_to_loop(
     })
 }
 
+fn runtime_terminal_milestone(
+    activity_id: CapabilityActivityId,
+    provider: ExtensionId,
+    runtime: RuntimeKind,
+    outcome: &RuntimeCapabilityOutcome,
+) -> Result<Option<LoopHostMilestoneKind>, AgentLoopHostError> {
+    Ok(match outcome {
+        RuntimeCapabilityOutcome::Completed(completed) => {
+            Some(LoopHostMilestoneKind::CapabilityCompleted {
+                activity_id,
+                capability_id: completed.capability_id.clone(),
+                provider,
+                runtime,
+                output_bytes: completed.usage.output_bytes,
+            })
+        }
+        RuntimeCapabilityOutcome::Failed(failure) => {
+            Some(LoopHostMilestoneKind::CapabilityFailed {
+                activity_id,
+                capability_id: failure.capability_id.clone(),
+                provider: Some(provider),
+                runtime: Some(runtime),
+                reason_kind: runtime_failure_kind_to_loop(failure.kind)?,
+            })
+        }
+        RuntimeCapabilityOutcome::Unknown(unknown) => {
+            Some(LoopHostMilestoneKind::CapabilityFailed {
+                activity_id,
+                capability_id: unknown.capability_id.clone(),
+                provider: Some(provider),
+                runtime: Some(runtime),
+                reason_kind: capability_failure_kind(unknown.kind.clone())?,
+            })
+        }
+        RuntimeCapabilityOutcome::ApprovalRequired(_)
+        | RuntimeCapabilityOutcome::AuthRequired(_)
+        | RuntimeCapabilityOutcome::ResourceBlocked(_)
+        | RuntimeCapabilityOutcome::SpawnedProcess(_) => None,
+    })
+}
+
 fn runtime_failure_to_loop(
     failure: RuntimeCapabilityFailure,
 ) -> Result<CapabilityOutcome, AgentLoopHostError> {
@@ -1702,6 +1879,8 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod runtime_lifecycle_tests;
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
@@ -3141,6 +3320,8 @@ mod tests {
         Arc::new(ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink::default())
     }
 
+    const RECORDING_OUTPUT_BYTES: u64 = 12;
+
     struct RecordingHostRuntime {
         capabilities: Vec<VisibleCapability>,
         requests: Mutex<Vec<RuntimeCapabilityRequest>>,
@@ -3173,7 +3354,10 @@ mod tests {
                 RuntimeCapabilityCompleted {
                     capability_id: request.capability_id,
                     output: serde_json::json!({"ok": true}),
-                    usage: ResourceUsage::default(),
+                    usage: ResourceUsage {
+                        output_bytes: RECORDING_OUTPUT_BYTES,
+                        ..ResourceUsage::default()
+                    },
                 },
             )))
         }

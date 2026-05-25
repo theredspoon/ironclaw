@@ -89,6 +89,14 @@ fn apply_run_event(
     entry: &EventLogEntry<RuntimeEvent>,
 ) {
     let event = &entry.record;
+    if matches!(
+        event.kind,
+        RuntimeEventKind::CapabilityActivityRequested
+            | RuntimeEventKind::CapabilityActivitySucceeded
+            | RuntimeEventKind::CapabilityActivityFailed
+    ) {
+        return;
+    }
     let existing = runs.get(&event.scope.invocation_id);
     let status = run_status_for_event(
         event.kind,
@@ -163,6 +171,7 @@ fn apply_capability_activity_event(
         .entry(event.scope.invocation_id)
         .or_insert_with(|| CapabilityActivityProjection {
             invocation_id: event.scope.invocation_id,
+            run_id: event.parent_invocation_id,
             capability_id: event.capability_id.clone(),
             thread_id: event.scope.thread_id.clone(),
             status,
@@ -176,6 +185,9 @@ fn apply_capability_activity_event(
         });
 
     activity.status = status;
+    if event.parent_invocation_id.is_some() {
+        activity.run_id = event.parent_invocation_id;
+    }
     activity.capability_id = event.capability_id.clone();
     activity.thread_id = event.scope.thread_id.clone();
     if event.provider.is_some() {
@@ -210,16 +222,18 @@ fn capability_activity_status_for_event(
     has_active_process: bool,
 ) -> Option<CapabilityActivityStatus> {
     match kind {
-        RuntimeEventKind::DispatchRequested => Some(CapabilityActivityStatus::Started),
+        RuntimeEventKind::DispatchRequested | RuntimeEventKind::CapabilityActivityRequested => {
+            Some(CapabilityActivityStatus::Started)
+        }
         RuntimeEventKind::RuntimeSelected | RuntimeEventKind::ProcessStarted => {
             Some(CapabilityActivityStatus::Running)
         }
-        RuntimeEventKind::DispatchSucceeded
+        RuntimeEventKind::DispatchSucceeded | RuntimeEventKind::CapabilityActivitySucceeded
             if has_active_process && current_status == Some(CapabilityActivityStatus::Running) =>
         {
             Some(CapabilityActivityStatus::Running)
         }
-        RuntimeEventKind::DispatchSucceeded
+        RuntimeEventKind::DispatchSucceeded | RuntimeEventKind::CapabilityActivitySucceeded
             if has_active_process
                 && matches!(
                     current_status,
@@ -228,12 +242,12 @@ fn capability_activity_status_for_event(
         {
             current_status
         }
-        RuntimeEventKind::DispatchSucceeded | RuntimeEventKind::ProcessCompleted => {
-            Some(CapabilityActivityStatus::Completed)
-        }
-        RuntimeEventKind::DispatchFailed | RuntimeEventKind::ProcessFailed => {
-            Some(CapabilityActivityStatus::Failed)
-        }
+        RuntimeEventKind::DispatchSucceeded
+        | RuntimeEventKind::CapabilityActivitySucceeded
+        | RuntimeEventKind::ProcessCompleted => Some(CapabilityActivityStatus::Completed),
+        RuntimeEventKind::DispatchFailed
+        | RuntimeEventKind::CapabilityActivityFailed
+        | RuntimeEventKind::ProcessFailed => Some(CapabilityActivityStatus::Failed),
         RuntimeEventKind::ProcessKilled => Some(CapabilityActivityStatus::Killed),
         RuntimeEventKind::ModelStarted
         | RuntimeEventKind::ModelCompleted
@@ -285,6 +299,11 @@ fn run_status_for_event(
         RuntimeEventKind::ProcessKilled => RunProjectionStatus::Killed,
         RuntimeEventKind::HookDispatched
         | RuntimeEventKind::HookDecisionEmitted
-        | RuntimeEventKind::HookFailed => current_status.unwrap_or(RunProjectionStatus::Running),
+        | RuntimeEventKind::HookFailed
+        | RuntimeEventKind::CapabilityActivityRequested
+        | RuntimeEventKind::CapabilityActivitySucceeded
+        | RuntimeEventKind::CapabilityActivityFailed => {
+            current_status.unwrap_or(RunProjectionStatus::Running)
+        }
     }
 }
