@@ -618,7 +618,8 @@ async fn production_requires_live_turn_wake_notifier() {
             test_master_key(),
         )
         .with_production_trust_policy(production_trust_policy())
-        .with_runtime_policy(production_runtime_policy()),
+        .with_runtime_policy(production_runtime_policy())
+        .with_runtime_process_binding(test_sandbox_process_binding()),
     )
     .await;
 
@@ -751,7 +752,8 @@ async fn production_libsql_resolved_secret_master_key_rejects_invalid_env_key() 
         )
         .with_production_trust_policy(production_trust_policy())
         .with_runtime_policy(production_runtime_policy())
-        .with_turn_run_wake_notifier(notifier),
+        .with_turn_run_wake_notifier(notifier)
+        .with_runtime_process_binding(test_sandbox_process_binding()),
     )
     .await;
 
