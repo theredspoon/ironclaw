@@ -26,6 +26,8 @@ mod input;
 mod llm_catalog;
 mod local_runtime_profile;
 mod product_live_adapters;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod production_runtime_policy;
 mod profile;
 mod projection;
 mod readiness;
@@ -50,7 +52,7 @@ pub use auth::{
 };
 pub use error::RebornBuildError;
 pub use factory::{RebornServices, build_reborn_services};
-pub use input::RebornBuildInput;
+pub use input::{RebornBuildInput, RebornRuntimeProcessBinding};
 #[cfg(feature = "root-llm-provider")]
 pub use llm_catalog::{
     RebornLlmCatalogError, resolve_against_registry, resolve_llm_selection_against_catalog,
@@ -66,6 +68,8 @@ pub use product_live_adapters::{
     ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig,
     capability_allowlist, visible_capability_request_for_run,
 };
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+pub use production_runtime_policy::RebornProductionRuntimePolicy;
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
 pub use runtime::{
@@ -185,10 +189,11 @@ use ironclaw_filesystem::LibSqlRootFilesystem;
 use ironclaw_filesystem::PostgresRootFilesystem;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
+use ironclaw_host_api::ProcessBackendKind;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::{
     MountAlias, MountGrant, MountPermissions, MountView, ResourceScope, SYSTEM_RESERVED_ID,
-    SecretHandle, VirtualPath, runtime_policy::EffectiveRuntimePolicy,
+    SecretHandle, VirtualPath,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_runtime::{CapabilitySurfaceVersion, HostRuntimeServices};
@@ -341,7 +346,7 @@ where
     pub event_store: RebornEventStoreConfig,
     pub secret_master_key: Option<SecretMaterial>,
     pub trust_policy: Arc<TPolicy>,
-    pub runtime_policy: EffectiveRuntimePolicy,
+    pub runtime_policy: RebornProductionRuntimePolicy,
     pub turn_run_wake_notifier: Arc<TWake>,
     pub surface_version: CapabilitySurfaceVersion,
 }
@@ -357,7 +362,7 @@ where
     pub event_store: RebornEventStoreConfig,
     pub secret_master_key: Option<SecretMaterial>,
     pub trust_policy: Arc<TPolicy>,
-    pub runtime_policy: EffectiveRuntimePolicy,
+    pub runtime_policy: RebornProductionRuntimePolicy,
     pub turn_run_wake_notifier: Arc<TWake>,
     pub surface_version: CapabilitySurfaceVersion,
 }
@@ -384,6 +389,10 @@ pub enum RebornCompositionError {
     Turn(#[from] TurnError),
     #[error("reborn run-profile resolver substrate failed: {0}")]
     RunProfile(#[from] ironclaw_turns::run_profile::RunProfileRegistryError),
+    #[error("tenant-sandbox process backend requires explicit tenant sandbox process port")]
+    MissingTenantSandboxProcessPort,
+    #[error("tenant sandbox process port was supplied for runtime backend {process_backend:?}")]
+    UnexpectedTenantSandboxProcessPort { process_backend: ProcessBackendKind },
 }
 
 /// Build production-wired host-runtime services over libSQL-backed substrates.
@@ -420,6 +429,8 @@ where
         &scoped_filesystem,
     )));
 
+    let (runtime_policy, process_binding) = config.runtime_policy.into_parts();
+
     let services = HostRuntimeServices::new(
         Arc::new(ExtensionRegistry::new()),
         filesystem,
@@ -429,7 +440,7 @@ where
         config.surface_version,
     )
     .with_trust_policy(config.trust_policy)
-    .with_runtime_policy(config.runtime_policy)
+    .with_runtime_policy(runtime_policy)
     .with_capability_leases(capability_leases)
     .with_secret_store(Arc::clone(&secret_store))
     .with_turn_run_wake_notifier(config.turn_run_wake_notifier)
@@ -440,6 +451,8 @@ where
     ))
     .with_reborn_event_store_config(RebornProfile::Production, config.event_store)
     .await?;
+    let services =
+        crate::factory::apply_production_runtime_process_binding(services, process_binding);
 
     // safety: `with_secret_store` is called unconditionally above on the same
     // builder chain, so `try_with_host_http_egress` can only return a
@@ -485,6 +498,8 @@ where
         &scoped_filesystem,
     )));
 
+    let (runtime_policy, process_binding) = config.runtime_policy.into_parts();
+
     let services = HostRuntimeServices::new(
         Arc::new(ExtensionRegistry::new()),
         filesystem,
@@ -494,7 +509,7 @@ where
         config.surface_version,
     )
     .with_trust_policy(config.trust_policy)
-    .with_runtime_policy(config.runtime_policy)
+    .with_runtime_policy(runtime_policy)
     .with_capability_leases(capability_leases)
     .with_secret_store(Arc::clone(&secret_store))
     .with_turn_run_wake_notifier(config.turn_run_wake_notifier)
@@ -505,6 +520,8 @@ where
     ))
     .with_reborn_event_store_config(RebornProfile::Production, config.event_store)
     .await?;
+    let services =
+        crate::factory::apply_production_runtime_process_binding(services, process_binding);
 
     // safety: `with_secret_store` is called unconditionally above on the same
     // builder chain, so `try_with_host_http_egress` can only return a

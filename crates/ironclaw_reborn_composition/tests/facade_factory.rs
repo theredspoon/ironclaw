@@ -30,6 +30,8 @@ use ironclaw_host_runtime::{
 use ironclaw_reborn::planned_driver_factory::PLANNED_DEFAULT_PROFILE_ID;
 #[cfg(all(feature = "postgres", not(feature = "libsql")))]
 use ironclaw_reborn_composition::RebornCompositionProfile;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_reborn_composition::RebornRuntimeProcessBinding;
 #[cfg(feature = "libsql")]
 use ironclaw_reborn_composition::{RebornBuildError, RebornCompositionProfile};
 use ironclaw_reborn_composition::{RebornBuildInput, RebornReadinessState, build_reborn_services};
@@ -47,6 +49,9 @@ use ironclaw_turns::{
     runner::{ClaimedTurnRun, TurnRunTransitionPort},
 };
 use secrecy::SecretString;
+
+#[path = "facade_factory/sandbox_process_ports.rs"]
+mod sandbox_process_ports;
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 fn test_master_key() -> SecretMaterial {
@@ -330,6 +335,37 @@ async fn local_dev_builds_facades_without_production_claim() {
     assert!(services.readiness.facades.turn_coordinator);
     assert!(services.readiness.facades.product_auth);
     assert!(services.product_auth.is_some());
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn test_sandbox_process_binding() -> RebornRuntimeProcessBinding {
+    let process_port = Arc::new(ironclaw_host_runtime::TenantSandboxProcessPort::new(
+        Arc::new(ProductionReadySandboxTransport),
+    ));
+    RebornRuntimeProcessBinding::tenant_sandbox(process_port)
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[derive(Debug)]
+struct ProductionReadySandboxTransport;
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[async_trait::async_trait]
+impl ironclaw_host_runtime::SandboxCommandTransport for ProductionReadySandboxTransport {
+    async fn run_command(
+        &self,
+        _request: ironclaw_host_runtime::CommandExecutionRequest,
+    ) -> Result<
+        ironclaw_host_runtime::CommandExecutionOutput,
+        ironclaw_host_runtime::RuntimeProcessError,
+    > {
+        Ok(ironclaw_host_runtime::CommandExecutionOutput {
+            output: String::new(),
+            exit_code: 0,
+            sandboxed: true,
+            duration: std::time::Duration::ZERO,
+        })
+    }
 }
 
 #[tokio::test]
@@ -675,6 +711,7 @@ async fn production_libsql_services_wire_first_party_runtime_http_egress() {
         .with_production_trust_policy(production_trust_policy())
         .with_runtime_policy(production_runtime_policy())
         .with_turn_run_wake_notifier(notifier)
+        .with_runtime_process_binding(test_sandbox_process_binding())
         .with_required_runtime_backends([RuntimeKind::FirstParty])
         .require_runtime_http_egress(),
     )
@@ -720,6 +757,7 @@ async fn production_postgres_services_wire_first_party_runtime_http_egress() {
         .with_production_trust_policy(production_trust_policy())
         .with_runtime_policy(production_runtime_policy())
         .with_turn_run_wake_notifier(notifier)
+        .with_runtime_process_binding(test_sandbox_process_binding())
         .with_required_runtime_backends([RuntimeKind::FirstParty])
         .require_runtime_http_egress(),
     )
@@ -759,13 +797,14 @@ async fn migration_dry_run_validates_libsql_shape() {
             RebornCompositionProfile::MigrationDryRun,
             "test-owner",
             db,
-            db_path.to_string_lossy(),
+            dir.path().join("events.db").to_string_lossy(),
             None,
             test_master_key(),
         )
         .with_production_trust_policy(production_trust_policy())
         .with_runtime_policy(production_runtime_policy())
-        .with_turn_run_wake_notifier(notifier),
+        .with_turn_run_wake_notifier(notifier)
+        .with_runtime_process_binding(test_sandbox_process_binding()),
     )
     .await
     .unwrap();
@@ -814,7 +853,8 @@ async fn migration_dry_run_validates_postgres_planned_turn_profile() {
         )
         .with_production_trust_policy(production_trust_policy())
         .with_runtime_policy(production_runtime_policy())
-        .with_turn_run_wake_notifier(notifier),
+        .with_turn_run_wake_notifier(notifier)
+        .with_runtime_process_binding(test_sandbox_process_binding()),
     )
     .await
     .unwrap();

@@ -58,7 +58,7 @@ use ironclaw_turns::{
     InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
 };
 
-use crate::input::RebornStorageInput;
+use crate::input::{RebornRuntimeProcessBinding, RebornStorageInput};
 use crate::{
     RebornAuthContinuationDispatcher, RebornBuildError, RebornBuildInput, RebornCompositionProfile,
     RebornFacadeReadiness, RebornProductAuthServicePorts, RebornProductAuthServices,
@@ -101,6 +101,43 @@ type LocalDevProcessServices = ProcessServices<
     ironclaw_processes::InMemoryProcessStore,
     ironclaw_processes::InMemoryProcessResultStore,
 >;
+
+fn apply_runtime_process_binding<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+    binding: RebornRuntimeProcessBinding,
+) -> HostRuntimeServices<F, G, S, R>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    match binding {
+        RebornRuntimeProcessBinding::None => services,
+        RebornRuntimeProcessBinding::TenantSandbox { process_port } => {
+            services.with_tenant_sandbox_process_port(process_port)
+        }
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+pub(crate) fn apply_production_runtime_process_binding<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+    binding: RebornRuntimeProcessBinding,
+) -> HostRuntimeServices<F, G, S, R>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    match binding {
+        RebornRuntimeProcessBinding::None => services,
+        RebornRuntimeProcessBinding::TenantSandbox { process_port } => {
+            services.with_production_tenant_sandbox_process_port(process_port)
+        }
+    }
+}
 
 pub struct RebornServices {
     pub host_runtime: Option<Arc<dyn ironclaw_host_runtime::HostRuntime>>,
@@ -209,6 +246,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         profile,
         storage,
         runtime_policy,
+        runtime_process_binding,
         product_auth_ports,
         ..
     } = input;
@@ -270,8 +308,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     if let Some(runtime_policy) = runtime_policy {
         services = services.with_runtime_policy(runtime_policy);
     }
-    // TODO(process-port): local runtime policies intentionally use the
-    // LocalHostProcessPort until a non-local process backend is composed.
+    services = apply_runtime_process_binding(services, runtime_process_binding);
 
     let host_runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> =
         Arc::new(services.host_runtime_for_local_testing());
@@ -662,6 +699,7 @@ async fn build_production_shaped(
         production_trust_policy,
         runtime_policy,
         turn_run_wake_notifier,
+        runtime_process_binding,
         required_runtime_backends,
         require_runtime_http_egress,
         require_wasm_credentials,
@@ -678,6 +716,7 @@ async fn build_production_shaped(
         production_trust_policy,
         runtime_policy,
         turn_run_wake_notifier,
+        runtime_process_binding,
         required_runtime_backends,
         require_runtime_http_egress,
         require_wasm_credentials,
@@ -704,10 +743,8 @@ async fn build_production_shaped(
                 production_trust_policy,
                 runtime_policy,
                 turn_run_wake_notifier,
+                runtime_process_binding,
             )?;
-            // TODO(process-port): if production enables FirstParty runtime,
-            // HostRuntimeServices must be given a production process port;
-            // otherwise the LocalHostProcessPort default is rejected.
             let context = RebornProductionBuildContext {
                 profile,
                 wiring_config,
@@ -726,10 +763,8 @@ async fn build_production_shaped(
                 production_trust_policy,
                 runtime_policy,
                 turn_run_wake_notifier,
+                runtime_process_binding,
             )?;
-            // TODO(process-port): if production enables FirstParty runtime,
-            // HostRuntimeServices must be given a production process port;
-            // otherwise the LocalHostProcessPort default is rejected.
             let context = RebornProductionBuildContext {
                 profile,
                 wiring_config,
@@ -746,6 +781,7 @@ struct RebornProductionWiring {
     trust_policy: Arc<HostTrustPolicy>,
     runtime_policy: EffectiveRuntimePolicy,
     turn_run_wake_notifier: Arc<ironclaw_host_runtime::SchedulerTurnRunWakeNotifier>,
+    runtime_process_binding: RebornRuntimeProcessBinding,
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -761,19 +797,34 @@ fn production_wiring(
     trust_policy: Option<Arc<HostTrustPolicy>>,
     runtime_policy: Option<EffectiveRuntimePolicy>,
     turn_run_wake_notifier: Option<Arc<ironclaw_host_runtime::SchedulerTurnRunWakeNotifier>>,
+    runtime_process_binding: RebornRuntimeProcessBinding,
 ) -> Result<RebornProductionWiring, RebornBuildError> {
     let trust_policy = trust_policy.ok_or(RebornBuildError::MissingProductionTrustPolicy)?;
     if !trust_policy.has_sources() {
         return Err(RebornBuildError::EmptyProductionTrustPolicy);
     }
     let runtime_policy = runtime_policy.ok_or(RebornBuildError::MissingRuntimePolicy)?;
+    validate_production_process_binding(&runtime_policy, &runtime_process_binding)?;
     let turn_run_wake_notifier =
         turn_run_wake_notifier.ok_or(RebornBuildError::MissingTurnRunWakeNotifier)?;
     Ok(RebornProductionWiring {
         trust_policy,
         runtime_policy,
         turn_run_wake_notifier,
+        runtime_process_binding,
     })
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn validate_production_process_binding(
+    runtime_policy: &EffectiveRuntimePolicy,
+    binding: &RebornRuntimeProcessBinding,
+) -> Result<(), RebornBuildError> {
+    binding
+        .validate_for_production_policy(runtime_policy)
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        })
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -866,6 +917,10 @@ where
     .with_filesystem_turn_state_store(stores.scoped_filesystem)
     .with_run_profile_resolver(planned_run_profile_resolver()?)
     .with_turn_run_wake_notifier(production_wiring.turn_run_wake_notifier);
+    let services = apply_production_runtime_process_binding(
+        services,
+        production_wiring.runtime_process_binding,
+    );
 
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> =
         Arc::new(services.turn_coordinator_for_production()?);
