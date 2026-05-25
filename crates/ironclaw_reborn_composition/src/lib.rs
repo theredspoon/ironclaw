@@ -25,6 +25,7 @@ mod gsuite;
 mod input;
 #[cfg(feature = "root-llm-provider")]
 mod llm_catalog;
+mod local_dev_mounts;
 mod local_runtime_profile;
 mod product_live_adapters;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -61,8 +62,9 @@ pub use llm_catalog::{
     resolve_reborn_runtime_llm,
 };
 pub use local_runtime_profile::{
-    RebornLocalRuntimeProfileError, local_dev_runtime_policy, local_dev_yolo_runtime_policy,
-    local_runtime_build_input,
+    RebornLocalRuntimeProfileError, RebornLocalRuntimeProfileOptions, local_dev_runtime_policy,
+    local_dev_yolo_runtime_policy, local_runtime_build_input,
+    local_runtime_build_input_with_options,
 };
 pub use product_live_adapters::{
     ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
