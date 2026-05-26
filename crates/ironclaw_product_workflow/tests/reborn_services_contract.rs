@@ -10,14 +10,16 @@ use ironclaw_product_adapters::{
     ProjectionStream, ProjectionSubscriptionRequest, ProtocolAuthFailure, RedactedString,
 };
 use ironclaw_product_workflow::{
-    ApprovalInteractionDecision, ApprovalInteractionService, ListPendingApprovalsRequest,
+    ApprovalInteractionDecision, ApprovalInteractionService, LifecyclePackageKind,
+    LifecyclePackageRef, LifecyclePhase, LifecycleProductContext, LifecycleProductFacade,
+    LifecycleProductResponse, LifecycleReadinessBlocker, ListPendingApprovalsRequest,
     ListPendingApprovalsResponse, RebornGetRunStateRequest, RebornResolveGateResponse,
     RebornServices, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
     RebornServicesErrorKind, RebornStreamEventsRequest, RebornSubmitTurnResponse,
     RebornTimelineRequest, ResolveApprovalInteractionRequest, ResolveApprovalInteractionResponse,
     WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
     WebUiInboundValidationCode, WebUiListThreadsRequest, WebUiResolveGateRequest,
-    WebUiSendMessageRequest, approval_gate_ref,
+    WebUiSendMessageRequest, WebUiSetupExtensionRequest, approval_gate_ref,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
@@ -350,6 +352,51 @@ impl ApprovalInteractionService for RecordingApprovalInteractionService {
                 })
             }
         })
+    }
+}
+
+struct RecordingLifecycleFacade {
+    package_refs: Mutex<Vec<LifecyclePackageRef>>,
+}
+
+impl RecordingLifecycleFacade {
+    fn new() -> Self {
+        Self {
+            package_refs: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn package_refs(&self) -> Vec<LifecyclePackageRef> {
+        self.package_refs.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait]
+impl LifecycleProductFacade for RecordingLifecycleFacade {
+    async fn execute(
+        &self,
+        _context: LifecycleProductContext,
+        _action: ironclaw_product_workflow::LifecycleProductAction,
+    ) -> Result<LifecycleProductResponse, ironclaw_product_workflow::ProductWorkflowError> {
+        panic!("setup_extension should project package state, not execute lifecycle actions")
+    }
+
+    async fn project_package(
+        &self,
+        _context: LifecycleProductContext,
+        package_ref: LifecyclePackageRef,
+    ) -> Result<LifecycleProductResponse, ironclaw_product_workflow::ProductWorkflowError> {
+        self.package_refs
+            .lock()
+            .expect("lock")
+            .push(package_ref.clone());
+        Ok(LifecycleProductResponse::projection(
+            Some(package_ref),
+            LifecyclePhase::UnsupportedOrLegacy,
+            vec![LifecycleReadinessBlocker::runtime(Some(
+                "extension_lifecycle_store_unwired".to_string(),
+            ))?],
+        ))
     }
 }
 
@@ -2701,6 +2748,39 @@ async fn approval_gate_resolution_with_persistent_flag_is_rejected_without_appro
     assert_eq!(err.status_code, 503);
     assert_eq!(approval_interactions.resolution_count(), 0);
     assert_eq!(coordinator.resumption_count(), 0);
+}
+
+#[tokio::test]
+async fn setup_extension_projects_through_configured_lifecycle_facade() {
+    let lifecycle_facade = Arc::new(RecordingLifecycleFacade::new());
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        Arc::new(FakeTurnCoordinator::default()),
+    )
+    .with_lifecycle_product_facade(lifecycle_facade.clone());
+
+    let response = services
+        .setup_extension(
+            caller(),
+            ironclaw_common::ExtensionName::new("github").expect("valid extension"),
+            WebUiSetupExtensionRequest::default(),
+        )
+        .await
+        .expect("setup extension response");
+
+    assert_eq!(response.phase, LifecyclePhase::UnsupportedOrLegacy);
+    assert!(response.blockers.iter().any(|blocker| matches!(
+        blocker,
+        LifecycleReadinessBlocker::Runtime { ref_id: Some(ref_id) }
+            if ref_id.as_str() == "extension_lifecycle_store_unwired"
+    )));
+    assert_eq!(
+        lifecycle_facade.package_refs(),
+        vec![
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, "github")
+                .expect("valid package ref")
+        ]
+    );
 }
 
 #[tokio::test]

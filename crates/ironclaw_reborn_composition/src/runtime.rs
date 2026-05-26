@@ -1365,9 +1365,10 @@ mod tests {
     };
     use ironclaw_product_adapters::{ProductOutboundPayload, ProductProjectionItem};
     use ironclaw_product_workflow::{
-        RebornServicesErrorCode, RebornServicesErrorKind, RebornStreamEventsRequest,
-        RebornSubmitTurnResponse, WebUiAuthenticatedCaller, WebUiCreateThreadRequest,
-        WebUiResolveGateRequest, WebUiSendMessageRequest, approval_gate_ref,
+        ExtensionName, LifecycleReadinessBlocker, RebornServicesErrorCode, RebornServicesErrorKind,
+        RebornStreamEventsRequest, RebornSubmitTurnResponse, WebUiAuthenticatedCaller,
+        WebUiCreateThreadRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
+        WebUiSetupExtensionRequest, approval_gate_ref,
     };
     use ironclaw_run_state::ApprovalRequestStore;
     use ironclaw_skills::SkillTrust;
@@ -2796,6 +2797,71 @@ mod tests {
         );
         assert_eq!(bundle.readiness, runtime.services().readiness);
         assert_eq!(bundle.readiness.state, RebornReadinessState::DevOnly);
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn local_dev_webui_bundle_uses_local_lifecycle_facade_for_setup_extension() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let gateway = Arc::new(RecordingGateway {
+            reply: "webui lifecycle ok".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::local_dev(
+                "runtime-webui-lifecycle-owner",
+                root.path().join("local-dev"),
+            )
+            .with_runtime_policy(local_dev_runtime_policy()),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-webui-lifecycle-tenant".to_string(),
+            agent_id: "runtime-webui-lifecycle-agent".to_string(),
+            source_binding_id: "runtime-webui-lifecycle-source".to_string(),
+            reply_target_binding_id: "runtime-webui-lifecycle-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let bundle = build_webui_services(&runtime, None).expect("webui bundle");
+        let caller = WebUiAuthenticatedCaller::new(
+            TenantId::new("runtime-webui-lifecycle-tenant").unwrap(),
+            UserId::new("runtime-webui-lifecycle-owner").unwrap(),
+            Some(AgentId::new("runtime-webui-lifecycle-agent").unwrap()),
+            None,
+        );
+
+        let setup = bundle
+            .api
+            .setup_extension(
+                caller,
+                ExtensionName::new("github").expect("valid extension name"),
+                WebUiSetupExtensionRequest::default(),
+            )
+            .await
+            .expect("setup extension lifecycle projection");
+
+        assert!(
+            setup.blockers.iter().any(|blocker| matches!(
+                blocker,
+                LifecycleReadinessBlocker::Runtime { ref_id: Some(ref_id) }
+                    if ref_id.as_str() == "extension_lifecycle_store_unwired"
+            )),
+            "local webui bundle should use the local lifecycle facade projection"
+        );
+        assert!(
+            !setup.blockers.iter().any(|blocker| matches!(
+                blocker,
+                LifecycleReadinessBlocker::Runtime { ref_id: Some(ref_id) }
+                    if ref_id.as_str() == "reborn_lifecycle_facade_unwired"
+            )),
+            "local webui bundle must not fall back to the default unwired facade"
+        );
 
         runtime.shutdown().await.expect("runtime shutdown");
     }

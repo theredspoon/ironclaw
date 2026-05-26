@@ -27,7 +27,7 @@ use ironclaw_filesystem::{LocalFilesystem, ScopedFilesystem};
 use ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy;
 use ironclaw_host_api::runtime_policy::FilesystemBackendKind;
 use ironclaw_host_api::{
-    EffectKind, HostPath, MountPermissions, MountView, PackageId, VirtualPath,
+    EffectKind, HostPath, MountPermissions, MountView, PackageId, UserId, VirtualPath,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_host_api::{MountAlias, MountGrant};
@@ -65,7 +65,10 @@ use ironclaw_turns::{
 };
 
 use crate::input::{RebornRuntimeProcessBinding, RebornStorageInput};
-use crate::local_dev_mounts::{skill_context_mount_view, workspace_mount_view};
+use crate::lifecycle::RebornLocalSkillManagementPort;
+use crate::local_dev_mounts::{
+    skill_context_mount_view, skill_management_mount_view, workspace_mount_view,
+};
 use crate::{
     RebornAuthContinuationDispatcher, RebornBuildError, RebornBuildInput, RebornCompositionProfile,
     RebornFacadeReadiness, RebornProductAuthServicePorts, RebornProductAuthServices,
@@ -174,6 +177,7 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) checkpoint_state_store: Arc<dyn CheckpointStateStore>,
     pub(crate) loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
     pub(crate) thread_service: Arc<dyn SessionThreadService>,
+    pub(crate) skill_management: Arc<RebornLocalSkillManagementPort>,
     pub(crate) skill_mounts: MountView,
     pub(crate) skill_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
     pub(crate) workspace_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
@@ -274,6 +278,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         runtime_policy,
         runtime_process_binding,
         product_auth_ports,
+        owner_id,
         ..
     } = input;
     let RebornStorageInput::LocalDev {
@@ -323,8 +328,12 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         build_local_dev_root_filesystem(&root, &workspace_root, host_home_root.as_ref()).await?;
     let (skill_filesystem, workspace_filesystem, runtime_workspace_mounts) =
         build_workspace_filesystems(Arc::clone(&filesystem), host_home_root.as_ref())?;
+    let owner_user_id = UserId::new(owner_id).map_err(|error| RebornBuildError::InvalidConfig {
+        reason: error.to_string(),
+    })?;
     let store_graph = build_local_dev_store_graph(
         Arc::clone(&filesystem),
+        owner_user_id,
         skill_filesystem,
         workspace_filesystem,
         runtime_workspace_mounts,
@@ -380,13 +389,14 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
 #[cfg(feature = "libsql")]
 fn build_local_dev_store_graph(
     filesystem: Arc<LocalDevRootFilesystem>,
+    owner_user_id: UserId,
     skill_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
     workspace_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
     workspace_mounts: MountView,
 ) -> Result<RebornLocalDevStoreGraph, RebornBuildError> {
     let scoped_filesystem = local_dev_scoped_filesystem(Arc::clone(&filesystem));
     let event_log = local_dev_event_log(Arc::clone(&filesystem))?;
-    let audit_log = local_dev_audit_log(filesystem)?;
+    let audit_log = local_dev_audit_log(Arc::clone(&filesystem))?;
     let run_state = Arc::new(FilesystemRunStateStore::new(Arc::clone(&scoped_filesystem)));
     let approval_requests = Arc::new(FilesystemApprovalRequestStore::new(Arc::clone(
         &scoped_filesystem,
@@ -408,6 +418,15 @@ fn build_local_dev_store_graph(
         skill_context_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         })?;
+    let skill_management_mounts =
+        skill_management_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        })?;
+    let skill_management = Arc::new(RebornLocalSkillManagementPort::new(
+        owner_user_id,
+        filesystem,
+        skill_management_mounts,
+    ));
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
@@ -415,6 +434,7 @@ fn build_local_dev_store_graph(
         checkpoint_state_store,
         loop_checkpoint_store,
         thread_service,
+        skill_management,
         skill_mounts,
         skill_filesystem,
         workspace_filesystem,
@@ -443,6 +463,7 @@ fn build_local_dev_store_graph(
 #[cfg(not(feature = "libsql"))]
 fn build_local_dev_store_graph(
     filesystem: Arc<LocalDevRootFilesystem>,
+    owner_user_id: UserId,
     skill_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
     workspace_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
     workspace_mounts: MountView,
@@ -450,7 +471,7 @@ fn build_local_dev_store_graph(
     #[cfg(feature = "postgres")]
     let subagent_goal_filesystem = local_dev_scoped_filesystem(Arc::clone(&filesystem));
     let event_log = local_dev_event_log(Arc::clone(&filesystem))?;
-    let audit_log = local_dev_audit_log(filesystem)?;
+    let audit_log = local_dev_audit_log(Arc::clone(&filesystem))?;
     let run_state = Arc::new(InMemoryRunStateStore::new());
     let approval_requests = Arc::new(InMemoryApprovalRequestStore::new());
     let capability_leases = Arc::new(InMemoryCapabilityLeaseStore::new());
@@ -465,6 +486,15 @@ fn build_local_dev_store_graph(
         skill_context_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         })?;
+    let skill_management_mounts =
+        skill_management_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        })?;
+    let skill_management = Arc::new(RebornLocalSkillManagementPort::new(
+        owner_user_id,
+        filesystem,
+        skill_management_mounts,
+    ));
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
@@ -472,6 +502,7 @@ fn build_local_dev_store_graph(
         checkpoint_state_store,
         loop_checkpoint_store,
         thread_service,
+        skill_management,
         skill_mounts,
         skill_filesystem,
         workspace_filesystem,
