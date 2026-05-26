@@ -266,6 +266,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
             status: TurnStatus::Cancelled,
             event_cursor: EventCursor(13),
             already_terminal: false,
+            actor: None,
         })
     }
 
@@ -345,6 +346,7 @@ impl ApprovalInteractionService for RecordingApprovalInteractionService {
                     status: TurnStatus::Cancelled,
                     event_cursor: EventCursor(23),
                     already_terminal: false,
+                    actor: None,
                 })
             }
         })
