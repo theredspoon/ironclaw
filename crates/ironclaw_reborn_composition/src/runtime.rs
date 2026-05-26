@@ -966,7 +966,7 @@ pub async fn build_reborn_runtime(
         .map_err(|error| RebornRuntimeError::InvalidArgument {
             reason: error.to_string(),
         })?;
-    let milestone_sink: Arc<dyn LoopHostMilestoneSink> = Arc::new(
+    let durable_milestone_sink: Arc<dyn LoopHostMilestoneSink> = Arc::new(
         DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope),
     );
     #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -978,6 +978,12 @@ pub async fn build_reborn_runtime(
     if trusted_laptop_access {
         append_trusted_laptop_access_audit(&audit_log, &thread_scope, &actor_user_id).await?;
     }
+    let projection_services = build_reborn_projection_services(
+        Arc::clone(&event_log),
+        validated_identity.reply_target_binding_ref.clone(),
+    );
+    let milestone_sink = projection_services
+        .with_live_reasoning_milestone_sink(durable_milestone_sink, actor_user_id.clone());
     let local_dev_capabilities = local_dev::capability_wiring(
         &services,
         actor_user_id.clone(),
@@ -1074,12 +1080,9 @@ pub async fn build_reborn_runtime(
             Arc::clone(&planned_turn_coordinator),
         ));
     let turn_event_source: Arc<dyn TurnEventProjectionSource> = turn_state_store.clone();
-    let projection_services = build_reborn_projection_services(
-        Arc::clone(&event_log),
-        validated_identity.reply_target_binding_ref.clone(),
-    )
-    .with_turn_events(turn_event_source, Arc::clone(&planned_turn_coordinator))
-    .with_display_previews(Arc::clone(&local_dev_capabilities.display_previews));
+    let projection_services = projection_services
+        .with_turn_events(turn_event_source, Arc::clone(&planned_turn_coordinator))
+        .with_display_previews(Arc::clone(&local_dev_capabilities.display_previews));
     services.turn_coordinator = Some(Arc::clone(&planned_turn_coordinator));
 
     let worker_cancel = CancellationToken::new();
