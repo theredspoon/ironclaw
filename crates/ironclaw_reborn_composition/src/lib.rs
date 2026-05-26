@@ -21,8 +21,10 @@
 use std::sync::Arc;
 
 mod auth;
+mod available_extensions;
 mod default_system_prompt;
 mod error;
+mod extension_lifecycle;
 mod factory;
 mod gsuite;
 mod input;

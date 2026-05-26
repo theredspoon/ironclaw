@@ -4334,6 +4334,7 @@ dependencies = [
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_trust",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
