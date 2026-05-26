@@ -8,10 +8,12 @@ use ironclaw_host_api::{ExtensionId, SecretHandle};
 use crate::{
     AuthChallenge, AuthContinuationEvent, AuthFlowId, AuthFlowManager, AuthFlowRecord,
     AuthFlowStatus, AuthInteractionId, AuthInteractionService, AuthProductError,
-    AuthProviderClient, CredentialAccount, CredentialAccountId, CredentialAccountListPage,
-    CredentialAccountListRequest, CredentialAccountMutation, CredentialAccountProjection,
-    CredentialAccountSelectionRequest, CredentialAccountService, CredentialAccountStatus,
-    CredentialAccountUpdateBinding, CredentialOwnership, CredentialSetupService,
+    AuthProviderClient, CredentialAccount, CredentialAccountChoiceRequest, CredentialAccountId,
+    CredentialAccountListPage, CredentialAccountListRequest, CredentialAccountLookupRequest,
+    CredentialAccountMutation, CredentialAccountProjection, CredentialAccountSelectionRequest,
+    CredentialAccountService, CredentialAccountStatus, CredentialAccountUpdateBinding,
+    CredentialOwnership, CredentialRecoveryKind, CredentialRecoveryProjection,
+    CredentialRecoveryReason, CredentialRecoveryRequest, CredentialSetupService,
     ManualTokenSetupRequest, NewAuthFlow, NewCredentialAccount, OAuthCallbackClaimRequest,
     OAuthCallbackFailureInput, OAuthCallbackInput, OAuthProviderCallbackRequest,
     OAuthProviderExchange, ProviderCallbackOutcome, SecretCleanupAction, SecretCleanupReport,
@@ -270,14 +272,16 @@ impl CredentialAccountService for InMemoryAuthProductServices {
 
     async fn get_account(
         &self,
-        scope: &crate::AuthProductScope,
-        account_id: CredentialAccountId,
+        request: CredentialAccountLookupRequest,
     ) -> Result<Option<CredentialAccount>, AuthProductError> {
         let state = self.lock_state();
-        let Some(account) = state.accounts.get(&account_id) else {
+        let Some(account) = state.accounts.get(&request.account_id) else {
             return Ok(None);
         };
-        if !scope_matches(scope, &account.scope) {
+        if !scope_matches(&request.scope, &account.scope) {
+            return Err(AuthProductError::CrossScopeDenied);
+        }
+        if !account_is_authorized_for_requester(account, request.requester_extension.as_ref()) {
             return Err(AuthProductError::CrossScopeDenied);
         }
         Ok(Some(account.clone()))
@@ -296,6 +300,10 @@ impl CredentialAccountService for InMemoryAuthProductServices {
                 scope_matches(&request.scope, &account.scope)
                     && account.provider == request.provider
                     && request.cursor.is_none_or(|cursor| account.id > cursor)
+                    && account_is_authorized_for_requester(
+                        account,
+                        request.requester_extension.as_ref(),
+                    )
             })
             .map(CredentialAccount::projection)
             .collect::<Vec<_>>();
@@ -353,7 +361,9 @@ impl CredentialAccountService for InMemoryAuthProductServices {
         let selectable = configured
             .iter()
             .copied()
-            .filter(|account| account_is_selectable_for_requester(account, &request))
+            .filter(|account| {
+                account_is_authorized_for_requester(account, request.requester_extension.as_ref())
+            })
             .map(CredentialAccount::projection)
             .collect::<Vec<_>>();
         match selectable.as_slice() {
@@ -361,6 +371,102 @@ impl CredentialAccountService for InMemoryAuthProductServices {
             [account] => Ok(account.clone()),
             _ => Err(AuthProductError::AccountSelectionRequired),
         }
+    }
+
+    async fn project_credential_recovery(
+        &self,
+        request: CredentialRecoveryRequest,
+    ) -> Result<CredentialRecoveryProjection, AuthProductError> {
+        let state = self.lock_state();
+        let mut accounts = state
+            .accounts
+            .values()
+            .filter(|account| {
+                scope_matches(&request.scope, &account.scope)
+                    && account.provider == request.provider
+            })
+            .collect::<Vec<_>>();
+        accounts.sort_by_key(|account| account.id);
+
+        if accounts.is_empty() {
+            return Ok(CredentialRecoveryProjection::setup_required(
+                request.provider,
+                CredentialRecoveryReason::NoAccount,
+                Vec::new(),
+            ));
+        }
+
+        let authorized = accounts
+            .iter()
+            .copied()
+            .filter(|account| {
+                account_is_authorized_for_requester(account, request.requester_extension.as_ref())
+            })
+            .collect::<Vec<_>>();
+        if authorized.is_empty() {
+            return Ok(CredentialRecoveryProjection::setup_required(
+                request.provider,
+                CredentialRecoveryReason::NoAccount,
+                Vec::new(),
+            ));
+        }
+
+        let configured = authorized
+            .iter()
+            .copied()
+            .filter(|account| account.status == CredentialAccountStatus::Configured)
+            .collect::<Vec<_>>();
+        match configured.as_slice() {
+            [account] => {
+                return Ok(CredentialRecoveryProjection::configured(
+                    request.provider,
+                    account.projection(),
+                ));
+            }
+            [_, ..] => {
+                return Ok(CredentialRecoveryProjection::account_selection_required(
+                    request.provider,
+                    configured
+                        .iter()
+                        .map(|account| account.projection())
+                        .collect(),
+                ));
+            }
+            [] => {}
+        }
+
+        if let [account] = authorized.as_slice() {
+            return Ok(recovery_projection_for_single_account(
+                request.provider,
+                account,
+            ));
+        }
+
+        Ok(recovery_projection_for_unconfigured_accounts(
+            request.provider,
+            &authorized,
+        ))
+    }
+
+    async fn select_configured_account(
+        &self,
+        request: CredentialAccountChoiceRequest,
+    ) -> Result<CredentialAccountProjection, AuthProductError> {
+        let state = self.lock_state();
+        let account = state
+            .accounts
+            .get(&request.account_id)
+            .ok_or(AuthProductError::CredentialMissing)?;
+        if !scope_matches(&request.scope, &account.scope) || account.provider != request.provider {
+            return Err(AuthProductError::CrossScopeDenied);
+        }
+        if account.status != CredentialAccountStatus::Configured {
+            return Err(AuthProductError::CredentialMissing);
+        }
+        if !account_is_authorized_for_requester(account, request.requester_extension.as_ref()) {
+            return Err(AuthProductError::CrossScopeDenied);
+        }
+        Ok(account.projection())
     }
 }
 
@@ -841,23 +947,107 @@ fn validate_update_authority_fields(
     Ok(())
 }
 
-fn account_is_selectable_for_requester(
+fn recovery_projection_for_single_account(
+    provider: crate::AuthProviderId,
     account: &CredentialAccount,
-    request: &CredentialAccountSelectionRequest,
+) -> CredentialRecoveryProjection {
+    let (kind, reason) = recovery_kind_and_reason_for_status(account.status);
+    match kind {
+        CredentialRecoveryKind::Configured => {
+            CredentialRecoveryProjection::configured(provider, account.projection())
+        }
+        CredentialRecoveryKind::SetupRequired => CredentialRecoveryProjection::setup_required(
+            provider,
+            reason,
+            vec![account.projection()],
+        ),
+        CredentialRecoveryKind::ReauthorizeRequired => {
+            CredentialRecoveryProjection::reauthorize_required(
+                provider,
+                reason,
+                vec![account.projection()],
+            )
+        }
+        CredentialRecoveryKind::AccountSelectionRequired => {
+            unreachable!("single account recovery cannot produce account selection required")
+        }
+    }
+}
+
+fn recovery_projection_for_unconfigured_accounts(
+    provider: crate::AuthProviderId,
+    accounts: &[&CredentialAccount],
+) -> CredentialRecoveryProjection {
+    let setup_reason = accounts
+        .iter()
+        .map(|account| recovery_kind_and_reason_for_status(account.status))
+        .find_map(|(kind, reason)| {
+            (kind == CredentialRecoveryKind::SetupRequired).then_some(reason)
+        });
+    let reason = setup_reason.unwrap_or_else(|| {
+        accounts
+            .iter()
+            .map(|account| recovery_kind_and_reason_for_status(account.status).1)
+            .next()
+            .unwrap_or(CredentialRecoveryReason::NoAccount)
+    });
+    let choices = accounts
+        .iter()
+        .map(|account| account.projection())
+        .collect::<Vec<_>>();
+    if setup_reason.is_some() {
+        CredentialRecoveryProjection::setup_required(provider, reason, choices)
+    } else {
+        CredentialRecoveryProjection::reauthorize_required(provider, reason, choices)
+    }
+}
+
+fn recovery_kind_and_reason_for_status(
+    status: CredentialAccountStatus,
+) -> (CredentialRecoveryKind, CredentialRecoveryReason) {
+    match status {
+        CredentialAccountStatus::Configured => (
+            CredentialRecoveryKind::Configured,
+            CredentialRecoveryReason::Configured,
+        ),
+        CredentialAccountStatus::PendingSetup => (
+            CredentialRecoveryKind::SetupRequired,
+            CredentialRecoveryReason::PendingSetup,
+        ),
+        CredentialAccountStatus::Missing => (
+            CredentialRecoveryKind::SetupRequired,
+            CredentialRecoveryReason::AccountMissing,
+        ),
+        CredentialAccountStatus::Inactive => (
+            CredentialRecoveryKind::SetupRequired,
+            CredentialRecoveryReason::AccountInactive,
+        ),
+        CredentialAccountStatus::Expired => (
+            CredentialRecoveryKind::ReauthorizeRequired,
+            CredentialRecoveryReason::AccountExpired,
+        ),
+        CredentialAccountStatus::RefreshFailed => (
+            CredentialRecoveryKind::ReauthorizeRequired,
+            CredentialRecoveryReason::RefreshFailed,
+        ),
+        CredentialAccountStatus::Revoked => (
+            CredentialRecoveryKind::ReauthorizeRequired,
+            CredentialRecoveryReason::AccountRevoked,
+        ),
+    }
+}
+
+fn account_is_authorized_for_requester(
+    account: &CredentialAccount,
+    requester_extension: Option<&ironclaw_host_api::ExtensionId>,
 ) -> bool {
     match account.ownership {
         CredentialOwnership::UserReusable => true,
-        CredentialOwnership::ExtensionOwned => {
-            account
-                .owner_extension
-                .as_ref()
-                .is_some_and(|owner_extension| {
-                    request.requester_extension.as_ref() == Some(owner_extension)
-                })
-        }
-        CredentialOwnership::SharedAdminManaged => request
-            .requester_extension
+        CredentialOwnership::ExtensionOwned => account
+            .owner_extension
             .as_ref()
+            .is_some_and(|owner_extension| requester_extension == Some(owner_extension)),
+        CredentialOwnership::SharedAdminManaged => requester_extension
             .is_some_and(|requester| account.granted_extensions.contains(requester)),
         CredentialOwnership::System => false,
     }

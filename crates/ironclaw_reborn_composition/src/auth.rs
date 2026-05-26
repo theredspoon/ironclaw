@@ -636,10 +636,11 @@ mod tests {
     use super::*;
     use ironclaw_auth::{
         AuthChallenge, AuthFlowId, AuthFlowRecord, AuthProductError, AuthProductScope,
-        CredentialAccount, CredentialAccountId, CredentialAccountListPage,
-        CredentialAccountListRequest, CredentialAccountMutation, CredentialAccountProjection,
-        CredentialAccountSelectionRequest, CredentialAccountStatus, NewAuthFlow,
-        NewCredentialAccount, OAuthCallbackClaimRequest, OAuthCallbackFailureInput,
+        CredentialAccount, CredentialAccountChoiceRequest, CredentialAccountId,
+        CredentialAccountListPage, CredentialAccountListRequest, CredentialAccountLookupRequest,
+        CredentialAccountMutation, CredentialAccountProjection, CredentialAccountSelectionRequest,
+        CredentialAccountStatus, CredentialRecoveryProjection, CredentialRecoveryRequest,
+        NewAuthFlow, NewCredentialAccount, OAuthCallbackClaimRequest, OAuthCallbackFailureInput,
         OAuthCallbackInput, OAuthProviderCallbackRequest, OAuthProviderExchange,
         SecretCleanupReport, SecretCleanupRequest, SecretSubmitRequest, SecretSubmitResult,
     };
@@ -810,8 +811,7 @@ mod tests {
 
         async fn get_account(
             &self,
-            _scope: &AuthProductScope,
-            _account_id: CredentialAccountId,
+            _request: CredentialAccountLookupRequest,
         ) -> Result<Option<CredentialAccount>, AuthProductError> {
             unreachable!("constructor tests do not call credential-account methods")
         }
@@ -835,6 +835,20 @@ mod tests {
         async fn select_unique_configured_account(
             &self,
             _request: CredentialAccountSelectionRequest,
+        ) -> Result<CredentialAccountProjection, AuthProductError> {
+            unreachable!("constructor tests do not call credential-account methods")
+        }
+
+        async fn project_credential_recovery(
+            &self,
+            _request: CredentialRecoveryRequest,
+        ) -> Result<CredentialRecoveryProjection, AuthProductError> {
+            unreachable!("constructor tests do not call credential-account methods")
+        }
+
+        async fn select_configured_account(
+            &self,
+            _request: CredentialAccountChoiceRequest,
         ) -> Result<CredentialAccountProjection, AuthProductError> {
             unreachable!("constructor tests do not call credential-account methods")
         }
