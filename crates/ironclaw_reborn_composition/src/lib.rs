@@ -49,7 +49,9 @@ mod webui_serve;
 mod webui_ws_origin;
 
 pub use auth::{
-    RebornAuthContinuationDispatcher, RebornOAuthCallbackError, RebornOAuthCallbackOutcome,
+    RebornAuthContinuationDispatcher, RebornAuthProductError, RebornManualTokenChallenge,
+    RebornManualTokenError, RebornManualTokenSetupRequest, RebornManualTokenSubmitRequest,
+    RebornManualTokenSubmitResponse, RebornOAuthCallbackError, RebornOAuthCallbackOutcome,
     RebornOAuthCallbackRequest, RebornOAuthCallbackResponse, RebornProductAuthServicePorts,
     RebornProductAuthServices,
 };
