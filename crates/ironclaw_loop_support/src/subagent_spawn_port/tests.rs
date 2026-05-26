@@ -2,12 +2,13 @@ use chrono::Utc;
 use ironclaw_host_api::{AgentId, TenantId, UserId};
 use ironclaw_threads::{
     AcceptedInboundMessage, AcceptedInboundMessageReplay, AppendAssistantDraftRequest,
-    AppendToolResultReferenceRequest, ContextMessages, ContextWindow, CreateSummaryArtifactRequest,
-    InMemorySessionThreadService, LatestThreadMessageRequest, ListThreadsForScopeRequest,
-    ListThreadsForScopeResponse, LoadContextMessagesRequest, LoadContextWindowRequest,
-    RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
-    SessionThreadRecord, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageRecord,
-    UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
+    AppendCapabilityDisplayPreviewRequest, AppendToolResultReferenceRequest, ContextMessages,
+    ContextWindow, CreateSummaryArtifactRequest, InMemorySessionThreadService,
+    LatestThreadMessageRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
+    LoadContextMessagesRequest, LoadContextWindowRequest, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord, SummaryArtifact,
+    ThreadHistory, ThreadHistoryRequest, ThreadMessageRecord, UpdateAssistantDraftRequest,
+    UpdateToolResultReferenceRequest,
 };
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunResponse, EventCursor, GetRunStateRequest,
@@ -397,6 +398,13 @@ impl SessionThreadService for FailingMarkThreadService {
         request: AppendToolResultReferenceRequest,
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         self.inner.append_tool_result_reference(request).await
+    }
+
+    async fn append_capability_display_preview(
+        &self,
+        request: AppendCapabilityDisplayPreviewRequest,
+    ) -> Result<ThreadMessageRecord, SessionThreadError> {
+        self.inner.append_capability_display_preview(request).await
     }
 
     async fn update_tool_result_reference(
