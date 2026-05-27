@@ -68,9 +68,8 @@ use ironclaw_turns::{
 
 use crate::default_system_prompt::seed_default_system_prompt;
 use crate::input::{RebornRuntimeProcessBinding, RebornStorageInput};
-use crate::local_dev_mounts::{
-    skill_context_mount_view, skill_management_mount_view, workspace_mount_view,
-};
+use crate::lifecycle::{RebornLocalSkillManagementPort, build_local_skill_management_port};
+use crate::local_dev_mounts::{skill_context_mount_view, workspace_mount_view};
 use crate::{
     RebornAuthContinuationDispatcher, RebornBuildError, RebornBuildInput, RebornCompositionProfile,
     RebornFacadeReadiness, RebornProductAuthServicePorts, RebornProductAuthServices,
@@ -79,7 +78,6 @@ use crate::{
 use crate::{
     available_extensions::AvailableExtensionCatalog,
     extension_lifecycle::RebornLocalExtensionManagementPort,
-    lifecycle::RebornLocalSkillManagementPort,
 };
 
 #[cfg(feature = "libsql")]
@@ -479,15 +477,7 @@ fn build_local_dev_store_graph(
         skill_context_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         })?;
-    let skill_management_mounts =
-        skill_management_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
-            reason: error.to_string(),
-        })?;
-    let skill_management = Arc::new(RebornLocalSkillManagementPort::new(
-        owner_user_id,
-        filesystem,
-        skill_management_mounts,
-    ));
+    let skill_management = build_local_skill_management_port(owner_user_id, filesystem)?;
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
@@ -552,15 +542,7 @@ fn build_local_dev_store_graph(
         skill_context_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         })?;
-    let skill_management_mounts =
-        skill_management_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
-            reason: error.to_string(),
-        })?;
-    let skill_management = Arc::new(RebornLocalSkillManagementPort::new(
-        owner_user_id,
-        filesystem,
-        skill_management_mounts,
-    ));
+    let skill_management = build_local_skill_management_port(owner_user_id, filesystem)?;
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),

@@ -1,6 +1,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{future::Future, thread};
 
 use anyhow::Context;
 use ironclaw_reborn_composition::{
@@ -23,6 +24,31 @@ pub(crate) fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+pub(crate) fn block_on_cli<F, T, E>(future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: Into<anyhow::Error> + Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return thread::spawn(move || block_on_cli_future(future))
+            .join()
+            .map_err(|_| anyhow::anyhow!("CLI async task thread panicked"))?;
+    }
+    block_on_cli_future(future)
+}
+
+fn block_on_cli_future<F, T, E>(future: F) -> anyhow::Result<T>
+where
+    F: Future<Output = Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(future).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -232,11 +258,7 @@ pub(crate) fn build_runtime_input_with_options(
 
     reject_unsupported_runtime_sections(config_file.as_ref(), caller)?;
 
-    let owner_id = config_file
-        .as_ref()
-        .and_then(|file| file.identity.as_ref())
-        .and_then(|identity| identity.default_owner.as_deref())
-        .unwrap_or("reborn-cli");
+    let owner_id = default_owner_id(config_file.as_ref());
 
     let local_dev_root: PathBuf = config.home().path().join("local-dev");
 
@@ -299,6 +321,15 @@ pub(crate) fn build_runtime_input_with_options(
     Ok(runtime_input)
 }
 
+pub(crate) fn default_owner_id(
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> &str {
+    config_file
+        .and_then(|file| file.identity.as_ref())
+        .and_then(|identity| identity.default_owner.as_deref())
+        .unwrap_or("reborn-cli")
+}
+
 fn confirmed_host_home_root(options: RuntimeInputOptions) -> anyhow::Result<PathBuf> {
     debug_assert!(options.confirm_host_access);
     std::env::var_os("HOME")
@@ -316,7 +347,7 @@ fn composition_profile(profile: RebornProfile) -> RebornCompositionProfile {
     }
 }
 
-fn read_config_file(
+pub(crate) fn read_config_file(
     config: &RebornBootConfig,
 ) -> anyhow::Result<Option<ironclaw_reborn_config::RebornConfigFile>> {
     use ironclaw_reborn_config::RebornConfigFile;
@@ -356,7 +387,7 @@ fn runtime_identity(
     }
 }
 
-fn effective_profile(
+pub(crate) fn effective_profile(
     config: &RebornBootConfig,
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
 ) -> anyhow::Result<RebornProfile> {
@@ -451,9 +482,16 @@ mod tests {
     use ironclaw_reborn_config::RebornBootConfig;
 
     use super::{
-        RuntimeInputCaller, RuntimeInputOptions, build_runtime_input,
+        RuntimeInputCaller, RuntimeInputOptions, block_on_cli, build_runtime_input,
         build_runtime_input_with_options,
     };
+
+    #[tokio::test]
+    async fn block_on_cli_can_run_inside_existing_tokio_runtime() {
+        let value = block_on_cli(async { Ok::<_, anyhow::Error>(42) }).expect("block future");
+
+        assert_eq!(value, 42);
+    }
 
     #[test]
     fn build_runtime_input_maps_configured_cli_identity() {
