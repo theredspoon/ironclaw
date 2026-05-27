@@ -39,8 +39,8 @@ use std::{
 
 use async_trait::async_trait;
 use ironclaw_filesystem::{
-    CasExpectation, ContentType, Entry, FilesystemError, FilesystemOperation, RecordVersion,
-    RootFilesystem, ScopedFilesystem,
+    CasExpectation, ContentType, Entry, FileType, FilesystemError, FilesystemOperation,
+    RecordVersion, RootFilesystem, ScopedFilesystem,
 };
 use ironclaw_host_api::{HostApiError, InvocationId, ResourceScope, ScopedPath, ThreadId};
 use serde::{Deserialize, Serialize};
@@ -53,12 +53,13 @@ use crate::{
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
     AppendToolResultReferenceRequest, CapabilityDisplayPreviewEnvelope, ContextMessage,
     ContextMessages, ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest,
-    LatestThreadMessageRequest, LoadContextMessagesRequest, LoadContextWindowRequest,
-    MessageContent, MessageKind, MessageStatus, ProviderToolCallReferenceEnvelope,
-    RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
-    SessionThreadRecord, SessionThreadService, SummaryArtifact, ThreadHistory,
-    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
-    ToolResultReferenceEnvelope, UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
+    LatestThreadMessageRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
+    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
+    MessageStatus, ProviderToolCallReferenceEnvelope, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
+    SessionThreadService, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageId,
+    ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
+    UpdateToolResultReferenceRequest,
 };
 
 /// Bound on the CAS retry loop. Mirrors the run-state / authorization
@@ -1232,7 +1233,113 @@ where
             Err(PutError::Other(error)) => Err(error),
         }
     }
+
+    async fn list_threads_for_scope(
+        &self,
+        request: ListThreadsForScopeRequest,
+    ) -> Result<ListThreadsForScopeResponse, SessionThreadError> {
+        // Per-request work scales with total thread count, not page
+        // size: `list_dir` materializes every entry, we sort, then
+        // slice. The current `ScopedFilesystem` port doesn't expose a
+        // cursor-paginated directory listing, and adding one belongs
+        // upstream of this crate. Acceptable today because:
+        //   * local-dev / single-tenant deployments keep the per-scope
+        //     thread count bounded (per agent + project + owner).
+        //   * names are short strings; the dominant per-page cost is
+        //     the parallel `get` fan-out, not the directory scan.
+        // When a tenant grows past low thousands of threads under a
+        // single scope, replace this with a storage-level paginator
+        // (e.g. a secondary index keyed by `(scope, thread_id)`).
+        let limit = request
+            .limit
+            .map(|n| (n as usize).clamp(1, LIST_THREADS_MAX_PAGE_SIZE))
+            .unwrap_or(LIST_THREADS_DEFAULT_PAGE_SIZE);
+        let resource_scope = request.scope.to_resource_scope();
+        let root = scoped_path(&format!("{}/threads", scope_axes_string(&request.scope)))?;
+        let entries = match self.filesystem.list_dir(&resource_scope, &root).await {
+            Ok(entries) => entries,
+            Err(error) if is_not_found(&error) => {
+                return Ok(ListThreadsForScopeResponse {
+                    threads: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut thread_ids: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.file_type == FileType::Directory)
+            .map(|entry| entry.name)
+            .collect();
+        thread_ids.sort();
+        let start_index = match request.cursor.as_deref() {
+            Some(cursor) => thread_ids
+                .iter()
+                .position(|id| id.as_str() > cursor)
+                .unwrap_or(thread_ids.len()),
+            None => 0,
+        };
+        let end_index = start_index.saturating_add(limit).min(thread_ids.len());
+        let thread_ids_page: Vec<ThreadId> = thread_ids[start_index..end_index]
+            .iter()
+            .map(|name| ThreadId::new(name.clone()).map_err(invalid_path))
+            .collect::<Result<_, _>>()?;
+        // Parallelize the per-thread reads. `list_dir` only returns
+        // names, so each entry still requires a `get` to materialize
+        // the record — issuing them concurrently turns an N-sequential
+        // page (up to 200 reads) into a single bounded fan-out.
+        let reads = thread_ids_page
+            .iter()
+            .map(|tid| self.read_thread_versioned(&request.scope, tid));
+        let results: Vec<Result<Option<(StoredThreadRecord, RecordVersion)>, SessionThreadError>> =
+            futures::future::join_all(reads).await;
+        let mut page: Vec<SessionThreadRecord> = Vec::with_capacity(thread_ids_page.len());
+        for (thread_id, result) in thread_ids_page.iter().zip(results) {
+            match result {
+                Ok(Some((stored, _))) if stored.record.scope == request.scope => {
+                    page.push(stored.record);
+                }
+                Ok(_) => {
+                    // Absent record or scope-mismatched payload (e.g.
+                    // tenancy drift between disk and request) — skip
+                    // silently, matching the prior behavior.
+                }
+                Err(error) => {
+                    // silent-ok: list_threads is a sidebar read; one
+                    // corrupted record must not blank out the whole
+                    // page. The error is surfaced through tracing so
+                    // operators see it without the user losing the
+                    // rest of their thread list.
+                    tracing::warn!(
+                        thread_id = %thread_id.as_str(),
+                        scope = ?request.scope,
+                        ?error,
+                        "skipping unreadable thread record during list_threads_for_scope",
+                    );
+                }
+            }
+        }
+        // Cursor must reflect the last *attempted* thread_id in this
+        // slice, not the last *successful* one — otherwise a page
+        // where every record was unreadable or scope-mismatched
+        // would return `next_cursor: None` and the caller would treat
+        // a transient corruption as end-of-stream. Using the slice's
+        // last id guarantees the next request advances strictly past
+        // the inspected range.
+        let next_cursor = if end_index < thread_ids.len() {
+            thread_ids_page.last().map(|tid| tid.as_str().to_string())
+        } else {
+            None
+        };
+        Ok(ListThreadsForScopeResponse {
+            threads: page,
+            next_cursor,
+        })
+    }
 }
+
+const LIST_THREADS_DEFAULT_PAGE_SIZE: usize = 50;
+const LIST_THREADS_MAX_PAGE_SIZE: usize = 200;
 
 // ── Idempotency key shape ──────────────────────────────────────
 //
