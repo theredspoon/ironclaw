@@ -1754,6 +1754,7 @@ mod tests {
                 )
                 .expect("message ref"),
                 tool_result_provider_call: None,
+                tool_result_content: None,
             }],
             surface_version: None,
             resolved_model_route: None,

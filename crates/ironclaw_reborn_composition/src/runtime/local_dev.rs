@@ -22,21 +22,21 @@ use ironclaw_host_runtime::{
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
-    HostRuntimeLoopCapabilityPortFactory, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
-    loop_driver_execution_extension_id,
+    HostManagedToolResultContent, HostRuntimeLoopCapabilityPortFactory,
+    LoopCapabilityInputResolver, LoopCapabilityResultWriter, loop_driver_execution_extension_id,
 };
 use ironclaw_reborn::loop_driver_host::LoopCapabilityPortFactory;
 use ironclaw_threads::{
     AppendCapabilityDisplayPreviewRequest, CapabilityDisplayPreviewEnvelope,
     CapabilityDisplayPreviewEnvelopeInput, CapabilityDisplayPreviewStatus, SessionThreadService,
-    ThreadScope, ToolResultReferenceEnvelope, ToolResultSafeSummary,
+    ThreadScope,
 };
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 use ironclaw_turns::{
     LoopResultRef,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, CapabilityInputRef, LoopCapabilityPort,
-        LoopHostMilestoneSink, LoopRunContext, ProviderToolCall,
+        LoopHostMilestoneSink, LoopRunContext, ProviderToolCall, sanitize_model_visible_text,
     },
 };
 
@@ -184,7 +184,9 @@ impl LoopCapabilityPortFactory for LocalDevLoopCapabilityPortFactory {
 
 const LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_REFS: usize = 1024;
 const LOCAL_DEV_CAPABILITY_IO_MAX_STAGED_BYTES: usize = 4 * 1024 * 1024;
-const MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES: usize = 480;
+// Replay payload cap for provider calls. This is a model-window guard, not a
+// safe-summary formatter; the staged result remains available for follow-up.
+const LOCAL_DEV_MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES: usize = 100_000;
 
 struct LocalDevCapabilityIo {
     inputs: StdMutex<StagedValueStore>,
@@ -594,63 +596,53 @@ fn hydrate_tool_result_messages(
         if message.role != HostManagedModelMessageRole::ToolResult {
             continue;
         }
-        let mut envelope: ToolResultReferenceEnvelope = serde_json::from_str(&message.content)
-            .map_err(|error| {
-                ironclaw_loop_support::raw_host_managed_model_error(
-                    "local_dev_model_replay",
-                    "decode_tool_result_envelope",
+        let envelope = match message.tool_result_content.as_ref() {
+            Some(HostManagedToolResultContent::Reference { envelope }) => envelope,
+            Some(HostManagedToolResultContent::Resolved { .. }) => continue,
+            None => {
+                return Err(HostManagedModelError::safe(
                     HostManagedModelErrorKind::InvalidRequest,
-                    "tool result reference transcript content is invalid",
-                    error,
-                )
-            })?;
+                    "tool result replay content is missing",
+                ));
+            }
+        };
         let output = capability_io
             .result_output(&envelope.result_ref)
             .map_err(model_capability_io_error)?;
         let Some(output) = output else {
             continue;
         };
-        envelope.safe_summary = ToolResultSafeSummary::new(model_visible_tool_output(&output))
-            .map_err(|error| {
-                ironclaw_loop_support::raw_host_managed_model_error(
-                    "local_dev_model_replay",
-                    "sanitize_tool_result",
-                    HostManagedModelErrorKind::InvalidRequest,
-                    "tool result output could not be represented safely for model replay",
-                    error,
-                )
-            })?;
-        message.content = serde_json::to_string(&envelope).map_err(|error| {
-            let safe_summary = error.to_string();
-            ironclaw_loop_support::raw_host_managed_model_error(
-                "local_dev_model_replay",
-                "encode_tool_result_envelope",
-                HostManagedModelErrorKind::InvalidRequest,
-                safe_summary,
-                error,
-            )
-        })?;
+        message.content = model_visible_tool_result_content(&output)?;
+        message.tool_result_content = Some(HostManagedToolResultContent::Resolved {
+            safe_summary: envelope.safe_summary.clone(),
+        });
     }
     Ok(request)
 }
 
-/// Convert local-dev tool output into a `ToolResultSafeSummary`-compatible replay string.
-/// This is not product-live canonical result storage; it is a bounded local-dev bridge so provider
-/// follow-up calls receive useful output while preserving the transcript safe-summary contract.
-fn model_visible_tool_output(output: &serde_json::Value) -> String {
-    let mut sanitized = String::from("tool output");
-    append_model_visible_value(output, &mut sanitized);
-    let sanitized = sanitized.split_whitespace().collect::<Vec<_>>().join(" ");
-    if ToolResultSafeSummary::new(sanitized.clone()).is_ok() {
-        sanitized
-    } else {
-        "tool output available".to_string()
+fn model_visible_tool_result_content(
+    output: &serde_json::Value,
+) -> Result<String, HostManagedModelError> {
+    let mut content =
+        String::with_capacity(LOCAL_DEV_MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES.min(4096));
+    let truncated = append_model_visible_value(output, &mut content);
+    if content.is_empty() {
+        return Err(HostManagedModelError::safe(
+            HostManagedModelErrorKind::InvalidRequest,
+            "tool result output could not be represented for model replay",
+        ));
     }
+    if truncated {
+        content.push_str("\n\n[... truncated: showing first ");
+        content.push_str(&LOCAL_DEV_MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES.to_string());
+        content.push_str(" bytes. Use a follow-up tool call to inspect the full result.]");
+    }
+    Ok(content)
 }
 
-fn append_model_visible_value(value: &serde_json::Value, output: &mut String) {
-    if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
-        return;
+fn append_model_visible_value(value: &serde_json::Value, output: &mut String) -> bool {
+    if output.len() >= LOCAL_DEV_MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+        return true;
     }
     match value {
         serde_json::Value::Null => append_sanitized_capped(" null", output),
@@ -658,29 +650,37 @@ fn append_model_visible_value(value: &serde_json::Value, output: &mut String) {
         serde_json::Value::Number(value) => append_sanitized_capped(&format!(" {value}"), output),
         serde_json::Value::String(value) => append_sanitized_capped(&format!(" {value}"), output),
         serde_json::Value::Array(values) => {
+            if append_sanitized_capped(" array", output) {
+                return true;
+            }
             for value in values {
-                append_model_visible_value(value, output);
-                if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
-                    break;
+                if append_model_visible_value(value, output) {
+                    return true;
                 }
             }
+            false
         }
         serde_json::Value::Object(values) => {
+            if append_sanitized_capped(" object", output) {
+                return true;
+            }
             for (key, value) in values {
-                append_sanitized_capped(&format!(" {key}"), output);
-                append_model_visible_value(value, output);
-                if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
-                    break;
+                if append_sanitized_capped(&format!(" {key}"), output)
+                    || append_model_visible_value(value, output)
+                {
+                    return true;
                 }
             }
+            false
         }
     }
 }
 
-fn append_sanitized_capped(value: &str, output: &mut String) {
+fn append_sanitized_capped(value: &str, output: &mut String) -> bool {
+    let value = sanitize_model_visible_text(value.to_string());
     for character in value.chars() {
-        if output.len() >= MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
-            break;
+        if output.len() >= LOCAL_DEV_MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+            return true;
         }
         let character = if character.is_control()
             || matches!(
@@ -691,11 +691,12 @@ fn append_sanitized_capped(value: &str, output: &mut String) {
         } else {
             character
         };
-        if output.len() + character.len_utf8() > MODEL_VISIBLE_TOOL_OUTPUT_MAX_BYTES {
-            break;
+        if output.len() + character.len_utf8() > LOCAL_DEV_MODEL_VISIBLE_TOOL_RESULT_MAX_BYTES {
+            return true;
         }
         output.push(character);
     }
+    false
 }
 
 fn model_capability_io_error(error: AgentLoopHostError) -> HostManagedModelError {
