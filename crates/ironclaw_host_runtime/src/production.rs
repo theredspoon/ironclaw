@@ -43,12 +43,12 @@ use ironclaw_trust::{HostTrustPolicy, TrustDecision, TrustError, TrustPolicy, Tr
 use crate::{
     BuiltinObligationHandler, BuiltinObligationServices, CancelRuntimeWorkOutcome,
     CancelRuntimeWorkRequest, CapabilitySurfaceVersion, HostRuntime, HostRuntimeError,
-    HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeBackendHealth,
-    RuntimeBlockedReason, RuntimeCapabilityCompleted, RuntimeCapabilityFailure,
-    RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest,
-    RuntimeFailureKind, RuntimeStatusRequest, RuntimeWorkId, RuntimeWorkSummary,
-    VisibleCapabilityRequest, VisibleCapabilitySurface, plan_capability,
-    surface::CapabilityCatalog,
+    HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
+    RuntimeBackendHealth, RuntimeBlockedReason, RuntimeCapabilityCompleted,
+    RuntimeCapabilityFailure, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
+    RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeGateId, RuntimeStatusRequest,
+    RuntimeWorkId, RuntimeWorkSummary, VisibleCapabilityRequest, VisibleCapabilitySurface,
+    plan_capability, surface::CapabilityCatalog,
 };
 
 /// Default production wiring for [`HostRuntime`].
@@ -526,10 +526,15 @@ impl HostRuntime for DefaultHostRuntime {
                     idempotency_key = idempotency_key.as_deref().unwrap_or(""),
                     "capability resume failed"
                 );
-                Ok(RuntimeCapabilityOutcome::Failed(failure_from(
-                    error,
-                    capability_id,
-                )))
+                match error {
+                    CapabilityInvocationError::AuthorizationRequiresAuth { capability } => {
+                        Ok(auth_required_outcome(capability))
+                    }
+                    other => Ok(RuntimeCapabilityOutcome::Failed(failure_from(
+                        other,
+                        capability_id,
+                    ))),
+                }
             }
         }
     }
@@ -978,6 +983,9 @@ impl DefaultHostRuntime {
                     }
                 }
             }
+            CapabilityInvocationError::AuthorizationRequiresAuth { capability } => {
+                Ok(auth_required_outcome(capability))
+            }
             other => Ok(RuntimeCapabilityOutcome::Failed(failure_from(
                 other,
                 capability_id,
@@ -1248,6 +1256,15 @@ fn completed_outcome_from(
     }
 }
 
+fn auth_required_outcome(capability_id: CapabilityId) -> RuntimeCapabilityOutcome {
+    RuntimeCapabilityOutcome::AuthRequired(RuntimeAuthGate {
+        gate_id: RuntimeGateId::new(),
+        capability_id,
+        reason: RuntimeBlockedReason::AuthRequired,
+        required_secrets: Vec::new(),
+    })
+}
+
 fn spawned_process_outcome_from(
     result: CapabilitySpawnResult,
     capability_id: CapabilityId,
@@ -1304,6 +1321,7 @@ fn sanitized_failure_message(error: &CapabilityInvocationError) -> Option<String
         | AuthorizationDenied { .. }
         | UnsupportedObligations { .. }
         | ObligationFailed { .. }
+        | AuthorizationRequiresAuth { .. }
         | AuthorizationRequiresApproval { .. }
         | ApprovalRequestMismatch { .. }
         | ApprovalFingerprintMismatch { .. }
@@ -1325,6 +1343,9 @@ fn sanitized_failure_message(error: &CapabilityInvocationError) -> Option<String
 pub(crate) fn failure_kind_from(error: &CapabilityInvocationError) -> RuntimeFailureKind {
     match error {
         CapabilityInvocationError::UnknownCapability { .. } => RuntimeFailureKind::MissingRuntime,
+        CapabilityInvocationError::AuthorizationRequiresAuth { .. } => {
+            RuntimeFailureKind::Authorization
+        }
         CapabilityInvocationError::AuthorizationDenied { .. }
         | CapabilityInvocationError::UnsupportedObligations { .. }
         | CapabilityInvocationError::AuthorizationRequiresApproval { .. }
