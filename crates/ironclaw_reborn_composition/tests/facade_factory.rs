@@ -183,6 +183,14 @@ fn local_dev_builtin_visible_request() -> VisibleCapabilityRequest {
                 "builtin.http",
                 vec![EffectKind::DispatchCapability, EffectKind::Network],
             ),
+            local_dev_grant(
+                "builtin.http.save",
+                vec![
+                    EffectKind::DispatchCapability,
+                    EffectKind::Network,
+                    EffectKind::WriteFilesystem,
+                ],
+            ),
         ],
     };
     let context = ExecutionContext::local_default(
@@ -201,7 +209,11 @@ fn local_dev_builtin_visible_request() -> VisibleCapabilityRequest {
         TrustDecision {
             effective_trust: EffectiveTrustClass::user_trusted(),
             authority_ceiling: AuthorityCeiling {
-                allowed_effects: vec![EffectKind::DispatchCapability, EffectKind::Network],
+                allowed_effects: vec![
+                    EffectKind::DispatchCapability,
+                    EffectKind::Network,
+                    EffectKind::WriteFilesystem,
+                ],
                 max_resource_ceiling: None,
             },
             provenance: TrustProvenance::AdminConfig,
@@ -513,6 +525,10 @@ async fn local_dev_runtime_policy_exposes_http_capability() {
         visible_ids.contains(&"builtin.http"),
         "local-dev facade should expose host HTTP when the runtime policy allows network"
     );
+    assert!(
+        visible_ids.contains(&"builtin.http.save"),
+        "local-dev facade should expose saved-body HTTP when network and filesystem are allowed"
+    );
 }
 
 #[cfg(feature = "libsql")]
@@ -543,6 +559,10 @@ async fn local_dev_runtime_policy_hides_http_capability() {
     assert!(
         !visible_ids.contains(&"builtin.http"),
         "local-dev facade must forward the supplied runtime policy before visible-surface filtering"
+    );
+    assert!(
+        !visible_ids.contains(&"builtin.http.save"),
+        "local-dev facade must hide saved-body HTTP when network is denied"
     );
 }
 
