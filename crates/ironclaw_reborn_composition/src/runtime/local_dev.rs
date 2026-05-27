@@ -46,6 +46,10 @@ use crate::{
     projection::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore},
 };
 
+mod extension_surface;
+
+use extension_surface::{LocalDevExtensionSurface, LocalDevExtensionSurfaceSource};
+
 pub(super) struct LocalDevCapabilityWiring {
     pub(super) capability_factory: Arc<dyn LoopCapabilityPortFactory>,
     pub(super) capability_input_resolver: Arc<dyn LoopCapabilityInputResolver>,
@@ -63,10 +67,10 @@ pub(super) fn capability_wiring(
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
 ) -> Option<LocalDevCapabilityWiring> {
     let runtime = services.host_runtime.clone()?;
-    let workspace_mounts = services
-        .local_runtime
-        .as_ref()
-        .map(|runtime| runtime.workspace_mounts.clone())?;
+    let local_runtime = services.local_runtime.as_ref()?;
+    let workspace_mounts = local_runtime.workspace_mounts.clone();
+    let extension_surface_source =
+        LocalDevExtensionSurfaceSource::new(local_runtime.extension_management.clone());
     let display_previews = Arc::new(CapabilityDisplayPreviewStore::default());
     let capability_io = Arc::new(LocalDevCapabilityIo::new_with_durable_previews(
         Arc::clone(&display_previews),
@@ -80,6 +84,7 @@ pub(super) fn capability_wiring(
             runtime,
             user_id,
             workspace_mounts,
+            extension_surface_source,
             Arc::clone(&capability_input_resolver),
             Arc::clone(&capability_result_writer),
             milestone_sink,
@@ -102,6 +107,7 @@ struct LocalDevLoopCapabilityPortFactory {
     runtime: Arc<dyn HostRuntime>,
     user_id: UserId,
     workspace_mounts: MountView,
+    extension_surface_source: LocalDevExtensionSurfaceSource,
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
@@ -112,6 +118,7 @@ impl LocalDevLoopCapabilityPortFactory {
         runtime: Arc<dyn HostRuntime>,
         user_id: UserId,
         workspace_mounts: MountView,
+        extension_surface_source: LocalDevExtensionSurfaceSource,
         input_resolver: Arc<dyn LoopCapabilityInputResolver>,
         result_writer: Arc<dyn LoopCapabilityResultWriter>,
         milestone_sink: Arc<dyn LoopHostMilestoneSink>,
@@ -120,6 +127,7 @@ impl LocalDevLoopCapabilityPortFactory {
             runtime,
             user_id,
             workspace_mounts,
+            extension_surface_source,
             input_resolver,
             result_writer,
             milestone_sink,
@@ -135,11 +143,17 @@ impl LoopCapabilityPortFactory for LocalDevLoopCapabilityPortFactory {
     ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
         let workspace_mounts = self.workspace_mounts.clone();
         let skill_mounts = skill_management_mount_view().map_err(host_api_agent_loop_error)?;
+        let extension_surface = self
+            .extension_surface_source
+            .snapshot()
+            .await
+            .map_err(host_api_agent_loop_error)?;
         let visible_request = local_dev_visible_capability_request(
             run_context,
             self.user_id.clone(),
             workspace_mounts.clone(),
             skill_mounts.clone(),
+            &extension_surface,
         )?;
         let mut factory = HostRuntimeLoopCapabilityPortFactory::new(
             Arc::clone(&self.runtime),
@@ -684,9 +698,13 @@ fn local_dev_visible_capability_request(
     user_id: UserId,
     workspace_mounts: MountView,
     skill_mounts: MountView,
+    extension_surface: &LocalDevExtensionSurface,
 ) -> Result<HostVisibleCapabilityRequest, AgentLoopHostError> {
     let extension_id = loop_driver_execution_extension_id(run_context)?;
-    let grants = local_dev_builtin_grants(&extension_id, &workspace_mounts, &skill_mounts)?;
+    let mut grants = local_dev_builtin_grants(&extension_id, &workspace_mounts, &skill_mounts)?;
+    grants
+        .grants
+        .extend(extension_surface.grants(&extension_id));
     let mut context = ExecutionContext::local_default(
         user_id,
         extension_id,
@@ -720,6 +738,7 @@ fn local_dev_visible_capability_request(
             evaluated_at: Utc::now(),
         },
     );
+    provider_trust.extend(extension_surface.provider_trust());
 
     Ok(HostVisibleCapabilityRequest::new(
         context,
