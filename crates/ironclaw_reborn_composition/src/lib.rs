@@ -695,6 +695,14 @@ impl SecretStore for SharedSecretStore {
         self.inner.metadata(scope, handle).await
     }
 
+    async fn delete(
+        &self,
+        scope: &ResourceScope,
+        handle: &SecretHandle,
+    ) -> Result<bool, SecretStoreError> {
+        self.inner.delete(scope, handle).await
+    }
+
     async fn lease_once(
         &self,
         scope: &ResourceScope,
