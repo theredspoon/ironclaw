@@ -366,6 +366,7 @@ mod tests {
                 EffectKind::DispatchCapability,
                 EffectKind::ReadFilesystem,
                 EffectKind::WriteFilesystem,
+                EffectKind::DeleteFilesystem,
                 EffectKind::SpawnProcess,
                 EffectKind::ExecuteCode,
                 EffectKind::Network
@@ -492,6 +493,7 @@ mod tests {
                 EffectKind::DispatchCapability,
                 EffectKind::ReadFilesystem,
                 EffectKind::WriteFilesystem,
+                EffectKind::DeleteFilesystem,
                 EffectKind::Network
             ]
         );
@@ -499,6 +501,22 @@ mod tests {
         assert_eq!(
             skill_install_grant.constraints.network,
             local_dev_shell_network_policy
+        );
+
+        let skill_remove_grant = grant_for(SKILL_REMOVE_CAPABILITY_ID);
+        assert_eq!(
+            skill_remove_grant.constraints.allowed_effects,
+            vec![
+                EffectKind::DispatchCapability,
+                EffectKind::ReadFilesystem,
+                EffectKind::WriteFilesystem,
+                EffectKind::DeleteFilesystem
+            ]
+        );
+        assert_eq!(skill_remove_grant.constraints.mounts, skill_mounts);
+        assert_eq!(
+            skill_remove_grant.constraints.network,
+            NetworkPolicy::default()
         );
     }
 
