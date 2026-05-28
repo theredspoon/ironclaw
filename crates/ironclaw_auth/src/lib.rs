@@ -14,6 +14,7 @@ mod credential;
 mod error;
 mod fakes;
 mod flow;
+mod google_provider;
 mod ids;
 mod interaction;
 mod oauth;
@@ -41,6 +42,10 @@ pub use flow::{
     NewAuthFlow, OAuthCallbackClaimRequest, OAuthCallbackFailureInput, OAuthCallbackInput,
     ProviderCallbackOutcome,
 };
+pub use google_provider::{
+    GoogleProviderEgressPolicyAuthorizer, GoogleProviderStoredTokens, GoogleProviderTokenSet,
+    GoogleProviderTokenSink, GoogleProviderTokenStorageRequest,
+};
 pub use ids::{
     AuthFlowId, AuthGateRef, AuthInteractionId, AuthProviderId, AuthSessionId,
     AuthorizationCodeHash, CredentialAccountId, CredentialAccountLabel, LifecyclePackageRef,
@@ -61,7 +66,8 @@ pub use oauth::{
 };
 pub use provider::{
     AuthProviderClient, OAuthAuthorizationCode, OAuthProviderCallbackRequest,
-    OAuthProviderExchange, OAuthProviderRefresh, OAuthProviderRefreshRequest, PkceVerifierSecret,
+    OAuthProviderExchange, OAuthProviderExchangeContext, OAuthProviderRefresh,
+    OAuthProviderRefreshRequest, PkceVerifierSecret, validate_provider_callback_request,
 };
 pub use scope::{AuthProductScope, AuthSurface};
 
