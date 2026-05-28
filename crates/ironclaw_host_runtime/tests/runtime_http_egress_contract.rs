@@ -8,8 +8,8 @@ use ironclaw_host_api::{
     MountGrant, MountPermissions, MountView, NetworkMethod, NetworkPolicy, NetworkScheme,
     NetworkTargetPattern, Obligation, ResourceEstimate, ResourceScope, RuntimeCredentialInjection,
     RuntimeCredentialSource, RuntimeCredentialTarget, RuntimeHttpEgress, RuntimeHttpEgressError,
-    RuntimeHttpEgressRequest, RuntimeHttpSaveTarget, RuntimeKind, ScopedPath, SecretHandle,
-    TenantId, TrustClass, UserId, VirtualPath,
+    RuntimeHttpEgressRequest, RuntimeHttpEgressResponse, RuntimeHttpSaveTarget, RuntimeKind,
+    ScopedPath, SecretHandle, TenantId, TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
     BuiltinObligationServices, HostHttpEgressService, RuntimeHttpBodyStore,
@@ -21,6 +21,7 @@ use ironclaw_mcp::{
 };
 use ironclaw_network::{
     NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse, NetworkUsage,
+    PolicyNetworkHttpEgress, ReqwestNetworkTransport,
 };
 use ironclaw_resources::InMemoryResourceGovernor;
 use ironclaw_scripts::{ScriptHostHttpRequest, ScriptRuntimeHttpAdapter};
@@ -31,6 +32,8 @@ use ironclaw_secrets::{
 use ironclaw_wasm::{WasmHostHttp, WasmHttpRequest, WasmRuntimeHttpAdapter};
 use serde_json::{Value, json};
 use std::{
+    io::{Read, Write},
+    net::TcpListener,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -241,7 +244,7 @@ fn host_http_egress_reuses_staged_secret_for_multiple_targets_in_one_request() {
             scope: scope.clone(),
             capability_id: sample_capability_id(),
             method: NetworkMethod::Post,
-            url: "https://api.example.test/v1/run".to_string(),
+            url: "https://api.example.test/v1/__credential__/run".to_string(),
             headers: vec![],
             body: b"hello".to_vec(),
             network_policy: sample_policy(),
@@ -267,6 +270,16 @@ fn host_http_egress_reuses_staged_secret_for_multiple_targets_in_one_request() {
                     },
                     required: true,
                 },
+                RuntimeCredentialInjection {
+                    handle: handle.clone(),
+                    source: RuntimeCredentialSource::StagedObligation {
+                        capability_id: capability_id.clone(),
+                    },
+                    target: RuntimeCredentialTarget::PathPlaceholder {
+                        placeholder: "__credential__".to_string(),
+                    },
+                    required: true,
+                },
             ],
             response_body_limit: Some(4096),
             save_body_to: None,
@@ -288,9 +301,201 @@ fn host_http_egress_reuses_staged_secret_for_multiple_targets_in_one_request() {
     );
     assert_eq!(
         requests[0].url,
-        "https://api.example.test/v1/run?token=sk-staged-secret"
+        "https://api.example.test/v1/sk-staged-secret/run?token=sk-staged-secret"
     );
     drop(requests);
+}
+
+#[test]
+fn host_http_egress_rejects_invalid_path_placeholder_before_transport() {
+    for (placeholder, url) in [
+        ("", "https://api.example.test/v1/__credential__/run"),
+        (
+            "bad/placeholder",
+            "https://api.example.test/v1/__credential__/run",
+        ),
+        (
+            "bad?placeholder",
+            "https://api.example.test/v1/__credential__/run",
+        ),
+        (
+            "bad#placeholder",
+            "https://api.example.test/v1/__credential__/run",
+        ),
+        (
+            "__missing__",
+            "https://api.example.test/v1/__credential__/run",
+        ),
+    ] {
+        let network = RecordingNetwork::ok(NetworkHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: br#"{"ok":true}"#.to_vec(),
+            usage: NetworkUsage {
+                request_bytes: 5,
+                response_bytes: 11,
+                resolved_ip: None,
+            },
+        });
+        let network_recorder = network.requests.clone();
+        let scope = sample_scope();
+        let capability_id = sample_capability_id();
+        let handle = SecretHandle::new("api-token").unwrap();
+        let services = test_obligation_services();
+        stage_policy_sync(&services, &scope, &capability_id, sample_policy());
+        stage_secret_sync(
+            &services,
+            &scope,
+            &capability_id,
+            &handle,
+            "sk-staged-secret",
+        );
+        let service = services.host_http_egress(network);
+
+        let error = service
+            .execute(RuntimeHttpEgressRequest {
+                runtime: RuntimeKind::Script,
+                scope: scope.clone(),
+                capability_id: capability_id.clone(),
+                method: NetworkMethod::Post,
+                url: url.to_string(),
+                headers: vec![],
+                body: b"hello".to_vec(),
+                network_policy: sample_policy(),
+                credential_injections: vec![RuntimeCredentialInjection {
+                    handle: handle.clone(),
+                    source: RuntimeCredentialSource::StagedObligation {
+                        capability_id: capability_id.clone(),
+                    },
+                    target: RuntimeCredentialTarget::PathPlaceholder {
+                        placeholder: placeholder.to_string(),
+                    },
+                    required: true,
+                }],
+                response_body_limit: Some(4096),
+                save_body_to: None,
+                timeout_ms: None,
+            })
+            .expect_err("invalid path placeholder must fail before network dispatch");
+
+        assert!(matches!(
+            error,
+            ironclaw_host_api::RuntimeHttpEgressError::Credential { .. }
+        ));
+        assert!(
+            network_recorder.lock().unwrap().is_empty(),
+            "case {placeholder:?} must not dispatch to the network"
+        );
+    }
+}
+
+#[test]
+fn host_http_egress_rejects_path_placeholder_value_breaking_chars_before_transport() {
+    for material in [
+        "",
+        ".",
+        "..",
+        "sk-staged/secret",
+        "sk-staged?secret",
+        "sk-staged#secret",
+        "sk-staged\nsecret",
+        "sk-staged\0secret",
+        "sk-staged+secret",
+    ] {
+        let (error, network_recorder) = execute_path_placeholder_egress(
+            "https://api.example.test/v1/__credential__/run",
+            "__credential__",
+            material,
+        )
+        .expect_err("invalid path placeholder credential value must fail before network dispatch");
+
+        assert!(matches!(
+            error,
+            ironclaw_host_api::RuntimeHttpEgressError::Credential { .. }
+        ));
+        assert!(error.to_string().contains("path value is invalid"));
+        assert!(
+            network_recorder.lock().unwrap().is_empty(),
+            "material {material:?} must not dispatch to the network"
+        );
+    }
+}
+
+#[test]
+fn host_http_egress_requires_https_for_path_placeholder_before_transport() {
+    let (error, network_recorder) = execute_path_placeholder_egress(
+        "http://api.example.test/v1/__credential__/run",
+        "__credential__",
+        "sk-staged-secret",
+    )
+    .expect_err("path placeholder credential injection must require HTTPS");
+
+    assert!(matches!(
+        error,
+        ironclaw_host_api::RuntimeHttpEgressError::Credential { .. }
+    ));
+    assert!(error.to_string().contains("requires HTTPS"));
+    assert!(network_recorder.lock().unwrap().is_empty());
+}
+
+#[test]
+fn host_http_egress_rejects_multiple_path_placeholder_occurrences_before_transport() {
+    let (error, network_recorder) = execute_path_placeholder_egress(
+        "https://api.example.test/__credential__/v1/__credential__/run",
+        "__credential__",
+        "sk-staged-secret",
+    )
+    .expect_err("path placeholder credential injection must have one target segment");
+
+    assert!(matches!(
+        error,
+        ironclaw_host_api::RuntimeHttpEgressError::Credential { .. }
+    ));
+    assert!(error.to_string().contains("exactly once"));
+    assert!(network_recorder.lock().unwrap().is_empty());
+}
+
+#[test]
+fn host_http_egress_preserves_existing_path_encoding_when_rewriting_placeholder() {
+    let (_response, network_recorder) = execute_path_placeholder_egress(
+        "https://api.example.test/v1/foo%20bar/__credential__/run%2Ftail",
+        "__credential__",
+        "sk-staged-secret",
+    )
+    .expect("path placeholder rewrite should preserve existing encoded segments");
+
+    let requests = network_recorder.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url,
+        "https://api.example.test/v1/foo%20bar/sk-staged-secret/run%2Ftail"
+    );
+}
+
+#[test]
+fn host_http_egress_rejects_path_placeholder_target_url_errors_before_transport() {
+    for (url, expected_reason) in [
+        ("not a url", "credential injection target URL is invalid"),
+        (
+            "mailto:security@example.test",
+            "credential injection path placeholder requires HTTPS",
+        ),
+    ] {
+        let (error, network_recorder) =
+            execute_path_placeholder_egress(url, "__credential__", "sk-staged-secret").expect_err(
+                "invalid path placeholder target URL must fail before network dispatch",
+            );
+
+        assert!(matches!(
+            error,
+            ironclaw_host_api::RuntimeHttpEgressError::Credential { .. }
+        ));
+        assert!(error.to_string().contains(expected_reason));
+        assert!(
+            network_recorder.lock().unwrap().is_empty(),
+            "url {url:?} must not dispatch to the network"
+        );
+    }
 }
 
 #[test]
@@ -931,6 +1136,136 @@ fn host_http_egress_injects_and_redacts_url_encoded_query_credentials() {
 }
 
 #[test]
+fn host_http_egress_redacts_path_placeholder_credentials_from_response() {
+    let network = RecordingNetwork::ok(NetworkHttpResponse {
+        status: 302,
+        headers: vec![(
+            "location".to_string(),
+            "https://api.example.test/v1/sk-staged-secret/next".to_string(),
+        )],
+        body: b"upstream echoed sk-staged-secret".to_vec(),
+        usage: NetworkUsage {
+            request_bytes: 5,
+            response_bytes: 30,
+            resolved_ip: None,
+        },
+    });
+    let network_recorder = network.requests.clone();
+    let scope = sample_scope();
+    let capability_id = sample_capability_id();
+    let handle = SecretHandle::new("api-token").unwrap();
+    let services = test_obligation_services();
+    stage_policy_sync(&services, &scope, &capability_id, sample_policy());
+    stage_secret_sync(
+        &services,
+        &scope,
+        &capability_id,
+        &handle,
+        "sk-staged-secret",
+    );
+    let service = services.host_http_egress(network);
+
+    let response = service
+        .execute(RuntimeHttpEgressRequest {
+            runtime: RuntimeKind::Script,
+            scope,
+            capability_id: capability_id.clone(),
+            method: NetworkMethod::Post,
+            url: "https://api.example.test/v1/__credential__/run".to_string(),
+            headers: vec![],
+            body: b"hello".to_vec(),
+            network_policy: sample_policy(),
+            credential_injections: vec![RuntimeCredentialInjection {
+                handle,
+                source: RuntimeCredentialSource::StagedObligation { capability_id },
+                target: RuntimeCredentialTarget::PathPlaceholder {
+                    placeholder: "__credential__".to_string(),
+                },
+                required: true,
+            }],
+            response_body_limit: Some(4096),
+            save_body_to: None,
+            timeout_ms: None,
+        })
+        .expect("path placeholder credential response echoes should be redacted");
+
+    assert_eq!(response.status, 302);
+    assert!(response.redaction_applied);
+    let rendered_body = String::from_utf8(response.body).unwrap();
+    assert!(rendered_body.contains("[REDACTED]"));
+    assert!(!rendered_body.contains("sk-staged-secret"));
+    let location = response
+        .headers
+        .iter()
+        .find(|(name, _)| name == "location")
+        .map(|(_, value)| value.as_str())
+        .expect("location header should be preserved after redaction");
+    assert!(location.contains("[REDACTED]"));
+    assert!(!location.contains("sk-staged-secret"));
+
+    let requests = network_recorder.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url,
+        "https://api.example.test/v1/sk-staged-secret/run"
+    );
+}
+
+#[test]
+fn host_http_egress_redacts_path_placeholder_credentials_from_network_errors() {
+    let network = UrlEchoNetwork::new();
+    let network_recorder = network.requests.clone();
+    let scope = sample_scope();
+    let capability_id = sample_capability_id();
+    let handle = SecretHandle::new("api-token").unwrap();
+    let services = test_obligation_services();
+    stage_policy_sync(&services, &scope, &capability_id, sample_policy());
+    stage_secret_sync(
+        &services,
+        &scope,
+        &capability_id,
+        &handle,
+        "sk-staged-secret",
+    );
+    let service = services.host_http_egress(network);
+
+    let error = service
+        .execute(RuntimeHttpEgressRequest {
+            runtime: RuntimeKind::Script,
+            scope,
+            capability_id: capability_id.clone(),
+            method: NetworkMethod::Post,
+            url: "https://api.example.test/v1/__credential__/run".to_string(),
+            headers: vec![],
+            body: b"hello".to_vec(),
+            network_policy: sample_policy(),
+            credential_injections: vec![RuntimeCredentialInjection {
+                handle,
+                source: RuntimeCredentialSource::StagedObligation { capability_id },
+                target: RuntimeCredentialTarget::PathPlaceholder {
+                    placeholder: "__credential__".to_string(),
+                },
+                required: true,
+            }],
+            response_body_limit: Some(4096),
+            save_body_to: None,
+            timeout_ms: None,
+        })
+        .expect_err("network errors after path placeholder injection should be sanitized");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("transport_failed"));
+    assert!(!rendered.contains("sk-staged-secret"));
+    assert!(!rendered.contains("api.example.test/v1/sk-staged-secret/run"));
+    let requests = network_recorder.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url,
+        "https://api.example.test/v1/sk-staged-secret/run"
+    );
+}
+
+#[test]
 fn host_http_egress_forwards_timeout_to_network() {
     let network = RecordingNetwork::ok(NetworkHttpResponse {
         status: 200,
@@ -968,6 +1303,47 @@ fn host_http_egress_forwards_timeout_to_network() {
     let requests = network_recorder.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].timeout_ms, Some(250));
+}
+
+#[test]
+fn host_http_egress_with_reqwest_transport_returns_redirect_without_following() {
+    let (url, server) = single_response_server(
+        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/followed\r\nContent-Length: 0\r\n\r\n",
+    );
+    let network =
+        PolicyNetworkHttpEgress::new(ReqwestNetworkTransport::new(Duration::from_secs(2)));
+    let service = HostHttpEgressService::new_with_request_policy_for_tests(
+        network,
+        InMemorySecretStore::new(),
+    );
+
+    let response = service
+        .execute(RuntimeHttpEgressRequest {
+            runtime: RuntimeKind::Script,
+            scope: sample_scope(),
+            capability_id: sample_capability_id(),
+            method: NetworkMethod::Get,
+            url,
+            headers: vec![],
+            body: Vec::new(),
+            network_policy: local_http_policy(),
+            credential_injections: vec![],
+            response_body_limit: Some(1024),
+            save_body_to: None,
+            timeout_ms: None,
+        })
+        .expect("redirect responses should be returned to the caller, not followed");
+    server.join().unwrap();
+
+    assert_eq!(response.status, 302);
+    assert_eq!(
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.as_str()),
+        Some("http://127.0.0.1:9/followed")
+    );
 }
 
 #[test]
@@ -1620,12 +1996,12 @@ async fn mcp_http_client_cannot_use_direct_secret_store_lease_with_production_eg
         .await
         .expect_err("production MCP egress must require staged credentials");
 
-    assert_eq!(error, "credential_unavailable");
+    assert_eq!(error, "request_denied");
     let requests = network_recorder.lock().unwrap();
     assert_eq!(
         requests.len(),
-        2,
-        "MCP handshake may run unauthenticated, but credentials must not be exposed before tools/call"
+        0,
+        "MCP direct leases must fail before initialize, initialized, or tools/call transport"
     );
     assert!(requests.iter().all(|request| {
         !request
@@ -3057,6 +3433,63 @@ impl NetworkHttpEgress for RecordingNetwork {
     }
 }
 
+type RecordedRequests = Arc<Mutex<Vec<NetworkHttpRequest>>>;
+type PathPlaceholderEgressResult = Result<
+    (RuntimeHttpEgressResponse, RecordedRequests),
+    (RuntimeHttpEgressError, RecordedRequests),
+>;
+
+fn execute_path_placeholder_egress(
+    url: &str,
+    placeholder: &str,
+    material: &str,
+) -> PathPlaceholderEgressResult {
+    let network = RecordingNetwork::ok(NetworkHttpResponse {
+        status: 200,
+        headers: vec![],
+        body: br#"{"ok":true}"#.to_vec(),
+        usage: NetworkUsage {
+            request_bytes: 5,
+            response_bytes: 11,
+            resolved_ip: None,
+        },
+    });
+    let network_recorder = network.requests.clone();
+    let scope = sample_scope();
+    let capability_id = sample_capability_id();
+    let handle = SecretHandle::new("api-token").unwrap();
+    let services = test_obligation_services();
+    stage_policy_sync(&services, &scope, &capability_id, sample_policy());
+    stage_secret_sync(&services, &scope, &capability_id, &handle, material);
+    let service = services.host_http_egress(network);
+
+    let response = service.execute(RuntimeHttpEgressRequest {
+        runtime: RuntimeKind::Script,
+        scope,
+        capability_id: capability_id.clone(),
+        method: NetworkMethod::Post,
+        url: url.to_string(),
+        headers: vec![],
+        body: b"hello".to_vec(),
+        network_policy: sample_policy(),
+        credential_injections: vec![RuntimeCredentialInjection {
+            handle,
+            source: RuntimeCredentialSource::StagedObligation { capability_id },
+            target: RuntimeCredentialTarget::PathPlaceholder {
+                placeholder: placeholder.to_string(),
+            },
+            required: true,
+        }],
+        response_body_limit: Some(4096),
+        save_body_to: None,
+        timeout_ms: None,
+    });
+
+    response
+        .map(|response| (response, network_recorder.clone()))
+        .map_err(|error| (error, network_recorder))
+}
+
 struct TokioBackedSecretStore {
     inner: InMemorySecretStore,
 }
@@ -3314,4 +3747,28 @@ fn caller_supplied_policy() -> NetworkPolicy {
         deny_private_ip_ranges: false,
         max_egress_bytes: Some(1),
     }
+}
+
+fn local_http_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        allowed_targets: vec![NetworkTargetPattern {
+            scheme: Some(NetworkScheme::Http),
+            host_pattern: "127.0.0.1".to_string(),
+            port: None,
+        }],
+        deny_private_ip_ranges: false,
+        max_egress_bytes: Some(1024),
+    }
+}
+
+fn single_response_server(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).unwrap();
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (format!("http://127.0.0.1:{port}/test"), handle)
 }

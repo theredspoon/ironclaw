@@ -231,7 +231,7 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
     }));
 
     let planner_calls = planner.calls();
-    assert_eq!(planner_calls.len(), 3);
+    assert_eq!(planner_calls.len(), 4);
     assert!(planner_calls.iter().all(|call| call.scope == scope));
     assert!(
         planner_calls
@@ -244,7 +244,6 @@ async fn concrete_mcp_http_client_routes_json_rpc_through_shared_egress() {
 async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange() {
     let scope = sample_scope();
     let mut plan = host_http_plan();
-    let staged_obligation = plan.credential_injections[0].clone();
     let secret_store_lease = RuntimeCredentialInjection {
         handle: SecretHandle::new("legacy-token").unwrap(),
         source: RuntimeCredentialSource::SecretStoreLease,
@@ -254,13 +253,37 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
         },
         required: true,
     };
-    plan.credential_injections = vec![secret_store_lease, staged_obligation.clone()];
+    plan.credential_injections = vec![secret_store_lease];
     let egress = RecordingRuntimeEgress::json_rpc();
+    let planner = RecordingEgressPlanner::new(plan.clone());
     let client = McpHostHttpClient::new(
         McpRuntimeHttpAdapter::new(Arc::new(egress.clone())),
-        RecordingEgressPlanner::new(plan.clone()),
+        planner.clone(),
     );
 
+    let error = client
+        .call_tool(McpClientRequest {
+            provider: ExtensionId::new("github-mcp").unwrap(),
+            capability_id: CapabilityId::new("github-mcp.search").unwrap(),
+            scope: scope.clone(),
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            url: Some("https://mcp.example.test/mcp".to_string()),
+            input: json!({"query": "ironclaw"}),
+            max_output_bytes: 4096,
+        })
+        .await
+        .expect_err("direct secret-store leases must fail before MCP transport");
+
+    assert_eq!(error, "request_denied");
+    assert!(
+        egress.requests().is_empty(),
+        "direct leases must be rejected before initialize or tools/call transport"
+    );
+    assert_eq!(planner.calls().len(), 1);
+
+    planner.set_plan(host_http_plan());
     client
         .call_tool(McpClientRequest {
             provider: ExtensionId::new("github-mcp").unwrap(),
@@ -274,23 +297,23 @@ async fn concrete_mcp_http_client_sends_credentials_only_for_tool_call_exchange(
             max_output_bytes: 4096,
         })
         .await
-        .unwrap();
+        .expect("failed direct-lease preflight must not poison later MCP session state");
 
     let requests = egress.requests();
-    assert_eq!(requests.len(), 3);
-    assert!(
-        requests[0].credential_injections.is_empty(),
-        "initialize handshake must not receive credential injections"
-    );
-    assert!(
-        requests[1].credential_injections.is_empty(),
-        "initialized notification must not receive credential injections"
-    );
     assert_eq!(
-        requests[2].credential_injections,
-        vec![staged_obligation],
-        "MCP tools/call must only receive credentials staged by satisfied obligations"
+        requests.len(),
+        3,
+        "legitimate call should perform initialize, initialized, tools/call after failed preflight"
     );
+    assert_eq!(json_rpc_method(&requests[0].body), "initialize");
+    assert!(
+        requests[0]
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("Mcp-Session-Id")),
+        "failed preflight must not leave a stale session id for the next initialize"
+    );
+    assert_eq!(planner.calls().len(), 5);
 }
 
 #[tokio::test]
@@ -1063,20 +1086,24 @@ struct RecordedPlanCall {
 
 #[derive(Debug, Clone)]
 struct RecordingEgressPlanner {
-    plan: McpHostHttpEgressPlan,
+    plan: Arc<Mutex<McpHostHttpEgressPlan>>,
     calls: Arc<Mutex<Vec<RecordedPlanCall>>>,
 }
 
 impl RecordingEgressPlanner {
     fn new(plan: McpHostHttpEgressPlan) -> Self {
         Self {
-            plan,
+            plan: Arc::new(Mutex::new(plan)),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn calls(&self) -> Vec<RecordedPlanCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn set_plan(&self, plan: McpHostHttpEgressPlan) {
+        *self.plan.lock().unwrap() = plan;
     }
 }
 
@@ -1087,7 +1114,7 @@ impl McpHostHttpEgressPlanner for RecordingEgressPlanner {
             method: request.method,
             url: request.url.to_string(),
         });
-        self.plan.clone()
+        self.plan.lock().unwrap().clone()
     }
 }
 
