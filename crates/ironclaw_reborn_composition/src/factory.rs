@@ -27,7 +27,7 @@ use ironclaw_filesystem::{
 use ironclaw_filesystem::{LocalFilesystem, ScopedFilesystem};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy;
-use ironclaw_host_api::runtime_policy::FilesystemBackendKind;
+use ironclaw_host_api::runtime_policy::{FilesystemBackendKind, ProcessBackendKind, SecretMode};
 use ironclaw_host_api::{
     EffectKind, ExtensionId, HostPath, MountPermissions, MountView, PackageId, UserId, VirtualPath,
 };
@@ -35,7 +35,8 @@ use ironclaw_host_api::{
 use ironclaw_host_api::{MountAlias, MountGrant};
 use ironclaw_host_runtime::{
     CapabilitySurfaceVersion, FirstPartyCapabilityRegistry, HostRuntimeServices,
-    ProductAuthProviderRuntimePorts, builtin_first_party_handlers, builtin_first_party_package,
+    LocalHostProcessPort, ProductAuthProviderRuntimePorts, builtin_first_party_handlers,
+    builtin_first_party_package,
 };
 #[cfg(feature = "libsql")]
 use ironclaw_loop_support::FilesystemCheckpointStateStore;
@@ -163,6 +164,38 @@ where
             services.with_tenant_sandbox_process_port(process_port)
         }
     }
+}
+
+fn local_dev_process_port_for_policy(
+    runtime_policy: &Option<ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy>,
+    workspace_root: &Path,
+    host_home_root: Option<&LocalDevHostHomeRoot>,
+) -> Option<LocalHostProcessPort> {
+    let runtime_policy = runtime_policy.as_ref()?;
+    if runtime_policy.process_backend != ProcessBackendKind::LocalHost {
+        return None;
+    }
+    let mut process_port = if runtime_policy.secret_mode == SecretMode::InheritedEnv {
+        LocalHostProcessPort::new_inherited_env()
+    } else {
+        LocalHostProcessPort::new()
+    }
+    .with_workdir_alias("/workspace", workspace_root);
+    if let Some(host_home_root) = host_home_root {
+        process_port =
+            process_port.with_workdir_alias("/host", host_home_root.canonical_root.clone());
+        for alias in host_home_root.aliases() {
+            let alias_str = match alias.to_str() {
+                Some(s) => s,
+                None => {
+                    tracing::debug!(alias = ?alias, "skipping non-UTF-8 host home alias");
+                    continue;
+                }
+            };
+            process_port = process_port.with_workdir_alias(alias_str, alias.to_path_buf());
+        }
+    }
+    Some(process_port)
 }
 
 fn require_product_auth_runtime_ports<F, G, S, R>(
@@ -435,8 +468,16 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     .with_approval_requests(Arc::clone(&store_graph.approval_requests))
     .with_capability_leases(Arc::clone(&store_graph.capability_leases))
     .with_turn_state_and_transition_port(Arc::clone(&store_graph.turn_state));
+    let local_dev_process_port = local_dev_process_port_for_policy(
+        &runtime_policy,
+        &workspace_root,
+        host_home_root.as_ref(),
+    );
     if let Some(runtime_policy) = runtime_policy {
         services = services.with_runtime_policy(runtime_policy);
+    }
+    if let Some(process_port) = local_dev_process_port {
+        services = services.with_runtime_process_port(Arc::new(process_port));
     }
     services = apply_runtime_process_binding(services, runtime_process_binding);
     let google_provider_client = google_oauth_config
