@@ -106,9 +106,9 @@ pub use sandbox_process::{
     RebornScopedSandboxCommandTransport,
 };
 pub use services::{
-    HostRuntimeServices, ProductionEventStoreWiringError, ProductionWiringComponent,
-    ProductionWiringConfig, ProductionWiringIssue, ProductionWiringIssueKind,
-    ProductionWiringReport, RegisteredRuntimeHealth,
+    HostRuntimeServices, ProductAuthProviderRuntimePorts, ProductionEventStoreWiringError,
+    ProductionWiringComponent, ProductionWiringConfig, ProductionWiringIssue,
+    ProductionWiringIssueKind, ProductionWiringReport, RegisteredRuntimeHealth,
 };
 pub use surface::{CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess};
 pub use turn_scheduler::{
