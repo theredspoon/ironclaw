@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -14,6 +15,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures_util::FutureExt as _;
 use ironclaw_extensions::{ExtensionPackage, ExtensionRuntime};
 use ironclaw_host_api::{
     CapabilityId, ExtensionId, NetworkMethod, NetworkPolicy, ResourceEstimate, ResourceReservation,
@@ -165,26 +167,30 @@ where
         Self { egress }
     }
 
-    pub fn request(
+    pub async fn request(
         &self,
         request: McpHostHttpRequest,
     ) -> Result<McpHostHttpResponse, McpHostHttpError> {
-        self.egress
-            .execute(RuntimeHttpEgressRequest {
-                runtime: RuntimeKind::Mcp,
-                scope: request.scope,
-                capability_id: request.capability_id,
-                method: request.method,
-                url: request.url,
-                headers: request.headers,
-                body: request.body,
-                network_policy: request.network_policy,
-                credential_injections: request.credential_injections,
-                response_body_limit: request.response_body_limit,
-                save_body_to: None,
-                timeout_ms: request.timeout_ms,
-            })
-            .map_err(mcp_http_error)
+        AssertUnwindSafe(self.egress.execute(RuntimeHttpEgressRequest {
+            runtime: RuntimeKind::Mcp,
+            scope: request.scope,
+            capability_id: request.capability_id,
+            method: request.method,
+            url: request.url,
+            headers: request.headers,
+            body: request.body,
+            network_policy: request.network_policy,
+            credential_injections: request.credential_injections,
+            response_body_limit: request.response_body_limit,
+            save_body_to: None,
+            timeout_ms: request.timeout_ms,
+        }))
+        .catch_unwind()
+        .await
+        .map_err(|_| McpHostHttpError::Egress {
+            reason: "runtime_http_egress_panicked".to_string(),
+        })?
+        .map_err(mcp_http_error)
     }
 }
 
@@ -194,32 +200,37 @@ fn mcp_http_error(error: RuntimeHttpEgressError) -> McpHostHttpError {
     }
 }
 
+#[async_trait]
 pub trait McpHostHttp: Send + Sync {
-    fn request(&self, request: McpHostHttpRequest)
-    -> Result<McpHostHttpResponse, McpHostHttpError>;
+    async fn request(
+        &self,
+        request: McpHostHttpRequest,
+    ) -> Result<McpHostHttpResponse, McpHostHttpError>;
 }
 
+#[async_trait]
 impl<E> McpHostHttp for McpRuntimeHttpAdapter<E>
 where
-    E: RuntimeHttpEgress,
+    E: RuntimeHttpEgress + Send + Sync,
 {
-    fn request(
+    async fn request(
         &self,
         request: McpHostHttpRequest,
     ) -> Result<McpHostHttpResponse, McpHostHttpError> {
-        McpRuntimeHttpAdapter::request(self, request)
+        McpRuntimeHttpAdapter::request(self, request).await
     }
 }
 
+#[async_trait]
 impl<T> McpHostHttp for Arc<T>
 where
-    T: McpHostHttp + ?Sized,
+    T: McpHostHttp + ?Sized + Send + Sync,
 {
-    fn request(
+    async fn request(
         &self,
         request: McpHostHttpRequest,
     ) -> Result<McpHostHttpResponse, McpHostHttpError> {
-        self.as_ref().request(request)
+        self.as_ref().request(request).await
     }
 }
 
@@ -365,7 +376,7 @@ where
         self.state.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn send_json_rpc(
+    async fn send_json_rpc(
         &self,
         request: &McpClientRequest,
         session_key: &McpHostHttpSessionKey,
@@ -414,6 +425,7 @@ where
                 response_body_limit,
                 timeout_ms: plan.timeout_ms,
             })
+            .await
             .map_err(mcp_client_http_error)?;
 
         let usage = ResourceUsage {
@@ -540,37 +552,43 @@ where
         self.preflight_tools_call_credentials(&request, tool_call_params.clone())?;
 
         let mut usage = ResourceUsage::default();
-        let initialize = self.send_json_rpc(
-            &request,
-            &session_key,
-            Some(self.next_request_id()),
-            McpJsonRpcMethod::Initialize,
-            Some(json_rpc_initialize_params()),
-        )?;
+        let initialize = self
+            .send_json_rpc(
+                &request,
+                &session_key,
+                Some(self.next_request_id()),
+                McpJsonRpcMethod::Initialize,
+                Some(json_rpc_initialize_params()),
+            )
+            .await?;
         accumulate_usage(&mut usage, initialize.usage);
         if initialize.response.error {
             return Err(response_error());
         }
 
-        let initialized = self.send_json_rpc(
-            &request,
-            &session_key,
-            None,
-            McpJsonRpcMethod::InitializedNotification,
-            None,
-        )?;
+        let initialized = self
+            .send_json_rpc(
+                &request,
+                &session_key,
+                None,
+                McpJsonRpcMethod::InitializedNotification,
+                None,
+            )
+            .await?;
         accumulate_usage(&mut usage, initialized.usage);
         if initialized.response.error {
             return Err(response_error());
         }
 
-        let call = self.send_json_rpc(
-            &request,
-            &session_key,
-            Some(self.next_request_id()),
-            McpJsonRpcMethod::ToolsCall,
-            Some(tool_call_params),
-        )?;
+        let call = self
+            .send_json_rpc(
+                &request,
+                &session_key,
+                Some(self.next_request_id()),
+                McpJsonRpcMethod::ToolsCall,
+                Some(tool_call_params),
+            )
+            .await?;
         accumulate_usage(&mut usage, call.usage);
         if call.response.error {
             return Err(response_error());

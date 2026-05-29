@@ -109,8 +109,8 @@ async fn mcp_runtime_requires_host_mediated_egress_for_http_transports() {
     assert!(client.requests.lock().unwrap().is_empty());
 }
 
-#[test]
-fn mcp_host_http_adapter_returns_sanitized_shared_egress_errors() {
+#[tokio::test]
+async fn mcp_host_http_adapter_returns_sanitized_shared_egress_errors() {
     let adapter = McpRuntimeHttpAdapter::new(Arc::new(SecretEchoRuntimeEgress));
 
     let error = adapter
@@ -126,12 +126,37 @@ fn mcp_host_http_adapter_returns_sanitized_shared_egress_errors() {
             response_body_limit: Some(4096),
             timeout_ms: Some(1000),
         })
+        .await
         .expect_err("MCP HTTP adapter errors should be sanitized before runtime visibility");
 
     let rendered = error.to_string();
     assert!(rendered.contains("network_error"));
     assert!(!rendered.contains("sk-test-secret"));
     assert!(!rendered.contains("10.0.0.7"));
+}
+
+#[tokio::test]
+async fn mcp_host_http_adapter_maps_panicking_runtime_egress_to_sanitized_error() {
+    let adapter = McpRuntimeHttpAdapter::new(Arc::new(PanickingRuntimeEgress));
+
+    let error = adapter
+        .request(McpHostHttpRequest {
+            scope: sample_scope(),
+            capability_id: CapabilityId::new("github-mcp.search").unwrap(),
+            method: NetworkMethod::Get,
+            url: "https://mcp.example.test/mcp".to_string(),
+            headers: vec![],
+            body: vec![],
+            network_policy: mcp_http_policy(),
+            credential_injections: vec![],
+            response_body_limit: Some(4096),
+            timeout_ms: Some(1000),
+        })
+        .await
+        .expect_err("runtime egress panics should be contained at the MCP host boundary");
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("runtime_http_egress_panicked"));
 }
 
 #[tokio::test]
@@ -677,7 +702,7 @@ async fn mcp_runtime_denies_budget_before_adapter_call() {
         .set_limit(
             account.clone(),
             ResourceLimits {
-                max_concurrency_slots: Some(0),
+                max_output_bytes: Some(1),
                 ..ResourceLimits::default()
             },
         )
@@ -691,7 +716,7 @@ async fn mcp_runtime_denies_budget_before_adapter_call() {
                 capability_id: &CapabilityId::new("github-mcp.search").unwrap(),
                 scope,
                 estimate: ResourceEstimate {
-                    concurrency_slots: Some(1),
+                    output_bytes: Some(10_000),
                     ..ResourceEstimate::default()
                 },
                 resource_reservation: None,
@@ -1032,8 +1057,9 @@ impl RecordingRuntimeEgress {
     }
 }
 
+#[async_trait::async_trait]
 impl RuntimeHttpEgress for RecordingRuntimeEgress {
-    fn execute(
+    async fn execute(
         &self,
         request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
@@ -1216,8 +1242,9 @@ impl ScopedSessionRuntimeEgress {
     }
 }
 
+#[async_trait::async_trait]
 impl RuntimeHttpEgress for ScopedSessionRuntimeEgress {
-    fn execute(
+    async fn execute(
         &self,
         request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
@@ -1258,8 +1285,9 @@ impl RuntimeHttpEgress for ScopedSessionRuntimeEgress {
 #[derive(Debug)]
 struct InvalidSessionRuntimeEgress;
 
+#[async_trait::async_trait]
 impl RuntimeHttpEgress for InvalidSessionRuntimeEgress {
-    fn execute(
+    async fn execute(
         &self,
         request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
@@ -1282,8 +1310,9 @@ impl RuntimeHttpEgress for InvalidSessionRuntimeEgress {
 #[derive(Debug)]
 struct MissingIdRuntimeEgress;
 
+#[async_trait::async_trait]
 impl RuntimeHttpEgress for MissingIdRuntimeEgress {
-    fn execute(
+    async fn execute(
         &self,
         request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
@@ -1335,8 +1364,9 @@ impl ErrorSessionRuntimeEgress {
     }
 }
 
+#[async_trait::async_trait]
 impl RuntimeHttpEgress for ErrorSessionRuntimeEgress {
-    fn execute(
+    async fn execute(
         &self,
         request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
@@ -1392,8 +1422,9 @@ impl RuntimeHttpEgress for ErrorSessionRuntimeEgress {
 #[derive(Debug)]
 struct SecretEchoRuntimeEgress;
 
+#[async_trait::async_trait]
 impl RuntimeHttpEgress for SecretEchoRuntimeEgress {
-    fn execute(
+    async fn execute(
         &self,
         _request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
@@ -1402,6 +1433,19 @@ impl RuntimeHttpEgress for SecretEchoRuntimeEgress {
             request_bytes: 0,
             response_bytes: 0,
         })
+    }
+}
+
+#[derive(Debug)]
+struct PanickingRuntimeEgress;
+
+#[async_trait]
+impl RuntimeHttpEgress for PanickingRuntimeEgress {
+    async fn execute(
+        &self,
+        _request: RuntimeHttpEgressRequest,
+    ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
+        panic!("runtime HTTP egress should not unwind through MCP host");
     }
 }
 
@@ -1559,7 +1603,13 @@ transport = "stdio"
 command = "github-mcp"
 args = ["--stdio"]
 
-[[capabilities]]
+[[host_api]]
+id = "ironclaw.capability_provider/v1"
+section = "capability_provider.tools"
+
+[capability_provider.tools]
+
+[[capability_provider.tools.capabilities]]
 id = "github-mcp.search"
 description = "Search GitHub"
 effects = ["network", "dispatch_capability"]
@@ -1582,7 +1632,13 @@ runner = "sandboxed_process"
 command = "script-echo"
 args = ["--json"]
 
-[[capabilities]]
+[[host_api]]
+id = "ironclaw.capability_provider/v1"
+section = "capability_provider.tools"
+
+[capability_provider.tools]
+
+[[capability_provider.tools.capabilities]]
 id = "script.echo"
 description = "Echo text"
 effects = ["dispatch_capability"]

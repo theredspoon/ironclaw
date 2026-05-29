@@ -2,6 +2,7 @@ mod credential;
 mod pipeline;
 mod sanitize;
 
+use async_trait::async_trait;
 use ironclaw_host_api::{
     CapabilityId, NetworkPolicy, ResourceScope, RuntimeHttpEgress, RuntimeHttpEgressError,
     RuntimeHttpEgressRequest, RuntimeHttpEgressResponse,
@@ -153,18 +154,19 @@ impl<N, S> HostHttpEgressService<N, S> {
     }
 }
 
+#[async_trait]
 impl<N, S> RuntimeHttpEgress for HostHttpEgressService<N, S>
 where
-    N: NetworkHttpEgress,
-    S: SecretStore,
+    N: NetworkHttpEgress + Send + Sync,
+    S: SecretStore + Send + Sync,
 {
-    fn execute(
+    async fn execute(
         &self,
         request: RuntimeHttpEgressRequest,
     ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
         let scope = request.scope.clone();
         let capability_id = request.capability_id.clone();
-        let result = pipeline::execute(self, request);
+        let result = pipeline::execute(self, request).await;
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
