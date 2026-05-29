@@ -1741,6 +1741,8 @@ mod tests {
     use ironclaw_product_workflow::{LifecyclePackageKind, LifecyclePackageRef};
     use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 
+    use crate::runtime::SKILL_ACTIVATE_CAPABILITY_ID;
+
     #[tokio::test]
     async fn local_dev_services_include_repl_runtime_substrate() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2162,6 +2164,7 @@ mod tests {
             .map(|capability| capability.id.as_str())
             .collect::<Vec<_>>();
         assert!(ids.contains(&SKILL_LIST_CAPABILITY_ID));
+        assert!(!ids.contains(&SKILL_ACTIVATE_CAPABILITY_ID));
         assert!(ids.contains(&SKILL_INSTALL_CAPABILITY_ID));
         assert!(ids.contains(&SKILL_REMOVE_CAPABILITY_ID));
 
@@ -2173,6 +2176,9 @@ mod tests {
         ] {
             assert!(registry.contains_handler(&ironclaw_host_api::CapabilityId::new(id).unwrap()));
         }
+        assert!(!registry.contains_handler(
+            &ironclaw_host_api::CapabilityId::new(SKILL_ACTIVATE_CAPABILITY_ID).unwrap()
+        ));
     }
 
     #[test]
