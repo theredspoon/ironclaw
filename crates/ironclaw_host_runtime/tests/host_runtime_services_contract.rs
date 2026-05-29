@@ -6026,6 +6026,7 @@ impl RuntimeProcessPort for ProductionCandidateProcessPort {
     ) -> Result<CommandExecutionOutput, RuntimeProcessError> {
         Ok(CommandExecutionOutput {
             output: String::new(),
+            saved_output: None,
             exit_code: 0,
             sandboxed: true,
             duration: Duration::ZERO,
@@ -6044,6 +6045,7 @@ impl SandboxCommandTransport for ProductionCandidateSandboxTransport {
     ) -> Result<CommandExecutionOutput, RuntimeProcessError> {
         Ok(CommandExecutionOutput {
             output: String::new(),
+            saved_output: None,
             exit_code: 0,
             sandboxed: false,
             duration: Duration::ZERO,

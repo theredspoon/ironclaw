@@ -46,6 +46,7 @@ pub mod memory_context;
 mod obligations;
 mod planner;
 mod process_aliases;
+mod process_output;
 mod process_port;
 mod production;
 mod sandbox_process;
@@ -86,6 +87,7 @@ pub use obligations::{
     ProcessObligationLifecycleStore,
 };
 pub use planner::{ExecutionPlan, PlannerError, plan_capability};
+pub use process_output::{SavedCommandOutput, SavedCommandOutputSanitization};
 pub use process_port::{
     CommandExecutionOutput, CommandExecutionRequest, LocalHostProcessPort, RuntimeProcessError,
     RuntimeProcessPort, SandboxCommandTransport, TenantSandboxProcessPort,
