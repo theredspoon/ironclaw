@@ -98,6 +98,7 @@ use crate::{
         extend_builtin_first_party_package, insert_handlers as insert_extension_lifecycle_handlers,
     },
     gsuite::register_bundled_gsuite_first_party_handlers,
+    nearai_mcp::{nearai_mcp_endpoint_from_env, nearai_mcp_runtime},
     web_access::register_bundled_web_access_first_party_handlers,
 };
 
@@ -217,6 +218,34 @@ where
         .ok_or_else(|| RebornBuildError::InvalidConfig {
             reason: "Google OAuth provider backend requires host runtime HTTP egress".to_string(),
         })
+}
+
+fn attach_nearai_mcp_runtime<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    let Some(runtime_ports) = services.product_auth_provider_runtime_ports() else {
+        tracing::debug!("skipping NEAR AI MCP runtime because host runtime HTTP egress is absent");
+        return Ok(services);
+    };
+    let endpoint = match nearai_mcp_endpoint_from_env() {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            tracing::debug!(
+                "skipping NEAR AI MCP runtime: {reason} (this only affects the optional NEAR AI MCP extension)"
+            );
+            return Ok(services);
+        }
+    };
+    Ok(services.with_mcp_runtime(nearai_mcp_runtime(
+        runtime_ports.runtime_http_egress(),
+        endpoint,
+    )))
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -477,6 +506,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     .with_approval_requests(Arc::clone(&store_graph.approval_requests))
     .with_capability_leases(Arc::clone(&store_graph.capability_leases))
     .with_turn_state_and_transition_port(Arc::clone(&store_graph.turn_state));
+    services = attach_nearai_mcp_runtime(services)?;
     let local_dev_process_port = local_dev_process_port_for_policy(
         &runtime_policy,
         &workspace_root,
@@ -1171,6 +1201,15 @@ fn web_access_allowed_effects() -> Vec<EffectKind> {
     vec![EffectKind::DispatchCapability, EffectKind::Network]
 }
 
+#[cfg(test)]
+fn nearai_allowed_effects() -> Vec<EffectKind> {
+    vec![
+        EffectKind::DispatchCapability,
+        EffectKind::Network,
+        EffectKind::UseSecret,
+    ]
+}
+
 async fn build_production_shaped(
     input: RebornBuildInput,
 ) -> Result<RebornServices, RebornBuildError> {
@@ -1621,6 +1660,7 @@ where
     .with_filesystem_turn_state_store(stores.scoped_filesystem)
     .with_run_profile_resolver(planned_run_profile_resolver()?)
     .with_turn_run_wake_notifier(production_wiring.turn_run_wake_notifier);
+    let services = attach_nearai_mcp_runtime(services)?;
     let google_provider_client = google_oauth_config
         .map(|config| {
             let runtime_ports = require_product_auth_runtime_ports(&services)?;
@@ -1931,6 +1971,70 @@ mod tests {
         };
         assert_eq!(failure.capability_id.as_str(), "web-access.search");
         assert_eq!(failure.kind, RuntimeFailureKind::Backend);
+    }
+
+    #[tokio::test]
+    async fn local_dev_nearai_mcp_installs_and_activates_model_visible_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "local-dev-nearai-mcp-owner",
+            dir.path().join("local-dev"),
+        ))
+        .await
+        .expect("local-dev services build");
+        let local_runtime = services.local_runtime.as_ref().expect("local runtime");
+        let extension_management = local_runtime
+            .extension_management
+            .as_ref()
+            .expect("extension management");
+        let nearai_ref =
+            LifecyclePackageRef::new(LifecyclePackageKind::Extension, "nearai").expect("valid ref");
+
+        extension_management
+            .install(nearai_ref.clone())
+            .await
+            .expect("install NEAR AI MCP");
+        extension_management
+            .activate(nearai_ref)
+            .await
+            .expect("activate NEAR AI MCP");
+
+        let capabilities = extension_management
+            .active_model_visible_capabilities()
+            .await
+            .expect("active capabilities");
+        let search = capabilities
+            .iter()
+            .find(|capability| capability.id.as_str() == "nearai.search")
+            .expect("nearai.search active");
+
+        assert_eq!(search.provider.as_str(), "nearai");
+        assert_eq!(search.effects, nearai_allowed_effects());
+        assert_eq!(search.runtime_credentials.len(), 1);
+        assert_eq!(
+            search.runtime_credentials[0].handle,
+            SecretHandle::new("llm_nearai_api_key").unwrap()
+        );
+        assert_eq!(
+            search.runtime_credentials[0].audience.host_pattern,
+            "private.near.ai"
+        );
+    }
+
+    #[test]
+    fn attach_nearai_mcp_runtime_skips_services_without_runtime_http_egress() {
+        let services = HostRuntimeServices::new(
+            Arc::new(ExtensionRegistry::new()),
+            Arc::new(LocalFilesystem::new()),
+            Arc::new(InMemoryResourceGovernor::new()),
+            Arc::new(GrantAuthorizer::new()),
+            ProcessServices::in_memory(),
+            CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+        );
+
+        let services = attach_nearai_mcp_runtime(services).expect("attach is optional");
+
+        assert!(services.product_auth_provider_runtime_ports().is_none());
     }
 
     #[cfg(feature = "libsql")]
