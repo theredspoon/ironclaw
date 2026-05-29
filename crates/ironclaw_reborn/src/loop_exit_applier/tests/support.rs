@@ -19,8 +19,8 @@ use ironclaw_turns::{
     runner::{
         ApplyValidatedLoopExitRequest, BlockRunRequest, CancelRunCompletionRequest,
         ClaimRunRequest, ClaimedTurnRun, CompleteRunRequest, FailRunRequest, HeartbeatRequest,
-        RecordModelRouteSnapshotRequest, RecordRecoveryRequiredRequest,
-        RecoverExpiredLeasesRequest, RecoverExpiredLeasesResponse, TurnRunTransitionPort,
+        RecordModelRouteSnapshotRequest, RecordRunnerFailureRequest, RecoverExpiredLeasesRequest,
+        RecoverExpiredLeasesResponse, TurnRunTransitionPort,
     },
 };
 
@@ -355,16 +355,16 @@ impl TurnRunTransitionPort for RecordingTransitionPort {
         ))
     }
 
-    async fn record_recovery_required(
+    async fn record_runner_failure(
         &self,
-        request: RecordRecoveryRequiredRequest,
+        request: RecordRunnerFailureRequest,
     ) -> Result<TurnRunState, TurnError> {
         self.raw_failures
             .lock()
             .expect("lock")
             .push(request.failure.category().to_string());
         Ok(state_for_mapping(
-            TurnStatus::RecoveryRequired,
+            TurnStatus::Failed,
             request.run_id,
             Some(request.failure),
             None,
@@ -418,7 +418,7 @@ impl TurnRunTransitionPort for RecordingTransitionPort {
                 }
             },
             ironclaw_turns::LoopExitMapping::RecoveryRequired { failure } => {
-                self.record_recovery_required(RecordRecoveryRequiredRequest {
+                self.record_runner_failure(RecordRunnerFailureRequest {
                     run_id: request.run_id,
                     runner_id: request.runner_id,
                     lease_token: request.lease_token,
