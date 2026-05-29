@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 use crate::product_auth_durable::{FilesystemAuthProductServices, UnavailableAuthProviderClient};
 use ironclaw_auth::AuthProviderClient;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -98,7 +99,9 @@ use crate::{
     extension_lifecycle_capabilities::{
         extend_builtin_first_party_package, insert_handlers as insert_extension_lifecycle_handlers,
     },
-    gsuite::register_bundled_gsuite_first_party_handlers,
+    gsuite::{
+        ProductAuthRuntimeGsuiteCredentialStager, register_bundled_gsuite_first_party_handlers,
+    },
     nearai_mcp::{nearai_mcp_endpoint_from_env, nearai_mcp_runtime},
     web_access::register_bundled_web_access_first_party_handlers,
 };
@@ -217,7 +220,7 @@ where
     services
         .product_auth_provider_runtime_ports()
         .ok_or_else(|| RebornBuildError::InvalidConfig {
-            reason: "Google OAuth provider backend requires host runtime HTTP egress".to_string(),
+            reason: "product auth runtime ports unavailable; host runtime must be configured with HTTP egress and a secret store".to_string(),
         })
 }
 
@@ -520,10 +523,14 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         services = services.with_runtime_process_port(Arc::new(process_port));
     }
     services = apply_runtime_process_binding(services, runtime_process_binding);
+    let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let google_provider_client = google_oauth_config
         .map(|config| {
-            let runtime_ports = require_product_auth_runtime_ports(&services)?;
-            google_provider_client(config, Arc::clone(&secret_store), runtime_ports)
+            google_provider_client(
+                config,
+                Arc::clone(&secret_store),
+                product_auth_runtime_ports.clone(),
+            )
         })
         .transpose()?;
     let product_auth = match product_auth_ports {
@@ -543,6 +550,9 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     register_bundled_gsuite_first_party_handlers(
         &mut first_party_registry,
         product_auth.credential_account_service(),
+        Arc::new(ProductAuthRuntimeGsuiteCredentialStager::new(
+            product_auth_runtime_ports.clone(),
+        )),
     )
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: format!("GSuite first-party handlers are invalid: {error}"),
@@ -1629,6 +1639,7 @@ where
         google_oauth_config,
     } = context;
     let secret_store: Arc<dyn SecretStore> = stores.secret_credentials.secret_store.clone();
+    let mut first_party_registry = builtin_first_party_registry()?;
     let product_auth_filesystem = Arc::clone(&stores.scoped_filesystem);
     let services = HostRuntimeServices::new(
         Arc::new(builtin_extension_registry()?),
@@ -1640,7 +1651,6 @@ where
     )
     .with_trust_policy(production_wiring.trust_policy)
     .with_runtime_policy(production_wiring.runtime_policy)
-    .with_first_party_capabilities(Arc::new(builtin_first_party_registry()?))
     .with_capability_leases(stores.leases)
     .with_secret_store(Arc::clone(&stores.secret_credentials.secret_store))
     .with_credential_broker(stores.secret_credentials.credential_broker)
@@ -1657,11 +1667,15 @@ where
     .with_filesystem_turn_state_store(Arc::clone(&stores.scoped_filesystem))
     .with_run_profile_resolver(planned_run_profile_resolver()?)
     .with_turn_run_wake_notifier(production_wiring.turn_run_wake_notifier);
+    let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let services = attach_nearai_mcp_runtime(services)?;
     let google_provider_client = google_oauth_config
         .map(|config| {
-            let runtime_ports = require_product_auth_runtime_ports(&services)?;
-            google_provider_client(config, Arc::clone(&secret_store), runtime_ports)
+            google_provider_client(
+                config,
+                Arc::clone(&secret_store),
+                product_auth_runtime_ports.clone(),
+            )
         })
         .transpose()?;
     let services = apply_production_runtime_process_binding(
@@ -1671,8 +1685,6 @@ where
 
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> =
         Arc::new(services.turn_coordinator_for_production()?);
-    let host_runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> =
-        Arc::new(services.host_runtime_for_production(&wiring_config)?);
     let product_auth_ports = product_auth_ports.unwrap_or_else(|| {
         let durable = Arc::new(FilesystemAuthProductServices::new(
             product_auth_filesystem,
@@ -1683,18 +1695,32 @@ where
             Arc::new(UnavailableAuthProviderClient),
         )
     });
-    let product_auth = Some(compose_product_auth_services(
+    let product_auth_services = compose_product_auth_services(
         product_auth_ports,
         turn_coordinator.clone(),
         google_provider_client,
-    ));
+    );
     let product_auth_ready = true;
+    register_bundled_gsuite_first_party_handlers(
+        &mut first_party_registry,
+        product_auth_services.credential_account_service(),
+        Arc::new(ProductAuthRuntimeGsuiteCredentialStager::new(
+            product_auth_runtime_ports.clone(),
+        )),
+    )
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("GSuite first-party handlers are invalid: {error}"),
+    })?;
+    let services = services.with_first_party_capabilities(Arc::new(first_party_registry));
+
+    let host_runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> =
+        Arc::new(services.host_runtime_for_production(&wiring_config)?);
 
     Ok(RebornServices {
         host_runtime: Some(host_runtime),
         turn_coordinator: Some(turn_coordinator),
         readiness: readiness_for(profile, true, true, product_auth_ready),
-        product_auth,
+        product_auth: Some(product_auth_services),
         local_runtime: None,
     })
 }

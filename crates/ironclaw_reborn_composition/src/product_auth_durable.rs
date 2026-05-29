@@ -32,6 +32,7 @@ mod provider;
 #[cfg(test)]
 mod tests;
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 pub(crate) use provider::UnavailableAuthProviderClient;
 
 /// Durable production implementation of the product-auth ports.
