@@ -4629,6 +4629,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "ironclaw_host_api",
+ "percent-encoding",
  "reqwest",
  "thiserror 2.0.18",
  "tokio",
