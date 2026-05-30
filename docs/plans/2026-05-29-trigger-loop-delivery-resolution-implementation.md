@@ -246,8 +246,17 @@ Add typed request/response shapes in `ironclaw_outbound`:
 
 `RequestedOutboundContext` must carry a typed `ReplyTargetBindingRef` candidate,
 not a raw adapter/channel/conversation string. The top-level request must carry
-the delivery kind so validation can reject shared/group widening for
-authority-bearing prompt payloads.
+the intent, and `CommunicationDeliveryResolutionRequest::delivery_kind()` is
+derived from that intent so validation can reject shared/group widening for
+authority-bearing prompt payloads without allowing contradictory input.
+
+`SourceRouteContext` must also stay outbound-owned and binding-level only:
+carry the canonical `ReplyTargetBindingRef` produced by
+`ironclaw_conversations`, not raw adapter identity such as `AdapterKind`,
+`AdapterInstallationId`, `ExternalActorRef`, or `ExternalConversationRef`.
+`ironclaw_outbound` must not depend on `ironclaw_conversations`; composition or
+later product outbound orchestration owns any translation between conversation
+source-route records and outbound resolution inputs.
 
 Include serde and unit tests. Do not wire product egress yet.
 
