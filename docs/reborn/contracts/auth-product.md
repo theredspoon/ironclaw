@@ -435,6 +435,52 @@ pretending cleanup succeeded.
 
 ---
 
+## Product Facing HTTP Surfaces (#4201)
+
+The Reborn composition mounts host-owned HTTP routes that enter
+`RebornProductAuthServices` (see
+`crates/ironclaw_reborn_composition/src/product_auth_serve.rs`). All mutation
+routes share the same `LocalGateway` + `BearerToken` + per-caller body and
+rate-limit posture as the original `oauth/start` route and derive
+`AuthProductScope` from the authenticated caller, never from caller-supplied
+tenant/user fields.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/reborn/product-auth/oauth/start` | Open an OAuth setup flow; returns redacted authorization URL + invocation scope. |
+| `GET`  | `/api/reborn/product-auth/oauth/callback/{flow_id}` | Public OAuth callback; validates scope/state hash before any product effect. |
+| `POST` | `/api/reborn/product-auth/manual-token/submit` | One-shot manual-token setup + secret-submit (legacy WebUI shape, compatibility). |
+| `POST` | `/api/reborn/product-auth/manual-token/setup` | Mint a manual-token interaction challenge; returns `interaction_id` + `invocation_id`. |
+| `POST` | `/api/reborn/product-auth/manual-token/secret-submit` | Submit the raw token for an existing `interaction_id`; model transcript, tool arguments, logs, and durable events only ever see the redacted `credential_submitted` / `auth_failed` projection. |
+| `POST` | `/api/reborn/product-auth/accounts/list` | List redacted credential account projections for a provider. |
+| `POST` | `/api/reborn/product-auth/accounts/select` | Select a single configured account by id; returns its redacted projection. |
+| `POST` | `/api/reborn/product-auth/accounts/recovery` | Project the stable recovery state for a provider (configured / setup_required / reauthorize_required / account_selection_required). |
+| `POST` | `/api/reborn/product-auth/accounts/refresh` | Refresh / reauthorize an account; returns `CredentialRefreshReport` + projected recovery state. |
+| `POST` | `/api/reborn/product-auth/lifecycle/cleanup` | Apply ownership-aware deactivate/uninstall cleanup for an extension; returns a redacted `SecretCleanupReport`. |
+
+Rules:
+
+- `secret-submit` is the only product-facing entry point for raw manual-token
+  material. The raw token never enters tool arguments, model transcript,
+  durable chat history, projections, debug output, or errors; only redacted
+  `credential_submitted` / `auth_failed` projections cross the boundary.
+- Manual-token setup and secret-submit are linked by `interaction_id` plus an
+  `invocation_id` round-tripped through the browser, matching the OAuth
+  start/callback pattern.
+- All routes project only adapter-safe DTOs (`CredentialAccountProjection`,
+  `CredentialAccountListPage`, `CredentialRecoveryProjection`,
+  `CredentialRefreshReport`, `SecretCleanupReport`). Raw secret handles,
+  backend error strings, and host paths must not be projected.
+- These routes are an explicit exemption from the "everything goes through
+  tools" `ToolDispatcher::dispatch()` invariant. Product-auth HTTP is a
+  host-owned auth/secret-ingress boundary: credential setup, secure
+  secret-submit, recovery, refresh, and lifecycle cleanup are not in-turn
+  tool calls and must not surface raw secrets through the model-visible tool
+  dispatch path. Routes still derive scope from authenticated caller context
+  and enter `RebornProductAuthServices`.
+
+---
+
 ## V1 Behavior Inventory
 
 | Product behavior | V1 evidence path | Reborn owner | First-slice status |
