@@ -39,6 +39,7 @@ mod llm_catalog;
 mod local_dev_capability_policy;
 mod local_dev_mounts;
 mod local_runtime_profile;
+mod manual_token_flow;
 mod mcp;
 mod nearai_mcp;
 mod product_auth_durable;
