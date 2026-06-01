@@ -16,10 +16,14 @@ use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use cron::Schedule;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, Timestamp, UserId};
+use ironclaw_turns::TurnRunId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
+
+#[cfg(feature = "libsql")]
+mod libsql;
 
 const MIN_FIRE_CADENCE: Duration = Duration::from_secs(60);
 const MAX_DUE_TRIGGER_POLL_LIMIT: usize = 128;
@@ -37,8 +41,8 @@ pub enum TriggerError {
     InvalidRecord { reason: String },
     #[error("invalid schedule: {reason}")]
     InvalidSchedule { reason: String },
-    #[error("trigger repository backend unavailable")]
-    Backend,
+    #[error("trigger repository backend unavailable: {reason}")]
+    Backend { reason: String },
     #[error("trigger not found")]
     NotFound,
 }
@@ -204,6 +208,8 @@ pub struct TriggerRecord {
     pub last_run_at: Option<Timestamp>,
     pub last_fired_slot: Option<Timestamp>,
     pub last_status: Option<TriggerRunStatus>,
+    pub active_fire_slot: Option<Timestamp>,
+    pub active_run_ref: Option<TurnRunId>,
     pub created_at: Timestamp,
 }
 
@@ -377,6 +383,10 @@ pub trait TriggerRepository: Send + Sync {
         trigger_id: TriggerId,
     ) -> Result<Option<TriggerRecord>, TriggerError>;
 
+    /// Returns all triggers for a tenant in creation order.
+    ///
+    /// This method is currently unbounded. Callers must apply any product or
+    /// API pagination before exposing user-facing list surfaces.
     async fn list_triggers(&self, tenant_id: TenantId) -> Result<Vec<TriggerRecord>, TriggerError>;
 
     async fn remove_trigger(
@@ -385,12 +395,23 @@ pub trait TriggerRepository: Send + Sync {
         trigger_id: TriggerId,
     ) -> Result<Option<TriggerRecord>, TriggerError>;
 
+    /// Lists due triggers across all tenants for the trusted poller path.
+    ///
+    /// # Safety / Authorization
+    ///
+    /// This is a global query and must not be used for tenant-scoped or
+    /// user-facing list operations. Callers must preserve each returned
+    /// record's tenant/user authority when materializing a fire.
     async fn list_due_triggers(
         &self,
         now: Timestamp,
         limit: usize,
     ) -> Result<Vec<TriggerRecord>, TriggerError>;
 }
+
+/// Feature-gated durable repository constructor for composition/test wiring.
+#[cfg(feature = "libsql")]
+pub use libsql::LibSqlTriggerRepository;
 
 #[derive(Clone, Default)]
 pub struct InMemoryTriggerRepository {
@@ -471,20 +492,26 @@ impl TriggerRepository for InMemoryTriggerRepository {
             return Ok(Vec::new());
         }
         let limit = limit.min(MAX_DUE_TRIGGER_POLL_LIMIT);
-        let mut keys = {
-            let state = self.lock_state()?;
-            state
-                .iter()
-                .filter(|(_, record)| record.is_due_at(now))
-                .map(|(key, record)| (record.next_run_at, record.trigger_id, key.clone()))
-                .collect::<Vec<_>>()
-        };
-        keys.sort_by_key(|(next_run_at, trigger_id, _)| (*next_run_at, *trigger_id));
-        keys.truncate(limit);
         let state = self.lock_state()?;
-        Ok(keys
+        let mut selected_keys = state
+            .iter()
+            .filter(|(_, record)| record.is_due_at(now))
+            .map(|(key, record)| {
+                (
+                    record.next_run_at,
+                    record.tenant_id.clone(),
+                    record.trigger_id,
+                    key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        selected_keys.sort_by_key(|(next_run_at, tenant_id, trigger_id, _)| {
+            (*next_run_at, tenant_id.clone(), *trigger_id)
+        });
+        selected_keys.truncate(limit);
+        Ok(selected_keys
             .into_iter()
-            .filter_map(|(_, _, key)| state.get(&key).cloned())
+            .filter_map(|(_, _, _, key)| state.get(&key).cloned())
             .collect())
     }
 }
@@ -494,7 +521,9 @@ impl InMemoryTriggerRepository {
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<TriggerRepositoryKey, TriggerRecord>>, TriggerError>
     {
-        self.state.lock().map_err(|_| TriggerError::Backend)
+        self.state.lock().map_err(|_| TriggerError::Backend {
+            reason: "trigger repository mutex poisoned".to_string(),
+        })
     }
 }
 
@@ -641,6 +670,8 @@ mod tests {
             last_run_at: None,
             last_fired_slot: None,
             last_status: None,
+            active_fire_slot: None,
+            active_run_ref: None,
             created_at: ts(1_704_067_200),
         }
     }
@@ -1019,6 +1050,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_repository_list_due_triggers_orders_same_slot_by_tenant_then_trigger_id() {
+        let repo = InMemoryTriggerRepository::default();
+        let due_slot = ts(1_704_067_200);
+        let tenant_a_high = sample_record(
+            TriggerId::parse("01J00000000000000000000000").expect("ulid"),
+            tenant("tenant-a"),
+            due_slot,
+        );
+        let tenant_b_low = sample_record(
+            TriggerId::parse("01HZZZZZZZZZZZZZZZZZZZZZZZ").expect("ulid"),
+            tenant("tenant-b"),
+            due_slot,
+        );
+        let tenant_a_low = sample_record(
+            TriggerId::parse("01HZZZZZZZZZZZZZZZZZZZZZZY").expect("ulid"),
+            tenant("tenant-a"),
+            due_slot,
+        );
+        repo.upsert_trigger(tenant_b_low.clone())
+            .await
+            .expect("insert tenant b");
+        repo.upsert_trigger(tenant_a_high.clone())
+            .await
+            .expect("insert tenant a high");
+        repo.upsert_trigger(tenant_a_low.clone())
+            .await
+            .expect("insert tenant a low");
+
+        let due_records = repo
+            .list_due_triggers(due_slot, 10)
+            .await
+            .expect("list due");
+
+        assert_eq!(
+            due_records
+                .iter()
+                .map(|record| (record.tenant_id.clone(), record.trigger_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (tenant_a_low.tenant_id.clone(), tenant_a_low.trigger_id),
+                (tenant_a_high.tenant_id.clone(), tenant_a_high.trigger_id),
+                (tenant_b_low.tenant_id.clone(), tenant_b_low.trigger_id),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn in_memory_repository_list_due_triggers_clamps_large_limit() {
         let repo = InMemoryTriggerRepository::default();
         for _ in 0..=MAX_DUE_TRIGGER_POLL_LIMIT {
@@ -1050,6 +1128,6 @@ mod tests {
         let error = repo
             .lock_state()
             .expect_err("poisoned mutex maps to backend");
-        assert!(matches!(error, TriggerError::Backend));
+        assert!(matches!(error, TriggerError::Backend { .. }));
     }
 }

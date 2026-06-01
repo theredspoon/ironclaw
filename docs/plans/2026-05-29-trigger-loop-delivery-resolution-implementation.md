@@ -444,9 +444,29 @@ Add the first durable `TriggerRepository` backend:
   be derived from `state == Scheduled`, not written as independent fire state
 - `active_fire_slot` and `active_run_ref` persistence fields separate from
   `last_status`
+- `active_run_ref` is persisted and round-tripped as the submitted Reborn
+  `TurnRunId`; it is not an auth-layer `TurnRunRef` or a trigger-local opaque
+  wrapper, and PR 10 does not interpret it as a claim/clear decision
 - due-trigger query with limit
 - scoped list/remove behavior
 - backend-specific tests
+
+Reborn storage boundary: `ironclaw_triggers` may own the trigger repository
+backend because it owns trigger schema, row decoding, due-query semantics, and
+trigger-scoped persistence tests. It must not own generic database accessors,
+database URL/path/env parsing, production substrate selection, or shared
+connection bootstrap. Composition/bootstrap opens `Arc<libsql::Database>` or a
+PostgreSQL pool, then passes the already-constructed handle into the trigger
+repository constructor. This mirrors Reborn's substrate boundary: storage crates
+own domain persistence adapters; composition owns backend selection and handle
+construction.
+
+Because Reborn has moved several tenant-scoped stores away from raw database
+handles toward scoped filesystem storage, PR 10 must keep tenant boundaries
+explicit in the repository contract. Scoped create/list/remove remain
+tenant-scoped. The global due query is allowed only for the trusted host poller,
+and returned records must carry tenant/user/agent/project authority forward to
+later trusted-ingress materialization.
 
 Expected size: less than 1000 lines.
 
@@ -458,6 +478,11 @@ Add the second required backend and parity coverage:
 - shared parity tests across both backends
 - parity for active-fire fields and retryable `next_run_at` behavior
 - any schema compatibility fixes from PR 10
+
+PR 11 must preserve the same boundary as PR 10: add the second backend-specific
+repository implementation and parity tests in the trigger storage layer, but do
+not introduce a trigger-owned generic DB bootstrap or connection-string parser.
+Backend construction remains composition-owned.
 
 Expected size: less than 1000 lines.
 
@@ -475,6 +500,8 @@ Add the backend-agnostic repository claim/lease API that makes
 - write-order contract for `last_run_at`, `last_fired_slot`, `last_status`,
   `next_run_at`, `active_fire_slot`, and `active_run_ref`.
 - active-fire claim never uses `last_status` as the in-flight sentinel.
+- claim/clear code reads `active_run_ref` as a `TurnRunId` and consults the
+  turn-state system for terminal status; PR 10 only persists the field.
 
 Expected size: less than 600 lines.
 
