@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ironclaw_auth::{OAuthClientId, OAuthRedirectUri};
+use ironclaw_auth::{AuthProductError, OAuthClientId, OAuthRedirectUri};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::runtime_policy::ProcessBackendKind;
 use ironclaw_host_api::runtime_policy::{
@@ -27,11 +27,25 @@ pub struct OAuthClientConfig {
     pub redirect_uri: OAuthRedirectUri,
 }
 
+impl OAuthClientConfig {
+    pub fn new(
+        client_id: impl Into<String>,
+        redirect_uri: impl Into<String>,
+        client_secret: Option<SecretString>,
+    ) -> Result<Self, AuthProductError> {
+        Ok(Self {
+            client_id: OAuthClientId::new(client_id)?,
+            client_secret,
+            redirect_uri: OAuthRedirectUri::new(redirect_uri)?,
+        })
+    }
+}
+
 impl std::fmt::Debug for OAuthClientConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OAuthClientConfig")
-            .field("client_id", &self.client_id)
+            .field("client_id", &self.client_id.as_str())
             .field(
                 "client_secret",
                 &self.client_secret.as_ref().map(|_| "[REDACTED]"),

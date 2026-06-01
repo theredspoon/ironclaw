@@ -205,6 +205,7 @@ async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
     let flow = product_auth
         .flow_manager()
         .create_flow(NewAuthFlow {
+            id: None,
             scope: auth_scope.clone(),
             kind: AuthFlowKind::IntegrationCredential,
             provider: provider(),
@@ -629,6 +630,7 @@ async fn create_flow(
     product_auth
         .flow_manager()
         .create_flow(NewAuthFlow {
+            id: None,
             scope,
             kind: AuthFlowKind::IntegrationCredential,
             provider: provider(),
@@ -655,6 +657,7 @@ async fn create_notion_flow(
     match product_auth
         .flow_manager()
         .create_flow(NewAuthFlow {
+            id: None,
             scope,
             kind: AuthFlowKind::IntegrationCredential,
             provider: notion_provider(),
