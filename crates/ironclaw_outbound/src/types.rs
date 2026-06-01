@@ -3,6 +3,9 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, Timestamp};
 use ironclaw_turns::{ReplyTargetBindingRef, TurnActor, TurnRunId, TurnScope};
 use serde::{Deserialize, Serialize};
 
+use crate::delivery_resolution::{
+    CommunicationDeliveryKind, CommunicationDeliveryResolutionRequest,
+};
 use crate::{OutboundDeliveryId, OutboundError, ProjectionSubscriptionId, ProjectionUpdateRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,7 +14,20 @@ pub enum OutboundPushKind {
     FinalReply,
     Progress,
     GateRequired,
+    AuthPrompt,
     DeliveryStatus,
+}
+
+impl From<CommunicationDeliveryKind> for OutboundPushKind {
+    fn from(kind: CommunicationDeliveryKind) -> Self {
+        match kind {
+            CommunicationDeliveryKind::FinalReply => Self::FinalReply,
+            CommunicationDeliveryKind::ProgressUpdate => Self::Progress,
+            CommunicationDeliveryKind::ApprovalPrompt => Self::GateRequired,
+            CommunicationDeliveryKind::AuthPrompt => Self::AuthPrompt,
+            CommunicationDeliveryKind::DeliveryStatus => Self::DeliveryStatus,
+        }
+    }
 }
 
 #[allow(dead_code)] // retained for future debug/log surfaces — not yet wired
@@ -21,6 +37,7 @@ impl OutboundPushKind {
             Self::FinalReply => "final_reply",
             Self::Progress => "progress",
             Self::GateRequired => "gate_required",
+            Self::AuthPrompt => "auth_prompt",
             Self::DeliveryStatus => "delivery_status",
         }
     }
@@ -273,6 +290,14 @@ impl ValidatedReplyTargetBinding {
 pub struct PrepareOutboundDeliveryRequest {
     pub scope: TurnScope,
     pub candidate: OutboundPushCandidate,
+    pub attempted_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepareCommunicationDeliveryRequest {
+    pub resolution_request: CommunicationDeliveryResolutionRequest,
+    pub turn_run_id: Option<TurnRunId>,
+    pub projection_ref: ProjectionUpdateRef,
     pub attempted_at: Timestamp,
 }
 
