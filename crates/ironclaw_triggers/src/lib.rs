@@ -478,38 +478,28 @@ pub trait TriggerRepository: Send + Sync {
 
     async fn claim_due_fire(
         &self,
-        _request: ClaimDueFireRequest,
-    ) -> Result<ClaimDueFireOutcome, TriggerError> {
-        Err(unimplemented_durable_backend_error())
-    }
+        request: ClaimDueFireRequest,
+    ) -> Result<ClaimDueFireOutcome, TriggerError>;
 
     async fn mark_fire_accepted(
         &self,
-        _request: FireAcceptedRequest,
-    ) -> Result<Option<TriggerRecord>, TriggerError> {
-        Err(unimplemented_durable_backend_error())
-    }
+        request: FireAcceptedRequest,
+    ) -> Result<Option<TriggerRecord>, TriggerError>;
 
     async fn mark_fire_replayed(
         &self,
-        _request: FireReplayedRequest,
-    ) -> Result<Option<TriggerRecord>, TriggerError> {
-        Err(unimplemented_durable_backend_error())
-    }
+        request: FireReplayedRequest,
+    ) -> Result<Option<TriggerRecord>, TriggerError>;
 
     async fn mark_fire_retryable_failed(
         &self,
-        _request: FireRetryableFailedRequest,
-    ) -> Result<Option<TriggerRecord>, TriggerError> {
-        Err(unimplemented_durable_backend_error())
-    }
+        request: FireRetryableFailedRequest,
+    ) -> Result<Option<TriggerRecord>, TriggerError>;
 
     async fn mark_fire_permanently_failed(
         &self,
-        _request: FirePermanentFailedRequest,
-    ) -> Result<Option<TriggerRecord>, TriggerError> {
-        Err(unimplemented_durable_backend_error())
-    }
+        request: FirePermanentFailedRequest,
+    ) -> Result<Option<TriggerRecord>, TriggerError>;
 }
 
 /// Feature-gated durable libSQL repository type for composition/test wiring.
@@ -796,13 +786,7 @@ impl InMemoryTriggerRepository {
     }
 }
 
-fn unimplemented_durable_backend_error() -> TriggerError {
-    TriggerError::Backend {
-        reason: "atomic trigger fire claim persistence for this backend lands in PR 13".to_string(),
-    }
-}
-
-fn reject_non_future_next_run_at(
+pub(crate) fn reject_non_future_next_run_at(
     fire_slot: Timestamp,
     next_run_at: Timestamp,
 ) -> Result<(), TriggerError> {
@@ -814,7 +798,7 @@ fn reject_non_future_next_run_at(
     })
 }
 
-fn reject_run_ref_rewrite(
+pub(crate) fn reject_run_ref_rewrite(
     active_run_ref: TurnRunId,
     incoming_run_ref: TurnRunId,
 ) -> Result<(), TriggerError> {
@@ -826,7 +810,7 @@ fn reject_run_ref_rewrite(
     })
 }
 
-fn reject_failed_result_after_active_run(
+pub(crate) fn reject_failed_result_after_active_run(
     active_run_ref: Option<TurnRunId>,
 ) -> Result<(), TriggerError> {
     if active_run_ref.is_none() {
@@ -1459,6 +1443,32 @@ mod tests {
             })
             .await
             .expect_err("poisoned mutex maps to backend through claim API");
+        assert!(matches!(error, TriggerError::Backend { .. }));
+    }
+
+    #[tokio::test]
+    async fn in_memory_repository_mark_fire_accepted_returns_backend_error_when_mutex_is_poisoned()
+    {
+        let repo = InMemoryTriggerRepository::default();
+        let poison_repo = repo.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poison_repo.state.lock().expect("lock before poison");
+            panic!("poison trigger repository mutex");
+        });
+
+        let fire_slot = ts(1_704_067_200);
+        let error = repo
+            .mark_fire_accepted(FireAcceptedRequest {
+                tenant_id: tenant("tenant-a"),
+                trigger_id: TriggerId::parse("01HZZZZZZZZZZZZZZZZZZZZZZZ").expect("ulid"),
+                fire_slot,
+                run_id: TurnRunId::parse("01890f0f-9b6f-7a85-9e5b-9f21a93c4f5a")
+                    .expect("valid run"),
+                submitted_at: fire_slot,
+                next_run_at: ts(1_704_067_260),
+            })
+            .await
+            .expect_err("poisoned mutex maps to backend through accepted-result API");
         assert!(matches!(error, TriggerError::Backend { .. }));
     }
 }
