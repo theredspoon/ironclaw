@@ -633,6 +633,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     );
     restore_extension_lifecycle_state(
         &available_extensions,
+        &extension_filesystem,
         &extension_installation_store,
         &extension_lifecycle_service,
         &active_extensions,
