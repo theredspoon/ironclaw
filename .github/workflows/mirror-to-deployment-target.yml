@@ -3,7 +3,6 @@ name: Mirror to deployment target
 on:
   push:
     branches:
-      - main
       - native-matrix-channel-pilot
 
 jobs:
@@ -21,4 +20,4 @@ jobs:
           DEPLOYMENT_MIRROR_PAT: ${{ secrets.DEPLOYMENT_MIRROR_PAT }}
         run: |
           git remote add deployment_mirror https://x-access-token:${DEPLOYMENT_MIRROR_PAT}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git
-          git push deployment_mirror "$GITHUB_REF" --tags --force
+          git push deployment_mirror HEAD:refs/heads/main
