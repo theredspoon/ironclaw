@@ -24,10 +24,10 @@ jobs:
 
       - name: Generate enjimi mirror token
         id: enjimi_token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
-          app-id: ${{ secrets.ENJIMI_MIRROR_APP_ID }}
-          private-key: ${{ secrets.ENJIMI_MIRROR_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.ENJIMI_IRONCLAW_MIRROR_CLIENT_ID }}
+          private-key: ${{ secrets.ENJIMI_IRONCLAW_MIRROR_PRIVATE_KEY }}
           owner: enjimi
           repositories: ironclaw
 
