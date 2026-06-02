@@ -13,6 +13,9 @@ jobs:
   sync:
     if: github.repository == 'theredspoon/ironclaw'
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_MIRROR_BRANCH: upstream-main
+      INTEGRATION_BRANCH: main
     steps:
       - uses: actions/checkout@v6
         with:
@@ -20,50 +23,60 @@ jobs:
 
       - name: Fetch upstream
         run: |
+          git fetch --no-tags origin "+refs/heads/${INTEGRATION_BRANCH}:refs/remotes/origin/${INTEGRATION_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${UPSTREAM_MIRROR_BRANCH}:refs/remotes/origin/${UPSTREAM_MIRROR_BRANCH}" || true
           git remote add upstream https://github.com/nearai/ironclaw.git
-          git fetch upstream main --no-tags
+          git fetch --no-tags upstream "+refs/heads/main:refs/remotes/upstream/main"
 
-      - name: Check if upstream has new commits
-        id: check
+      - name: Fast-forward exact upstream mirror
+        id: mirror
         run: |
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          if git show-ref --verify --quiet "refs/remotes/origin/${UPSTREAM_MIRROR_BRANCH}"; then
+            if git merge-base --is-ancestor "origin/${UPSTREAM_MIRROR_BRANCH}" upstream/main; then
+              git push origin "upstream/main:refs/heads/${UPSTREAM_MIRROR_BRANCH}"
+              echo "result=fast-forward" >> "$GITHUB_OUTPUT"
+            else
+              echo "result=diverged" >> "$GITHUB_OUTPUT"
+              echo "::error::${UPSTREAM_MIRROR_BRANCH} has commits that are not in nearai/main; refusing to overwrite exact mirror"
+              exit 1
+            fi
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            git push origin "upstream/main:refs/heads/${UPSTREAM_MIRROR_BRANCH}"
+            echo "result=created" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Attempt fast-forward merge
-        if: steps.check.outputs.skip == 'false'
-        id: ff
+      - name: Check integration branch status
+        id: integration
         run: |
-          if git merge --ff-only upstream/main; then
-            echo "result=fast-forward" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags origin \
+            "+refs/heads/${INTEGRATION_BRANCH}:refs/remotes/origin/${INTEGRATION_BRANCH}" \
+            "+refs/heads/${UPSTREAM_MIRROR_BRANCH}:refs/remotes/origin/${UPSTREAM_MIRROR_BRANCH}"
+          if git merge-base --is-ancestor "origin/${UPSTREAM_MIRROR_BRANCH}" "origin/${INTEGRATION_BRANCH}"; then
+            echo "needs_pr=false" >> "$GITHUB_OUTPUT"
           else
-            echo "result=diverged" >> "$GITHUB_OUTPUT"
+            echo "needs_pr=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push if fast-forwarded
-        if: steps.ff.outputs.result == 'fast-forward'
-        run: git push origin main --tags
-
-      - name: Open PR if diverged
-        if: steps.ff.outputs.result == 'diverged'
+      - name: Open upstream integration PR
+        if: steps.integration.outputs.needs_pr == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git reset --hard HEAD
-          branch="sync/upstream-$(date +%Y%m%d)"
-          git checkout -b "$branch"
-          git merge upstream/main --no-edit || true
-          git push -u origin "$branch"
-          if git diff --quiet HEAD; then
-            gh pr create \
-              --title "sync: merge upstream/main $(date +%Y-%m-%d)" \
-              --body "Automated sync from nearai/ironclaw. Fast-forward was not possible — manual review required."
+          existing_pr="$(
+            gh pr list \
+              --base "${INTEGRATION_BRANCH}" \
+              --head "${UPSTREAM_MIRROR_BRANCH}" \
+              --state open \
+              --json number \
+              --jq '.[0].number // empty'
+          )"
+
+          if [[ -n "$existing_pr" ]]; then
+            echo "Existing upstream integration PR: #${existing_pr}"
           else
             gh pr create \
-              --title "sync: merge upstream/main $(date +%Y-%m-%d) (conflicts)" \
-              --body "Automated sync from nearai/ironclaw. There are merge conflicts that need manual resolution."
+              --base "${INTEGRATION_BRANCH}" \
+              --head "${UPSTREAM_MIRROR_BRANCH}" \
+              --title "sync: integrate nearai/main $(date +%Y-%m-%d)" \
+              --body "Automated sync from nearai/ironclaw. The \`${UPSTREAM_MIRROR_BRANCH}\` branch is an exact fast-forward mirror of \`nearai/main\`; this PR merges it into the theredspoon integration branch for review and CI."
           fi
