@@ -71,7 +71,7 @@ mod runtime;
 mod runtime_input;
 mod skill_listing;
 #[cfg(feature = "slack-v2-host-beta")]
-mod slack_serve;
+pub mod slack_serve;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod web_access;
