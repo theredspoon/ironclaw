@@ -2106,7 +2106,7 @@ fn local_dev_root_filesystem(
                 StorageClass::StructuredRecords,
                 ContentKind::MemoryDocument,
                 IndexPolicy::FullTextAndVector,
-                BackendCapabilities::in_memory_full(),
+                memory.capabilities(),
             )?,
             memory,
         )?;

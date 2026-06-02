@@ -21,11 +21,13 @@ use ironclaw_events::{
 use ironclaw_extensions::{
     ExtensionInstallationStore, ExtensionLifecycleService, ExtensionRegistry,
 };
-use ironclaw_filesystem::RootFilesystem;
+#[cfg(not(feature = "libsql"))]
+use ironclaw_filesystem::InMemoryBackend;
 #[cfg(feature = "libsql")]
+use ironclaw_filesystem::LibSqlRootFilesystem;
 use ironclaw_filesystem::{
-    BackendCapabilities, BackendId, BackendKind, Capability, CompositeRootFilesystem, ContentKind,
-    IndexPolicy, LibSqlRootFilesystem, MountDescriptor, StorageClass,
+    BackendCapabilities, BackendId, BackendKind, CompositeRootFilesystem, ContentKind, IndexPolicy,
+    MountDescriptor, RootFilesystem, StorageClass,
 };
 use ironclaw_filesystem::{LocalFilesystem, ScopedFilesystem};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -110,10 +112,7 @@ use crate::{
     web_access::register_bundled_web_access_first_party_handlers,
 };
 
-#[cfg(feature = "libsql")]
 pub(crate) type LocalDevRootFilesystem = CompositeRootFilesystem;
-#[cfg(not(feature = "libsql"))]
-pub(crate) type LocalDevRootFilesystem = LocalFilesystem;
 
 type LocalDevWorkspaceFilesystems = (
     Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
@@ -1002,6 +1001,7 @@ async fn build_local_dev_root_filesystem(
         )?,
         Arc::clone(&database),
     )?;
+    mount_local_dev_memory_root(&mut root, Arc::clone(&database))?;
     root.mount(
         local_dev_mount_descriptor(
             "/events",
@@ -1014,30 +1014,7 @@ async fn build_local_dev_root_filesystem(
         )?,
         database,
     )?;
-    root.mount(
-        local_dev_mount_descriptor(
-            "/projects",
-            "local-dev-project-files",
-            BackendKind::LocalFilesystem,
-            StorageClass::FileContent,
-            ContentKind::ProjectFile,
-            IndexPolicy::NotIndexed,
-            local_dev_bytes_capabilities(),
-        )?,
-        Arc::clone(&local),
-    )?;
-    root.mount(
-        local_dev_mount_descriptor(
-            "/system/extensions",
-            "local-dev-system-extensions",
-            BackendKind::LocalFilesystem,
-            StorageClass::FileContent,
-            ContentKind::ExtensionPackage,
-            IndexPolicy::NotIndexed,
-            local_dev_bytes_capabilities(),
-        )?,
-        Arc::clone(&local),
-    )?;
+    mount_local_dev_project_roots(&mut root, local)?;
     Ok(Arc::new(root))
 }
 
@@ -1047,11 +1024,18 @@ async fn build_local_dev_root_filesystem(
     workspace_root: &Path,
     host_home_root: Option<&LocalDevHostHomeRoot>,
 ) -> Result<Arc<LocalDevRootFilesystem>, RebornBuildError> {
-    Ok(Arc::new(local_dev_project_filesystem(
+    let local = Arc::new(local_dev_project_filesystem(
         root,
         workspace_root,
         host_home_root,
-    )?))
+    )?);
+    tracing::warn!(
+        "local-dev: /memory is backed by InMemoryBackend; memory documents are ephemeral and will be lost on restart"
+    );
+    let mut composite = CompositeRootFilesystem::new();
+    mount_local_dev_memory_root(&mut composite, Arc::new(InMemoryBackend::new()))?;
+    mount_local_dev_project_roots(&mut composite, local)?;
+    Ok(Arc::new(composite))
 }
 
 fn local_dev_project_filesystem(
@@ -1079,6 +1063,59 @@ fn local_dev_project_filesystem(
         )?;
     }
     Ok(filesystem)
+}
+
+fn mount_local_dev_memory_root<F>(
+    root: &mut CompositeRootFilesystem,
+    backend: Arc<F>,
+) -> Result<(), RebornBuildError>
+where
+    F: RootFilesystem + 'static,
+{
+    root.mount(
+        local_dev_mount_descriptor(
+            "/memory",
+            "local-dev-memory",
+            BackendKind::MemoryDocuments,
+            StorageClass::StructuredRecords,
+            ContentKind::MemoryDocument,
+            IndexPolicy::FullTextAndVector,
+            backend.capabilities(),
+        )?,
+        backend,
+    )?;
+    Ok(())
+}
+
+fn mount_local_dev_project_roots(
+    root: &mut CompositeRootFilesystem,
+    local: Arc<LocalFilesystem>,
+) -> Result<(), RebornBuildError> {
+    root.mount(
+        local_dev_mount_descriptor(
+            "/projects",
+            "local-dev-project-files",
+            BackendKind::LocalFilesystem,
+            StorageClass::FileContent,
+            ContentKind::ProjectFile,
+            IndexPolicy::NotIndexed,
+            BackendCapabilities::bytes_only(),
+        )?,
+        Arc::clone(&local),
+    )?;
+    root.mount(
+        local_dev_mount_descriptor(
+            "/system/extensions",
+            "local-dev-system-extensions",
+            BackendKind::LocalFilesystem,
+            StorageClass::FileContent,
+            ContentKind::ExtensionPackage,
+            IndexPolicy::NotIndexed,
+            BackendCapabilities::bytes_only(),
+        )?,
+        local,
+    )?;
+    Ok(())
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -1207,7 +1244,8 @@ fn write_local_dev_secret_master_key(path: &Path, key: &str) -> Result<(), Rebor
     }
 }
 
-#[cfg(feature = "libsql")]
+// Intentionally uncfg'd: called from both libsql and no-libsql local-dev root
+// filesystem paths.
 fn local_dev_mount_descriptor(
     virtual_root: &str,
     backend_id: &str,
@@ -1226,17 +1264,6 @@ fn local_dev_mount_descriptor(
         index_policy,
         capabilities,
     })
-}
-
-#[cfg(feature = "libsql")]
-fn local_dev_bytes_capabilities() -> BackendCapabilities {
-    BackendCapabilities::empty()
-        .with(Capability::Read)
-        .with(Capability::Write)
-        .with(Capability::Append)
-        .with(Capability::List)
-        .with(Capability::Stat)
-        .with(Capability::Delete)
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -2222,6 +2249,7 @@ mod tests {
         RuntimeKind, ScopedPath, SecretHandle, TrustClass, UserId, VirtualPath,
     };
     use ironclaw_host_runtime::{
+        MEMORY_SEARCH_CAPABILITY_ID, MEMORY_TREE_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID,
         RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeFailureKind,
         SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
         TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID,
@@ -2258,6 +2286,122 @@ mod tests {
                 .is_some()
         );
         assert_eq!(services.readiness.state, RebornReadinessState::DevOnly);
+    }
+
+    #[tokio::test]
+    async fn local_dev_memory_first_party_tools_use_mounted_memory_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "local-dev-memory-owner",
+            dir.path().join("local-dev"),
+        ))
+        .await
+        .expect("local-dev services build");
+        let runtime = services.host_runtime.expect("host runtime composed");
+
+        invoke_json(
+            runtime.as_ref(),
+            MEMORY_WRITE_CAPABILITY_ID,
+            memory_context(MEMORY_WRITE_CAPABILITY_ID),
+            serde_json::json!({
+                "target": "projects/alpha/notes.md",
+                "content": "local dev mounted memory root search marker",
+                "append": false
+            }),
+        )
+        .await
+        .expect("memory_write should use the mounted /memory root");
+
+        let tree = invoke_json(
+            runtime.as_ref(),
+            MEMORY_TREE_CAPABILITY_ID,
+            memory_context(MEMORY_TREE_CAPABILITY_ID),
+            serde_json::json!({"path": "", "depth": 3}),
+        )
+        .await
+        .expect("memory_tree should list the mounted /memory root");
+        assert!(
+            tree.to_string().contains("alpha/"),
+            "memory_tree should include the written memory document: {tree}"
+        );
+
+        let search = invoke_json(
+            runtime.as_ref(),
+            MEMORY_SEARCH_CAPABILITY_ID,
+            memory_context(MEMORY_SEARCH_CAPABILITY_ID),
+            serde_json::json!({"query": "mounted memory root search marker", "limit": 5}),
+        )
+        .await
+        .expect("memory_search should query the mounted /memory root");
+        assert_eq!(search["result_count"], serde_json::json!(1));
+        assert_eq!(
+            search["results"][0]["path"],
+            serde_json::json!("projects/alpha/notes.md")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn local_dev_memory_documents_persist_across_rebuilds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dev_root = dir.path().join("local-dev");
+        let owner = "local-dev-durable-memory-owner";
+
+        let services =
+            build_reborn_services(RebornBuildInput::local_dev(owner, local_dev_root.clone()))
+                .await
+                .expect("first local-dev services build");
+        let runtime = services
+            .host_runtime
+            .as_ref()
+            .expect("host runtime composed");
+
+        invoke_json(
+            runtime.as_ref(),
+            MEMORY_WRITE_CAPABILITY_ID,
+            memory_context(MEMORY_WRITE_CAPABILITY_ID),
+            serde_json::json!({
+                "target": "projects/durable/notes.md",
+                "content": "local dev durable mounted memory root search marker",
+                "append": false
+            }),
+        )
+        .await
+        .expect("memory_write should persist through the libsql /memory root");
+        drop(services);
+
+        let rebuilt =
+            build_reborn_services(RebornBuildInput::local_dev(owner, local_dev_root.clone()))
+                .await
+                .expect("rebuilt local-dev services");
+        let runtime = rebuilt.host_runtime.as_ref().expect("rebuilt host runtime");
+
+        let tree = invoke_json(
+            runtime.as_ref(),
+            MEMORY_TREE_CAPABILITY_ID,
+            memory_context(MEMORY_TREE_CAPABILITY_ID),
+            serde_json::json!({"path": "", "depth": 3}),
+        )
+        .await
+        .expect("memory_tree should list rebuilt libsql memory documents");
+        assert!(
+            tree.to_string().contains("durable/"),
+            "memory_tree should include the persisted memory document: {tree}"
+        );
+
+        let search = invoke_json(
+            runtime.as_ref(),
+            MEMORY_SEARCH_CAPABILITY_ID,
+            memory_context(MEMORY_SEARCH_CAPABILITY_ID),
+            serde_json::json!({"query": "durable mounted memory root search marker", "limit": 5}),
+        )
+        .await
+        .expect("memory_search should query rebuilt libsql memory documents");
+        assert_eq!(search["result_count"], serde_json::json!(1));
+        assert_eq!(
+            search["results"][0]["path"],
+            serde_json::json!("projects/durable/notes.md")
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -3010,6 +3154,14 @@ mod tests {
 
     fn workspace_context(capability_id: &str) -> ExecutionContext {
         execution_context(capability_id, workspace_mounts())
+    }
+
+    fn memory_context(capability_id: &str) -> ExecutionContext {
+        execution_context(
+            capability_id,
+            memory_mount_view(MountPermissions::read_write_list_delete())
+                .expect("valid memory mounts"),
+        )
     }
 
     fn gsuite_context(capability_id: &str) -> ExecutionContext {
