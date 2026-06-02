@@ -63,11 +63,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           existing_pr="$(
-            gh pr list \
-              --base "${INTEGRATION_BRANCH}" \
-              --head "${UPSTREAM_MIRROR_BRANCH}" \
-              --state open \
-              --json number \
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -F state=open \
+              -F base="${INTEGRATION_BRANCH}" \
+              -F head="${GITHUB_REPOSITORY_OWNER}:${UPSTREAM_MIRROR_BRANCH}" \
               --jq '.[0].number // empty'
           )"
 
