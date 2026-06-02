@@ -526,6 +526,7 @@ mod tests {
                                                 provider,
                                             )
                                             .unwrap(),
+                                            setup: Default::default(),
                                         },
                                     provider_scopes: Vec::new(),
                                     audience: NetworkTargetPattern {
