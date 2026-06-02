@@ -1,0 +1,24 @@
+name: Mirror to deployment target
+
+on:
+  push:
+    branches:
+      - main
+      - native-matrix-channel-pilot
+
+jobs:
+  mirror:
+    if: github.repository == 'theredspoon/ironclaw'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push to deployment mirror
+        env:
+          DEPLOYMENT_MIRROR_PAT: ${{ secrets.DEPLOYMENT_MIRROR_PAT }}
+        run: |
+          git remote add deployment_mirror https://x-access-token:${DEPLOYMENT_MIRROR_PAT}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git
+          git push deployment_mirror "$GITHUB_REF" --tags --force
