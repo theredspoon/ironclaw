@@ -11,9 +11,9 @@ use ironclaw_event_projections::{
 };
 use ironclaw_events::{InMemoryDurableEventLog, RuntimeEvent};
 use ironclaw_host_api::{
-    AgentId, CapabilityId, ExtensionId, InvocationId, ResourceScope,
-    RuntimeCredentialAccountProviderId, RuntimeCredentialAuthRequirement, RuntimeKind, TenantId,
-    ThreadId, UserId,
+    AgentId, CapabilityId, ExtensionId, InvocationId, NetworkMethod, ResourceScope,
+    RuntimeCredentialAccountProviderId, RuntimeCredentialAuthRequirement, RuntimeHttpEgress,
+    RuntimeHttpEgressRequest, RuntimeHttpEgressResponse, RuntimeKind, TenantId, ThreadId, UserId,
 };
 use ironclaw_product_adapters::{
     AuthPromptChallengeKind, CapabilityActivityStatusView, ProductOutboundEnvelope,
@@ -39,6 +39,7 @@ mod display_preview;
 mod failure_explanation;
 mod runtime_stream;
 mod turn_stream;
+mod turn_stream_auth;
 
 fn long_test_id(prefix: &str, character: char) -> String {
     format!("{prefix}-{}", character.to_string().repeat(96))
