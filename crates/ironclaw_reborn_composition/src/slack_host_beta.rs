@@ -17,8 +17,8 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_product_workflow::{
     DefaultInboundTurnService, DefaultProductWorkflow, InMemoryIdempotencyLedger,
-    ProductConversationBindingService, ProductInstallationKey, ProductInstallationScope,
-    StaticProductInstallationResolver,
+    ProductActorUserResolver, ProductConversationBindingService, ProductInstallationKey,
+    ProductInstallationScope, StaticProductActorUserResolver, StaticProductInstallationResolver,
 };
 use ironclaw_slack_v2_adapter::{
     SLACK_USER_ACTOR_KIND, SlackV2Adapter, SlackV2AdapterConfig,
@@ -65,7 +65,10 @@ pub struct SlackHostBetaConfig {
     pub project_id: Option<ProjectId>,
     pub installation_id: AdapterInstallationId,
     pub installation_selector: SlackInstallationSelector,
+    /// Slack actor used by the legacy static personal-binding builder.
     pub slack_actor: ExternalActorRef,
+    /// Host user used by the legacy static personal-binding builder and as the
+    /// resource owner for Slack bot-token egress.
     pub user_id: UserId,
     pub signing_secret: SecretString,
     pub bot_token: SecretString,
@@ -138,10 +141,23 @@ pub fn build_slack_events_route_mount(
     runtime: &RebornRuntime,
     config: SlackHostBetaConfig,
 ) -> Result<PublicRouteMount, SlackHostBetaBuildError> {
+    let actor_user_resolver = Arc::new(StaticProductActorUserResolver::new([(
+        config.slack_actor.clone(),
+        config.user_id.clone(),
+    )]));
+    build_slack_events_route_mount_with_actor_user_resolver(runtime, config, actor_user_resolver)
+}
+
+pub fn build_slack_events_route_mount_with_actor_user_resolver(
+    runtime: &RebornRuntime,
+    config: SlackHostBetaConfig,
+    actor_user_resolver: Arc<dyn ProductActorUserResolver>,
+) -> Result<PublicRouteMount, SlackHostBetaBuildError> {
+    // The resolver controls inbound Slack actor binding. `config.user_id` still
+    // scopes the host-mediated Slack bot-token egress for this beta route.
     tracing::warn!(
         "Slack host-beta uses in-memory conversation bindings, idempotency ledger, and outbound state; Slack continuity, retry deduplication, and delivery state are lost on process restart"
     );
-
     let adapter_id = ProductAdapterId::new(SLACK_ADAPTER_ID)
         .map_err(|reason| invalid_config("adapter_id", reason.to_string()))?;
     let token_handle = EgressCredentialHandle::new(SLACK_BOT_TOKEN_HANDLE)
@@ -157,19 +173,18 @@ pub fn build_slack_events_route_mount(
     let conversation_port: Arc<dyn ironclaw_conversations::ConversationBindingService> =
         conversations.clone();
     let actor_pairings: Arc<dyn ironclaw_conversations::ConversationActorPairingService> =
-        conversations;
+        conversations.clone();
     let scope = ProductInstallationScope::with_default_scope(
         config.tenant_id.clone(),
         config.agent_id.clone(),
         config.project_id.clone(),
     )
-    .with_preconfigured_actor_binding(config.slack_actor.clone(), config.user_id.clone());
+    .with_actor_user_resolver(actor_user_resolver, actor_pairings);
     let installation_resolver = StaticProductInstallationResolver::new([(
         ProductInstallationKey::new(adapter_id, config.installation_id.clone()),
         scope,
     )]);
-    let binding = ProductConversationBindingService::new(conversation_port, installation_resolver)
-        .with_actor_pairings(actor_pairings);
+    let binding = ProductConversationBindingService::new(conversation_port, installation_resolver);
 
     let inbound = Arc::new(DefaultInboundTurnService::new(
         binding.clone(),
@@ -265,7 +280,7 @@ fn invalid_config(field: &'static str, reason: String) -> SlackHostBetaBuildErro
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use async_trait::async_trait;
@@ -280,6 +295,7 @@ mod tests {
         HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
         HostManagedModelResponse,
     };
+    use ironclaw_product_workflow::{ProductActorUserResolutionRequest, ProductWorkflowError};
     use ironclaw_threads::{ListThreadsForScopeRequest, ThreadHistoryRequest, ThreadScope};
     use ironclaw_turns::run_profile::LoopCapabilityPort;
     use secrecy::ExposeSecret;
@@ -336,6 +352,47 @@ mod tests {
             .expect("body collects")
             .to_bytes();
         assert!(String::from_utf8_lossy(&bytes).contains("reborn-slack-ok"));
+
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn custom_actor_user_resolver_routes_inbound_slack_event() {
+        let (runtime, _root) = runtime().await;
+        let resolver = Arc::new(RecordingProductActorUserResolver::new(
+            UserId::new(USER).expect("user"),
+        ));
+        let mount = build_slack_events_route_mount_with_actor_user_resolver(
+            &runtime,
+            config(),
+            resolver.clone(),
+        )
+        .expect("route builds");
+
+        let body = dm_event_body();
+        let timestamp = current_unix_timestamp();
+        let response = mount
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(SLACK_EVENTS_PATH)
+                    .header(SLACK_TIMESTAMP_HEADER, timestamp.to_string())
+                    .header(SLACK_SIGNATURE_HEADER, slack_signature(timestamp, body))
+                    .body(Body::from(body))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let calls = wait_for_resolver_calls(&resolver, 1).await;
+        assert!(!calls.is_empty());
+        assert_eq!(calls[0].adapter_id.as_str(), SLACK_ADAPTER_ID);
+        assert_eq!(calls[0].installation_id.as_str(), INSTALLATION);
+        assert_eq!(calls[0].external_actor_ref.kind(), SLACK_USER_ACTOR_KIND);
+        assert_eq!(calls[0].external_actor_ref.id(), SLACK_USER);
 
         runtime.shutdown().await.expect("runtime shuts down");
     }
@@ -502,6 +559,73 @@ mod tests {
         mac.update(format!("v0:{timestamp}:").as_bytes());
         mac.update(body.as_bytes());
         format!("v0={:x}", mac.finalize().into_bytes())
+    }
+
+    fn dm_event_body() -> &'static str {
+        r#"{
+          "type":"event_callback",
+          "team_id":"T-HOST",
+          "api_app_id":"A-HOST",
+          "event_id":"Ev-host-beta-custom-resolver",
+          "event":{
+            "type":"message",
+            "channel_type":"im",
+            "user":"U-HOST",
+            "channel":"D-HOST",
+            "text":"hello",
+            "ts":"1710000000.000001"
+          }
+        }"#
+    }
+
+    async fn wait_for_resolver_calls(
+        resolver: &RecordingProductActorUserResolver,
+        expected_len: usize,
+    ) -> Vec<ProductActorUserResolutionRequest> {
+        for _ in 0..40 {
+            let calls = resolver.calls();
+            if calls.len() >= expected_len {
+                return calls;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        resolver.calls()
+    }
+
+    #[derive(Debug)]
+    struct RecordingProductActorUserResolver {
+        user_id: UserId,
+        calls: Mutex<Vec<ProductActorUserResolutionRequest>>,
+    }
+
+    impl RecordingProductActorUserResolver {
+        fn new(user_id: UserId) -> Self {
+            Self {
+                user_id,
+                calls: Mutex::default(),
+            }
+        }
+
+        fn calls(&self) -> Vec<ProductActorUserResolutionRequest> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProductActorUserResolver for RecordingProductActorUserResolver {
+        async fn resolve_product_actor_user(
+            &self,
+            request: ProductActorUserResolutionRequest,
+        ) -> Result<Option<UserId>, ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            Ok(Some(self.user_id.clone()))
+        }
     }
 
     #[derive(Debug)]
