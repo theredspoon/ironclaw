@@ -20,6 +20,7 @@
 //! property that satisfies the "narrow Reborn public surface" requirement
 //! pinned by `crates/ironclaw_architecture/tests/reborn_dependency_boundaries.rs`.
 
+// arch-exempt: large_file, needs Reborn runtime helper extraction, plan #4471
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,12 +32,6 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const MAX_DESCENDANT_CANCEL_NODES: usize = 1_000;
-
-#[cfg(not(any(feature = "libsql", feature = "postgres")))]
-use ironclaw_conversations::InMemoryConversationServices;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_conversations::RebornFilesystemConversationServices;
 use ironclaw_events::{DurableAuditLog, DurableEventLog, InMemoryAuditSink, RuntimeEvent};
 use ironclaw_first_party_extension_ports::{
     FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, SelectableSkillContextSource,
@@ -109,6 +104,8 @@ use crate::{
     RebornBuildError, RebornCompositionProfile, RebornProductAuthServices, RebornServices,
     build_reborn_services,
 };
+
+const MAX_DESCENDANT_CANCEL_NODES: usize = 1_000;
 
 mod approval;
 mod auth_interaction;
@@ -286,13 +283,12 @@ async fn build_trigger_poller_services(
     let authorizer = build_trigger_fire_authorizer(authorizer_config, tenant_id)?;
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     {
-        let conversations = RebornFilesystemConversationServices::new(Arc::clone(
-            &local_runtime.subagent_goal_filesystem,
-        ))
-        .await
-        .map_err(|error| RebornRuntimeError::InvalidArgument {
-            reason: format!("trigger conversation services unavailable: {error}"),
-        })?;
+        let conversations = local_runtime
+            .durable_trigger_conversation_services()
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!("trigger conversation services unavailable: {error}"),
+            })?;
         #[cfg(any(test, feature = "test-support"))]
         let pairing_service: Arc<
             dyn ironclaw_conversations::ConversationActorPairingService,
@@ -317,8 +313,7 @@ async fn build_trigger_poller_services(
     }
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     {
-        let _ = local_runtime;
-        let conversations = InMemoryConversationServices::default();
+        let conversations = local_runtime.trigger_conversation_services.clone();
         #[cfg(any(test, feature = "test-support"))]
         let pairing_service: Arc<
             dyn ironclaw_conversations::ConversationActorPairingService,
