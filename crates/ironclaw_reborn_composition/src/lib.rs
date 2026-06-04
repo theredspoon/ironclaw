@@ -81,6 +81,10 @@ mod slack_egress;
 #[cfg(feature = "slack-v2-host-beta")]
 mod slack_host_beta;
 #[cfg(feature = "slack-v2-host-beta")]
+mod slack_host_state;
+#[cfg(feature = "slack-v2-host-beta")]
+mod slack_pairing_notifier;
+#[cfg(feature = "slack-v2-host-beta")]
 mod slack_personal_binding;
 #[cfg(feature = "slack-v2-host-beta")]
 mod slack_personal_binding_pairing;
@@ -195,8 +199,9 @@ pub use slack_egress::{
 };
 #[cfg(feature = "slack-v2-host-beta")]
 pub use slack_host_beta::{
-    SlackHostBetaBuildError, SlackHostBetaConfig, SlackHostBetaConfigInput,
+    SlackHostBetaBuildError, SlackHostBetaConfig, SlackHostBetaConfigInput, SlackHostBetaMounts,
     build_slack_events_route_mount, build_slack_events_route_mount_with_actor_user_resolver,
+    build_slack_host_beta_mounts,
 };
 #[cfg(feature = "slack-v2-host-beta")]
 pub use slack_personal_binding::{
