@@ -111,7 +111,13 @@ export function useChat(threadId) {
   const pendingSeqRef = React.useRef(1);
   const [cooldownUntil, setCooldownUntil] = React.useState(0);
   const [now, setNow] = React.useState(Date.now());
-  const [activeRun, setActiveRun] = React.useState(null);
+  const [activeRun, setActiveRunState] = React.useState(null);
+  const activeRunRef = React.useRef(activeRun);
+  const setActiveRun = React.useCallback((next) => {
+    const value = typeof next === "function" ? next(activeRunRef.current) : next;
+    activeRunRef.current = value;
+    setActiveRunState(value);
+  }, []);
   const [channelConnectAction, setChannelConnectAction] = React.useState(null);
 
   const getPendingMessages = React.useCallback(
@@ -230,6 +236,7 @@ export function useChat(threadId) {
     setIsProcessing,
     setPendingGate,
     setActiveRun,
+    activeRunRef,
     // Reborn's projection bridge does not yet emit `Text` items for
     // assistant replies, so the SSE stream only delivers `run_status`.
     // On terminal success, refetch the timeline so the assistant
@@ -323,6 +330,7 @@ export function useChat(threadId) {
             runId: response.run_id,
             threadId: response.thread_id || sendThreadId,
             status: response.status || null,
+            source: "local",
           });
         }
         const timelineMessageId = recordAcceptedMessageRef(
@@ -488,11 +496,10 @@ export function useChat(threadId) {
     async (reason) => {
       const runId = activeRun?.runId;
       if (!runId || !threadId) return;
-      try {
-        await cancelRunRequest({ threadId, runId, reason });
-      } finally {
-        setIsProcessing(false);
-      }
+      setPendingGate(null);
+      setIsProcessing(false);
+      setActiveRun(null);
+      await cancelRunRequest({ threadId, runId, reason });
     },
     [activeRun, threadId],
   );

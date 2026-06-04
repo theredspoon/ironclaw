@@ -40,7 +40,9 @@ export function Chat({
     hasMore,
     cooldownSeconds,
     recoveryNotice,
+    activeRun,
     send,
+    cancelRun,
     retryMessage,
     approve,
     recoverHistory,
@@ -64,6 +66,13 @@ export function Chat({
   const composerDisabled = (isProcessing && !pendingGate) || cooldownSeconds > 0;
   const composerStatusText =
     cooldownSeconds > 0 ? `Retry in ${cooldownSeconds}s` : undefined;
+  const canCancelRun = Boolean(
+    activeThreadId &&
+      activeRun?.runId &&
+      activeRun.threadId === activeThreadId &&
+      isProcessing &&
+      !pendingGate
+  );
 
   const handleSend = React.useCallback(
     async (content, { images = [], attachments = [] } = {}) => {
@@ -87,6 +96,11 @@ export function Chat({
       await handleSend(text);
     },
     [handleSend, setSuggestions]
+  );
+
+  const handleCancelRun = React.useCallback(
+    () => cancelRun("user_requested"),
+    [cancelRun]
   );
 
   /* Mirror the active thread's lifecycle into the per-thread state store
@@ -156,6 +170,8 @@ export function Chat({
             resetKey=${composerResetKey}
             context=${runtimeContext}
             statusText=${composerStatusText}
+            canCancel=${canCancelRun}
+            onCancel=${handleCancelRun}
           />
         `}
         ${!showLanding &&
@@ -233,6 +249,8 @@ export function Chat({
             resetKey=${composerResetKey}
             context=${runtimeContext}
             statusText=${composerStatusText}
+            canCancel=${canCancelRun}
+            onCancel=${handleCancelRun}
           />
         `}
       </div>
