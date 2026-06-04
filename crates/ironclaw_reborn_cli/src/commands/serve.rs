@@ -152,8 +152,7 @@ impl ServeCommand {
             .map(ironclaw_reborn_composition::host_api::ProjectId::new)
             .transpose()
             .map_err(|err| anyhow!("[identity].default_project is invalid: {err}"))?;
-        #[cfg(feature = "slack-v2-host-beta")]
-        let slack_host_beta_config = crate::commands::serve_slack::resolve_slack_host_beta_config(
+        let slack_host_beta_config = crate::commands::serve_slack::resolve_slack_config_for_serve(
             config_file.as_ref().and_then(|file| file.slack.as_ref()),
             &tenant_id,
             &default_agent_id,
@@ -162,9 +161,7 @@ impl ServeCommand {
             &boot_config.home().config_file_path(),
         )?;
         #[cfg(not(feature = "slack-v2-host-beta"))]
-        crate::commands::serve_slack::reject_enabled_slack_without_feature(
-            config_file.as_ref().and_then(|file| file.slack.as_ref()),
-        )?;
+        let _ = slack_host_beta_config;
 
         // Resolve listen address with explicit precedence:
         //   CLI flag (Some(...)) > config file > compile-time default.

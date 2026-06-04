@@ -17,6 +17,38 @@ const DEFAULT_SLACK_SIGNING_SECRET_ENV_VAR: &str = "IRONCLAW_REBORN_SLACK_SIGNIN
 const DEFAULT_SLACK_BOT_TOKEN_ENV_VAR: &str = "IRONCLAW_REBORN_SLACK_BOT_TOKEN";
 
 #[cfg(feature = "slack-v2-host-beta")]
+pub(crate) fn resolve_slack_config_for_serve(
+    section: Option<&ironclaw_reborn_config::SlackSection>,
+    tenant_id: &ironclaw_reborn_composition::host_api::TenantId,
+    default_agent_id: &ironclaw_reborn_composition::host_api::AgentId,
+    default_project_id: Option<&ironclaw_reborn_composition::host_api::ProjectId>,
+    default_user_id: &ironclaw_reborn_composition::host_api::UserId,
+    config_path: &Path,
+) -> anyhow::Result<Option<SlackHostBetaConfig>> {
+    resolve_slack_host_beta_config(
+        section,
+        tenant_id,
+        default_agent_id,
+        default_project_id,
+        default_user_id,
+        config_path,
+    )
+}
+
+#[cfg(not(feature = "slack-v2-host-beta"))]
+pub(crate) fn resolve_slack_config_for_serve(
+    section: Option<&ironclaw_reborn_config::SlackSection>,
+    _tenant_id: &ironclaw_reborn_composition::host_api::TenantId,
+    _default_agent_id: &ironclaw_reborn_composition::host_api::AgentId,
+    _default_project_id: Option<&ironclaw_reborn_composition::host_api::ProjectId>,
+    _default_user_id: &ironclaw_reborn_composition::host_api::UserId,
+    _config_path: &std::path::Path,
+) -> anyhow::Result<Option<()>> {
+    reject_enabled_slack_without_feature(section)?;
+    Ok(None)
+}
+
+#[cfg(feature = "slack-v2-host-beta")]
 pub(crate) fn resolve_slack_host_beta_config(
     section: Option<&ironclaw_reborn_config::SlackSection>,
     tenant_id: &ironclaw_reborn_composition::host_api::TenantId,
@@ -508,6 +540,25 @@ mod tests {
             error.to_string().contains("slack-v2-host-beta"),
             "message: {error}"
         );
+    }
+
+    #[cfg(not(feature = "slack-v2-host-beta"))]
+    #[test]
+    fn reject_enabled_slack_without_feature_allows_disabled_section() {
+        let section = ironclaw_reborn_config::SlackSection {
+            enabled: Some(false),
+            ..Default::default()
+        };
+
+        reject_enabled_slack_without_feature(Some(&section))
+            .expect("disabled Slack config should be a no-op without the host-beta feature");
+    }
+
+    #[cfg(not(feature = "slack-v2-host-beta"))]
+    #[test]
+    fn reject_enabled_slack_without_feature_allows_absent_section() {
+        reject_enabled_slack_without_feature(None)
+            .expect("absent Slack config should be a no-op without the host-beta feature");
     }
 
     #[cfg(feature = "slack-v2-host-beta")]
