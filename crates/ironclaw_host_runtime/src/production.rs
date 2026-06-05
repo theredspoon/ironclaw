@@ -44,8 +44,8 @@ use ironclaw_turns::run_profile::LoopSafeSummary;
 
 use crate::{
     BuiltinObligationHandler, BuiltinObligationServices, CancelRuntimeWorkOutcome,
-    CancelRuntimeWorkRequest, CapabilitySurfaceVersion, HostRuntime, HostRuntimeError,
-    HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
+    CancelRuntimeWorkRequest, CapabilityFailureDisposition, CapabilitySurfaceVersion, HostRuntime,
+    HostRuntimeError, HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
     RuntimeBackendHealth, RuntimeBlockedReason, RuntimeCapabilityCompleted,
     RuntimeCapabilityFailure, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
     RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeGateId, RuntimeStatusRequest,
@@ -1024,10 +1024,42 @@ impl DefaultHostRuntime {
                 required_secrets,
                 credential_requirements,
             )),
-            other => Ok(RuntimeCapabilityOutcome::Failed(failure_from(
-                other,
-                capability_id,
-            ))),
+            other => {
+                let should_fail_dispatch_run =
+                    matches!(other, CapabilityInvocationError::Dispatch { .. });
+                let failure = failure_from(other, capability_id);
+                if should_fail_dispatch_run {
+                    self.fail_terminal_dispatch_run(&failure, &scope, invocation_id)
+                        .await;
+                }
+                Ok(RuntimeCapabilityOutcome::Failed(failure))
+            }
+        }
+    }
+
+    async fn fail_terminal_dispatch_run(
+        &self,
+        failure: &RuntimeCapabilityFailure,
+        scope: &ResourceScope,
+        invocation_id: InvocationId,
+    ) {
+        if failure.disposition() != CapabilityFailureDisposition::ModelVisibleToolError {
+            return;
+        }
+        let Some(run_state) = self.run_state.as_ref() else {
+            return;
+        };
+        if let Err(error) = run_state
+            .fail(scope, invocation_id, "Dispatch".to_string())
+            .await
+        {
+            tracing::warn!(
+                invocation_id = %invocation_id,
+                capability_id = %failure.capability_id,
+                failure_kind = failure.kind.as_str(),
+                transition_error = %unavailable_from_run_state(error),
+                "terminal dispatch failure could not transition run state; failure is returned to caller",
+            );
         }
     }
 
