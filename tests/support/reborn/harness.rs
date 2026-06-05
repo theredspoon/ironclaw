@@ -1034,11 +1034,12 @@ impl RebornBinaryE2EHarness {
             .resolve_binding(binding_request)
             .await?;
         let thread_scope = thread_scope_from_binding_with_route_kind(&binding, route_kind)?;
-        let turn_scope = TurnScope::new(
+        let turn_scope = TurnScope::new_with_owner(
             binding.tenant_id.clone(),
             binding.agent_id.clone(),
             binding.project_id.clone(),
             binding.thread_id.clone(),
+            binding.subject_user_id.clone(),
         );
         let actor = TurnActor::new(binding.actor_user_id.clone());
         let ack = self.workflow.accept_inbound(envelope).await?;
