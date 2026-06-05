@@ -12,10 +12,10 @@ use ironclaw_events::{
     parse_jsonl, replay_jsonl, sanitize_error_kind,
 };
 use ironclaw_host_api::{
-    Action, ActionSummary, AgentId, ApprovalRequest, ApprovalRequestId, AuditEnvelope,
-    CapabilityId, CorrelationId, DenyReason, ExecutionContext, ExtensionId, InvocationId,
-    MountView, Principal, ProjectId, ResourceEstimate, ResourceScope, RuntimeKind, TenantId,
-    UserId,
+    Action, ActionSummary, AgentId, ApprovalDecisionKind, ApprovalRequest, ApprovalRequestId,
+    AuditEnvelope, CapabilityId, CorrelationId, DenyReason, ExecutionContext, ExtensionId,
+    InvocationId, MountView, Principal, ProjectId, ResourceEstimate, ResourceScope, RuntimeKind,
+    TenantId, UserId,
 };
 
 fn capability_id() -> CapabilityId {
@@ -639,7 +639,7 @@ async fn approval_audit_records_partition_by_stream_key() {
         &alice_scope,
         &alice_request,
         Principal::User(alice_scope.user_id.clone()),
-        "approved",
+        ApprovalDecisionKind::Approved,
     );
     let bob_request = ApprovalRequest {
         id: ApprovalRequestId::new(),
@@ -657,7 +657,7 @@ async fn approval_audit_records_partition_by_stream_key() {
         &bob_scope,
         &bob_request,
         Principal::User(bob_scope.user_id.clone()),
-        "approved",
+        ApprovalDecisionKind::Approved,
     );
 
     log.append(alice_audit).await.expect("alice audit");
@@ -714,7 +714,7 @@ async fn approval_audit_envelope_serialization_excludes_raw_reason_and_fingerpri
         &scope,
         &request,
         Principal::User(scope.user_id.clone()),
-        "approved",
+        ApprovalDecisionKind::Approved,
     );
 
     let serialized = serde_json::to_string(&envelope).expect("serialize");
@@ -855,6 +855,19 @@ async fn replay_jsonl_with_zero_limit_is_rejected() {
 }
 
 #[tokio::test]
+async fn replay_jsonl_rejects_malformed_line_rather_than_silently_skipping() {
+    let scope = local_scope("alice", Some("default"));
+    let event = RuntimeEvent::dispatch_requested(scope, capability_id());
+    let mut bytes = serde_json::to_vec(&event).expect("serialize event");
+    bytes.push(b'\n');
+    bytes.extend_from_slice(b"something not even json\n");
+
+    let result: Result<ironclaw_events::EventReplay<RuntimeEvent>, _> =
+        replay_jsonl(&bytes, None, 1);
+    assert!(matches!(result, Err(EventError::Serialize { .. })));
+}
+
+#[tokio::test]
 async fn replay_jsonl_with_future_cursor_returns_replay_gap() {
     // Symmetric to the in-memory log: a JSONL-backed durable log must not
     // silently echo a cursor beyond the file head. Without this, a future
@@ -895,6 +908,7 @@ async fn direct_construction_serialize_path_resanitizes_error_kind() {
         timestamp: chrono::Utc::now(),
         kind: RuntimeEventKind::DispatchFailed,
         scope,
+        parent_invocation_id: None,
         capability_id: capability_id(),
         provider: Some(extension_id()),
         runtime: Some(RuntimeKind::Wasm),
@@ -903,6 +917,12 @@ async fn direct_construction_serialize_path_resanitizes_error_kind() {
         // Free-form raw text with a path-like fragment — exactly what the
         // redaction invariant forbids in durable storage.
         error_kind: Some("/Users/alice/token=secret raw error".to_string()),
+        hook_id: None,
+        hook_point: None,
+        hook_trust_class: None,
+        hook_decision: None,
+        hook_failure_category: None,
+        hook_failure_disposition: None,
     };
 
     let json = serde_json::to_string(&event).expect("serialize");
