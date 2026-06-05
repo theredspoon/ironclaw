@@ -44,8 +44,8 @@ use ironclaw_turns::run_profile::LoopSafeSummary;
 
 use crate::{
     BuiltinObligationHandler, BuiltinObligationServices, CancelRuntimeWorkOutcome,
-    CancelRuntimeWorkRequest, CapabilityFailureDisposition, CapabilitySurfaceVersion, HostRuntime,
-    HostRuntimeError, HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
+    CancelRuntimeWorkRequest, CapabilitySurfaceVersion, HostRuntime, HostRuntimeError,
+    HostRuntimeHealth, HostRuntimeStatus, RuntimeApprovalGate, RuntimeAuthGate,
     RuntimeBackendHealth, RuntimeBlockedReason, RuntimeCapabilityCompleted,
     RuntimeCapabilityFailure, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
     RuntimeCapabilityResumeRequest, RuntimeFailureKind, RuntimeGateId, RuntimeStatusRequest,
@@ -1029,7 +1029,7 @@ impl DefaultHostRuntime {
                     matches!(other, CapabilityInvocationError::Dispatch { .. });
                 let failure = failure_from(other, capability_id);
                 if should_fail_dispatch_run {
-                    self.fail_terminal_dispatch_run(&failure, &scope, invocation_id)
+                    self.fail_dispatch_run(&failure, &scope, invocation_id)
                         .await;
                 }
                 Ok(RuntimeCapabilityOutcome::Failed(failure))
@@ -1037,15 +1037,12 @@ impl DefaultHostRuntime {
         }
     }
 
-    async fn fail_terminal_dispatch_run(
+    async fn fail_dispatch_run(
         &self,
         failure: &RuntimeCapabilityFailure,
         scope: &ResourceScope,
         invocation_id: InvocationId,
     ) {
-        if failure.disposition() != CapabilityFailureDisposition::ModelVisibleToolError {
-            return;
-        }
         let Some(run_state) = self.run_state.as_ref() else {
             return;
         };

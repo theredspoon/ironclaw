@@ -561,10 +561,8 @@ where
         }
         if let Some(run_state_approval_store) = &self.run_state_approval_store {
             runtime = runtime.with_run_state_approval_store(Arc::clone(run_state_approval_store));
-        } else {
-            if let Some(approval_requests) = &self.approval_requests {
-                runtime = runtime.with_approval_requests(Arc::clone(approval_requests));
-            }
+        } else if let Some(approval_requests) = &self.approval_requests {
+            runtime = runtime.with_approval_requests(Arc::clone(approval_requests));
         }
         if let Some(capability_leases) = &self.capability_leases {
             runtime = runtime.with_capability_leases(Arc::clone(capability_leases));
