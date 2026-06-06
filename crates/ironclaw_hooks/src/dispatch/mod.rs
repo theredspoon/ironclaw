@@ -58,6 +58,9 @@ use crate::wasm::{
     WasmBeforeCapabilityHook, WasmBeforePromptHook, WasmHookFailure, WasmObserverHook,
 };
 
+mod lifecycle_owner;
+use lifecycle_owner::{LifecycleOwnerLookup, resolve_event_owner};
+
 /// Default per-hook wall-clock budget. Tunable per dispatcher.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -1332,28 +1335,18 @@ impl HookDispatcher {
         &self,
         event: &RuntimeEvent,
     ) -> Option<ironclaw_host_api::ExtensionId> {
-        if let Some(provider) = event.provider.clone() {
-            return Some(provider);
-        }
-        if !matches!(
-            event.kind,
-            RuntimeEventKind::HookDispatched
-                | RuntimeEventKind::HookDecisionEmitted
-                | RuntimeEventKind::HookFailed
-        ) {
-            return None;
-        }
-        let hook_id = event.hook_id.as_deref()?;
-        match self.registry.lock() {
-            Ok(registry) => registry.owning_extension_for_hook_hex(hook_id).cloned(),
-            Err(poisoned) => {
-                // Keep the same fail-closed posture as other registry reads:
-                // if the registry cannot be trusted, providerless OwnCapabilities
-                // hooks remain inert.
-                let _ = poisoned;
-                None
-            }
-        }
+        // The lifecycle provider-ownership security policy lives in
+        // `lifecycle_owner` (PR #3931 P2 extraction). Here we only translate
+        // the registry-lock probe into a `LifecycleOwnerLookup` value; the
+        // resolver applies the fail-closed policy. The probe closure is only
+        // invoked for lifecycle events that carry a `hook_id` anchor.
+        resolve_event_owner(event, |hook_id| match self.registry.lock() {
+            Err(_poisoned) => LifecycleOwnerLookup::Poisoned,
+            Ok(registry) => match registry.owning_extension_for_hook_hex(hook_id).cloned() {
+                Some(owner) => LifecycleOwnerLookup::Owner(owner),
+                None => LifecycleOwnerLookup::Unknown,
+            },
+        })
     }
 
     #[cfg(test)]
@@ -4509,6 +4502,91 @@ mod tests {
         );
     }
 
+    /// PR #3640 followup (Bug 3, hook-lifecycle provider spoofing): a
+    /// `HookFailed` event whose `hook_id` is owned by ext-B but whose
+    /// `provider` payload claims ext-A must NOT cause ext-A's
+    /// `OwnCapabilities` hooks to fire. For hook-lifecycle event kinds the
+    /// scope provider is resolved from the registry by `hook_id`, and the
+    /// untrusted `event.provider` claim is ignored when it disagrees with the
+    /// resolved owner. Fail-closed: the spoof targets ext-A's watcher, which
+    /// must stay inert.
+    #[tokio::test]
+    async fn hook_failed_with_spoofed_provider_does_not_fire_target_extension_hooks() {
+        let ext_a = ironclaw_host_api::ExtensionId::new("ext-a").expect("valid extension id");
+        let ext_b = ironclaw_host_api::ExtensionId::new("ext-b").expect("valid extension id");
+
+        // Subject hook genuinely owned by ext-B. Its hook_id is what the
+        // spoofed event will reference.
+        let subject_id = ext_hook_id("spoof-subject");
+        let subject = HookBinding {
+            hook_id: subject_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
+            point: HookPointSpec::BeforeCapability,
+            event_kind_filter: None,
+            owning_extension: Some(ext_b.clone()),
+            scope: HookBindingScope::OwnCapabilities,
+            poisoned: false,
+        };
+        // Watcher owned by ext-A, scoped to OwnCapabilities, listening for
+        // HookFailed. It must only observe events whose true owner is ext-A.
+        let watcher_id = ext_hook_id("spoof-watcher");
+        let watcher = HookBinding {
+            hook_id: watcher_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase: HookPhase::Telemetry,
+            priority: HookPriority::DEFAULT,
+            point: HookPointSpec::EventTriggered,
+            event_kind_filter: Some(RuntimeEventKind::HookFailed),
+            owning_extension: Some(ext_a.clone()),
+            scope: HookBindingScope::OwnCapabilities,
+            poisoned: false,
+        };
+
+        let mut registry = HookRegistry::new();
+        registry.insert(subject).expect("subject");
+        registry.insert(watcher).expect("watcher");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_event_triggered_impl(
+            watcher_id,
+            EventTriggeredHookImpl::Any(Box::new(NotingEventHook)),
+        );
+
+        // Spoof: event names ext-B's subject hook_id but claims provider=ext-A.
+        let mut event = RuntimeEvent::hook_failed(
+            event_resource_scope(),
+            event_capability(),
+            subject_id.to_hex(),
+            "panic",
+            "fail_isolated",
+            None,
+        );
+        event.provider = Some(ext_a.clone());
+
+        // The resolved provider must be the true owner (ext-B), never the
+        // payload claim (ext-A).
+        let resolved = dispatcher.scope_provider_for_runtime_event(&event);
+        assert_eq!(
+            resolved,
+            Some(ext_b.clone()),
+            "hook-lifecycle scope provider must resolve from hook_id, not the spoofed payload"
+        );
+
+        let outcome = dispatcher
+            .dispatch_event_triggered_at(tenant(), EventCursor::new(1), &event)
+            .await;
+        assert_eq!(
+            outcome.facts.len(),
+            0,
+            "ext-A's OwnCapabilities watcher must NOT fire for a HookFailed \
+             spoofing provider=ext-A on a hook actually owned by ext-B: {:?}",
+            outcome.facts
+        );
+    }
+
     /// PR #3640 finding D11: the registry-mutex-poison fallback path in
     /// `scope_provider_for_runtime_event` returns `None` (fail-closed) so
     /// providerless `OwnCapabilities` Installed hooks remain inert when the
@@ -4554,6 +4632,121 @@ mod tests {
         assert!(
             resolved.is_none(),
             "poisoned registry must fall back to None for scope resolution"
+        );
+    }
+
+    /// PR #3931 (Hole 2, unknown-hook spoof): a hook-lifecycle event whose
+    /// `hook_id` does NOT resolve in the registry must NOT let the carried
+    /// `provider` payload fire that extension's `OwnCapabilities` hooks. The
+    /// provider field is forgeable (it is part of the event payload, not an
+    /// unforgeable host stamp), so a synthesized lifecycle event naming an
+    /// unknown hook_id + provider=target could otherwise activate the target's
+    /// OwnCapabilities watchers. Fail-closed: provider resolves to `None`
+    /// (hook inert).
+    #[tokio::test]
+    async fn unknown_lifecycle_hook_id_with_carried_provider_stays_inert() {
+        let target = ironclaw_host_api::ExtensionId::new("target").expect("valid extension id");
+
+        // Watcher owned by `target`, OwnCapabilities-scoped, listening for
+        // HookFailed. It must only observe events whose true owner is `target`.
+        let watcher_id = ext_hook_id("hole2-unknown-watcher");
+        let watcher = HookBinding {
+            hook_id: watcher_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase: HookPhase::Telemetry,
+            priority: HookPriority::DEFAULT,
+            point: HookPointSpec::EventTriggered,
+            event_kind_filter: Some(RuntimeEventKind::HookFailed),
+            owning_extension: Some(target.clone()),
+            scope: HookBindingScope::OwnCapabilities,
+            poisoned: false,
+        };
+
+        let mut registry = HookRegistry::new();
+        registry.insert(watcher).expect("watcher");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_event_triggered_impl(
+            watcher_id,
+            EventTriggeredHookImpl::Any(Box::new(NotingEventHook)),
+        );
+
+        // Synthesize a HookFailed naming a hook_id that is NOT in the registry,
+        // but claiming provider=target. The unknown hook_id used to fall
+        // through to the carried provider; it must now resolve to None.
+        let unknown_subject = ext_hook_id("hole2-unknown-subject");
+        let mut event = RuntimeEvent::hook_failed(
+            event_resource_scope(),
+            event_capability(),
+            unknown_subject.to_hex(),
+            "panic",
+            "fail_isolated",
+            None,
+        );
+        event.provider = Some(target.clone());
+
+        let resolved = dispatcher.scope_provider_for_runtime_event(&event);
+        assert!(
+            resolved.is_none(),
+            "unknown lifecycle hook_id must resolve to None, not the forgeable \
+             carried provider: {resolved:?}"
+        );
+
+        let outcome = dispatcher
+            .dispatch_event_triggered_at(tenant(), EventCursor::new(1), &event)
+            .await;
+        assert_eq!(
+            outcome.facts.len(),
+            0,
+            "target's OwnCapabilities watcher must NOT fire for a synthesized \
+             HookFailed naming an unknown hook_id + provider=target: {:?}",
+            outcome.facts
+        );
+    }
+
+    /// PR #3931 (Hole 2, poison + carried provider): a poisoned registry must
+    /// not be collapsed into the carried-provider fallback. The earlier
+    /// poison test used `provider: None`, so it passed even while a non-None
+    /// claim would have leaked through `(None, claimed) => claimed`. Here the
+    /// event carries `provider=target`; a poisoned registry must still resolve
+    /// to `None` (fail-closed), never the spoofable claim.
+    #[tokio::test]
+    async fn poisoned_registry_with_carried_provider_resolves_none() {
+        let target = ironclaw_host_api::ExtensionId::new("target").expect("valid extension id");
+        let id = ext_hook_id("hole2-poison-watcher");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(event_triggered_binding(id, RuntimeEventKind::HookFailed))
+            .expect("insert");
+        let dispatcher = Arc::new(HookDispatcher::new(registry));
+
+        let poisoner = Arc::clone(&dispatcher);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.registry.lock().expect("first lock ok");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            dispatcher.registry.is_poisoned(),
+            "mutex must be poisoned for this test to exercise the fallback"
+        );
+
+        let subject_id = ext_hook_id("hole2-poison-subject");
+        let mut event = RuntimeEvent::hook_failed(
+            event_resource_scope(),
+            event_capability(),
+            subject_id.to_hex(),
+            "panic",
+            "fail_isolated",
+            None,
+        );
+        event.provider = Some(target.clone());
+
+        let resolved = dispatcher.scope_provider_for_runtime_event(&event);
+        assert!(
+            resolved.is_none(),
+            "poisoned registry must resolve to None even when the event carries \
+             a provider claim, never trust the spoofable payload: {resolved:?}"
         );
     }
 
