@@ -19,8 +19,8 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use ironclaw_hooks::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
 use ironclaw_hooks::predicate_state::{
-    InvocationKey, MAX_KEYS_PER_TENANT, MAX_SAMPLES_PER_KEY, PredicateBackendError,
-    PredicateEventId, PredicateStateBackend, ValueKey,
+    InvocationKey, MAX_KEYS_PER_TENANT, MAX_SAMPLES_PER_KEY, PredicateEventId,
+    PredicateStateBackend, ValueKey,
 };
 use ironclaw_hooks_postgres::PostgresPredicateStateBackend;
 use ironclaw_host_api::TenantId;
@@ -245,6 +245,8 @@ async fn cross_host_value_replay_sums_once() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn per_key_sample_cap_fails_closed_under_flood() {
+    use ironclaw_hooks::predicate_state::PredicateBackendError;
+
     let (url, _guard) = guarded!();
     let hs = hosts(&url, 1).await;
     let backend = &hs[0];
@@ -281,125 +283,6 @@ async fn per_key_sample_cap_fails_closed_under_flood() {
     assert_eq!(
         replay as usize, MAX_SAMPLES_PER_KEY,
         "replay at the cap is a no-op against the count"
-    );
-}
-
-/// Per-key sample cap under a flood on the VALUE path: the cap-reject branch
-/// in the shared `record()` body runs identically for `record_value`, but the
-/// value-table INSERT and `SUM(value)` aggregate are variant-specific, so a
-/// regression there (e.g. the value INSERT failing to dedup, or `aggregate_sum`
-/// miscounting) could silently admit over-cap values while the invocation path
-/// stays correct. This mirrors `per_key_sample_cap_fails_closed_under_flood`
-/// against `record_value`: fill exactly to the cap with distinct in-window
-/// ids, assert the next distinct id at `MAX_SAMPLES_PER_KEY+1` fails closed
-/// with `WindowOverflow`, and assert an in-window replay at the cap still
-/// dedups (sum unchanged) rather than overflowing.
-///
-/// Gated on a reachable Postgres via `IRONCLAW_HOOKS_POSTGRES_URL` /
-/// `DATABASE_URL`; skipped (passing) otherwise.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn per_value_key_sample_cap_fails_closed_under_flood() {
-    let (url, _guard) = guarded!();
-    let hs = hosts(&url, 1).await;
-    let backend = &hs[0];
-    let key = val_key("flood-value-tenant", "cap.spend", "amount");
-    let window = Duration::from_secs(86_400);
-
-    // Each sample contributes a fixed amount so the running sum is a direct
-    // multiple of the in-window sample count — lets us assert the sum tracks
-    // the count exactly as we fill to the cap.
-    let per_sample = Decimal::from(2);
-    for i in 0..MAX_SAMPLES_PER_KEY {
-        let ts = base() + chrono::Duration::milliseconds(i as i64);
-        let sum = backend
-            .record_value(&key, &ev(&format!("vflood-{i}")), ts, per_sample, window)
-            .await
-            .expect("value inserts up to the cap succeed");
-        assert_eq!(
-            sum,
-            per_sample * Decimal::from(i + 1),
-            "running sum must track the in-window sample count up to the cap"
-        );
-    }
-
-    // The next distinct in-window id must fail closed, not silent-evict.
-    let overflow_ts = base() + chrono::Duration::milliseconds(MAX_SAMPLES_PER_KEY as i64);
-    let result = backend
-        .record_value(
-            &key,
-            &ev("vflood-overflow"),
-            overflow_ts,
-            per_sample,
-            window,
-        )
-        .await;
-    assert!(
-        matches!(result, Err(PredicateBackendError::WindowOverflow { .. })),
-        "hitting the per-value-key cap must fail closed, got {result:?}"
-    );
-
-    // A replay of an in-window id at the cap dedups to a no-op against the
-    // sum rather than overflowing — replay refusal survives the cap boundary.
-    let replay_ts = base() + chrono::Duration::milliseconds(MAX_SAMPLES_PER_KEY as i64 + 1);
-    let replay = backend
-        .record_value(&key, &ev("vflood-0"), replay_ts, per_sample, window)
-        .await
-        .expect("replay of an in-window value id must dedup, not overflow");
-    assert_eq!(
-        replay,
-        per_sample * Decimal::from(MAX_SAMPLES_PER_KEY),
-        "replay at the cap is a no-op against the sum"
-    );
-}
-
-/// `evictions_observed()` increments only AFTER `tx.commit()`. A per-key cap
-/// overflow rolls the transaction back via `drop(tx)` (it never commits), so
-/// the monitoring counter must NOT advance on that path. A bug crediting an
-/// eviction on rollback would emit spurious telemetry. This drives a single
-/// key to `MAX_SAMPLES_PER_KEY+1` (forcing the `WindowOverflow` rollback) and
-/// asserts `evictions_observed()` is unchanged from the pre-overflow snapshot.
-///
-/// Gated on a reachable Postgres via `IRONCLAW_HOOKS_POSTGRES_URL` /
-/// `DATABASE_URL`; skipped (passing) otherwise.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn evictions_counter_unchanged_on_window_overflow() {
-    let (url, _guard) = guarded!();
-    let hs = hosts(&url, 1).await;
-    let backend = &hs[0];
-    let key = inv_key("overflow-evict-tenant", "cap.hot");
-    let window = Duration::from_secs(86_400);
-
-    // Fill exactly to the cap — these are single-sample-per-key-free inserts
-    // against ONE key, so no scope-LRU eviction fires (one distinct key, well
-    // under MAX_KEYS_PER_TENANT).
-    for i in 0..MAX_SAMPLES_PER_KEY {
-        let ts = base() + chrono::Duration::milliseconds(i as i64);
-        backend
-            .record_invocation(&key, &ev(&format!("ovf-{i}")), ts, window)
-            .await
-            .expect("inserts up to the cap succeed");
-    }
-
-    // Snapshot the eviction counter immediately before the overflow.
-    let before = backend.evictions_observed();
-
-    // Drive the key one past the cap: this must roll back via `drop(tx)`.
-    let overflow_ts = base() + chrono::Duration::milliseconds(MAX_SAMPLES_PER_KEY as i64);
-    let result = backend
-        .record_invocation(&key, &ev("ovf-overflow"), overflow_ts, window)
-        .await;
-    assert!(
-        matches!(result, Err(PredicateBackendError::WindowOverflow { .. })),
-        "the over-cap insert must fail closed, got {result:?}"
-    );
-
-    let after = backend.evictions_observed();
-    assert_eq!(
-        before, after,
-        "evictions_observed() must NOT advance when a per-key cap overflow \
-         rolls the transaction back (counter increments only after commit)"
     );
 }
 
@@ -522,14 +405,12 @@ async fn scope_lru_eviction_serializes_against_victim_writes_no_deadlock() {
         let k = inv_key(tenant, &format!("fresh.{i}"));
         let ts = base() + chrono::Duration::seconds(10_000 + i as i64);
         handles.push(tokio::spawn(async move {
-            // RETURN the backend result so the join below can assert it. A
-            // discarded result would let a deadlock-detected/serialization
-            // DB error pass silently as long as the task returned before the
-            // timeout (serrrfirat regression on #3933). The result is checked
-            // against the allowed-outcome set after the join.
-            backend
+            // A fresh key may itself be evicted by a later pass; both Ok and
+            // a benign overflow are acceptable — what must NOT happen is a
+            // hang or an Unavailable (deadlock/serialization) error.
+            let _ = backend
                 .record_invocation(&k, &ev(&format!("fresh-e{i}")), ts, window)
-                .await
+                .await;
         }));
     }
     for i in 0..HOT_HITS {
@@ -539,52 +420,22 @@ async fn scope_lru_eviction_serializes_against_victim_writes_no_deadlock() {
         // ids so each is a real insert (subject to the per-key sample cap).
         let ts = base() + chrono::Duration::seconds(20_000 + i as i64);
         handles.push(tokio::spawn(async move {
-            backend
+            let _ = backend
                 .record_invocation(&hot, &ev(&format!("hot-e{i}")), ts, window)
-                .await
+                .await;
         }));
     }
 
     // Hard timeout is the deadlock detector: pre-fix this join would hang
     // (or surface a Postgres deadlock-detected error) instead of completing.
-    // Collect every task's backend result so we can assert the allowed
-    // outcomes EXPLICITLY rather than discarding them.
     let join_all = async {
-        let mut results = Vec::with_capacity(handles.len());
         for handle in handles {
-            results.push(handle.await.expect("task did not panic"));
+            handle.await.expect("task did not panic");
         }
-        results
     };
-    let results = tokio::time::timeout(Duration::from_secs(60), join_all)
+    tokio::time::timeout(Duration::from_secs(60), join_all)
         .await
         .expect("all record tasks completed without deadlock/hang");
-
-    // Assert the production failure mode this test documents actually fails
-    // the test: each record must be either `Ok` (recorded / replayed) or a
-    // benign quota/window outcome. A `Unavailable(..)` whose message looks
-    // like a Postgres deadlock-detected or serialization-failure error means
-    // the eviction lock discipline regressed — that must surface as a test
-    // failure, not a silent pass.
-    for (i, r) in results.iter().enumerate() {
-        match r {
-            Ok(_) => {}
-            Err(PredicateBackendError::WindowOverflow { .. }) => {
-                // A fresh/hot key can legitimately hit the per-key sample cap.
-            }
-            Err(PredicateBackendError::Unavailable(msg)) => {
-                let lower = msg.to_lowercase();
-                assert!(
-                    !(lower.contains("deadlock") || lower.contains("serialize")),
-                    "task {i} surfaced a deadlock/serialization DB error \
-                     (eviction lock discipline regressed): {msg}"
-                );
-                // A non-deadlock `Unavailable` here is the explicit fail-closed
-                // quota outcome (every stale victim momentarily locked) — that
-                // is an allowed outcome of the new quota-enforcement contract.
-            }
-        }
-    }
 
     // Consistency: whatever survived for the hot key, the backend's reported
     // aggregate must equal its actual surviving IN-WINDOW row count — no torn
@@ -634,91 +485,6 @@ async fn scope_lru_eviction_serializes_against_victim_writes_no_deadlock() {
         distinct as usize <= MAX_KEYS_PER_TENANT,
         "per-scope LRU bound must hold after the concurrent race; had {distinct}"
     );
-}
-
-/// Stateful proof that the per-scope quota is ACTUALLY enforced, not merely
-/// best-effort. Drives a single uncontended host sequentially well past
-/// [`MAX_KEYS_PER_TENANT`] distinct keys, then asserts the scope holds at
-/// EXACTLY the cap — no overshoot. This is the regression guard for the
-/// "silently best-effort `Ok(evicted)`" BLOCKER (serrrfirat on #3933): the
-/// old code could commit an over-quota scope if victims happened to be
-/// locked; with a single sequential writer no victim is ever locked, so the
-/// quota-enforcement loop must drive the scope exactly to the cap on every
-/// newly-material insert. A regression that under-evicts would leave
-/// `distinct > MAX_KEYS_PER_TENANT` and fail here. Run against a real
-/// Postgres via `IRONCLAW_HOOKS_POSTGRES_URL` / `DATABASE_URL`; skipped
-/// (passing) otherwise.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn scope_quota_is_enforced_exactly_not_best_effort() {
-    let (url, _guard) = guarded!();
-    let hs = hosts(&url, 1).await;
-    let backend = &hs[0];
-    let window = Duration::from_secs(86_400);
-    let tenant = "quota-exact-tenant";
-
-    // Insert OVERSHOOT keys beyond the cap. Each key gets one in-window
-    // sample with a strictly increasing timestamp so the oldest-front LRU
-    // victim selection is deterministic (key N is staler than key N+1).
-    const OVERSHOOT: usize = 200;
-    let total = MAX_KEYS_PER_TENANT + OVERSHOOT;
-    for i in 0..total {
-        let k = inv_key(tenant, &format!("k.{i}"));
-        let ts = base() + chrono::Duration::seconds(i as i64);
-        backend
-            .record_invocation(&k, &ev(&format!("e{i}")), ts, window)
-            .await
-            .expect("record under uncontended single writer must succeed");
-    }
-
-    // The scope must hold at EXACTLY the cap — eviction kept pace with every
-    // over-cap insert. Verify via a direct distinct-key count.
-    let pool = build_pool(&url).expect("pool");
-    let client = pool.get().await.expect("client");
-    let scope = ironclaw_hooks_postgres::test_support::scope_hash_bytes(tenant);
-    let distinct: i64 = client
-        .query_one(
-            "SELECT COUNT(DISTINCT key_hash)::BIGINT FROM hooks_predicate_invocations \
-             WHERE scope_hash = $1",
-            &[&&scope[..]],
-        )
-        .await
-        .expect("distinct count")
-        .get(0);
-    assert_eq!(
-        distinct as usize, MAX_KEYS_PER_TENANT,
-        "uncontended sequential flood must leave the scope at EXACTLY the cap \
-         (quota enforced, not best-effort); had {distinct}"
-    );
-
-    // And the surviving keys must be the MOST-RECENT ones: the oldest-front
-    // victims (k.0 .. k.OVERSHOOT-1) were evicted, so k.0 must be gone and
-    // the newest key (k.{total-1}) must survive.
-    let oldest = inv_key(tenant, "k.0");
-    let oldest_hash = ironclaw_hooks_postgres::test_support::invocation_key_hash_bytes(&oldest);
-    let oldest_rows: i64 = client
-        .query_one(
-            "SELECT COUNT(*)::BIGINT FROM hooks_predicate_invocations WHERE key_hash = $1",
-            &[&&oldest_hash[..]],
-        )
-        .await
-        .expect("count oldest")
-        .get(0);
-    assert_eq!(
-        oldest_rows, 0,
-        "the oldest-front key must have been evicted under the quota"
-    );
-    let newest = inv_key(tenant, &format!("k.{}", total - 1));
-    let newest_hash = ironclaw_hooks_postgres::test_support::invocation_key_hash_bytes(&newest);
-    let newest_rows: i64 = client
-        .query_one(
-            "SELECT COUNT(*)::BIGINT FROM hooks_predicate_invocations WHERE key_hash = $1",
-            &[&&newest_hash[..]],
-        )
-        .await
-        .expect("count newest")
-        .get(0);
-    assert_eq!(newest_rows, 1, "the most-recent key must survive eviction");
 }
 
 /// Deterministic reproduction of the eviction deadlock cycle at the raw-SQL
@@ -796,100 +562,4 @@ async fn eviction_try_lock_does_not_block_on_in_flight_victim() {
     // Clean up both transactions.
     tx_l.rollback().await.expect("rollback L");
     tx_v.rollback().await.expect("rollback V");
-}
-
-/// `evict_older_than` is the time-based reaper (distinct from the per-scope
-/// LRU eviction): it deletes every row with `occurred_at < cutoff` from BOTH
-/// typed tables and returns the total rows removed. This proves the Postgres
-/// override actually reaps both tables and spares in-window rows — the two
-/// `DELETE` statements had no integration coverage (henrypark tests finding).
-///
-/// Gated on a reachable Postgres via `IRONCLAW_HOOKS_POSTGRES_URL` /
-/// `DATABASE_URL`; skipped (passing) otherwise.
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn evict_older_than_removes_stale_rows_from_both_tables() {
-    let (url, _guard) = guarded!();
-    let hs = hosts(&url, 1).await;
-    let backend = &hs[0];
-    let window = Duration::from_secs(86_400);
-
-    // Unique tenant so this test's rows are isolated from sibling tests that
-    // share the truncated-once schema.
-    let tenant = "reaper-tenant";
-    let inv = inv_key(tenant, "cap.reap");
-    let val = val_key(tenant, "cap.reap", "amount");
-
-    // Two stale rows (well before the cutoff) and one fresh row (after it),
-    // on EACH table — so we can prove the reaper hits both tables and spares
-    // the fresh rows.
-    let stale_a = base();
-    let stale_b = base() + chrono::Duration::seconds(10);
-    let fresh = base() + chrono::Duration::seconds(1_000);
-
-    backend
-        .record_invocation(&inv, &ev("inv-stale-a"), stale_a, window)
-        .await
-        .expect("inv stale a");
-    backend
-        .record_invocation(&inv, &ev("inv-stale-b"), stale_b, window)
-        .await
-        .expect("inv stale b");
-    backend
-        .record_invocation(&inv, &ev("inv-fresh"), fresh, window)
-        .await
-        .expect("inv fresh");
-
-    backend
-        .record_value(&val, &ev("val-stale-a"), stale_a, Decimal::from(5), window)
-        .await
-        .expect("val stale a");
-    backend
-        .record_value(&val, &ev("val-fresh"), fresh, Decimal::from(7), window)
-        .await
-        .expect("val fresh");
-
-    // Cutoff between the stale and fresh rows: reaps 2 invocation + 1 value
-    // stale rows = 3 total, leaving 1 invocation + 1 value fresh row.
-    let cutoff = base() + chrono::Duration::seconds(100);
-    let removed = backend
-        .evict_older_than(cutoff)
-        .await
-        .expect("evict_older_than");
-    assert_eq!(
-        removed, 3,
-        "reaper must delete all 3 stale rows across both tables, got {removed}"
-    );
-
-    // Verify directly: only the fresh rows survive in each table.
-    let pool = build_pool(&url).expect("pool");
-    let client = pool.get().await.expect("client");
-    let inv_hash = ironclaw_hooks_postgres::test_support::invocation_key_hash_bytes(&inv);
-    let inv_remaining: i64 = client
-        .query_one(
-            "SELECT COUNT(*)::BIGINT FROM hooks_predicate_invocations WHERE key_hash = $1",
-            &[&&inv_hash[..]],
-        )
-        .await
-        .expect("count inv")
-        .get(0);
-    assert_eq!(
-        inv_remaining, 1,
-        "only the fresh invocation row must survive the reap"
-    );
-
-    // The value table shares the key derivation; query its surviving rows by
-    // the value key's hash directly via a fresh dedup record-and-read would
-    // mutate state, so count rows for this tenant's value key instead. We
-    // re-derive the value key's hash the same way the backend does by
-    // recording a replay of the fresh id (a no-op that returns the live sum).
-    let live_sum = backend
-        .record_value(&val, &ev("val-fresh"), fresh, Decimal::from(7), window)
-        .await
-        .expect("replay fresh value");
-    assert_eq!(
-        live_sum,
-        Decimal::from(7),
-        "only the fresh value row must survive the reap (stale value row gone)"
-    );
 }

@@ -155,14 +155,7 @@ impl LibSqlPredicateStateBackend {
         for attempt in 0..CONNECT_ATTEMPTS {
             match self.db.connect() {
                 Ok(conn) => {
-                    // `PRAGMA busy_timeout = N` echoes the new value back as a
-                    // result row in this libSQL build, so it must go through
-                    // `query` — `execute` rejects it with
-                    // `Execute returned rows`. (Gemini review #3936 suggested
-                    // `execute`; verified against the contract suite that it
-                    // fails here, so `query` is correct for this driver.)
-                    let _ = conn
-                        .query("PRAGMA busy_timeout = 5000", ())
+                    conn.query("PRAGMA busy_timeout = 5000", ())
                         .await
                         .map_err(map_err)?;
                     return Ok(conn);
@@ -185,21 +178,19 @@ impl LibSqlPredicateStateBackend {
     /// wrapped in `BEGIN IMMEDIATE` so concurrent first-time migrations
     /// serialise. SQLite supports transactional DDL.
     pub async fn run_migrations(&self) -> Result<(), PredicateBackendError> {
+        // Connect (and retry/backoff) before taking the lock so a transient
+        // open race never stalls other writers; the lock spans only the txn.
+        let conn = self.connect().await?;
         // Migrations are writers too: serialise with record_* / evict.
         let _write_guard = self.write_lock.lock().await;
-        let conn = self.connect().await?;
         conn.execute("BEGIN IMMEDIATE", ()).await.map_err(map_err)?;
         let result = run_migrations_inner(&conn).await;
         match result {
-            Ok(()) => match conn.execute("COMMIT", ()).await {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    // Roll back explicitly on a failed COMMIT (libSQL
-                    // replication state); same rationale as `finish_txn`.
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(map_err(e))
-                }
-            },
+            Ok(()) => conn
+                .execute("COMMIT", ())
+                .await
+                .map(|_| ())
+                .map_err(map_err),
             Err(err) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 Err(err)
@@ -243,10 +234,18 @@ impl LibSqlPredicateStateBackend {
             read_result,
         } = spec;
 
+        // Open (and, if needed, retry) the connection BEFORE taking the
+        // write_lock. `connect()` can sleep on its exponential backoff
+        // (`SQLITE_CANTOPEN` race); holding the in-process write lock across
+        // that sleep would needlessly stall every other writer without any
+        // serialisation benefit — nothing touches SQLite's write path until
+        // `BEGIN IMMEDIATE` below. The lock only needs to span the actual
+        // transaction.
+        let conn = self.connect().await?;
+
         // Serialise in-process writers before touching SQLite (see the
         // concurrency contract on the struct). Held for the whole transaction.
         let _write_guard = self.write_lock.lock().await;
-        let conn = self.connect().await?;
         conn.execute("BEGIN IMMEDIATE", ()).await.map_err(map_err)?;
 
         let result = async {
@@ -479,9 +478,11 @@ impl PredicateStateBackend for LibSqlPredicateStateBackend {
     /// its own `BEGIN IMMEDIATE` transaction.
     async fn evict_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, PredicateBackendError> {
         let cutoff_ms = to_epoch_millis(cutoff);
+        // Connect (and retry/backoff) before taking the lock; the lock spans
+        // only the transaction (see record()).
+        let conn = self.connect().await?;
         // Reaper is a writer too: serialise with record_* / migrations.
         let _write_guard = self.write_lock.lock().await;
-        let conn = self.connect().await?;
         conn.execute("BEGIN IMMEDIATE", ()).await.map_err(map_err)?;
         let result = async {
             let a = conn
@@ -502,16 +503,10 @@ impl PredicateStateBackend for LibSqlPredicateStateBackend {
         }
         .await;
         match result {
-            Ok(dropped) => match conn.execute("COMMIT", ()).await {
-                Ok(_) => Ok(dropped),
-                Err(e) => {
-                    // Same rationale as `finish_txn`: roll back explicitly on a
-                    // failed COMMIT so libSQL replication state can't be left
-                    // indeterminate, then surface the commit error.
-                    let _ = conn.execute("ROLLBACK", ()).await;
-                    Err(map_err(e))
-                }
-            },
+            Ok(dropped) => {
+                conn.execute("COMMIT", ()).await.map_err(map_err)?;
+                Ok(dropped)
+            }
             Err(err) => {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 Err(err)
@@ -529,20 +524,11 @@ async fn finish_txn<T>(
     backend: &LibSqlPredicateStateBackend,
 ) -> Result<T, PredicateBackendError> {
     match result {
-        Ok((value, evicted)) => match conn.execute("COMMIT", ()).await {
-            Ok(_) => {
-                backend.bump_evictions(evicted);
-                Ok(value)
-            }
-            Err(e) => {
-                // A failed COMMIT leaves the transaction open: for local SQLite
-                // conn-drop auto-rolls back, but in libSQL replication mode the
-                // replication state can stay indeterminate until an explicit
-                // ROLLBACK. Best-effort rollback, then surface the commit error.
-                let _ = conn.execute("ROLLBACK", ()).await;
-                Err(map_err(e))
-            }
-        },
+        Ok((value, evicted)) => {
+            conn.execute("COMMIT", ()).await.map_err(map_err)?;
+            backend.bump_evictions(evicted);
+            Ok(value)
+        }
         Err(err) => {
             let _ = conn.execute("ROLLBACK", ()).await;
             Err(err)
@@ -574,15 +560,13 @@ async fn event_id_exists(
     key_hash: &[u8],
     event_id: &PredicateEventId,
 ) -> Result<bool, PredicateBackendError> {
-    // `(key_hash, event_id)` is the PRIMARY KEY, so this is a unique point
-    // lookup matching at most one row — `LIMIT 1` is not a perf win here (it is
-    // for `key_exists`), but kept consistent with the existence-check form.
-    row_exists(
+    let count = scalar_u32(
         conn,
-        &format!("SELECT 1 FROM {table} WHERE key_hash = ?1 AND event_id = ?2 LIMIT 1"),
+        &format!("SELECT count(*) FROM {table} WHERE key_hash = ?1 AND event_id = ?2"),
         params![key_hash.to_vec(), event_id.as_str()],
     )
-    .await
+    .await?;
+    Ok(count > 0)
 }
 
 /// Whether any row exists for `key_hash` — i.e. whether this is an existing
@@ -592,25 +576,13 @@ async fn key_exists(
     table: &str,
     key_hash: &[u8],
 ) -> Result<bool, PredicateBackendError> {
-    // `WHERE key_hash = ?1` can match up to `MAX_SAMPLES_PER_KEY` rows; a
-    // `SELECT 1 ... LIMIT 1` stops at the first index entry (O(1)) instead of
-    // counting them all (O(N)).
-    row_exists(
+    let count = scalar_u32(
         conn,
-        &format!("SELECT 1 FROM {table} WHERE key_hash = ?1 LIMIT 1"),
+        &format!("SELECT count(*) FROM {table} WHERE key_hash = ?1"),
         params![key_hash.to_vec()],
     )
-    .await
-}
-
-/// Whether the query yields at least one row (the existence-check form).
-async fn row_exists(
-    conn: &Connection,
-    sql: &str,
-    params: impl libsql::params::IntoParams,
-) -> Result<bool, PredicateBackendError> {
-    let mut rows = conn.query(sql, params).await.map_err(map_err)?;
-    Ok(rows.next().await.map_err(map_err)?.is_some())
+    .await?;
+    Ok(count > 0)
 }
 
 /// Enforce the per-tenant [`MAX_KEYS_PER_TENANT`] distinct-key quota before
@@ -633,6 +605,21 @@ async fn row_exists(
 /// Postgres (which has none) once total scopes exceed `MAX_HISTORY_KEYS` while
 /// staying under the per-tenant quota — a cross-backend inconsistency the
 /// parity matrix had to exclude. Dropping it restores parity.
+///
+/// # Reaper requirement — quota counts un-reaped expired rows
+///
+/// The `COUNT(DISTINCT key_hash) WHERE scope_hash = ?1` below counts EVERY
+/// stored row for the tenant, including expired rows from OTHER keys: the
+/// per-key window trim in `record_*` only deletes `WHERE key_hash = ?1`, never
+/// sibling keys. So a tenant with many idle short-window keys can read at
+/// `MAX_KEYS_PER_TENANT` and trip LRU eviction (advancing `evictions_observed`)
+/// even though its *active* key count is lower. The evicted keys are already
+/// expired, so gate correctness is unaffected, but operators MUST schedule a
+/// periodic [`PredicateStateBackend::evict_older_than`] reaper to keep the
+/// quota aligned with the active key count. See
+/// `ironclaw_hooks/docs/successors/03-persistent-counter.md` (Reaper
+/// requirement). This is NOT fixed by a behavior change here: counting only
+/// in-window rows would require a window per key, which the quota does not have.
 ///
 /// [`MAX_HISTORY_KEYS`]: ironclaw_hooks::predicate_state::MAX_HISTORY_KEYS
 /// [`MAX_KEYS_PER_TENANT`]: ironclaw_hooks::predicate_state::MAX_KEYS_PER_TENANT
@@ -670,18 +657,9 @@ async fn evict_oldest_key(
     table: &str,
     scope: &[u8],
 ) -> Result<bool, PredicateBackendError> {
-    // The victim is the tenant's key with the smallest `min(occurred_at)`.
-    // Equivalently, that is exactly the `key_hash` of the single oldest row in
-    // the scope: the key owning the globally-oldest row has the smallest
-    // per-key front timestamp. So we can pick it with an index-friendly
-    // `ORDER BY occurred_at ASC, key_hash ASC LIMIT 1` over the
-    // `idx_..._scope_ts` index instead of a global `GROUP BY` aggregation. The
-    // `key_hash ASC` tie-break makes the choice deterministic when several rows
-    // share the minimum timestamp, matching the prior grouped ordering
-    // (smallest `min(occurred_at)`, then smallest `key_hash`).
     let select_victim = format!(
         "SELECT key_hash FROM {table} WHERE scope_hash = ?1 \
-         ORDER BY occurred_at ASC, key_hash ASC LIMIT 1"
+         GROUP BY key_hash ORDER BY min(occurred_at) ASC, key_hash ASC LIMIT 1"
     );
     let mut rows = conn
         .query(&select_victim, params![scope.to_vec()])

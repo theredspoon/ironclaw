@@ -62,12 +62,15 @@ CREATE TABLE IF NOT EXISTS hooks_predicate_invocations (
 -- aggregates over (key_hash, occurred_at).
 CREATE INDEX IF NOT EXISTS hooks_predicate_invocations_key_ts_idx
     ON hooks_predicate_invocations (key_hash, occurred_at);
--- Per-scope (tenant) distinct-key LRU eviction. enforce_scope_quota runs
--- COUNT(DISTINCT key_hash) and ranks victims by MIN(occurred_at) per key,
--- both scoped by scope_hash; the (scope_hash, key_hash, occurred_at) cover
--- lets those run as index-only scans for tenants with many recorded keys.
+-- Per-scope (tenant) distinct-key LRU eviction scans by scope.
 CREATE INDEX IF NOT EXISTS hooks_predicate_invocations_scope_idx
-    ON hooks_predicate_invocations (scope_hash, key_hash, occurred_at);
+    ON hooks_predicate_invocations (scope_hash);
+-- Per-tenant LRU quota: the distinct-key COUNT (WHERE scope_hash = ?) and the
+-- GROUP BY key_hash ORDER BY min(occurred_at) victim scan both filter by
+-- scope_hash then group/aggregate by key_hash. This composite keeps that
+-- access pattern off a full per-tenant row scan.
+CREATE INDEX IF NOT EXISTS hooks_predicate_invocations_scope_key_idx
+    ON hooks_predicate_invocations (scope_hash, key_hash);
 -- Operator reaper (`evict_older_than`) deletes globally by age.
 CREATE INDEX IF NOT EXISTS hooks_predicate_invocations_ts_idx
     ON hooks_predicate_invocations (occurred_at);
@@ -86,8 +89,11 @@ CREATE TABLE IF NOT EXISTS hooks_predicate_values (
 
 CREATE INDEX IF NOT EXISTS hooks_predicate_values_key_ts_idx
     ON hooks_predicate_values (key_hash, occurred_at);
--- Same index-only-scan cover for the value table's scope-quota pass.
 CREATE INDEX IF NOT EXISTS hooks_predicate_values_scope_idx
-    ON hooks_predicate_values (scope_hash, key_hash, occurred_at);
+    ON hooks_predicate_values (scope_hash);
+-- Mirror of the invocations composite: per-tenant LRU quota over the value
+-- table also filters by scope_hash and groups by key_hash.
+CREATE INDEX IF NOT EXISTS hooks_predicate_values_scope_key_idx
+    ON hooks_predicate_values (scope_hash, key_hash);
 CREATE INDEX IF NOT EXISTS hooks_predicate_values_ts_idx
     ON hooks_predicate_values (occurred_at);
