@@ -345,8 +345,17 @@ impl HookCapabilityInputResolver for HookCapabilityInputResolverAdapter {
 
 pub type HookDispatcherFactory = Arc<dyn Fn() -> Arc<HookDispatcher> + Send + Sync + 'static>;
 
-pub type HookDispatcherBuilderFactory =
-    Arc<dyn Fn() -> HookDispatcherBuilder + Send + Sync + 'static>;
+/// Per-run hook dispatcher builder factory.
+///
+/// Returns a freshly-minted [`HookDispatcherBuilder`] per host build, or an
+/// error if the per-run install replay fails. The composition path validates
+/// every install set once at composition time and replays the identical
+/// scratch-validated set per run, so in practice this never errors; the
+/// `Result` exists so a future regression surfaces as a build error rather than
+/// a panic (CLAUDE.md forbids `.expect()` in production code).
+pub type HookDispatcherBuilderFactory = Arc<
+    dyn Fn() -> Result<HookDispatcherBuilder, RebornLoopDriverHostError> + Send + Sync + 'static,
+>;
 
 /// Default number of durable runtime events read per subscription poll.
 pub const DEFAULT_EVENT_TRIGGERED_SUBSCRIPTION_BATCH_LIMIT: usize = 64;
@@ -1113,7 +1122,7 @@ where
     /// inside the closure exactly as with the legacy factory.
     pub fn with_hook_dispatcher_builder_factory<F>(mut self, factory: F) -> Self
     where
-        F: Fn() -> HookDispatcherBuilder + Send + Sync + 'static,
+        F: Fn() -> Result<HookDispatcherBuilder, RebornLoopDriverHostError> + Send + Sync + 'static,
     {
         self.hook_dispatcher_builder_factory = Some(Arc::new(factory));
         self
@@ -1380,7 +1389,7 @@ where
             self.hook_dispatcher_factory.as_ref(),
         ) {
             (Some(builder_factory), _) => {
-                let mut builder = builder_factory();
+                let mut builder = builder_factory()?;
                 if let Some(sink) = self.hook_security_audit_sink.as_ref() {
                     builder = builder.with_security_audit_sink(Arc::clone(sink));
                 }

@@ -84,8 +84,7 @@ use ironclaw_turns::{
 };
 
 use crate::default_system_prompt::DefaultSystemPromptIdentitySource;
-use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore};
-use crate::hooks::build_hook_dispatcher_builder_factory;
+use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore, builtin_extension_registry};
 use crate::local_dev_capability_policy::local_dev_capability_policy;
 use crate::projection::{RebornProjectionServices, build_reborn_projection_services};
 use crate::runtime_input::{
@@ -1624,13 +1623,40 @@ pub async fn build_reborn_runtime(
     let capability_input_resolver = local_dev_capabilities.capability_input_resolver;
     let capability_result_writer = local_dev_capabilities.capability_result_writer;
     let model_gateway = local_dev_capabilities.model_gateway;
-    let hook_dispatcher_builder_factory = build_hook_dispatcher_builder_factory(
-        hooks_config,
-        local_runtime.extension_registry.as_ref(),
-    )
-    .map_err(|error| RebornRuntimeError::InvalidArgument {
-        reason: format!("hook framework activation failed: {error}"),
-    })?;
+    // Hook framework activation (#3934 + third-party projection), gated behind
+    // the typed `HooksActivationConfig` carried in `RebornRuntimeInput` (master
+    // flag default OFF; third-party sub-flag also default OFF). The env vars
+    // (`HOOKS_ENABLED`, `HOOKS_THIRD_PARTY_ENABLED`) are resolved ONCE at the
+    // edge that builds the input (the CLI / ingress adapter); this composition
+    // root consumes the typed config and never reads the environment itself.
+    //
+    // Hook-only projection containment: third-party `[[hooks]]` are discovered
+    // and projected into a `HookProjectionRegistry` that carries ONLY hook
+    // metadata (no `ExtensionRegistry`, no `ExtensionPackage`) and reaches ONLY
+    // this hook factory, not the capability catalog or surface resolver.
+    let hook_dispatcher_builder_factory = {
+        let third_party_input = crate::hooks::ThirdPartyDiscoveryInput {
+            filesystem: local_runtime.extension_filesystem.as_ref(),
+            tenant_id: &validated_identity.tenant_id,
+        };
+        let projection_registry = crate::hooks::build_hook_projection_registry(
+            builtin_extension_registry()?,
+            Some(third_party_input),
+            hooks_config,
+        )
+        .await
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("hook projection registry assembly failed: {error}"),
+        })?;
+        crate::hooks::build_hook_dispatcher_builder_factory_for_tenant(
+            hooks_config,
+            &projection_registry,
+            &validated_identity.tenant_id,
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("hook framework activation failed: {error}"),
+        })?
+    };
 
     let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state: Arc::clone(&turn_state_store),

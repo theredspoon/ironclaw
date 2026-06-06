@@ -2715,14 +2715,14 @@ fn first_party_only_hook_factory() -> ironclaw_reborn::loop_driver_host::HookDis
 {
     Arc::new(|| {
         let hook_id = HookId::for_builtin(E2E_NOOP_OBSERVER_PATH, HookVersion::ONE);
-        HookDispatcherBuilder::new(HookRegistry::new())
+        Ok(HookDispatcherBuilder::new(HookRegistry::new())
             .install_builtin_observer(
                 hook_id,
                 HookPhase::Telemetry,
                 HookPointSpec::AfterCapability,
                 Box::new(E2eNoOpObserver),
             )
-            .expect("install first-party no-op observer")
+            .expect("install first-party no-op observer"))
     })
 }
 
@@ -2739,7 +2739,7 @@ fn extension_deny_hook_factory(
     Arc::new(move || {
         let evaluator = Arc::new(PredicateEvaluator::new());
         let registrar = HookRegistrar::new(evaluator);
-        let mut builder = first_party_only_hook_factory()();
+        let mut builder = first_party_only_hook_factory()().expect("first-party builder");
         let entry = HookManifestEntry::new(
             HookLocalId::new("deny-cap").expect("valid hook local id"),
             HookManifestKind::BeforeCapability,
@@ -2759,7 +2759,7 @@ fn extension_deny_hook_factory(
             .install(ext_id, "0.1.0", &entries, builder)
             .expect("install extension deny hook");
         builder = next;
-        builder
+        Ok(builder)
     })
 }
 

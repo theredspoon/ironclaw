@@ -395,6 +395,11 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) host_state_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     pub(crate) subagent_goal_filesystem: Arc<ScopedFilesystem<LocalDevRootFilesystem>>,
+    /// Tenant-scoped root filesystem used for third-party extension hook
+    /// discovery (`/system/extensions/<tenant>`). The runtime derives the
+    /// discovery root from the authenticated tenant id; this is the same
+    /// backend the rest of local-dev composition uses.
+    pub(crate) extension_filesystem: Arc<LocalDevRootFilesystem>,
     pub(crate) workspace_mounts: MountView,
     pub(crate) local_dev_storage_root: PathBuf,
     pub(crate) default_system_prompt_path: PathBuf,
@@ -905,7 +910,8 @@ fn build_local_dev_store_graph(
                 reason: error.to_string(),
             }
         })?;
-    let skill_management = build_local_skill_management_port(owner_user_id, filesystem)?;
+    let skill_management =
+        build_local_skill_management_port(owner_user_id, Arc::clone(&filesystem))?;
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
@@ -935,6 +941,7 @@ fn build_local_dev_store_graph(
         #[cfg(feature = "slack-v2-host-beta")]
         host_state_filesystem: Arc::clone(&scoped_filesystem),
         subagent_goal_filesystem: Arc::clone(&scoped_filesystem),
+        extension_filesystem: Arc::clone(&filesystem),
         workspace_mounts,
         local_dev_storage_root,
         default_system_prompt_path,
@@ -1002,7 +1009,8 @@ fn build_local_dev_store_graph(
                 reason: error.to_string(),
             }
         })?;
-    let skill_management = build_local_skill_management_port(owner_user_id, filesystem)?;
+    let skill_management =
+        build_local_skill_management_port(owner_user_id, Arc::clone(&filesystem))?;
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     let trigger_conversation_services = local_dev_trigger_conversation_services();
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
@@ -1035,6 +1043,7 @@ fn build_local_dev_store_graph(
         host_state_filesystem: Arc::clone(&subagent_goal_filesystem),
         #[cfg(feature = "postgres")]
         subagent_goal_filesystem,
+        extension_filesystem: Arc::clone(&filesystem),
         workspace_mounts,
         local_dev_storage_root,
         default_system_prompt_path,
@@ -1749,7 +1758,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
-fn builtin_extension_registry() -> Result<ExtensionRegistry, RebornBuildError> {
+pub(crate) fn builtin_extension_registry() -> Result<ExtensionRegistry, RebornBuildError> {
     // Shared by local-dev and production composition so host-owned first-party
     // capabilities expose the same built-in package contract in both profiles.
     let mut registry = ExtensionRegistry::new();
@@ -2734,6 +2743,7 @@ mod tests {
                 )])
                 .expect("mount view"),
             )),
+            extension_filesystem: Arc::clone(&base_runtime.extension_filesystem),
             workspace_mounts: base_runtime.workspace_mounts.clone(),
             local_dev_storage_root: base_runtime.local_dev_storage_root.clone(),
             default_system_prompt_path: base_runtime.default_system_prompt_path.clone(),

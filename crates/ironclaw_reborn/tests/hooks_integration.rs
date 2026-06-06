@@ -4229,7 +4229,7 @@ async fn hook_telemetry_attribution_is_per_run_not_captured() {
                 sink.deny("two-run-telemetry-test");
             }
         }
-        HDBuilder::new(HReg::new())
+        Ok(HDBuilder::new(HReg::new())
             .install_installed_before_capability(
                 hook_id,
                 HookPhase::Policy,
@@ -4237,7 +4237,7 @@ async fn hook_telemetry_attribution_is_per_run_not_captured() {
                 HookBindingScope::Global,
                 Box::new(AlwaysDeny),
             )
-            .expect("install always-deny hook")
+            .expect("install always-deny hook"))
     });
 
     // Run 1.
