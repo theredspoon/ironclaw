@@ -306,13 +306,6 @@ pub use ironclaw_reborn::local_trigger_access::{
     LocalTriggerAccessSource, RebornLibSqlLocalTriggerAccessStore,
     RebornLocalTriggerAccessStoreError,
 };
-/// Reborn-owned WebChat user-identity store, re-exported so host binaries reach
-/// it through this composition facade. [`open_webui_user_store`] opens it so the
-/// libSQL substrate handle stays private to this facade.
-#[cfg(feature = "webui-v2-beta")]
-pub use ironclaw_reborn::webui_users::{
-    RebornLibSqlUserStore, RebornUserStoreError, ResolveIdentity,
-};
 
 #[cfg(feature = "webui-v2-beta")]
 #[async_trait::async_trait]
@@ -345,25 +338,58 @@ impl runtime_input::TriggerFireAccessChecker for RebornLibSqlLocalTriggerAccessS
     }
 }
 
-/// Open the reborn-owned WebChat user-identity store on the substrate DB
-/// at `path`, creating the parent directory and running its idempotent
-/// migrations. Keeps the libSQL handle private to the composition layer
-/// (composition CLAUDE.md: "keep lower substrate handles private").
+/// Canonical Reborn identity resolver vocabulary (issue #4381): the one
+/// boundary that maps every external identity — WebUI OAuth logins and
+/// external channel/product actors — to a stable `UserId` before runtime
+/// state is touched. Only the resolver trait, request, surface, and error
+/// types are re-exported so host wiring (`ironclaw-reborn serve`, the CLI
+/// `UserDirectory` adapter) depends on the facade vocabulary, never on
+/// `ironclaw_reborn_identity` directly. The concrete filesystem-backed store
+/// stays private to this composition layer (composition CLAUDE.md: "keep
+/// lower substrate handles private").
 #[cfg(feature = "webui-v2-beta")]
-pub async fn open_webui_user_store(
-    path: &std::path::Path,
-) -> Result<std::sync::Arc<RebornLibSqlUserStore>, RebornUserStoreError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| RebornUserStoreError::Backend(err.to_string()))?;
-    }
-    let db = std::sync::Arc::new(
-        libsql::Builder::new_local(path)
-            .build()
-            .await
-            .map_err(|err| RebornUserStoreError::Backend(err.to_string()))?,
-    );
-    Ok(std::sync::Arc::new(RebornLibSqlUserStore::open(db).await?))
+pub use ironclaw_reborn_identity::{
+    ExternalSubjectId, IdentityKeyError, ProviderInstanceId, ProviderKind, RebornIdentityError,
+    RebornIdentityResolver, ResolveExternalIdentity, SurfaceKind,
+};
+
+/// Test-support: build a standalone canonical Reborn identity resolver on an
+/// in-memory host filesystem under `tenant_id`.
+///
+/// This mirrors the production path
+/// [`RebornRuntime::open_reborn_identity_resolver`](crate::RebornRuntime::open_reborn_identity_resolver),
+/// which builds the same filesystem-backed store on the runtime's durable
+/// scoped filesystem. Production callers must use that accessor; this free
+/// function exists only so tests (and downstream integration crates via
+/// `test-support`) can build a resolver without standing up a full runtime.
+/// Gated so it ships zero bytes in production binaries.
+#[cfg(all(feature = "webui-v2-beta", any(test, feature = "test-support")))]
+pub fn open_reborn_identity_resolver(
+    tenant_id: &ironclaw_host_api::TenantId,
+) -> std::sync::Arc<dyn RebornIdentityResolver> {
+    use ironclaw_host_api::{
+        AgentId, MountAlias, MountGrant, MountPermissions, MountView, UserId, VirtualPath,
+    };
+
+    let root = std::sync::Arc::new(ironclaw_filesystem::InMemoryBackend::default());
+    let view = MountView::new(vec![MountGrant::new(
+        MountAlias::new("/tenant-shared").expect("mount alias"),
+        VirtualPath::new("/tenants/test/shared").expect("virtual path"),
+        MountPermissions::read_write_list_delete(),
+    )])
+    .expect("mount view");
+    let filesystem = std::sync::Arc::new(ironclaw_filesystem::ScopedFilesystem::with_fixed_view(
+        root, view,
+    ));
+    std::sync::Arc::new(
+        ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
+            filesystem,
+            tenant_id.clone(),
+            UserId::new("test-owner").expect("user"),
+            AgentId::new("test-agent").expect("agent"),
+            None,
+        ),
+    )
 }
 
 /// Open the reborn-owned local trigger access store on the substrate DB at
