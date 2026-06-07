@@ -87,6 +87,8 @@ mod skill_listing;
 #[cfg(feature = "slack-v2-host-beta")]
 mod slack_actor_identity;
 #[cfg(feature = "slack-v2-host-beta")]
+mod slack_channel_routes;
+#[cfg(feature = "slack-v2-host-beta")]
 mod slack_connectable_channel;
 #[cfg(feature = "slack-v2-host-beta")]
 mod slack_delivery;
@@ -215,6 +217,10 @@ pub use skill_listing::{RebornSkillListError, list_reborn_local_skills};
 pub use slack_actor_identity::{
     RebornUserIdentityLookup, RebornUserIdentityLookupError, SlackUserIdentityActorResolver,
     slack_user_identity_provider_user_id,
+};
+#[cfg(feature = "slack-v2-host-beta")]
+pub use slack_channel_routes::{
+    SlackChannelRouteAdminRouteConfig, WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH,
 };
 #[cfg(feature = "slack-v2-host-beta")]
 pub use slack_connectable_channel::build_webui_services_with_slack_host_beta_mounts;
@@ -658,6 +664,12 @@ fn invocation_mount_view_for_segments(
         VirtualPath::new(format!("/tenants/{tenant_id}/shared"))?,
         MountPermissions::read_write(),
     ));
+    #[cfg(feature = "slack-v2-host-beta")]
+    grants.push(MountGrant::new(
+        MountAlias::new("/tenant-shared/slack-channel-routes")?,
+        VirtualPath::new(format!("/tenants/{tenant_id}/shared/slack-channel-routes"))?,
+        MountPermissions::read_only(),
+    ));
     for system_subroot in ["/system/settings", "/system/extensions", "/system/skills"] {
         grants.push(MountGrant::new(
             MountAlias::new(system_subroot)?,
@@ -666,6 +678,30 @@ fn invocation_mount_view_for_segments(
         ));
     }
     MountView::new(grants)
+}
+
+#[cfg(all(
+    any(feature = "libsql", feature = "postgres"),
+    feature = "slack-v2-host-beta"
+))]
+pub(crate) fn slack_host_state_mount_view(
+    scope: &ResourceScope,
+) -> Result<MountView, ironclaw_host_api::HostApiError> {
+    let tenant_id = resource_scope_path_segment(scope.tenant_id.as_str());
+    MountView::new(vec![
+        MountGrant::new(
+            MountAlias::new("/tenant-shared/slack-personal-binding")?,
+            VirtualPath::new(format!(
+                "/tenants/{tenant_id}/shared/slack-personal-binding"
+            ))?,
+            MountPermissions::read_write_list_delete(),
+        ),
+        MountGrant::new(
+            MountAlias::new("/tenant-shared/slack-channel-routes")?,
+            VirtualPath::new(format!("/tenants/{tenant_id}/shared/slack-channel-routes"))?,
+            MountPermissions::read_write_list_delete(),
+        ),
+    ])
 }
 
 /// Wrap `root` in a tenant-aware [`ScopedFilesystem`] whose resolver is
@@ -853,6 +889,61 @@ mod mount_view_tests {
         assert_eq!(
             resolved.as_str(),
             &format!("/tenants/{}/shared/foo", scope.tenant_id.as_str())
+        );
+    }
+
+    #[cfg(feature = "slack-v2-host-beta")]
+    #[test]
+    fn invocation_mount_view_exposes_slack_channel_routes_read_only() {
+        let scope = sample_scope();
+        let view = invocation_mount_view(&scope).unwrap();
+        let (resolved, grant) = view
+            .resolve_with_grant(
+                &ScopedPath::new("/tenant-shared/slack-channel-routes/install/team/route.json")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            &format!(
+                "/tenants/{}/shared/slack-channel-routes/install/team/route.json",
+                scope.tenant_id.as_str()
+            )
+        );
+        assert_eq!(grant.alias.as_str(), "/tenant-shared/slack-channel-routes");
+        assert_eq!(grant.permissions, MountPermissions::read_only());
+    }
+
+    #[cfg(feature = "slack-v2-host-beta")]
+    #[test]
+    fn slack_host_state_mount_view_grants_delete_only_to_slack_state_root() {
+        let scope = sample_scope();
+        let view = slack_host_state_mount_view(&scope).unwrap();
+        let resolved = view
+            .resolve(
+                &ScopedPath::new("/tenant-shared/slack-channel-routes/install/team/route.json")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            &format!(
+                "/tenants/{}/shared/slack-channel-routes/install/team/route.json",
+                scope.tenant_id.as_str()
+            )
+        );
+        let grant = view
+            .mounts
+            .iter()
+            .find(|grant| grant.alias.as_str() == "/tenant-shared/slack-channel-routes")
+            .expect("slack host-state grant");
+        assert_eq!(
+            grant.permissions,
+            MountPermissions::read_write_list_delete()
+        );
+        assert!(
+            view.resolve(&ScopedPath::new("/tenant-shared/other.json").unwrap())
+                .is_err()
         );
     }
 
