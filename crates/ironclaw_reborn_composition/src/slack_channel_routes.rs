@@ -159,7 +159,7 @@ impl SlackChannelSubjectAssigner {
         hasher.update(channel_id.as_bytes());
         let digest = hasher.finalize();
         let mut suffix = String::with_capacity(32);
-        for byte in &digest[..16] {
+        for byte in digest.iter().take(16) {
             use std::fmt::Write as _;
             write!(&mut suffix, "{byte:02x}").map_err(|_| SlackChannelRouteError::InvalidRoute)?;
         }
