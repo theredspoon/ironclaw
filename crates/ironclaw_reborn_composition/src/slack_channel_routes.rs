@@ -1070,6 +1070,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_admin_list_handles_oversized_cursor_without_overflow() {
+        let store = Arc::new(InMemorySlackChannelRouteStore::new());
+        let mount = slack_channel_route_admin_route_mount(route_config(store));
+
+        let response = mount
+            .protected
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "{WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH}?limit=1&cursor={}",
+                        usize::MAX
+                    ))
+                    .header("content-length", "0")
+                    .extension(caller(TENANT, "user:admin"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("list responds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["routes"], serde_json::json!([]));
+        assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn route_admin_delete_unknown_route_returns_deleted_false() {
         let mount = slack_channel_route_admin_route_mount(route_config(Arc::new(
             InMemorySlackChannelRouteStore::new(),
