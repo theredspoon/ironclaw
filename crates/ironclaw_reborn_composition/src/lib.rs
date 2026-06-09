@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+mod approval_test_support;
 mod auth;
 #[cfg(test)]
 mod auth_dcr_tests;
@@ -49,6 +51,7 @@ mod llm_config_service;
 mod llm_key_store;
 #[cfg(feature = "root-llm-provider")]
 mod llm_reload;
+mod local_dev_authorization;
 mod local_dev_capability_policy;
 mod local_dev_mounts;
 mod local_runtime_profile;
@@ -75,6 +78,7 @@ mod product_live_adapters;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 mod production_runtime_policy;
 mod profile;
+mod profile_approval_authorization;
 mod projection;
 pub use auth_prompt::{AuthChallengeProvider, AuthChallengeView};
 #[cfg(feature = "root-llm-provider")]
@@ -86,6 +90,7 @@ mod provider_repo;
 mod readiness;
 mod runtime;
 mod runtime_input;
+mod runtime_profile_approval_policy;
 mod skill_listing;
 #[cfg(feature = "slack-v2-host-beta")]
 mod slack_actor_identity;
@@ -146,6 +151,8 @@ pub use extension_lifecycle_command::{
     RebornExtensionLifecycleCommand, RebornExtensionLifecycleCommandError,
     execute_reborn_extension_lifecycle_command, render_reborn_extension_lifecycle_response,
 };
+#[cfg(feature = "test-support")]
+pub use factory::RebornLocalDevApprovalTestParts;
 pub use factory::{RebornServices, build_reborn_services};
 pub use gsuite::{bundled_gsuite_extension_packages, bundled_gsuite_first_party_handlers};
 pub use hooks::{
