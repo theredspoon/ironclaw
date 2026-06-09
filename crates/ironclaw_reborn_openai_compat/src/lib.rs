@@ -6,9 +6,11 @@
 //! the OpenAI-compatible Chat Completions and Responses surfaces. The optional
 //! `openai-compat-beta` feature exposes axum route fragments for host
 //! composition without routing through the v1 gateway. By default the router is
-//! fail-closed; host composition can inject a ProductWorkflow-backed
-//! non-streaming Chat Completions service for the first wired slice.
+//! fail-closed; host composition can inject ProductWorkflow-backed Chat,
+//! Responses, and projection-streaming services for the wired Reborn slices.
 
+#[cfg(feature = "openai-compat-beta")]
+mod ack_helpers;
 mod chat;
 #[cfg(feature = "openai-compat-beta")]
 mod chat_workflow;
@@ -18,12 +20,16 @@ mod error;
 mod handlers;
 #[cfg(feature = "openai-compat-beta")]
 mod identity;
+#[cfg(feature = "openai-compat-beta")]
+mod projection_helpers;
 mod refs;
 mod responses;
 #[cfg(feature = "openai-compat-beta")]
 mod responses_workflow;
 #[cfg(feature = "openai-compat-beta")]
 mod router;
+#[cfg(feature = "openai-compat-beta")]
+mod streaming;
 
 pub use chat::{
     OpenAiChatChoice, OpenAiChatCompletionChunk, OpenAiChatCompletionRequest,
@@ -84,3 +90,8 @@ pub use responses_workflow::{
 };
 #[cfg(feature = "openai-compat-beta")]
 pub use router::{OpenAiCompatRouterState, openai_compat_router, openai_compat_router_with_state};
+#[cfg(feature = "openai-compat-beta")]
+pub use streaming::{
+    OpenAiChatProjectionStreamRequest, OpenAiCompatProjectionStreamer,
+    OpenAiResponseProjectionStreamRequest,
+};
