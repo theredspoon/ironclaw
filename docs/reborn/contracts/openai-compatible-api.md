@@ -1,7 +1,8 @@
 # Reborn OpenAI-Compatible API Contract
 
-**Status:** contract, identity, and non-streaming Chat Completions workflow
-slices (#4442, #4443, #4444)
+**Status:** contract, identity, non-streaming Chat Completions workflow,
+and non-streaming Responses create/retrieve/cancel workflow slices (#4442, #4443,
+#4444, #4445)
 **Parent:** #3283
 **Crates:** `crates/ironclaw_reborn_openai_compat`,
 `crates/ironclaw_reborn_openai_compat_storage`
@@ -13,13 +14,15 @@ that speak Chat Completions or Responses. It is behavior-compatible at the HTTP
 shape where practical, but it must not reuse the v1 gateway's stateless LLM
 proxy code path.
 
-These first slices are contract-first, with one narrow ProductWorkflow-backed
-route. They define DTOs, host-owned ingress descriptors, a sanitized
+These first slices are contract-first, with narrow ProductWorkflow-backed
+routes. They define DTOs, host-owned ingress descriptors, a sanitized
 OpenAI-style error envelope, route fragments, and the opaque ref/idempotency
 vocabulary. `POST /v1/chat/completions` can submit non-streaming user-message
 requests through ProductWorkflow when host composition injects the workflow
-state. Responses routes, retrieve, cancel, and SSE translation remain
-fail-closed.
+state. `POST /api/v1/responses`, `POST /v1/responses`, Responses retrieve,
+and Responses cancel can use the same injected ProductWorkflow-backed Responses
+service. SSE translation remains fail-closed until the EventStreamManager stream
+slice lands.
 
 ## Route Surface
 
@@ -110,6 +113,38 @@ The route:
   treating client-supplied tools as model-only hints rather than executable
   Reborn capabilities.
 
+## Non-Streaming Responses
+
+Host composition may inject `OpenAiResponsesWorkflow` for:
+
+- `POST /api/v1/responses`
+- `POST /v1/responses`
+- `GET /api/v1/responses/{response_id}`
+- `GET /v1/responses/{response_id}`
+- `POST /api/v1/responses/{response_id}/cancel`
+- `POST /v1/responses/{response_id}/cancel`
+
+The route:
+
+- Requires verified bearer/session auth middleware to provide
+  `OpenAiCompatAuthenticatedCaller`.
+- Rejects `stream: true`, request `tools`, and `tool_choice` before
+  ProductWorkflow side effects. Streaming and full Responses request-tool
+  semantics remain later slices.
+- Authorizes `previous_response_id` against the caller scope before using it as
+  conversation context.
+- Reserves actor-scoped opaque `resp_*` refs and idempotency mappings before
+  create submission. Same-key/same-body replays the same projection-backed
+  response; same-key/different-body returns a sanitized conflict.
+- Submits create requests through `ProductWorkflow` as user-message payloads and
+  waits through a composition-supplied projection reader. Wait timeout detaches
+  the HTTP waiter and returns a retryable sanitized service-unavailable error.
+- Retrieves current state through an authorized opaque-ref lookup and the
+  projection reader, not raw legacy conversation messages.
+- Cancels only when the opaque ref is authorized and bound to a Reborn run ref,
+  then submits a typed ProductWorkflow control action. Nonexistent, unauthorized,
+  and unbound refs all return the same sanitized not-found envelope.
+
 ## Error Shape
 
 Errors serialize as:
@@ -133,6 +168,7 @@ prompts, raw tool input/output, secrets, or user content in error payloads.
 
 With `openai-compat-beta`, the default route fragment can be mounted for
 composition tests and returns `501` with code `unsupported`. Host composition
-can inject the non-streaming Chat Completions workflow state. Other route
-families keep returning fail-closed sanitized errors until their own
-ProductWorkflow, projection, cancel, or event-stream slices land.
+can inject the non-streaming Chat Completions workflow state and the
+non-streaming Responses workflow state. OpenAI-compatible SSE translation still
+returns fail-closed sanitized errors until the EventStreamManager stream slice
+lands.

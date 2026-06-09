@@ -16,8 +16,12 @@ mod descriptors;
 mod error;
 #[cfg(feature = "openai-compat-beta")]
 mod handlers;
+#[cfg(feature = "openai-compat-beta")]
+mod identity;
 mod refs;
 mod responses;
+#[cfg(feature = "openai-compat-beta")]
+mod responses_workflow;
 #[cfg(feature = "openai-compat-beta")]
 mod router;
 
@@ -30,8 +34,7 @@ pub use chat::{
 };
 #[cfg(feature = "openai-compat-beta")]
 pub use chat_workflow::{
-    OPENAI_COMPAT_ACTOR_KIND, OPENAI_COMPAT_ADAPTER_ID, OPENAI_COMPAT_CONVERSATION_PREFIX,
-    OPENAI_COMPAT_INSTALLATION_ID, OpenAiChatCompletionProjection,
+    OPENAI_COMPAT_CONVERSATION_PREFIX, OpenAiChatCompletionProjection,
     OpenAiChatCompletionProjectionReader, OpenAiChatCompletionProjectionRequest,
     OpenAiChatCompletionsWorkflow, OpenAiChatModelOnlyTools, OpenAiCompatAuthenticatedCaller,
 };
@@ -54,6 +57,10 @@ pub use handlers::{
     chat_completions, responses_api_cancel, responses_api_create, responses_api_retrieve,
     responses_v1_cancel, responses_v1_create, responses_v1_retrieve,
 };
+#[cfg(feature = "openai-compat-beta")]
+pub use identity::{
+    OPENAI_COMPAT_ACTOR_KIND, OPENAI_COMPAT_ADAPTER_ID, OPENAI_COMPAT_INSTALLATION_ID,
+};
 pub use refs::{
     InMemoryOpenAiCompatRefStore, OpenAiChatCompletionId, OpenAiCompatActorScope,
     OpenAiCompatBindInternalRefs, OpenAiCompatIdempotencyConflict, OpenAiCompatIdempotencyKey,
@@ -69,6 +76,11 @@ pub use responses::{
     OpenAiResponseOutputItemStatus, OpenAiResponseStatus, OpenAiResponseUsage,
     OpenAiResponsesCreateRequest, OpenAiResponsesInput, OpenAiResponsesInputItem,
     OpenAiResponsesMessageRole,
+};
+#[cfg(feature = "openai-compat-beta")]
+pub use responses_workflow::{
+    OpenAiResponseProjection, OpenAiResponseReadRequest, OpenAiResponseWaitRequest,
+    OpenAiResponsesProjectionReader, OpenAiResponsesWorkflow,
 };
 #[cfg(feature = "openai-compat-beta")]
 pub use router::{OpenAiCompatRouterState, openai_compat_router, openai_compat_router_with_state};

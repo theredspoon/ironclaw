@@ -1,11 +1,12 @@
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::HeaderMap;
 
 use crate::{
     OpenAiChatCompletionResponse, OpenAiCompatAuthenticatedCaller, OpenAiCompatHttpError,
-    OpenAiCompatIdempotencyKey, OpenAiCompatRouterState,
+    OpenAiCompatIdempotencyKey, OpenAiCompatRouteSurface, OpenAiCompatRouterState,
+    OpenAiResponseId, OpenAiResponseObject,
 };
 
 pub async fn chat_completions(
@@ -33,39 +34,132 @@ pub async fn chat_completions(
 }
 
 pub async fn responses_api_create(
-    State(_state): State<OpenAiCompatRouterState>,
-) -> OpenAiCompatHttpError {
-    OpenAiCompatHttpError::not_wired()
+    State(state): State<OpenAiCompatRouterState>,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    create_response(
+        state,
+        caller,
+        headers,
+        body,
+        OpenAiCompatRouteSurface::ResponsesApi,
+    )
+    .await
 }
 
 pub async fn responses_v1_create(
-    State(_state): State<OpenAiCompatRouterState>,
-) -> OpenAiCompatHttpError {
-    OpenAiCompatHttpError::not_wired()
+    State(state): State<OpenAiCompatRouterState>,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    create_response(
+        state,
+        caller,
+        headers,
+        body,
+        OpenAiCompatRouteSurface::ResponsesApi,
+    )
+    .await
 }
 
 pub async fn responses_api_retrieve(
-    State(_state): State<OpenAiCompatRouterState>,
-) -> OpenAiCompatHttpError {
-    OpenAiCompatHttpError::not_wired()
+    State(state): State<OpenAiCompatRouterState>,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    Path(response_id): Path<String>,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    retrieve_response(state, caller, response_id).await
 }
 
 pub async fn responses_v1_retrieve(
-    State(_state): State<OpenAiCompatRouterState>,
-) -> OpenAiCompatHttpError {
-    OpenAiCompatHttpError::not_wired()
+    State(state): State<OpenAiCompatRouterState>,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    Path(response_id): Path<String>,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    retrieve_response(state, caller, response_id).await
 }
 
 pub async fn responses_api_cancel(
-    State(_state): State<OpenAiCompatRouterState>,
-) -> OpenAiCompatHttpError {
-    OpenAiCompatHttpError::not_wired()
+    State(state): State<OpenAiCompatRouterState>,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    Path(response_id): Path<String>,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    cancel_response(state, caller, response_id).await
 }
 
 pub async fn responses_v1_cancel(
-    State(_state): State<OpenAiCompatRouterState>,
-) -> OpenAiCompatHttpError {
-    OpenAiCompatHttpError::not_wired()
+    State(state): State<OpenAiCompatRouterState>,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    Path(response_id): Path<String>,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    cancel_response(state, caller, response_id).await
+}
+
+fn require_caller(
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+) -> Result<OpenAiCompatAuthenticatedCaller, OpenAiCompatHttpError> {
+    caller.map(|Extension(caller)| caller).ok_or_else(|| {
+        OpenAiCompatHttpError::from_kind(
+            401,
+            false,
+            crate::OpenAiCompatErrorKind::Authentication,
+            None,
+        )
+    })
+}
+
+async fn create_response(
+    state: OpenAiCompatRouterState,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    headers: HeaderMap,
+    body: Bytes,
+    surface: OpenAiCompatRouteSurface,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    let Some(workflow) = state.responses() else {
+        return Err(OpenAiCompatHttpError::not_wired());
+    };
+    let caller = require_caller(caller)?;
+    let idempotency_key = idempotency_key_from_headers(&headers)?;
+    workflow
+        .create_response(caller, &body, idempotency_key, surface)
+        .await
+        .map(Json)
+}
+
+async fn retrieve_response(
+    state: OpenAiCompatRouterState,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    response_id: String,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    let Some(workflow) = state.responses() else {
+        return Err(OpenAiCompatHttpError::not_wired());
+    };
+    let caller = require_caller(caller)?;
+    let response_id = OpenAiResponseId::new(response_id)
+        .map_err(|_| OpenAiCompatHttpError::not_found(Some("response_id".to_string())))?;
+    workflow
+        .retrieve_response(caller, response_id)
+        .await
+        .map(Json)
+}
+
+async fn cancel_response(
+    state: OpenAiCompatRouterState,
+    caller: Option<Extension<OpenAiCompatAuthenticatedCaller>>,
+    response_id: String,
+) -> Result<Json<OpenAiResponseObject>, OpenAiCompatHttpError> {
+    let Some(workflow) = state.responses() else {
+        return Err(OpenAiCompatHttpError::not_wired());
+    };
+    let caller = require_caller(caller)?;
+    let response_id = OpenAiResponseId::new(response_id)
+        .map_err(|_| OpenAiCompatHttpError::not_found(Some("response_id".to_string())))?;
+    workflow
+        .cancel_response(caller, response_id)
+        .await
+        .map(Json)
 }
 
 fn idempotency_key_from_headers(
