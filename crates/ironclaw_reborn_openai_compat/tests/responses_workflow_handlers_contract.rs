@@ -14,6 +14,7 @@ use ironclaw_product_adapters::{
     AuthRequirement, FakeProductWorkflow, ProductAdapterError, ProductInboundAck,
     ProductInboundEnvelope, ProductInboundPayload, ProductProjectionReadInput, ProductRejection,
     ProductRejectionKind, ProductWorkflow, ProjectionReadRequest, ProtocolAuthEvidence,
+    RedactedString,
 };
 use ironclaw_reborn_openai_compat::{
     InMemoryOpenAiCompatRefStore, OpenAiCompatActorScope, OpenAiCompatAuthenticatedCaller,
@@ -331,6 +332,7 @@ async fn unsupported_responses_tools_and_unwired_stream_reject_before_product_wo
     assert_eq!(stream.status(), http::StatusCode::NOT_IMPLEMENTED);
 
     let tools = router
+        .clone()
         .oneshot(response_create_request(
             "/api/v1/responses",
             json!({"model": "gpt-reborn", "input": "hello", "tools": [{"type": "web_search_preview"}]}),
@@ -339,7 +341,53 @@ async fn unsupported_responses_tools_and_unwired_stream_reject_before_product_wo
         .await
         .expect("tools");
     assert_eq!(tools.status(), http::StatusCode::BAD_REQUEST);
+
+    let tool_choice = router
+        .oneshot(response_create_request(
+            "/api/v1/responses",
+            json!({
+                "model": "gpt-reborn",
+                "input": "hello",
+                "tool_choice": {"type": "function", "function": {"name": "lookup"}}
+            }),
+            None,
+        ))
+        .await
+        .expect("tool choice");
+    assert_eq!(tool_choice.status(), http::StatusCode::BAD_REQUEST);
     assert_eq!(workflow.accepted_count(), 0);
+}
+
+#[tokio::test]
+async fn responses_product_workflow_error_redacts_request_and_backend_details() {
+    let workflow = Arc::new(ErrorWorkflow::new(ProductAdapterError::Internal {
+        detail: RedactedString::new(
+            "provider stack /host/path /Users/alice SECRET_SENTINEL sk-live runtime trace",
+        ),
+    }));
+    let router = router_with_product_workflow(
+        workflow,
+        Arc::new(InMemoryOpenAiCompatRefStore::new()),
+        Arc::new(StaticResponsesReader::completed("unused")),
+        caller(),
+    );
+
+    let response = router
+        .oneshot(response_create_request(
+            "/api/v1/responses",
+            json!({
+                "model": "gpt-reborn",
+                "input": "RAW_TOOL_INPUT_SENTINEL secret-token /host/path"
+            }),
+            None,
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let rendered = json_body(response).await.to_string();
+    assert!(rendered.contains("internal_error"), "{rendered}");
+    assert_error_body_excludes_redaction_sentinels(&rendered);
 }
 
 #[tokio::test]
@@ -634,6 +682,64 @@ async fn lookup_and_cancel_nonexistent_ids_return_same_not_found_shape() {
     assert_eq!(json_body(retrieve).await, json_body(cancel).await);
 }
 
+#[tokio::test]
+async fn lookup_and_cancel_cross_scope_ids_return_same_not_found_shape() {
+    let workflow = Arc::new(FakeProductWorkflow::new());
+    let ref_store = Arc::new(InMemoryOpenAiCompatRefStore::new());
+    let reader = Arc::new(StaticResponsesReader::completed("unused"));
+    let alice_router = router_with_store_and_caller(
+        workflow.clone(),
+        ref_store.clone(),
+        reader.clone(),
+        caller_for_user("user-a"),
+    );
+    let bob_router =
+        router_with_store_and_caller(workflow, ref_store, reader, caller_for_user("user-b"));
+
+    let created = json_body(
+        alice_router
+            .oneshot(response_create_request(
+                "/api/v1/responses",
+                json!({"model": "gpt-reborn", "input": "hello"}),
+                None,
+            ))
+            .await
+            .expect("create"),
+    )
+    .await;
+    let id = created["id"].as_str().expect("id");
+
+    let unauthorized_retrieve = bob_router
+        .clone()
+        .oneshot(get_request(&format!("/api/v1/responses/{id}")))
+        .await
+        .expect("unauthorized retrieve");
+    let unauthorized_cancel = bob_router
+        .clone()
+        .oneshot(post_empty(&format!("/api/v1/responses/{id}/cancel")))
+        .await
+        .expect("unauthorized cancel");
+    let missing_retrieve = bob_router
+        .clone()
+        .oneshot(get_request("/api/v1/responses/resp_missing"))
+        .await
+        .expect("missing retrieve");
+    let missing_cancel = bob_router
+        .oneshot(post_empty("/api/v1/responses/resp_missing/cancel"))
+        .await
+        .expect("missing cancel");
+
+    assert_eq!(unauthorized_retrieve.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(unauthorized_cancel.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(missing_retrieve.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(missing_cancel.status(), http::StatusCode::NOT_FOUND);
+
+    let expected = json_body(missing_retrieve).await;
+    assert_eq!(json_body(unauthorized_retrieve).await, expected);
+    assert_eq!(json_body(unauthorized_cancel).await, expected);
+    assert_eq!(json_body(missing_cancel).await, expected);
+}
+
 async fn assert_fixed_ack_status(ack: ProductInboundAck, status: http::StatusCode) {
     let workflow = Arc::new(FixedAckWorkflow::new(ack));
     let service = OpenAiResponsesWorkflow::new(
@@ -673,10 +779,28 @@ fn router_with_store(
     ref_store: Arc<InMemoryOpenAiCompatRefStore>,
     reader: Arc<dyn OpenAiResponsesProjectionReader>,
 ) -> axum::Router {
+    router_with_store_and_caller(workflow, ref_store, reader, caller())
+}
+
+fn router_with_store_and_caller(
+    workflow: Arc<FakeProductWorkflow>,
+    ref_store: Arc<InMemoryOpenAiCompatRefStore>,
+    reader: Arc<dyn OpenAiResponsesProjectionReader>,
+    caller: OpenAiCompatAuthenticatedCaller,
+) -> axum::Router {
     workflow.program_projection_read_resolution(sample_projection_read_request());
+    router_with_product_workflow(workflow, ref_store, reader, caller)
+}
+
+fn router_with_product_workflow(
+    workflow: Arc<dyn ProductWorkflow>,
+    ref_store: Arc<InMemoryOpenAiCompatRefStore>,
+    reader: Arc<dyn OpenAiResponsesProjectionReader>,
+    caller: OpenAiCompatAuthenticatedCaller,
+) -> axum::Router {
     let service = OpenAiResponsesWorkflow::new(workflow, ref_store, reader);
     openai_compat_router_with_state(OpenAiCompatRouterState::with_responses(Arc::new(service)))
-        .layer(axum::Extension(caller()))
+        .layer(axum::Extension(caller))
 }
 
 fn response_create_request(
@@ -750,14 +874,18 @@ fn submitted_user_message_json(envelope: &ProductInboundEnvelope) -> Value {
 }
 
 fn caller() -> OpenAiCompatAuthenticatedCaller {
+    caller_for_user("user-a")
+}
+
+fn caller_for_user(user_id: &str) -> OpenAiCompatAuthenticatedCaller {
     OpenAiCompatAuthenticatedCaller::new(
         OpenAiCompatActorScope::new(
             TenantId::new("tenant-a").expect("tenant"),
-            UserId::new("user-a").expect("user"),
+            UserId::new(user_id).expect("user"),
             Some(AgentId::new("agent-a").expect("agent")),
             Some(ProjectId::new("project-a").expect("project")),
         ),
-        ProtocolAuthEvidence::test_verified(AuthRequirement::BearerToken, "user-a"),
+        ProtocolAuthEvidence::test_verified(AuthRequirement::BearerToken, user_id),
     )
     .expect("caller")
 }
@@ -845,6 +973,26 @@ impl ProductWorkflow for FixedAckWorkflow {
             .expect("workflow read lock")
             .push(request);
         Ok(sample_projection_read_request())
+    }
+}
+
+struct ErrorWorkflow {
+    error: ProductAdapterError,
+}
+
+impl ErrorWorkflow {
+    fn new(error: ProductAdapterError) -> Self {
+        Self { error }
+    }
+}
+
+#[async_trait]
+impl ProductWorkflow for ErrorWorkflow {
+    async fn submit_inbound(
+        &self,
+        _envelope: ProductInboundEnvelope,
+    ) -> Result<ProductInboundAck, ProductAdapterError> {
+        Err(self.error.clone())
     }
 }
 
@@ -1034,5 +1182,23 @@ impl OpenAiResponsesProjectionReader for RecordingResponsesReader {
             id: request.public_id,
             ..self.response.clone()
         })
+    }
+}
+
+fn assert_error_body_excludes_redaction_sentinels(rendered: &str) {
+    for forbidden in [
+        "RAW_TOOL_INPUT_SENTINEL",
+        "provider stack",
+        "/host/path",
+        "/Users/alice",
+        "SECRET_SENTINEL",
+        "secret-token",
+        "sk-live",
+        "runtime trace",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "error body leaked forbidden detail {forbidden:?}: {rendered}"
+        );
     }
 }

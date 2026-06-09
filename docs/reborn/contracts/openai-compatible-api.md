@@ -1,8 +1,8 @@
 # Reborn OpenAI-Compatible API Contract
 
-**Status:** contract, identity, non-streaming Chat Completions workflow,
-and non-streaming Responses create/retrieve/cancel workflow slices (#4442, #4443,
-#4444, #4445)
+**Status:** contract, identity, ProductWorkflow-backed Chat Completions,
+Responses create/retrieve/cancel, idempotency/opaque-ref, and projection-backed
+SSE streaming slices (#4442, #4443, #4444, #4445, #4446, #4447)
 **Parent:** #3283
 **Crates:** `crates/ironclaw_reborn_openai_compat`,
 `crates/ironclaw_reborn_openai_compat_storage`
@@ -21,8 +21,9 @@ vocabulary. `POST /v1/chat/completions` can submit non-streaming user-message
 requests through ProductWorkflow when host composition injects the workflow
 state. `POST /api/v1/responses`, `POST /v1/responses`, Responses retrieve,
 and Responses cancel can use the same injected ProductWorkflow-backed Responses
-service. SSE translation remains fail-closed until the EventStreamManager stream
-slice lands.
+service. Projection-backed SSE translation is owned by this route crate through a
+composition-supplied projection-stream port; Reborn keepalive/control frames and
+projection cursors stay internal.
 
 ## Route Surface
 
@@ -80,8 +81,10 @@ bind sockets or call `axum::serve`.
 - Non-streaming Chat Completions wait timeout detaches from the wait, not from
   the underlying turn. The API response is a retryable sanitized service
   unavailable error.
-- SSE translation is a later slice over `ironclaw_event_streams`; Reborn stream
-  control frames must not leak into OpenAI-compatible SSE payloads.
+- SSE translation consumes a composition-supplied projection stream port and
+  emits OpenAI-compatible events from `ProductProjectionItem` state. Reborn
+  keepalive/control frames, projection cursors, internal refs, provider
+  diagnostics, and runtime details must not leak into SSE ids or payloads.
 
 ## Non-Streaming Chat Completions
 
@@ -95,7 +98,9 @@ The route:
 
 - Requires verified bearer/session auth middleware to provide
   `OpenAiCompatAuthenticatedCaller`.
-- Rejects `stream: true` before ProductWorkflow side effects.
+- Routes `stream: true` through the projection-backed SSE translator when a
+  projection streamer is injected; otherwise rejects it before ProductWorkflow
+  side effects.
 - Reserves an actor-scoped opaque `chatcmpl-*` ref and idempotency mapping
   before submission.
 - Converts OpenAI-compatible messages into a `UserMessagePayload` and submits it
@@ -128,9 +133,11 @@ The route:
 
 - Requires verified bearer/session auth middleware to provide
   `OpenAiCompatAuthenticatedCaller`.
-- Rejects `stream: true`, request `tools`, and `tool_choice` before
-  ProductWorkflow side effects. Streaming and full Responses request-tool
-  semantics remain later slices.
+- Routes `stream: true` through the projection-backed SSE translator when a
+  projection streamer is injected; otherwise rejects it before ProductWorkflow
+  side effects. Request `tools` and `tool_choice` are explicitly rejected
+  before ProductWorkflow side effects until a dedicated capability-view
+  contract exists.
 - Authorizes `previous_response_id` against the caller scope before using it as
   conversation context.
 - Reserves actor-scoped opaque `resp_*` refs and idempotency mappings before
@@ -144,6 +151,34 @@ The route:
 - Cancels only when the opaque ref is authorized and bound to a Reborn run ref,
   then submits a typed ProductWorkflow control action. Nonexistent, unauthorized,
   and unbound refs all return the same sanitized not-found envelope.
+
+## Streaming Chat And Responses
+
+When host composition injects `with_projection_streamer(...)`, `stream: true`
+Chat and Responses create requests submit through `ProductWorkflow` and then
+translate projection updates into OpenAI-compatible SSE at the route boundary.
+Chat emits `chat.completion.chunk` events plus `[DONE]`; Responses emits
+`response.created`, `response.output_text.delta`, terminal `response.completed`,
+`response.failed`, or `response.cancelled` events as appropriate. Terminal
+`RunStatus` projection items complete or fail streams even when no synthetic
+final-reply projection item is present.
+
+Streaming idempotency follows the same actor-scope, route-surface, and
+fingerprint rules as non-streaming create. Same-key/same-body replays reuse the
+recorded accepted ProductWorkflow ack and must not resubmit after an accepted
+turn; pending mappings left by a non-accepted submit may be retried. Same-key/
+different-body conflicts remain sanitized.
+
+The SSE translator must suppress Reborn keepalive/control frames, raw
+projection cursors, internal product-action/turn-run/projection refs, provider
+messages, host paths, secrets, raw tool input, and runtime details. Translation
+errors emit sanitized OpenAI-compatible stream errors.
+
+Responses request `tools` and `tool_choice` remain intentionally unsupported on
+both streaming and non-streaming creates until Reborn has a capability-view
+contract for exposing executable tool affordances through this API. Chat
+Completions may pass client-supplied tools as model-only metadata, but route
+code must not execute them as Reborn capabilities.
 
 ## Error Shape
 
@@ -167,8 +202,9 @@ prompts, raw tool input/output, secrets, or user content in error payloads.
 ## Current Fail-Closed Behavior
 
 With `openai-compat-beta`, the default route fragment can be mounted for
-composition tests and returns `501` with code `unsupported`. Host composition
-can inject the non-streaming Chat Completions workflow state and the
-non-streaming Responses workflow state. OpenAI-compatible SSE translation still
-returns fail-closed sanitized errors until the EventStreamManager stream slice
-lands.
+composition tests and returns `501` with code `unsupported` until host
+composition injects workflow state. Host composition can inject Chat
+Completions and Responses workflows, with optional projection streamers for
+OpenAI-compatible SSE. Without a projection streamer, `stream: true` remains a
+sanitized fail-closed invalid request rather than falling back to v1 gateway SSE
+or raw `AppEvent` streams.
