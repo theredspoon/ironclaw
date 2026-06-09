@@ -37,11 +37,12 @@ use ironclaw_product_workflow::{
     RebornGetRunStateRequest, RebornOutboundDeliveryModality,
     RebornOutboundDeliveryTargetCapabilities, RebornOutboundDeliveryTargetDescription,
     RebornOutboundDeliveryTargetId, RebornOutboundDeliveryTargetListResponse,
-    RebornOutboundDeliveryTargetOption, RebornOutboundDeliveryTargetSummary,
-    RebornOutboundPreferencesResponse, RebornResolveGateResponse, RebornServices,
-    RebornServicesApi, RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind,
-    RebornSetOutboundPreferencesRequest, RebornStreamEventsRequest, RebornSubmitTurnResponse,
-    RebornTimelineRequest, ResolveApprovalInteractionRequest, ResolveApprovalInteractionResponse,
+    RebornOutboundDeliveryTargetOption, RebornOutboundDeliveryTargetStatus,
+    RebornOutboundDeliveryTargetSummary, RebornOutboundPreferencesResponse,
+    RebornResolveGateResponse, RebornServices, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornServicesErrorKind, RebornSetOutboundPreferencesRequest,
+    RebornStreamEventsRequest, RebornSubmitTurnResponse, RebornTimelineRequest,
+    ResolveApprovalInteractionRequest, ResolveApprovalInteractionResponse,
     ResolveAuthInteractionRequest, ResolveAuthInteractionResponse,
     StaticConnectableChannelsProductFacade, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
     WebUiCreateThreadRequest, WebUiInboundValidationCode, WebUiListAutomationsRequest,
@@ -844,6 +845,7 @@ impl OutboundPreferencesProductFacade for RecordingOutboundPreferencesFacade {
         self.get_calls.lock().expect("lock").push(caller);
         Ok(RebornOutboundPreferencesResponse {
             final_reply_target: Some(outbound_target_summary("slack-dm-alpha")),
+            final_reply_target_status: RebornOutboundDeliveryTargetStatus::Available,
             default_modality: RebornOutboundDeliveryModality::Text,
         })
     }
@@ -859,6 +861,7 @@ impl OutboundPreferencesProductFacade for RecordingOutboundPreferencesFacade {
             .push(OutboundPreferencesSetCall { caller, request });
         Ok(RebornOutboundPreferencesResponse {
             final_reply_target: Some(outbound_target_summary("slack-dm-beta")),
+            final_reply_target_status: RebornOutboundDeliveryTargetStatus::Available,
             default_modality: RebornOutboundDeliveryModality::Text,
         })
     }
@@ -4205,6 +4208,7 @@ fn set_outbound_preferences_empty_json_defaults_final_target_to_none() {
 fn outbound_preferences_response_preserves_client_json_shape() {
     let response = RebornOutboundPreferencesResponse {
         final_reply_target: Some(outbound_target_summary("slack-dm-alpha")),
+        final_reply_target_status: RebornOutboundDeliveryTargetStatus::Available,
         default_modality: RebornOutboundDeliveryModality::Text,
     };
 
@@ -4218,6 +4222,7 @@ fn outbound_preferences_response_preserves_client_json_shape() {
                 "display_name": "Slack DM",
                 "description": "Slack direct message",
             },
+            "final_reply_target_status": "available",
             "default_modality": "text",
         })
     );
@@ -4234,8 +4239,78 @@ fn outbound_preferences_response_empty_json_defaults_to_text_without_target() {
 
     assert!(response.final_reply_target.is_none());
     assert_eq!(
+        response.final_reply_target_status,
+        RebornOutboundDeliveryTargetStatus::NoneConfigured
+    );
+    assert_eq!(
         response.default_modality,
         RebornOutboundDeliveryModality::Text
+    );
+}
+
+#[test]
+fn outbound_preferences_response_missing_status_defaults_to_available_when_target_present() {
+    let response: RebornOutboundPreferencesResponse = serde_json::from_value(json!({
+        "final_reply_target": {
+            "target_id": "slack-dm-alpha",
+            "channel": "slack",
+            "display_name": "Slack DM",
+            "description": "Slack direct message",
+        },
+        "default_modality": "text",
+    }))
+    .expect("deserialize legacy preferences response");
+
+    assert_eq!(
+        response.final_reply_target_status,
+        RebornOutboundDeliveryTargetStatus::Available
+    );
+    assert!(response.final_reply_target.is_some());
+    assert_eq!(
+        response.default_modality,
+        RebornOutboundDeliveryModality::Text
+    );
+}
+
+#[test]
+fn outbound_preferences_response_serializes_unavailable_status_without_target() {
+    let response = RebornOutboundPreferencesResponse {
+        final_reply_target: None,
+        final_reply_target_status: RebornOutboundDeliveryTargetStatus::Unavailable,
+        default_modality: RebornOutboundDeliveryModality::Text,
+    };
+
+    let serialized =
+        serde_json::to_value(&response).expect("serialize unavailable preferences response");
+    assert_eq!(
+        serialized,
+        json!({
+            "final_reply_target_status": "unavailable",
+            "default_modality": "text",
+        })
+    );
+
+    let deserialized: RebornOutboundPreferencesResponse =
+        serde_json::from_value(serialized).expect("deserialize unavailable preferences response");
+    assert_eq!(deserialized, response);
+}
+
+#[test]
+fn outbound_preferences_response_serializes_none_configured_status_explicitly() {
+    let response = RebornOutboundPreferencesResponse {
+        final_reply_target: None,
+        final_reply_target_status: RebornOutboundDeliveryTargetStatus::NoneConfigured,
+        default_modality: RebornOutboundDeliveryModality::Text,
+    };
+
+    let serialized =
+        serde_json::to_value(&response).expect("serialize none configured preferences response");
+    assert_eq!(
+        serialized,
+        json!({
+            "final_reply_target_status": "none_configured",
+            "default_modality": "text",
+        })
     );
 }
 
