@@ -128,6 +128,10 @@ fn dockerfile_reborn_builds_with_postgres_feature() {
         !dockerfile.contains("IRONCLAW_REBORN_HOME=/data/ironclaw-reborn"),
         "Dockerfile.reborn must let the entrypoint resolve Railway volume mounts before falling back to /data: {dockerfile}"
     );
+    assert!(
+        !dockerfile.contains("\nVOLUME "),
+        "Railway's Dockerfile builder rejects Docker VOLUME instructions; configure Railway volumes outside the image: {dockerfile}"
+    );
 }
 
 #[test]

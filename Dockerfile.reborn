@@ -82,8 +82,6 @@ RUN useradd -m -d /home/ironclaw -u 1000 ironclaw \
     && chown -R ironclaw:ironclaw /home/ironclaw /data/ironclaw-reborn /workspace \
     && chmod +x /usr/local/bin/ironclaw-reborn-entrypoint
 
-VOLUME ["/data/ironclaw-reborn"]
-
 WORKDIR /workspace
 
 EXPOSE 3000
