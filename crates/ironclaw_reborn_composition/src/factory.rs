@@ -891,8 +891,9 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         }
     };
     services = services.with_runtime_credential_account_resolver(Arc::new(
-        ProductAuthRuntimeCredentialResolver::new(
+        ProductAuthRuntimeCredentialResolver::new_with_refresh(
             product_auth.runtime_credential_account_selection_service(),
+            product_auth.runtime_credential_account_refresh_service(),
         ),
     ));
     let mut available_extensions = AvailableExtensionCatalog::from_filesystem_root(
@@ -988,11 +989,14 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
             reason: format!("web access first-party handlers are invalid: {error}"),
         },
     )?;
-    insert_extension_lifecycle_handlers(&mut first_party_registry, extension_management).map_err(
-        |error| RebornBuildError::InvalidConfig {
-            reason: format!("local-dev extension lifecycle handlers are invalid: {error}"),
-        },
-    )?;
+    insert_extension_lifecycle_handlers(
+        &mut first_party_registry,
+        extension_management,
+        product_auth.runtime_credential_account_selection_service(),
+    )
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("local-dev extension lifecycle handlers are invalid: {error}"),
+    })?;
     services = services.with_first_party_capabilities(Arc::new(first_party_registry));
 
     let host_runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> =
@@ -2911,8 +2915,9 @@ where
     // CredentialAccountService. Unconditional in production: product_auth_services
     // always exists (durable filesystem fallback from #4234).
     let services = services.with_runtime_credential_account_resolver(Arc::new(
-        ProductAuthRuntimeCredentialResolver::new(
+        ProductAuthRuntimeCredentialResolver::new_with_refresh(
             product_auth_services.runtime_credential_account_selection_service(),
+            product_auth_services.runtime_credential_account_refresh_service(),
         ),
     ));
     register_bundled_gsuite_first_party_handlers(
@@ -3593,7 +3598,10 @@ mod tests {
             .await
             .expect("install Gmail");
         extension_management
-            .activate(gmail_ref, ExtensionActivationMode::Static)
+            .activate_with_prechecked_credentials_for_test(
+                gmail_ref,
+                ExtensionActivationMode::Static,
+            )
             .await
             .expect("activate Gmail");
         extension_management
@@ -3601,7 +3609,10 @@ mod tests {
             .await
             .expect("install Google Calendar");
         extension_management
-            .activate(calendar_ref, ExtensionActivationMode::Static)
+            .activate_with_prechecked_credentials_for_test(
+                calendar_ref,
+                ExtensionActivationMode::Static,
+            )
             .await
             .expect("activate Google Calendar");
 
@@ -3722,7 +3733,10 @@ mod tests {
             .await
             .expect("install Notion MCP");
         extension_management
-            .activate(notion_ref, ExtensionActivationMode::Static)
+            .activate_with_prechecked_credentials_for_test(
+                notion_ref,
+                ExtensionActivationMode::Static,
+            )
             .await
             .expect("activate Notion MCP");
 
@@ -3773,7 +3787,10 @@ mod tests {
             .await
             .expect("install Web Access");
         extension_management
-            .activate(web_access_ref, ExtensionActivationMode::Static)
+            .activate_with_prechecked_credentials_for_test(
+                web_access_ref,
+                ExtensionActivationMode::Static,
+            )
             .await
             .expect("activate Web Access");
 
