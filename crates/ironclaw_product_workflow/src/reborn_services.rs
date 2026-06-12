@@ -3837,7 +3837,9 @@ fn kind_for_workflow_rejection(kind: ProductWorkflowRejectionKind) -> RebornServ
         ProductWorkflowRejectionKind::Unauthorized => RebornServicesErrorKind::ParticipantDenied,
         ProductWorkflowRejectionKind::InvalidRequest => RebornServicesErrorKind::Validation,
         ProductWorkflowRejectionKind::Unavailable => RebornServicesErrorKind::ServiceUnavailable,
-        ProductWorkflowRejectionKind::Conflict => RebornServicesErrorKind::Conflict,
+        ProductWorkflowRejectionKind::Conflict | ProductWorkflowRejectionKind::Ambiguous => {
+            RebornServicesErrorKind::Conflict
+        }
     }
 }
 
