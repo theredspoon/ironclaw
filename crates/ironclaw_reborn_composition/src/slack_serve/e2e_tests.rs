@@ -1861,6 +1861,7 @@ fn turn_state(
         credential_requirements: Vec::new(),
         failure: None,
         event_cursor: EventCursor::default(),
+        product_context: None,
     }
 }
 
