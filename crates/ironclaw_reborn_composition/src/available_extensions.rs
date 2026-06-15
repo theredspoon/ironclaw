@@ -118,42 +118,34 @@ fn onboarding(package_id: &str) -> Option<LifecycleExtensionOnboarding> {
         "github" => Some(onboarding_message(
             "GitHub needs a personal access token before its repository and pull request tools can run.",
             Some(
-                "Install GitHub first. Activation will open the secure credential prompt for a GitHub personal access token with the repository permissions you want IronClaw to use.",
+                "Create a GitHub personal access token with the repository permissions you want IronClaw to use, then paste it here.",
             ),
             Some("https://github.com/settings/personal-access-tokens/new"),
-            "Install GitHub, then activate it to open the token prompt and publish its tools.",
+            "After saving the token, activate GitHub to publish its tools.",
         )),
         "gmail" => Some(onboarding_message(
             "Gmail needs Google OAuth authorization before mail tools can run.",
-            Some(
-                "Install Gmail first. Activation will open the Google OAuth prompt for the account IronClaw should use.",
-            ),
+            Some("Authorize the Google account that IronClaw should use for Gmail."),
             None,
-            "Install Gmail, then activate it to open OAuth and publish its tools.",
+            "After authorization completes, activate Gmail to publish its tools.",
         )),
         "google-calendar" => Some(onboarding_message(
             "Google Calendar needs Google OAuth authorization before calendar tools can run.",
-            Some(
-                "Install Google Calendar first. Activation will open the Google OAuth prompt for calendar access.",
-            ),
+            Some("Authorize the Google account that IronClaw should use for Google Calendar."),
             None,
-            "Install Google Calendar, then activate it to open OAuth and publish its tools.",
+            "After authorization completes, activate Google Calendar to publish its tools.",
         )),
         "notion" => Some(onboarding_message(
             "Notion needs OAuth authorization before MCP tools can run.",
-            Some(
-                "Install Notion first. Activation will open the OAuth prompt for the workspace IronClaw should access.",
-            ),
+            Some("Authorize the Notion workspace that IronClaw should access."),
             None,
-            "Install Notion, then activate it to open OAuth and publish its MCP tools.",
+            "After authorization completes, activate Notion to publish its MCP tools.",
         )),
         "nearai" => Some(onboarding_message(
             "NEAR AI needs an API key before its MCP tools can run.",
-            Some(
-                "Install NEAR AI first. Activation will open the secure credential prompt for the API key IronClaw should use.",
-            ),
+            Some("Paste the NEAR AI API key IronClaw should use."),
             None,
-            "Install NEAR AI, then activate it to open the API key prompt and publish its MCP tools.",
+            "After saving the API key, activate NEAR AI to publish its MCP tools.",
         )),
         "web-access" => Some(onboarding_message(
             "Web Access does not need credentials. Activate it to make web search and saved-result retrieval tools available.",
@@ -1691,13 +1683,59 @@ mod tests {
                 onboarding.credential_next_step.is_some(),
                 "{extension_id} must include the next user step"
             );
-            assert!(
-                onboarding
-                    .credential_next_step
-                    .as_deref()
-                    .is_some_and(|step| step.contains("Install") && step.contains("activate")),
-                "{extension_id} onboarding should preserve install-then-activate ordering"
-            );
+            if matches!(extension_id, "gmail" | "google-calendar" | "notion") {
+                assert!(
+                    onboarding
+                        .credential_instructions
+                        .as_deref()
+                        .is_some_and(|instructions| {
+                            instructions.starts_with("Authorize ")
+                                && !instructions.contains("Install")
+                        }),
+                    "{extension_id} configure onboarding should not repeat install-first copy"
+                );
+                assert!(
+                    onboarding
+                        .credential_next_step
+                        .as_deref()
+                        .is_some_and(|step| {
+                            step.starts_with("After authorization completes")
+                                && step.contains("activate")
+                                && !step.contains("Install")
+                        }),
+                    "{extension_id} configure next step should describe post-authorization activation"
+                );
+            } else if matches!(extension_id, "github" | "nearai") {
+                assert!(
+                    onboarding
+                        .credential_instructions
+                        .as_deref()
+                        .is_some_and(|instructions| {
+                            (instructions.contains("Paste") || instructions.contains("paste"))
+                                && !instructions.contains("Install")
+                        }),
+                    "{extension_id} configure onboarding should describe token entry without install-first copy"
+                );
+                assert!(
+                    onboarding
+                        .credential_next_step
+                        .as_deref()
+                        .is_some_and(|step| {
+                            step.starts_with("After saving")
+                                && step.contains("activate")
+                                && !step.contains("Install")
+                        }),
+                    "{extension_id} configure next step should describe activation after saving credentials"
+                );
+            } else {
+                assert!(
+                    onboarding
+                        .credential_next_step
+                        .as_deref()
+                        .is_some_and(|step| step.contains("Install") && step.contains("activate")),
+                    "{extension_id} onboarding should preserve install-then-activate ordering"
+                );
+            }
         }
     }
 
