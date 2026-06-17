@@ -4438,6 +4438,7 @@ dependencies = [
  "ironclaw_safety",
  "ironclaw_skills",
  "regex",
+ "serde",
  "serde_json",
  "similar",
  "tempfile",
