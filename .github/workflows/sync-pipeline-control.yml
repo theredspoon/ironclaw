@@ -31,6 +31,9 @@ jobs:
           private-key: ${{ secrets.PIPELINE_CONTROL_SYNC_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - name: Merge upstream into sync branch
         env:
@@ -64,7 +67,20 @@ jobs:
           Resolve the conflict manually, then rerun this workflow.
           EOF
           )"
-            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+            existing_issue="$(
+              gh issue list --repo "${GITHUB_REPOSITORY}" \
+                --state open \
+                --search "${title} in:title" \
+                --json number,title \
+                --jq '.[] | select(.title == "'"${title}"'") | .number' \
+                | head -1
+            )"
+
+            if [[ -n "${existing_issue}" ]]; then
+              gh issue comment "${existing_issue}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
+            else
+              gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+            fi
             echo "::error::Unable to merge upstream/main into pipeline-control"
             exit 1
           fi
