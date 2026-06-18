@@ -1,0 +1,101 @@
+name: Sync pipeline-control with upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  sync:
+    if: github.repository == 'theredspoon/ironclaw'
+    runs-on: ubuntu-latest
+    env:
+      BASE_BRANCH: pipeline-control
+      SYNC_BRANCH: sync/pipeline-control-upstream
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate pipeline-control sync token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.PIPELINE_CONTROL_SYNC_CLIENT_ID }}
+          private-key: ${{ secrets.PIPELINE_CONTROL_SYNC_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
+
+      - name: Merge upstream into sync branch
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          git fetch --no-tags origin "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" || true
+          git remote add upstream https://github.com/nearai/ironclaw.git
+          git fetch --no-tags upstream "+refs/heads/main:refs/remotes/upstream/main"
+
+          git checkout -B "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
+
+          if ! git merge --no-edit upstream/main; then
+            git merge --abort || true
+            title="Unable to merge upstream/main into pipeline-control"
+            body="$(cat <<EOF
+          The scheduled pipeline-control upstream sync could not merge \`nearai/main\` into \`${BASE_BRANCH}\`.
+
+          - sync branch: \`${SYNC_BRANCH}\`
+          - upstream: \`nearai/main\`
+          - base branch: \`${BASE_BRANCH}\`
+          - workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Resolve the conflict manually, then rerun this workflow.
+          EOF
+          )"
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
+            echo "::error::Unable to merge upstream/main into pipeline-control"
+            exit 1
+          fi
+
+          git push --force-with-lease origin "${SYNC_BRANCH}:refs/heads/${SYNC_BRANCH}"
+
+      - name: Open or update sync PR
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          existing_pr="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -F state=open \
+              -F base="${BASE_BRANCH}" \
+              -F head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}" \
+              --jq '.[0].number // empty'
+          )"
+
+          pr_title="sync: update pipeline-control with nearai/main $(date +%Y-%m-%d)"
+          pr_body="$(cat <<EOF
+          Automated sync from \`nearai/ironclaw:main\` into \`${BASE_BRANCH}\`.
+
+          This PR is prepared on \`${SYNC_BRANCH}\`; the workflow never updates \`${BASE_BRANCH}\` directly.
+          EOF
+          )"
+
+          if [[ -n "${existing_pr}" ]]; then
+            gh pr edit "${existing_pr}" --repo "${GITHUB_REPOSITORY}" --title "${pr_title}" --body "${pr_body}"
+            echo "Updated existing pipeline-control sync PR #${existing_pr}"
+          else
+            gh pr create --repo "${GITHUB_REPOSITORY}" --base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --title "${pr_title}" --body "${pr_body}"
+          fi
