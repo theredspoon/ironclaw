@@ -270,11 +270,24 @@ jobs:
       - name: Self-test the boundary script
         run: python3 scripts/check_gateway_boundaries.py test
 
-  live-canary-policy:
-    name: Live canary fork policy
+  live-canary-policy-github-hosted:
+    name: Live canary fork policy (GitHub-hosted)
     needs: changes
-    if: needs.changes.outputs.has_live_canary_policy == 'true'
+    if: needs.changes.outputs.has_live_canary_policy == 'true' && github.repository_owner != 'enjimi'
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Check fork live canary policy
+        run: scripts/test-live-canary-fork-policy.sh
+
+  live-canary-policy-self-hosted:
+    name: Live canary fork policy (self-hosted)
+    needs: changes
+    if: needs.changes.outputs.has_live_canary_policy == 'true' && github.repository_owner == 'enjimi'
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -298,12 +311,17 @@ jobs:
       - reborn-cli-smoke
       - no-panics
       - gateway-boundaries
-      - live-canary-policy
+      - live-canary-policy-github-hosted
+      - live-canary-policy-self-hosted
     steps:
       - run: |
           if [[ "${{ needs.changes.outputs.has_code }}" == "false" ]]; then
-            if [[ "${{ needs.live-canary-policy.result }}" != "success" && "${{ needs.live-canary-policy.result }}" != "skipped" ]]; then
-              echo "live-canary-policy failed: ${{ needs.live-canary-policy.result }}"
+            if [[ "${{ needs.live-canary-policy-github-hosted.result }}" != "success" && "${{ needs.live-canary-policy-github-hosted.result }}" != "skipped" ]]; then
+              echo "live-canary-policy-github-hosted failed: ${{ needs.live-canary-policy-github-hosted.result }}"
+              exit 1
+            fi
+            if [[ "${{ needs.live-canary-policy-self-hosted.result }}" != "success" && "${{ needs.live-canary-policy-self-hosted.result }}" != "skipped" ]]; then
+              echo "live-canary-policy-self-hosted failed: ${{ needs.live-canary-policy-self-hosted.result }}"
               exit 1
             fi
             echo "No code changes — style checks skipped correctly"
@@ -328,7 +346,8 @@ jobs:
             "no-panics=${{ needs.no-panics.result }}" \
             "reborn-cli-smoke=${{ needs.reborn-cli-smoke.result }}" \
             "clippy-windows=${{ needs.clippy-windows.result }}" \
-            "live-canary-policy=${{ needs.live-canary-policy.result }}"; do
+            "live-canary-policy-github-hosted=${{ needs.live-canary-policy-github-hosted.result }}" \
+            "live-canary-policy-self-hosted=${{ needs.live-canary-policy-self-hosted.result }}"; do
             name="${job_result%%=*}"
             result="${job_result##*=}"
             if [[ "$result" != "success" && "$result" != "skipped" ]]; then
