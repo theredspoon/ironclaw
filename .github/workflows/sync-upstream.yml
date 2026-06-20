@@ -107,9 +107,11 @@ jobs:
           if [[ -n "$existing_pr" ]]; then
             echo "Existing Matrix pilot sync PR: #${existing_pr}"
           else
-            gh pr create \
-              --base "${INTEGRATION_BRANCH}" \
-              --head "${SYNC_BRANCH}" \
-              --title "sync: update Matrix pilot with nearai/main $(date +%Y-%m-%d)" \
-              --body "Automated sync from nearai/ironclaw. The \`${UPSTREAM_MIRROR_BRANCH}\` branch is an exact fast-forward mirror of \`nearai/main\`; this PR merges it into \`${INTEGRATION_BRANCH}\` for CI. When checks pass, the Matrix pilot branch is fast-forwarded so upstream ancestry is preserved."
+            body="Automated sync from nearai/ironclaw. The \`${UPSTREAM_MIRROR_BRANCH}\` branch is an exact fast-forward mirror of \`nearai/main\`; this PR merges it into \`${INTEGRATION_BRANCH}\` for CI. When checks pass, the Matrix pilot branch is fast-forwarded so upstream ancestry is preserved."
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f base="${INTEGRATION_BRANCH}" \
+              -f head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}" \
+              -f title="sync: update Matrix pilot with nearai/main $(date +%Y-%m-%d)" \
+              -f body="${body}" \
+              --jq '.html_url'
           fi
