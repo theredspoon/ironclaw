@@ -68,7 +68,8 @@ jobs:
         run: |
           set -euo pipefail
           git remote add deployment_mirror "https://x-access-token:${DEPLOYMENT_MIRROR_TOKEN}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git"
-          git push deployment_mirror "HEAD:refs/heads/${MIRROR_BRANCH}"
+          git fetch deployment_mirror "refs/heads/${MIRROR_BRANCH}:refs/remotes/deployment_mirror/${MIRROR_BRANCH}" || true
+          git push --force-with-lease deployment_mirror "HEAD:refs/heads/${MIRROR_BRANCH}"
 
       - name: Open or update deployment target PR
         env:
