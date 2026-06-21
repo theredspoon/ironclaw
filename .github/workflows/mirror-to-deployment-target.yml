@@ -13,7 +13,9 @@ jobs:
     if: github.repository == 'theredspoon/ironclaw'
     runs-on: ubuntu-latest
     env:
+      DEPLOYMENT_MIRROR_OWNER: ${{ vars.DEPLOYMENT_MIRROR_OWNER }}
       DEPLOYMENT_MIRROR_REPOSITORY: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}
+      DEPLOYMENT_MIRROR_REPOSITORY_NAME: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
       MIRROR_BRANCH: mirror/native-matrix-channel-pilot
       TARGET_BRANCH: deployment-target
     steps:
