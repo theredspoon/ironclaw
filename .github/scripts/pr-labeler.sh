@@ -20,28 +20,28 @@ REPO="${REPO:?REPO is required}"
 set_exclusive_label() {
   local prefix="$1" desired="$2"
 
+  # Fetch current labels on the PR
   local current
-  current=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')
+  current=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
 
+  # Remove any existing label with the same prefix
   while IFS= read -r label; do
     [[ -z "$label" ]] && continue
     if [[ "$label" == "${prefix}:"* && "$label" != "$desired" ]]; then
-      local encoded_label
-      encoded_label=$(jq -rn --arg label "$label" '$label | @uri')
-      gh api --method DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/${encoded_label}" >/dev/null || true
+      gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$label" 2>/dev/null || true
     fi
   done <<< "$current"
 
-  gh api --method POST "repos/${REPO}/issues/${PR_NUMBER}/labels" \
-    --field "labels[]=${desired}" >/dev/null
+  # Add the desired label
+  gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$desired"
 }
 
 # ─── size ───────────────────────────────────────────────────────────────────
 
 classify_size() {
   # Sum changed lines across non-doc files
-  local page_totals total
-  page_totals=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+  local total
+  total=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" \
     --paginate --jq '
       [.[]
         | select(.filename | test("\\.(md|txt|rst|adoc)$") | not)
@@ -49,7 +49,6 @@ classify_size() {
         | .changes]
       | add // 0
     ')
-  total=$(awk '{sum += $1} END {print sum + 0}' <<< "$page_totals")
 
   local label
   if   (( total < 10 ));  then label="size: XS"
@@ -68,7 +67,7 @@ classify_size() {
 classify_risk() {
   # If "risk: manual" is present, skip — it's a sticky override
   local current
-  current=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')
+  current=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '.labels[].name')
   if echo "$current" | grep -qx "risk: manual"; then
     echo "Risk: skipped (manual override)"
     return

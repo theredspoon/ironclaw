@@ -38,7 +38,6 @@ env:
 jobs:
   build:
     name: Build & Push
-    if: github.repository == 'nearai/ironclaw'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -196,7 +195,7 @@ jobs:
           app-id: ${{ secrets.GH_RELEASES_MANAGER_APP_ID }}
           private-key: ${{ secrets.GH_RELEASES_MANAGER_APP_PRIVATE_KEY }}
           owner: nearai
-          repositories: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}-dind
+          repositories: ironclaw-dind
 
       - name: Trigger ironclaw-dind Build & Push
         if: steps.app-token.outcome == 'success' && steps.check.outputs.skip != 'true'
