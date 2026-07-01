@@ -1,6 +1,7 @@
 name: Mirror to deployment target
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - native-matrix-channel-pilot

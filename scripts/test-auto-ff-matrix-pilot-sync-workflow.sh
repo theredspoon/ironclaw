@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+workflow=".github/workflows/auto-ff-matrix-pilot-sync.yml"
+mirror_workflow=".github/workflows/mirror-to-deployment-target.yml"
+
+if [[ ! -f "${workflow}" ]]; then
+    echo "missing ${workflow}"
+    exit 1
+fi
+
+if [[ ! -f "${mirror_workflow}" ]]; then
+    echo "missing ${mirror_workflow}"
+    exit 1
+fi
+
+require_in() {
+    local file="$1"
+    local pattern="$2"
+    local description="$3"
+    if ! grep -Eq -- "${pattern}" "${file}"; then
+        echo "missing ${description}: ${pattern}"
+        exit 1
+    fi
+}
+
+require_in "${workflow}" 'name:[[:space:]]*Auto fast-forward Matrix pilot sync' "workflow name"
+require_in "${workflow}" 'workflow_run:' "workflow-run trigger"
+require_in "${workflow}" 'actions:[[:space:]]*write' "Actions write permission for workflow dispatch"
+require_in "${workflow}" 'BASE_BRANCH:[[:space:]]*native-matrix-channel-pilot' "Matrix pilot branch"
+require_in "${workflow}" 'git push origin "\$\{actual_head\}:refs/heads/\$\{BASE_BRANCH\}"' "pilot branch fast-forward"
+require_in "${workflow}" 'name:[[:space:]]*Dispatch deployment mirror' "post-fast-forward mirror dispatch step"
+require_in "${workflow}" 'GH_TOKEN:[[:space:]]*\$\{\{ github\.token \}\}' "dispatch token"
+require_in "${workflow}" 'gh workflow run mirror-to-deployment-target\.yml --ref "\$\{BASE_BRANCH\}"' "explicit deployment mirror dispatch"
+require_in "${mirror_workflow}" 'workflow_dispatch:' "manual mirror dispatch trigger"
+require_in "${mirror_workflow}" 'branches:' "push trigger branch restriction"
+require_in "${mirror_workflow}" 'native-matrix-channel-pilot' "Matrix pilot push trigger"
+
+echo "auto-ff Matrix pilot workflow contract OK"
