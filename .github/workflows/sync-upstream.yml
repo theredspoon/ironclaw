@@ -93,7 +93,8 @@ jobs:
           for stale_module in \
             crates/ironclaw_reborn/src/local_trigger_access.rs \
             crates/ironclaw_turns/src/memory.rs \
-            crates/ironclaw_memory/tests/repo_in_memory_contract.rs
+            crates/ironclaw_memory/tests/repo_in_memory_contract.rs \
+            crates/ironclaw_memory/tests/memory_filesystem_contract.rs
           do
             if ! git cat-file -e "origin/${UPSTREAM_MIRROR_BRANCH}:${stale_module}" 2>/dev/null; then
               git rm -f --ignore-unmatch "${stale_module}"
