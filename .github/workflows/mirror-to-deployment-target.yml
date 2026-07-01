@@ -46,6 +46,20 @@ jobs:
           owner: ${{ vars.DEPLOYMENT_MIRROR_OWNER }}
           repositories: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
 
+      - name: Add deployment mirror remote
+        env:
+          DEPLOYMENT_MIRROR_TOKEN: ${{ steps.mirror_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git remote add deployment_mirror "https://x-access-token:${DEPLOYMENT_MIRROR_TOKEN}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git"
+
+      - name: Preserve deployment target workflows
+        run: |
+          set -euo pipefail
+          git fetch deployment_mirror "refs/heads/${TARGET_BRANCH}:refs/remotes/deployment_mirror/${TARGET_BRANCH}"
+          rm -rf .github/workflows
+          git checkout "refs/remotes/deployment_mirror/${TARGET_BRANCH}" -- .github/workflows
+
       - name: Disable Dependabot on deployment mirror
         run: |
           set -euo pipefail
@@ -75,12 +89,8 @@ jobs:
           fi
 
       - name: Push to deployment mirror ingress branch
-        env:
-          DEPLOYMENT_MIRROR_TOKEN: ${{ steps.mirror_token.outputs.token }}
         run: |
           set -euo pipefail
-          git remote add deployment_mirror "https://x-access-token:${DEPLOYMENT_MIRROR_TOKEN}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git"
-          git fetch deployment_mirror "refs/heads/${TARGET_BRANCH}:refs/remotes/deployment_mirror/${TARGET_BRANCH}"
           git fetch deployment_mirror "refs/heads/${MIRROR_BRANCH}:refs/remotes/deployment_mirror/${MIRROR_BRANCH}" || true
           source_tree="$(git write-tree)"
           target_parent="$(git rev-parse "refs/remotes/deployment_mirror/${TARGET_BRANCH}")"
