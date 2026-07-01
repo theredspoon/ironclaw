@@ -1,6 +1,6 @@
-//! Egress + tool-result assertions for [`RebornIntegrationHarness`] — the
-//! canonical, richer egress-assertion API (design §3.3 `assertions.rs`, §3.6
-//! P1 ergonomics).
+//! Egress + tool-result + model-prompt assertions for [`RebornIntegrationHarness`]
+//! — the canonical, richer egress-assertion API (design §3.3 `assertions.rs`,
+//! §3.6 P1 ergonomics).
 //!
 //! Slice 2 co-located three asserts in `builder.rs`
 //! (`assert_reply_contains`/`assert_tool_invoked`/`assert_egress_request_matching`,
@@ -11,9 +11,18 @@
 //! `pub(super)` accessors on the harness (`captured_egress_requests` /
 //! `captured_capability_results`) rather than re-reaching internals.
 //!
-//! All of these assert over the SAME captured `RecordingRuntimeHttpEgress`
-//! request log slice 2 wired — there is one egress-assertion API, not a parallel
-//! one (the O-egress MCP/OAuth interceptor folds its per-URL needs in here).
+//! The egress-assertion group (`assert_egress_count` / `assert_egress_url_order`
+//! / `assert_egress_method_order` / `assert_egress_body_contains`) all assert
+//! over the SAME captured `RecordingRuntimeHttpEgress` request log slice 2 wired
+//! — there is one runtime-lane egress-assertion API, not a parallel one (the
+//! O-egress MCP/OAuth interceptor folds its per-URL needs in here). The one
+//! exception is `assert_network_egress_header_contains`, which reads the
+//! recording *network* egress lane — required for the T0-SECRET-INJECT
+//! credential-injection proof, whose harness routes through the host egress
+//! pipeline over the network recorder (see that method's docs for why).
+//! `assert_system_prompt_contains` reads a different capture source — the
+//! scripted `TraceLlm`'s captured requests, via the harness's
+//! `captured_system_prompts` accessor.
 
 // Shared integration-test support: not every binary that mounts the
 // `reborn_support` tree consumes this module (e.g. `support_unit_tests.rs`), so
@@ -137,6 +146,30 @@ impl RebornIntegrationHarness {
         .into())
     }
 
+    /// Assert some model-visible `System`-role prompt captured across all
+    /// requests captured by the harness so far contains `text`. Reads the
+    /// scripted `TraceLlm` retained before the `dyn LlmProvider` upcast —
+    /// proves prompt-injected content (safety banners, skill instructions,
+    /// profile lines) actually reached the model.
+    pub async fn assert_system_prompt_contains(&self, text: &str) -> HarnessResult<()> {
+        let prompts = self.captured_system_prompts();
+        if prompts.iter().any(|prompt| prompt.contains(text)) {
+            return Ok(());
+        }
+        let seen: Vec<String> = prompts
+            .iter()
+            .map(|prompt| match prompt.char_indices().nth(200) {
+                Some((cutoff, _)) => format!("{}...[truncated]", &prompt[..cutoff]),
+                None => prompt.clone(),
+            })
+            .collect();
+        Err(format!(
+            "no captured system prompt containing {text:?}; saw {} system message(s): {seen:?}",
+            prompts.len()
+        )
+        .into())
+    }
+
     /// Assert a model-visible tool error of `class` carrying `reason` was
     /// persisted for this thread. Unlike [`assert_tool_result_contains`] (which
     /// reads the in-process recorder, populated only on the *Completed* write
@@ -194,6 +227,70 @@ impl RebornIntegrationHarness {
         }
         Err(format!(
             "no persisted tool-error summary of class {class:?} with reason {reason:?}; saw {summaries:?}"
+        )
+        .into())
+    }
+
+    /// Assert that any captured **network** egress request whose URL
+    /// contains `url_substr` carried a header named `header_name`
+    /// (case-insensitive) whose value contains `value_substr`. This is the
+    /// credential-injection-on-the-wire proof for T0-SECRET-INJECT: a
+    /// host-injected `Authorization: Bearer <token>` lands on the outbound
+    /// request only after the egress pipeline's `apply_credential_injections`
+    /// step, which the recording network egress captures.
+    ///
+    /// **Why the network lane, not the runtime lane:** the GitHub WASM harness
+    /// (`with_github_issue_tools`) wires its recording `RuntimeHttpEgress` and
+    /// then calls `try_with_host_http_egress`, which overwrites the runtime port
+    /// with the host egress pipeline over the recording *network* egress. So the
+    /// injected request flows through the network recorder, and the runtime-lane
+    /// `assert_egress_*` family (which reads `runtime_http_requests()`) is inert
+    /// for this wiring. Assert here instead.
+    ///
+    /// Checks only the `[baseline_network_count..]` delta so a group thread never
+    /// spuriously matches a prior thread's request (R2), mirroring the runtime-lane
+    /// `assert_egress_*` family's baseline discipline even though no group
+    /// constructor wires `GithubIssueTools` today.
+    pub async fn assert_network_egress_header_contains(
+        &self,
+        url_substr: &str,
+        header_name: &str,
+        value_substr: &str,
+    ) -> HarnessResult<()> {
+        let requests = self.captured_network_requests();
+        let mut matching = requests
+            .iter()
+            .filter(|r| r.url.contains(url_substr))
+            .peekable();
+        if matching.peek().is_none() {
+            let seen: Vec<&str> = requests.iter().map(|r| r.url.as_str()).collect();
+            return Err(format!(
+                "no captured network egress request matching url {url_substr:?}; saw {seen:?}"
+            )
+            .into());
+        }
+        let mut first_seen: Option<Vec<&str>> = None;
+        for request in matching {
+            if request.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(header_name) && value.contains(value_substr)
+            }) {
+                return Ok(());
+            }
+            if first_seen.is_none() {
+                first_seen = Some(
+                    request
+                        .headers
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect(),
+                );
+            }
+        }
+        let seen = first_seen.unwrap_or_default();
+        Err(format!(
+            "no network egress request matching url {url_substr:?} has header {header_name:?} \
+             with the expected value (redacted, not logged); header names present (first \
+             matching request): {seen:?}"
         )
         .into())
     }
