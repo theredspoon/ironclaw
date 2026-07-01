@@ -53,12 +53,15 @@ jobs:
           set -euo pipefail
           git remote add deployment_mirror "https://x-access-token:${DEPLOYMENT_MIRROR_TOKEN}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git"
 
-      - name: Preserve deployment target workflows
+      - name: Preserve deployment target-owned workflows
         run: |
           set -euo pipefail
           git fetch deployment_mirror "refs/heads/${TARGET_BRANCH}:refs/remotes/deployment_mirror/${TARGET_BRANCH}"
-          rm -rf .github/workflows
-          git checkout "refs/remotes/deployment_mirror/${TARGET_BRANCH}" -- .github/workflows
+          target_owned_workflows=(
+            .github/workflows/pilot-linux-artifact.yml
+            .github/workflows/regression-test-check.yml
+          )
+          git checkout "refs/remotes/deployment_mirror/${TARGET_BRANCH}" -- "${target_owned_workflows[@]}"
 
       - name: Disable Dependabot on deployment mirror
         run: |
