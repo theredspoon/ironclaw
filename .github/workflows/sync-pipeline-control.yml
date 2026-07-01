@@ -91,7 +91,8 @@ jobs:
             crates/ironclaw_turns/src/memory.rs \
             crates/ironclaw_memory/tests/repo_in_memory_contract.rs \
             crates/ironclaw_memory/tests/memory_filesystem_contract.rs \
-            crates/ironclaw_memory/tests/memory_backend_contract.rs
+            crates/ironclaw_memory/tests/memory_backend_contract.rs \
+            crates/ironclaw_memory/tests/repo_filesystem_contract.rs
           do
             if ! git cat-file -e "upstream/main:${stale_module}" 2>/dev/null; then
               git rm -f --ignore-unmatch "${stale_module}"
