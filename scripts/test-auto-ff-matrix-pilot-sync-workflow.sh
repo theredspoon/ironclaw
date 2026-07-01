@@ -40,7 +40,9 @@ require_in "${mirror_workflow}" 'workflow_dispatch:' "manual mirror dispatch tri
 require_in "${mirror_workflow}" 'source_ref:' "manual mirror source ref input"
 require_in "${mirror_workflow}" 'SOURCE_REF:[[:space:]]*\$\{\{ github\.event\.inputs\.source_ref \|\| github\.ref_name \}\}' "source ref selection"
 require_in "${mirror_workflow}" 'ref:[[:space:]]*\$\{\{ github\.event\.inputs\.source_ref \|\| github\.ref_name \}\}' "source checkout ref"
-require_in "${mirror_workflow}" 'SOURCE_SHA="\$\(git rev-parse HEAD\)"' "source sha computed after checkout"
+require_in "${mirror_workflow}" 'MIRRORED_SOURCE_SHA=\$\(git rev-parse HEAD\)' "source sha captured before mirror mutation"
+require_in "${mirror_workflow}" 'Deploy Matrix pilot source \$\{MIRRORED_SOURCE_SHA:0:12\}' "deployment commit uses mirrored source sha"
+require_in "${mirror_workflow}" '\[skip-regression-check\]' "deployment mirror regression-check skip marker"
 require_in "${mirror_workflow}" 'branches:' "push trigger branch restriction"
 require_in "${mirror_workflow}" 'native-matrix-channel-pilot' "Matrix pilot push trigger"
 

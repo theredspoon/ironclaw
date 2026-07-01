@@ -32,6 +32,11 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.inputs.source_ref || github.ref_name }}
 
+      - name: Capture mirrored source revision
+        run: |
+          set -euo pipefail
+          echo "MIRRORED_SOURCE_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+
       - name: Generate deployment mirror token
         id: mirror_token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -74,7 +79,6 @@ jobs:
           DEPLOYMENT_MIRROR_TOKEN: ${{ steps.mirror_token.outputs.token }}
         run: |
           set -euo pipefail
-          SOURCE_SHA="$(git rev-parse HEAD)"
           git remote add deployment_mirror "https://x-access-token:${DEPLOYMENT_MIRROR_TOKEN}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git"
           git fetch deployment_mirror "refs/heads/${TARGET_BRANCH}:refs/remotes/deployment_mirror/${TARGET_BRANCH}"
           git fetch deployment_mirror "refs/heads/${MIRROR_BRANCH}:refs/remotes/deployment_mirror/${MIRROR_BRANCH}" || true
@@ -83,7 +87,8 @@ jobs:
           deployment_commit="$(
             git commit-tree "${source_tree}" \
               -p "${target_parent}" \
-              -m "Deploy Matrix pilot source ${SOURCE_SHA:0:12}"
+              -m "Deploy Matrix pilot source ${MIRRORED_SOURCE_SHA:0:12}" \
+              -m "[skip-regression-check]"
           )"
           git push --force-with-lease deployment_mirror "${deployment_commit}:refs/heads/${MIRROR_BRANCH}"
 
@@ -92,7 +97,6 @@ jobs:
           GH_TOKEN: ${{ steps.mirror_token.outputs.token }}
         run: |
           set -euo pipefail
-          SOURCE_SHA="$(git rev-parse HEAD)"
 
           existing_pr="$(
             gh api --method GET "repos/${DEPLOYMENT_MIRROR_REPOSITORY}/pulls" \
@@ -108,7 +112,7 @@ jobs:
 
           - source repository: \`${GITHUB_REPOSITORY}\`
           - source ref: \`${SOURCE_REF}\`
-          - source sha: \`${SOURCE_SHA}\`
+          - source sha: \`${MIRRORED_SOURCE_SHA}\`
           - target branch: \`${TARGET_BRANCH}\`
 
           After this PR merges, \`${DEPLOYMENT_MIRROR_REPOSITORY}:${TARGET_BRANCH}\` triggers the pilot Linux artifact workflow.
@@ -118,7 +122,7 @@ jobs:
           if [[ -n "${existing_pr}" ]]; then
             gh pr edit "${existing_pr}" \
               --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
-              --title "Deploy Matrix pilot source ${SOURCE_SHA:0:12}" \
+              --title "Deploy Matrix pilot source ${MIRRORED_SOURCE_SHA:0:12}" \
               --body "${pr_body}"
             echo "Updated existing deployment mirror PR #${existing_pr}"
           else
@@ -126,6 +130,6 @@ jobs:
               --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
               --base "${TARGET_BRANCH}" \
               --head "${MIRROR_BRANCH}" \
-              --title "Deploy Matrix pilot source ${SOURCE_SHA:0:12}" \
+              --title "Deploy Matrix pilot source ${MIRRORED_SOURCE_SHA:0:12}" \
               --body "${pr_body}"
           fi
