@@ -904,7 +904,7 @@ impl ApprovalTurnRunLocator for LocalDevApprovalTurnRunLocator {
             .runs
             .iter()
             .filter(|run| {
-                run.scope == turn_scope
+                run.scope.same_thread(&turn_scope)
                     && run.status == TurnStatus::BlockedApproval
                     && run.gate_ref.is_some()
                     && snapshot_run_actor_matches(&snapshot, run, &actor)
@@ -937,7 +937,7 @@ impl ApprovalTurnRunLocator for LocalDevApprovalTurnRunLocator {
             .runs
             .iter()
             .find(|run| {
-                run.scope == turn_scope
+                run.scope.same_thread(&turn_scope)
                     && run.status == TurnStatus::BlockedApproval
                     && run.gate_ref.as_ref() == Some(gate_ref)
                     && snapshot_run_actor_matches(&snapshot, run, &actor)
@@ -956,7 +956,7 @@ impl ApprovalTurnRunLocator for LocalDevApprovalTurnRunLocator {
                     && checkpoint
                         .scope
                         .as_ref()
-                        .is_none_or(|stored| stored == &turn_scope)
+                        .is_none_or(|stored| stored.same_thread(&turn_scope))
             })
             .filter_map(|checkpoint| {
                 snapshot
@@ -964,7 +964,7 @@ impl ApprovalTurnRunLocator for LocalDevApprovalTurnRunLocator {
                     .iter()
                     .find(|run| {
                         run.run_id == checkpoint.run_id
-                            && run.scope == turn_scope
+                            && run.scope.same_thread(&turn_scope)
                             && snapshot_run_actor_matches(&snapshot, run, &actor)
                     })
                     .map(|run| run.run_id)
@@ -981,10 +981,9 @@ fn snapshot_run_actor_matches(
     run: &TurnRunRecord,
     actor: &TurnActor,
 ) -> bool {
-    snapshot
-        .turns
-        .iter()
-        .any(|turn| turn.turn_id == run.turn_id && turn.scope == run.scope && turn.actor == *actor)
+    snapshot.turns.iter().any(|turn| {
+        turn.turn_id == run.turn_id && turn.scope.same_thread(&run.scope) && turn.actor == *actor
+    })
 }
 
 // Only referenced by the durable filesystem snapshot path (async `Result`);
