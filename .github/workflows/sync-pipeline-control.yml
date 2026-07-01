@@ -53,15 +53,16 @@ jobs:
 
           git checkout -B "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
 
-          if ! git merge --no-edit upstream/main; then
+          if ! git merge --no-edit --allow-unrelated-histories -X theirs upstream/main; then
             git merge --abort || true
             title="Unable to merge upstream/main into pipeline-control"
             body="$(cat <<EOF
-          The scheduled pipeline-control upstream sync could not merge \`nearai/main\` into \`${BASE_BRANCH}\`.
+          The scheduled pipeline-control upstream sync could not import \`nearai/main\` into \`${BASE_BRANCH}\`.
 
           - sync branch: \`${SYNC_BRANCH}\`
           - upstream: \`nearai/main\`
           - base branch: \`${BASE_BRANCH}\`
+          - import policy: upstream source wins on unrelated-history conflicts; the resulting PR remains the review gate
           - workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
           Resolve the conflict manually, then rerun this workflow.
@@ -81,7 +82,7 @@ jobs:
             else
               gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "${body}"
             fi
-            echo "::error::Unable to merge upstream/main into pipeline-control"
+            echo "::error::Unable to import upstream/main into pipeline-control"
             exit 1
           fi
 

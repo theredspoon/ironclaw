@@ -45,10 +45,12 @@ require 'INTEGRATION_BRANCH:[[:space:]]*native-matrix-channel-pilot' "Matrix pil
 require 'SYNC_BRANCH:[[:space:]]*sync/native-matrix-pilot' "sync branch"
 require 'git fetch --no-tags upstream.*refs/heads/main' "upstream main fetch"
 require 'git push origin "upstream/main:refs/heads/\$\{UPSTREAM_MIRROR_BRANCH\}"' "workflow-capable mirror push"
+require 'git merge --no-edit --allow-unrelated-histories -X theirs "origin/\$\{UPSTREAM_MIRROR_BRANCH\}"' "upstream-wins unrelated-history import"
 require 'git push origin "HEAD:refs/heads/\$\{SYNC_BRANCH\}" --force-with-lease' "lease-protected sync branch push"
 require 'GH_TOKEN:[[:space:]]*\$\{\{ steps\.app_token\.outputs\.token \}\}' "PR operations use app token"
 require 'gh api --method POST "repos/\$\{GITHUB_REPOSITORY\}/pulls"' "REST pull request creation"
 require '-f head="\$\{GITHUB_REPOSITORY_OWNER\}:\$\{SYNC_BRANCH\}"' "owned sync branch PR head"
+require 'imports it into \\\`\$\{INTEGRATION_BRANCH\}\\\` for CI with upstream source winning unrelated-history conflicts' "import policy PR body"
 
 reject 'GH_TOKEN:[[:space:]]*\$\{\{ secrets\.GITHUB_TOKEN \}\}' "default token for PR operations"
 reject 'permissions:[[:space:]]*$[^#]*contents:[[:space:]]*write' "workflow-level contents write"
