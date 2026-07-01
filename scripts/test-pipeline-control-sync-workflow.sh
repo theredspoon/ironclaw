@@ -47,6 +47,7 @@ require 'crates/ironclaw_reborn/src/local_trigger_access\.rs' "stale local trigg
 require 'crates/ironclaw_turns/src/memory\.rs' "stale memory module prune"
 require 'crates/ironclaw_memory/tests/repo_in_memory_contract\.rs' "stale memory contract test prune"
 require 'crates/ironclaw_memory/tests/memory_filesystem_contract\.rs' "stale memory filesystem contract test prune"
+require 'crates/ironclaw_memory/tests/memory_backend_contract\.rs' "stale memory backend contract test prune"
 require 'git rm -f --ignore-unmatch "\$\{stale_module\}"' "stale module removal"
 require "grep -Fq 'Downstream sync exception: nearai/main currently tracks these' .gitignore" "idempotent ignore exception guard"
 require '!\.claude/\*\*' "tracked Claude asset ignore exception"
