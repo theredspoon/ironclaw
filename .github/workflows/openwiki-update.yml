@@ -13,12 +13,21 @@ name: OpenWiki Update
 #     the required-check workflows actually trigger on it — a GITHUB_TOKEN-opened PR
 #     does not trigger other workflows, so a human reviewer would see no checks and
 #     the ruleset would block the merge.
-#   - OPENWIKI_MODEL_ID must match OpenWiki's Anthropic model resolution; if the
-#     run errors on the model, adjust the string (e.g. an "anthropic/"/"anthropic:"
-#     prefix, or claude-haiku-4-5-20251001 for a cheaper pass).
+#   - Provider set explicitly to "anthropic" (openwiki defaults to OpenRouter otherwise);
+#     model ids are openwiki's own (src/constants.ts): claude-haiku-4-5 (default),
+#     claude-sonnet-5, claude-opus-4.8. Override per-run via the model_id dispatch input.
+#   - openwiki's read_file tool wraps binary files as media/document content blocks, which
+#     Anthropic rejects (e.g. tests/fixtures/hello.pdf -> a non-PDF document block, 400).
+#     openwiki has no hard ignore config, so the "Strip binary assets" step below removes
+#     them from the EPHEMERAL checkout (the real repo is untouched) so they can't be read.
 
 on:
   workflow_dispatch:
+    inputs:
+      model_id:
+        description: "OPENWIKI_MODEL_ID (openwiki Anthropic ids: claude-haiku-4-5, claude-sonnet-5, claude-opus-4.8)"
+        required: false
+        default: "claude-haiku-4-5"
   schedule:
     - cron: "0 8 * * 1"   # Mondays 08:00 UTC (weekly)
 
@@ -51,11 +60,47 @@ jobs:
       - name: Install OpenWiki
         run: npm install --global openwiki
 
+      # openwiki bug (langchain-ai/openwiki#33): the bundled deepagents read-tool maps
+      # any unmapped/extensionless file (Makefile, Dockerfile, LICENSE, *.lock, ...) to
+      # application/octet-stream and sends it as a base64 `document` block, which the
+      # Anthropic Messages API rejects (only application/pdf allowed) -> 400 mid-run.
+      # Workaround from the issue: fall back to text/plain instead of octet-stream.
+      - name: Patch deepagents MIME fallback (openwiki#33 workaround)
+        run: |
+          B="$(npm root -g)/openwiki/node_modules/deepagents/dist"
+          patched=0
+          for f in "$B"/*.js "$B"/*.cjs; do
+            [ -f "$f" ] || continue
+            if grep -q 'toLocaleLowerCase()] || "application/octet-stream"' "$f"; then
+              sed -i 's#toLocaleLowerCase()\] || "application/octet-stream"#toLocaleLowerCase()] || "text/plain"#g' "$f"
+              patched=$((patched+1))
+            fi
+          done
+          echo "patched ${patched} deepagents bundle file(s): octet-stream -> text/plain"
+          if [ "${patched}" -eq 0 ]; then
+            echo "::warning::openwiki#33 patch matched nothing — deepagents bundle layout may have changed; run may 400 on extensionless files"
+          fi
+
+      # Real binaries (.png/.pdf/.xlsx/...) are ALSO sent as document blocks and only
+      # application/pdf is accepted, so strip them from this ephemeral checkout too
+      # (the real repo is untouched; binaries carry no documentation value).
+      - name: Strip binary assets openwiki must not attach
+        run: |
+          find . -type f \( \
+            -name '*.pdf' -o -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' \
+            -o -name '*.gif' -o -name '*.webp' -o -name '*.ico' -o -name '*.svg' \
+            -o -name '*.wasm' -o -name '*.woff' -o -name '*.woff2' -o -name '*.ttf' \
+            -o -name '*.otf' -o -name '*.gz' -o -name '*.zip' -o -name '*.zst' \
+            -o -name '*.mp4' -o -name '*.mov' -o -name '*.pdf' \) \
+            -not -path './.git/*' -delete
+          echo "stripped binary assets from ephemeral checkout"
+
       - name: Regenerate wiki
         run: openwiki --update --print
         env:
+          OPENWIKI_PROVIDER: anthropic
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENWIKI_MODEL_ID: claude-sonnet-4-6
+          OPENWIKI_MODEL_ID: ${{ github.event.inputs.model_id || 'claude-haiku-4-5' }}
 
       - name: Open review PR
         id: cpr
