@@ -194,12 +194,15 @@ export LIBSQL_AUTH_TOKEN="your-auth-token"
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `HTTP_HOST` | string | `127.0.0.1` | Bind host |
-| `HTTP_PORT` | int | `8080` | Port number |
+| `WEBHOOK_HOST` | string | `127.0.0.1` | Unified webhook listener bind host |
+| `WEBHOOK_PORT` | int | `8080` | Unified webhook listener port |
+| `HTTP_ENABLED` | bool | `false` | Enable the named HTTP webhook channel |
+| `HTTP_HOST` | string | `127.0.0.1` | Legacy listener fallback and HTTP channel host |
+| `HTTP_PORT` | int | `8080` | Legacy listener fallback and HTTP channel port |
 | `HTTP_WEBHOOK_SECRET` | string | — | Shared secret for validation |
 
 <Warning>
-The HTTP webhook binds to `127.0.0.1:8080` by default. To receive webhooks from external services, set `HTTP_HOST=0.0.0.0`.
+The unified webhook listener binds to `127.0.0.1:8080` by default. To receive webhooks from external services, set `WEBHOOK_HOST=0.0.0.0`.
 </Warning>
 
 ### Terminal UI
@@ -343,7 +346,6 @@ These variables are resolved by the current `src/config/` modules but are less c
 
 | Variable | Description |
 |----------|-------------|
-| `HTTP_ENABLED` | Enables HTTP webhook channel even without host/port env overrides. |
 | `CLI_MODE` | CLI mode; `tui` enables the TUI channel. |
 | `TUI_THEME` | TUI theme name. |
 | `TUI_SIDEBAR` | Controls TUI sidebar visibility. |

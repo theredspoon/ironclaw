@@ -5,7 +5,7 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::web::sse::{DEFAULT_BROADCAST_BUFFER, DEFAULT_MAX_CONNECTIONS};
 use crate::config::helpers::{
     db_first_bool, db_first_optional_string, db_first_or_default, optional_env, parse_bool_env,
-    parse_optional_env,
+    parse_option_env, parse_optional_env,
 };
 use crate::error::ConfigError;
 use crate::settings::{ChannelSettings, Settings};
@@ -16,6 +16,7 @@ use secrecy::SecretString;
 pub struct ChannelsConfig {
     pub cli: CliConfig,
     pub http: Option<HttpConfig>,
+    pub webhook_listener: WebhookListenerConfig,
     pub gateway: Option<GatewayConfig>,
     pub signal: Option<SignalConfig>,
     pub tui: Option<TuiChannelConfig>,
@@ -64,6 +65,15 @@ pub struct HttpConfig {
     pub webhook_secret: Option<SecretString>,
     pub user_id: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct WebhookListenerConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+pub const DEFAULT_WEBHOOK_LISTENER_HOST: &str = "127.0.0.1";
+pub const DEFAULT_WEBHOOK_LISTENER_PORT: u16 = 8080;
 
 /// Maximum allowed broadcast buffer size to prevent OOM from misconfiguration.
 ///
@@ -162,20 +172,36 @@ impl ChannelsConfig {
         let cs = &settings.channels;
         let defaults = ChannelSettings::default();
 
-        let http_enabled_by_env =
-            optional_env("HTTP_PORT")?.is_some() || optional_env("HTTP_HOST")?.is_some();
-        let http_enabled_by_db =
-            db_first_bool(cs.http_enabled, defaults.http_enabled, "HTTP_ENABLED")?;
-        let http = if http_enabled_by_env || http_enabled_by_db {
+        let http_enabled = db_first_bool(cs.http_enabled, defaults.http_enabled, "HTTP_ENABLED")?;
+        let webhook_host = match optional_env("WEBHOOK_HOST")? {
+            Some(host) => host,
+            None => db_first_optional_string(&cs.http_host, "HTTP_HOST")?
+                .unwrap_or_else(|| DEFAULT_WEBHOOK_LISTENER_HOST.to_string()),
+        };
+        let webhook_port = match parse_option_env("WEBHOOK_PORT")? {
+            Some(port) => port,
+            None => {
+                if let Some(ref db_port) = cs.http_port {
+                    db_first_or_default(db_port, &DEFAULT_WEBHOOK_LISTENER_PORT, "HTTP_PORT")?
+                } else {
+                    parse_optional_env("HTTP_PORT", DEFAULT_WEBHOOK_LISTENER_PORT)?
+                }
+            }
+        };
+        let webhook_listener = WebhookListenerConfig {
+            host: webhook_host,
+            port: webhook_port,
+        };
+        let http = if http_enabled {
             Some(HttpConfig {
                 host: db_first_optional_string(&cs.http_host, "HTTP_HOST")?
-                    .unwrap_or_else(|| "127.0.0.1".to_string()),
+                    .unwrap_or_else(|| DEFAULT_WEBHOOK_LISTENER_HOST.to_string()),
                 port: {
                     // defaults.http_port is None, so any Some(..) is an explicit DB override.
                     if let Some(ref db_port) = cs.http_port {
-                        db_first_or_default(db_port, &8080, "HTTP_PORT")?
+                        db_first_or_default(db_port, &DEFAULT_WEBHOOK_LISTENER_PORT, "HTTP_PORT")?
                     } else {
-                        parse_optional_env("HTTP_PORT", 8080)?
+                        parse_optional_env("HTTP_PORT", DEFAULT_WEBHOOK_LISTENER_PORT)?
                     }
                 },
                 webhook_secret: optional_env("HTTP_WEBHOOK_SECRET")?.map(SecretString::from),
@@ -426,6 +452,7 @@ impl ChannelsConfig {
                 enabled: cli_enabled,
             },
             http,
+            webhook_listener,
             gateway,
             signal,
             tui,
@@ -542,6 +569,10 @@ mod telegram_v2_tests {
         ChannelsConfig {
             cli: CliConfig { enabled: false },
             http: None,
+            webhook_listener: WebhookListenerConfig {
+                host: DEFAULT_WEBHOOK_LISTENER_HOST.to_string(),
+                port: DEFAULT_WEBHOOK_LISTENER_PORT,
+            },
             gateway: None,
             signal: None,
             tui: None,
@@ -748,6 +779,7 @@ fn default_channels_dir() -> PathBuf {
 mod tests {
     use crate::config::channels::*;
     use crate::config::helpers::lock_env;
+    use crate::error::ConfigError;
     use crate::settings::Settings;
 
     #[test]
@@ -905,6 +937,10 @@ mod tests {
         let cfg = ChannelsConfig {
             cli: CliConfig { enabled: true },
             http: None,
+            webhook_listener: WebhookListenerConfig {
+                host: DEFAULT_WEBHOOK_LISTENER_HOST.to_string(),
+                port: DEFAULT_WEBHOOK_LISTENER_PORT,
+            },
             gateway: None,
             signal: None,
             tui: None,
@@ -935,6 +971,10 @@ mod tests {
         let cfg = ChannelsConfig {
             cli: CliConfig { enabled: false },
             http: None,
+            webhook_listener: WebhookListenerConfig {
+                host: DEFAULT_WEBHOOK_LISTENER_HOST.to_string(),
+                port: DEFAULT_WEBHOOK_LISTENER_PORT,
+            },
             gateway: None,
             signal: None,
             tui: None,
@@ -949,6 +989,128 @@ mod tests {
         assert_eq!(cfg.wasm_channel_owner_ids.get("slack"), Some(&67890));
         assert!(!cfg.wasm_channels_enabled);
         assert_eq!(cfg.configured_wasm_channels, vec!["telegram"]);
+    }
+
+    fn clear_webhook_listener_env() {
+        // SAFETY: callers hold ENV_MUTEX via lock_env()
+        unsafe {
+            std::env::remove_var("HTTP_ENABLED");
+            std::env::remove_var("HTTP_HOST");
+            std::env::remove_var("HTTP_PORT");
+            std::env::remove_var("WEBHOOK_HOST");
+            std::env::remove_var("WEBHOOK_PORT");
+            std::env::remove_var("HTTP_WEBHOOK_SECRET");
+        }
+    }
+
+    #[test]
+    fn resolve_does_not_enable_http_channel_from_legacy_http_host_port_env() {
+        let _guard = lock_env();
+        clear_webhook_listener_env();
+        let settings = Settings::default();
+
+        // SAFETY: under ENV_MUTEX
+        unsafe {
+            std::env::set_var("HTTP_HOST", "0.0.0.0");
+            std::env::set_var("HTTP_PORT", "8089");
+        }
+
+        let cfg = ChannelsConfig::resolve(&settings, "owner-scope").expect("resolve");
+
+        assert!(cfg.http.is_none());
+        assert_eq!(cfg.webhook_listener.host, "0.0.0.0");
+        assert_eq!(cfg.webhook_listener.port, 8089);
+
+        clear_webhook_listener_env();
+    }
+
+    #[test]
+    fn resolve_does_not_enable_http_channel_when_http_enabled_false() {
+        let _guard = lock_env();
+        clear_webhook_listener_env();
+        let settings = Settings::default();
+
+        // SAFETY: under ENV_MUTEX
+        unsafe {
+            std::env::set_var("HTTP_ENABLED", "false");
+            std::env::set_var("HTTP_HOST", "0.0.0.0");
+            std::env::set_var("HTTP_PORT", "8089");
+        }
+
+        let cfg = ChannelsConfig::resolve(&settings, "owner-scope").expect("resolve");
+
+        assert!(cfg.http.is_none());
+        assert_eq!(cfg.webhook_listener.host, "0.0.0.0");
+        assert_eq!(cfg.webhook_listener.port, 8089);
+
+        clear_webhook_listener_env();
+    }
+
+    #[test]
+    fn resolve_uses_webhook_host_port_for_listener_bind() {
+        let _guard = lock_env();
+        clear_webhook_listener_env();
+        let settings = Settings::default();
+
+        // SAFETY: under ENV_MUTEX
+        unsafe {
+            std::env::set_var("HTTP_HOST", "0.0.0.0");
+            std::env::set_var("HTTP_PORT", "8089");
+            std::env::set_var("WEBHOOK_HOST", "127.0.0.9");
+            std::env::set_var("WEBHOOK_PORT", "9091");
+        }
+
+        let cfg = ChannelsConfig::resolve(&settings, "owner-scope").expect("resolve");
+
+        assert!(cfg.http.is_none());
+        assert_eq!(cfg.webhook_listener.host, "127.0.0.9");
+        assert_eq!(cfg.webhook_listener.port, 9091);
+
+        clear_webhook_listener_env();
+    }
+
+    #[test]
+    fn resolve_enables_http_channel_only_with_http_enabled_true() {
+        let _guard = lock_env();
+        clear_webhook_listener_env();
+        let settings = Settings::default();
+
+        // SAFETY: under ENV_MUTEX
+        unsafe {
+            std::env::set_var("HTTP_ENABLED", "true");
+            std::env::set_var("HTTP_HOST", "0.0.0.0");
+            std::env::set_var("HTTP_PORT", "8089");
+            std::env::set_var("WEBHOOK_HOST", "127.0.0.9");
+            std::env::set_var("WEBHOOK_PORT", "9091");
+        }
+
+        let cfg = ChannelsConfig::resolve(&settings, "owner-scope").expect("resolve");
+        let http = cfg.http.expect("http channel config");
+
+        assert_eq!(http.host, "0.0.0.0");
+        assert_eq!(http.port, 8089);
+        assert_eq!(http.user_id, "owner-scope");
+        assert_eq!(cfg.webhook_listener.host, "127.0.0.9");
+        assert_eq!(cfg.webhook_listener.port, 9091);
+
+        clear_webhook_listener_env();
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_webhook_listener_port() {
+        let _guard = lock_env();
+        clear_webhook_listener_env();
+        let settings = Settings::default();
+
+        // SAFETY: under ENV_MUTEX
+        unsafe {
+            std::env::set_var("WEBHOOK_PORT", "not-a-port");
+        }
+
+        let err = ChannelsConfig::resolve(&settings, "owner-scope").expect_err("must reject");
+        assert!(matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "WEBHOOK_PORT"));
+
+        clear_webhook_listener_env();
     }
 
     #[test]
@@ -986,6 +1148,8 @@ mod tests {
         assert_eq!(http.host, "127.0.0.2");
         assert_eq!(http.port, 8181);
         assert_eq!(http.user_id, "owner-scope");
+        assert_eq!(cfg.webhook_listener.host, "127.0.0.2");
+        assert_eq!(cfg.webhook_listener.port, 8181);
 
         let gateway = cfg.gateway.expect("gateway config");
         assert_eq!(gateway.host, "127.0.0.3");

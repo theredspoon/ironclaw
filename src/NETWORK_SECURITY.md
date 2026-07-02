@@ -31,7 +31,7 @@ IronClaw operates across four trust boundaries:
 | Listener | Default Port | Default Bind | Auth Mechanism | Config Env Var | Source |
 |----------|-------------|-------------|----------------|----------------|--------|
 | Web Gateway | 3000 | `127.0.0.1` | Bearer token (constant-time) | `GATEWAY_HOST`, `GATEWAY_PORT`, `GATEWAY_AUTH_TOKEN` | `server.rs` — `start_server()` |
-| HTTP Webhook Server | 8080 | `0.0.0.0` | Shared secret (body field) | `HTTP_HOST`, `HTTP_PORT`, `HTTP_WEBHOOK_SECRET` | `webhook_server.rs` — `start()` |
+| Unified Webhook Listener | 8080 | `127.0.0.1` | Route-specific auth | `WEBHOOK_HOST`, `WEBHOOK_PORT` | `webhook_server.rs` — `start()` |
 | Orchestrator Internal API | 50051 | `127.0.0.1` (macOS/Win) / `0.0.0.0` (Linux) | Per-job bearer token (constant-time) | `ORCHESTRATOR_PORT` | `api.rs` — `OrchestratorApi::start()` |
 | OAuth Callback Listener | 9876 | `127.0.0.1` | None (ephemeral, 5-min timeout) | N/A (hardcoded) | `src/auth/oauth.rs` — `bind_callback_listener()` |
 | Sandbox HTTP Proxy | OS-assigned (ephemeral) | `127.0.0.1` | None (loopback only) | N/A (auto-assigned) | `proxy/http.rs` — `SandboxProxy::start()` |
@@ -134,9 +134,9 @@ Shutdown is triggered via a `oneshot::Sender` stored in `GatewayState::shutdown_
 
 ### Bind Address
 
-Configurable via `HTTP_HOST` (default `127.0.0.1`) and `HTTP_PORT` (default `8080`).
+Configurable via `WEBHOOK_HOST` (default `127.0.0.1`) and `WEBHOOK_PORT` (default `8080`). `HTTP_HOST` and `HTTP_PORT` are retained as legacy listener fallbacks for existing configurations.
 
-By default the webhook server binds to loopback only. For external webhook providers, expose it intentionally via a tunnel or set `HTTP_HOST` explicitly.
+By default the webhook server binds to loopback only. For external webhook providers, expose it intentionally via a tunnel or set `WEBHOOK_HOST` explicitly.
 
 **`--cli-only` mode:** When the `--cli-only` flag is set, non-CLI network services and channel activations are suppressed — no webhook server, WASM channel endpoints, HTTP channel, Signal channel, relay channel restoration, gateway channel, managed tunnel, or sandbox orchestrator API will start.
 

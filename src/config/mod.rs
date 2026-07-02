@@ -54,8 +54,9 @@ use crate::settings::Settings;
 pub use self::agent::AgentConfig;
 pub use self::builder::BuilderModeConfig;
 pub use self::channels::{
-    ChannelsConfig, CliConfig, DEFAULT_GATEWAY_PORT, GatewayConfig, GatewayOidcConfig, HttpConfig,
-    SignalConfig, TuiChannelConfig, validate_telegram_v1_v2_exclusivity,
+    ChannelsConfig, CliConfig, DEFAULT_GATEWAY_PORT, DEFAULT_WEBHOOK_LISTENER_HOST,
+    DEFAULT_WEBHOOK_LISTENER_PORT, GatewayConfig, GatewayOidcConfig, HttpConfig, SignalConfig,
+    TuiChannelConfig, WebhookListenerConfig, validate_telegram_v1_v2_exclusivity,
 };
 pub use self::database::{DatabaseBackend, DatabaseConfig, SslMode, default_libsql_path};
 pub use self::heartbeat::HeartbeatConfig;
@@ -203,6 +204,10 @@ impl Config {
             channels: ChannelsConfig {
                 cli: CliConfig { enabled: false },
                 http: None,
+                webhook_listener: WebhookListenerConfig {
+                    host: DEFAULT_WEBHOOK_LISTENER_HOST.to_string(),
+                    port: DEFAULT_WEBHOOK_LISTENER_PORT,
+                },
                 gateway: None,
                 signal: None,
                 tui: None,

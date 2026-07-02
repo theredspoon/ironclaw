@@ -11,13 +11,20 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use ironclaw::config::{ChannelsConfig, CliConfig, validate_telegram_v1_v2_exclusivity};
+use ironclaw::config::{
+    ChannelsConfig, CliConfig, DEFAULT_WEBHOOK_LISTENER_HOST, DEFAULT_WEBHOOK_LISTENER_PORT,
+    WebhookListenerConfig, validate_telegram_v1_v2_exclusivity,
+};
 use ironclaw::error::ConfigError;
 
 fn channels_cfg(v1_enabled: bool, v1_telegram_listed: bool, v2_enabled: bool) -> ChannelsConfig {
     ChannelsConfig {
         cli: CliConfig { enabled: false },
         http: None,
+        webhook_listener: WebhookListenerConfig {
+            host: DEFAULT_WEBHOOK_LISTENER_HOST.to_string(),
+            port: DEFAULT_WEBHOOK_LISTENER_PORT,
+        },
         gateway: None,
         signal: None,
         tui: None,

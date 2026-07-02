@@ -90,6 +90,23 @@ fn non_cli_channels_enabled(cli_only: bool) -> bool {
     !cli_only
 }
 
+fn webhook_listener_addr(
+    channels: &ironclaw::config::ChannelsConfig,
+) -> anyhow::Result<std::net::SocketAddr> {
+    format!(
+        "{}:{}",
+        channels.webhook_listener.host, channels.webhook_listener.port
+    )
+    .parse()
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "WEBHOOK_HOST/WEBHOOK_PORT must resolve to a valid socket address: {}:{} ({error})",
+            channels.webhook_listener.host,
+            channels.webhook_listener.port
+        )
+    })
+}
+
 fn normalize_startup_wasm_channel_names<I, S>(names: I) -> std::collections::HashSet<String>
 where
     I: IntoIterator<Item = S>,
@@ -783,7 +800,6 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Add HTTP channel if configured and not CLI-only mode.
-    let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
     #[cfg(unix)]
     let mut http_channel_state: Option<Arc<ironclaw::channels::HttpChannelState>> = None;
     if enable_non_cli && let Some(ref http_config) = config.channels.http {
@@ -793,31 +809,20 @@ async fn async_main() -> anyhow::Result<()> {
             http_channel_state = Some(http_channel.shared_state());
         }
         webhook_routes.push(http_channel.routes());
-        let (host, port) = http_channel.addr();
-        webhook_server_addr = Some(
-            format!("{}:{}", host, port)
-                .parse()
-                .expect("HttpConfig host:port must be a valid SocketAddr"),
-        );
         channel_names.push("http".to_string());
         channels.add(Box::new(http_channel)).await;
-        tracing::debug!(
-            "HTTP channel enabled on {}:{}",
-            http_config.host,
-            http_config.port
-        );
+        tracing::debug!("HTTP webhook channel enabled");
     }
 
     // Start the unified webhook server if any routes were registered.
     let webhook_server: Option<Arc<tokio::sync::Mutex<WebhookServer>>> = if !webhook_routes
         .is_empty()
     {
-        let addr = webhook_server_addr
-            .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 8080)));
+        let addr = webhook_listener_addr(&config.channels)?;
         if addr.ip().is_unspecified() {
             tracing::warn!(
                 "Webhook server is binding to {} — it will be reachable from all network interfaces. \
-                 Set HTTP_HOST=127.0.0.1 to restrict to localhost.",
+                 Set WEBHOOK_HOST=127.0.0.1 to restrict to localhost.",
                 addr.ip()
             );
         }
@@ -1485,23 +1490,14 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 };
 
-                let new_http = match new_config.channels.http {
-                    Some(c) => c,
-                    None => {
-                        tracing::warn!("SIGHUP: HTTP channel no longer configured, skipping");
+                let new_addr = match webhook_listener_addr(&new_config.channels) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        tracing::error!("SIGHUP: invalid webhook listener config: {}", e);
                         continue;
                     }
                 };
-
-                // Compute new socket addr
-                let new_addr: std::net::SocketAddr =
-                    match format!("{}:{}", new_http.host, new_http.port).parse() {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::error!("SIGHUP: invalid addr in config: {}", e);
-                            continue;
-                        }
-                    };
+                let new_http = new_config.channels.http;
 
                 // Restart listener if addr changed.
                 // Two-phase approach: bind outside the lock, then swap under lock.
@@ -1569,8 +1565,8 @@ async fn async_main() -> anyhow::Result<()> {
                 if !restart_failed {
                     use secrecy::{ExposeSecret, SecretString};
                     let new_secret = new_http
-                        .webhook_secret
                         .as_ref()
+                        .and_then(|http| http.webhook_secret.as_ref())
                         .map(|s| SecretString::from(s.expose_secret().to_string()));
 
                     // Update all channels that support secret swapping
@@ -1663,6 +1659,29 @@ fn oauth_base_url(host: &str, port: u16) -> String {
 mod tests {
     use super::*;
 
+    fn test_channels_config(
+        webhook_host: &str,
+        webhook_port: u16,
+    ) -> ironclaw::config::ChannelsConfig {
+        ironclaw::config::ChannelsConfig {
+            cli: ironclaw::config::CliConfig { enabled: false },
+            http: None,
+            webhook_listener: ironclaw::config::WebhookListenerConfig {
+                host: webhook_host.to_string(),
+                port: webhook_port,
+            },
+            gateway: None,
+            signal: None,
+            tui: None,
+            wasm_channels_dir: std::env::temp_dir().join("ironclaw-test-channels"),
+            wasm_channels_enabled: false,
+            configured_wasm_channels: Vec::new(),
+            wasm_channel_owner_ids: std::collections::HashMap::new(),
+            reborn_telegram_v2_enabled: false,
+            wasm_channel_runtime_overrides: std::collections::HashMap::new(),
+        }
+    }
+
     /// Regression test for <https://github.com/nearai/ironclaw/issues/1840>:
     /// `--cli-only` must suppress webhook server and all non-CLI channels.
     #[test]
@@ -1675,6 +1694,21 @@ mod tests {
             non_cli_channels_enabled(false),
             "default mode should enable non-CLI channels"
         );
+    }
+
+    #[test]
+    fn webhook_listener_addr_uses_dedicated_listener_config() {
+        let channels = test_channels_config("127.0.0.1", 9091);
+        let addr = webhook_listener_addr(&channels).expect("valid listener config");
+
+        assert_eq!(addr, "127.0.0.1:9091".parse().expect("socket addr"));
+    }
+
+    #[test]
+    fn webhook_listener_addr_returns_error_for_malformed_listener_config() {
+        let channels = test_channels_config("127.0.0.1:9091", 9092);
+
+        assert!(webhook_listener_addr(&channels).is_err());
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {

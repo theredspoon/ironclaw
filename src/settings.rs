@@ -411,11 +411,13 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub http_enabled: bool,
 
-    /// HTTP webhook port (if enabled).
+    /// Legacy HTTP channel port. The unified webhook listener binds using
+    /// WEBHOOK_PORT, falling back to this value for compatibility.
     #[serde(default)]
     pub http_port: Option<u16>,
 
-    /// HTTP webhook host.
+    /// Legacy HTTP channel host. The unified webhook listener binds using
+    /// WEBHOOK_HOST, falling back to this value for compatibility.
     #[serde(default)]
     pub http_host: Option<String>,
 

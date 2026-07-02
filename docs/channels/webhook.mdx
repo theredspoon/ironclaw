@@ -16,8 +16,8 @@ If you haven't set up your agent yet, follow our [Quickstart guide](../quickstar
 
 ```bash
 export HTTP_ENABLED=true
-export HTTP_HOST=0.0.0.0
-export HTTP_PORT=8080
+export WEBHOOK_HOST=0.0.0.0
+export WEBHOOK_PORT=8080
 export HTTP_WEBHOOK_SECRET=your-secret
 ```
 
@@ -33,7 +33,7 @@ Step 6: Channel Configuration
 ## Security
 
 <Warning>
-The HTTP webhook binds to `0.0.0.0:8080` by default. If you don't need external webhook delivery, set `HTTP_HOST=127.0.0.1`.
+The unified webhook listener binds to `127.0.0.1:8080` by default. If you need external webhook delivery without a tunnel, set `WEBHOOK_HOST=0.0.0.0`.
 </Warning>
 
 ### Shared Secret Validation
@@ -165,7 +165,7 @@ print(response.json()["job_id"])
 <AccordionGroup>
   <Accordion title="Connection refused" icon="x-circle">
     - Check IronClaw is running
-    - Verify `HTTP_PORT` is correct
+    - Verify `WEBHOOK_PORT` is correct
     - Check firewall: `sudo ufw allow 8080`
   </Accordion>
 

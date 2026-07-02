@@ -32,7 +32,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// HTTP webhook channel.
 pub struct HttpChannel {
-    config: HttpConfig,
     state: Arc<HttpChannelState>,
 }
 
@@ -89,7 +88,6 @@ impl HttpChannel {
         let user_id = config.user_id.clone();
 
         Self {
-            config,
             state: Arc::new(HttpChannelState {
                 tx: RwLock::new(None),
                 pending_responses: RwLock::new(std::collections::HashMap::new()),
@@ -114,11 +112,6 @@ impl HttpChannel {
             .route("/webhook", post(webhook_handler))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(self.state.clone())
-    }
-
-    /// Return the configured host and port for this channel.
-    pub fn addr(&self) -> (&str, u16) {
-        (&self.config.host, self.config.port)
     }
 
     /// Return a shared handle to the channel state for out-of-band updates.
@@ -667,11 +660,7 @@ impl Channel for HttpChannel {
         let (tx, rx) = mpsc::channel(256);
         *self.state.tx.write().await = Some(tx);
 
-        tracing::info!(
-            "HTTP channel ready ({}:{})",
-            self.config.host,
-            self.config.port
-        );
+        tracing::info!("HTTP webhook channel ready");
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
