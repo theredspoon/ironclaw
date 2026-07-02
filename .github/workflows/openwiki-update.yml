@@ -1,0 +1,76 @@
+name: OpenWiki Update
+
+# Regenerates the narrative code wiki (openwiki/) and opens a PR for HUMAN review.
+#
+# Decisions (see docs/plans/2026-07-02 discovery rollout):
+#   - Provider: Anthropic via ANTHROPIC_API_KEY (already a repo secret).
+#   - Publish: open a pull request; a human reviews and merges. NO auto-merge —
+#     SOC 2 change management (CC8.1 / separation of duties) requires every change
+#     to main to be human-reviewed and approved. The bot only authors the proposal.
+#
+# Notes:
+#   - The PR is opened via the GH_RELEASES_MANAGER GitHub App (not GITHUB_TOKEN) so
+#     the required-check workflows actually trigger on it — a GITHUB_TOKEN-opened PR
+#     does not trigger other workflows, so a human reviewer would see no checks and
+#     the ruleset would block the merge.
+#   - OPENWIKI_MODEL_ID must match OpenWiki's Anthropic model resolution; if the
+#     run errors on the model, adjust the string (e.g. an "anthropic/"/"anthropic:"
+#     prefix, or claude-haiku-4-5-20251001 for a cheaper pass).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"   # Mondays 08:00 UTC (weekly)
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint GitHub App token
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_RELEASES_MANAGER_APP_ID }}
+          private-key: ${{ secrets.GH_RELEASES_MANAGER_APP_PRIVATE_KEY }}
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install OpenWiki
+        run: npm install --global openwiki
+
+      - name: Regenerate wiki
+        run: openwiki --update --print
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENWIKI_MODEL_ID: claude-sonnet-4-6
+
+      - name: Open review PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.app.outputs.token }}
+          add-paths: openwiki
+          branch: openwiki/update
+          delete-branch: true
+          commit-message: "docs: update OpenWiki wiki"
+          title: "docs: update OpenWiki wiki"
+          labels: documentation
+          body: |
+            Automated OpenWiki narrative-docs refresh (`openwiki/`).
+
+            Review and merge as usual — this PR is NOT auto-merged; a human
+            approves it per change-management policy. Precise structural discovery
+            lives in the codebase-memory graph; this is the prose "what/why" layer.
