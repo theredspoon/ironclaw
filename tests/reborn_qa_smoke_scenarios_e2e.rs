@@ -1,9 +1,12 @@
 #[allow(dead_code)]
-#[path = "support/reborn/mod.rs"]
+#[path = "support/reborn_parity_qa/mod.rs"]
+mod parity_qa_support;
+#[allow(dead_code)]
+#[path = "integration/support/mod.rs"]
 mod reborn_support;
 mod support;
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use ironclaw_host_api::CapabilityId;
 use ironclaw_host_runtime::{
@@ -16,6 +19,10 @@ use ironclaw_loop_support::{
     DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID, HostManagedModelMessageRole, HostManagedModelResponse,
 };
 use ironclaw_turns::TurnStatus;
+use parity_qa_support::binary_e2e::RebornBinaryE2EHarness;
+use parity_qa_support::model_replay::{
+    RebornModelReplayStep, RebornScriptedProviderToolCall, RebornTraceReplayModelGateway,
+};
 use reborn_support::{
     config::WaitConfig,
     extension_surface::{
@@ -23,10 +30,8 @@ use reborn_support::{
         EXTENSION_INSTALL_CAPABILITY_ID, EXTENSION_LIFECYCLE_CAPABILITY_IDS,
         EXTENSION_REMOVE_CAPABILITY_ID, EXTENSION_SEARCH_CAPABILITY_ID,
     },
-    harness::{RebornBinaryE2EHarness, RecordingTestCapabilityPort},
-    model_replay::{
-        RebornModelReplayStep, RebornScriptedProviderToolCall, RebornTraceReplayModelGateway,
-    },
+    github as github_support,
+    harness::RecordingTestCapabilityPort,
 };
 
 const COVERED_QA_SCENARIOS: &[&str] = &[
@@ -56,7 +61,7 @@ const COVERED_QA_SCENARIOS: &[&str] = &[
 
 #[test]
 fn every_pasted_qa_scenario_has_reborn_e2e_coverage() {
-    reborn_support::qa_scenarios::assert_all_covered(COVERED_QA_SCENARIOS);
+    parity_qa_support::qa_scenarios::assert_all_covered(COVERED_QA_SCENARIOS);
 }
 
 #[tokio::test]
@@ -201,8 +206,11 @@ async fn qa_trigger_automation_smokes_create_view_and_cleanup() {
                 serde_json::json!({
                     "name": "qa-reborn-heartbeat-smoke",
                     "prompt": "reborn heartbeat smoke",
-                    "cron": "*/2 * * * *",
-                    "timezone": "UTC"
+                    "schedule": {
+                        "kind": "cron",
+                        "expression": "*/2 * * * *",
+                        "timezone": "UTC"
+                    }
                 }),
             )],
             expected_tool_results: Vec::new(),
@@ -222,8 +230,11 @@ async fn qa_trigger_automation_smokes_create_view_and_cleanup() {
                 serde_json::json!({
                     "name": "qa-reborn-cron-smoke",
                     "prompt": "summarize repo status",
-                    "cron": "0 9 * * 1",
-                    "timezone": "UTC"
+                    "schedule": {
+                        "kind": "cron",
+                        "expression": "0 9 * * 1",
+                        "timezone": "UTC"
+                    }
                 }),
             )],
             expected_tool_results: Vec::new(),
@@ -298,10 +309,12 @@ async fn qa_trigger_automation_smokes_create_view_and_cleanup() {
 }
 
 #[tokio::test]
+#[ignore = "TEMP(disable-spawn-subagents): spawn_subagent temporarily disabled via capability deny filter; re-enable by clearing runtime disabled_capability_ids"]
 async fn qa_subagent_capability_smoke_uses_child_run() {
     let spawn_subagent = cap(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID);
     let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
-        RebornModelReplayStep::ProviderToolCalls {
+        RebornModelReplayStep::ProviderToolCallsForRequest {
+            request_contains: "split repo testing docs and security docs checks".to_string(),
             calls: vec![call(
                 &spawn_subagent,
                 "qa_spawn_docs_checks",
@@ -312,18 +325,21 @@ async fn qa_subagent_capability_smoke_uses_child_run() {
             )],
             expected_tool_results: Vec::new(),
         },
-        RebornModelReplayStep::Response {
+        RebornModelReplayStep::DelayedResponseForRequest {
+            request_contains: "check repo testing docs and security docs independently".to_string(),
             response: HostManagedModelResponse::assistant_reply(
                 "child found testing docs and security docs",
             ),
+            delay: Duration::from_secs(1),
             expected_tool_results: Vec::new(),
         },
-        RebornModelReplayStep::Response {
+        RebornModelReplayStep::ResponseForRequest {
+            request_contains: "child found testing docs and security docs".to_string(),
             response: HostManagedModelResponse::assistant_reply("qa subagent smoke complete"),
             expected_tool_results: Vec::new(),
         },
     ]);
-    let mut harness = RebornBinaryE2EHarness::with_harness_blocked_evidence_unscoped_worker(
+    let mut harness = RebornBinaryE2EHarness::with_harness_blocked_evidence(
         "room-qa-subagent",
         model_gateway,
         RecordingTestCapabilityPort::echo_with_spawn_subagent(),
@@ -342,7 +358,15 @@ async fn qa_subagent_capability_smoke_uses_child_run() {
     harness
         .wait_for_status_with_config(submitted.run_id, TurnStatus::BlockedDependentRun, qa_wait())
         .await
-        .expect("parent should block on child");
+        .unwrap_or_else(|error| {
+            let model_requests = harness.model_requests();
+            panic!(
+                "parent should block on child: {error}; model_request_count={}; model_request_shapes={}; remaining_model_responses={}",
+                model_requests.len(),
+                model_request_shape_summary(&model_requests),
+                harness.remaining_model_responses()
+            )
+        });
     let children = harness
         .children_of(&submitted.scope, submitted.run_id)
         .await
@@ -441,8 +465,15 @@ async fn qa_skill_discovery_and_invocation_smokes_are_read_only_until_invoked() 
     harness.shutdown().await;
 }
 
-#[tokio::test]
-async fn qa_error_process_repo_patch_and_cleanup_smokes() {
+#[test]
+fn qa_error_process_repo_patch_and_cleanup_smokes() {
+    run_async_test_with_stack(
+        "qa_error_process_repo_patch_and_cleanup_smokes",
+        qa_error_process_repo_patch_and_cleanup_smokes_impl,
+    );
+}
+
+async fn qa_error_process_repo_patch_and_cleanup_smokes_impl() {
     let json = cap(JSON_CAPABILITY_ID);
     let shell = cap(SHELL_CAPABILITY_ID);
     let write_file = cap(WRITE_FILE_CAPABILITY_ID);
@@ -663,11 +694,7 @@ async fn qa_extension_lifecycle_tools_search_install_activate_and_remove_e2e() {
             expected_tool_results: Vec::new(),
         },
         RebornModelReplayStep::AssertProviderToolsThenProviderToolCalls {
-            capability_ids: capability_ids(&[
-                "github.get_issue",
-                "github.comment_issue",
-                "github.search_issues",
-            ]),
+            capability_ids: github_support::capability_ids().expect("github capability ids"),
             calls: vec![call(
                 &remove,
                 "qa_extension_remove_github",
@@ -888,17 +915,9 @@ async fn qa_plugin_browser_mcp_artifact_and_image_capability_surface_smokes() {
 
 #[tokio::test]
 async fn qa_github_capability_smoke_discovers_actions_without_live_github() {
-    let expected = [
-        "github.get_repo",
-        "github.list_issues",
-        "github.create_issue",
-        "github.get_pull_request",
-        "github.create_pr_review",
-        "github.get_workflow_runs",
-    ];
     let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
         RebornModelReplayStep::AssertProviderToolsThenResponse {
-            capability_ids: expected.iter().map(|id| cap(id)).collect(),
+            capability_ids: github_support::capability_ids().expect("github capability ids"),
             response: HostManagedModelResponse::assistant_reply("qa github smoke complete"),
             expected_tool_results: Vec::new(),
         },
@@ -977,6 +996,53 @@ fn qa_wait() -> WaitConfig {
         timeout: Duration::from_secs(60),
         poll_interval: Duration::from_millis(20),
     }
+}
+
+fn run_async_test_with_stack<F, Fut>(name: &'static str, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio test runtime")
+                .block_on(test());
+        })
+        .expect("spawn stack-sized test thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn model_request_shape_summary(
+    requests: &[ironclaw_loop_support::HostManagedModelRequest],
+) -> String {
+    if requests.is_empty() {
+        return "none".to_string();
+    }
+    requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let roles = request
+                .messages
+                .iter()
+                .map(|message| format!("{:?}", message.role))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "#{index}:messages={},roles=[{}]",
+                request.messages.len(),
+                roles
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn call(

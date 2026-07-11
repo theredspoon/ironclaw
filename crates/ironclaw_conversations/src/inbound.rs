@@ -9,8 +9,8 @@ use ironclaw_triggers::{
     TrustedTriggerSubmitRequest,
 };
 use ironclaw_turns::{
-    AdmissionRejectionReason, RunOriginAdapter, SubmitTurnRequest, TurnCoordinator, TurnError,
-    TurnSurfaceType,
+    AdmissionRejectionReason, RunOriginAdapter, RunProfileId, RunProfileRequest, SubmitTurnRequest,
+    TurnCoordinator, TurnError, TurnSurfaceType,
 };
 
 use crate::trusted_trigger::{TrustedTriggerInboundFailureKind, classify_inbound_error};
@@ -398,7 +398,19 @@ fn trusted_inbound_request_from_trigger(
             requested_agent_id: None,
             requested_project_id: None,
             received_at,
-            requested_run_profile: None,
+            // Issue #5505: a trusted trigger fire must run under the
+            // dedicated scheduled_trigger profile so the host deny-map
+            // (ironclaw_runner runtime.rs) strips the trigger mutator
+            // capabilities from the fire's model-visible surface — a fire
+            // must not be able to create/remove/pause/resume triggers.
+            requested_run_profile: Some(
+                RunProfileRequest::new(RunProfileId::scheduled_trigger().as_str()).map_err(
+                    |reason| InboundTurnError::InvalidExternalRef {
+                        kind: "run_profile_request",
+                        reason,
+                    },
+                )?,
+            ),
         },
         fire.agent_id,
         fire.project_id,
@@ -430,6 +442,7 @@ fn should_rotate_submit_key(error: &TurnError) -> bool {
         | TurnError::InvalidRequest { .. }
         | TurnError::CapacityExceeded { .. }
         | TurnError::Conflict { .. }
+        | TurnError::RunNotRetryable { .. }
         | TurnError::InvalidTransition { .. }
         | TurnError::LeaseMismatch
         | TurnError::InvalidRunOriginAdapter => false,
@@ -498,9 +511,17 @@ fn retryable_trusted_trigger_backend_error(_error: &InboundTurnError) -> Trigger
 
 fn opaque_trusted_trigger_inbound_rejection(
     reason: &'static str,
-    _error: &InboundTurnError,
+    error: &InboundTurnError,
 ) -> TriggerError {
     tracing::debug!(reason, "trusted trigger inbound rejection");
+    if matches!(
+        error,
+        InboundTurnError::BindingRequired { .. } | InboundTurnError::AccessDenied { .. }
+    ) {
+        return TriggerError::BlockedMaterialization {
+            reason: "trusted trigger inbound request blocked".to_string(),
+        };
+    }
     TriggerError::InvalidMaterialization {
         reason: reason.to_string(),
     }
@@ -522,10 +543,10 @@ mod tests {
     use ironclaw_turns::{
         AcceptedMessageRef, AdmissionRejection, AdmissionRejectionReason, CancelRunRequest,
         CancelRunResponse, EventCursor, GetRunStateRequest, ReplyTargetBindingRef,
-        ResumeTurnRequest, ResumeTurnResponse, RunProfileId, RunProfileVersion, SourceBindingRef,
-        SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnCapacityResource, TurnCoordinator,
-        TurnError, TurnId, TurnOriginKind, TurnRunId, TurnRunState, TurnScope, TurnStatus,
-        TurnSurfaceType,
+        ResumeTurnRequest, ResumeTurnResponse, RetryTurnRequest, RetryTurnResponse, RunProfileId,
+        RunProfileRequest, RunProfileVersion, SourceBindingRef, SubmitTurnRequest,
+        SubmitTurnResponse, ThreadBusy, TurnCapacityResource, TurnCoordinator, TurnError, TurnId,
+        TurnOriginKind, TurnRunId, TurnRunState, TurnScope, TurnStatus, TurnSurfaceType,
     };
 
     use super::{
@@ -781,7 +802,8 @@ mod tests {
             )
             .await;
 
-        let submitter = trusted_trigger_fire_submitter(services.clone(), services, coordinator);
+        let submitter =
+            trusted_trigger_fire_submitter(services.clone(), services, coordinator.clone());
 
         let fire_slot = Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
         let identity = TriggerFireIdentity::new(tenant(), TriggerId::new(), fire_slot);
@@ -791,6 +813,7 @@ mod tests {
             agent_id: Some(agent()),
             project_id: Some(project()),
             prompt: "test trigger prompt".to_string(),
+            delivery_target: None,
         };
         let content_ref =
             TriggerInboundContentRef::new("content:test-trigger-creator").expect("content ref");
@@ -810,6 +833,19 @@ mod tests {
             turn_scope.explicit_owner_user_id(),
             Some(&creator),
             "submit_trusted_trigger_fire must surface the creator as explicit turn-scope owner"
+        );
+        // Issue #5505: a trusted trigger fire must request the dedicated
+        // scheduled_trigger run profile so the host deny-map (ironclaw_runner
+        // runtime.rs) strips the trigger mutator capabilities from the fire's
+        // model-visible surface. Assert through the same recording
+        // coordinator already used above, on the SubmitTurnRequest that
+        // actually reached the coordinator.
+        let submissions = coordinator.submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(
+            submissions[0].requested_run_profile,
+            Some(RunProfileRequest::new(RunProfileId::scheduled_trigger().as_str()).unwrap()),
+            "trigger fire must request the scheduled_trigger run profile"
         );
     }
 
@@ -969,14 +1005,6 @@ mod tests {
                 kind: "adapter_kind",
                 reason: "empty".to_string(),
             },
-            InboundTurnError::BindingRequired {
-                adapter_kind: TRIGGER_TRUSTED_ADAPTER_KIND.to_string(),
-                external_actor_id: "actor".to_string(),
-            },
-            InboundTurnError::AccessDenied {
-                actor_id: "actor".to_string(),
-                thread_id: "thread".to_string(),
-            },
             InboundTurnError::BindingConflict {
                 thread_id: "conflicting-thread".to_string(),
             },
@@ -993,6 +1021,24 @@ mod tests {
                 classified,
                 ironclaw_triggers::TriggerError::InvalidMaterialization { reason }
                     if reason == "trusted trigger inbound request rejected"
+            ));
+        }
+
+        for error in [
+            InboundTurnError::BindingRequired {
+                adapter_kind: TRIGGER_TRUSTED_ADAPTER_KIND.to_string(),
+                external_actor_id: "actor".to_string(),
+            },
+            InboundTurnError::AccessDenied {
+                actor_id: "actor".to_string(),
+                thread_id: "thread".to_string(),
+            },
+        ] {
+            let classified = classify_trusted_trigger_inbound_error(error);
+            assert!(matches!(
+                classified,
+                ironclaw_triggers::TriggerError::BlockedMaterialization { reason }
+                    if reason == "trusted trigger inbound request blocked"
             ));
         }
     }
@@ -1016,6 +1062,7 @@ mod tests {
             resolution: ConversationBindingResolution {
                 tenant_id: tenant_id.clone(),
                 actor: actor.clone(),
+                binding_epoch: None,
                 turn_scope: TurnScope::new(
                     tenant_id.clone(),
                     Some(agent()),
@@ -1345,6 +1392,13 @@ mod tests {
             unimplemented!("not used by inbound facade tests")
         }
 
+        async fn retry_turn(
+            &self,
+            _request: RetryTurnRequest,
+        ) -> Result<RetryTurnResponse, TurnError> {
+            unimplemented!("not used by inbound facade tests")
+        }
+
         async fn cancel_run(
             &self,
             _request: CancelRunRequest,
@@ -1478,6 +1532,13 @@ mod tests {
             &self,
             _request: ResumeTurnRequest,
         ) -> Result<ResumeTurnResponse, TurnError> {
+            unimplemented!("not used by submit-key rotation tests")
+        }
+
+        async fn retry_turn(
+            &self,
+            _request: RetryTurnRequest,
+        ) -> Result<RetryTurnResponse, TurnError> {
             unimplemented!("not used by submit-key rotation tests")
         }
 

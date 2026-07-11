@@ -72,6 +72,12 @@ pub struct WebUiAuthenticatedCaller {
     pub agent_id: Option<AgentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<ProjectId>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub operator_webui_config: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl WebUiAuthenticatedCaller {
@@ -86,7 +92,13 @@ impl WebUiAuthenticatedCaller {
             user_id,
             agent_id,
             project_id,
+            operator_webui_config: false,
         }
+    }
+
+    pub fn with_operator_webui_config(mut self, operator_webui_config: bool) -> Self {
+        self.operator_webui_config = operator_webui_config;
+        self
     }
 
     pub fn actor(&self) -> TurnActor {
@@ -240,6 +252,17 @@ pub struct WebUiCancelRunRequest {
     pub reason: Option<String>,
 }
 
+/// Browser body for WebUI failed-run retry mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WebUiRetryRunRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_action_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
 /// Browser query for WebUI list-threads read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WebUiListThreadsRequest {
@@ -247,6 +270,32 @@ pub struct WebUiListThreadsRequest {
     pub limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_thread_id: Option<String>,
+    #[serde(default)]
+    pub needs_approval: bool,
+}
+
+impl WebUiListThreadsRequest {
+    pub fn set_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn set_cursor(mut self, cursor: impl Into<String>) -> Self {
+        self.cursor = Some(cursor.into());
+        self
+    }
+
+    pub fn set_candidate_thread_id(mut self, candidate_thread_id: impl Into<String>) -> Self {
+        self.candidate_thread_id = Some(candidate_thread_id.into());
+        self
+    }
+
+    pub fn set_needs_approval(mut self, needs_approval: bool) -> Self {
+        self.needs_approval = needs_approval;
+        self
+    }
 }
 
 /// Browser query for WebUI automation listing.
@@ -256,6 +305,37 @@ pub struct WebUiListAutomationsRequest {
     pub limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_limit: Option<u32>,
+    /// When `true`, soft-completed (fire-once) automations are included in the
+    /// response alongside active ones. Defaults to `false` (active-only) so
+    /// existing callers that do not set this flag are unaffected.
+    #[serde(default)]
+    pub include_completed: bool,
+}
+
+impl WebUiListAutomationsRequest {
+    pub fn set_limit(mut self, limit: u32) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn set_run_limit(mut self, run_limit: u32) -> Self {
+        self.run_limit = Some(run_limit);
+        self
+    }
+
+    pub fn set_include_completed(mut self, include_completed: bool) -> Self {
+        self.include_completed = include_completed;
+        self
+    }
+}
+
+/// Browser body for WebUI automation rename mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WebUiRenameAutomationRequest {
+    /// Optional at the DTO boundary so `{}` returns the stable field-level
+    /// `missing_field` validation error instead of a generic JSON rejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Browser body for WebUI extension-setup interaction.
@@ -362,6 +442,12 @@ pub enum WebUiInboundCommand {
         client_action_id: IdempotencyKey,
         resolution: WebUiGateResolution,
     },
+    RetryRun {
+        scope: TurnScope,
+        actor: TurnActor,
+        run_id: TurnRunId,
+        client_action_id: IdempotencyKey,
+    },
 }
 
 impl WebUiCreateThreadRequest {
@@ -428,6 +514,24 @@ impl WebUiCancelRunRequest {
     }
 }
 
+impl WebUiRetryRunRequest {
+    pub fn into_command(
+        self,
+        caller: WebUiAuthenticatedCaller,
+    ) -> Result<WebUiInboundCommand, WebUiInboundValidationError> {
+        let client_action_id = parse_client_action_id(self.client_action_id)?;
+        let thread_id = parse_thread_id(self.thread_id)?;
+        let run_id = parse_run_id(self.run_id)?;
+
+        Ok(WebUiInboundCommand::RetryRun {
+            scope: caller.turn_scope(thread_id),
+            actor: caller.actor(),
+            run_id,
+            client_action_id,
+        })
+    }
+}
+
 impl WebUiResolveGateRequest {
     pub fn into_command(
         self,
@@ -459,6 +563,7 @@ pub enum WebUiInboundValidationCode {
     TooLong,
     InvalidControlCharacter,
     InvalidId,
+    UnknownKey,
     InvalidValue,
 }
 

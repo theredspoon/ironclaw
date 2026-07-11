@@ -52,7 +52,10 @@
 //! `#[ignore]` because they spend tokens and may import live credentials.
 
 #[allow(dead_code)]
-#[path = "support/reborn/mod.rs"]
+#[path = "support/reborn_parity_qa/mod.rs"]
+mod parity_qa_support;
+#[allow(dead_code)]
+#[path = "integration/support/mod.rs"]
 mod reborn_support;
 mod support;
 
@@ -64,14 +67,12 @@ use std::{
 use chrono::Utc;
 use ironclaw_host_api::TenantId;
 use ironclaw_triggers::{TriggerRunStatus, TriggerState};
-use reborn_support::{
-    model_replay::RebornTraceReplayModelGateway,
-    qa_trace::{
-        build_qa_trace_runtime_with_http_exchanges,
-        build_qa_trace_runtime_with_http_exchanges_and_trigger_poller, load_qa_trace,
-        qa_trace_tenant_id, record_qa_phrase, recorded_tool_calls, send_qa_phrase,
-        strip_expected_tool_results,
-    },
+use parity_qa_support::model_replay::RebornTraceReplayModelGateway;
+use parity_qa_support::qa_trace::{
+    build_qa_trace_runtime_with_http_exchanges,
+    build_qa_trace_runtime_with_http_exchanges_and_trigger_poller, load_qa_trace,
+    qa_trace_tenant_id, record_qa_phrase, recorded_tool_calls, send_qa_phrase,
+    strip_expected_tool_results,
 };
 use support::trace_llm::{LlmTrace, TraceExpects, TraceResponse, TraceStep, TraceTurn};
 
@@ -274,8 +275,11 @@ async fn replay_routine_phrase(case: &QaPhrase, cron_fragment: &str) {
         .expect("list triggers after replay");
     assert!(
         triggers.iter().any(|record| {
-            let ironclaw_triggers::TriggerSchedule::Cron { expression, .. } = &record.schedule;
-            expression.contains(cron_fragment)
+            matches!(
+                &record.schedule,
+                ironclaw_triggers::TriggerSchedule::Cron { expression, .. }
+                    if expression.contains(cron_fragment)
+            )
         }),
         "replayed {} should create a routine scheduled {cron_fragment}; triggers: {triggers:#?}",
         case.fixture
@@ -336,8 +340,11 @@ async fn replay_routine_phrase_fires(case: &QaPhrase, cron_fragment: &str) {
     let mut trigger = triggers
         .iter()
         .find(|record| {
-            let ironclaw_triggers::TriggerSchedule::Cron { expression, .. } = &record.schedule;
-            expression.contains(cron_fragment)
+            matches!(
+                &record.schedule,
+                ironclaw_triggers::TriggerSchedule::Cron { expression, .. }
+                    if expression.contains(cron_fragment)
+            )
         })
         .cloned()
         .unwrap_or_else(|| {

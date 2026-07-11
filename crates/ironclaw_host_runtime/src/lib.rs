@@ -27,8 +27,8 @@
 use async_trait::async_trait;
 use ironclaw_host_api::{
     ApprovalRequestId, CapabilityDisplayOutputPreview, CapabilityId, CorrelationId,
-    ExecutionContext, ExtensionId, ProcessId, ResourceEstimate, ResourceScope, ResourceUsage,
-    RuntimeCredentialAuthRequirement, RuntimeKind, SecretHandle,
+    DispatchFailureDetail, ExecutionContext, ExtensionId, ProcessId, ResourceEstimate,
+    ResourceScope, ResourceUsage, RuntimeCredentialAuthRequirement, RuntimeKind, SecretHandle,
     runtime_policy::{DeploymentMode, EffectiveRuntimePolicy, RuntimeProfile},
 };
 use ironclaw_trust::TrustDecision;
@@ -37,12 +37,14 @@ use std::{collections::BTreeMap, env, fmt};
 use thiserror::Error;
 
 mod capability_catalog;
+mod document_output;
 mod egress;
 mod extension_contracts;
 mod first_party;
 mod first_party_tools;
 mod http_body;
 mod invocation_services;
+mod latency;
 pub mod memory_context;
 mod obligations;
 mod planner;
@@ -53,7 +55,6 @@ mod production;
 mod sandbox_process;
 mod services;
 mod surface;
-mod turn_scheduler;
 mod user_profile_source;
 mod wasm_credentials;
 
@@ -69,7 +70,8 @@ pub use egress::{
 };
 pub use extension_contracts::{
     default_host_api_contract_registry, default_host_port_catalog,
-    discover_extensions_tolerant_bounded, discover_extensions_with_default_host_api_contracts,
+    discover_extensions_tolerant_bounded, discover_extensions_tolerant_bounded_with_contracts,
+    discover_extensions_with_default_host_api_contracts,
     discover_extensions_with_default_host_api_contracts_and_catalog,
 };
 pub use first_party::{
@@ -83,11 +85,13 @@ pub use first_party_tools::{
     MEMORY_SEARCH_CAPABILITY_ID, MEMORY_TREE_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID,
     PROFILE_SET_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SHELL_CAPABILITY_ID,
     SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
-    SPAWN_SUBAGENT_CAPABILITY_ID, TIME_CAPABILITY_ID, TRACE_COMMONS_CREDITS_CAPABILITY_ID,
+    SPAWN_SUBAGENT_CAPABILITY_ID, TIME_CAPABILITY_ID,
+    TRACE_COMMONS_ACCOUNT_LOGIN_LINK_CAPABILITY_ID, TRACE_COMMONS_CREDITS_CAPABILITY_ID,
     TRACE_COMMONS_ONBOARD_CAPABILITY_ID, TRACE_COMMONS_PROFILE_SET_CAPABILITY_ID,
     TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID, TRACE_COMMONS_STATUS_CAPABILITY_ID,
-    TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID,
-    TriggerCreateHook, WRITE_FILE_CAPABILITY_ID, builtin_first_party_handlers,
+    TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_PAUSE_CAPABILITY_ID,
+    TRIGGER_REMOVE_CAPABILITY_ID, TRIGGER_RESUME_CAPABILITY_ID, TriggerCreateHook,
+    WRITE_FILE_CAPABILITY_ID, builtin_first_party_handlers,
     builtin_first_party_handlers_for_process_backend,
     builtin_first_party_handlers_with_trigger_create_hook,
     builtin_first_party_handlers_with_trigger_create_hook_for_process_backend,
@@ -126,11 +130,6 @@ pub use services::{
     RegisteredRuntimeHealth,
 };
 pub use surface::{CapabilitySurfacePolicy, VisibleCapability, VisibleCapabilityAccess};
-pub use turn_scheduler::{
-    SchedulerTurnRunWakeNotifier, TurnRunExecutor, TurnRunExecutorError, TurnRunScheduler,
-    TurnRunSchedulerConfig, TurnRunSchedulerHandle,
-};
-
 /// Stable, validated idempotency key supplied by upper turn/loop services.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(String);
@@ -581,6 +580,7 @@ pub struct RuntimeCapabilityFailure {
     pub capability_id: CapabilityId,
     pub kind: RuntimeFailureKind,
     pub message: Option<String>,
+    pub detail: Option<DispatchFailureDetail>,
 }
 
 /// Explicit fallback for outcome categories that the loop adapter cannot handle
@@ -690,8 +690,14 @@ mod raw_http_diagnostic_policy_tests {
 }
 
 /// Stable, sanitized failure categories.
+///
+// Deliberately NOT `#[non_exhaustive]`: the `Unknown` variant is the open-set
+// escape hatch for unrecognized runtime failures, so the attribute would only
+// force classifiers to keep a wildcard arm that silently buckets a new named
+// variant. Without it, disposition/classification matches are exhaustive and a
+// new named variant fails to compile until classified. See
+// `docs/plans/2026-06-28-reborn-error-recoverability-audit.md` §6.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum RuntimeFailureKind {
     Authorization,
     Backend,
@@ -709,7 +715,6 @@ pub enum RuntimeFailureKind {
     Resource,
     Transient,
     Unavailable,
-    Unknown,
 }
 
 impl RuntimeFailureKind {
@@ -732,7 +737,6 @@ impl RuntimeFailureKind {
             Self::Resource => "resource",
             Self::Transient => "transient",
             Self::Unavailable => "unavailable",
-            Self::Unknown => "unknown",
         }
     }
 }
@@ -760,7 +764,13 @@ impl RuntimeCapabilityFailure {
             capability_id,
             kind,
             message,
+            detail: None,
         }
+    }
+
+    pub fn with_detail(mut self, detail: DispatchFailureDetail) -> Self {
+        self.detail = Some(detail);
+        self
     }
 
     pub fn safe_summary(&self) -> Option<String> {

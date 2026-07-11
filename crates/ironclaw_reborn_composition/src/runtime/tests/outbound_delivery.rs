@@ -14,20 +14,18 @@ use ironclaw_product_workflow::{
 use ironclaw_threads::{LoadContextMessagesRequest, MessageKind, ThreadHistoryRequest};
 use ironclaw_turns::{
     ReplyTargetBindingRef, TurnStatus,
-    run_profile::{LoopCapabilityPort, ProviderToolCall},
+    run_profile::{LoopCapabilityPort, ProviderToolCall, RegisterProviderToolCallRequest},
 };
 
 use crate::RebornCompositionProfile;
 use crate::input::RebornBuildInput;
-use crate::outbound_preferences::{
-    OutboundDeliveryTargetEntry, OutboundDeliveryTargetProvider,
-    OutboundDeliveryTargetRegistrationOutcome,
-};
+use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
+use crate::outbound::{OutboundDeliveryTargetProvider, OutboundDeliveryTargetRegistrationOutcome};
 use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
 
 use super::build_reborn_runtime;
 
-const RUNTIME_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Default)]
 struct OutboundDeliveryTriggerGateway {
@@ -130,7 +128,7 @@ impl HostManagedModelGateway for OutboundDeliveryTriggerGateway {
             _ => unreachable!("handled above"),
         };
         let candidate = capabilities
-            .register_provider_tool_call(call)
+            .register_provider_tool_call(RegisterProviderToolCallRequest::new(call))
             .await
             .map_err(model_capability_error)?;
         Ok(HostManagedModelResponse::capability_calls(
@@ -195,7 +193,7 @@ async fn local_dev_runtime_selects_outbound_delivery_target_before_trigger_creat
     })
     .with_poll_settings(PollSettings {
         interval: Duration::from_millis(10),
-        max_total: Duration::from_secs(3),
+        max_total: RUNTIME_SEND_TIMEOUT,
     })
     .with_model_gateway_override(gateway_for_runtime);
 

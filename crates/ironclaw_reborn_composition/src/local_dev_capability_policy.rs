@@ -81,12 +81,22 @@ impl LocalDevCapabilityPolicy {
             .map(|grant| &grant.capability)
     }
 
+    pub(crate) fn system_extensions_lifecycle_capability_ids(
+        &self,
+    ) -> impl Iterator<Item = &CapabilityId> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.mounts == LocalDevMountProfile::SystemExtensionsLifecycle)
+            .map(|grant| &grant.capability)
+    }
+
     pub(crate) fn builtin_grants(
         &self,
         grantee: &ExtensionId,
         workspace_mounts: &MountView,
         skill_mounts: &MountView,
         memory_mounts: &MountView,
+        system_extensions_mounts: &MountView,
     ) -> CapabilitySet {
         let grants = self
             .grants
@@ -101,6 +111,7 @@ impl LocalDevCapabilityPolicy {
                     workspace_mounts,
                     skill_mounts,
                     memory_mounts,
+                    system_extensions_mounts,
                     None,
                 ),
             })
@@ -114,6 +125,7 @@ impl LocalDevCapabilityPolicy {
         workspace_mounts: &MountView,
         skill_mounts: &MountView,
         memory_mounts: &MountView,
+        system_extensions_mounts: &MountView,
     ) -> Result<GrantConstraints, LocalDevCapabilityPolicyError> {
         let grant = self.grant(capability)?;
         Ok(constraint_terms(
@@ -121,6 +133,7 @@ impl LocalDevCapabilityPolicy {
             workspace_mounts,
             skill_mounts,
             memory_mounts,
+            system_extensions_mounts,
             None,
         ))
     }
@@ -131,6 +144,7 @@ impl LocalDevCapabilityPolicy {
         workspace_mounts: &MountView,
         skill_mounts: &MountView,
         memory_mounts: &MountView,
+        system_extensions_mounts: &MountView,
     ) -> Result<LeaseApproval, LocalDevCapabilityPolicyError> {
         let constraints = match action {
             LocalDevApprovalPolicyAction::Dispatch { capability } => self.grant_constraints_for(
@@ -138,6 +152,7 @@ impl LocalDevCapabilityPolicy {
                 workspace_mounts,
                 skill_mounts,
                 memory_mounts,
+                system_extensions_mounts,
             )?,
             LocalDevApprovalPolicyAction::SpawnCapability { capability } => {
                 match self.grant(capability) {
@@ -146,6 +161,7 @@ impl LocalDevCapabilityPolicy {
                         workspace_mounts,
                         skill_mounts,
                         memory_mounts,
+                        system_extensions_mounts,
                         Some(EffectKind::SpawnProcess),
                     ),
                     Err(LocalDevCapabilityPolicyError::MissingGrant { .. }) => {
@@ -158,6 +174,7 @@ impl LocalDevCapabilityPolicy {
                             workspace_mounts,
                             skill_mounts,
                             memory_mounts,
+                            system_extensions_mounts,
                             None,
                         )
                     }
@@ -183,20 +200,17 @@ impl LocalDevCapabilityPolicy {
 pub(crate) fn local_dev_one_shot_lease_approval(constraints: GrantConstraints) -> LeaseApproval {
     LeaseApproval {
         issued_by: Principal::HostRuntime,
-        allowed_effects: constraints.allowed_effects,
-        mounts: constraints.mounts,
-        network: constraints.network,
-        secrets: constraints.secrets,
-        resource_ceiling: constraints.resource_ceiling,
-        // Local-dev leases are single-use (max_invocations = 1).
-        // Wall-clock expiry is intentionally None: the policy file does
-        // not configure an expires_at ceiling, and a short hard-coded
-        // timeout would race against slow human approval flows. The
-        // one-shot invocation count is the sole consumption bound.
-        // If invocation-count enforcement ever regresses, this lease
-        // becomes perpetual — see approval gate tests for the invariant.
-        expires_at: constraints.expires_at,
-        max_invocations: Some(1),
+        constraints: GrantConstraints {
+            // Local-dev leases are single-use (max_invocations = 1).
+            // Wall-clock expiry is intentionally None: the policy file does
+            // not configure an expires_at ceiling, and a short hard-coded
+            // timeout would race against slow human approval flows. The
+            // one-shot invocation count is the sole consumption bound.
+            // If invocation-count enforcement ever regresses, this lease
+            // becomes perpetual — see approval gate tests for the invariant.
+            max_invocations: Some(1),
+            ..constraints
+        },
     }
 }
 
@@ -247,6 +261,7 @@ pub(crate) enum LocalDevMountProfile {
     Ambient,
     SkillManagement,
     Memory,
+    SystemExtensionsLifecycle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -411,6 +426,7 @@ fn constraint_terms(
     workspace_mounts: &MountView,
     skill_mounts: &MountView,
     memory_mounts: &MountView,
+    system_extensions_mounts: &MountView,
     required_effect: Option<EffectKind>,
 ) -> GrantConstraints {
     let mounts = match source.mounts() {
@@ -418,6 +434,7 @@ fn constraint_terms(
         LocalDevMountProfile::Ambient => MountView::default(),
         LocalDevMountProfile::SkillManagement => skill_mounts.clone(),
         LocalDevMountProfile::Memory => memory_mounts.clone(),
+        LocalDevMountProfile::SystemExtensionsLifecycle => system_extensions_mounts.clone(),
     };
     let network = match source.network() {
         LocalDevNetworkProfile::Default => NetworkPolicy::default(),
@@ -550,6 +567,16 @@ mod tests {
             &policy,
             "builtin.trigger_list",
             &[EffectKind::DispatchCapability],
+        );
+        assert_trigger_grant(
+            &policy,
+            "builtin.trigger_pause",
+            &[EffectKind::DispatchCapability, EffectKind::ExternalWrite],
+        );
+        assert_trigger_grant(
+            &policy,
+            "builtin.trigger_resume",
+            &[EffectKind::DispatchCapability, EffectKind::ExternalWrite],
         );
         assert_trigger_grant(
             &policy,
@@ -691,12 +718,19 @@ mod tests {
                 &MountView::default(),
                 &MountView::default(),
                 &MountView::default(),
+                &MountView::default(),
             )
             .expect("lease approval");
 
-        assert!(approval.allowed_effects.contains(&EffectKind::SpawnProcess));
+        assert!(
+            approval
+                .constraints
+                .allowed_effects
+                .contains(&EffectKind::SpawnProcess)
+        );
         assert_eq!(
             approval
+                .constraints
                 .allowed_effects
                 .iter()
                 .filter(|effect| **effect == EffectKind::SpawnProcess)
@@ -717,11 +751,13 @@ mod tests {
                 &MountView::default(),
                 &MountView::default(),
                 &MountView::default(),
+                &MountView::default(),
             )
             .expect("lease approval");
 
         assert_eq!(
             approval
+                .constraints
                 .allowed_effects
                 .iter()
                 .filter(|effect| **effect == EffectKind::SpawnProcess)
