@@ -149,7 +149,10 @@ fn read_file_continuation_notice(
     next_offset: usize,
 ) -> String {
     format!(
-        "[Showing lines {}-{} of {} ({} limit). Use offset={} to continue.]",
+        "[Showing lines {}-{} of {} ({} limit). This file is large: to analyze, summarize, or \
+         count over it, run ONE shell command or script (grep/awk/python) over the whole file and \
+         read only the computed result — do NOT page through it (offset={}) and reason over it in \
+         context, which is slow and costly.]",
         start_line + 1,
         last_line_shown,
         total_lines,
@@ -249,7 +252,11 @@ fn read_file_text_output(
 
     let lines_shown = rendered.len();
     let last_line_shown = start_line + lines_shown;
-    let has_more = last_line_shown < total_lines;
+    // A continuation notice only makes sense once at least one line was rendered.
+    // An explicit `limit: 0` selects no lines, so there is nothing to continue
+    // from and "[Showing lines 1-0 ...]" would be a nonsensical inverted range.
+    // Suppressing the notice here keeps the zero-value path byte-for-byte v1.
+    let has_more = lines_shown > 0 && last_line_shown < total_lines;
     let next_offset = has_more.then_some(last_line_shown + 1);
     let truncated_by = if truncated_by_bytes {
         Some(ReadTruncationReason::Bytes)

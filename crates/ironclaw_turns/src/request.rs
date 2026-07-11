@@ -20,6 +20,15 @@ pub enum GateResumeDisposition {
     Denied,
 }
 
+impl GateResumeDisposition {
+    /// Stable snake_case value shared with the serde wire representation.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResumeTurnPrecondition {
@@ -31,6 +40,7 @@ pub enum ResumeTurnPrecondition {
     BlockedAuthGate,
     BlockedResourceGate,
     BlockedDependentRunGate,
+    BlockedExternalToolGate,
 }
 
 impl ResumeTurnPrecondition {
@@ -45,6 +55,7 @@ impl ResumeTurnPrecondition {
             Self::BlockedAuthGate => Some(TurnStatus::BlockedAuth),
             Self::BlockedResourceGate => Some(TurnStatus::BlockedResource),
             Self::BlockedDependentRunGate => Some(TurnStatus::BlockedDependentRun),
+            Self::BlockedExternalToolGate => Some(TurnStatus::BlockedExternalTool),
         }
     }
 }
@@ -114,6 +125,16 @@ pub struct ResumeTurnRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryTurnRequest {
+    pub scope: TurnScope,
+    pub actor: TurnActor,
+    pub run_id: TurnRunId,
+    pub source_binding_ref: SourceBindingRef,
+    pub reply_target_binding_ref: ReplyTargetBindingRef,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelRunRequest {
     pub scope: TurnScope,
     pub actor: TurnActor,
@@ -159,9 +180,24 @@ mod tests {
     fn gate_resume_disposition_denied_round_trips() {
         let disposition = GateResumeDisposition::Denied;
         let json = serde_json::to_string(&disposition).expect("serialize");
-        assert!(json.contains("denied"), "wire value is snake_case: {json}");
+        assert_eq!(disposition.as_str(), "denied");
+        assert_eq!(json, format!("\"{}\"", disposition.as_str()));
         let decoded: GateResumeDisposition = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(disposition, decoded);
+    }
+
+    #[test]
+    fn external_tool_precondition_maps_to_status_and_round_trips() {
+        let precondition = ResumeTurnPrecondition::BlockedExternalToolGate;
+        assert_eq!(
+            precondition.required_status(),
+            Some(TurnStatus::BlockedExternalTool)
+        );
+        // Wire-stable snake_case contract for the new precondition.
+        let json = serde_json::to_string(&precondition).expect("serialize");
+        assert_eq!(json, "\"blocked_external_tool_gate\"");
+        let decoded: ResumeTurnPrecondition = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(precondition, decoded);
     }
 
     /// Asserts the serde contract on `ResumeTurnRequest.resume_disposition`:

@@ -436,6 +436,7 @@ fn turn_run_state_actor_is_serde_backward_compatible() {
         received_at: fixed_time(),
         checkpoint_id: None,
         gate_ref: None,
+        blocked_activity_id: None,
         credential_requirements: Vec::new(),
         failure: None,
         event_cursor: EventCursor(1),
@@ -487,6 +488,7 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
         received_at: fixed_time(),
         checkpoint_id: Some(checkpoint_id),
         gate_ref: Some(GateRef::new("gate-checkpoint-public").unwrap()),
+        blocked_activity_id: None,
         credential_requirements: Vec::new(),
         failure: None,
         event_cursor: EventCursor(1),
@@ -504,12 +506,15 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
         blocked_gate: Some(ironclaw_turns::TurnBlockedGateMetadata {
             gate_ref: GateRef::new("gate-checkpoint-public").unwrap(),
             gate_kind: ironclaw_turns::TurnBlockedGateKind::Approval,
+            activity_id: None,
             credential_requirements: Vec::new(),
         }),
         sanitized_reason: Some("checkpointed".to_string()),
+        retryable: None,
+        detail: None,
     };
-    let snapshot = TurnPersistenceSnapshot {
-        checkpoints: vec![TurnCheckpointRecord {
+    let snapshot = TurnPersistenceSnapshot::default()
+        .set_checkpoints(vec![TurnCheckpointRecord {
             checkpoint_id,
             run_id,
             scope: Some(scope.clone()),
@@ -519,10 +524,8 @@ fn turn_checkpoint_public_status_does_not_expose_checkpoint_payload() {
             kind: LoopCheckpointKind::BeforeBlock,
             state_ref: LoopCheckpointStateRef::new("checkpoint:public-status").unwrap(),
             created_at: fixed_time(),
-        }],
-        events: vec![event.clone()],
-        ..TurnPersistenceSnapshot::default()
-    };
+        }])
+        .set_events(vec![event.clone()]);
 
     let public_wire = format!(
         "{}{}{}{:?}",
@@ -829,6 +832,7 @@ fn turn_persistence_snapshot_legacy_run_defaults_resume_disposition_to_none() {
         resolved_model_route: None,
         checkpoint_id: None,
         gate_ref: None,
+        blocked_activity_id: None,
         credential_requirements: vec![],
         failure: None,
         event_cursor: EventCursor(0),
@@ -847,10 +851,7 @@ fn turn_persistence_snapshot_legacy_run_defaults_resume_disposition_to_none() {
 
     // Serialize the snapshot — auth_resume_disposition (the wire key) must be absent
     // in the output when resume_disposition is None.
-    let snapshot = TurnPersistenceSnapshot {
-        runs: vec![record],
-        ..TurnPersistenceSnapshot::default()
-    };
+    let snapshot = TurnPersistenceSnapshot::default().set_runs(vec![record]);
     let mut json_val = serde_json::to_value(&snapshot).expect("serialize snapshot");
 
     // Verify the key is indeed absent (proving our legacy simulation is accurate).
@@ -969,6 +970,7 @@ fn turn_persistence_snapshot_legacy_run_preserves_denied_resume_disposition() {
         resolved_model_route: None,
         checkpoint_id: None,
         gate_ref: None,
+        blocked_activity_id: None,
         credential_requirements: vec![],
         failure: None,
         event_cursor: EventCursor(0),
@@ -985,10 +987,7 @@ fn turn_persistence_snapshot_legacy_run_preserves_denied_resume_disposition() {
         resume_disposition: None,
     };
 
-    let snapshot = TurnPersistenceSnapshot {
-        runs: vec![record],
-        ..TurnPersistenceSnapshot::default()
-    };
+    let snapshot = TurnPersistenceSnapshot::default().set_runs(vec![record]);
     let mut json_val = serde_json::to_value(&snapshot).expect("serialize snapshot");
 
     // Inject the legacy key into the run object to simulate a persisted record

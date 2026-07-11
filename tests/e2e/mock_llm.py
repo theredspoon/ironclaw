@@ -33,13 +33,25 @@ CANNED_RESPONSES = [
     (re.compile(r"link test", re.IGNORECASE),
      "See [the pull request](https://example.com/pr/1) for details."),
     # Reborn v2 download chips: after the agent writes a CSV and a PDF (the
-    # write_file dispatch lives in TOOL_CALL_PATTERNS), it replies referencing
-    # their /workspace paths so the WebUI renders downloadable file chips. Fires
-    # after the tool calls run (match_tool_call dedups the already-run writes).
+    # builtin__write_file dispatch lives in TOOL_CALL_PATTERNS), it replies
+    # referencing their /workspace paths so the WebUI renders downloadable file
+    # chips. Fires after the tool calls run (match_tool_call dedups the
+    # already-run writes).
     (
         re.compile(r"produce a downloadable csv and pdf", re.IGNORECASE),
         "Done — I saved /workspace/report.csv and /workspace/report.pdf. "
         "Both are ready to download.",
+    ),
+    (
+        re.compile(r"reborn write approval file (?P<label>[a-z0-9_-]+)", re.IGNORECASE),
+        "Done - saved the approval test file.",
+    ),
+    (
+        re.compile(
+            r"reborn create automation rename target (?P<label>[a-z0-9_-]+)",
+            re.IGNORECASE,
+        ),
+        "Created the automation for rename testing.",
     ),
     (re.compile(r"\bhello\b|\bhi\b|\bhey\b", re.IGNORECASE), "Hello! How can I help you today?"),
     (re.compile(r"2\s*\+\s*2|two plus two", re.IGNORECASE), "The answer is 4."),
@@ -100,6 +112,8 @@ CANNED_RESPONSES = [
      "I found the information you requested."),
 ]
 DEFAULT_RESPONSE = "I understand your request."
+EMULATE_GITHUB_BEARER = "ghp_emulate_github_token"
+EMULATE_SLACK_BEARER = "emulate-slack-token"
 
 TOOL_FAILURE_TRIGGER = re.compile(r"issue 1780 tool failure", re.IGNORECASE)
 TRUNCATED_TOOL_CALL_TRIGGER = re.compile(
@@ -123,12 +137,52 @@ GCAL_LIFECYCLE_TRIGGER = re.compile(
     r"create a google calendar event titled",
     re.IGNORECASE,
 )
+GDRIVE_UPLOAD_LIFECYCLE_TRIGGER = re.compile(
+    r"upload a google drive file titled",
+    re.IGNORECASE,
+)
+SLACK_DELIVERY_LIFECYCLE_TRIGGER = re.compile(
+    r"send slack canary (?P<marker>\S+) to (?P<channel>[A-Z0-9]+)",
+    re.IGNORECASE,
+)
+GITHUB_RELEASE_SLACK_TRIGGER = re.compile(
+    r"notify slack channel (?P<channel>[A-Z0-9]+) about the latest release in "
+    r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+) with marker "
+    r"(?P<marker>\S+)",
+    re.IGNORECASE,
+)
+CALENDAR_DRIVE_SLACK_TRIGGER = re.compile(
+    r"prepare meeting and notify slack channel (?P<channel>[A-Z0-9]+) with marker "
+    r"(?P<marker>\S+)",
+    re.IGNORECASE,
+)
+GMAIL_SLACK_TRIGGER = re.compile(
+    r"check unread gmail and notify slack channel (?P<channel>[A-Z0-9]+) with "
+    r"marker (?P<marker>\S+)",
+    re.IGNORECASE,
+)
+SLACK_DRIVE_SLACK_TRIGGER = re.compile(
+    r"read slack channel (?P<source>[A-Z0-9]+), look up drive, and notify "
+    r"(?P<target>[A-Z0-9]+) with marker (?P<marker>\S+)",
+    re.IGNORECASE,
+)
 NOTION_SEARCH_LIFECYCLE_TRIGGER = re.compile(
     r"search notion for .*, then search again",
     re.IGNORECASE,
 )
 
 TOOL_CALL_PATTERNS = [
+    # Reborn parallel tool-call port: the Reborn provider-visible builtin tool
+    # names are namespaced/sanitized, while the legacy engine keeps using the
+    # unqualified trigger below.
+    (
+        re.compile(r"reborn parallel echo and time", re.IGNORECASE),
+        "builtin__echo",
+        lambda _: [
+            {"tool_name": "builtin__echo", "arguments": {"message": "parallel-test"}},
+            {"tool_name": "builtin__time", "arguments": {"operation": "now"}},
+        ],
+    ),
     # Parallel tool calls: return both echo and time in one response
     (
         re.compile(r"parallel echo and time", re.IGNORECASE),
@@ -138,24 +192,63 @@ TOOL_CALL_PATTERNS = [
             {"tool_name": "time", "arguments": {"operation": "now"}},
         ],
     ),
+    (
+        re.compile(r"reborn builtin echo (.+)", re.IGNORECASE),
+        "builtin__echo",
+        lambda m: {"message": m.group(1)},
+    ),
+    (
+        re.compile(r"reborn builtin time", re.IGNORECASE),
+        "builtin__time",
+        lambda _: {"operation": "now"},
+    ),
     (re.compile(r"echo (.+)", re.IGNORECASE), "echo", lambda m: {"message": m.group(1)}),
+    # Private tool installs (#5459 P1) — the three test-tools/ fixture bundles
+    # (test-tools/README.md). The provider-visible tool name sanitizes the
+    # dotted capability id's "." to "__" (`encode_provider_tool_name` in
+    # ironclaw_reborn::tool_disclosure); the model gateway's provider_tool_name
+    # validator rejects a raw "." outright ("only ASCII letters, digits, '_',
+    # and '-' are allowed"), so the mock LLM must emit the encoded form, not
+    # the dotted capability id.
+    # The combined pattern is checked first so it doesn't get shadowed by the
+    # single-tool "ascii renderer to draw a" pattern below.
+    (
+        re.compile(r"ascii renderer and market data", re.IGNORECASE),
+        "ascii-renderer__draw",
+        lambda _: [
+            {"tool_name": "ascii-renderer__draw", "arguments": {"subject": "robot"}},
+            {"tool_name": "market-data__snp500", "arguments": {}},
+        ],
+    ),
+    (
+        re.compile(r"ascii renderer to draw a (?P<subject>cat|dog|robot)", re.IGNORECASE),
+        "ascii-renderer__draw",
+        lambda m: {"subject": m.group("subject").lower()},
+    ),
+    (
+        re.compile(r"hacker news tool", re.IGNORECASE),
+        "hacker-news__top_stories",
+        lambda _: {},
+    ),
     # Reborn v2 download chips: one assistant turn writes a CSV and a PDF into
-    # the project workspace. After both results land, match_tool_call dedups
-    # write_file and the conversation falls through to the CANNED_RESPONSES
-    # reply that references the two paths.
+    # the project workspace. Reborn exposes this first-party tool by capability
+    # id; the provider-facing tool name sanitizes dots as "__". After both
+    # results land, match_tool_call dedups builtin__write_file and the
+    # conversation falls through to the CANNED_RESPONSES reply that
+    # references the two paths.
     (
         re.compile(r"produce a downloadable csv and pdf", re.IGNORECASE),
-        "write_file",
+        "builtin__write_file",
         lambda _: [
             {
-                "tool_name": "write_file",
+                "tool_name": "builtin__write_file",
                 "arguments": {
                     "path": "/workspace/report.csv",
                     "content": "name,score\nalice,90\nbob,85\n",
                 },
             },
             {
-                "tool_name": "write_file",
+                "tool_name": "builtin__write_file",
                 "arguments": {
                     "path": "/workspace/report.pdf",
                     "content": (
@@ -165,6 +258,30 @@ TOOL_CALL_PATTERNS = [
                 },
             },
         ],
+    ),
+    (
+        re.compile(r"reborn write approval file (?P<label>[a-z0-9_-]+)", re.IGNORECASE),
+        "builtin__write_file",
+        lambda m: {
+            "path": f"/workspace/reborn-approval-{m.group('label')}.txt",
+            "content": f"approved {m.group('label')}\n",
+        },
+    ),
+    (
+        re.compile(
+            r"reborn create automation rename target (?P<label>[a-z0-9_-]+)",
+            re.IGNORECASE,
+        ),
+        "builtin__trigger_create",
+        lambda m: {
+            "name": f"E2E rename original {m.group('label')}",
+            "prompt": f"E2E automation rename prompt {m.group('label')}",
+            "schedule": {
+                "kind": "once",
+                "at": "2999-06-02T00:00:00",
+                "timezone": "UTC",
+            },
+        },
     ),
     (
         re.compile(
@@ -947,11 +1064,28 @@ def _active_skill_names(messages: list[dict]) -> set[str]:
     return names
 
 
+def _typed_user_content_for_skill_detection(messages: list[dict]) -> str:
+    """Return user-authored text without generated attachment context.
+
+    Reborn appends a model-visible ``<attachments>`` block to user messages so
+    tools can reason about uploaded files and their /workspace storage paths.
+    Those paths are not user-typed slash skills, so the mock's missing-skill
+    heuristic must ignore that generated block.
+    """
+    return re.sub(
+        r"\n+<attachments>.*?</attachments>\s*$",
+        "",
+        _last_user_content(messages),
+        flags=re.DOTALL,
+    )
+
+
 def _missing_explicit_skills(messages: list[dict]) -> list[str]:
     active = _active_skill_names(messages)
     missing = []
     seen = set()
-    for match in re.finditer(r'(^|[\s"\(])/(?P<name>[A-Za-z0-9._-]+)', _last_user_content(messages)):
+    content = _typed_user_content_for_skill_detection(messages)
+    for match in re.finditer(r'(^|[\s"\(])/(?P<name>[A-Za-z0-9._-]+)', content):
         name = match.group("name").lower()
         if name in active or name in seen:
             continue
@@ -985,11 +1119,18 @@ def _derive_skill_name_from_url(url: str) -> str:
     return slug or "remote-skill"
 
 
-def _conversation_wants_slow_response(messages: list[dict]) -> bool:
-    return _conversation_has_user_trigger(
+def _conversation_slow_response_delay(messages: list[dict]) -> float:
+    if _conversation_has_user_trigger(
+        messages,
+        re.compile(r"editable composer slow response", re.IGNORECASE),
+    ):
+        return 5.0
+    if _conversation_has_user_trigger(
         messages,
         re.compile(r"refresh-mid-response|slow response|slowly", re.IGNORECASE),
-    )
+    ):
+        return 2.0
+    return 0.0
 
 
 def _assistant_has_phrase(messages: list[dict], phrase: str) -> bool:
@@ -1284,6 +1425,21 @@ def _normalize_tool_calls(tool_name: str, value: object) -> list[dict]:
     return [{"tool_name": tool_name, "arguments": value}]
 
 
+def _advertised_tool_names(tools: object) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.add(function["name"])
+        elif isinstance(tool.get("name"), str):
+            names.add(tool["name"])
+    return names
+
+
 def match_tool_call(messages: list[dict], has_tools: bool) -> list[dict] | None:
     """Return the list of tool calls to emit for the latest user message.
 
@@ -1458,6 +1614,11 @@ def _find_tool_result(messages: list[dict]) -> dict | None:
     return results[0] if results else None
 
 
+def _find_named_tool_results(messages: list[dict], name: str) -> list[dict]:
+    """Collect fresh tool results for one tool name."""
+    return [result for result in _find_tool_results(messages) if result.get("name") == name]
+
+
 def _tool_results_include_denial(tool_results: list[dict]) -> bool:
     return any(DENIAL_PATTERN.search(tr.get("content", "")) for tr in tool_results)
 
@@ -1595,6 +1756,56 @@ def _extract_calendar_event_id(content: str) -> str | None:
     return None
 
 
+def _extract_drive_file_id(content: str) -> str | None:
+    """Extract the file id from a Google Drive upload/get tool result."""
+    def from_value(value: object) -> str | None:
+        if isinstance(value, dict):
+            for key in ("id", "file_id"):
+                candidate = value.get(key)
+                if isinstance(candidate, str):
+                    return candidate
+            for key in ("file", "output", "result"):
+                candidate = from_value(value.get(key))
+                if candidate:
+                    return candidate
+            for candidate_value in value.values():
+                candidate = from_value(candidate_value)
+                if candidate:
+                    return candidate
+        if isinstance(value, list):
+            for item in value:
+                candidate = from_value(item)
+                if candidate:
+                    return candidate
+        if isinstance(value, str):
+            try:
+                return from_value(json.loads(value))
+            except (json.JSONDecodeError, ValueError, TypeError):
+                return None
+        return None
+
+    try:
+        parsed = json.loads(content)
+        extracted = from_value(parsed)
+        if extracted:
+            return extracted
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    m = re.search(r'"(?:id|file_id)"\s*:\s*"([^"]+)"', content)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_drive_file_id_from_results(tool_results: list[dict]) -> str | None:
+    """Extract a Drive file id from any prior lifecycle tool result."""
+    for result in tool_results:
+        file_id = _extract_drive_file_id(result.get("content", ""))
+        if file_id:
+            return file_id
+    return None
+
+
 def _tomorrow_10am_utc() -> str:
     """Return an RFC3339 timestamp for tomorrow at 10:00 UTC."""
     from datetime import datetime, timedelta, timezone
@@ -1622,16 +1833,33 @@ async def _send_sse(resp: web.StreamResponse, data: dict):
     await resp.write(f"data: {json.dumps(data)}\n\n".encode())
 
 
-def match_special_response(messages: list[dict], has_tools: bool) -> dict | None:
+def _preferred_tool_name(available_tool_names: set[str], legacy: str) -> str:
+    reborn_name = {
+        "echo": "builtin__echo",
+        "time": "builtin__time",
+    }.get(legacy)
+    if reborn_name and reborn_name in available_tool_names:
+        return reborn_name
+    return legacy
+
+
+def match_special_response(
+    messages: list[dict],
+    has_tools: bool,
+    available_tool_names: set[str] | None = None,
+) -> dict | None:
     """Deterministic issue-specific responses for agent-loop recovery tests."""
     last_user = _last_user_content(messages)
+    available_tool_names = available_tool_names or set()
+    echo_tool = _preferred_tool_name(available_tool_names, "echo")
+    time_tool = _preferred_tool_name(available_tool_names, "time")
 
     if _conversation_has_user_trigger(messages, LOOP_FOREVER_TRIGGER):
         if has_tools:
             return {
                 "type": "tool_call",
                 "tool_call": {
-                    "tool_name": "echo",
+                    "tool_name": echo_tool,
                     "arguments": {"message": "loop-iteration"},
                 },
             }
@@ -1645,7 +1873,7 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
             return {
                 "type": "truncated_tool_call",
                 "tool_call": {
-                    "tool_name": "time",
+                    "tool_name": time_tool,
                     "arguments": {},
                 },
                 "content": "Attempting a tool call but the response was truncated.",
@@ -1659,7 +1887,7 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
         return {
             "type": "tool_call",
             "tool_call": {
-                "tool_name": "time",
+                "tool_name": time_tool,
                 "arguments": {"operation": "broken-operation"},
             },
         }
@@ -1676,12 +1904,18 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
         if n == 0 and has_tools:
             return {
                 "type": "tool_call",
-                "tool_call": {"tool_name": "echo", "arguments": {"message": "step-one"}},
+                "tool_call": {
+                    "tool_name": echo_tool,
+                    "arguments": {"message": "step-one"},
+                },
             }
         if n == 1 and has_tools:
             return {
                 "type": "tool_call",
-                "tool_call": {"tool_name": "time", "arguments": {"operation": "now"}},
+                "tool_call": {
+                    "tool_name": time_tool,
+                    "arguments": {"operation": "now"},
+                },
             }
         return {
             "type": "text",
@@ -1693,7 +1927,7 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
     if m and has_tools:
         owner = m.group("owner")
         repo = m.group("repo")
-        tool_results = _find_tool_results(messages)
+        tool_results = _find_named_tool_results(messages, "github")
         n = len(tool_results)
         if n == 0:
             return {
@@ -1750,7 +1984,7 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
     m = GMAIL_ROUNDTRIP_TRIGGER.search(last_user)
     if m and has_tools:
         email = m.group("email")
-        tool_results = _find_tool_results(messages)
+        tool_results = _find_named_tool_results(messages, "gmail")
         n = len(tool_results)
         if n == 0:
             subject = _extract_canary_subject(last_user)
@@ -1798,7 +2032,7 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
 
     # ── Lifecycle canary: Google Calendar create → list → delete ─────────
     if GCAL_LIFECYCLE_TRIGGER.search(last_user) and has_tools:
-        tool_results = _find_tool_results(messages)
+        tool_results = _find_named_tool_results(messages, "google_calendar")
         n = len(tool_results)
         if n == 0:
             title = _extract_canary_title(last_user)
@@ -1846,6 +2080,209 @@ def match_special_response(messages: list[dict], has_tools: bool) -> dict | None
             "type": "text",
             "text": "google_calendar lifecycle complete. Event created, verified, and deleted.",
         }
+
+    # ── Lifecycle canary: Google Drive upload → download ────────────────
+    if GDRIVE_UPLOAD_LIFECYCLE_TRIGGER.search(last_user) and has_tools:
+        tool_results = _find_named_tool_results(messages, "google_drive")
+        n = len(tool_results)
+        title = _extract_canary_title(last_user)
+        if n == 0:
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "google_drive",
+                    "arguments": {
+                        "action": "upload_file",
+                        "name": title,
+                        "content": f"Canary Google Drive content for {title}",
+                        "mime_type": "text/plain",
+                    },
+                },
+            }
+        if n == 1:
+            file_id = _extract_drive_file_id_from_results(tool_results)
+            if file_id:
+                return {
+                    "type": "tool_call",
+                    "tool_call": {
+                        "tool_name": "google_drive",
+                        "arguments": {"action": "download_file", "file_id": file_id},
+                    },
+                }
+        return {
+            "type": "text",
+            "text": "google_drive lifecycle complete. File uploaded and downloaded.",
+        }
+
+    # ── Lifecycle canary: Slack send through the real extension ─────────
+    m = SLACK_DELIVERY_LIFECYCLE_TRIGGER.search(last_user)
+    if m and has_tools:
+        tool_results = _find_named_tool_results(messages, "slack_tool")
+        if not tool_results:
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "slack_tool",
+                    "arguments": {
+                        "action": "send_message",
+                        "channel": m.group("channel"),
+                        "text": m.group("marker"),
+                    },
+                },
+            }
+        return {
+            "type": "text",
+            "text": "slack delivery lifecycle complete. Message sent exactly once.",
+        }
+
+    # ── Cross-provider canary: GitHub release → Slack ───────────────────
+    m = GITHUB_RELEASE_SLACK_TRIGGER.search(last_user)
+    if m and has_tools:
+        github_results = _find_named_tool_results(messages, "github")
+        slack_results = _find_named_tool_results(messages, "slack_tool")
+        if not github_results:
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "github",
+                    "arguments": {
+                        "action": "list_releases",
+                        "owner": m.group("owner"),
+                        "repo": m.group("repo"),
+                        "limit": 1,
+                    },
+                },
+            }
+        if not slack_results:
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "slack_tool",
+                    "arguments": {
+                        "action": "send_message",
+                        "channel": m.group("channel"),
+                        "text": m.group("marker"),
+                    },
+                },
+            }
+        return {
+            "type": "text",
+            "text": "github release to slack lifecycle complete.",
+        }
+
+    # ── Cross-provider canary: Calendar + Drive → Slack ─────────────────
+    m = CALENDAR_DRIVE_SLACK_TRIGGER.search(last_user)
+    if m and has_tools:
+        if not _find_named_tool_results(messages, "google_calendar"):
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "google_calendar",
+                    "arguments": {
+                        "action": "list_events",
+                        "calendar_id": "primary",
+                        "time_min": "2026-01-01T00:00:00Z",
+                        "max_results": 5,
+                        "query": "PepsiCo",
+                    },
+                },
+            }
+        if not _find_named_tool_results(messages, "google_drive"):
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "google_drive",
+                    "arguments": {
+                        "action": "list_files",
+                        "query": "name contains 'PepsiCo'",
+                        "page_size": 5,
+                    },
+                },
+            }
+        if not _find_named_tool_results(messages, "slack_tool"):
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "slack_tool",
+                    "arguments": {
+                        "action": "send_message",
+                        "channel": m.group("channel"),
+                        "text": m.group("marker"),
+                    },
+                },
+            }
+        return {"type": "text", "text": "calendar drive to slack complete."}
+
+    # ── Cross-provider canary: Gmail → Slack ────────────────────────────
+    m = GMAIL_SLACK_TRIGGER.search(last_user)
+    if m and has_tools:
+        if not _find_named_tool_results(messages, "gmail"):
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "gmail",
+                    "arguments": {
+                        "action": "list_messages",
+                        "query": "is:unread",
+                        "max_results": 5,
+                    },
+                },
+            }
+        if not _find_named_tool_results(messages, "slack_tool"):
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "slack_tool",
+                    "arguments": {
+                        "action": "send_message",
+                        "channel": m.group("channel"),
+                        "text": m.group("marker"),
+                    },
+                },
+            }
+        return {"type": "text", "text": "gmail to slack complete."}
+
+    # ── Cross-provider canary: Slack → Drive → Slack ────────────────────
+    m = SLACK_DRIVE_SLACK_TRIGGER.search(last_user)
+    if m and has_tools:
+        slack_results = _find_named_tool_results(messages, "slack_tool")
+        if not slack_results:
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "slack_tool",
+                    "arguments": {
+                        "action": "get_channel_history",
+                        "channel": m.group("source"),
+                        "limit": 10,
+                    },
+                },
+            }
+        if not _find_named_tool_results(messages, "google_drive"):
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "google_drive",
+                    "arguments": {
+                        "action": "list_files",
+                        "query": "name contains 'Reborn QA Brief'",
+                        "page_size": 5,
+                    },
+                },
+            }
+        if len(slack_results) == 1:
+            return {
+                "type": "tool_call",
+                "tool_call": {
+                    "tool_name": "slack_tool",
+                    "arguments": {
+                        "action": "send_message",
+                        "channel": m.group("target"),
+                        "text": m.group("marker"),
+                    },
+                },
+            }
+        return {"type": "text", "text": "slack drive to slack complete."}
 
     # ── Lifecycle canary: Notion search → search again ────────────────────
     if NOTION_SEARCH_LIFECYCLE_TRIGGER.search(last_user) and has_tools:
@@ -1914,11 +2351,14 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     _last_chat_request = body
     messages = body.get("messages", [])
     stream = body.get("stream", False)
-    has_tools = bool(body.get("tools"))
+    tools = body.get("tools")
+    has_tools = bool(tools)
+    available_tool_names = _advertised_tool_names(tools)
     cid = f"mock-{uuid.uuid4().hex[:8]}"
 
-    if _conversation_wants_slow_response(messages):
-        await asyncio.sleep(2.0)
+    slow_response_delay = _conversation_slow_response_delay(messages)
+    if slow_response_delay > 0:
+        await asyncio.sleep(slow_response_delay)
 
     # Job-mode conversations (background routine/job execution)
     job_resp = match_job_response(messages, has_tools)
@@ -1935,7 +2375,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
 
     # Special chat-loop recovery cases that intentionally override the normal
     # tool-result summary path (for example, the looping case).
-    special = match_special_response(messages, has_tools)
+    special = match_special_response(messages, has_tools, available_tool_names)
     if special and _conversation_has_user_trigger(messages, LOOP_FOREVER_TRIGGER):
         return await _dispatch_special_response(request, cid, stream, special)
     # Multi-step chain: must bypass tool-result-summary to issue second tool call
@@ -1946,6 +2386,12 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
         GITHUB_ISSUE_LIFECYCLE_TRIGGER,
         GMAIL_ROUNDTRIP_TRIGGER,
         GCAL_LIFECYCLE_TRIGGER,
+        GDRIVE_UPLOAD_LIFECYCLE_TRIGGER,
+        SLACK_DELIVERY_LIFECYCLE_TRIGGER,
+        GITHUB_RELEASE_SLACK_TRIGGER,
+        CALENDAR_DRIVE_SLACK_TRIGGER,
+        GMAIL_SLACK_TRIGGER,
+        SLACK_DRIVE_SLACK_TRIGGER,
         NOTION_SEARCH_LIFECYCLE_TRIGGER,
     ):
         if special and _conversation_has_user_trigger(messages, lifecycle_trigger):
@@ -2268,6 +2714,19 @@ def _is_google_token_url(url: str) -> bool:
     return "googleapis.com" in lowered or "accounts.google.com" in lowered
 
 
+def _is_github_token_url(url: str) -> bool:
+    if not url:
+        return False
+    return "github.com/login/oauth/access_token" in url.lower()
+
+
+def _is_slack_token_url(url: str) -> bool:
+    if not url:
+        return False
+    lowered = url.lower()
+    return "slack.com/api/oauth.v2.access" in lowered
+
+
 async def oauth_exchange(request: web.Request) -> web.Response:
     """Mock OAuth token exchange proxy for E2E tests.
 
@@ -2309,6 +2768,21 @@ async def oauth_exchange(request: web.Request) -> web.Response:
         if live_refresh:
             resp["refresh_token"] = live_refresh
         return web.json_response(resp)
+
+    if _is_github_token_url(data.get("token_url", "")):
+        return web.json_response({
+            access_token_field: EMULATE_GITHUB_BEARER,
+            "refresh_token": "mock-github-refresh-token",
+            "expires_in": 3600,
+        })
+
+    if _is_slack_token_url(data.get("token_url", "")):
+        return web.json_response({
+            access_token_field: EMULATE_SLACK_BEARER,
+            "token_type": "bot",
+            "scope": "chat:write,channels:read,channels:history,users:read",
+            "bot_user_id": "B_EMULATE_REBORN_BOT",
+        })
 
     return web.json_response({
         access_token_field: f"mock-token-{code}",
@@ -2692,9 +3166,15 @@ def main():
     async def get_last_chat_request(request: web.Request) -> web.Response:
         return web.json_response(_last_chat_request or {})
 
+    async def reset_chat_requests(request: web.Request) -> web.Response:
+        global _last_chat_request
+        _last_chat_request = None
+        return web.json_response({"ok": True})
+
     app.router.add_post("/__mock/set_github_api_url", set_github_api_url)
     app.router.add_get("/__mock/github_api_url", get_github_api_url)
     app.router.add_get("/__mock/last_chat_request", get_last_chat_request)
+    app.router.add_post("/__mock/chat_requests/reset", reset_chat_requests)
     # Mock MCP server endpoints
     app.router.add_post("/mcp", mcp_endpoint)
     app.router.add_post("/mcp-400", mcp_endpoint_400)

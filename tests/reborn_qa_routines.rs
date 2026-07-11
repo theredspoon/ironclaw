@@ -18,7 +18,10 @@
 //! carrying the routine prompt.
 
 #[allow(dead_code)]
-#[path = "support/reborn/mod.rs"]
+#[path = "support/reborn_parity_qa/mod.rs"]
+mod parity_qa_support;
+#[allow(dead_code)]
+#[path = "integration/support/mod.rs"]
 mod reborn_support;
 mod support;
 
@@ -27,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ironclaw_approvals::AutoApproveSettingInput;
 use ironclaw_host_api::{
     AgentId, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
     ExecutionContext, ExtensionId, GrantConstraints, MountView, NetworkPolicy, Principal,
@@ -48,11 +52,9 @@ use ironclaw_reborn_composition::{
 use ironclaw_triggers::{TriggerId, TriggerPollerWorkerConfig, TriggerRunStatus, TriggerState};
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 use ironclaw_turns::TurnStatus;
-use reborn_support::{
-    harness::RebornBinaryE2EHarness,
-    model_replay::{
-        RebornModelReplayStep, RebornScriptedProviderToolCall, RebornTraceReplayModelGateway,
-    },
+use parity_qa_support::binary_e2e::RebornBinaryE2EHarness;
+use parity_qa_support::model_replay::{
+    RebornModelReplayStep, RebornScriptedProviderToolCall, RebornTraceReplayModelGateway,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex as TokioMutex;
@@ -79,8 +81,11 @@ async fn run_routine_creation(case: RoutineCreationCase) {
                 json!({
                     "name": case.trigger_name,
                     "prompt": case.prompt,
-                    "cron": case.cron,
-                    "timezone": "UTC",
+                    "schedule": {
+                        "kind": "cron",
+                        "expression": case.cron,
+                        "timezone": "UTC"
+                    },
                 }),
             )],
             expected_tool_results: Vec::new(),
@@ -289,7 +294,24 @@ async fn build_qa_fire_runtime(
                 }),
         )
         .with_model_gateway_override(gateway);
-    build_reborn_runtime(input).await.expect("runtime builds")
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    seed_qa_fire_auto_approve(&runtime).await;
+    runtime
+}
+
+async fn seed_qa_fire_auto_approve(runtime: &RebornRuntime) {
+    let auto_approve = runtime
+        .services()
+        .local_dev_auto_approve_settings_for_test()
+        .expect("QA fire runtime exposes local-dev auto-approve settings");
+    auto_approve
+        .set(AutoApproveSettingInput {
+            scope: trigger_management_execution_context().resource_scope,
+            enabled: true,
+            updated_by: Principal::User(UserId::new(QA_USER).expect("QA user id")),
+        })
+        .await
+        .expect("seed QA fire global auto-approve");
 }
 
 #[tokio::test]
@@ -307,8 +329,11 @@ async fn reborn_qa_routine_created_by_tool_fires_and_runs_routine_prompt() {
         json!({
             "name": "Deployment health watcher",
             "prompt": QA_ROUTINE_PROMPT,
-            "cron": "*/5 * * * *",
-            "timezone": "UTC",
+            "schedule": {
+                "kind": "cron",
+                "expression": "*/5 * * * *",
+                "timezone": "UTC"
+            },
         }),
     )
     .await;
@@ -462,8 +487,11 @@ async fn reborn_qa_fired_routine_executes_action_and_finalizes_reply() {
         json!({
             "name": "Deployment health watcher action",
             "prompt": QA_ROUTINE_PROMPT,
-            "cron": "*/5 * * * *",
-            "timezone": "UTC",
+            "schedule": {
+                "kind": "cron",
+                "expression": "*/5 * * * *",
+                "timezone": "UTC"
+            },
         }),
     )
     .await;
