@@ -65,7 +65,7 @@ jobs:
   auth-smoke:
     name: Auth Smoke
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'auth-smoke'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -97,7 +97,7 @@ jobs:
   auth-full:
     name: Auth Full
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'auth-full'))
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -129,7 +129,7 @@ jobs:
   auth-channels:
     name: Auth Channels
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'auth-channels'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -161,7 +161,7 @@ jobs:
   auth-live-seeded:
     name: Auth Live Seeded
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'auth-live-seeded'))
     runs-on: ubuntu-latest
     timeout-minutes: 75
@@ -251,7 +251,7 @@ jobs:
   auth-browser-consent:
     name: Auth Browser Consent
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'auth-browser-consent'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -353,7 +353,7 @@ jobs:
   workflow-canary:
     name: Workflow Canary
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'workflow-canary'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -408,7 +408,7 @@ jobs:
   deterministic-replay:
     name: Deterministic Replay
     if: >
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *') ||
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *') ||
       (github.event_name == 'workflow_dispatch' &&
       (inputs.lane == 'all' || inputs.lane == 'deterministic-replay'))
     runs-on: ubuntu-latest
@@ -551,7 +551,7 @@ jobs:
     name: Private OAuth Live
     if: >
       (github.event_name == 'workflow_dispatch' && (inputs.lane == 'all' || inputs.lane == 'private-oauth')) ||
-      (github.event_name == 'schedule' && github.event.schedule == '0 */6 * * *' && vars.LIVE_CANARY_PRIVATE_OAUTH_ENABLED == 'true')
+      (github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' && github.event.schedule == '0 */6 * * *' && vars.LIVE_CANARY_PRIVATE_OAUTH_ENABLED == 'true')
     runs-on: [self-hosted, ironclaw-live]
     timeout-minutes: 120
     env:
@@ -799,7 +799,7 @@ jobs:
         # whole canary run. Gated on schedule + workflow_dispatch only —
         # PR-triggered runs (if any) skip the post to keep noise out of
         # the channel.
-        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        if: ${{ github.event_name == 'schedule' && github.repository == 'nearai/ironclaw' || github.event_name == 'workflow_dispatch' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           CANARY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

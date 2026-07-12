@@ -13,7 +13,7 @@ permissions:
 jobs:
   sync:
     if: github.repository == 'theredspoon/ironclaw'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     env:
       BASE_BRANCH: pipeline-control
       SYNC_BRANCH: sync/pipeline-control-upstream

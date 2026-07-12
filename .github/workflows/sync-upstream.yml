@@ -12,7 +12,7 @@ permissions:
 jobs:
   sync:
     if: github.repository == 'theredspoon/ironclaw'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     env:
       UPSTREAM_MIRROR_BRANCH: upstream-main
       INTEGRATION_BRANCH: native-matrix-channel-pilot
