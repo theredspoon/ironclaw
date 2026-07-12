@@ -1,0 +1,152 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  sync:
+    if: github.repository == 'theredspoon/ironclaw'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_MIRROR_BRANCH: upstream-main
+      INTEGRATION_BRANCH: native-matrix-channel-pilot
+      SYNC_BRANCH: sync/native-matrix-pilot
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Generate upstream sync token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.PIPELINE_CONTROL_SYNC_CLIENT_ID }}
+          private-key: ${{ secrets.PIPELINE_CONTROL_SYNC_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Fetch upstream
+        run: |
+          git fetch --no-tags origin "+refs/heads/${INTEGRATION_BRANCH}:refs/remotes/origin/${INTEGRATION_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${UPSTREAM_MIRROR_BRANCH}:refs/remotes/origin/${UPSTREAM_MIRROR_BRANCH}" || true
+          git remote add upstream https://github.com/nearai/ironclaw.git
+          git fetch --no-tags upstream "+refs/heads/main:refs/remotes/upstream/main"
+
+      - name: Fast-forward exact upstream mirror
+        id: mirror
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git show-ref --verify --quiet "refs/remotes/origin/${UPSTREAM_MIRROR_BRANCH}"; then
+            if git merge-base --is-ancestor "origin/${UPSTREAM_MIRROR_BRANCH}" upstream/main; then
+              git push origin "upstream/main:refs/heads/${UPSTREAM_MIRROR_BRANCH}"
+              echo "result=fast-forward" >> "$GITHUB_OUTPUT"
+            else
+              echo "result=diverged" >> "$GITHUB_OUTPUT"
+              echo "::error::${UPSTREAM_MIRROR_BRANCH} has commits that are not in nearai/main; refusing to overwrite exact mirror"
+              exit 1
+            fi
+          else
+            git push origin "upstream/main:refs/heads/${UPSTREAM_MIRROR_BRANCH}"
+            echo "result=created" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check integration branch status
+        id: integration
+        run: |
+          git fetch --no-tags origin \
+            "+refs/heads/${INTEGRATION_BRANCH}:refs/remotes/origin/${INTEGRATION_BRANCH}" \
+            "+refs/heads/${UPSTREAM_MIRROR_BRANCH}:refs/remotes/origin/${UPSTREAM_MIRROR_BRANCH}"
+          if git merge-base --is-ancestor "origin/${UPSTREAM_MIRROR_BRANCH}" "origin/${INTEGRATION_BRANCH}"; then
+            echo "needs_pr=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_pr=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Matrix pilot sync branch
+        if: steps.integration.outputs.needs_pr == 'true'
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" || true
+          git checkout -B "${SYNC_BRANCH}" "origin/${INTEGRATION_BRANCH}"
+          if ! git merge --no-edit --allow-unrelated-histories -X theirs "origin/${UPSTREAM_MIRROR_BRANCH}"; then
+            git merge --abort || true
+            echo "::error::Unable to import ${UPSTREAM_MIRROR_BRANCH} into ${INTEGRATION_BRANCH}; manual Matrix pilot sync required"
+            exit 1
+          fi
+
+          for stale_module in \
+            crates/ironclaw_reborn/src/local_trigger_access.rs \
+            crates/ironclaw_turns/src/memory.rs \
+            crates/ironclaw_memory/tests/repo_in_memory_contract.rs \
+            crates/ironclaw_memory/tests/memory_filesystem_contract.rs \
+            crates/ironclaw_memory/tests/memory_backend_contract.rs \
+            crates/ironclaw_memory/tests/repo_filesystem_contract.rs
+          do
+            if ! git cat-file -e "origin/${UPSTREAM_MIRROR_BRANCH}:${stale_module}" 2>/dev/null; then
+              git rm -f --ignore-unmatch "${stale_module}"
+            fi
+          done
+
+          if ! grep -Fq 'Downstream sync exception: nearai/main currently tracks these' .gitignore; then
+            cat >> .gitignore <<'EOF'
+
+          # Downstream sync exception: nearai/main currently tracks these
+          # source/control assets even though broad local-ignore rules also
+          # match them. Keep the explicit exceptions in generated sync PRs so
+          # the tracked-ignored-files guard rejects only accidental local output.
+          !.claude/
+          !.claude/**
+          !.codegraph/
+          !.codegraph/.gitignore
+          !crates/ironclaw_webui_v2_static/static/dist/
+          !crates/ironclaw_webui_v2_static/static/dist/**
+          EOF
+          fi
+
+          git add .gitignore
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: normalize upstream import"
+          fi
+
+          git push origin "HEAD:refs/heads/${SYNC_BRANCH}" --force-with-lease
+
+      - name: Open Matrix pilot sync PR
+        if: steps.integration.outputs.needs_pr == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          existing_pr="$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -F state=open \
+              -F base="${INTEGRATION_BRANCH}" \
+              -F head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}" \
+              --jq '.[0].number // empty'
+          )"
+
+          if [[ -n "$existing_pr" ]]; then
+            echo "Existing Matrix pilot sync PR: #${existing_pr}"
+          else
+            body="Automated sync from nearai/ironclaw. The \`${UPSTREAM_MIRROR_BRANCH}\` branch is an exact fast-forward mirror of \`nearai/main\`; this PR imports it into \`${INTEGRATION_BRANCH}\` for CI with upstream source winning unrelated-history conflicts. When checks pass, the Matrix pilot branch is fast-forwarded so upstream ancestry is preserved."
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f base="${INTEGRATION_BRANCH}" \
+              -f head="${GITHUB_REPOSITORY_OWNER}:${SYNC_BRANCH}" \
+              -f title="sync: update Matrix pilot with nearai/main $(date +%Y-%m-%d)" \
+              -f body="${body}" \
+              --jq '.html_url'
+          fi

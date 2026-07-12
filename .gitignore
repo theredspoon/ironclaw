@@ -1,0 +1,18 @@
+# CI Automation Branch .gitignore
+
+# This branch is minimal by design - it should only contain:
+# - .github/workflows/ (3 automation workflows)
+# - README.md
+# - .gitignore
+
+# Ignore everything that might accidentally get added
+*
+
+# But allow our specific files
+!/.gitignore
+!/README.md
+!/.github/
+!/.github/workflows/
+!/.github/workflows/sync-upstream.yml
+!/.github/workflows/mirror-to-deployment-target.yml
+!/.github/workflows/auto-ff-matrix-pilot-sync.yml
