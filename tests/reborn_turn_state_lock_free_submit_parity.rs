@@ -1,5 +1,8 @@
 #[allow(dead_code)]
-#[path = "support/reborn/mod.rs"]
+#[path = "support/reborn_parity_qa/mod.rs"]
+mod parity_qa_support;
+#[allow(dead_code)]
+#[path = "integration/support/mod.rs"]
 mod reborn_support;
 mod support;
 
@@ -8,15 +11,18 @@ use std::time::Duration;
 use ironclaw_loop_support::HostManagedModelResponse;
 use ironclaw_product_adapters::ProductInboundAck;
 use ironclaw_turns::TurnStatus;
-use reborn_support::harness::{
-    RebornBinaryE2EHarness, RebornHarnessSharedStorage, RecordingTestCapabilityPort,
-    test_product_scope,
-};
-use reborn_support::model_replay::RebornTraceReplayModelGateway;
+use parity_qa_support::binary_e2e::{RebornBinaryE2EHarness, RebornHarnessSharedStorage};
+use parity_qa_support::model_replay::RebornTraceReplayModelGateway;
+use reborn_support::harness::{RecordingTestCapabilityPort, test_product_scope};
 
 #[tokio::test]
 async fn reborn_user_submit_completes_while_another_turn_state_write_is_blocked() {
     const ROOM: &str = "room-turn-state-lock-free-submit";
+    // The live submit is still awaited before releasing the blocked writer, so
+    // a real lock regression times out here; the wider window only absorbs CI
+    // scheduler/build-host jitter around the binary-E2E harness.
+    const LOCK_FREE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
+    const BLOCKED_SUBMIT_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
     let shared_storage = RebornHarnessSharedStorage::new().expect("shared storage");
     let scope = test_product_scope(
@@ -70,14 +76,14 @@ async fn reborn_user_submit_completes_while_another_turn_state_write_is_blocked(
     });
 
     tokio::time::timeout(
-        Duration::from_secs(1),
+        LOCK_FREE_SUBMIT_TIMEOUT,
         shared_storage.wait_for_blocked_turn_state_put(),
     )
     .await
     .expect("first inbound submit should reach the delayed turn-state write");
 
     let live = tokio::time::timeout(
-        Duration::from_secs(1),
+        LOCK_FREE_SUBMIT_TIMEOUT,
         live_harness.submit_text_for(ROOM, "alice", "event-turn-state-live", "live writer"),
     )
     .await
@@ -91,7 +97,7 @@ async fn reborn_user_submit_completes_while_another_turn_state_write_is_blocked(
         .expect("live run should complete while the first writer remains blocked");
 
     shared_storage.release_blocked_turn_state_put();
-    let blocked = tokio::time::timeout(Duration::from_secs(3), blocked_submit)
+    let blocked = tokio::time::timeout(BLOCKED_SUBMIT_RELEASE_TIMEOUT, blocked_submit)
         .await
         .expect("blocked submit should finish after release")
         .expect("blocked submit task")

@@ -13,7 +13,7 @@ use crate::local_dev_capability_policy::{
     LocalDevApprovalPolicyAction, LocalDevCapabilityPolicy, LocalDevCapabilityPolicyError,
     local_dev_one_shot_lease_approval,
 };
-use crate::outbound_delivery_capability_surface::OUTBOUND_DELIVERY_TARGET_SET_CAPABILITY_ID;
+use crate::outbound::OUTBOUND_DELIVERY_TARGET_SET_CAPABILITY_ID;
 
 use super::local_dev::extension_surface::LocalDevExtensionSurfaceSource;
 
@@ -75,8 +75,12 @@ impl LocalDevApprovalLeaseTermsProvider {
                 tracing::error!(%error, "local-dev extension approval lease terms are unavailable");
                 lease_terms_unavailable()
             })?;
+        // Lease terms resolve for the user whose run raised the gate; the
+        // owner filter in `grants` then behaves exactly like dispatch did
+        // (#5459 P1): their own private capability resolves, anyone else's
+        // yields no grant and the lease stays unavailable.
         let Some(grant) = surface
-            .grants(extension_id)
+            .grants(extension_id, &gate.resource_scope().user_id)
             .into_iter()
             .find(|grant| grant.capability == *capability)
         else {
@@ -226,12 +230,10 @@ mod tests {
     use ironclaw_product_workflow::approval_gate_ref;
     use ironclaw_turns::{GateRef, TurnRunId};
 
-    use crate::{
-        extension_lifecycle::ActiveExtensionCapability,
-        local_dev_capability_policy::local_dev_capability_policy,
-        runtime::local_dev::extension_surface::{
-            LocalDevExtensionSurface, LocalDevExtensionSurfaceSource,
-        },
+    use crate::extension_host::extension_lifecycle::ActiveExtensionCapability;
+    use crate::local_dev_capability_policy::local_dev_capability_policy;
+    use crate::runtime::local_dev::extension_surface::{
+        LocalDevExtensionSurface, LocalDevExtensionSurfaceSource,
     };
 
     use super::*;
@@ -248,6 +250,8 @@ mod tests {
                 effects: vec![EffectKind::Network, EffectKind::UseSecret],
                 default_permission: PermissionMode::Allow,
                 runtime_credentials: Vec::new(),
+                network_targets: Vec::new(),
+                owner: ironclaw_extensions::InstallationOwner::Tenant,
             }]),
         );
         let terms_provider = LocalDevApprovalLeaseTermsProvider::new(
@@ -275,13 +279,13 @@ mod tests {
             .expect("extension lease terms");
 
         assert_eq!(approval.issued_by, Principal::HostRuntime);
-        assert_eq!(approval.max_invocations, Some(1));
+        assert_eq!(approval.constraints.max_invocations, Some(1));
         assert_eq!(
-            approval.allowed_effects,
+            approval.constraints.allowed_effects,
             vec![EffectKind::Network, EffectKind::UseSecret]
         );
         assert_eq!(
-            approval.secrets,
+            approval.constraints.secrets,
             Vec::<SecretHandle>::new(),
             "test capability has no runtime credential handles"
         );
@@ -318,6 +322,8 @@ mod tests {
                     },
                     required: true,
                 }],
+                network_targets: Vec::new(),
+                owner: ironclaw_extensions::InstallationOwner::Tenant,
             }]),
         );
         let terms_provider = LocalDevApprovalLeaseTermsProvider::new(
@@ -345,16 +351,16 @@ mod tests {
             .expect("extension spawn lease terms");
 
         assert_eq!(approval.issued_by, Principal::HostRuntime);
-        assert_eq!(approval.max_invocations, Some(1));
+        assert_eq!(approval.constraints.max_invocations, Some(1));
         assert_eq!(
-            approval.allowed_effects,
+            approval.constraints.allowed_effects,
             vec![
                 EffectKind::SpawnProcess,
                 EffectKind::Network,
                 EffectKind::UseSecret
             ]
         );
-        assert_eq!(approval.secrets, vec![secret]);
+        assert_eq!(approval.constraints.secrets, vec![secret]);
     }
 
     #[tokio::test]
@@ -369,6 +375,8 @@ mod tests {
                 effects: vec![EffectKind::Network],
                 default_permission: PermissionMode::Allow,
                 runtime_credentials: Vec::new(),
+                network_targets: Vec::new(),
+                owner: ironclaw_extensions::InstallationOwner::Tenant,
             }]),
         );
         let terms_provider = LocalDevApprovalLeaseTermsProvider::new(
@@ -407,6 +415,8 @@ mod tests {
                 effects: vec![EffectKind::Network],
                 default_permission: PermissionMode::Ask,
                 runtime_credentials: Vec::new(),
+                network_targets: Vec::new(),
+                owner: ironclaw_extensions::InstallationOwner::Tenant,
             }]),
         );
         let terms_provider = LocalDevApprovalLeaseTermsProvider::new(
@@ -474,6 +484,8 @@ mod tests {
                 effects: vec![EffectKind::Network],
                 default_permission: PermissionMode::Deny,
                 runtime_credentials: Vec::new(),
+                network_targets: Vec::new(),
+                owner: ironclaw_extensions::InstallationOwner::Tenant,
             }]),
         );
         let terms_provider = LocalDevApprovalLeaseTermsProvider::new(

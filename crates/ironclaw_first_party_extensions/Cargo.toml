@@ -10,6 +10,9 @@ homepage = "https://github.com/nearai/ironclaw"
 repository = "https://github.com/nearai/ironclaw"
 publish = false
 
+[package.metadata.ironclaw]
+layer = "loops"
+
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22.1"
@@ -21,6 +24,7 @@ ironclaw_auth = { path = "../ironclaw_auth" }
 ironclaw_extractors = { path = "../ironclaw_extractors" }
 ironclaw_filesystem = { path = "../ironclaw_filesystem" }
 ironclaw_host_api = { path = "../ironclaw_host_api" }
+ironclaw_observability = { path = "../ironclaw_observability" }
 ironclaw_safety = { path = "../ironclaw_safety" }
 ironclaw_skills = { path = "../ironclaw_skills" }
 regex = "1"

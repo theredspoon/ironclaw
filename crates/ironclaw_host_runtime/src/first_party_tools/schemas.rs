@@ -149,7 +149,7 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
         "schemas/builtin/shell.input.v1.json" => json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Shell command to execute" },
+                "command": { "type": "string", "description": "Shell command to execute. Prefer ONE command that does the whole job: combine steps with '&&' or pipes, or write and run a single script (awk/python) — do NOT issue one command per metric/day/line, and don't re-read files you already have." },
                 "workdir": { "type": "string", "description": "Optional scoped working directory" },
                 "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds" }
             },
@@ -222,6 +222,16 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 "confirmed": {
                     "type": "boolean",
                     "description": "Must be true only after the user has explicitly asked to mint a manual/browser profile-management token in this conversation (default: false)"
+                }
+            },
+            "additionalProperties": false
+        }),
+        "schemas/builtin/trace_commons-account_login_link.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "Must be true only after the user explicitly asked to open a Trace Commons account/profile login link in this conversation (default: false)"
                 }
             },
             "additionalProperties": false
@@ -476,7 +486,11 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Prompt submitted when the trigger fires. Runtime validation caps UTF-8 content at 32768 bytes. Do not embed delivery routing here; when the user asks to send routine or trigger results through an outbound product/channel, first select the target through the visible outbound delivery target capabilities, then create the trigger."
+                    "description": "Prompt submitted when the trigger fires. Runtime validation caps UTF-8 content at 32768 bytes. Write only the action to perform when the trigger fires — direct imperative steps. Never tell the prompt to send results back to the requesting user (each fire's final reply is delivered automatically; use delivery_target_id to route it) — receiving results is routing, never a prompt step, even when phrased as 'send me the result' and even with the requester's own conversation id pinned. When the task itself is to message someone else or post somewhere, that belongs in the prompt with the exact recipient conversation id pinned (resolve it now, while the user is present — e.g. 'Send a joke to the Slack DM D0ABC123 (Firat)'). Do not describe creating, scheduling, or configuring the trigger itself; rewrite the user's scheduling request into the run-time action."
+                },
+                "delivery_target_id": {
+                    "type": "string",
+                    "description": "Optional per-trigger outbound delivery target id from builtin__outbound_delivery_targets_list. When set, this trigger's results are delivered to that target; when omitted, the user's default outbound delivery target at fire time is used. Prefer setting this whenever the user names a destination for this trigger's results."
                 },
                 "schedule": {
                     "description": "When and how often the trigger fires. This value is the schedule object itself. For recurring triggers use {\"kind\":\"cron\",\"expression\":\"0 14 * * 2\",\"timezone\":\"America/Los_Angeles\"}. For one-time triggers use {\"kind\":\"once\",\"at\":\"2026-06-23T14:00:00\",\"timezone\":\"America/Los_Angeles\"}. Do not pass {\"operation\":\"parse\",\"data\":...}.",
@@ -628,4 +642,30 @@ fn response_body_limit_schema(require_save_to: bool) -> Value {
         "default": default,
         "description": description
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_builtin_input_schema_ref;
+
+    #[test]
+    fn trigger_create_prompt_description_warns_against_self_referential_creation_prompts() {
+        // Issue #5505 (generation-time defense): the model must write the
+        // trigger's per-fire action steps, not meta-instructions describing
+        // creating/scheduling the trigger itself — otherwise a fired trigger
+        // re-invokes trigger_create instead of doing the task ("a routine
+        // that creates routines").
+        let schema =
+            resolve_builtin_input_schema_ref("schemas/builtin/trigger_create.input.v1.json")
+                .expect("trigger_create schema is registered");
+        let description = schema["properties"]["prompt"]["description"]
+            .as_str()
+            .expect("prompt description is a string");
+
+        assert!(
+            description
+                .contains("Do not describe creating, scheduling, or configuring the trigger"),
+            "prompt description must warn against self-referential creation prompts: {description}"
+        );
+    }
 }

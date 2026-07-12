@@ -18,7 +18,7 @@
 //!   roots.
 //!
 //! The CLI builds this struct from env vars / config; it does not call into
-//! `ironclaw_reborn` or `ironclaw_llm` directly.
+//! `ironclaw_runner` or `ironclaw_llm` directly.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,17 +28,17 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, Timestamp, UserId};
 #[cfg(any(test, feature = "test-support"))]
 use ironclaw_loop_support::HostManagedModelGateway;
 use ironclaw_loop_support::HostSkillContextSource;
-use ironclaw_reborn::runtime::{
-    DEFAULT_MAX_CONCURRENT_RUNS_PER_USER, DEFAULT_MAX_CONCURRENT_TRIGGER_RUNS,
-    DEFAULT_TURN_RUNNER_WORKER_COUNT,
-};
 use ironclaw_reborn_config::BudgetDefaults;
 #[cfg(feature = "root-llm-provider")]
 use ironclaw_reborn_config::RebornBootConfig;
+use ironclaw_runner::runtime::{
+    DEFAULT_MAX_CONCURRENT_RUNS_PER_USER, DEFAULT_MAX_CONCURRENT_TRIGGER_RUNS,
+    DEFAULT_TURN_RUNNER_WORKER_COUNT, ToolDisclosureMode,
+};
 use ironclaw_triggers::{TriggerId, TriggerPollerWorkerConfig};
 
-use crate::hooks::HooksActivationConfig;
 use crate::input::RebornBuildInput;
+use crate::observability::hooks::HooksActivationConfig;
 
 /// Caller-owned identity for an assembled Reborn runtime.
 ///
@@ -231,6 +231,31 @@ impl Default for TurnRunnerSettings {
     }
 }
 
+impl TurnRunnerSettings {
+    pub fn set_heartbeat_interval(mut self, heartbeat_interval: Duration) -> Self {
+        self.heartbeat_interval = heartbeat_interval;
+        self
+    }
+
+    pub fn set_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
+    }
+
+    pub fn set_worker_count(mut self, worker_count: std::num::NonZeroUsize) -> Self {
+        self.worker_count = Some(worker_count);
+        self
+    }
+
+    pub fn set_max_concurrent_runs_per_user(
+        mut self,
+        max_concurrent_runs_per_user: std::num::NonZeroU32,
+    ) -> Self {
+        self.max_concurrent_runs_per_user = Some(max_concurrent_runs_per_user);
+        self
+    }
+}
+
 /// Completion polling policy for `RebornRuntime::send_user_message`.
 #[derive(Debug, Clone)]
 pub struct PollSettings {
@@ -387,6 +412,7 @@ pub struct RebornRuntimeInput {
     #[cfg(feature = "root-llm-provider")]
     pub boot: Option<RebornBootConfig>,
     pub runner: TurnRunnerSettings,
+    pub tool_disclosure: Option<ToolDisclosureMode>,
     pub trigger_poller: TriggerPollerSettings,
     pub credential_refresh: CredentialRefreshSettings,
     pub trigger_fire_access_checker: Option<Arc<dyn TriggerFireAccessChecker>>,
@@ -421,6 +447,11 @@ pub struct RebornRuntimeInput {
     /// run, so a downstream caller can reconstruct the full step-by-step
     /// trajectory (the sealed runtime otherwise exposes only the final reply).
     pub trajectory_observer: Option<Arc<dyn crate::RebornTrajectoryObserver>>,
+    /// Mints the one-time API bearer returned when an admin creates a user. The
+    /// serve layer supplies a session-store-backed minter; when unset, the admin
+    /// user-management surface stays unwired (create reports unavailable).
+    #[cfg(feature = "webui-v2-beta")]
+    pub admin_api_token_minter: Option<Arc<dyn crate::AdminApiTokenMinter>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) model_gateway_override: Option<Arc<dyn HostManagedModelGateway>>,
     /// Cost table to pair with the model-gateway override. Without this,
@@ -445,6 +476,7 @@ impl RebornRuntimeInput {
             #[cfg(feature = "root-llm-provider")]
             boot: None,
             runner: TurnRunnerSettings::default(),
+            tool_disclosure: None,
             trigger_poller: TriggerPollerSettings::default(),
             credential_refresh: CredentialRefreshSettings::default(),
             trigger_fire_access_checker: None,
@@ -457,6 +489,8 @@ impl RebornRuntimeInput {
             budget_defaults: None,
             budget_event_observer: None,
             trajectory_observer: None,
+            #[cfg(feature = "webui-v2-beta")]
+            admin_api_token_minter: None,
             #[cfg(any(test, feature = "test-support"))]
             model_gateway_override: None,
             #[cfg(any(test, feature = "test-support"))]
@@ -488,12 +522,24 @@ impl RebornRuntimeInput {
         self
     }
 
+    /// Install the admin API-token minter used when an admin creates a user.
+    /// The serve layer builds a session-store-backed minter; without it the
+    /// admin user-management surface stays unwired.
+    #[cfg(feature = "webui-v2-beta")]
+    pub fn with_admin_api_token_minter(
+        mut self,
+        minter: Arc<dyn crate::AdminApiTokenMinter>,
+    ) -> Self {
+        self.admin_api_token_minter = Some(minter);
+        self
+    }
+
     /// Install a trajectory observer that receives each capability/tool call +
     /// result during a run (for downstream step-by-step trajectory capture).
     ///
     /// The observer receives a **bounded safe preview** of arguments/results
     /// (long strings truncated, large arrays capped — see
-    /// [`crate::trajectory_observer`]), keeping a downstream logs/UI/telemetry
+    /// [`crate::observability::trajectory_observer`]), keeping a downstream logs/UI/telemetry
     /// sink within the same boundary the model-visible display path enforces.
     /// A consumer that needs the unbounded raw payloads (and owns its own
     /// redaction/access control) must opt in via
@@ -508,8 +554,11 @@ impl RebornRuntimeInput {
         mut self,
         observer: Arc<dyn crate::RebornTrajectoryObserver>,
     ) -> Self {
-        self.trajectory_observer =
-            Some(crate::trajectory_observer::SafePreviewTrajectoryObserver::wrap(observer));
+        self.trajectory_observer = Some(
+            crate::observability::trajectory_observer::SafePreviewTrajectoryObserver::wrap(
+                observer,
+            ),
+        );
         self
     }
 
@@ -549,6 +598,11 @@ impl RebornRuntimeInput {
 
     pub fn with_runner_settings(mut self, runner: TurnRunnerSettings) -> Self {
         self.runner = runner;
+        self
+    }
+
+    pub fn with_tool_disclosure(mut self, mode: ToolDisclosureMode) -> Self {
+        self.tool_disclosure = Some(mode);
         self
     }
 

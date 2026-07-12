@@ -94,6 +94,249 @@ async fn webui_event_stream_drains_live_reasoning_projection_from_update_source(
     }));
 }
 
+#[tokio::test]
+async fn webui_event_stream_drains_live_assistant_text_projection_from_update_source() {
+    let fixture = live_projection_fixture("webui-text");
+    let user_id = fixture.user_id.clone();
+    let thread_id = fixture.thread_id.clone();
+    let scope = fixture.scope.clone();
+    let run_id = TurnRunId::new();
+    let secret_like_token = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+
+    for safe_text in [
+        "partial answer".to_string(),
+        format!("partial answer with {secret_like_token}"),
+    ] {
+        fixture
+            .sink
+            .publish_loop_milestone(LoopHostMilestone {
+                scope: scope.clone(),
+                actor: None,
+                turn_id: TurnId::new(),
+                run_id,
+                loop_driver_id: LoopDriverId::new("test_loop").unwrap(),
+                kind: LoopHostMilestoneKind::ModelTextDelta { safe_text },
+            })
+            .await
+            .unwrap();
+    }
+    fixture
+        .sink
+        .publish_loop_milestone(LoopHostMilestone {
+            scope: scope.clone(),
+            actor: None,
+            turn_id: TurnId::new(),
+            run_id,
+            loop_driver_id: LoopDriverId::new("test_loop").unwrap(),
+            kind: LoopHostMilestoneKind::CapabilityInvoked {
+                activity_id: CapabilityActivityId::new(),
+                capability_id: CapabilityId::new("builtin.test").unwrap(),
+            },
+        })
+        .await
+        .unwrap();
+
+    let events = fixture
+        .services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor: TurnActor::new(user_id),
+            scope,
+            after_cursor: None,
+        })
+        .await
+        .unwrap();
+    let expected_id = format!("text:{run_id}");
+    let text_bodies = events
+        .iter()
+        .filter_map(|event| match event.payload() {
+            ProductOutboundPayload::ProjectionUpdate { state }
+                if state.thread_id == thread_id.to_string() =>
+            {
+                state.items.iter().find_map(|item| match item {
+                    ProductProjectionItem::Text {
+                        id,
+                        run_id: observed_run_id,
+                        body,
+                    } if id == &expected_id && *observed_run_id == Some(run_id) => {
+                        Some(body.clone())
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        text_bodies,
+        vec![
+            "partial answer".to_string(),
+            "partial answer with [redacted]".to_string()
+        ],
+        "assistant text should drain as incremental updates to one stable text item"
+    );
+    let wire = serde_json::to_string(&events).unwrap();
+    assert!(!wire.contains(secret_like_token));
+}
+
+#[tokio::test]
+async fn live_assistant_text_coalescer_flushes_latest_update_on_timer() {
+    let fixture = live_projection_fixture("webui-text-timer");
+    let scope = fixture.scope.clone();
+    let run_id = TurnRunId::new();
+    let mut subscription = fixture
+        .services
+        .webui_event_stream()
+        .subscribe(ProjectionSubscriptionRequest {
+            actor: TurnActor::new(fixture.user_id.clone()),
+            scope: scope.clone(),
+            after_cursor: None,
+        })
+        .await
+        .unwrap();
+    let milestone = |safe_text| LoopHostMilestone {
+        scope: scope.clone(),
+        actor: None,
+        turn_id: TurnId::new(),
+        run_id,
+        loop_driver_id: LoopDriverId::new("test_loop").unwrap(),
+        kind: LoopHostMilestoneKind::ModelTextDelta { safe_text },
+    };
+
+    fixture
+        .sink
+        .publish_loop_milestone(milestone("first".to_string()))
+        .await
+        .unwrap();
+    fixture
+        .sink
+        .publish_loop_milestone(milestone("latest".to_string()))
+        .await
+        .unwrap();
+
+    let mut text_bodies = Vec::new();
+    for _ in 0..2 {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), subscription.next())
+            .await
+            .expect("coalesced live projection event")
+            .expect("live projection subscription remains open")
+            .expect("live projection event remains valid");
+        let ProductOutboundPayload::ProjectionUpdate { state } = envelope.payload() else {
+            continue;
+        };
+        text_bodies.extend(state.items.iter().filter_map(|item| match item {
+            ProductProjectionItem::Text {
+                run_id: observed_run_id,
+                body,
+                ..
+            } if *observed_run_id == Some(run_id) => Some(body.clone()),
+            _ => None,
+        }));
+    }
+
+    assert_eq!(text_bodies, vec!["first", "latest"]);
+}
+
+#[tokio::test]
+async fn live_assistant_text_burst_stays_subscribed_and_flushes_before_tool_activity() {
+    let fixture = live_projection_fixture("webui-text-burst");
+    let scope = fixture.scope.clone();
+    let run_id = TurnRunId::new();
+    let capability_id = CapabilityId::new("builtin.http").unwrap();
+    let activity_id = CapabilityActivityId::new();
+    let mut subscription = fixture
+        .services
+        .webui_event_stream()
+        .subscribe(ProjectionSubscriptionRequest {
+            actor: TurnActor::new(fixture.user_id.clone()),
+            scope: scope.clone(),
+            after_cursor: None,
+        })
+        .await
+        .unwrap();
+
+    let milestone = |kind| LoopHostMilestone {
+        scope: scope.clone(),
+        actor: None,
+        turn_id: TurnId::new(),
+        run_id,
+        loop_driver_id: LoopDriverId::new("test_loop").unwrap(),
+        kind,
+    };
+
+    for index in 0..64 {
+        fixture
+            .sink
+            .publish_loop_milestone(milestone(LoopHostMilestoneKind::ModelTextDelta {
+                safe_text: format!("partial answer {index}"),
+            }))
+            .await
+            .unwrap();
+    }
+    fixture
+        .sink
+        .publish_loop_milestone(milestone(LoopHostMilestoneKind::CapabilityInvoked {
+            activity_id,
+            capability_id: capability_id.clone(),
+        }))
+        .await
+        .unwrap();
+
+    let mut text_bodies = Vec::new();
+    let mut saw_tool = false;
+    let mut latest_text_preceded_tool = false;
+    for _ in 0..8 {
+        let envelope = tokio::time::timeout(std::time::Duration::from_secs(1), subscription.next())
+            .await
+            .expect("live projection event")
+            .expect("live projection subscription remains open")
+            .expect("live projection event remains valid");
+
+        let ProductOutboundPayload::ProjectionUpdate { state } = envelope.payload() else {
+            continue;
+        };
+        for item in &state.items {
+            match item {
+                ProductProjectionItem::Text {
+                    run_id: observed_run_id,
+                    body,
+                    ..
+                } if *observed_run_id == Some(run_id) => text_bodies.push(body.clone()),
+                ProductProjectionItem::CapabilityActivity(activity)
+                    if activity.invocation_id == InvocationId::from_uuid(activity_id.as_uuid()) =>
+                {
+                    latest_text_preceded_tool =
+                        text_bodies.last().map(String::as_str) == Some("partial answer 63");
+                    saw_tool = true;
+                }
+                _ => {}
+            }
+        }
+        if saw_tool {
+            break;
+        }
+    }
+
+    assert!(
+        saw_tool,
+        "the text burst must not terminate the live subscription"
+    );
+    assert!(
+        latest_text_preceded_tool,
+        "releasing the state lock must not reorder the latest text after tool activity"
+    );
+    assert_eq!(
+        text_bodies.last().map(String::as_str),
+        Some("partial answer 63"),
+        "the tool boundary must flush the latest cumulative assistant text"
+    );
+    assert!(
+        text_bodies.len() <= 3,
+        "the 64-update burst should be coalesced before delivery: {text_bodies:#?}"
+    );
+}
+
 // The post-run skill-learning notifier publishes a learned-skill bubble
 // through a `LiveProjectionPublisher` that shares the runtime's live update
 // source. This guards that such a bubble actually drains to the WebUI
@@ -281,6 +524,95 @@ async fn skill_learned_bubble_delivers_when_sse_resumes_from_advanced_durable_cu
             )
         }),
         "learned-skill bubble must deliver when SSE resumes from an advanced live cursor: {resumed:#?}"
+    );
+}
+
+// Regression: multiple `LiveProjectionPublisher` instances created from the
+// same `RebornProjectionServices` over a run's lifetime (e.g. the milestone
+// sink's publisher plus the post-run skill-learning publisher, created seconds
+// later) must SHARE one monotonic live sequence counter. If each publisher
+// owned its own counter, two live items published by different publishers would
+// collide on the same projection cursor (both starting at sequence 1), and an
+// SSE client resuming from the first item's cursor would silently skip the
+// second. Guards the shared `Arc<AtomicU64>` wiring across
+// `build_reborn_projection_services` and `live_projection_publisher` — a
+// revert to a per-publisher `AtomicU64::new(0)` passes every other live-progress
+// test but fails this one.
+#[tokio::test]
+async fn live_publishers_from_same_services_share_monotonic_sequence() {
+    let fixture = live_projection_fixture("webui-shared-sequence");
+    let user_id = fixture.user_id.clone();
+    let scope = fixture.scope.clone();
+    let run_id = TurnRunId::new();
+
+    let reasoning = |body: &str| LoopHostMilestone {
+        scope: scope.clone(),
+        actor: None,
+        turn_id: TurnId::new(),
+        run_id,
+        loop_driver_id: LoopDriverId::new("test_loop").unwrap(),
+        kind: LoopHostMilestoneKind::ModelReasoningDelta {
+            safe_delta: body.to_string(),
+        },
+    };
+
+    // Publisher A (the fixture's) emits one live reasoning item.
+    fixture
+        .sink
+        .publish_loop_milestone(reasoning("from publisher A"))
+        .await
+        .unwrap();
+
+    // A second, independently created publisher emits another. In production
+    // this is a fresh publisher minted later in the run's lifetime.
+    let sink_b = fixture
+        .services
+        .with_live_progress_milestone_sink_for_publisher(
+            Arc::new(InMemoryLoopHostMilestoneSink::default()),
+            fixture.services.live_projection_publisher(user_id.clone()),
+        );
+    sink_b
+        .publish_loop_milestone(reasoning("from publisher B"))
+        .await
+        .unwrap();
+
+    let events = fixture
+        .services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor: TurnActor::new(user_id),
+            scope,
+            after_cursor: None,
+        })
+        .await
+        .unwrap();
+
+    let thinking_cursors = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload(),
+                ProductOutboundPayload::ProjectionUpdate { state }
+                    if state.items.iter().any(|item| matches!(
+                        item,
+                        ProductProjectionItem::Thinking { body, .. }
+                            if body == "from publisher A" || body == "from publisher B"
+                    ))
+            )
+        })
+        .map(|event| event.projection_cursor().clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        thinking_cursors.len(),
+        2,
+        "both publishers' live reasoning items must reach the stream on their \
+         own cursor: {events:#?}"
+    );
+    assert_ne!(
+        thinking_cursors[0], thinking_cursors[1],
+        "independently created publishers must share one monotonic sequence, so \
+         their live items land on distinct projection cursors"
     );
 }
 
