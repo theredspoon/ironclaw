@@ -18,7 +18,7 @@ permissions:
 jobs:
   fast-forward:
     if: github.repository == 'theredspoon/ironclaw'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     env:
       BASE_BRANCH: native-matrix-channel-pilot
       SYNC_BRANCH: sync/native-matrix-pilot

@@ -29,7 +29,7 @@ env:
 jobs:
   changes:
     name: Detect code changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     outputs:
       has_code: ${{ steps.non_pr.outputs.has_code || steps.diff.outputs.has_code }}
       has_boundary_check: ${{ steps.non_pr.outputs.has_boundary_check || steps.diff.outputs.has_boundary_check }}
@@ -85,7 +85,7 @@ jobs:
     name: Configure clippy matrix
     needs: changes
     if: needs.changes.outputs.has_code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
@@ -104,7 +104,7 @@ jobs:
     name: Formatting
     needs: changes
     if: needs.changes.outputs.has_code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -121,7 +121,7 @@ jobs:
     name: Gateway JS syntax
     needs: changes
     if: needs.changes.outputs.has_code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -140,7 +140,7 @@ jobs:
     name: cargo-deny
     needs: changes
     if: needs.changes.outputs.has_code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -153,7 +153,7 @@ jobs:
     name: Clippy (${{ matrix.name }})
     needs: [changes, clippy-matrix]
     if: needs.changes.outputs.has_code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     strategy:
       fail-fast: true
       matrix:
@@ -180,7 +180,7 @@ jobs:
     name: Clippy Windows (${{ matrix.name }})
     needs: [changes, clippy-matrix]
     if: needs.changes.outputs.has_code == 'true' && github.event_name == 'push'
-    runs-on: windows-latest
+    runs-on: [self-hosted, ci-standard]
     strategy:
       fail-fast: true
       matrix:
@@ -205,7 +205,7 @@ jobs:
     name: Reborn CLI smoke tests
     needs: changes
     if: needs.changes.outputs.has_reborn_cli == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -237,7 +237,7 @@ jobs:
     name: No panics in production code
     needs: changes
     if: needs.changes.outputs.has_code == 'true' && github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -256,7 +256,7 @@ jobs:
     name: Gateway platform/feature boundaries
     needs: changes
     if: needs.changes.outputs.has_code == 'true' || needs.changes.outputs.has_boundary_check == 'true'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -274,7 +274,7 @@ jobs:
     name: Live canary fork policy (GitHub-hosted)
     needs: changes
     if: needs.changes.outputs.has_live_canary_policy == 'true' && github.repository_owner != vars.DEPLOYMENT_MIRROR_OWNER
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -298,7 +298,7 @@ jobs:
 
   code-style:
     name: Code Style (fmt + clippy)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci-standard]
     if: always()
     needs:
       - changes

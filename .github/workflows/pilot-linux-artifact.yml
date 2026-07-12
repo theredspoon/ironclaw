@@ -32,7 +32,7 @@ concurrency:
 jobs:
   build:
     name: Build pilot artifact
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, ci-standard]
     steps:
       - name: Check out requested source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
