@@ -1,0 +1,79 @@
+name: dalek-wasip2-validation
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - reborn-matrix-pilot
+    paths:
+      - "crates/ironclaw_wasm/**"
+      - "wit/tool.wit"
+      - "scripts/dalek-wasip2-validation.sh"
+      - ".github/workflows/dalek-wasip2-validation.yml"
+      - ".github/actions/install-cargo-component/**"
+  merge_group:
+    branches:
+      - main
+      - reborn-matrix-pilot
+
+permissions:
+  contents: read
+
+jobs:
+  dalek-wasip2-validation:
+    name: dalek-wasip2-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IRONCLAW_DISABLE_OS_KEYCHAIN: "1"
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Fetch pull request base for safety diff
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin \
+            "${{ github.event.pull_request.base.ref }}:refs/remotes/origin/${{ github.event.pull_request.base.ref }}"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: wasm-dalek
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo-component
+        uses: ./.github/actions/install-cargo-component
+
+      - name: Install wasm-tools
+        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        with:
+          tool: wasm-tools@1.253.0
+
+      - name: Install supply-chain tools
+        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+
+      - name: Run Dalek WASI Preview 2 validation
+        env:
+          PRE_COMMIT_SAFETY_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.event.pull_request.base.ref) || '' }}
+        run: scripts/dalek-wasip2-validation.sh
+
+      - name: Upload Dalek WASI Preview 2 validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dalek-wasip2-validation
+          path: target/dalek-wasip2-validation/logs/
+          if-no-files-found: ignore
