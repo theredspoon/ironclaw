@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://near.ai/ironclaw/schemas/dalek-wasip2-result.schema.json",
+  "title": "Dalek WASI Preview 2 Validation Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "validation_name",
+    "validation_status",
+    "source_branch",
+    "source_commit",
+    "validation_package",
+    "component_wasm_sha256",
+    "wit_package",
+    "toolchain_versions",
+    "dependency_config",
+    "test_summary",
+    "failure_modes",
+    "resource_observations",
+    "log_artifacts",
+    "fallback_contract",
+    "downstream_action",
+    "binding_artifacts",
+    "reproduction_commands"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "validation_name": { "const": "Dalek WASI Preview 2" },
+    "validation_status": { "enum": ["success", "fallback", "blocker"] },
+    "source_branch": { "type": "string", "minLength": 1 },
+    "source_commit": { "type": "string", "minLength": 7 },
+    "validation_package": { "type": "string", "minLength": 1 },
+    "component_wasm_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "wit_package": { "const": "near:agent/sandboxed-tool@0.3.0" },
+    "toolchain_versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustc", "cargo", "cargo_component", "wasm_tools", "wasmtime", "wasm_opt"],
+      "properties": {
+        "rustc": { "$ref": "#/$defs/tool_version" },
+        "cargo": { "$ref": "#/$defs/tool_version" },
+        "cargo_component": { "$ref": "#/$defs/tool_version" },
+        "wasm_tools": { "$ref": "#/$defs/tool_version" },
+        "wasmtime": { "$ref": "#/$defs/tool_version" },
+        "wasm_opt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "pin_source"],
+          "properties": {
+            "version": { "type": ["string", "null"] },
+            "pin_source": { "type": ["string", "null"] }
+          }
+        }
+      }
+    },
+    "dependency_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cargo_lock_sha256", "crates"],
+      "properties": {
+        "cargo_lock_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "crates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "version", "features", "default_features", "source"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "version": { "type": "string", "pattern": "^=[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$" },
+              "features": { "type": "array", "items": { "type": "string" } },
+              "default_features": { "type": "boolean" },
+              "source": { "enum": ["registry", "git", "path", "vendored"] }
+            }
+          }
+        }
+      }
+    },
+    "test_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["group_a", "group_b", "group_c", "group_d"],
+      "properties": {
+        "group_a": { "$ref": "#/$defs/group_status" },
+        "group_b": { "$ref": "#/$defs/group_status" },
+        "group_c": { "$ref": "#/$defs/group_status" },
+        "group_d": { "$ref": "#/$defs/group_status" }
+      }
+    },
+    "failure_modes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["phase", "error_code", "classification", "sanitized_summary"],
+        "properties": {
+          "phase": { "type": "string", "minLength": 1 },
+          "error_code": { "type": "string", "minLength": 1 },
+          "classification": { "enum": ["fix", "fallback", "blocker"] },
+          "sanitized_summary": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "resource_observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "success_profile",
+        "too_low_failure_profile",
+        "steady_state_ed25519_relative_to_native",
+        "steady_state_x25519_relative_to_native",
+        "component_size_bytes"
+      ],
+      "properties": {
+        "success_profile": { "$ref": "#/$defs/resource_profile" },
+        "too_low_failure_profile": {
+          "allOf": [
+            { "$ref": "#/$defs/resource_profile" },
+            {
+              "type": "object",
+              "required": ["error_code"],
+              "properties": { "error_code": { "const": "resource_limit_exceeded" } }
+            }
+          ]
+        },
+        "steady_state_ed25519_relative_to_native": { "type": "string", "minLength": 1 },
+        "steady_state_x25519_relative_to_native": { "type": "string", "minLength": 1 },
+        "component_size_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "log_artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "path_or_ci_artifact", "retention_policy", "redaction_status"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "path_or_ci_artifact": { "type": "string", "minLength": 1 },
+        "retention_policy": { "type": "string", "minLength": 1 },
+        "redaction_status": { "const": "passed" }
+      }
+    },
+    "fallback_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required",
+        "trigger_criteria",
+        "wit_namespace",
+        "wit_world",
+        "wit_imports",
+        "operations_moved_to_host",
+        "operations_remaining_in_component",
+        "key_material_boundary",
+        "host_storage_owner",
+        "authorization_scope",
+        "audit_events",
+        "zeroization_expectation"
+      ],
+      "properties": {
+        "required": { "type": "boolean" },
+        "trigger_criteria": { "type": "array", "items": { "type": "string" } },
+        "wit_namespace": { "type": ["string", "null"] },
+        "wit_world": { "type": ["string", "null"] },
+        "wit_imports": { "type": "array", "items": { "type": "string" } },
+        "operations_moved_to_host": { "type": "array", "items": { "type": "string" } },
+        "operations_remaining_in_component": { "type": "array", "items": { "type": "string" } },
+        "key_material_boundary": { "enum": ["opaque_handles", "reviewed_raw_material_exception", null] },
+        "host_storage_owner": { "type": ["string", "null"] },
+        "authorization_scope": { "type": ["string", "null"] },
+        "audit_events": { "type": "array", "items": { "type": "string" } },
+        "zeroization_expectation": { "type": ["string", "null"] }
+      }
+    },
+    "downstream_action": { "enum": ["proceed", "proceed_with_patch", "proceed_with_host_crypto_provider", "block"] },
+    "binding_artifacts": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "reproduction_commands": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "validation_status": { "const": "success" } } },
+      "then": {
+        "properties": {
+          "test_summary": {
+            "properties": {
+              "group_a": { "const": "pass" },
+              "group_b": { "const": "pass" },
+              "group_c": { "const": "pass" },
+              "group_d": { "const": "pass" }
+            }
+          },
+          "failure_modes": { "maxItems": 0 },
+          "fallback_contract": { "properties": { "required": { "const": false } } },
+          "downstream_action": { "const": "proceed" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "validation_status": { "const": "fallback" } } },
+      "then": {
+        "properties": {
+          "failure_modes": { "minItems": 1 },
+          "fallback_contract": {
+            "properties": {
+              "required": { "const": true },
+              "operations_moved_to_host": { "minItems": 1 },
+              "audit_events": { "minItems": 1 }
+            }
+          },
+          "downstream_action": { "enum": ["proceed_with_patch", "proceed_with_host_crypto_provider"] }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "validation_status": { "const": "blocker" } } },
+      "then": {
+        "properties": {
+          "failure_modes": {
+            "contains": {
+              "type": "object",
+              "properties": { "classification": { "const": "blocker" } },
+              "required": ["classification"]
+            }
+          },
+          "downstream_action": { "const": "block" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "tool_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "pin_source"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "pin_source": { "type": "string", "minLength": 1 }
+      }
+    },
+    "group_status": { "enum": ["pass", "fail", "skipped"] },
+    "resource_profile": {
+      "type": "object",
+      "required": ["memory_limit_bytes", "stack_limit_bytes", "fuel_or_epoch_limit"],
+      "properties": {
+        "memory_limit_bytes": { "type": "integer", "minimum": 1 },
+        "stack_limit_bytes": { "type": "integer", "minimum": 1 },
+        "fuel_or_epoch_limit": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

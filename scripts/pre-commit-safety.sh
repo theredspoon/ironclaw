@@ -35,6 +35,15 @@ GATEWAY_APP_JS_TMP=""
 
 # Determine a suitable base ref for standalone diffs.
 resolve_base_ref() {
+    if [ -n "${PRE_COMMIT_SAFETY_BASE_REF:-}" ]; then
+        if git rev-parse --verify --quiet "$PRE_COMMIT_SAFETY_BASE_REF" >/dev/null 2>&1; then
+            echo "$PRE_COMMIT_SAFETY_BASE_REF"
+            return 0
+        fi
+        echo "pre-commit-safety: PRE_COMMIT_SAFETY_BASE_REF is set but not available: $PRE_COMMIT_SAFETY_BASE_REF" >&2
+        exit 1
+    fi
+
     local candidates=(
         "@{upstream}"
         "origin/HEAD"
