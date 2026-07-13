@@ -1,12 +1,12 @@
-name: Auto fast-forward Matrix pilot sync
+name: Auto fast-forward Reborn Matrix pilot sync
 
 on:
   workflow_run:
     workflows:
       - Code Style
       - Regression Test Check
-      - nearai-bench dispatcher tests
-      - Run Tests
+      - Tests (Reborn)
+      - Platform & Compat
     types:
       - completed
 
@@ -20,8 +20,8 @@ jobs:
     if: github.repository == 'theredspoon/ironclaw'
     runs-on: ubuntu-latest
     env:
-      BASE_BRANCH: native-matrix-channel-pilot
-      SYNC_BRANCH: sync/native-matrix-pilot
+      BASE_BRANCH: reborn-matrix-pilot
+      SYNC_BRANCH: sync/reborn-matrix-pilot
       UPSTREAM_MIRROR_BRANCH: upstream-main
     steps:
       - uses: actions/checkout@v6
@@ -46,9 +46,11 @@ jobs:
             exit 0
           fi
 
-          echo "found=true" >> "$GITHUB_OUTPUT"
-          echo "number=$(jq -r '.number' <<<"${pr_json}")" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$(jq -r '.head.sha' <<<"${pr_json}")" >> "$GITHUB_OUTPUT"
+          {
+            echo "found=true"
+            echo "number=$(jq -r '.number' <<<"${pr_json}")"
+            echo "head_sha=$(jq -r '.head.sha' <<<"${pr_json}")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check sync PR status
         if: steps.pr.outputs.found == 'true'
@@ -100,7 +102,7 @@ jobs:
 
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
-      - name: Fast-forward Matrix pilot
+      - name: Fast-forward Reborn Matrix pilot
         if: steps.checks.outputs.ready == 'true'
         env:
           EXPECTED_HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -122,17 +124,8 @@ jobs:
           fi
 
           if ! git merge-base --is-ancestor "origin/${UPSTREAM_MIRROR_BRANCH}" "origin/${SYNC_BRANCH}"; then
-            echo "::error::${SYNC_BRANCH} does not contain ${UPSTREAM_MIRROR_BRANCH}; refusing to update Matrix pilot"
+            echo "::error::${SYNC_BRANCH} does not contain ${UPSTREAM_MIRROR_BRANCH}; refusing to update Reborn Matrix pilot"
             exit 1
           fi
 
           git push origin "${actual_head}:refs/heads/${BASE_BRANCH}"
-
-      - name: Dispatch deployment mirror
-        if: steps.checks.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run mirror-to-deployment-target.yml \
-            --ref "${GITHUB_REF_NAME}" \
-            -f "source_ref=${BASE_BRANCH}"
