@@ -5,6 +5,8 @@ wit_bindgen::generate!({
     path: "../../../../../wit/tool.wit",
 });
 
+use std::collections::BTreeSet;
+
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use vodozemac::olm::{Account, OlmMessage, SessionConfig};
@@ -31,7 +33,7 @@ impl exports::near::agent::tool::Guest for DalekWasip2Validation {
     }
 
     fn description() -> String {
-        "Dalek WASI Preview 2 validation fixture for dalek-family and vodozemac wasm32-wasip2 execution through the Reborn sandboxed-tool ABI. This is non-production test infrastructure.".to_string()
+        "Dalek WASI Preview 2 validation fixture for Matrix vodozemac and dalek-family wasm32-wasip2 execution through the canonical sandboxed-tool ABI. This is non-production test infrastructure.".to_string()
     }
 }
 
@@ -74,7 +76,7 @@ struct CaseResult {
 }
 
 fn execute_case(params: &str) -> Result<String, String> {
-    touch_reborn_host_imports_if_requested(params);
+    touch_host_imports_if_requested(params);
     let request: ValidationRequest =
         serde_json::from_str(params).map_err(|error| format!("invalid request: {error}"))?;
     let result = match request.case {
@@ -102,7 +104,7 @@ fn execute_case(params: &str) -> Result<String, String> {
     serde_json::to_string(&result).map_err(|error| format!("result serialization failed: {error}"))
 }
 
-fn touch_reborn_host_imports_if_requested(params: &str) {
+fn touch_host_imports_if_requested(params: &str) {
     if !params.contains("__dalek_wasip2_touch_host_imports__") {
         return;
     }
@@ -121,30 +123,27 @@ fn touch_reborn_host_imports_if_requested(params: &str) {
 fn metadata() -> CaseResult {
     pass(
         "metadata",
-        "canonical Reborn ABI metadata exports are available",
+        "canonical sandboxed-tool ABI metadata exports are available",
         1,
     )
 }
 
 fn rng_success() -> Result<CaseResult, String> {
-    let mut seen: [[u8; 32]; 32] = [[0; 32]; 32];
+    const BLOCKS: usize = 16 * 256;
+    let mut seen = BTreeSet::<[u8; 32]>::new();
     let mut one_bits = 0u32;
-    for block_index in 0..32 {
+    for _ in 0..BLOCKS {
         let mut block = [0u8; 32];
         getrandom::fill(&mut block).map_err(|error| format!("getrandom failed: {error}"))?;
         if block == [0; 32] {
             return Ok(fail("rng-success", "weak_rng_sample", "all-zero RNG block"));
         }
-        if seen[..block_index]
-            .iter()
-            .any(|previous| previous == &block)
-        {
+        if !seen.insert(block) {
             return Ok(fail("rng-success", "weak_rng_sample", "repeated RNG block"));
         }
         one_bits += block.iter().map(|byte| byte.count_ones()).sum::<u32>();
-        seen[block_index] = block;
     }
-    let total_bits = 32 * 32 * 8;
+    let total_bits = (BLOCKS * 32 * 8) as u32;
     if !(total_bits * 45 / 100..=total_bits * 55 / 100).contains(&one_bits) {
         return Ok(fail(
             "rng-success",
@@ -155,7 +154,7 @@ fn rng_success() -> Result<CaseResult, String> {
     Ok(pass(
         "rng-success",
         "WASI Preview 2 getrandom path produced non-catastrophic entropy sample",
-        32,
+        BLOCKS as u32,
     ))
 }
 
@@ -293,8 +292,16 @@ fn vodozemac_negative() -> Result<CaseResult, String> {
     if let Some(byte) = ciphertext.first_mut() {
         *byte ^= 0x80;
     }
-    msg = OlmMessage::from_parts(message_type, &ciphertext)
-        .map_err(|error| format!("mutated message rejected during parse: {error}"))?;
+    msg = match OlmMessage::from_parts(message_type, &ciphertext) {
+        Ok(message) => message,
+        Err(_) => {
+            return Ok(pass(
+                "vodozemac-negative",
+                "mutated vodozemac message failed closed during parse",
+                1,
+            ));
+        }
+    };
     if bob
         .create_inbound_session(
             SessionConfig::version_1(),

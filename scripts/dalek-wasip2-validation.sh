@@ -12,6 +12,9 @@ FIXTURE_LOCK="crates/ironclaw_wasm/tests/fixtures/dalek-wasip2-component/Cargo.l
 COMPONENT_WASM="crates/ironclaw_wasm/tests/fixtures/dalek-wasip2-component/target/wasm32-wasip1/release/dalek_wasip2_component.wasm"
 LOG_DIR="target/dalek-wasip2-validation/logs"
 RUN_ID="${RUN_ID:-local}"
+RESULT_PATH="${LOG_DIR}/${RUN_ID}-result.json"
+JSONL_PATH="${LOG_DIR}/${RUN_ID}.jsonl"
+WIT_PATH="${LOG_DIR}/${RUN_ID}.wit"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -54,15 +57,20 @@ cargo audit --file "${FIXTURE_LOCK}"
 cargo deny --manifest-path "${FIXTURE_MANIFEST}" check advisories licenses bans sources
 cargo component build --release --target wasm32-wasip2 --manifest-path "${FIXTURE_MANIFEST}"
 wasm-tools validate "${COMPONENT_WASM}" --features component-model
-wasm-tools component wit "${COMPONENT_WASM}" > "${LOG_DIR}/${RUN_ID}.wit"
-grep -q 'import near:agent/host@0.3.0' "${LOG_DIR}/${RUN_ID}.wit"
-grep -q 'export near:agent/tool@0.3.0' "${LOG_DIR}/${RUN_ID}.wit"
-grep -q 'import wasi:random/random@0.2.3' "${LOG_DIR}/${RUN_ID}.wit"
-cargo test -p ironclaw_wasm --test dalek_wasip2_validation -- --nocapture
+wasm-tools component wit "${COMPONENT_WASM}" > "${WIT_PATH}"
+grep -q 'import near:agent/host@0.3.0' "${WIT_PATH}"
+grep -q 'export near:agent/tool@0.3.0' "${WIT_PATH}"
+grep -q 'import wasi:random/random@0.2.3' "${WIT_PATH}"
+DALEK_WASIP2_REQUIRE_COMPONENT=1 \
+DALEK_WASIP2_RESULT_PATH="${RESULT_PATH}" \
+DALEK_WASIP2_LOG_PATH="${JSONL_PATH}" \
+DALEK_WASIP2_COMPONENT_SHA256="$(shasum -a 256 "${COMPONENT_WASM}" | awk '{print $1}')" \
+  cargo test -p ironclaw_wasm --test dalek_wasip2_validation -- --nocapture
 scripts/pre-commit-safety.sh
 
-cat > "${LOG_DIR}/${RUN_ID}.jsonl" <<JSONL
-{"phase":"dalek-wasip2","operation":"validation-script","status":"pass","error_code":null,"error_class":null,"message":"Dalek WASI Preview 2 validation script completed","component_sha256":"$(shasum -a 256 "${COMPONENT_WASM}" | awk '{print $1}')","wasmtime_version":"46.0.1","iteration_count":1,"memory_limit_bytes":1048576,"stack_limit_bytes":1048576}
-JSONL
+test -s "${RESULT_PATH}"
+test -s "${JSONL_PATH}"
 
-echo "Dalek WASI Preview 2 validation complete. Logs: ${LOG_DIR}/${RUN_ID}.jsonl"
+echo "Dalek WASI Preview 2 validation complete."
+echo "Result: ${RESULT_PATH}"
+echo "Logs: ${JSONL_PATH}"
