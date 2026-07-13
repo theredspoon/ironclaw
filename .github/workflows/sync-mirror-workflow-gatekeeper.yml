@@ -39,13 +39,20 @@ jobs:
 
           # Fetch all active workflows
           gh api repos/theredspoon/ironclaw/actions/workflows --paginate \
-            --jq '.workflows[] | select(.state == "active") | {name: .name, path: .path}' \
+            --jq '.workflows[] | select(.state == "active") | {id: .id, name: .name, path: .path}' \
             > /tmp/active-workflows.json
 
           while IFS= read -r workflow; do
+            id=$(echo "$workflow" | jq -r '.id')
             name=$(echo "$workflow" | jq -r '.name')
             path=$(echo "$workflow" | jq -r '.path')
             filename=$(basename "$path")
+
+            # Skip Dependabot workflows (cannot be disabled via API)
+            if [[ "$path" == dynamic/* ]]; then
+              echo "⚠️  Skipping (managed by GitHub): $name ($path)"
+              continue
+            fi
 
             # Check if workflow is on allowlist
             allowed=false
@@ -58,7 +65,7 @@ jobs:
 
             if [[ "$allowed" == "false" ]]; then
               echo "🔒 Disabling: $name ($filename)"
-              gh workflow disable "$filename" -R theredspoon/ironclaw || true
+              gh api repos/theredspoon/ironclaw/actions/workflows/$id/disable --method PUT || echo "   Failed to disable (may require manual intervention)"
               ((disabled_count++))
             fi
           done < /tmp/active-workflows.json
