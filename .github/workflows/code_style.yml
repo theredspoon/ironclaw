@@ -4,6 +4,7 @@ on:
   merge_group:
     branches:
       - main
+      - reborn-matrix-pilot
     types:
       - checks_requested
   # Pushes to main refresh the rust-cache entries that PR and merge-group
@@ -11,6 +12,7 @@ on:
   push:
     branches:
       - main
+      - reborn-matrix-pilot
 
 permissions:
   contents: read
@@ -38,9 +40,11 @@ jobs:
       - id: non_pr
         if: github.event_name == 'push'
         run: |
-          echo "has_code=true" >> "$GITHUB_OUTPUT"
-          echo "has_boundary_check=true" >> "$GITHUB_OUTPUT"
-          echo "has_reborn_cli=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "has_code=true"
+            echo "has_boundary_check=true"
+            echo "has_reborn_cli=true"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         with:
