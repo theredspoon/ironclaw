@@ -2407,6 +2407,50 @@ def _slack_second_user_token(extra_env: dict[str, str]) -> str | None:
     return _env_value(SLACK_SECOND_USER_TOKEN_ENV, extra_env)
 
 
+def _extension_is_listed(extensions: list[object], package_id: str) -> bool:
+    return any(
+        isinstance(extension, dict)
+        and isinstance(extension.get("package_ref"), dict)
+        and extension["package_ref"].get("id") == package_id
+        for extension in extensions
+    )
+
+
+async def _ensure_extension_installed_on_page(
+    page: object,
+    observed: dict[str, object],
+    *,
+    package_id: str,
+    display_name: str,
+) -> None:
+    extensions_body = await _fetch_webui_json(page, "/api/webchat/v2/extensions")
+    extensions = extensions_body.get("extensions")
+    if not isinstance(extensions, list):
+        raise AssertionError(
+            f"extensions body did not include a list: {extensions_body!r}"
+        )
+    prefix = package_id.replace("-", "_")
+    if _extension_is_listed(extensions, package_id):
+        observed[f"{prefix}_install_message"] = f"{display_name} already installed"
+        observed[f"{prefix}_install_onboarding_state"] = "existing_installation"
+        return
+
+    install_body = await _webui_json(
+        page,
+        "POST",
+        "/api/webchat/v2/extensions/install",
+        {"package_ref": {"kind": "extension", "id": package_id}},
+    )
+    if install_body.get("success") is not True:
+        raise AssertionError(
+            f"{display_name} install did not succeed: {install_body!r}"
+        )
+    observed[f"{prefix}_install_message"] = install_body.get("message")
+    observed[f"{prefix}_install_onboarding_state"] = install_body.get(
+        "onboarding_state"
+    )
+
+
 async def _installed_active_extension_ids(ctx: LiveQaContext) -> dict[str, object]:
     """Active extension package ids from the server's own extensions API.
 
@@ -3154,6 +3198,16 @@ async def _slack_connect_case(ctx: LiveQaContext, *, case_name: str) -> ProbeRes
         instructions = str(action_body.get("instructions") or "")
         if not _slack_connect_instructions_look_valid(instructions):
             raise AssertionError(f"unexpected Slack connect instructions: {instructions!r}")
+        # Extension-scoped OAuth deliberately rejects an absent installation.
+        # Exercise the same global install transition as the product UI before
+        # probing the OAuth start surface; do not manufacture per-user setup
+        # state inside the canary. Reruns reuse an existing installation.
+        await _ensure_extension_installed_on_page(
+            page,
+            observed,
+            package_id="slack",
+            display_name="Slack",
+        )
         account_scope = _slack_personal_auth_ready_account(personal_auth)
         invocation_id = str(account_scope.get("invocation_id") or "").strip()
         thread_id = str(account_scope.get("thread_id") or "").strip()
