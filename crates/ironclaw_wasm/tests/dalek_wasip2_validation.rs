@@ -59,6 +59,15 @@ fn validation_result_schema_rejects_ambiguous_status_strings() {
     result["validation_status"] = json!("success | fallback | blocker");
 
     assert!(!validator.is_valid(&result));
+
+    let mut prerelease_pin = success_result(
+        "0".repeat(64),
+        "0".repeat(64),
+        1,
+        "target/dalek-wasip2-validation/logs/local.jsonl",
+    );
+    prerelease_pin["dependency_config"]["crates"][0]["version"] = json!("=1.2.3-alpha");
+    assert!(!validator.is_valid(&prerelease_pin));
 }
 
 #[test]
@@ -220,8 +229,12 @@ fn pinned_toolchain_commands_are_declared() {
     assert!(script.contains("WASM_TOOLS_VERSION=\"1.253.0\""));
     assert!(script.contains("CARGO_AUDIT_VERSION=\"0.22.2\""));
     assert!(script.contains("CARGO_DENY_VERSION=\"0.20.2\""));
-    assert!(script.contains("cargo component build --release --target wasm32-wasip2"));
+    assert!(!script.contains("cargo generate-lockfile"));
+    assert!(script.contains("cargo component build --release --locked --target wasm32-wasip2"));
+    assert!(script.contains("check_fixture_lock_clean"));
+    assert!(script.contains("write_blocker_result"));
     assert!(script.contains(COMPONENT_WASM));
+    assert!(script.contains("check_component_output"));
     assert!(script.contains("wasm-tools validate"));
     assert!(script.contains("cargo audit --file"));
     assert!(script.contains("cargo deny --manifest-path"));
@@ -461,6 +474,10 @@ fn success_result(
         "test_summary": {"group_a":"pass","group_b":"pass","group_c":"pass","group_d":"pass"},
         "failure_modes": [],
         "resource_observations": resource_observations(component_size),
+        "validation_notes": [
+            "dalek-wasip2-validation is the stable source-repo name for this feasibility gate",
+            "RNG failure-injection rows are fixture-level deterministic classifications, not host-level entropy injection"
+        ],
         "log_artifacts": {"schema_version":1,"path_or_ci_artifact":log_path,"retention_policy":"CI artifact dalek-wasip2-validation retained by workflow defaults","redaction_status":"passed"},
         "fallback_contract": fallback_contract(false),
         "downstream_action": "proceed",

@@ -69,7 +69,7 @@
             "required": ["name", "version", "features", "default_features", "source"],
             "properties": {
               "name": { "type": "string", "minLength": 1 },
-              "version": { "type": "string", "pattern": "^=[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?$" },
+              "version": { "type": "string", "pattern": "^=[0-9]+\\.[0-9]+\\.[0-9]+$" },
               "features": { "type": "array", "items": { "type": "string" } },
               "default_features": { "type": "boolean" },
               "source": { "enum": ["registry", "git", "path", "vendored"] }
@@ -129,6 +129,10 @@
         "steady_state_x25519_relative_to_native": { "type": "string", "minLength": 1 },
         "component_size_bytes": { "type": "integer", "minimum": 1 }
       }
+    },
+    "validation_notes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
     },
     "log_artifacts": {
       "type": "object",

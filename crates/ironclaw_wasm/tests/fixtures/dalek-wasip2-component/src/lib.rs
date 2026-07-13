@@ -189,7 +189,8 @@ fn dalek_negative() -> Result<CaseResult, String> {
     let signing_key = signing_key_from_seed(13);
     let verifying_key = signing_key.verifying_key();
     let message = b"dalek-negative";
-    let mut signature_bytes = signing_key.sign(message).to_bytes();
+    let valid_signature = signing_key.sign(message);
+    let mut signature_bytes = valid_signature.to_bytes();
     signature_bytes[0] ^= 0x01;
     let signature = Signature::from_bytes(&signature_bytes);
     if verifying_key.verify(message, &signature).is_ok() {
@@ -199,9 +200,24 @@ fn dalek_negative() -> Result<CaseResult, String> {
             "bit-flipped Ed25519 signature verified",
         ));
     }
+    let mut mutated_message = *message;
+    mutated_message[0] ^= 0x01;
+    if verifying_key.verify(&mutated_message, &valid_signature).is_ok() {
+        return Ok(fail(
+            "dalek-negative",
+            "crypto_negative_case_failed",
+            "bit-flipped Ed25519 message verified",
+        ));
+    }
+    if Signature::try_from(&valid_signature.to_bytes()[..63]).is_ok() {
+        return Ok(fail(
+            "dalek-negative",
+            "crypto_negative_case_failed",
+            "truncated Ed25519 signature parsed",
+        ));
+    }
     let wrong_key = VerifyingKey::from_bytes(&signing_key_from_seed(14).verifying_key().to_bytes())
         .map_err(|error| format!("wrong public key construction failed: {error}"))?;
-    let valid_signature = signing_key.sign(message);
     if wrong_key.verify(message, &valid_signature).is_ok() {
         return Ok(fail(
             "dalek-negative",
@@ -209,10 +225,23 @@ fn dalek_negative() -> Result<CaseResult, String> {
             "wrong Ed25519 public key verified",
         ));
     }
+    let alice_secret = StaticSecret::from([41u8; 32]);
+    let bob_secret = StaticSecret::from([42u8; 32]);
+    let wrong_peer_secret = StaticSecret::from([43u8; 32]);
+    let expected_shared = alice_secret.diffie_hellman(&X25519PublicKey::from(&bob_secret));
+    let wrong_peer_shared =
+        alice_secret.diffie_hellman(&X25519PublicKey::from(&wrong_peer_secret));
+    if expected_shared.as_bytes() == wrong_peer_shared.as_bytes() {
+        return Ok(fail(
+            "dalek-negative",
+            "crypto_negative_case_failed",
+            "wrong X25519 peer produced the expected shared secret",
+        ));
+    }
     Ok(pass(
         "dalek-negative",
         "Ed25519 negative cases failed closed",
-        2,
+        5,
     ))
 }
 
@@ -274,20 +303,34 @@ fn vodozemac_roundtrip() -> Result<CaseResult, String> {
 }
 
 fn vodozemac_negative() -> Result<CaseResult, String> {
-    let alice = Account::new();
-    let mut bob = Account::new();
-    bob.generate_one_time_keys(1);
-    let bob_otk = *bob
-        .one_time_keys()
-        .values()
-        .next()
-        .ok_or_else(|| "vodozemac did not generate one-time key".to_string())?;
-    let mut alice_session = alice
-        .create_outbound_session(SessionConfig::version_1(), bob.curve25519_key(), bob_otk)
-        .map_err(|error| format!("outbound session failed: {error}"))?;
-    let mut msg = alice_session
-        .encrypt("negative")
-        .map_err(|error| format!("encrypt failed: {error}"))?;
+    let (alice, mut bob, msg) = new_prekey_message("negative-truncated")?;
+    let (message_type, ciphertext) = msg.to_parts();
+    let truncated = ciphertext
+        .get(..ciphertext.len().saturating_sub(1))
+        .ok_or_else(|| "vodozemac ciphertext was unexpectedly empty".to_string())?;
+    if let Ok(truncated_msg) = OlmMessage::from_parts(message_type, truncated) {
+        match truncated_msg {
+            OlmMessage::PreKey(pre_key) => {
+                if bob
+                    .create_inbound_session(
+                        SessionConfig::version_1(),
+                        alice.curve25519_key(),
+                        &pre_key,
+                    )
+                    .is_ok()
+                {
+                    return Ok(fail(
+                        "vodozemac-negative",
+                        "crypto_negative_case_failed",
+                        "truncated vodozemac pre-key message established a session",
+                    ));
+                }
+            }
+            OlmMessage::Normal(_) => {}
+        }
+    }
+
+    let (alice, mut bob, mut msg) = new_prekey_message("negative-mutated")?;
     let (message_type, mut ciphertext) = msg.clone().to_parts();
     if let Some(byte) = ciphertext.first_mut() {
         *byte ^= 0x80;
@@ -297,8 +340,8 @@ fn vodozemac_negative() -> Result<CaseResult, String> {
         Err(_) => {
             return Ok(pass(
                 "vodozemac-negative",
-                "mutated vodozemac message failed closed during parse",
-                1,
+                "truncated and mutated vodozemac messages failed closed",
+                2,
             ));
         }
     };
@@ -311,8 +354,8 @@ fn vodozemac_negative() -> Result<CaseResult, String> {
                 OlmMessage::Normal(_) => {
                     return Ok(pass(
                         "vodozemac-negative",
-                        "mutated pre-key became non-pre-key and failed closed",
-                        1,
+                        "truncated and mutated vodozemac messages failed closed",
+                        2,
                     ));
                 }
             },
@@ -327,9 +370,27 @@ fn vodozemac_negative() -> Result<CaseResult, String> {
     }
     Ok(pass(
         "vodozemac-negative",
-        "mutated vodozemac pre-key message failed closed",
-        1,
+        "truncated and mutated vodozemac messages failed closed",
+        2,
     ))
+}
+
+fn new_prekey_message(plaintext: &str) -> Result<(Account, Account, OlmMessage), String> {
+    let alice = Account::new();
+    let mut bob = Account::new();
+    bob.generate_one_time_keys(1);
+    let bob_otk = *bob
+        .one_time_keys()
+        .values()
+        .next()
+        .ok_or_else(|| "vodozemac did not generate one-time key".to_string())?;
+    let mut alice_session = alice
+        .create_outbound_session(SessionConfig::version_1(), bob.curve25519_key(), bob_otk)
+        .map_err(|error| format!("outbound session failed: {error}"))?;
+    let msg = alice_session
+        .encrypt(plaintext)
+        .map_err(|error| format!("encrypt failed: {error}"))?;
+    Ok((alice, bob, msg))
 }
 
 fn resource_success() -> CaseResult {
@@ -373,7 +434,11 @@ fn signing_key_from_seed(seed: u8) -> SigningKey {
 }
 
 fn deterministic_failure(case: &'static str, error_code: &'static str) -> CaseResult {
-    fail(case, error_code, "deterministic fixture failure injection")
+    fail(
+        case,
+        error_code,
+        "fixture-level deterministic failure classification; not host entropy injection",
+    )
 }
 
 fn pass(case: &'static str, message: &'static str, iteration_count: u32) -> CaseResult {
