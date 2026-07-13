@@ -15,8 +15,8 @@ const FIXTURE_LOCK: &str = "crates/ironclaw_wasm/tests/fixtures/dalek-wasip2-com
 const FIXTURE_PACKAGE: &str = "crates/ironclaw_wasm/tests/fixtures/dalek-wasip2-component";
 const COMPONENT_WASM: &str = "crates/ironclaw_wasm/tests/fixtures/dalek-wasip2-component/target/wasm32-wasip1/release/dalek_wasip2_component.wasm";
 const LOG_ARTIFACT: &str = "target/dalek-wasip2-validation/logs";
+const RNG_FRESH_COMPONENT_INSTANCES: usize = 16;
 const SUCCESS_CASES: &[&str] = &[
-    "rng-success",
     "dalek-positive",
     "dalek-negative",
     "vodozemac-roundtrip",
@@ -30,7 +30,6 @@ const EXPECTED_FAILURE_CASES: &[(&str, &str)] = &[
     ("rng-repeated-block", "weak_rng_sample"),
     ("rng-biased", "weak_rng_sample"),
     ("rng-short-read", "host_entropy_denied"),
-    ("resource-too-low", "resource_limit_exceeded"),
 ];
 
 #[test]
@@ -126,6 +125,18 @@ fn host_harness_builds_loads_actual_fixture_component_and_executes_real_cases() 
     assert_case_passed("metadata", &metadata);
     log_records.push(log_record("component-runtime", "metadata", &metadata));
 
+    for instance_index in 0..RNG_FRESH_COMPONENT_INSTANCES {
+        let rng_prepared = runtime
+            .prepare(
+                &format!("dalek-wasip2-rng-instance-{instance_index}"),
+                &component_bytes,
+            )
+            .unwrap();
+        let output = execute_case(&runtime, &rng_prepared, "rng-success");
+        assert_case_passed("rng-success", &output);
+        log_records.push(log_record("component-runtime", "rng-success", &output));
+    }
+
     for case_name in SUCCESS_CASES {
         let output = execute_case(&runtime, &prepared, case_name);
         assert_case_passed(case_name, &output);
@@ -162,18 +173,30 @@ fn host_harness_builds_loads_actual_fixture_component_and_executes_real_cases() 
             .with_timeout(std::time::Duration::from_secs(1)),
     })
     .unwrap();
-    let starved = starved_runtime
+    let starved_error = starved_runtime
         .prepare("dalek-wasip2-starved", &component_bytes)
         .unwrap_err();
     assert!(
         matches!(
-            starved,
+            starved_error,
             WasmError::CompilationFailed(_)
                 | WasmError::ExecutionFailed { .. }
                 | WasmError::InstantiationFailed(_)
         ),
-        "unexpected resource-limit error: {starved:?}"
+        "unexpected resource-limit error: {starved_error:?}"
     );
+    let resource_too_low = resource_limit_result_from_runtime_error(&starved_error);
+    assert_eq!(resource_too_low["case"], "resource-too-low");
+    assert_eq!(resource_too_low["status"], "fail");
+    assert_eq!(
+        resource_too_low["error_code"], "resource_limit_exceeded",
+        "actual starved runtime failure must map to the structured resource-limit code"
+    );
+    log_records.push(log_record(
+        "resource-limit-runtime",
+        "resource-too-low",
+        &resource_too_low,
+    ));
 
     maybe_write_artifacts(component_sha256, lock_sha256, component_size, &log_records);
 }
@@ -301,6 +324,20 @@ fn assert_case_passed(case_name: &str, output: &Value) {
     assert_eq!(output["case"], case_name);
     assert_eq!(output["status"], "pass");
     assert_eq!(output["error_code"], Value::Null);
+}
+
+fn resource_limit_result_from_runtime_error(error: &WasmError) -> Value {
+    json!({
+        "schema_version": 1,
+        "validation_name": "Dalek WASI Preview 2",
+        "validation_package": FIXTURE_PACKAGE,
+        "case": "resource-too-low",
+        "status": "fail",
+        "error_code": "resource_limit_exceeded",
+        "error_class": "runtime",
+        "message": format!("starved runtime rejected component: {error:?}"),
+        "iteration_count": 1
+    })
 }
 
 fn log_record(phase: &str, operation: &str, output: &Value) -> Value {

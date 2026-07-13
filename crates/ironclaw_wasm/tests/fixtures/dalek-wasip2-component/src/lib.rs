@@ -129,7 +129,7 @@ fn metadata() -> CaseResult {
 }
 
 fn rng_success() -> Result<CaseResult, String> {
-    const BLOCKS: usize = 16 * 256;
+    const BLOCKS: usize = 256;
     let mut seen = BTreeSet::<[u8; 32]>::new();
     let mut one_bits = 0u32;
     for _ in 0..BLOCKS {
