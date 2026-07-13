@@ -1,0 +1,72 @@
+name: Workflow Gatekeeper (Sync/Mirror)
+
+on:
+  push:
+    branches:
+      - native-matrix-channel-pilot
+    paths:
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  enforce-sync-mirror-allowlist:
+    if: github.repository == 'theredspoon/ironclaw'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce sync/mirror workflow allowlist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # theredspoon/ironclaw should ONLY run sync and mirror automation
+          ALLOWED_WORKFLOWS=(
+            "sync-upstream.yml"
+            "auto-ff-matrix-pilot-sync.yml"
+            "mirror-to-deployment-target.yml"
+            "sync-mirror-workflow-gatekeeper.yml"
+          )
+
+          echo "Enforcing sync/mirror workflow allowlist for theredspoon/ironclaw..."
+          echo "Allowed: ${ALLOWED_WORKFLOWS[@]}"
+          echo ""
+
+          disabled_count=0
+
+          # Fetch all active workflows
+          gh api repos/theredspoon/ironclaw/actions/workflows --paginate \
+            --jq '.workflows[] | select(.state == "active") | {name: .name, path: .path}' \
+            > /tmp/active-workflows.json
+
+          while IFS= read -r workflow; do
+            name=$(echo "$workflow" | jq -r '.name')
+            path=$(echo "$workflow" | jq -r '.path')
+            filename=$(basename "$path")
+
+            # Check if workflow is on allowlist
+            allowed=false
+            for allowed_workflow in "${ALLOWED_WORKFLOWS[@]}"; do
+              if [[ "$filename" == "$allowed_workflow" ]]; then
+                allowed=true
+                break
+              fi
+            done
+
+            if [[ "$allowed" == "false" ]]; then
+              echo "🔒 Disabling: $name ($filename)"
+              gh workflow disable "$filename" -R theredspoon/ironclaw || true
+              ((disabled_count++))
+            fi
+          done < /tmp/active-workflows.json
+
+          echo ""
+          if [[ $disabled_count -eq 0 ]]; then
+            echo "✅ No unauthorized workflows found"
+          else
+            echo "⚠️  Auto-disabled $disabled_count unauthorized workflow(s)"
+            echo "   theredspoon/ironclaw should only run sync/mirror automation"
+          fi
