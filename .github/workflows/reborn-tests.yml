@@ -16,14 +16,17 @@ on:
   pull_request:
     branches:
       - main
+      - reborn-matrix-pilot
   merge_group:
     branches:
       - main
+      - reborn-matrix-pilot
     types:
       - checks_requested
   push:
     branches:
       - main
+      - reborn-matrix-pilot
 
 permissions:
   contents: read

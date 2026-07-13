@@ -27,14 +27,17 @@ on:
   pull_request:
     branches:
       - main
+      - reborn-matrix-pilot
   merge_group:
     branches:
       - main
+      - reborn-matrix-pilot
     types:
       - checks_requested
   push:
     branches:
       - main
+      - reborn-matrix-pilot
 
 permissions:
   contents: read
@@ -69,19 +72,21 @@ jobs:
       - id: non_diff
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         run: |
-          echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          echo "has_core_code=true" >> "$GITHUB_OUTPUT"
-          echo "has_legacy_tests=true" >> "$GITHUB_OUTPUT"
-          echo "has_runtime_heavy_risk=true" >> "$GITHUB_OUTPUT"
-          # Keep deterministic full browser E2E in its own scheduled/manual
-          # workflow. The merge queue runs only smoke coverage for web-risk
-          # changes so queued merges remain fast.
-          echo "has_web_risk=false" >> "$GITHUB_OUTPUT"
-          echo "has_direct_wasm_abi_risk=true" >> "$GITHUB_OUTPUT"
-          echo "has_wasm_abi_risk=true" >> "$GITHUB_OUTPUT"
-          echo "has_telegram_risk=true" >> "$GITHUB_OUTPUT"
-          echo "has_slack_risk=true" >> "$GITHUB_OUTPUT"
-          echo "has_docker_risk=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "docs_only=false"
+            echo "has_core_code=true"
+            echo "has_legacy_tests=true"
+            echo "has_runtime_heavy_risk=true"
+            # Keep deterministic full browser E2E in its own scheduled/manual
+            # workflow. The merge queue runs only smoke coverage for web-risk
+            # changes so queued merges remain fast.
+            echo "has_web_risk=false"
+            echo "has_direct_wasm_abi_risk=true"
+            echo "has_wasm_abi_risk=true"
+            echo "has_telegram_risk=true"
+            echo "has_slack_risk=true"
+            echo "has_docker_risk=true"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         with:
