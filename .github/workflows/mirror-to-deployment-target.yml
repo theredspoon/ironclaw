@@ -53,16 +53,6 @@ jobs:
           set -euo pipefail
           git remote add deployment_mirror "https://x-access-token:${DEPLOYMENT_MIRROR_TOKEN}@github.com/${DEPLOYMENT_MIRROR_REPOSITORY}.git"
 
-      - name: Preserve deployment target-owned workflows
-        run: |
-          set -euo pipefail
-          git fetch deployment_mirror "refs/heads/${TARGET_BRANCH}:refs/remotes/deployment_mirror/${TARGET_BRANCH}"
-          target_owned_workflows=(
-            .github/workflows/pilot-linux-artifact.yml
-            .github/workflows/regression-test-check.yml
-          )
-          git checkout "refs/remotes/deployment_mirror/${TARGET_BRANCH}" -- "${target_owned_workflows[@]}"
-
       - name: Disable Dependabot on deployment mirror
         run: |
           set -euo pipefail
@@ -95,7 +85,16 @@ jobs:
         run: |
           set -euo pipefail
           git fetch deployment_mirror "refs/heads/${MIRROR_BRANCH}:refs/remotes/deployment_mirror/${MIRROR_BRANCH}" || true
-          source_tree="$(git write-tree)"
+
+          # Build source tree excluding .github/workflows/
+          # Deployment target maintains its own workflows independently
+          full_tree="$(git write-tree)"
+          temp_index="${RUNNER_TEMP}/mirror-index"
+          GIT_INDEX_FILE="${temp_index}" git read-tree "${full_tree}"
+          GIT_INDEX_FILE="${temp_index}" git rm -r --cached .github/workflows 2>/dev/null || true
+          source_tree="$(GIT_INDEX_FILE="${temp_index}" git write-tree)"
+          rm -f "${temp_index}"
+
           target_parent="$(git rev-parse "refs/remotes/deployment_mirror/${TARGET_BRANCH}")"
           deployment_commit="$(
             git commit-tree "${source_tree}" \
