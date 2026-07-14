@@ -61,6 +61,7 @@ fn adapter() -> MatrixProductAdapter {
             header_name: "x-matrix-webhook-secret".to_string(),
         },
     })
+    .expect("explicit product adapter policy")
 }
 
 fn render_context(room_id: &str) -> MatrixRenderContext {
@@ -119,6 +120,24 @@ fn matrix_product_adapter_rejects_unverified_inbound_payload() {
         .expect_err("host auth evidence must be verified");
 
     assert!(matches!(err, ProductAdapterError::Authentication(_)));
+}
+
+#[test]
+fn matrix_product_adapter_requires_explicit_production_policy() {
+    let err = MatrixProductAdapter::new(MatrixProductAdapterConfig {
+        adapter_id: ProductAdapterId::new("matrix").expect("adapter id"),
+        installation_id: AdapterInstallationId::new("inst_abc123").expect("installation id"),
+        parse_policy: MatrixParsePolicy::default(),
+        auth_requirement: AuthRequirement::SharedSecretHeader {
+            header_name: "x-matrix-webhook-secret".to_string(),
+        },
+    })
+    .expect_err("product adapter policy must not fail open in production");
+
+    assert_eq!(
+        err.reason_code,
+        MatrixReasonCode::MissingPolicyConfiguration
+    );
 }
 
 #[test]
@@ -376,6 +395,17 @@ fn media_filename_and_mime_are_hardened() {
     };
     assert_eq!(payload.attachments[0].filename.as_deref(), Some("untitled"));
     assert_eq!(payload.attachments[0].mime_type, "application/octet-stream");
+
+    let active_content_mime = parse(text_event(json!({
+        "msgtype": "m.image",
+        "body": "vector.svg",
+        "url": "mxc://example.org/media-id",
+        "info": {"mimetype": "image/svg+xml"}
+    })));
+    let ProductInboundPayload::UserMessage(payload) = active_content_mime.product.payload else {
+        panic!("expected media user message");
+    };
+    assert_eq!(payload.attachments[0].mime_type, "application/octet-stream");
 }
 
 #[test]
@@ -408,6 +438,36 @@ fn event_id_validation_accepts_current_and_legacy_matrix_forms() {
     })
     .expect_err("event ids must use Matrix event sigil");
     assert_eq!(invalid.reason_code, MatrixReasonCode::MalformedMatrixEvent);
+}
+
+#[test]
+fn invalid_relation_event_ids_are_not_preserved_or_rendered() {
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.text",
+        "body": "invalid relation references",
+        "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": "not-a-matrix-event",
+            "m.in_reply_to": {"event_id": "also-not-a-matrix-event"}
+        }
+    })));
+
+    assert!(parsed.metadata.reply_to_event_id.is_none());
+    assert!(parsed.metadata.relation.is_none());
+    assert!(
+        parsed
+            .product
+            .external_conversation_ref
+            .topic_id()
+            .is_none()
+    );
+    assert!(
+        parsed
+            .product
+            .external_conversation_ref
+            .reply_target_message_id()
+            .is_none()
+    );
 }
 
 #[test]
@@ -666,7 +726,7 @@ fn metadata_serializes_route_fields_without_logging_raw_metadata() {
 }
 
 #[test]
-fn metadata_debug_redacts_internal_and_adversarial_fields() {
+fn metadata_debug_redacts_sensitive_and_adversarial_fields() {
     let parsed = parse(text_event(json!({
         "msgtype": "m.image",
         "body": "<b>body</b>",

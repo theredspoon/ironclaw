@@ -1,4 +1,4 @@
-//! Pure Matrix parse/render contracts for the Reborn Matrix channel.
+//! Pure Matrix parse/render contracts for the Matrix channel.
 
 #![forbid(unsafe_code)]
 
@@ -30,6 +30,28 @@ const MAX_EVENT_FIELD: usize = 512;
 const MAX_FORMATTED_BODY: usize = 64 * 1024;
 const MAX_HTML_NESTING: usize = 20;
 
+/// Input for parsing one Matrix event into Matrix facts and, on native builds,
+/// the authoritative product inbound DTO.
+///
+/// ```
+/// # use ironclaw_matrix_adapter::{MatrixParseInput, MatrixParsePolicy, parse_matrix_event};
+/// # use serde_json::json;
+/// let parsed = parse_matrix_event(MatrixParseInput {
+///     raw_event: json!({
+///         "type": "m.room.message",
+///         "event_id": "$event:example.org",
+///         "room_id": "!room:example.org",
+///         "sender": "@alice:example.org",
+///         "content": {"msgtype": "m.text", "body": "hello"}
+///     }),
+///     installation_id: "inst_abc123".to_string(),
+///     policy: MatrixParsePolicy {
+///         allowed_rooms: vec!["!room:example.org".to_string()],
+///         allowed_senders: vec!["@alice:example.org".to_string()],
+///     },
+/// }).expect("valid Matrix event");
+/// assert_eq!(parsed.facts.deduplication_key, "matrix-inst_abc123-$event:example.org");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixParseInput {
     pub raw_event: Value,
@@ -37,6 +59,12 @@ pub struct MatrixParseInput {
     pub policy: MatrixParsePolicy,
 }
 
+/// Explicit admission policy for Matrix parse/render boundaries.
+///
+/// Empty allowlists are accepted only by the pure parser for local contract tests
+/// and pre-transport parsing. [`MatrixProductAdapter`] construction rejects an
+/// empty room or sender allowlist so production hosts cannot accidentally emit
+/// workflow input with fail-open policy.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MatrixParsePolicy {
     /// Empty allowlists fail open for local contract tests and pre-transport
@@ -44,6 +72,13 @@ pub struct MatrixParsePolicy {
     /// configuration before emitting workflow input.
     pub allowed_rooms: Vec<String>,
     pub allowed_senders: Vec<String>,
+}
+
+impl MatrixParsePolicy {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn is_explicit_for_product_adapter(&self) -> bool {
+        !self.allowed_rooms.is_empty() && !self.allowed_senders.is_empty()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,11 +99,18 @@ pub struct MatrixProductAdapter {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl MatrixProductAdapter {
-    pub fn new(config: MatrixProductAdapterConfig) -> Self {
-        Self {
+    pub fn new(config: MatrixProductAdapterConfig) -> Result<Self, MatrixAdapterDiagnostic> {
+        if !config.parse_policy.is_explicit_for_product_adapter() {
+            return Err(MatrixAdapterDiagnostic::new(
+                MatrixReasonCode::MissingPolicyConfiguration,
+                PartialFacts::default(),
+                "matrix product adapter requires explicit room and sender allowlists",
+            ));
+        }
+        Ok(Self {
             config,
             capabilities: ProductAdapterCapabilities::external_channel_default(),
-        }
+        })
     }
 
     pub fn config(&self) -> &MatrixProductAdapterConfig {
@@ -76,6 +118,23 @@ impl MatrixProductAdapter {
     }
 }
 
+/// Native render input for translating a product outbound envelope into a typed
+/// Matrix command.
+///
+/// ```ignore
+/// let input = MatrixRenderInput {
+///     envelope,
+///     context: MatrixRenderContext {
+///         installation_id: "inst_abc123".to_string(),
+///         route_metadata: MatrixRouteMetadata {
+///             room_id: "!room:example.org".to_string(),
+///             reply_to_event_id: Some("$reply:example.org".to_string()),
+///             thread_root_event_id: None,
+///         },
+///         allowed_target_rooms: vec!["!room:example.org".to_string()],
+///     },
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(not(target_arch = "wasm32"))]
 pub struct MatrixRenderInput {
@@ -90,6 +149,27 @@ pub struct MatrixRenderContext {
     pub allowed_target_rooms: Vec<String>,
 }
 
+/// Parsed Matrix event, including Matrix-owned facts and metadata. Native builds
+/// also include the canonical [`ParsedProductInbound`] value used by product
+/// workflows; wasm builds keep this type protocol-only until component packaging
+/// wires it to the product adapter ABI.
+///
+/// ```
+/// # use ironclaw_matrix_adapter::{MatrixParseInput, MatrixParsePolicy, parse_matrix_event};
+/// # use serde_json::json;
+/// let parsed = parse_matrix_event(MatrixParseInput {
+///     raw_event: json!({
+///         "type": "m.room.encrypted",
+///         "event_id": "$encrypted:example.org",
+///         "room_id": "!room:example.org",
+///         "sender": "@alice:example.org",
+///         "content": {"algorithm": "m.megolm.v1.aes-sha2", "session_id": "opaque"}
+///     }),
+///     installation_id: "inst_abc123".to_string(),
+///     policy: MatrixParsePolicy::default(),
+/// }).expect("encrypted events become typed diagnostics");
+/// assert!(!parsed.metadata.diagnostics.is_empty());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedMatrixInbound {
     pub facts: MatrixInboundEvent,
@@ -205,6 +285,8 @@ pub enum RelationKind {
     Thread,
 }
 
+/// Matrix-specific encryption state. The adapter records undecryptable status without
+/// carrying ciphertext, key material, or product-level encryption fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum EncryptionState {
@@ -223,6 +305,15 @@ pub struct MatrixRouteMetadata {
     pub thread_root_event_id: Option<String>,
 }
 
+/// Typed Matrix transport command produced by the renderer. The adapter returns
+/// commands instead of performing network side effects.
+///
+/// ```ignore
+/// if let MatrixOutboundCommand::SendMessage { room_id, body, .. } = command {
+///     assert_eq!(room_id, "!room:example.org");
+///     assert_eq!(body["msgtype"], "m.text");
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MatrixOutboundCommand {
@@ -276,6 +367,7 @@ pub enum MatrixReasonCode {
     UnauthorizedTargetRoom,
     MissingRouteMetadata,
     UnsupportedMediaKind,
+    MissingPolicyConfiguration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +669,7 @@ fn map_matrix_diagnostic_to_adapter_error(
         | MatrixReasonCode::UnsupportedMsgtype
         | MatrixReasonCode::UnsupportedOutboundPayload
         | MatrixReasonCode::MissingRouteMetadata
+        | MatrixReasonCode::MissingPolicyConfiguration
         | MatrixReasonCode::UnsupportedMediaKind
         | MatrixReasonCode::UnsafeFormattedBody
         | MatrixReasonCode::UndecryptableEvent => ProductAdapterError::WorkflowRejected {
@@ -1105,14 +1198,14 @@ fn parse_relation(content: &Map<String, Value>) -> ParsedRelation {
         .and_then(Value::as_object)
         .and_then(|reply| reply.get("event_id"))
         .and_then(Value::as_str)
-        .and_then(sanitize_matrix_id)
-        .map(|value| value.to_string());
+        .filter(|event_id| is_valid_matrix_event_id(event_id))
+        .map(str::to_string);
     let relation = relates_to.and_then(|relates_to| {
         let event_id = relates_to
             .get("event_id")
             .and_then(Value::as_str)
-            .and_then(sanitize_matrix_id)
-            .map(|value| value.to_string())?;
+            .filter(|event_id| is_valid_matrix_event_id(event_id))
+            .map(str::to_string)?;
         let kind = match relates_to.get("rel_type").and_then(Value::as_str) {
             Some("m.thread") => RelationKind::Thread,
             _ => RelationKind::Reply,
@@ -1373,6 +1466,8 @@ fn sanitize_field_value(value: &str) -> String {
 }
 
 fn looks_like_credential(value: &str) -> bool {
+    // Keep this lightweight denylist aligned with the credential families
+    // exercised in tests; broader secret scanning belongs in CI.
     value.contains("Bearer ")
         || value.contains("sk_")
         || value.contains("syt_")
@@ -1410,12 +1505,23 @@ fn normalize_mime_type(value: &str) -> String {
 }
 
 fn is_allowed_mime_type(value: &str) -> bool {
-    value.starts_with("image/")
-        || value.starts_with("audio/")
-        || value.starts_with("video/")
-        || value == "text/plain"
-        || value == "application/pdf"
-        || value == "application/octet-stream"
+    matches!(
+        value,
+        "image/jpeg"
+            | "image/png"
+            | "image/gif"
+            | "image/webp"
+            | "audio/mpeg"
+            | "audio/mp4"
+            | "audio/ogg"
+            | "audio/wav"
+            | "video/mp4"
+            | "video/ogg"
+            | "video/webm"
+            | "text/plain"
+            | "application/pdf"
+            | "application/octet-stream"
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
