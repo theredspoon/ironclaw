@@ -1,6 +1,6 @@
 {
   "version": "0.1.0",
-  "wit_version": "0.3.1",
+  "wit_version": "0.3.2",
   "type": "channel",
   "name": "matrix",
   "description": "Matrix homeserver channel skeleton for IronClaw Reborn",

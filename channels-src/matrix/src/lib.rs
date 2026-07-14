@@ -484,7 +484,7 @@ mod tests {
 
         assert_eq!(manifest["type"], "channel");
         assert_eq!(manifest["name"], "matrix");
-        assert_eq!(manifest["wit_version"], "0.3.1");
+        assert_eq!(manifest["wit_version"], "0.3.2");
         assert_eq!(
             manifest["capabilities"]["http"]["credentials"]["matrix_token"]["secret_name"],
             "matrix_access_token"
