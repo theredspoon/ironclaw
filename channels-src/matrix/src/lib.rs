@@ -9,7 +9,13 @@ use exports::near::agent::channel::{
     AgentResponse, ChannelConfig, EndpointPattern, Guest, HttpEndpointConfig, IncomingHttpRequest,
     OutgoingHttpResponse, StatusUpdate,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use ironclaw_matrix_adapter::{MatrixParseInput, MatrixParsePolicy, parse_matrix_event};
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+use ironclaw_product_adapters::ProductInboundPayload;
 use near::agent::channel_host;
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+use near::agent::channel_host::EmittedMessage;
 use serde::Deserialize;
 
 const WEBHOOK_PATH: &str = "/webhook/matrix";
@@ -154,10 +160,7 @@ impl Guest for MatrixChannel {
             return json_response(401, serde_json::json!({"error": "webhook secret required"}));
         }
 
-        json_response(
-            501,
-            serde_json::json!({"error": "Matrix webhook intake is not implemented"}),
-        )
+        parse_webhook_request(req.body)
     }
 
     fn on_poll() {
@@ -190,6 +193,61 @@ impl Guest for MatrixChannel {
         );
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_webhook_request(body: Vec<u8>) -> OutgoingHttpResponse {
+    let raw_event = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return json_response(
+                400,
+                serde_json::json!({"reason_code": "malformed_matrix_event"}),
+            );
+        }
+    };
+    match parse_matrix_event(MatrixParseInput {
+        raw_event,
+        installation_id: "matrix-wasm".to_string(),
+        policy: MatrixParsePolicy::default(),
+    }) {
+        Ok(parsed) => {
+            emit_parsed_message(parsed);
+            json_response(202, serde_json::json!({"status": "accepted"}))
+        }
+        Err(diagnostic) => json_response(
+            400,
+            serde_json::to_value(diagnostic)
+                .unwrap_or_else(|_| serde_json::json!({"reason_code": "malformed_matrix_event"})),
+        ),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parse_webhook_request(_body: Vec<u8>) -> OutgoingHttpResponse {
+    json_response(
+        501,
+        serde_json::json!({"error": "Matrix webhook intake awaits host product bridge"}),
+    )
+}
+
+#[cfg(all(not(test), not(target_arch = "wasm32")))]
+fn emit_parsed_message(parsed: ironclaw_matrix_adapter::ParsedMatrixInbound) {
+    let ProductInboundPayload::UserMessage(payload) = parsed.product.payload else {
+        return;
+    };
+    let metadata_json = serde_json::to_string(&parsed.metadata).unwrap_or_else(|_| "{}".to_string());
+    channel_host::emit_message(&EmittedMessage {
+        user_id: parsed.facts.sender,
+        user_name: None,
+        content: payload.text,
+        thread_id: parsed.metadata.relation.as_ref().map(|relation| relation.event_id.clone()),
+        metadata_json,
+        attachments: Vec::new(),
+    });
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn emit_parsed_message(_parsed: ironclaw_matrix_adapter::ParsedMatrixInbound) {}
 
 #[cfg(not(test))]
 fn host_log(level: channel_host::LogLevel, message: &str) {
@@ -427,15 +485,52 @@ mod tests {
     }
 
     #[test]
-    fn http_request_reports_skeleton_not_implemented() {
-        let response =
-            <MatrixChannel as Guest>::on_http_request(request("POST", "/webhook/matrix"));
+    fn http_request_rejects_malformed_matrix_json() {
+        let mut req = request("POST", "/webhook/matrix");
+        req.body = b"{".to_vec();
+        let response = <MatrixChannel as Guest>::on_http_request(req);
 
-        assert_eq!(response.status, 501);
-        assert_eq!(
-            body_json(&response)["error"],
-            "Matrix webhook intake is not implemented"
-        );
+        assert_eq!(response.status, 400);
+        assert_eq!(body_json(&response)["reason_code"], "malformed_matrix_event");
+    }
+
+    #[test]
+    fn http_request_returns_typed_diagnostic_for_unsupported_event() {
+        let mut req = request("POST", "/webhook/matrix");
+        req.body = serde_json::json!({
+            "type": "m.room.member",
+            "event_id": "$event:example.org",
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "content": {"body": "Bearer sk_live_secret"}
+        })
+        .to_string()
+        .into_bytes();
+        let response = <MatrixChannel as Guest>::on_http_request(req);
+
+        assert_eq!(response.status, 400);
+        let body = body_json(&response);
+        assert_eq!(body["reason_code"], "unsupported_event_type");
+        assert!(!response.body.windows(b"sk_live".len()).any(|w| w == b"sk_live"));
+    }
+
+    #[test]
+    fn http_request_parses_matrix_text_event_through_adapter() {
+        let mut req = request("POST", "/webhook/matrix");
+        req.body = serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$event:example.org",
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1710000000000_i64,
+            "content": {"msgtype": "m.text", "body": "hello matrix"}
+        })
+        .to_string()
+        .into_bytes();
+        let response = <MatrixChannel as Guest>::on_http_request(req);
+
+        assert_eq!(response.status, 202);
+        assert_eq!(body_json(&response)["status"], "accepted");
     }
 
     #[test]

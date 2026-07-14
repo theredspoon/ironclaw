@@ -595,6 +595,27 @@ pub enum ProductInboundPayload {
     NoOp,
 }
 
+/// Encryption status for E2EE-capable protocols.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum EncryptionStatus {
+    /// Plaintext message from an unencrypted conversation.
+    Unencrypted,
+    /// Successfully decrypted E2EE message. Matrix session storage owns this in
+    /// ICWM-R004; R002 only preserves the shared contract shape.
+    Decrypted {
+        algorithm: String,
+        session_id: String,
+    },
+    /// Encrypted message that could not be decrypted by the adapter boundary.
+    Undecryptable {
+        algorithm: String,
+        reason_code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+}
+
 /// Adapter-produced parse result. It deliberately excludes host-trusted fields
 /// (adapter id, installation id, verified auth claim, and received_at).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,6 +624,8 @@ pub struct ParsedProductInbound {
     pub external_actor_ref: ExternalActorRef,
     pub external_conversation_ref: ExternalConversationRef,
     pub payload: ProductInboundPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_status: Option<EncryptionStatus>,
 }
 
 impl ParsedProductInbound {
@@ -617,7 +640,13 @@ impl ParsedProductInbound {
             external_actor_ref,
             external_conversation_ref,
             payload,
+            encryption_status: None,
         })
+    }
+
+    pub fn with_encryption_status(mut self, encryption_status: EncryptionStatus) -> Self {
+        self.encryption_status = Some(encryption_status);
+        self
     }
 }
 
@@ -660,6 +689,7 @@ pub struct ProductInboundEnvelope {
     external_event_id: ExternalEventId,
     external_actor_ref: ExternalActorRef,
     external_conversation_ref: ExternalConversationRef,
+    encryption_status: Option<EncryptionStatus>,
     auth_claim: VerifiedAuthClaim,
     received_at: DateTime<Utc>,
     payload: ProductInboundPayload,
@@ -676,6 +706,7 @@ impl ProductInboundEnvelope {
             external_event_id: parsed.external_event_id,
             external_actor_ref: parsed.external_actor_ref,
             external_conversation_ref: parsed.external_conversation_ref,
+            encryption_status: parsed.encryption_status,
             auth_claim: context.auth_claim,
             received_at: context.received_at,
             payload: parsed.payload,
@@ -700,6 +731,10 @@ impl ProductInboundEnvelope {
 
     pub fn external_conversation_ref(&self) -> &ExternalConversationRef {
         &self.external_conversation_ref
+    }
+
+    pub fn encryption_status(&self) -> Option<&EncryptionStatus> {
+        self.encryption_status.as_ref()
     }
 
     pub fn auth_claim(&self) -> &VerifiedAuthClaim {
@@ -1091,6 +1126,48 @@ mod tests {
         .expect("envelope");
         assert_eq!(envelope.adapter_id().as_str(), "telegram_v2");
         assert_eq!(envelope.payload(), &ProductInboundPayload::NoOp);
+    }
+
+    #[test]
+    fn parsed_product_inbound_defaults_encryption_status_to_none() {
+        let parsed = sample_parsed(ProductInboundPayload::NoOp);
+        assert_eq!(parsed.encryption_status, None);
+    }
+
+    #[test]
+    fn parsed_product_inbound_preserves_explicit_encryption_status() {
+        let parsed = sample_parsed(ProductInboundPayload::NoOp).with_encryption_status(
+            EncryptionStatus::Undecryptable {
+                algorithm: "m.megolm.v1.aes-sha2".to_string(),
+                reason_code: "undecryptable_event".to_string(),
+                session_id: Some("opaque-session-id".to_string()),
+            },
+        );
+        let envelope =
+            ProductInboundEnvelope::from_trusted_parse(sample_context(), parsed).expect("envelope");
+
+        assert_eq!(
+            envelope.encryption_status(),
+            Some(&EncryptionStatus::Undecryptable {
+                algorithm: "m.megolm.v1.aes-sha2".to_string(),
+                reason_code: "undecryptable_event".to_string(),
+                session_id: Some("opaque-session-id".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn encryption_status_round_trips_through_parsed_product_inbound_serde() {
+        let parsed = sample_parsed(ProductInboundPayload::NoOp)
+            .with_encryption_status(EncryptionStatus::Unencrypted);
+        let json = serde_json::to_string(&parsed).expect("serialize parsed inbound");
+        let roundtrip: ParsedProductInbound =
+            serde_json::from_str(&json).expect("deserialize parsed inbound");
+
+        assert_eq!(
+            roundtrip.encryption_status,
+            Some(EncryptionStatus::Unencrypted)
+        );
     }
 
     #[test]

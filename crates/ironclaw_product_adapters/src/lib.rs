@@ -45,7 +45,7 @@ pub use fakes::{
 pub use identity::{AdapterInstallationId, ProductAdapterId, ProductSurfaceKind};
 pub use inbound::{
     ApprovalDecision, ApprovalResolutionPayload, AuthResolutionPayload, AuthResolutionResult,
-    InboundCommandPayload, InboundRetryDisposition, LinkedThreadActionPayload,
+    EncryptionStatus, InboundCommandPayload, InboundRetryDisposition, LinkedThreadActionPayload,
     ParsedProductInbound, ProductCommandResultPayload, ProductControlActionPayload,
     ProductInboundAck, ProductInboundEnvelope, ProductInboundPayload, ProductRejection,
     ProductRejectionDisposition, ProductRejectionKind, ProductSlashCommandParseError,
