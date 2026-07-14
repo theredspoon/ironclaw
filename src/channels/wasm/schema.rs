@@ -597,6 +597,13 @@ pub struct ChannelConfig {
     /// Polling configuration.
     #[serde(default)]
     pub poll: Option<PollConfigSchema>,
+
+    /// Optional HTTP allowlist provided by the component.
+    ///
+    /// If present, overrides the manifest allowlist for this channel instance.
+    /// If absent, the host uses the manifest allowlist.
+    #[serde(default)]
+    pub http_allowlist: Option<Vec<crate::tools::wasm::EndpointPattern>>,
 }
 
 impl Default for ChannelConfig {
@@ -605,6 +612,7 @@ impl Default for ChannelConfig {
             display_name: "WASM Channel".to_string(),
             http_endpoints: Vec::new(),
             poll: None,
+            http_allowlist: None,
         }
     }
 }

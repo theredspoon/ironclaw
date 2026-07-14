@@ -93,6 +93,7 @@ impl Guest for WechatChannel {
                 interval_ms: config.poll_interval_ms.max(30_000),
                 enabled: true,
             }),
+            http_allowlist: None,
         })
     }
 

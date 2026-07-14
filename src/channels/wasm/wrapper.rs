@@ -801,6 +801,10 @@ pub struct WasmChannel {
     /// Channel configuration returned by on_start.
     channel_config: RwLock<Option<ChannelConfig>>,
 
+    /// WASM-provided HTTP allowlist (from on_start http_allowlist).
+    /// When present and validated, overrides the manifest allowlist for HTTP requests.
+    wasm_http_allowlist: RwLock<Option<Vec<crate::tools::wasm::EndpointPattern>>>,
+
     /// Message sender (for emitting messages to the stream).
     /// Wrapped in Arc for sharing with the polling task.
     message_tx: Arc<RwLock<Option<mpsc::Sender<IncomingMessage>>>>,
@@ -1161,6 +1165,7 @@ impl WasmChannel {
             capabilities,
             config_json: RwLock::new(config_json),
             channel_config: RwLock::new(None),
+            wasm_http_allowlist: RwLock::new(None),
             message_tx: Arc::new(RwLock::new(None)),
             pending_responses: RwLock::new(HashMap::new()),
             rate_limiter: Arc::new(RwLock::new(rate_limiter)),
@@ -1478,6 +1483,113 @@ impl WasmChannel {
         caps
     }
 
+    fn validate_dynamic_http_allowlist(
+        &self,
+        patterns: &[crate::tools::wasm::EndpointPattern],
+    ) -> Result<(), String> {
+        if self.capabilities.tool_capabilities.http.is_none() {
+            return Err("channel manifest does not declare HTTP capability".to_string());
+        }
+
+        if patterns.is_empty() {
+            return Err("dynamic HTTP allowlist must contain at least one pattern".to_string());
+        }
+
+        for (index, pattern) in patterns.iter().enumerate() {
+            let host = pattern.host.trim();
+            if host.is_empty() || host != pattern.host {
+                return Err(format!(
+                    "dynamic HTTP allowlist pattern {index} has an invalid host"
+                ));
+            }
+
+            if host.starts_with("*.")
+                || host.contains('*')
+                || host.contains("://")
+                || host.contains('/')
+                || host.contains('\\')
+                || host.contains('@')
+                || host.contains(':')
+                || host.contains('?')
+                || host.contains('#')
+                || host.contains('[')
+                || host.contains(']')
+                || host.chars().any(char::is_whitespace)
+            {
+                return Err(format!(
+                    "dynamic HTTP allowlist pattern {index} must use a single DNS hostname"
+                ));
+            }
+
+            if host.parse::<std::net::IpAddr>().is_ok()
+                || host == "localhost"
+                || host.ends_with(".localhost")
+                || host.starts_with('.')
+                || host.ends_with('.')
+                || host.contains("..")
+                || !host.contains('.')
+                || !host.chars().all(|ch| {
+                    ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '.'
+                })
+                || !host.split('.').all(|label| {
+                    !label.is_empty()
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label.len() <= 63
+                })
+            {
+                return Err(format!(
+                    "dynamic HTTP allowlist pattern {index} must use a valid public DNS hostname"
+                ));
+            }
+
+            let Some(path_prefix) = pattern.path_prefix.as_deref() else {
+                return Err(format!(
+                    "dynamic HTTP allowlist pattern {index} must include a path_prefix"
+                ));
+            };
+            if !path_prefix.starts_with('/')
+                || path_prefix.contains('\\')
+                || path_prefix.contains("//")
+                || path_prefix.contains("/../")
+                || path_prefix == "/.."
+            {
+                return Err(format!(
+                    "dynamic HTTP allowlist pattern {index} has an invalid path_prefix"
+                ));
+            }
+
+            for method in &pattern.methods {
+                if method.is_empty()
+                    || !method
+                        .chars()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+                {
+                    return Err(format!(
+                        "dynamic HTTP allowlist pattern {index} has an invalid HTTP method"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create effective capabilities by merging WASM-provided HTTP allowlist if present.
+    async fn effective_capabilities(&self) -> ChannelCapabilities {
+        let mut caps = self.capabilities.clone();
+        if let Some(wasm_allowlist) = self.wasm_http_allowlist.read().await.as_ref() {
+            tracing::debug!(
+                channel = %self.name,
+                patterns = wasm_allowlist.len(),
+                "Using WASM-provided HTTP allowlist"
+            );
+            if let Some(ref mut http) = caps.tool_capabilities.http {
+                http.allowlist = wasm_allowlist.clone();
+            }
+        }
+        caps
+    }
     /// Add channel host functions to the linker using generated bindings.
     ///
     /// Uses the wasmtime::component::bindgen! generated `add_to_linker` function
@@ -2035,7 +2147,8 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
+        let base_caps = self.effective_capabilities().await;
+        let capabilities = Self::inject_workspace_reader(&base_caps, &self.workspace_store);
         let config_json = self.config_json.read().await.clone();
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
@@ -2120,6 +2233,7 @@ impl WasmChannel {
                 display_name: self.prepared.description.clone(),
                 http_endpoints: Vec::new(),
                 poll: None,
+                http_allowlist: None,
             });
         }
 
@@ -2190,7 +2304,8 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
+        let base_caps = self.effective_capabilities().await;
+        let capabilities = Self::inject_workspace_reader(&base_caps, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
         let host_credentials = resolve_channel_host_credentials(
@@ -2301,7 +2416,8 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
+        let base_caps = self.effective_capabilities().await;
+        let capabilities = Self::inject_workspace_reader(&base_caps, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -2423,7 +2539,8 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
+        let base_caps = self.effective_capabilities().await;
+        let capabilities = Self::inject_workspace_reader(&base_caps, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -2586,7 +2703,8 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
+        let base_caps = self.effective_capabilities().await;
+        let capabilities = Self::inject_workspace_reader(&base_caps, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -2702,7 +2820,8 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
+        let base_caps = self.effective_capabilities().await;
+        let capabilities = Self::inject_workspace_reader(&base_caps, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
@@ -3711,6 +3830,23 @@ impl Channel for WasmChannel {
 
         // Store the config
         *self.channel_config.write().await = Some(config.clone());
+
+        *self.wasm_http_allowlist.write().await = None;
+
+        // Store WASM-provided HTTP allowlist if present (overrides manifest)
+        if let Some(ref http_allowlist) = config.http_allowlist {
+            self.validate_dynamic_http_allowlist(http_allowlist)
+                .map_err(|reason| ChannelError::StartupFailed {
+                    name: self.name.clone(),
+                    reason,
+                })?;
+            tracing::info!(
+                channel = %self.name,
+                patterns = http_allowlist.len(),
+                "Storing WASM-provided HTTP allowlist"
+            );
+            *self.wasm_http_allowlist.write().await = Some(http_allowlist.clone());
+        }
 
         // Register HTTP endpoints
         let mut endpoints = Vec::new();
@@ -5348,6 +5484,16 @@ fn convert_channel_config(wit: wit_channel::ChannelConfig) -> ChannelConfig {
                 interval_ms: p.interval_ms,
                 enabled: p.enabled,
             }),
+        http_allowlist: wit.http_allowlist.map(|patterns| {
+            patterns
+                .into_iter()
+                .map(|p| crate::tools::wasm::EndpointPattern {
+                    host: p.host,
+                    path_prefix: p.path_prefix,
+                    methods: p.methods.unwrap_or_default(),
+                })
+                .collect()
+        }),
     }
 }
 
@@ -7743,6 +7889,7 @@ mod tests {
         let poll_config = crate::channels::wasm::schema::ChannelConfig {
             display_name: "poll-channel".to_string(),
             http_endpoints: Vec::new(),
+            http_allowlist: None,
             poll: Some(crate::channels::wasm::schema::PollConfigSchema {
                 enabled: true,
                 interval_ms: 1000,

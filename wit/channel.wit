@@ -1,4 +1,4 @@
-package near:agent@0.3.1;
+package near:agent@0.3.2;
 
 // WASM Channel Sandbox Interface
 //
@@ -254,6 +254,25 @@ interface channel {
         enabled: bool,
     }
 
+    /// HTTP endpoint allowlist pattern.
+    ///
+    /// Defines which HTTP endpoints a channel can access for outbound requests.
+    /// Channels can return a dynamic allowlist from on-start based on their
+    /// configuration (e.g., Matrix specifies homeserver, Slack uses static slack.com).
+    record endpoint-pattern {
+        /// Host (domain) to match.
+        /// Example: "matrix.org", "slack.com"
+        host: string,
+        /// Path prefix to match (optional).
+        /// Example: "/_matrix/" matches "/_matrix/client/v3/sync"
+        /// If omitted, all paths on this host are allowed.
+        path-prefix: option<string>,
+        /// Allowed HTTP methods (optional).
+        /// Example: ["GET", "POST"]
+        /// If omitted, all methods are allowed.
+        methods: option<list<string>>,
+    }
+
     /// Channel configuration returned by on-start.
     record channel-config {
         /// Human-readable display name.
@@ -262,6 +281,15 @@ interface channel {
         http-endpoints: list<http-endpoint-config>,
         /// Optional polling configuration.
         poll: option<poll-config>,
+        /// Optional HTTP allowlist provided by component.
+        ///
+        /// If present, overrides the manifest allowlist for this channel instance.
+        /// If absent, the host uses the allowlist from the capabilities manifest.
+        ///
+        /// This enables channels with configurable endpoints (e.g., Matrix with
+        /// user-specified homeserver) to return dynamic allowlists while maintaining
+        /// backward compatibility with channels that use static manifest allowlists.
+        http-allowlist: option<list<endpoint-pattern>>,
     }
 
     // ==================== Request/Response Types ====================
