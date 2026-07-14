@@ -12,10 +12,13 @@ use exports::near::agent::channel::{
 use ironclaw_matrix_adapter::{MatrixParseInput, MatrixParsePolicy, parse_matrix_event};
 use near::agent::channel_host;
 #[cfg(not(test))]
-use near::agent::channel_host::EmittedMessage;
+use near::agent::channel_host::{EmittedMessage, InboundAttachment};
 use serde::Deserialize;
 
 const WEBHOOK_PATH: &str = "/webhook/matrix";
+#[cfg(not(test))]
+const MATRIX_PARSE_POLICY_PATH: &str = "state/parse_policy";
+const MAX_WEBHOOK_BODY_BYTES: usize = 128 * 1024;
 const SUPPORTED_CALLBACKS: &[&str] = &[
     "on_start",
     "on_http_request",
@@ -38,6 +41,10 @@ struct MatrixConfig {
     #[allow(dead_code)]
     #[serde(default)]
     poll_interval_ms: u32,
+    #[serde(default)]
+    allowed_rooms: Vec<String>,
+    #[serde(default)]
+    allowed_senders: Vec<String>,
 }
 
 /// Parse and validate homeserver URL, returning the domain.
@@ -126,6 +133,17 @@ impl Guest for MatrixChannel {
             path_prefix: Some("/_matrix/".to_string()),
             methods: None, // All HTTP methods allowed
         }];
+        let policy = MatrixParsePolicy {
+            allowed_rooms: config.allowed_rooms,
+            allowed_senders: config.allowed_senders,
+        };
+        if policy.allowed_rooms.is_empty() && policy.allowed_senders.is_empty() {
+            return Err(
+                "Matrix config must include allowed_rooms or allowed_senders for webhook admission"
+                    .to_string(),
+            );
+        }
+        save_parse_policy(&policy)?;
 
         host_log(
             channel_host::LogLevel::Info,
@@ -192,6 +210,12 @@ impl Guest for MatrixChannel {
 }
 
 fn parse_webhook_request(body: Vec<u8>) -> OutgoingHttpResponse {
+    if body.len() > MAX_WEBHOOK_BODY_BYTES {
+        return json_response(
+            413,
+            serde_json::json!({"reason_code": "malformed_matrix_event"}),
+        );
+    }
     let raw_event = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
@@ -204,7 +228,7 @@ fn parse_webhook_request(body: Vec<u8>) -> OutgoingHttpResponse {
     match parse_matrix_event(MatrixParseInput {
         raw_event,
         installation_id: "matrix-wasm".to_string(),
-        policy: MatrixParsePolicy::default(),
+        policy: load_parse_policy(),
     }) {
         Ok(parsed) => {
             emit_parsed_message(parsed);
@@ -223,6 +247,29 @@ fn emit_parsed_message(parsed: ironclaw_matrix_adapter::ParsedMatrixInbound) {
     let Some(content) = parsed.facts.content else {
         return;
     };
+    let attachments = content
+        .media
+        .as_ref()
+        .map(|media| {
+            vec![InboundAttachment {
+                id: parsed.facts.event_id.clone(),
+                mime_type: media
+                    .mime_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+                filename: media.filename.clone(),
+                size_bytes: media.size_bytes,
+                source_url: None,
+                storage_key: None,
+                extracted_text: None,
+                extras_json: serde_json::json!({
+                    "matrix_msgtype": media.msgtype,
+                    "matrix_media_url_in_metadata": media.mxc_url.is_some()
+                })
+                .to_string(),
+            }]
+        })
+        .unwrap_or_default();
     let metadata_json = serde_json::to_string(&parsed.metadata).unwrap_or_else(|_| "{}".to_string());
     channel_host::emit_message(&EmittedMessage {
         user_id: parsed.facts.sender,
@@ -230,7 +277,7 @@ fn emit_parsed_message(parsed: ironclaw_matrix_adapter::ParsedMatrixInbound) {
         content: content.body,
         thread_id: parsed.metadata.relation.as_ref().map(|relation| relation.event_id.clone()),
         metadata_json,
-        attachments: Vec::new(),
+        attachments,
     });
 }
 
@@ -244,6 +291,34 @@ fn host_log(level: channel_host::LogLevel, message: &str) {
 
 #[cfg(test)]
 fn host_log(_level: channel_host::LogLevel, _message: &str) {}
+
+#[cfg(not(test))]
+fn save_parse_policy(policy: &MatrixParsePolicy) -> Result<(), String> {
+    let policy_json =
+        serde_json::to_string(policy).map_err(|e| format!("Failed to serialize Matrix policy: {e}"))?;
+    channel_host::workspace_write(MATRIX_PARSE_POLICY_PATH, &policy_json)
+        .map_err(|e| format!("Failed to persist Matrix policy: {e}"))
+}
+
+#[cfg(test)]
+fn save_parse_policy(_policy: &MatrixParsePolicy) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn load_parse_policy() -> MatrixParsePolicy {
+    channel_host::workspace_read(MATRIX_PARSE_POLICY_PATH)
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn load_parse_policy() -> MatrixParsePolicy {
+    MatrixParsePolicy {
+        allowed_rooms: vec!["!room:example.org".to_string()],
+        allowed_senders: vec!["@alice:example.org".to_string()],
+    }
+}
 
 fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse {
     OutgoingHttpResponse {
@@ -274,7 +349,9 @@ mod tests {
             "homeserver_url": "https://matrix.org",
             "user_id": null,
             "device_id": null,
-            "polling_enabled": false
+            "polling_enabled": false,
+            "allowed_rooms": ["!room:example.org"],
+            "allowed_senders": ["@alice:example.org"]
         })
         .to_string()
     }
@@ -311,7 +388,8 @@ mod tests {
         let config_json = serde_json::json!({
             "homeserver_url": "https://matrix.org",
             "polling_enabled": true,
-            "poll_interval_ms": 45000
+            "poll_interval_ms": 45000,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -332,7 +410,8 @@ mod tests {
         let config_json = serde_json::json!({
             "homeserver_url": "https://matrix.org",
             "polling_enabled": false,
-            "poll_interval_ms": 1000
+            "poll_interval_ms": 1000,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -357,7 +436,8 @@ mod tests {
     fn on_start_rejects_http_homeserver() {
         let config_json = serde_json::json!({
             "homeserver_url": "http://matrix.org",
-            "polling_enabled": false
+            "polling_enabled": false,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -370,7 +450,8 @@ mod tests {
     fn on_start_rejects_homeserver_with_path() {
         let config_json = serde_json::json!({
             "homeserver_url": "https://matrix.org/_matrix/client",
-            "polling_enabled": false
+            "polling_enabled": false,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -390,7 +471,8 @@ mod tests {
         ] {
             let config_json = serde_json::json!({
                 "homeserver_url": homeserver_url,
-                "polling_enabled": false
+                "polling_enabled": false,
+                "allowed_rooms": ["!room:example.org"]
             })
             .to_string();
 
@@ -403,7 +485,8 @@ mod tests {
     fn on_start_normalizes_homeserver_host_to_lowercase() {
         let config_json = serde_json::json!({
             "homeserver_url": "https://Matrix.Example",
-            "polling_enabled": false
+            "polling_enabled": false,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -417,7 +500,8 @@ mod tests {
     fn on_start_constructs_allowlist_from_homeserver() {
         let config_json = serde_json::json!({
             "homeserver_url": "https://matrix.org",
-            "polling_enabled": false
+            "polling_enabled": false,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -434,7 +518,8 @@ mod tests {
     fn on_start_accepts_homeserver_with_trailing_slash() {
         let config_json = serde_json::json!({
             "homeserver_url": "https://homeserver.test/",
-            "polling_enabled": false
+            "polling_enabled": false,
+            "allowed_rooms": ["!room:example.org"]
         })
         .to_string();
 
@@ -443,6 +528,19 @@ mod tests {
         let allowlist = config.http_allowlist.expect("allowlist provided");
 
         assert_eq!(allowlist[0].host, "homeserver.test");
+    }
+
+    #[test]
+    fn on_start_rejects_empty_matrix_admission_policy() {
+        let config_json = serde_json::json!({
+            "homeserver_url": "https://matrix.org",
+            "polling_enabled": false
+        })
+        .to_string();
+
+        let err = <MatrixChannel as Guest>::on_start(config_json)
+            .expect_err("Matrix webhook policy must not fail open");
+        assert!(err.contains("allowed_rooms") || err.contains("allowed_senders"));
     }
 
     #[test]
@@ -483,6 +581,16 @@ mod tests {
     }
 
     #[test]
+    fn http_request_rejects_oversized_matrix_body_before_json_parse() {
+        let mut req = request("POST", "/webhook/matrix");
+        req.body = vec![b'{'; MAX_WEBHOOK_BODY_BYTES + 1];
+        let response = <MatrixChannel as Guest>::on_http_request(req);
+
+        assert_eq!(response.status, 413);
+        assert_eq!(body_json(&response)["reason_code"], "malformed_matrix_event");
+    }
+
+    #[test]
     fn http_request_returns_typed_diagnostic_for_unsupported_event() {
         let mut req = request("POST", "/webhook/matrix");
         req.body = serde_json::json!({
@@ -500,6 +608,24 @@ mod tests {
         let body = body_json(&response);
         assert_eq!(body["reason_code"], "unsupported_event_type");
         assert!(!response.body.windows(b"sk_live".len()).any(|w| w == b"sk_live"));
+    }
+
+    #[test]
+    fn http_request_applies_configured_matrix_policy() {
+        let mut req = request("POST", "/webhook/matrix");
+        req.body = serde_json::json!({
+            "type": "m.room.message",
+            "event_id": "$event:example.org",
+            "room_id": "!elsewhere:example.org",
+            "sender": "@alice:example.org",
+            "content": {"msgtype": "m.text", "body": "hello matrix"}
+        })
+        .to_string()
+        .into_bytes();
+        let response = <MatrixChannel as Guest>::on_http_request(req);
+
+        assert_eq!(response.status, 400);
+        assert_eq!(body_json(&response)["reason_code"], "unauthorized_room");
     }
 
     #[test]

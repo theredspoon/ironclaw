@@ -11,16 +11,12 @@ use ironclaw_product_adapters::{
     ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload, ProductTriggerReason,
     UserMessagePayload,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use pulldown_cmark::{Options, Parser, html};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-#[cfg(target_arch = "wasm32")]
-use wasm_product::{
-    EncryptionStatus, ExternalActorRef, ExternalConversationRef, ExternalEventId,
-    ParsedProductInbound, ProductAttachmentDescriptor, ProductAttachmentKind,
-    ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload, ProductTriggerReason,
-    UserMessagePayload,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use serde_json::json;
+use serde_json::{Map, Value};
 
 const DIAGNOSTIC_MESSAGE_MAX: usize = 100;
 const MAX_EVENT_FIELD: usize = 512;
@@ -43,6 +39,7 @@ pub struct MatrixParsePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct MatrixRenderInput {
     pub envelope: ProductOutboundEnvelope,
     pub context: MatrixRenderContext,
@@ -59,6 +56,7 @@ pub struct MatrixRenderContext {
 pub struct ParsedMatrixInbound {
     pub facts: MatrixInboundEvent,
     pub metadata: MatrixMessageMetadata,
+    #[cfg(not(target_arch = "wasm32"))]
     pub product: ParsedProductInbound,
 }
 
@@ -311,6 +309,7 @@ pub fn parse_matrix_event(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn render_matrix_outbound(
     input: MatrixRenderInput,
 ) -> Result<MatrixOutboundCommand, MatrixAdapterDiagnostic> {
@@ -376,6 +375,7 @@ pub fn render_matrix_outbound(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_room_message(
     object: &Map<String, Value>,
     facts: MatrixEventFacts,
@@ -480,6 +480,73 @@ fn parse_room_message(
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn parse_room_message(
+    object: &Map<String, Value>,
+    facts: MatrixEventFacts,
+    _installation_id: &str,
+) -> Result<ParsedMatrixInbound, MatrixAdapterDiagnostic> {
+    let content = object
+        .get("content")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            diagnostic_for_facts(
+                MatrixReasonCode::MalformedMatrixEvent,
+                &facts,
+                "matrix room message content must be an object",
+            )
+        })?;
+    let msgtype = required_string(content, "msgtype", &facts)?;
+
+    let mut metadata = MatrixMessageMetadata::from_facts(&facts);
+    metadata.msgtype = Some(msgtype.clone());
+    let relation = parse_relation(content);
+    metadata.reply_to_event_id = relation.reply_to_event_id.clone();
+    metadata.relation = relation.relation.clone();
+    metadata.formatted_body = sanitized_formatted_body(content, &facts, &mut metadata.diagnostics);
+
+    let message_content = match msgtype.as_str() {
+        "m.text" | "m.notice" => {
+            let body = required_string(content, "body", &facts)?;
+            MatrixMessageContent {
+                msgtype: msgtype.clone(),
+                body,
+                formatted_body: metadata.formatted_body.clone(),
+                media: None,
+            }
+        }
+        "m.image" | "m.file" | "m.audio" | "m.video" => {
+            let body = content
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(sanitize_filename)
+                .unwrap_or_default();
+            let media = matrix_media_from_content(content, &msgtype);
+            metadata.media_url = media.as_ref().and_then(|media| media.mxc_url.clone());
+            MatrixMessageContent {
+                msgtype: msgtype.clone(),
+                body,
+                formatted_body: metadata.formatted_body.clone(),
+                media,
+            }
+        }
+        _ => {
+            return Err(diagnostic_for_facts(
+                MatrixReasonCode::UnsupportedMsgtype,
+                &facts,
+                "matrix room message msgtype is not supported",
+            ));
+        }
+    };
+    let mut facts = facts;
+    facts.relation = metadata.relation.clone();
+    facts.content = Some(message_content);
+    facts.encryption = EncryptionState::Unencrypted;
+
+    Ok(ParsedMatrixInbound { facts, metadata })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_encrypted_event(
     object: &Map<String, Value>,
     facts: MatrixEventFacts,
@@ -524,6 +591,42 @@ fn parse_encrypted_event(
     )
 }
 
+#[cfg(target_arch = "wasm32")]
+fn parse_encrypted_event(
+    object: &Map<String, Value>,
+    facts: MatrixEventFacts,
+    _installation_id: &str,
+) -> Result<ParsedMatrixInbound, MatrixAdapterDiagnostic> {
+    let content = object.get("content").and_then(Value::as_object);
+    let algorithm = content
+        .and_then(|content| content.get("algorithm"))
+        .and_then(Value::as_str)
+        .and_then(sanitize_event_type)
+        .map(|value| value.to_string());
+    let session_id = content
+        .and_then(|content| content.get("session_id"))
+        .and_then(Value::as_str)
+        .and_then(sanitize_matrix_id)
+        .map(|value| value.to_string());
+    let diagnostic = diagnostic_for_facts(
+        MatrixReasonCode::UndecryptableEvent,
+        &facts,
+        "encrypted Matrix event cannot be decrypted in the parse/render adapter",
+    );
+    let encryption = EncryptionState::Undecryptable {
+        algorithm,
+        session_id,
+        reason_code: MatrixReasonCode::UndecryptableEvent,
+    };
+    let mut metadata = MatrixMessageMetadata::from_facts(&facts);
+    metadata.encryption = encryption.clone();
+    metadata.diagnostics = vec![diagnostic];
+    let mut facts = facts;
+    facts.encryption = encryption;
+    Ok(ParsedMatrixInbound { facts, metadata })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn product_result(
     facts: MatrixEventFacts,
     metadata: MatrixMessageMetadata,
@@ -584,6 +687,7 @@ fn product_result(
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn attachment_from_content(
     facts: &MatrixEventFacts,
     content: &Map<String, Value>,
@@ -821,26 +925,26 @@ fn sanitize_matrix_html(raw: &str) -> String {
         "i",
         "li",
         "ol",
-        "p",
         "pre",
-        "s",
         "strong",
-        "u",
         "ul",
     ]
     .into_iter()
     .collect();
     let mut tag_attributes: HashMap<&'static str, HashSet<&'static str>> = HashMap::new();
     tag_attributes.insert("a", ["href"].into_iter().collect());
+    let url_schemes: HashSet<&'static str> = ["http", "https"].into_iter().collect();
     ammonia::Builder::new()
         .tags(tags)
         .tag_attributes(tag_attributes)
+        .url_schemes(url_schemes)
         .url_relative(ammonia::UrlRelative::Deny)
         .link_rel(None)
         .clean(raw)
         .to_string()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn markdown_to_sanitized_matrix_html(markdown: &str) -> String {
     let mut unsafe_html = String::new();
     let parser = Parser::new_ext(markdown, Options::empty());
@@ -848,6 +952,7 @@ fn markdown_to_sanitized_matrix_html(markdown: &str) -> String {
     sanitize_matrix_html(&unsafe_html)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn markdown_to_plaintext(markdown: &str) -> String {
     let parser = Parser::new_ext(markdown, Options::empty());
     let mut text = String::new();
@@ -869,6 +974,7 @@ fn markdown_to_plaintext(markdown: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn render_relation(route: &MatrixRouteMetadata) -> Value {
     let mut relation = Map::new();
     if let Some(reply_to) = &route.reply_to_event_id {
@@ -952,13 +1058,17 @@ fn sanitize_field_value(value: &str) -> String {
 }
 
 fn looks_like_credential(value: &str) -> bool {
-    value.starts_with("Bearer ")
-        || value.starts_with("sk_")
-        || value.starts_with("syt_")
-        || (value.len() > 32
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')))
+    value.contains("Bearer ")
+        || value.contains("sk_")
+        || value.contains("syt_")
+        || value
+            .split(|c: char| c.is_whitespace() || matches!(c, ':' | ',' | ';' | '"' | '\''))
+            .any(|token| {
+                token.len() > 32
+                    && token
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+            })
 }
 
 fn normalize_mime_type(value: &str) -> String {
@@ -970,6 +1080,7 @@ fn normalize_mime_type(value: &str) -> String {
         .collect::<String>()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn default_mime_type(msgtype: &str) -> &'static str {
     match msgtype {
         "m.image" => "image/jpeg",
@@ -998,190 +1109,5 @@ fn sanitize_filename(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.chars().take(128).collect())
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-mod wasm_product {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ExternalEventId(String);
-
-    impl ExternalEventId {
-        pub fn new(value: impl Into<String>) -> Result<Self, ()> {
-            let value = value.into();
-            if value.is_empty() {
-                Err(())
-            } else {
-                Ok(Self(value))
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ExternalActorRef {
-        pub kind: String,
-        pub id: String,
-    }
-
-    impl ExternalActorRef {
-        pub fn new(
-            kind: impl Into<String>,
-            id: impl Into<String>,
-            _display_name: Option<String>,
-        ) -> Result<Self, ()> {
-            Ok(Self {
-                kind: kind.into(),
-                id: id.into(),
-            })
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ExternalConversationRef {
-        conversation_id: String,
-        topic_id: Option<String>,
-        reply_target_message_id: Option<String>,
-    }
-
-    impl ExternalConversationRef {
-        pub fn new(
-            _space_id: Option<&str>,
-            conversation_id: impl Into<String>,
-            topic_id: Option<&str>,
-            reply_target_message_id: Option<&str>,
-        ) -> Result<Self, ()> {
-            Ok(Self {
-                conversation_id: conversation_id.into(),
-                topic_id: topic_id.map(str::to_string),
-                reply_target_message_id: reply_target_message_id.map(str::to_string),
-            })
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum ProductInboundPayload {
-        UserMessage(UserMessagePayload),
-        NoOp,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct UserMessagePayload {
-        pub text: String,
-        pub attachments: Vec<ProductAttachmentDescriptor>,
-        pub trigger: ProductTriggerReason,
-    }
-
-    impl UserMessagePayload {
-        pub fn new(
-            text: impl Into<String>,
-            attachments: Vec<ProductAttachmentDescriptor>,
-            trigger: ProductTriggerReason,
-        ) -> Result<Self, ()> {
-            Ok(Self {
-                text: text.into(),
-                attachments,
-                trigger,
-            })
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum ProductTriggerReason {
-        DirectChat,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ProductAttachmentDescriptor {
-        pub external_file_id: String,
-        pub mime_type: String,
-        pub filename: Option<String>,
-        pub size_bytes: Option<u64>,
-        pub kind: ProductAttachmentKind,
-    }
-
-    impl ProductAttachmentDescriptor {
-        pub fn new(
-            external_file_id: impl Into<String>,
-            mime_type: impl Into<String>,
-            filename: Option<String>,
-            size_bytes: Option<u64>,
-            kind: ProductAttachmentKind,
-        ) -> Result<Self, ()> {
-            Ok(Self {
-                external_file_id: external_file_id.into(),
-                mime_type: mime_type.into(),
-                filename,
-                size_bytes,
-                kind,
-            })
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum ProductAttachmentKind {
-        Image,
-        Audio,
-        Video,
-        Document,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum EncryptionStatus {
-        Unencrypted,
-        Undecryptable {
-            algorithm: String,
-            reason_code: String,
-            session_id: Option<String>,
-        },
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ParsedProductInbound {
-        pub external_event_id: ExternalEventId,
-        pub external_actor_ref: ExternalActorRef,
-        pub external_conversation_ref: ExternalConversationRef,
-        pub payload: ProductInboundPayload,
-        pub encryption_status: Option<EncryptionStatus>,
-    }
-
-    impl ParsedProductInbound {
-        pub fn new(
-            external_event_id: ExternalEventId,
-            external_actor_ref: ExternalActorRef,
-            external_conversation_ref: ExternalConversationRef,
-            payload: ProductInboundPayload,
-        ) -> Result<Self, ()> {
-            Ok(Self {
-                external_event_id,
-                external_actor_ref,
-                external_conversation_ref,
-                payload,
-                encryption_status: None,
-            })
-        }
-
-        pub fn with_encryption_status(mut self, encryption_status: EncryptionStatus) -> Self {
-            self.encryption_status = Some(encryption_status);
-            self
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct ProductOutboundEnvelope {
-        pub delivery_attempt_id: String,
-        pub payload: ProductOutboundPayload,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum ProductOutboundPayload {
-        FinalReply(FinalReplyView),
-        Unsupported,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct FinalReplyView {
-        pub text: String,
     }
 }

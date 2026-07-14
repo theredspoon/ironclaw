@@ -12,6 +12,8 @@ use ironclaw_product_adapters::{
 use ironclaw_turns::ReplyTargetBindingRef;
 use serde_json::{Value, json};
 
+const ADAPTER_SOURCE: &str = include_str!("../src/lib.rs");
+
 fn text_event(content: Value) -> Value {
     json!({
         "type": "m.room.message",
@@ -79,6 +81,14 @@ fn parses_plain_text_into_product_user_message() {
 }
 
 #[test]
+fn wasm_path_does_not_define_shadow_product_contracts() {
+    assert!(!ADAPTER_SOURCE.contains("mod wasm_product"));
+    assert!(!ADAPTER_SOURCE.contains("pub struct ParsedProductInbound"));
+    assert!(!ADAPTER_SOURCE.contains("pub struct ProductOutboundEnvelope"));
+    assert!(!ADAPTER_SOURCE.contains("pub enum ProductInboundPayload"));
+}
+
+#[test]
 fn sanitizes_formatted_html_and_keeps_plaintext_payload() {
     let parsed = parse(text_event(json!({
         "msgtype": "m.text",
@@ -95,6 +105,21 @@ fn sanitizes_formatted_html_and_keeps_plaintext_payload() {
         ProductInboundPayload::UserMessage(payload) => assert_eq!(payload.text, "safe fallback"),
         other => panic!("unexpected payload: {other:?}"),
     }
+}
+
+#[test]
+fn formatted_html_allowlist_matches_matrix_contract() {
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.text",
+        "body": "safe fallback",
+        "format": "org.matrix.custom.html",
+        "formatted_body": "<p><u>under</u><s>strike</s><a href=\"mailto:ops@example.org\">mail</a><a href=\"https://example.org\">site</a></p>"
+    })));
+
+    assert_eq!(
+        parsed.metadata.formatted_body.as_deref(),
+        Some("understrike<a>mail</a><a href=\"https://example.org\">site</a>")
+    );
 }
 
 #[test]
@@ -332,6 +357,20 @@ fn diagnostics_escape_truncate_and_redact_adversarial_fields() {
     assert!(!diagnostic_json.contains("Bearer"));
     assert!(!diagnostic_json.contains("sk_live"));
     assert!(redacted.message.len() <= 100);
+
+    let embedded = parse_matrix_event(MatrixParseInput {
+        raw_event: json!({
+            "type": "m.room.member",
+            "event_id": "$prefix Bearer tokenvalue:example.org",
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "content": {"body": "ignored"}
+        }),
+        installation_id: "inst_abc123".to_string(),
+        policy: allow_policy(),
+    })
+    .expect_err("embedded credential pattern should be diagnostic-redacted");
+    assert_eq!(embedded.event_id.as_deref(), Some("[REDACTED-CREDENTIAL]"));
 }
 
 #[test]
