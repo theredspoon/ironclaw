@@ -33,7 +33,9 @@ fn parse(value: Value) -> ironclaw_matrix_adapter::ParsedMatrixInbound {
 
 #[test]
 fn parses_plain_text_into_product_user_message() {
-    let parsed = parse(text_event(json!({"msgtype": "m.text", "body": "hello matrix"})));
+    let parsed = parse(text_event(
+        json!({"msgtype": "m.text", "body": "hello matrix"}),
+    ));
 
     assert_eq!(parsed.facts.event_id, "$event:example.org");
     assert_eq!(parsed.facts.room_id, "!room:example.org");
@@ -96,13 +98,19 @@ fn preserves_reply_thread_and_dedup_metadata() {
         parsed.metadata.reply_to_event_id.as_deref(),
         Some("$reply:example.org")
     );
-    assert_eq!(parsed.metadata.relation.as_ref().unwrap().kind, RelationKind::Thread);
+    assert_eq!(
+        parsed.metadata.relation.as_ref().unwrap().kind,
+        RelationKind::Thread
+    );
     assert_eq!(
         parsed.product.external_conversation_ref.topic_id(),
         Some("$root:example.org")
     );
     assert_eq!(
-        parsed.product.external_conversation_ref.reply_target_message_id(),
+        parsed
+            .product
+            .external_conversation_ref
+            .reply_target_message_id(),
         Some("$reply:example.org")
     );
 }
@@ -124,7 +132,11 @@ fn parses_media_metadata_without_exposing_mxc_url() {
             assert_eq!(attachment.filename.as_deref(), Some("unsafe_name.PNG"));
             assert_eq!(attachment.size_bytes, Some(4096));
             assert_eq!(attachment.kind, ProductAttachmentKind::Image);
-            assert!(!serde_json::to_string(attachment).unwrap().contains("mxc://"));
+            assert!(
+                !serde_json::to_string(attachment)
+                    .unwrap()
+                    .contains("mxc://")
+            );
         }
         other => panic!("unexpected payload: {other:?}"),
     }
@@ -150,7 +162,10 @@ fn undecryptable_encrypted_event_is_noop_with_safe_status() {
     })
     .expect("encrypted event should become noop");
 
-    assert!(matches!(parsed.product.payload, ProductInboundPayload::NoOp));
+    assert!(matches!(
+        parsed.product.payload,
+        ProductInboundPayload::NoOp
+    ));
     assert_eq!(
         parsed.metadata.encryption,
         EncryptionState::Undecryptable {
@@ -159,9 +174,11 @@ fn undecryptable_encrypted_event_is_noop_with_safe_status() {
             reason_code: MatrixReasonCode::UndecryptableEvent,
         }
     );
-    assert!(!serde_json::to_string(&parsed.metadata.diagnostics)
-        .unwrap()
-        .contains("ciphertext"));
+    assert!(
+        !serde_json::to_string(&parsed.metadata.diagnostics)
+            .unwrap()
+            .contains("ciphertext")
+    );
 }
 
 #[test]
@@ -178,8 +195,15 @@ fn rejects_unsupported_and_unauthorized_events_with_sanitized_diagnostics() {
         allowed_senders: vec!["@alice:example.org".to_string()],
     })
     .expect_err("unsupported event should be diagnostic");
-    assert_eq!(unsupported.reason_code, MatrixReasonCode::UnsupportedEventType);
-    assert!(!serde_json::to_string(&unsupported).unwrap().contains("sk-live"));
+    assert_eq!(
+        unsupported.reason_code,
+        MatrixReasonCode::UnsupportedEventType
+    );
+    assert!(
+        !serde_json::to_string(&unsupported)
+            .unwrap()
+            .contains("sk-live")
+    );
 
     let unauthorized = parse_matrix_event(MatrixParseInput {
         raw_event: text_event(json!({"msgtype": "m.text", "body": "hello"})),
@@ -222,12 +246,17 @@ fn renders_final_reply_to_matrix_command_with_markdown_html() {
 
     assert_eq!(command.room_id(), "!room:example.org");
     assert_eq!(command.body()["msgtype"], "m.text");
-    assert_eq!(command.body()["body"], "**hello** [site](https://example.org)");
+    assert_eq!(
+        command.body()["body"],
+        "**hello** [site](https://example.org)"
+    );
     assert_eq!(command.body()["format"], "org.matrix.custom.html");
-    assert!(command.body()["formatted_body"]
-        .as_str()
-        .unwrap()
-        .contains("<strong>hello</strong>"));
+    assert!(
+        command.body()["formatted_body"]
+            .as_str()
+            .unwrap()
+            .contains("<strong>hello</strong>")
+    );
     assert_eq!(
         command.body()["m.relates_to"]["m.in_reply_to"]["event_id"],
         "$reply:example.org"
@@ -247,7 +276,10 @@ fn render_rejects_unsupported_payloads_and_target_rooms() {
         allowed_target_rooms: vec!["!room:example.org".to_string()],
     })
     .expect_err("keepalive is not a Matrix send command");
-    assert_eq!(err.reason_code, MatrixReasonCode::UnsupportedOutboundPayload);
+    assert_eq!(
+        err.reason_code,
+        MatrixReasonCode::UnsupportedOutboundPayload
+    );
 
     let err = render_matrix_outbound(MatrixRenderInput {
         envelope: outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
