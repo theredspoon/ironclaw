@@ -1,7 +1,7 @@
 use chrono::Utc;
 use ironclaw_matrix_adapter::{
-    EncryptionState, MatrixParseInput, MatrixParsePolicy, MatrixProductAdapter,
-    MatrixProductAdapterConfig, MatrixOutboundCommand, MatrixReasonCode, MatrixRenderContext,
+    EncryptionState, MatrixOutboundCommand, MatrixParseInput, MatrixParsePolicy,
+    MatrixProductAdapter, MatrixProductAdapterConfig, MatrixReasonCode, MatrixRenderContext,
     MatrixRenderInput, MatrixRouteMetadata, RelationKind, parse_matrix_event,
     render_matrix_outbound,
 };
@@ -210,13 +210,34 @@ fn xss_fixture_set_downgrades_or_sanitizes_to_safe_html() {
         let rendered = parsed.metadata.formatted_body.unwrap_or_default();
         assert!(!rendered.contains("javascript:"), "{rendered}");
         assert!(!rendered.contains("data:"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("onload"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("onerror"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("<script"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("<iframe"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("<object"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("<embed"), "{rendered}");
-        assert!(!rendered.to_ascii_lowercase().contains("expression("), "{rendered}");
+        assert!(
+            !rendered.to_ascii_lowercase().contains("onload"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("onerror"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("<script"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("<iframe"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("<object"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("<embed"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_ascii_lowercase().contains("expression("),
+            "{rendered}"
+        );
     }
 }
 
@@ -666,7 +687,9 @@ fn parser_is_panic_safe_for_deeply_nested_json() {
             })
         })
         .expect("deep-json test thread should spawn");
-    let result = handle.join().expect("deep-json test thread should not panic");
+    let result = handle
+        .join()
+        .expect("deep-json test thread should not panic");
     assert!(result.is_ok());
 }
 
@@ -688,7 +711,9 @@ fn parser_is_panic_safe_for_deeply_nested_arrays() {
             })
         })
         .expect("deep-array test thread should spawn");
-    let result = handle.join().expect("deep-array test thread should not panic");
+    let result = handle
+        .join()
+        .expect("deep-array test thread should not panic");
     assert!(result.is_ok());
 }
 

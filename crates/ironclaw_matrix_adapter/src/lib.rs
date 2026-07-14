@@ -137,10 +137,16 @@ impl std::fmt::Debug for MatrixMessageMetadata {
             .field("sender", &safe_debug_identifier(&self.sender))
             .field("origin_server_ts", &self.origin_server_ts)
             .field("event_type", &safe_debug_identifier(&self.event_type))
-            .field("transaction_id", &redacted_debug_option(self.transaction_id.as_deref()))
+            .field(
+                "transaction_id",
+                &redacted_debug_option(self.transaction_id.as_deref()),
+            )
             .field("msgtype", &redacted_debug_option(self.msgtype.as_deref()))
             .field("formatted_body", &"<redacted>")
-            .field("reply_to_event_id", &redacted_debug_option(self.reply_to_event_id.as_deref()))
+            .field(
+                "reply_to_event_id",
+                &redacted_debug_option(self.reply_to_event_id.as_deref()),
+            )
             .field("relation", &"<redacted>")
             .field("media_url", &"<redacted>")
             .field("encryption", &"<redacted>")
