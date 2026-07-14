@@ -6,11 +6,12 @@ use ironclaw_matrix_adapter::{
     render_matrix_outbound,
 };
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, ExternalActorRef, ExternalConversationRef,
-    FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView, ProductAdapter,
-    ProductAdapterError, ProductAdapterId, ProductAttachmentKind, ProductInboundPayload,
-    ProductOutboundEnvelope, ProductOutboundPayload, ProductOutboundTarget, ProductRenderOutcome,
-    ProjectionCursor, ProtocolAuthEvidence, ProtocolAuthFailure,
+    AdapterInstallationId, AuthRequirement, EgressRequest, ExternalActorRef,
+    ExternalConversationRef, FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView,
+    ParsedProductInbound, ProductAdapter, ProductAdapterError, ProductAdapterId,
+    ProductAttachmentKind, ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload,
+    ProductOutboundTarget, ProductRenderOutcome, ProjectionCursor, ProtocolAuthEvidence,
+    ProtocolAuthFailure,
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 use proptest::prelude::*;
@@ -900,6 +901,96 @@ async fn matrix_product_adapter_renders_outbound_at_product_boundary() {
         serde_json::from_slice(&response.body).expect("matrix command json");
     assert_eq!(command.room_id(), "!room:example.org");
     assert_eq!(command.body()["body"], "hello matrix");
+}
+
+#[test]
+fn matrix_dto_shapes_match_product_adapter_wit_json_shim() {
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.text",
+        "body": "json shim",
+        "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": "$root:example.org",
+            "m.in_reply_to": {"event_id": "$reply:example.org"}
+        }
+    })));
+
+    let parsed_json = serde_json::to_string(&parsed.product).expect("parsed product JSON");
+    let parsed_round_trip: ParsedProductInbound =
+        serde_json::from_str(&parsed_json).expect("parsed-inbound.parsed-json");
+    assert_eq!(
+        parsed_round_trip.external_event_id.as_str(),
+        "matrix-inst_abc123-$event:example.org"
+    );
+    assert_eq!(
+        parsed_round_trip.external_conversation_ref.topic_id(),
+        Some("$root:example.org")
+    );
+    assert_eq!(
+        parsed_round_trip
+            .external_conversation_ref
+            .reply_target_message_id(),
+        Some("$reply:example.org")
+    );
+
+    let envelope = outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
+        turn_run_id: ironclaw_turns::TurnRunId::new(),
+        text: "json shim response".to_string(),
+        generated_at: Utc::now(),
+    }));
+    let outbound_json = serde_json::to_string(&envelope).expect("outbound envelope JSON");
+    let outbound_round_trip: ProductOutboundEnvelope =
+        serde_json::from_str(&outbound_json).expect("outbound-envelope.outbound-json");
+    assert_eq!(outbound_round_trip.adapter_id.as_str(), "matrix");
+    assert_eq!(outbound_round_trip.installation_id.as_str(), "inst_abc123");
+
+    let command = render_matrix_outbound(MatrixRenderInput {
+        envelope,
+        context: render_context("!room:example.org"),
+    })
+    .expect("render command for R002A egress handoff");
+    let MatrixOutboundCommand::SendMessage { room_id, body, .. } = command else {
+        panic!("expected send-message command");
+    };
+    let egress_json = json!({
+        "host": "matrix.example.org",
+        "method": "PUT",
+        "path": format!(
+            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            room_id,
+            "txn-r002a-handoff"
+        ),
+        "headers": [{"name": "content-type", "value": "application/json"}],
+        "body": serde_json::to_vec(&body).expect("matrix request body"),
+        "credential_handle": "matrix_access_token"
+    });
+    let egress_round_trip: EgressRequest =
+        serde_json::from_value(egress_json).expect("outbound-render.egress-request-json");
+    assert_eq!(egress_round_trip.host().as_str(), "matrix.example.org");
+    assert_eq!(egress_round_trip.method().as_str(), "PUT");
+    assert_eq!(
+        egress_round_trip
+            .credential_handle()
+            .expect("credential")
+            .as_str(),
+        "matrix_access_token"
+    );
+
+    let wit = include_str!("../../ironclaw_wasm_product_adapters/wit/product_adapter.wit");
+    assert!(wit.contains("record parsed-inbound"));
+    assert!(wit.contains("parsed-json: string"));
+    assert!(wit.contains("record outbound-envelope"));
+    assert!(wit.contains("outbound-json: string"));
+    assert!(wit.contains("record outbound-render"));
+    assert!(wit.contains("egress-request-json: string"));
+    assert!(wit.contains("manifest: func() -> adapter-manifest"));
+    assert!(wit.contains("parse-inbound: func("));
+    assert!(wit.contains("render-outbound: func("));
+
+    let source = ADAPTER_SOURCE;
+    assert!(!source.contains("pub struct ParsedProductInbound"));
+    assert!(!source.contains("pub struct ProductOutboundEnvelope"));
+    assert!(!source.contains("pub struct EgressRequest"));
 }
 
 #[test]
