@@ -9,12 +9,9 @@ use exports::near::agent::channel::{
     AgentResponse, ChannelConfig, EndpointPattern, Guest, HttpEndpointConfig, IncomingHttpRequest,
     OutgoingHttpResponse, StatusUpdate,
 };
-#[cfg(not(target_arch = "wasm32"))]
 use ironclaw_matrix_adapter::{MatrixParseInput, MatrixParsePolicy, parse_matrix_event};
-#[cfg(all(not(test), not(target_arch = "wasm32")))]
-use ironclaw_product_adapters::ProductInboundPayload;
 use near::agent::channel_host;
-#[cfg(all(not(test), not(target_arch = "wasm32")))]
+#[cfg(not(test))]
 use near::agent::channel_host::EmittedMessage;
 use serde::Deserialize;
 
@@ -194,7 +191,6 @@ impl Guest for MatrixChannel {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_webhook_request(body: Vec<u8>) -> OutgoingHttpResponse {
     let raw_event = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -222,31 +218,23 @@ fn parse_webhook_request(body: Vec<u8>) -> OutgoingHttpResponse {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn parse_webhook_request(_body: Vec<u8>) -> OutgoingHttpResponse {
-    json_response(
-        501,
-        serde_json::json!({"error": "Matrix webhook intake awaits host product bridge"}),
-    )
-}
-
-#[cfg(all(not(test), not(target_arch = "wasm32")))]
+#[cfg(not(test))]
 fn emit_parsed_message(parsed: ironclaw_matrix_adapter::ParsedMatrixInbound) {
-    let ProductInboundPayload::UserMessage(payload) = parsed.product.payload else {
+    let Some(content) = parsed.facts.content else {
         return;
     };
     let metadata_json = serde_json::to_string(&parsed.metadata).unwrap_or_else(|_| "{}".to_string());
     channel_host::emit_message(&EmittedMessage {
         user_id: parsed.facts.sender,
         user_name: None,
-        content: payload.text,
+        content: content.body,
         thread_id: parsed.metadata.relation.as_ref().map(|relation| relation.event_id.clone()),
         metadata_json,
         attachments: Vec::new(),
     });
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 fn emit_parsed_message(_parsed: ironclaw_matrix_adapter::ParsedMatrixInbound) {}
 
 #[cfg(not(test))]

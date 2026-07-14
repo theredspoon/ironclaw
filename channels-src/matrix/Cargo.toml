@@ -9,13 +9,10 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
+ironclaw_matrix_adapter = { path = "../../crates/ironclaw_matrix_adapter" }
 wit-bindgen = "0.36"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ironclaw_matrix_adapter = { path = "../../crates/ironclaw_matrix_adapter" }
-ironclaw_product_adapters = { path = "../../crates/ironclaw_product_adapters" }
 
 [profile.release]
 opt-level = "s"

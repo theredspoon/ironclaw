@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(not(target_arch = "wasm32"))]
 use ironclaw_product_adapters::{
     EncryptionStatus, ExternalActorRef, ExternalConversationRef, ExternalEventId,
     ParsedProductInbound, ProductAttachmentDescriptor, ProductAttachmentKind,
@@ -13,6 +14,13 @@ use ironclaw_product_adapters::{
 use pulldown_cmark::{Options, Parser, html};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+#[cfg(target_arch = "wasm32")]
+use wasm_product::{
+    EncryptionStatus, ExternalActorRef, ExternalConversationRef, ExternalEventId,
+    ParsedProductInbound, ProductAttachmentDescriptor, ProductAttachmentKind,
+    ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload, ProductTriggerReason,
+    UserMessagePayload,
+};
 
 const DIAGNOSTIC_MESSAGE_MAX: usize = 100;
 const MAX_EVENT_FIELD: usize = 512;
@@ -208,8 +216,7 @@ pub enum MatrixReasonCode {
     UnsupportedMediaKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("{reason_code:?}: {message}")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixAdapterDiagnostic {
     pub reason_code: MatrixReasonCode,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,6 +229,14 @@ pub struct MatrixAdapterDiagnostic {
     pub sender: Option<Box<str>>,
     pub message: Box<str>,
 }
+
+impl std::fmt::Display for MatrixAdapterDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.reason_code, self.message)
+    }
+}
+
+impl std::error::Error for MatrixAdapterDiagnostic {}
 
 impl MatrixAdapterDiagnostic {
     fn new(reason_code: MatrixReasonCode, facts: PartialFacts, message: impl Into<String>) -> Self {
@@ -983,5 +998,190 @@ fn sanitize_filename(value: &str) -> Option<String> {
         None
     } else {
         Some(trimmed.chars().take(128).collect())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod wasm_product {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ExternalEventId(String);
+
+    impl ExternalEventId {
+        pub fn new(value: impl Into<String>) -> Result<Self, ()> {
+            let value = value.into();
+            if value.is_empty() {
+                Err(())
+            } else {
+                Ok(Self(value))
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ExternalActorRef {
+        pub kind: String,
+        pub id: String,
+    }
+
+    impl ExternalActorRef {
+        pub fn new(
+            kind: impl Into<String>,
+            id: impl Into<String>,
+            _display_name: Option<String>,
+        ) -> Result<Self, ()> {
+            Ok(Self {
+                kind: kind.into(),
+                id: id.into(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ExternalConversationRef {
+        conversation_id: String,
+        topic_id: Option<String>,
+        reply_target_message_id: Option<String>,
+    }
+
+    impl ExternalConversationRef {
+        pub fn new(
+            _space_id: Option<&str>,
+            conversation_id: impl Into<String>,
+            topic_id: Option<&str>,
+            reply_target_message_id: Option<&str>,
+        ) -> Result<Self, ()> {
+            Ok(Self {
+                conversation_id: conversation_id.into(),
+                topic_id: topic_id.map(str::to_string),
+                reply_target_message_id: reply_target_message_id.map(str::to_string),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ProductInboundPayload {
+        UserMessage(UserMessagePayload),
+        NoOp,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct UserMessagePayload {
+        pub text: String,
+        pub attachments: Vec<ProductAttachmentDescriptor>,
+        pub trigger: ProductTriggerReason,
+    }
+
+    impl UserMessagePayload {
+        pub fn new(
+            text: impl Into<String>,
+            attachments: Vec<ProductAttachmentDescriptor>,
+            trigger: ProductTriggerReason,
+        ) -> Result<Self, ()> {
+            Ok(Self {
+                text: text.into(),
+                attachments,
+                trigger,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ProductTriggerReason {
+        DirectChat,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ProductAttachmentDescriptor {
+        pub external_file_id: String,
+        pub mime_type: String,
+        pub filename: Option<String>,
+        pub size_bytes: Option<u64>,
+        pub kind: ProductAttachmentKind,
+    }
+
+    impl ProductAttachmentDescriptor {
+        pub fn new(
+            external_file_id: impl Into<String>,
+            mime_type: impl Into<String>,
+            filename: Option<String>,
+            size_bytes: Option<u64>,
+            kind: ProductAttachmentKind,
+        ) -> Result<Self, ()> {
+            Ok(Self {
+                external_file_id: external_file_id.into(),
+                mime_type: mime_type.into(),
+                filename,
+                size_bytes,
+                kind,
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ProductAttachmentKind {
+        Image,
+        Audio,
+        Video,
+        Document,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum EncryptionStatus {
+        Unencrypted,
+        Undecryptable {
+            algorithm: String,
+            reason_code: String,
+            session_id: Option<String>,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ParsedProductInbound {
+        pub external_event_id: ExternalEventId,
+        pub external_actor_ref: ExternalActorRef,
+        pub external_conversation_ref: ExternalConversationRef,
+        pub payload: ProductInboundPayload,
+        pub encryption_status: Option<EncryptionStatus>,
+    }
+
+    impl ParsedProductInbound {
+        pub fn new(
+            external_event_id: ExternalEventId,
+            external_actor_ref: ExternalActorRef,
+            external_conversation_ref: ExternalConversationRef,
+            payload: ProductInboundPayload,
+        ) -> Result<Self, ()> {
+            Ok(Self {
+                external_event_id,
+                external_actor_ref,
+                external_conversation_ref,
+                payload,
+                encryption_status: None,
+            })
+        }
+
+        pub fn with_encryption_status(mut self, encryption_status: EncryptionStatus) -> Self {
+            self.encryption_status = Some(encryption_status);
+            self
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ProductOutboundEnvelope {
+        pub delivery_attempt_id: String,
+        pub payload: ProductOutboundPayload,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ProductOutboundPayload {
+        FinalReply(FinalReplyView),
+        Unsupported,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct FinalReplyView {
+        pub text: String,
     }
 }
