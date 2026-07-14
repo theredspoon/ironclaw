@@ -250,6 +250,7 @@ impl Guest for SlackChannel {
                 require_secret: true,
             }],
             poll: None,
+            http_allowlist: None,
         })
     }
 
@@ -317,11 +318,7 @@ impl Guest for SlackChannel {
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
         let thread_ts = response.thread_id.clone().or(metadata.thread_ts.clone());
-        let ts = post_slack_message(
-            &metadata.channel,
-            &response.content,
-            thread_ts.as_deref(),
-        )?;
+        let ts = post_slack_message(&metadata.channel, &response.content, thread_ts.as_deref())?;
 
         if let Some(thread_ts) = thread_ts {
             if let Err(e) = remember_active_slack_thread(
@@ -748,7 +745,9 @@ fn load_active_slack_threads_from_workspace() -> HashMap<ActiveSlackThreadKey, u
     prune_active_slack_threads(&mut threads, now_ms);
 
     let serialized = serialize_active_slack_threads(&threads);
-    let should_persist = raw.as_deref().is_some_and(|existing| existing != serialized)
+    let should_persist = raw
+        .as_deref()
+        .is_some_and(|existing| existing != serialized)
         || (raw.is_none() && !threads.is_empty());
     if should_persist {
         let _ = host_workspace_write(ACTIVE_THREADS_PATH, &serialized);
@@ -798,7 +797,10 @@ fn remember_active_slack_thread(
     threads.remove(&active_slack_thread_key(None, "", thread_ts));
     prune_active_slack_threads(&mut threads, now_ms);
 
-    host_workspace_write(ACTIVE_THREADS_PATH, &serialize_active_slack_threads(&threads))
+    host_workspace_write(
+        ACTIVE_THREADS_PATH,
+        &serialize_active_slack_threads(&threads),
+    )
 }
 
 type ActiveThreads = HashMap<String, u64>;
@@ -880,9 +882,7 @@ fn check_sender_permission(user_id: &str, channel_id: &str, is_dm: bool) -> bool
             serde_json::from_str(&s).unwrap_or_else(|error| {
                 channel_host::log(
                     channel_host::LogLevel::Warn,
-                    &format!(
-                        "Failed to parse Slack allow_from state, treating as empty: {error}"
-                    ),
+                    &format!("Failed to parse Slack allow_from state, treating as empty: {error}"),
                 );
                 Vec::new()
             })
@@ -1137,8 +1137,8 @@ fn post_slack_message(
 ) -> Result<Option<String>, String> {
     let converted = markdown_to_mrkdwn(text);
     let payload = build_broadcast_payload(channel, &converted, thread_ts);
-    let payload_bytes = serde_json::to_vec(&payload)
-        .map_err(|e| format!("Failed to serialize payload: {}", e))?;
+    let payload_bytes =
+        serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize payload: {}", e))?;
 
     let headers = serde_json::json!({
         "Content-Type": "application/json"
@@ -1564,7 +1564,10 @@ mod tests {
             active_slack_thread_key(Some("T1"), "C123", "1710000000.000001"),
             1_710_000_000_000_u64,
         )]);
-        test_host::set_workspace(ACTIVE_THREADS_PATH, &serialize_active_slack_threads(&threads));
+        test_host::set_workspace(
+            ACTIVE_THREADS_PATH,
+            &serialize_active_slack_threads(&threads),
+        );
 
         handle_slack_event(
             sample_thread_message_event("1710000000.000001"),
@@ -1576,10 +1579,7 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].user_id, "U123");
         assert_eq!(emitted[0].content, "follow up");
-        assert_eq!(
-            emitted[0].thread_id.as_deref(),
-            Some("1710000000.000001")
-        );
+        assert_eq!(emitted[0].thread_id.as_deref(), Some("1710000000.000001"));
     }
 
     #[test]

@@ -598,6 +598,7 @@ impl Guest for DiscordChannel {
             } else {
                 None
             },
+            http_allowlist: None,
         })
     }
 
@@ -1233,14 +1234,9 @@ fn get_or_fetch_bot_id() -> Option<String> {
     }
 
     let headers = discord_auth_headers_json(false);
-    let resp = channel_host::http_request(
-        "GET",
-        "{DISCORD_API_BASE}/users/@me",
-        &headers,
-        None,
-        None,
-    )
-    .ok()?;
+    let resp =
+        channel_host::http_request("GET", "{DISCORD_API_BASE}/users/@me", &headers, None, None)
+            .ok()?;
 
     if resp.status < 200 || resp.status >= 300 {
         return None;
@@ -1558,8 +1554,7 @@ fn broadcast_dm(user_id: &str, content: &str) -> Result<(), String> {
     // Step 2: Send the message to the DM channel.
     let truncated = truncate_message(content);
     let payload = serde_json::json!({ "content": truncated });
-    let body =
-        serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
+    let body = serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
     send_discord_request(
         "POST",
         &format!("{DISCORD_API_BASE}/channels/{}/messages", dm_channel.id),
@@ -1828,9 +1823,9 @@ mod tests {
 
         assert_eq!(
             response_route_for_metadata(&metadata),
-            DiscordResponseRoute::InteractionWebhook(
-                format!("{DISCORD_API_BASE}/webhooks/app/tok/messages/@original")
-            )
+            DiscordResponseRoute::InteractionWebhook(format!(
+                "{DISCORD_API_BASE}/webhooks/app/tok/messages/@original"
+            ))
         );
     }
 
@@ -1847,9 +1842,9 @@ mod tests {
 
         assert_eq!(
             response_route_for_metadata(&metadata),
-            DiscordResponseRoute::ChannelMessage(
-                format!("{DISCORD_API_BASE}/channels/chan-1/messages")
-            )
+            DiscordResponseRoute::ChannelMessage(format!(
+                "{DISCORD_API_BASE}/channels/chan-1/messages"
+            ))
         );
     }
 
@@ -2106,9 +2101,9 @@ mod tests {
 
         assert_eq!(
             route,
-            DiscordResponseRoute::ChannelMessage(
-                format!("{DISCORD_API_BASE}/channels/chan-1/messages")
-            )
+            DiscordResponseRoute::ChannelMessage(format!(
+                "{DISCORD_API_BASE}/channels/chan-1/messages"
+            ))
         );
     }
 
@@ -2122,9 +2117,9 @@ mod tests {
 
         assert_eq!(
             route,
-            DiscordResponseRoute::InteractionWebhook(
-                format!("{DISCORD_API_BASE}/webhooks/app-1/tok-1")
-            )
+            DiscordResponseRoute::InteractionWebhook(format!(
+                "{DISCORD_API_BASE}/webhooks/app-1/tok-1"
+            ))
         );
     }
 

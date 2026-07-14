@@ -2,8 +2,8 @@
   "name": "slack",
   "display_name": "Slack Channel",
   "kind": "channel",
-  "version": "0.3.6",
-  "wit_version": "0.3.0",
+  "version": "0.3.7",
+  "wit_version": "0.3.1",
   "description": "Talk to your agent in Slack",
   "keywords": [
     "messaging",

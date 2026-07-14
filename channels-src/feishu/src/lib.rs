@@ -365,6 +365,7 @@ impl Guest for FeishuChannel {
                 require_secret: false,
             }],
             poll: None,
+            http_allowlist: None,
         })
     }
 

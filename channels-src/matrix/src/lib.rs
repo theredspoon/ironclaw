@@ -6,14 +6,13 @@ wit_bindgen::generate!({
 });
 
 use exports::near::agent::channel::{
-    AgentResponse, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
-    OutgoingHttpResponse, PollConfig, StatusUpdate,
+    AgentResponse, ChannelConfig, EndpointPattern, Guest, HttpEndpointConfig, IncomingHttpRequest,
+    OutgoingHttpResponse, StatusUpdate,
 };
 use near::agent::channel_host;
 use serde::Deserialize;
 
 const WEBHOOK_PATH: &str = "/webhook/matrix";
-const MIN_POLL_INTERVAL_MS: u32 = 30_000;
 const SUPPORTED_CALLBACKS: &[&str] = &[
     "on_start",
     "on_http_request",
@@ -24,9 +23,7 @@ const SUPPORTED_CALLBACKS: &[&str] = &[
 
 #[derive(Debug, Deserialize)]
 struct MatrixConfig {
-    #[allow(dead_code)]
-    #[serde(default)]
-    homeserver_url: Option<String>,
+    homeserver_url: String,
     #[allow(dead_code)]
     #[serde(default)]
     user_id: Option<String>,
@@ -35,12 +32,73 @@ struct MatrixConfig {
     device_id: Option<String>,
     #[serde(default)]
     polling_enabled: bool,
-    #[serde(default = "default_poll_interval_ms")]
+    #[allow(dead_code)]
+    #[serde(default)]
     poll_interval_ms: u32,
 }
 
-fn default_poll_interval_ms() -> u32 {
-    MIN_POLL_INTERVAL_MS
+/// Parse and validate homeserver URL, returning the domain.
+///
+/// Validation rules:
+/// - Must use HTTPS scheme (no HTTP)
+/// - Must have a valid host component
+/// - Must not have a path component (domain only)
+fn parse_homeserver_url(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed != url {
+        return Err("homeserver_url must not contain leading or trailing whitespace".to_string());
+    }
+
+    if !trimmed.starts_with("https://") {
+        return Err("homeserver_url must use HTTPS".to_string());
+    }
+
+    let mut host = &trimmed["https://".len()..];
+    if let Some(stripped) = host.strip_suffix('/') {
+        host = stripped;
+    }
+
+    if host.is_empty() {
+        return Err("homeserver_url must include a domain".to_string());
+    }
+
+    if host.contains('/') {
+        return Err("homeserver_url must be domain only (no path component)".to_string());
+    }
+
+    if host
+        .chars()
+        .any(|ch| matches!(ch, '?' | '#' | '@' | ':' | '[' | ']') || ch.is_whitespace())
+    {
+        return Err("homeserver_url must be an HTTPS origin host without userinfo, port, query, or fragment".to_string());
+    }
+
+    let host = host.to_ascii_lowercase();
+    if host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+        || !host
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '.')
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.len() <= 63
+        })
+    {
+        return Err("homeserver_url must contain a valid DNS hostname".to_string());
+    }
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err("homeserver_url must not point to localhost".to_string());
+    }
+
+    if host.contains('.') {
+        Ok(host)
+    } else {
+        Err("homeserver_url must contain a fully qualified hostname".to_string())
+    }
 }
 
 struct MatrixChannel;
@@ -50,12 +108,21 @@ impl Guest for MatrixChannel {
         let config: MatrixConfig = serde_json::from_str(&config_json)
             .map_err(|e| format!("Failed to parse Matrix config: {}", e))?;
 
-        if config.polling_enabled && config.poll_interval_ms < MIN_POLL_INTERVAL_MS {
-            return Err(format!(
-                "poll_interval_ms must be at least {}",
-                MIN_POLL_INTERVAL_MS
-            ));
+        if config.polling_enabled {
+            return Err(
+                "Matrix polling is not implemented yet; set polling_enabled to false".to_string(),
+            );
         }
+
+        // Parse and validate homeserver URL
+        let homeserver_domain = parse_homeserver_url(&config.homeserver_url)?;
+
+        // Construct dynamic HTTP allowlist based on configured homeserver
+        let http_allowlist = vec![EndpointPattern {
+            host: homeserver_domain,
+            path_prefix: Some("/_matrix/".to_string()),
+            methods: None, // All HTTP methods allowed
+        }];
 
         host_log(
             channel_host::LogLevel::Info,
@@ -69,14 +136,8 @@ impl Guest for MatrixChannel {
                 methods: vec!["POST".to_string()],
                 require_secret: true,
             }],
-            poll: if config.polling_enabled {
-                Some(PollConfig {
-                    interval_ms: config.poll_interval_ms,
-                    enabled: true,
-                })
-            } else {
-                None
-            },
+            poll: None,
+            http_allowlist: Some(http_allowlist),
         })
     }
 
@@ -109,7 +170,7 @@ impl Guest for MatrixChannel {
     fn on_respond(_response: AgentResponse) -> Result<(), String> {
         Err(unsupported_callback_error(
             "on_respond",
-            "Matrix outbound send is not implemented in the R001 skeleton",
+            "Matrix outbound send is not implemented yet",
         ))
     }
 
@@ -118,7 +179,7 @@ impl Guest for MatrixChannel {
     fn on_broadcast(_user_id: String, _response: AgentResponse) -> Result<(), String> {
         Err(unsupported_callback_error(
             "on_broadcast",
-            "Matrix broadcast is not implemented in the R001 skeleton",
+            "Matrix broadcast is not implemented yet",
         ))
     }
 
@@ -164,7 +225,7 @@ mod tests {
 
     fn default_config() -> String {
         serde_json::json!({
-            "homeserver_url": null,
+            "homeserver_url": "https://matrix.org",
             "user_id": null,
             "device_id": null,
             "polling_enabled": false
@@ -200,18 +261,17 @@ mod tests {
     }
 
     #[test]
-    fn on_start_enables_polling_when_configured() {
+    fn on_start_rejects_polling_until_sync_is_implemented() {
         let config_json = serde_json::json!({
+            "homeserver_url": "https://matrix.org",
             "polling_enabled": true,
             "poll_interval_ms": 45000
         })
         .to_string();
 
-        let config = <MatrixChannel as Guest>::on_start(config_json).expect("valid config");
-        let poll = config.poll.expect("polling should be configured");
-
-        assert!(poll.enabled);
-        assert_eq!(poll.interval_ms, 45_000);
+        let err = <MatrixChannel as Guest>::on_start(config_json)
+            .expect_err("polling must fail closed until Matrix sync exists");
+        assert!(err.contains("polling is not implemented"));
     }
 
     #[test]
@@ -222,16 +282,121 @@ mod tests {
     }
 
     #[test]
-    fn on_start_rejects_polling_below_wit_minimum() {
+    fn on_start_ignores_poll_interval_when_polling_disabled() {
         let config_json = serde_json::json!({
-            "polling_enabled": true,
+            "homeserver_url": "https://matrix.org",
+            "polling_enabled": false,
             "poll_interval_ms": 1000
         })
         .to_string();
 
+        let config = <MatrixChannel as Guest>::on_start(config_json)
+            .expect("poll interval is inert while polling is disabled");
+        assert!(config.poll.is_none());
+    }
+
+    #[test]
+    fn on_start_requires_homeserver_url() {
+        let config_json = serde_json::json!({
+            "polling_enabled": false
+        })
+        .to_string();
+
         let err = <MatrixChannel as Guest>::on_start(config_json)
-            .expect_err("poll intervals below 30s must fail");
-        assert!(err.contains("poll_interval_ms"));
+            .expect_err("missing homeserver_url must be rejected");
+        assert!(err.contains("homeserver_url") || err.contains("missing field"));
+    }
+
+    #[test]
+    fn on_start_rejects_http_homeserver() {
+        let config_json = serde_json::json!({
+            "homeserver_url": "http://matrix.org",
+            "polling_enabled": false
+        })
+        .to_string();
+
+        let err = <MatrixChannel as Guest>::on_start(config_json)
+            .expect_err("HTTP homeserver must be rejected");
+        assert!(err.contains("HTTPS"));
+    }
+
+    #[test]
+    fn on_start_rejects_homeserver_with_path() {
+        let config_json = serde_json::json!({
+            "homeserver_url": "https://matrix.org/_matrix/client",
+            "polling_enabled": false
+        })
+        .to_string();
+
+        let err = <MatrixChannel as Guest>::on_start(config_json)
+            .expect_err("homeserver with path must be rejected");
+        assert!(err.contains("domain only"));
+    }
+
+    #[test]
+    fn on_start_rejects_homeserver_with_url_bypass_components() {
+        for homeserver_url in [
+            "https://matrix.org:8448",
+            "https://user@matrix.org",
+            "https://matrix.org?server=evil.test",
+            "https://matrix.org#fragment",
+            " https://matrix.org",
+        ] {
+            let config_json = serde_json::json!({
+                "homeserver_url": homeserver_url,
+                "polling_enabled": false
+            })
+            .to_string();
+
+            <MatrixChannel as Guest>::on_start(config_json)
+                .expect_err("homeserver URL bypass components must be rejected");
+        }
+    }
+
+    #[test]
+    fn on_start_normalizes_homeserver_host_to_lowercase() {
+        let config_json = serde_json::json!({
+            "homeserver_url": "https://Matrix.Example",
+            "polling_enabled": false
+        })
+        .to_string();
+
+        let config = <MatrixChannel as Guest>::on_start(config_json).expect("valid homeserver");
+        let allowlist = config.http_allowlist.expect("allowlist should be provided");
+
+        assert_eq!(allowlist[0].host, "matrix.example");
+    }
+
+    #[test]
+    fn on_start_constructs_allowlist_from_homeserver() {
+        let config_json = serde_json::json!({
+            "homeserver_url": "https://matrix.org",
+            "polling_enabled": false
+        })
+        .to_string();
+
+        let config = <MatrixChannel as Guest>::on_start(config_json).expect("valid homeserver");
+        let allowlist = config.http_allowlist.expect("allowlist should be provided");
+
+        assert_eq!(allowlist.len(), 1);
+        assert_eq!(allowlist[0].host, "matrix.org");
+        assert_eq!(allowlist[0].path_prefix, Some("/_matrix/".to_string()));
+        assert!(allowlist[0].methods.is_none());
+    }
+
+    #[test]
+    fn on_start_accepts_homeserver_with_trailing_slash() {
+        let config_json = serde_json::json!({
+            "homeserver_url": "https://homeserver.test/",
+            "polling_enabled": false
+        })
+        .to_string();
+
+        let config =
+            <MatrixChannel as Guest>::on_start(config_json).expect("trailing slash accepted");
+        let allowlist = config.http_allowlist.expect("allowlist provided");
+
+        assert_eq!(allowlist[0].host, "homeserver.test");
     }
 
     #[test]

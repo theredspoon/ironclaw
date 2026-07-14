@@ -365,6 +365,7 @@ impl Guest for WhatsAppChannel {
                 require_secret: true,
             }],
             poll: None, // WhatsApp doesn't support polling
+            http_allowlist: None,
         })
     }
 
@@ -760,11 +761,7 @@ fn handle_message(
     let user_name = contact_names.get(&message.from).cloned();
 
     // Permission check (WhatsApp is always DM)
-    if !check_sender_permission(
-        &message.from,
-        user_name.as_deref(),
-        phone_number_id,
-    ) {
+    if !check_sender_permission(&message.from, user_name.as_deref(), phone_number_id) {
         return;
     }
 
@@ -867,10 +864,7 @@ fn check_sender_permission(
             Ok(result) => {
                 channel_host::log(
                     channel_host::LogLevel::Info,
-                    &format!(
-                        "Pairing request for {}: code {}",
-                        sender_phone, result.code
-                    ),
+                    &format!("Pairing request for {}: code {}", sender_phone, result.code),
                 );
                 let _ = send_pairing_reply(sender_phone, phone_number_id, &result.code);
             }
@@ -1118,10 +1112,7 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].id, "media_doc_1");
         assert_eq!(attachments[0].mime_type, "application/pdf");
-        assert_eq!(
-            attachments[0].filename,
-            Some("report.pdf".to_string())
-        );
+        assert_eq!(attachments[0].filename, Some("report.pdf".to_string()));
     }
 
     #[test]

@@ -870,7 +870,10 @@ fn rehydrate_pending_inbound_attachment_data(
         return Ok(());
     }
 
-    Err("Pending WeCom websocket attachment blob is missing; cannot restore inline data".to_string())
+    Err(
+        "Pending WeCom websocket attachment blob is missing; cannot restore inline data"
+            .to_string(),
+    )
 }
 
 fn extract_filename_from_content_disposition(header: &str) -> Option<String> {
@@ -1213,8 +1216,7 @@ fn metadata_is_group_chat(metadata: &WecomMessageMetadata) -> bool {
 
 fn safe_group_status_content(update: &StatusUpdate, content: String) -> String {
     if status_update_is_sensitive(update) {
-        "This action needs a private authorization step. Please DM the bot to continue."
-            .to_string()
+        "This action needs a private authorization step. Please DM the bot to continue.".to_string()
     } else {
         content
     }
@@ -1232,7 +1234,7 @@ fn build_websocket_command_payload(
         },
         "body": body,
     }))
-        .map_err(|e| format!("Failed to serialize WeCom websocket command: {e}"))
+    .map_err(|e| format!("Failed to serialize WeCom websocket command: {e}"))
 }
 
 fn websocket_req_id_now_millis() -> u64 {
@@ -1326,7 +1328,9 @@ fn read_websocket_media_chunk_base64(
         .ok_or_else(|| format!("WeCom websocket media chunk {chunk_index} blob is missing"))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(format!("WeCom websocket media chunk {chunk_index} blob is empty"));
+        return Err(format!(
+            "WeCom websocket media chunk {chunk_index} blob is empty"
+        ));
     }
     Ok(trimmed.to_string())
 }
@@ -1348,8 +1352,11 @@ fn prune_stale_pending_websocket_media_state(
     }
     state.sends = retained_sends;
 
-    let active_batch_ids: std::collections::HashSet<&str> =
-        state.sends.iter().map(|send| send.batch_id.as_str()).collect();
+    let active_batch_ids: std::collections::HashSet<&str> = state
+        .sends
+        .iter()
+        .map(|send| send.batch_id.as_str())
+        .collect();
     let before_batches = state.batches.len();
     state.batches.retain(|batch| {
         let age_ms = now_ms.saturating_sub(batch.created_at_ms);
@@ -1584,7 +1591,9 @@ fn build_websocket_active_markdown_payload(chat_id: &str, content: &str) -> Resu
     )
 }
 
-fn prepare_next_websocket_media_chunk(send: &mut PendingWebsocketMediaSend) -> Result<String, String> {
+fn prepare_next_websocket_media_chunk(
+    send: &mut PendingWebsocketMediaSend,
+) -> Result<String, String> {
     let req_id = websocket_control_req_id(
         WECOM_WS_UPLOAD_MEDIA_CHUNK_CMD,
         &format!("{}:{}", send.id, send.next_chunk_index),
@@ -2500,18 +2509,19 @@ fn update_recent_message_ids(
     ttl_ms: u64,
 ) -> Result<(bool, String), String> {
     let mut ids: Vec<RecentMessageIdEntry> = match existing_json.filter(|s| !s.trim().is_empty()) {
-        Some(raw) => serde_json::from_str::<Vec<RecentMessageIdEntry>>(raw).or_else(|_| {
-            serde_json::from_str::<Vec<String>>(raw).map(|legacy| {
-                legacy
-                    .into_iter()
-                    .map(|id| RecentMessageIdEntry {
-                        id,
-                        seen_at_ms: now_ms,
-                    })
-                    .collect()
+        Some(raw) => serde_json::from_str::<Vec<RecentMessageIdEntry>>(raw)
+            .or_else(|_| {
+                serde_json::from_str::<Vec<String>>(raw).map(|legacy| {
+                    legacy
+                        .into_iter()
+                        .map(|id| RecentMessageIdEntry {
+                            id,
+                            seen_at_ms: now_ms,
+                        })
+                        .collect()
+                })
             })
-        })
-        .map_err(|e| format!("Failed to parse recent WeCom message ids: {e}"))?,
+            .map_err(|e| format!("Failed to parse recent WeCom message ids: {e}"))?,
         None => Vec::new(),
     };
 
@@ -2598,11 +2608,15 @@ impl Guest for WecomChannel {
                 interval_ms: WECOM_POLL_INTERVAL_MS,
                 enabled: true,
             }),
+            http_allowlist: None,
         })
     }
 
     fn on_http_request(_req: IncomingHttpRequest) -> OutgoingHttpResponse {
-        text_response(404, "WeCom Bot channel does not expose an HTTP callback endpoint")
+        text_response(
+            404,
+            "WeCom Bot channel does not expose an HTTP callback endpoint",
+        )
     }
 
     fn on_poll() {
@@ -2648,7 +2662,10 @@ impl Guest for WecomChannel {
     }
 
     fn on_broadcast(_user_id: String, _response: AgentResponse) -> Result<(), String> {
-        Err("WeCom Bot broadcast is not supported without an active websocket chat route".to_string())
+        Err(
+            "WeCom Bot broadcast is not supported without an active websocket chat route"
+                .to_string(),
+        )
     }
 
     fn on_status(update: StatusUpdate) {
@@ -2855,11 +2872,8 @@ mod tests {
     #[test]
     fn websocket_media_ack_updates_state_before_returning_next_payload() {
         test_reset_websocket_state();
-        let attachment = make_outbound_attachment(
-            "cat.jpg",
-            "image/jpeg",
-            WEBSOCKET_MEDIA_CHUNK_SIZE + 1,
-        );
+        let attachment =
+            make_outbound_attachment("cat.jpg", "image/jpeg", WEBSOCKET_MEDIA_CHUNK_SIZE + 1);
         let (send, _init_payload) =
             build_pending_websocket_media_send("batch-1", "chat-1", &attachment, 0)
                 .expect("pending send");
@@ -3157,12 +3171,10 @@ mod tests {
         );
 
         assert_eq!(result.started, MAX_WEBSOCKET_MEDIA_ATTACHMENTS_PER_RESPONSE);
-        assert!(
-            result
-                .errors
-                .iter()
-                .any(|error| error.contains("attachment(s)"))
-        );
+        assert!(result
+            .errors
+            .iter()
+            .any(|error| error.contains("attachment(s)")));
         let persisted = load_pending_websocket_media_state();
         assert_eq!(
             persisted.sends.len(),
@@ -3643,7 +3655,9 @@ mod tests {
         assert!(!is_new);
         let ids: Vec<RecentMessageIdEntry> = serde_json::from_str(&json).expect("ids parse");
         assert_eq!(
-            ids.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["msg-1", "msg-2"]
         );
     }
@@ -3657,7 +3671,9 @@ mod tests {
         assert!(is_new);
         let ids: Vec<RecentMessageIdEntry> = serde_json::from_str(&json).expect("ids parse");
         assert_eq!(
-            ids.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["msg-2", "msg-3", "msg-4"]
         );
     }
@@ -3676,13 +3692,15 @@ mod tests {
         ])
         .expect("serialize dedupe entries");
 
-        let (is_new, json) = update_recent_message_ids(Some(&existing), "new", 8, 100, 20)
-            .expect("dedupe update");
+        let (is_new, json) =
+            update_recent_message_ids(Some(&existing), "new", 8, 100, 20).expect("dedupe update");
 
         assert!(is_new);
         let ids: Vec<RecentMessageIdEntry> = serde_json::from_str(&json).expect("ids parse");
         assert_eq!(
-            ids.iter().map(|entry| entry.id.as_str()).collect::<Vec<_>>(),
+            ids.iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["fresh", "new"]
         );
     }

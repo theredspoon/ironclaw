@@ -1,0 +1,38 @@
+{
+  "name": "matrix",
+  "display_name": "Matrix Channel",
+  "kind": "channel",
+  "version": "0.1.0",
+  "wit_version": "0.3.1",
+  "description": "Matrix channel skeleton for IronClaw Reborn",
+  "keywords": [
+    "messaging",
+    "chat",
+    "matrix",
+    "homeserver"
+  ],
+  "source": {
+    "dir": "channels-src/matrix",
+    "capabilities": "matrix.capabilities.json",
+    "crate_name": "matrix-channel"
+  },
+  "artifacts": {
+    "wasm32-wasip2": {
+      "url": null,
+      "sha256": null
+    }
+  },
+  "auth_summary": {
+    "method": "manual",
+    "provider": "Matrix",
+    "secrets": [
+      "matrix_access_token",
+      "matrix_webhook_secret"
+    ],
+    "shared_auth": null,
+    "setup_url": "https://spec.matrix.org"
+  },
+  "tags": [
+    "messaging"
+  ]
+}

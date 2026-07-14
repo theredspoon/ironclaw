@@ -673,6 +673,7 @@ impl Guest for TelegramChannel {
                 require_secret,
             }],
             poll,
+            http_allowlist: None,
         })
     }
 
