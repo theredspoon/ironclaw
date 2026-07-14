@@ -1,8 +1,9 @@
 use chrono::Utc;
 use ironclaw_matrix_adapter::{
     EncryptionState, MatrixParseInput, MatrixParsePolicy, MatrixProductAdapter,
-    MatrixProductAdapterConfig, MatrixReasonCode, MatrixRenderContext, MatrixRenderInput,
-    MatrixRouteMetadata, RelationKind, parse_matrix_event, render_matrix_outbound,
+    MatrixProductAdapterConfig, MatrixOutboundCommand, MatrixReasonCode, MatrixRenderContext,
+    MatrixRenderInput, MatrixRouteMetadata, RelationKind, parse_matrix_event,
+    render_matrix_outbound,
 };
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, ExternalActorRef, ExternalConversationRef,
@@ -12,7 +13,9 @@ use ironclaw_product_adapters::{
     ProjectionCursor, ProtocolAuthEvidence, ProtocolAuthFailure,
 };
 use ironclaw_turns::ReplyTargetBindingRef;
+use proptest::prelude::*;
 use serde_json::{Value, json};
+use std::panic;
 
 const ADAPTER_SOURCE: &str = include_str!("../src/lib.rs");
 
@@ -25,6 +28,12 @@ fn text_event(content: Value) -> Value {
         "origin_server_ts": 1710000000000_i64,
         "content": content
     })
+}
+
+fn text_event_with_id(event_id: &str, content: Value) -> Value {
+    let mut event = text_event(content);
+    event["event_id"] = json!(event_id);
+    event
 }
 
 fn parse(value: Value) -> ironclaw_matrix_adapter::ParsedMatrixInbound {
@@ -178,6 +187,40 @@ fn formatted_html_allowlist_matches_matrix_contract() {
 }
 
 #[test]
+fn xss_fixture_set_downgrades_or_sanitizes_to_safe_html() {
+    let vectors = [
+        r#"<img src=x onerror=alert(1)>"#,
+        r#"<svg onload=alert(1)>"#,
+        r#"<a href="data:text/html,<script>alert(1)</script>">x</a>"#,
+        r#"<iframe src="javascript:alert(1)">x</iframe>"#,
+        r#"<object data="javascript:alert(1)">x</object>"#,
+        r#"<embed src="javascript:alert(1)">"#,
+        r#"<div style="width: expression(alert(1))">x</div>"#,
+        r#"&lt;img src=x onerror=alert(1)&gt;"#,
+        r#"<A HREF="JaVaScRiPt:alert(1)" OnLoAd="alert(1)">x</A>"#,
+    ];
+
+    for vector in vectors {
+        let parsed = parse(text_event(json!({
+            "msgtype": "m.text",
+            "body": "plain fallback",
+            "format": "org.matrix.custom.html",
+            "formatted_body": vector
+        })));
+        let rendered = parsed.metadata.formatted_body.unwrap_or_default();
+        assert!(!rendered.contains("javascript:"), "{rendered}");
+        assert!(!rendered.contains("data:"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("onload"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("onerror"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("<script"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("<iframe"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("<object"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("<embed"), "{rendered}");
+        assert!(!rendered.to_ascii_lowercase().contains("expression("), "{rendered}");
+    }
+}
+
+#[test]
 fn unsafe_formatted_html_downgrades_to_plaintext() {
     let parsed = parse(text_event(json!({
         "msgtype": "m.text",
@@ -186,6 +229,34 @@ fn unsafe_formatted_html_downgrades_to_plaintext() {
         "formatted_body": "<script>credential sk-live-abc</script>"
     })));
 
+    assert!(parsed.metadata.formatted_body.is_none());
+    assert_eq!(
+        parsed.metadata.diagnostics[0].reason_code,
+        MatrixReasonCode::UnsafeFormattedBody
+    );
+}
+
+#[test]
+fn oversized_or_deeply_nested_formatted_html_downgrades_to_plaintext() {
+    let oversized = parse(text_event(json!({
+        "msgtype": "m.text",
+        "body": "plain fallback",
+        "format": "org.matrix.custom.html",
+        "formatted_body": "x".repeat(64 * 1024 + 1)
+    })));
+    assert!(oversized.metadata.formatted_body.is_none());
+    assert_eq!(
+        oversized.metadata.diagnostics[0].reason_code,
+        MatrixReasonCode::UnsafeFormattedBody
+    );
+
+    let deeply_nested = format!("{}safe{}", "<b>".repeat(21), "</b>".repeat(21));
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.text",
+        "body": "plain fallback",
+        "format": "org.matrix.custom.html",
+        "formatted_body": deeply_nested
+    })));
     assert!(parsed.metadata.formatted_body.is_none());
     assert_eq!(
         parsed.metadata.diagnostics[0].reason_code,
@@ -255,6 +326,67 @@ fn parses_media_metadata_without_exposing_mxc_url() {
         }
         other => panic!("unexpected payload: {other:?}"),
     }
+}
+
+#[test]
+fn media_filename_and_mime_are_hardened() {
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.file",
+        "body": "../<script>\u{0000}unsafe?.bin",
+        "url": "mxc://example.org/media-id",
+        "info": {"mimetype": "Application/X Weird\u{0000}", "size": 4096}
+    })));
+
+    let ProductInboundPayload::UserMessage(payload) = parsed.product.payload else {
+        panic!("expected media user message");
+    };
+    let attachment = &payload.attachments[0];
+    assert_eq!(attachment.filename.as_deref(), Some("script__unsafe_.bin"));
+    assert_eq!(attachment.mime_type, "application/octet-stream");
+
+    let empty_name = parse(text_event(json!({
+        "msgtype": "m.file",
+        "body": "../..",
+        "url": "mxc://example.org/media-id",
+        "info": {}
+    })));
+    let ProductInboundPayload::UserMessage(payload) = empty_name.product.payload else {
+        panic!("expected media user message");
+    };
+    assert_eq!(payload.attachments[0].filename.as_deref(), Some("untitled"));
+    assert_eq!(payload.attachments[0].mime_type, "application/octet-stream");
+}
+
+#[test]
+fn event_id_validation_accepts_current_and_legacy_matrix_forms() {
+    let current = parse(text_event_with_id(
+        "$opaqueBase64Hash",
+        json!({"msgtype": "m.text", "body": "hello"}),
+    ));
+    assert_eq!(
+        current.facts.deduplication_key,
+        "matrix-inst_abc123-$opaqueBase64Hash"
+    );
+
+    let legacy = parse(text_event_with_id(
+        "$opaque:example.org",
+        json!({"msgtype": "m.text", "body": "hello"}),
+    ));
+    assert_eq!(
+        legacy.facts.deduplication_key,
+        "matrix-inst_abc123-$opaque:example.org"
+    );
+
+    let invalid = parse_matrix_event(MatrixParseInput {
+        raw_event: text_event_with_id(
+            "not-an-event-id",
+            json!({"msgtype": "m.text", "body": "hello"}),
+        ),
+        installation_id: "inst_abc123".to_string(),
+        policy: allow_policy(),
+    })
+    .expect_err("event ids must use Matrix event sigil");
+    assert_eq!(invalid.reason_code, MatrixReasonCode::MalformedMatrixEvent);
 }
 
 #[test]
@@ -421,6 +553,37 @@ fn diagnostics_escape_truncate_and_redact_adversarial_fields() {
 }
 
 #[test]
+fn expanded_credential_patterns_are_redacted() {
+    for token in [
+        "AKIA1234567890ABCDEF",
+        "ASIA1234567890ABCDEF",
+        "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "gho_abcdefghijklmnopqrstuvwxyz123456",
+        "ghs_abcdefghijklmnopqrstuvwxyz123456",
+        "xoxb-1234567890-secret",
+        "xoxp-1234567890-secret",
+        "eyJhbGciOiJIUzI1NiJ9.secret.signature",
+        "AIzaSyDabcdefghijklmnopqrstuvwxyz",
+    ] {
+        let diagnostic = parse_matrix_event(MatrixParseInput {
+            raw_event: json!({
+                "type": "m.room.member",
+                "event_id": format!("$event-{token}:example.org"),
+                "room_id": "!room:example.org",
+                "sender": "@alice:example.org",
+                "content": {"body": "ignored"}
+            }),
+            installation_id: "inst_abc123".to_string(),
+            policy: allow_policy(),
+        })
+        .expect_err("unsupported event should be diagnostic");
+        let json = serde_json::to_string(&diagnostic).expect("diagnostic json");
+        assert!(json.contains("[REDACTED-CREDENTIAL]"), "{json}");
+        assert!(!json.contains(token), "{json}");
+    }
+}
+
+#[test]
 fn metadata_serializes_route_fields_without_logging_raw_metadata() {
     let parsed = parse(text_event(json!({
         "msgtype": "m.image",
@@ -450,6 +613,113 @@ fn metadata_serializes_route_fields_without_logging_raw_metadata() {
             .expect("diagnostic json")
             .contains("mxc://")
     );
+}
+
+#[test]
+fn metadata_debug_redacts_internal_and_adversarial_fields() {
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.image",
+        "body": "<b>body</b>",
+        "format": "org.matrix.custom.html",
+        "formatted_body": "<b>safe</b>",
+        "url": "mxc://example.org/media-id",
+        "info": {"mimetype": "image/png", "size": 12}
+    })));
+    let debug = format!("{:?}", parsed.metadata);
+    assert!(!debug.contains("mxc://"));
+    assert!(!debug.contains("<b>safe</b>"));
+    assert!(!debug.contains("<b>body</b>"));
+    assert!(!debug.contains("session_id"));
+
+    let diagnostic = parse_matrix_event(MatrixParseInput {
+        raw_event: json!({
+            "type": "m.room.member",
+            "event_id": "$event:example.org",
+            "room_id": "!room\nERROR:example.org",
+            "sender": "@attacker\nERROR:example.org",
+            "content": {"body": "ignored"}
+        }),
+        installation_id: "inst_abc123".to_string(),
+        policy: MatrixParsePolicy::default(),
+    })
+    .expect_err("control characters should become diagnostic");
+    let debug = format!("{diagnostic:?}");
+    assert!(!debug.contains('\n'));
+    assert!(!debug.contains("ERROR:example.org\n"));
+}
+
+#[test]
+fn parser_is_panic_safe_for_deeply_nested_json() {
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let mut value = json!("leaf");
+            for _ in 0..10_000 {
+                value = json!({ "nested": value });
+            }
+            panic::catch_unwind(|| {
+                parse_matrix_event(MatrixParseInput {
+                    raw_event: value,
+                    installation_id: "inst_abc123".to_string(),
+                    policy: MatrixParsePolicy::default(),
+                })
+            })
+        })
+        .expect("deep-json test thread should spawn");
+    let result = handle.join().expect("deep-json test thread should not panic");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn parser_is_panic_safe_for_deeply_nested_arrays() {
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let mut value = json!("leaf");
+            for _ in 0..10_000 {
+                value = json!([value]);
+            }
+            panic::catch_unwind(|| {
+                parse_matrix_event(MatrixParseInput {
+                    raw_event: value,
+                    installation_id: "inst_abc123".to_string(),
+                    policy: MatrixParsePolicy::default(),
+                })
+            })
+        })
+        .expect("deep-array test thread should spawn");
+    let result = handle.join().expect("deep-array test thread should not panic");
+    assert!(result.is_ok());
+}
+
+proptest! {
+    #[test]
+    fn parser_is_panic_safe_for_arbitrary_json(value in arbitrary_json()) {
+        let result = panic::catch_unwind(|| {
+            parse_matrix_event(MatrixParseInput {
+                raw_event: value,
+                installation_id: "inst_abc123".to_string(),
+                policy: MatrixParsePolicy::default(),
+            })
+        });
+        prop_assert!(result.is_ok());
+    }
+}
+
+fn arbitrary_json() -> impl Strategy<Value = Value> {
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        any::<i64>().prop_map(|value| Value::Number(value.into())),
+        ".*".prop_map(Value::String),
+    ];
+    leaf.prop_recursive(8, 64, 8, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..8).prop_map(Value::Array),
+            prop::collection::btree_map(".*", inner, 0..8)
+                .prop_map(|map| Value::Object(map.into_iter().collect())),
+        ]
+    })
 }
 
 #[test]
@@ -554,6 +824,57 @@ fn render_rejects_unsupported_payloads_and_target_rooms() {
     })
     .expect_err("target room must be allowlisted");
     assert_eq!(err.reason_code, MatrixReasonCode::UnauthorizedTargetRoom);
+}
+
+#[test]
+fn test_parse_render_round_trip_preserves_semantics() {
+    let parsed = parse(text_event(json!({
+        "msgtype": "m.text",
+        "body": "round trip",
+        "m.relates_to": {
+            "rel_type": "m.thread",
+            "event_id": "$root:example.org",
+            "m.in_reply_to": {"event_id": "$reply:example.org"}
+        }
+    })));
+
+    let command = render_matrix_outbound(MatrixRenderInput {
+        envelope: outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
+            turn_run_id: ironclaw_turns::TurnRunId::new(),
+            text: "round trip".to_string(),
+            generated_at: Utc::now(),
+        })),
+        context: MatrixRenderContext {
+            installation_id: "inst_abc123".to_string(),
+            route_metadata: MatrixRouteMetadata {
+                room_id: parsed.metadata.room_id.clone(),
+                reply_to_event_id: parsed.metadata.reply_to_event_id.clone(),
+                thread_root_event_id: parsed
+                    .metadata
+                    .relation
+                    .as_ref()
+                    .map(|relation| relation.event_id.clone()),
+            },
+            allowed_target_rooms: vec![parsed.metadata.room_id.clone()],
+        },
+    })
+    .expect("round-trip render");
+
+    let MatrixOutboundCommand::SendMessage { room_id, body, .. } = command else {
+        panic!("expected send message command");
+    };
+    assert_eq!(room_id, parsed.metadata.room_id);
+    assert_eq!(body["body"], "round trip");
+    assert_eq!(
+        body["m.relates_to"]["m.in_reply_to"]["event_id"],
+        "$reply:example.org"
+    );
+    assert_eq!(body["m.relates_to"]["event_id"], "$root:example.org");
+    assert_eq!(body["m.relates_to"]["rel_type"], "m.thread");
+    assert_eq!(
+        parsed.facts.deduplication_key,
+        "matrix-inst_abc123-$event:example.org"
+    );
 }
 
 fn outbound(payload: ProductOutboundPayload) -> ProductOutboundEnvelope {
