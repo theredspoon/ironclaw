@@ -7889,6 +7889,7 @@ mod tests {
         let poll_config = crate::channels::wasm::schema::ChannelConfig {
             display_name: "poll-channel".to_string(),
             http_endpoints: Vec::new(),
+            http_allowlist: None,
             poll: Some(crate::channels::wasm::schema::PollConfigSchema {
                 enabled: true,
                 interval_ms: 1000,
