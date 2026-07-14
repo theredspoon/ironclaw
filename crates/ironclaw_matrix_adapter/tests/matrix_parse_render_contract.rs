@@ -486,6 +486,35 @@ fn rejects_unsupported_and_unauthorized_events_with_sanitized_diagnostics() {
 }
 
 #[test]
+fn unsupported_msgtype_and_media_kind_have_distinct_diagnostics() {
+    let unsupported_msgtype = parse_matrix_event(MatrixParseInput {
+        raw_event: text_event(json!({"msgtype": "m.location", "body": "geo:0,0"})),
+        installation_id: "inst_abc123".to_string(),
+        policy: allow_policy(),
+    })
+    .expect_err("unknown room message msgtype should be diagnostic");
+    assert_eq!(
+        unsupported_msgtype.reason_code,
+        MatrixReasonCode::UnsupportedMsgtype
+    );
+
+    let unsupported_media = parse_matrix_event(MatrixParseInput {
+        raw_event: text_event(json!({
+            "msgtype": "m.sticker",
+            "body": "sticker",
+            "url": "mxc://example.org/sticker"
+        })),
+        installation_id: "inst_abc123".to_string(),
+        policy: allow_policy(),
+    })
+    .expect_err("unsupported media-like msgtype should be diagnostic");
+    assert_eq!(
+        unsupported_media.reason_code,
+        MatrixReasonCode::UnsupportedMediaKind
+    );
+}
+
+#[test]
 fn malformed_json_and_missing_required_fields_are_diagnostics() {
     let err = parse_matrix_event(MatrixParseInput {
         raw_event: json!({"type": "m.room.message", "content": {"body": "x"}}),
@@ -900,6 +929,29 @@ fn test_parse_render_round_trip_preserves_semantics() {
         parsed.facts.deduplication_key,
         "matrix-inst_abc123-$event:example.org"
     );
+
+    let reparsed = parse(text_event_with_id("$rendered:example.org", body));
+    assert_eq!(reparsed.metadata.room_id, parsed.metadata.room_id);
+    assert_eq!(
+        reparsed.metadata.reply_to_event_id.as_deref(),
+        parsed.metadata.reply_to_event_id.as_deref()
+    );
+    assert_eq!(
+        reparsed
+            .metadata
+            .relation
+            .as_ref()
+            .map(|relation| (&relation.kind, relation.event_id.as_str())),
+        parsed
+            .metadata
+            .relation
+            .as_ref()
+            .map(|relation| (&relation.kind, relation.event_id.as_str()))
+    );
+    let ProductInboundPayload::UserMessage(payload) = reparsed.product.payload else {
+        panic!("reparsed render command should be a user message");
+    };
+    assert_eq!(payload.text, "round trip");
 }
 
 fn outbound(payload: ProductOutboundPayload) -> ProductOutboundEnvelope {

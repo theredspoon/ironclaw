@@ -671,6 +671,13 @@ fn parse_room_message(
                 },
             )
         }
+        "m.sticker" => {
+            return Err(diagnostic_for_facts(
+                MatrixReasonCode::UnsupportedMediaKind,
+                &facts,
+                "matrix media msgtype is not supported as a product attachment",
+            ));
+        }
         _ => {
             return Err(diagnostic_for_facts(
                 MatrixReasonCode::UnsupportedMsgtype,
@@ -736,6 +743,13 @@ fn parse_room_message(
                 formatted_body: metadata.formatted_body.clone(),
                 media,
             }
+        }
+        "m.sticker" => {
+            return Err(diagnostic_for_facts(
+                MatrixReasonCode::UnsupportedMediaKind,
+                &facts,
+                "matrix media msgtype is not supported as a product attachment",
+            ));
         }
         _ => {
             return Err(diagnostic_for_facts(
