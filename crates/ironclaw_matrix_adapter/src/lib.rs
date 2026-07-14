@@ -28,6 +28,7 @@ use serde_json::{Map, Value};
 const DIAGNOSTIC_MESSAGE_MAX: usize = 100;
 const MAX_EVENT_FIELD: usize = 512;
 const MAX_FORMATTED_BODY: usize = 64 * 1024;
+const MAX_HTML_NESTING: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixParseInput {
@@ -111,7 +112,7 @@ pub struct MatrixInboundEvent {
     pub encryption: EncryptionState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixMessageMetadata {
     pub room_id: String,
     pub event_id: String,
@@ -126,6 +127,26 @@ pub struct MatrixMessageMetadata {
     pub media_url: Option<String>,
     pub encryption: EncryptionState,
     pub diagnostics: Vec<MatrixAdapterDiagnostic>,
+}
+
+impl std::fmt::Debug for MatrixMessageMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MatrixMessageMetadata")
+            .field("room_id", &safe_debug_identifier(&self.room_id))
+            .field("event_id", &safe_debug_identifier(&self.event_id))
+            .field("sender", &safe_debug_identifier(&self.sender))
+            .field("origin_server_ts", &self.origin_server_ts)
+            .field("event_type", &safe_debug_identifier(&self.event_type))
+            .field("transaction_id", &redacted_debug_option(self.transaction_id.as_deref()))
+            .field("msgtype", &redacted_debug_option(self.msgtype.as_deref()))
+            .field("formatted_body", &"<redacted>")
+            .field("reply_to_event_id", &redacted_debug_option(self.reply_to_event_id.as_deref()))
+            .field("relation", &"<redacted>")
+            .field("media_url", &"<redacted>")
+            .field("encryption", &"<redacted>")
+            .field("diagnostics", &self.diagnostics)
+            .finish()
+    }
 }
 
 impl MatrixMessageMetadata {
@@ -936,7 +957,7 @@ fn facts_from_object(
     object: &Map<String, Value>,
     partial: PartialFacts,
 ) -> Result<MatrixEventFacts, MatrixAdapterDiagnostic> {
-    let event_id = required_top_string(object, "event_id", &partial)?;
+    let event_id = required_event_id(object, &partial)?;
     let room_id = required_top_string(object, "room_id", &partial)?;
     let sender = required_top_string(object, "sender", &partial)?;
     let event_type = required_top_string(object, "type", &partial)?;
@@ -981,6 +1002,34 @@ fn partial_facts(object: &Map<String, Value>) -> PartialFacts {
             .and_then(Value::as_str)
             .map(str::to_string),
     }
+}
+
+fn required_event_id(
+    object: &Map<String, Value>,
+    partial: &PartialFacts,
+) -> Result<String, MatrixAdapterDiagnostic> {
+    let value = required_top_string(object, "event_id", partial)?;
+    if is_valid_matrix_event_id(&value) {
+        Ok(value)
+    } else {
+        Err(MatrixAdapterDiagnostic::new(
+            MatrixReasonCode::MalformedMatrixEvent,
+            PartialFacts {
+                event_id: Some(value),
+                room_id: partial.room_id.clone(),
+                event_type: partial.event_type.clone(),
+                sender: partial.sender.clone(),
+            },
+            "matrix event_id is not a valid Matrix event id",
+        ))
+    }
+}
+
+fn is_valid_matrix_event_id(value: &str) -> bool {
+    value.starts_with('$')
+        && value.len() <= 255
+        && value.len() > 1
+        && !value.chars().any(|c| c == '\0' || c.is_control())
 }
 
 fn required_top_string(
@@ -1073,6 +1122,14 @@ fn sanitized_formatted_body(
         ));
         return None;
     }
+    if html_nesting_exceeds(raw, MAX_HTML_NESTING) {
+        diagnostics.push(diagnostic_for_facts(
+            MatrixReasonCode::UnsafeFormattedBody,
+            facts,
+            "matrix formatted body was too deeply nested and was downgraded to plaintext",
+        ));
+        return None;
+    }
     let cleaned = sanitize_matrix_html(raw);
     if cleaned.trim().is_empty() && !raw.trim().is_empty() {
         diagnostics.push(diagnostic_for_facts(
@@ -1105,14 +1162,81 @@ fn sanitize_matrix_html(raw: &str) -> String {
     let mut tag_attributes: HashMap<&'static str, HashSet<&'static str>> = HashMap::new();
     tag_attributes.insert("a", ["href"].into_iter().collect());
     let url_schemes: HashSet<&'static str> = ["http", "https"].into_iter().collect();
-    ammonia::Builder::new()
+    let cleaned = ammonia::Builder::new()
         .tags(tags)
         .tag_attributes(tag_attributes)
         .url_schemes(url_schemes)
         .url_relative(ammonia::UrlRelative::Deny)
         .link_rel(None)
         .clean(raw)
-        .to_string()
+        .to_string();
+    sanitize_encoded_xss_text(&cleaned)
+}
+
+fn html_nesting_exceeds(raw: &str, limit: usize) -> bool {
+    let mut depth = 0usize;
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    while let Some(offset) = raw[i..].find('<') {
+        i += offset + 1;
+        let Some(&next) = bytes.get(i) else {
+            break;
+        };
+        if next == b'!' || next == b'?' {
+            continue;
+        }
+        if next == b'/' {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if next.is_ascii_alphabetic() {
+            depth += 1;
+            if depth > limit {
+                return true;
+            }
+            if let Some(end) = raw[i..].find('>') {
+                let tag = &raw[i..i + end];
+                if tag.trim_end().ends_with('/') {
+                    depth = depth.saturating_sub(1);
+                }
+                i += end + 1;
+            }
+        }
+    }
+    false
+}
+
+fn sanitize_encoded_xss_text(cleaned: &str) -> String {
+    let mut value = cleaned.to_string();
+    for pattern in [
+        "onerror",
+        "onload",
+        "javascript:",
+        "data:",
+        "expression(",
+        "&lt;script",
+        "&lt;iframe",
+        "&lt;object",
+        "&lt;embed",
+    ] {
+        value = replace_ascii_case_insensitive(&value, pattern, "");
+    }
+    value
+}
+
+fn replace_ascii_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
+    let lower_input = input.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut output = String::new();
+    let mut cursor = 0usize;
+    while let Some(offset) = lower_input[cursor..].find(&lower_needle) {
+        let start = cursor + offset;
+        output.push_str(&input[cursor..start]);
+        output.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    output.push_str(&input[cursor..]);
+    output
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1232,6 +1356,15 @@ fn looks_like_credential(value: &str) -> bool {
     value.contains("Bearer ")
         || value.contains("sk_")
         || value.contains("syt_")
+        || value.contains("AKIA")
+        || value.contains("ASIA")
+        || value.contains("ghp_")
+        || value.contains("gho_")
+        || value.contains("ghs_")
+        || value.contains("xoxb-")
+        || value.contains("xoxp-")
+        || value.contains("eyJ")
+        || value.contains("AIza")
         || value
             .split(|c: char| c.is_whitespace() || matches!(c, ':' | ',' | ';' | '"' | '\''))
             .any(|token| {
@@ -1243,20 +1376,32 @@ fn looks_like_credential(value: &str) -> bool {
 }
 
 fn normalize_mime_type(value: &str) -> String {
-    value
+    let normalized = value
         .trim()
         .to_ascii_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '+' | '-' | '.'))
-        .collect::<String>()
+        .collect::<String>();
+    if is_allowed_mime_type(&normalized) {
+        normalized
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+fn is_allowed_mime_type(value: &str) -> bool {
+    value.starts_with("image/")
+        || value.starts_with("audio/")
+        || value.starts_with("video/")
+        || value == "text/plain"
+        || value == "application/pdf"
+        || value == "application/octet-stream"
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn default_mime_type(msgtype: &str) -> &'static str {
     match msgtype {
-        "m.image" => "image/jpeg",
-        "m.audio" => "audio/ogg",
-        "m.video" => "video/mp4",
+        "m.image" | "m.audio" | "m.video" => "application/octet-stream",
         _ => "application/octet-stream",
     }
 }
@@ -1275,10 +1420,31 @@ fn sanitize_filename(value: &str) -> Option<String> {
             }
         })
         .collect::<String>();
-    let trimmed = filename.trim_matches(['.', ' ']).trim();
+    let trimmed = filename.trim_matches(['.', ' ', '_']).trim();
     if trimmed.is_empty() {
-        None
+        Some("untitled".to_string())
     } else {
-        Some(trimmed.chars().take(128).collect())
+        Some(truncate_utf8_bytes(trimmed, 255))
     }
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    for c in value.chars() {
+        if output.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        output.push(c);
+    }
+    output
+}
+
+fn safe_debug_identifier(value: &str) -> String {
+    sanitize_field_value(value)
+}
+
+fn redacted_debug_option(value: Option<&str>) -> String {
+    value
+        .map(sanitize_field_value)
+        .unwrap_or_else(|| "<none>".to_string())
 }
