@@ -158,6 +158,26 @@ fn matrix_policy_snapshot_authorizes_outbound_and_rejects_credential_pair_mismat
         err,
         MatrixInstallationPolicyRejection::CredentialHandleMismatch
     );
+
+    let err = authorize_matrix_outbound(
+        &snapshot,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: installation_id("install-alpha"),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!other:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: PolicyRevision::new(7).expect("revision"),
+        },
+    )
+    .expect_err("path room must match the authorized room");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::UnsafeMatrixRequestShape
+    );
 }
 
 #[test]
@@ -169,5 +189,9 @@ fn matrix_policy_external_response_shape_does_not_enumerate_policy_state() {
     assert_eq!(
         MatrixInstallationPolicyRejection::RoomNotAllowed.external_response_shape(),
         MatrixInstallationPolicyRejection::AmbiguousInstallation.external_response_shape()
+    );
+    assert_eq!(
+        MatrixInstallationPolicyRejection::InstallationDisabled.external_response_shape(),
+        MatrixInstallationPolicyRejection::MutationUnauthorized.external_response_shape()
     );
 }

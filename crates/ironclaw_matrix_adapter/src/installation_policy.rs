@@ -1,8 +1,9 @@
 //! Host-owned Matrix ProductAdapter installation policy.
 //!
-//! This module deliberately stays outside the ProductAdapter WIT/runtime config.
-//! It models the host-side policy snapshot required before Matrix WASM
-//! parse/render or Matrix HTTP egress can run.
+//! Matrix installations need host-side room, sender, homeserver, artifact, and
+//! credential binding before parse/render or HTTP egress can run. The policy
+//! snapshot here is per installation and per request; it is not global adapter
+//! state.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -47,15 +48,9 @@ pub enum MatrixInstallationPolicyRejection {
 
 impl MatrixInstallationPolicyRejection {
     pub fn external_response_shape(self) -> ExternalPolicyRejectionShape {
-        match self {
-            Self::MutationUnauthorized => ExternalPolicyRejectionShape {
-                status: 403,
-                body_code: "matrix_policy_forbidden",
-            },
-            _ => ExternalPolicyRejectionShape {
-                status: 403,
-                body_code: "matrix_policy_denied",
-            },
+        ExternalPolicyRejectionShape {
+            status: 403,
+            body_code: "matrix_policy_denied",
         }
     }
 }
@@ -533,11 +528,14 @@ pub fn authorize_matrix_outbound(
     if check.guest_authorization_header_present {
         return Err(MatrixInstallationPolicyRejection::GuestCredentialMaterialRejected);
     }
-    validate_matrix_send_path(&check.path)?;
+    validate_matrix_send_path(&check.path, &check.room_id)?;
     Ok(())
 }
 
-fn validate_matrix_send_path(path: &str) -> Result<(), MatrixInstallationPolicyRejection> {
+fn validate_matrix_send_path(
+    path: &str,
+    room_id: &MatrixRoomId,
+) -> Result<(), MatrixInstallationPolicyRejection> {
     if path.contains("://")
         || path.contains('\\')
         || path.contains('\n')
@@ -550,9 +548,15 @@ fn validate_matrix_send_path(path: &str) -> Result<(), MatrixInstallationPolicyR
     {
         return Err(MatrixInstallationPolicyRejection::UnsafeMatrixRequestShape);
     }
-    if path.starts_with("/_matrix/client/v3/rooms/") && path.contains("/send/m.room.message/") {
-        Ok(())
-    } else {
-        Err(MatrixInstallationPolicyRejection::UnsafeMatrixRequestShape)
+
+    let rest = path
+        .strip_prefix("/_matrix/client/v3/rooms/")
+        .ok_or(MatrixInstallationPolicyRejection::UnsafeMatrixRequestShape)?;
+    let (path_room, txn) = rest
+        .split_once("/send/m.room.message/")
+        .ok_or(MatrixInstallationPolicyRejection::UnsafeMatrixRequestShape)?;
+    if path_room != room_id.0 || txn.is_empty() || txn.contains('/') {
+        return Err(MatrixInstallationPolicyRejection::UnsafeMatrixRequestShape);
     }
+    Ok(())
 }

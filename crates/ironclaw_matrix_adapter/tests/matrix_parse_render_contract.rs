@@ -948,7 +948,7 @@ fn matrix_dto_shapes_match_product_adapter_wit_json_shim() {
         envelope,
         context: render_context("!room:example.org"),
     })
-    .expect("render command for R002A egress handoff");
+    .expect("render command for product adapter egress handoff");
     let MatrixOutboundCommand::SendMessage { room_id, body, .. } = command else {
         panic!("expected send-message command");
     };
