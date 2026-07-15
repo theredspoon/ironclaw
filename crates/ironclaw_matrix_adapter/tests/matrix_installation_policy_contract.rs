@@ -5,12 +5,10 @@ use ironclaw_matrix_adapter::installation_policy::{
     InstallationAuditMetadata, MatrixActivationState, MatrixHomeserverOrigin,
     MatrixInboundRoutingContext, MatrixInstallationPolicy, MatrixInstallationPolicyRejection,
     MatrixOutboundPolicyCheck, MatrixProductAdapterInstallation, MatrixRoomId, MatrixUserId,
-    PolicyRevision, StaticManifestBinding, WitPackageName, WitWorldName,
-    authorize_matrix_outbound, resolve_matrix_inbound_installation,
+    PolicyRevision, StaticManifestBinding, WitPackageName, WitWorldName, authorize_matrix_outbound,
+    resolve_matrix_inbound_installation,
 };
-use ironclaw_product_adapters::{
-    AdapterInstallationId, EgressCredentialHandle, ProductAdapterId,
-};
+use ironclaw_product_adapters::{AdapterInstallationId, EgressCredentialHandle, ProductAdapterId};
 
 fn adapter_id() -> ProductAdapterId {
     ProductAdapterId::new("matrix").expect("adapter id")
@@ -54,8 +52,7 @@ fn artifact() -> ComponentArtifactBinding {
 }
 
 fn audit() -> InstallationAuditMetadata {
-    InstallationAuditMetadata::new("operator-alpha", 1_710_000_000_000)
-        .expect("audit metadata")
+    InstallationAuditMetadata::new("operator-alpha", 1_710_000_000_000).expect("audit metadata")
 }
 
 fn policy() -> MatrixInstallationPolicy {
@@ -98,7 +95,10 @@ fn matrix_policy_rejects_ambiguous_or_disabled_inbound_before_guest_dispatch() {
 
     let ambiguous = resolve_matrix_inbound_installation(&[allowed.clone(), allowed], &ctx)
         .expect_err("multiple matching installations must fail closed");
-    assert_eq!(ambiguous, MatrixInstallationPolicyRejection::AmbiguousInstallation);
+    assert_eq!(
+        ambiguous,
+        MatrixInstallationPolicyRejection::AmbiguousInstallation
+    );
 }
 
 #[test]
@@ -154,7 +154,10 @@ fn matrix_policy_snapshot_authorizes_outbound_and_rejects_credential_pair_mismat
         },
     )
     .expect_err("wrong credential must fail closed");
-    assert_eq!(err, MatrixInstallationPolicyRejection::CredentialHandleMismatch);
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::CredentialHandleMismatch
+    );
 }
 
 #[test]

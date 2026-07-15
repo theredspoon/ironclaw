@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::{Map, Value};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod installation_policy;
+
 const DIAGNOSTIC_MESSAGE_MAX: usize = 100;
 const MAX_EVENT_FIELD: usize = 512;
 const MAX_FORMATTED_BODY: usize = 64 * 1024;
