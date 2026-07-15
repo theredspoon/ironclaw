@@ -8,7 +8,10 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use ironclaw_product_adapters::{AdapterInstallationId, EgressCredentialHandle, ProductAdapterId};
+use ironclaw_product_adapters::{
+    AdapterInstallationId, DeclaredEgressTarget, EgressCredentialHandle, ProductAdapterId,
+    ProtocolAuthEvidence,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixInstallationPolicyRejection {
@@ -47,6 +50,41 @@ pub enum MatrixInstallationPolicyRejection {
 }
 
 impl MatrixInstallationPolicyRejection {
+    pub const ALL: [Self; 32] = [
+        Self::InstallationNotFound,
+        Self::AmbiguousInstallation,
+        Self::InstallationDisabled,
+        Self::InstallationDeleting,
+        Self::AdapterMismatch,
+        Self::InstallationMismatch,
+        Self::ArtifactHashMismatch,
+        Self::ManifestHashMismatch,
+        Self::WitWorldMismatch,
+        Self::ArtifactSignatureInvalid,
+        Self::UnexpectedGuestImport,
+        Self::DirectHttpEgressDenied,
+        Self::AuthMissing,
+        Self::AuthInvalid,
+        Self::AuthReplay,
+        Self::RoomNotAllowed,
+        Self::SenderNotAllowed,
+        Self::HomeserverMismatch,
+        Self::EgressTargetUndeclared,
+        Self::EgressTargetOutOfBounds,
+        Self::CredentialHandleMissing,
+        Self::CredentialHandleMismatch,
+        Self::CredentialHandleRevoked,
+        Self::GuestCredentialMaterialRejected,
+        Self::UnsafeMatrixRequestShape,
+        Self::UnsafeRedirect,
+        Self::PrivateNetworkTarget,
+        Self::PolicyRevisionMismatch,
+        Self::PolicySnapshotExpired,
+        Self::MutationUnauthorized,
+        Self::MutationRejected,
+        Self::InvalidPolicyValue,
+    ];
+
     pub fn external_response_shape(self) -> ExternalPolicyRejectionShape {
         ExternalPolicyRejectionShape {
             status: 403,
@@ -109,6 +147,12 @@ fn parse_host_port(
         let (host, port) = host
             .split_once(']')
             .ok_or(MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        let ip = host
+            .parse::<Ipv6Addr>()
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        if is_disallowed_ipv6(ip) {
+            return Err(MatrixInstallationPolicyRejection::PrivateNetworkTarget);
+        }
         let port = if port.is_empty() {
             None
         } else {
@@ -170,13 +214,48 @@ fn is_disallowed_ipv4(ip: Ipv4Addr) -> bool {
     ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
+        || ip.is_multicast()
         || ip.is_broadcast()
         || ip.is_unspecified()
+        || is_ipv4_documentation(ip)
         || ip.octets() == [169, 254, 169, 254]
 }
 
+fn is_ipv4_documentation(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    matches!(
+        octets,
+        [192, 0, 2, _] | [198, 51, 100, _] | [203, 0, 113, _]
+    )
+}
+
 fn is_disallowed_ipv6(ip: Ipv6Addr) -> bool {
-    ip.is_loopback() || ip.is_unspecified() || ip.is_unique_local()
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || is_ipv6_link_local(ip)
+        || ip.is_multicast()
+        || is_ipv6_documentation(ip)
+        || ipv6_mapped_ipv4(ip).is_some_and(is_disallowed_ipv4)
+}
+
+fn is_ipv6_link_local(ip: Ipv6Addr) -> bool {
+    (ip.segments()[0] & 0xffc0) == 0xfe80
+}
+
+fn is_ipv6_documentation(ip: Ipv6Addr) -> bool {
+    ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8
+}
+
+fn ipv6_mapped_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let octets = ip.octets();
+    if octets[..10] == [0; 10] && octets[10] == 0xff && octets[11] == 0xff {
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -219,6 +298,10 @@ pub struct EgressTargetIndex(u32);
 impl EgressTargetIndex {
     pub fn new(value: u32) -> Self {
         Self(value)
+    }
+
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -300,6 +383,7 @@ pub struct ComponentArtifactBinding {
     pub wit_package: WitPackageName,
     pub wit_world: WitWorldName,
     pub manifest: StaticManifestBinding,
+    pub declared_egress_targets: Vec<DeclaredEgressTarget>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,8 +395,12 @@ pub enum MatrixActivationState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallationAuditMetadata {
-    actor: String,
-    at_ms: u64,
+    pub created_by: String,
+    pub created_at_ms: u64,
+    pub updated_by: String,
+    pub updated_at_ms: u64,
+    pub last_enable_actor: Option<String>,
+    pub last_enable_at_ms: Option<u64>,
 }
 
 impl InstallationAuditMetadata {
@@ -320,10 +408,38 @@ impl InstallationAuditMetadata {
         actor: impl Into<String>,
         at_ms: u64,
     ) -> Result<Self, MatrixInstallationPolicyRejection> {
+        let actor = non_empty(actor.into())?;
         Ok(Self {
-            actor: non_empty(actor.into())?,
-            at_ms,
+            created_by: actor.clone(),
+            created_at_ms: at_ms,
+            updated_by: actor,
+            updated_at_ms: at_ms,
+            last_enable_actor: None,
+            last_enable_at_ms: None,
         })
+    }
+
+    pub fn record_update(
+        &mut self,
+        actor: impl Into<String>,
+        at_ms: u64,
+    ) -> Result<(), MatrixInstallationPolicyRejection> {
+        self.updated_by = non_empty(actor.into())?;
+        self.updated_at_ms = at_ms;
+        Ok(())
+    }
+
+    pub fn record_enable(
+        &mut self,
+        actor: impl Into<String>,
+        at_ms: u64,
+    ) -> Result<(), MatrixInstallationPolicyRejection> {
+        let actor = non_empty(actor.into())?;
+        self.updated_by = actor.clone();
+        self.updated_at_ms = at_ms;
+        self.last_enable_actor = Some(actor);
+        self.last_enable_at_ms = Some(at_ms);
+        Ok(())
     }
 }
 
@@ -395,21 +511,47 @@ pub struct MatrixInboundRoutingContext {
     pub homeserver: MatrixHomeserverOrigin,
     pub room_id: MatrixRoomId,
     pub sender: MatrixUserId,
-    verified: bool,
+    pub auth: VerifiedMatrixAuthContext,
+    pub received_at_ms: u64,
 }
 
 impl MatrixInboundRoutingContext {
-    pub fn verified_for_test(
+    pub fn from_verified_auth(
         homeserver: MatrixHomeserverOrigin,
         room_id: MatrixRoomId,
         sender: MatrixUserId,
-    ) -> Self {
-        Self {
+        auth_evidence: &ProtocolAuthEvidence,
+        received_at_ms: u64,
+    ) -> Result<Self, MatrixInstallationPolicyRejection> {
+        Ok(Self {
             homeserver,
             room_id,
             sender,
-            verified: true,
-        }
+            auth: VerifiedMatrixAuthContext::from_evidence(auth_evidence)?,
+            received_at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedMatrixAuthContext {
+    subject: String,
+}
+
+impl VerifiedMatrixAuthContext {
+    pub fn from_evidence(
+        auth_evidence: &ProtocolAuthEvidence,
+    ) -> Result<Self, MatrixInstallationPolicyRejection> {
+        let claim = auth_evidence
+            .claim()
+            .ok_or(MatrixInstallationPolicyRejection::AuthInvalid)?;
+        Ok(Self {
+            subject: non_empty(claim.subject().to_string())?,
+        })
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
     }
 }
 
@@ -429,9 +571,6 @@ pub fn resolve_matrix_inbound_installation(
     installations: &[MatrixProductAdapterInstallation],
     ctx: &MatrixInboundRoutingContext,
 ) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection> {
-    if !ctx.verified {
-        return Err(MatrixInstallationPolicyRejection::AuthInvalid);
-    }
     let mut disabled_match = false;
     let mut deleting_match = false;
     let mut allowed = Vec::new();
@@ -463,6 +602,7 @@ pub fn resolve_matrix_inbound_installation(
             saw_sender_rejection = true;
             continue;
         }
+        validate_component_policy_binding(&installation.component, &installation.policy)?;
         allowed.push(installation);
     }
 
@@ -484,6 +624,25 @@ pub fn resolve_matrix_inbound_installation(
         [] if saw_sender_rejection => Err(MatrixInstallationPolicyRejection::SenderNotAllowed),
         [] if saw_homeserver => Err(MatrixInstallationPolicyRejection::RoomNotAllowed),
         [] => Err(MatrixInstallationPolicyRejection::InstallationNotFound),
+    }
+}
+
+fn validate_component_policy_binding(
+    component: &ComponentArtifactBinding,
+    policy: &MatrixInstallationPolicy,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    let target = component
+        .declared_egress_targets
+        .get(policy.egress_target_index.as_usize())
+        .ok_or(MatrixInstallationPolicyRejection::EgressTargetOutOfBounds)?;
+
+    if target.host.as_str() != policy.homeserver.host() {
+        return Err(MatrixInstallationPolicyRejection::HomeserverMismatch);
+    }
+    match target.credential_handle.as_ref() {
+        Some(handle) if handle == &policy.credential_handle => Ok(()),
+        Some(_) => Err(MatrixInstallationPolicyRejection::CredentialHandleMismatch),
+        None => Err(MatrixInstallationPolicyRejection::CredentialHandleMissing),
     }
 }
 
@@ -538,6 +697,9 @@ fn validate_matrix_send_path(
 ) -> Result<(), MatrixInstallationPolicyRejection> {
     if path.contains("://")
         || path.contains('\\')
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains('%')
         || path.contains('\n')
         || path.contains('\r')
         || path.contains('\0')
