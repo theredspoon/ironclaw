@@ -544,19 +544,21 @@ fn group0_forbidden_config_boundary_changes_are_absent() {
     ]
     .join("\n");
 
-    for forbidden in [
-        "installation-config-json",
-        "matrix-config-json",
-        "installation_config_json",
-        "ProductAdapterInstallationConfig",
-        "MatrixProductAdapterInstallationConfig",
-        "ProductAdapterAuthConfig",
-        "ProductAdapterEgressTargetConfig",
-        "product_adapter_host::installation_config_json",
-        "product_adapter_host::http_egress",
-    ] {
+    let forbidden = [
+        ["installation", "-config-json"].concat(),
+        ["matrix", "-config-json"].concat(),
+        ["installation", "_config_json"].concat(),
+        ["ProductAdapter", "InstallationConfig"].concat(),
+        ["MatrixProductAdapter", "InstallationConfig"].concat(),
+        ["ProductAdapter", "AuthConfig"].concat(),
+        ["ProductAdapter", "EgressTargetConfig"].concat(),
+        ["product_adapter_host::", "installation", "_config_json"].concat(),
+        ["product_adapter_host::", "http_egress"].concat(),
+    ];
+
+    for forbidden in forbidden {
         assert!(
-            !source.contains(forbidden),
+            !source.contains(&forbidden),
             "R002A must not expose forbidden Group 0 boundary `{forbidden}`"
         );
     }
