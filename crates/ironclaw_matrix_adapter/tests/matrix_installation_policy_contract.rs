@@ -30,6 +30,7 @@ use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
     EgressCredentialHandle, ProductAdapterId, ProtocolAuthEvidence, ProtocolAuthFailure,
 };
+use tempfile::tempdir;
 
 fn adapter_id() -> ProductAdapterId {
     ProductAdapterId::new("matrix").expect("adapter id")
@@ -535,12 +536,6 @@ fn matrix_policy_projection_cache_records_policy_mutation_audits() {
     registry
         .insert_projection(installation, "operator-alpha", 3)
         .expect("project installation");
-    assert_eq!(registry.audit_events().len(), 1);
-    assert_eq!(
-        registry.audit_events()[0].operation,
-        MatrixInstallationMutationOperation::Create
-    );
-
     let err = registry
         .apply_policy_mutation(
             &installation_id,
@@ -553,6 +548,58 @@ fn matrix_policy_projection_cache_records_policy_mutation_audits() {
         )
         .expect_err("durable lifecycle mutation belongs to extension store");
     assert_eq!(err, MatrixInstallationPolicyRejection::MutationRejected);
+    let err = registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Disable,
+            &authorized,
+            "operator-alpha",
+            5,
+        )
+        .expect_err("durable lifecycle mutation belongs to extension store");
+    assert_eq!(err, MatrixInstallationPolicyRejection::MutationRejected);
+    registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::UpdatePolicy { policy: policy() },
+            &authorized,
+            "operator-alpha",
+            6,
+        )
+        .expect("durable cache owner updates policy");
+    registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::RebindArtifact {
+                component: artifact(),
+                artifact_inspection: artifact_inspection(),
+            },
+            &authorized,
+            "operator-alpha",
+            7,
+        )
+        .expect("durable cache owner rebinds artifact");
+    registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::RebindCredential {
+                credential_handle: credential("matrix-access-token"),
+            },
+            &authorized,
+            "operator-alpha",
+            8,
+        )
+        .expect("durable cache owner rebinds credential");
+    let err = registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Delete,
+            &authorized,
+            "operator-alpha",
+            9,
+        )
+        .expect_err("durable lifecycle mutation belongs to extension store");
+    assert_eq!(err, MatrixInstallationPolicyRejection::MutationRejected);
 
     let err = registry
         .apply_policy_mutation(
@@ -560,7 +607,7 @@ fn matrix_policy_projection_cache_records_policy_mutation_audits() {
             MatrixInstallationMutation::UpdatePolicy { policy: policy() },
             &unauthorized,
             "operator-beta",
-            5,
+            10,
         )
         .expect_err("policy update requires authority");
     assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
@@ -578,7 +625,36 @@ fn matrix_policy_projection_cache_records_policy_mutation_audits() {
         vec![
             MatrixInstallationMutationOperation::Create,
             MatrixInstallationMutationOperation::Enable,
+            MatrixInstallationMutationOperation::Disable,
             MatrixInstallationMutationOperation::UpdatePolicy,
+            MatrixInstallationMutationOperation::RebindArtifact,
+            MatrixInstallationMutationOperation::RebindCredential,
+            MatrixInstallationMutationOperation::Delete,
+            MatrixInstallationMutationOperation::UpdatePolicy,
+        ]
+    );
+    assert!(
+        registry
+            .audit_events()
+            .iter()
+            .take(7)
+            .all(|event| event.actor == "operator-alpha")
+    );
+    assert_eq!(
+        registry
+            .audit_events()
+            .iter()
+            .map(|event| event.rejected_reason)
+            .collect::<Vec<_>>(),
+        vec![
+            None,
+            Some(MatrixInstallationPolicyRejection::MutationRejected),
+            Some(MatrixInstallationPolicyRejection::MutationRejected),
+            None,
+            None,
+            None,
+            Some(MatrixInstallationPolicyRejection::MutationRejected),
+            Some(MatrixInstallationPolicyRejection::MutationUnauthorized),
         ]
     );
     assert_eq!(
@@ -587,6 +663,78 @@ fn matrix_policy_projection_cache_records_policy_mutation_audits() {
             .last()
             .and_then(|event| event.rejected_reason),
         Some(MatrixInstallationPolicyRejection::MutationUnauthorized)
+    );
+}
+
+#[test]
+fn matrix_policy_projection_cache_persists_and_reloads_durable_snapshot() {
+    let installation = installation("install-alpha", MatrixActivationState::Enabled);
+    let installation_id = installation.installation_id.clone();
+    let mut registry = MatrixInstallationProjectionCache::new();
+    registry
+        .insert_projection(installation, "operator-alpha", 1)
+        .expect("project installation");
+    registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::UpdatePolicy { policy: policy() },
+            &MatrixInstallationMutationAuthority::tenant_operator(),
+            "operator-alpha",
+            2,
+        )
+        .expect("durable policy mutation");
+
+    let encoded = registry.to_json_string().expect("durable snapshot json");
+    let restored = MatrixInstallationProjectionCache::from_json_str(&encoded)
+        .expect("reload durable snapshot");
+
+    assert_eq!(
+        restored
+            .installation(&installation_id)
+            .expect("restored installation")
+            .activation,
+        MatrixActivationState::Enabled
+    );
+    assert_eq!(restored.audit_events(), registry.audit_events());
+}
+
+#[test]
+fn matrix_policy_projection_cache_saves_and_loads_from_durable_path() {
+    let installation = installation("install-alpha", MatrixActivationState::Enabled);
+    let installation_id = installation.installation_id.clone();
+    let mut registry = MatrixInstallationProjectionCache::new();
+    registry
+        .insert_projection(installation, "operator-alpha", 1)
+        .expect("project installation");
+    registry
+        .apply_policy_mutation(
+            &installation_id,
+            MatrixInstallationMutation::UpdatePolicy { policy: policy() },
+            &MatrixInstallationMutationAuthority::tenant_operator(),
+            "operator-alpha",
+            2,
+        )
+        .expect("durable policy mutation");
+
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("nested/matrix-policy-cache.json");
+    registry.save_to_path(&path).expect("save durable path");
+
+    let restored =
+        MatrixInstallationProjectionCache::load_from_path(&path).expect("load durable path");
+    assert_eq!(
+        restored
+            .installation(&installation_id)
+            .expect("restored installation")
+            .activation,
+        MatrixActivationState::Enabled
+    );
+    assert_eq!(restored.audit_events(), registry.audit_events());
+
+    std::fs::write(&path, br#"{"installations":{"wrong-key":{"#).expect("corrupt snapshot");
+    assert!(
+        MatrixInstallationProjectionCache::load_from_path(&path).is_err(),
+        "durable reload must fail closed on invalid persisted state"
     );
 }
 
@@ -1027,6 +1175,184 @@ fn matrix_policy_snapshot_revision_fails_closed_after_policy_update() {
         },
     )
     .expect_err("stale snapshot must fail closed on revision mismatch");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+    );
+}
+
+#[test]
+fn matrix_policy_durable_cache_mutations_invalidate_prepared_snapshots() {
+    let authorized = MatrixInstallationMutationAuthority::tenant_operator();
+    let ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+    );
+
+    let mut policy_install = installation("install-policy", MatrixActivationState::Enabled);
+    policy_install
+        .component
+        .declared_egress_targets
+        .push(DeclaredEgressTarget::new(
+            DeclaredEgressHost::new("matrix.example.org").expect("declared host"),
+            Some(credential("matrix-rotated-token")),
+        ));
+    let policy_id = policy_install.installation_id.clone();
+    let mut policy_cache = MatrixInstallationProjectionCache::new();
+    policy_cache
+        .insert_projection(policy_install, "operator-alpha", 1)
+        .expect("insert policy projection");
+    let prepared = resolve_matrix_inbound_installation(
+        &policy_cache.installations().cloned().collect::<Vec<_>>(),
+        &ctx,
+    )
+    .expect("prepared policy snapshot");
+    let mut rotated_policy = policy_cache
+        .installation(&policy_id)
+        .expect("stored installation")
+        .policy
+        .clone();
+    rotated_policy.egress_target_index = EgressTargetIndex::new(1);
+    rotated_policy.credential_handle = credential("matrix-rotated-token");
+    policy_cache
+        .apply_policy_mutation(
+            &policy_id,
+            MatrixInstallationMutation::UpdatePolicy {
+                policy: rotated_policy,
+            },
+            &authorized,
+            "operator-alpha",
+            2,
+        )
+        .expect("durable policy update");
+    let current_revision = policy_cache
+        .installation(&policy_id)
+        .expect("updated installation")
+        .policy_revision;
+    let err = authorize_matrix_outbound(
+        &prepared,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: policy_id.clone(),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: current_revision,
+        },
+    )
+    .expect_err("stale prepared policy snapshot fails closed");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+    );
+
+    let artifact_id = installation_id("install-artifact");
+    let mut artifact_cache = MatrixInstallationProjectionCache::new();
+    artifact_cache
+        .insert_projection(
+            installation("install-artifact", MatrixActivationState::Enabled),
+            "operator-alpha",
+            3,
+        )
+        .expect("insert artifact projection");
+    let prepared = resolve_matrix_inbound_installation(
+        &artifact_cache.installations().cloned().collect::<Vec<_>>(),
+        &ctx,
+    )
+    .expect("prepared artifact snapshot");
+    let mut rebound = artifact();
+    rebound.artifact_sha256 =
+        ArtifactSha256::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("sha");
+    let mut inspection = artifact_inspection();
+    inspection.artifact_sha256 = rebound.artifact_sha256.clone();
+    artifact_cache
+        .apply_policy_mutation(
+            &artifact_id,
+            MatrixInstallationMutation::RebindArtifact {
+                component: rebound,
+                artifact_inspection: inspection,
+            },
+            &authorized,
+            "operator-alpha",
+            4,
+        )
+        .expect("durable artifact rebind");
+    let current_revision = artifact_cache
+        .installation(&artifact_id)
+        .expect("updated installation")
+        .policy_revision;
+    let err = authorize_matrix_outbound(
+        &prepared,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: artifact_id.clone(),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: current_revision,
+        },
+    )
+    .expect_err("stale prepared artifact snapshot fails closed");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+    );
+
+    let credential_id = installation_id("install-credential");
+    let mut credential_cache = MatrixInstallationProjectionCache::new();
+    credential_cache
+        .insert_projection(
+            installation("install-credential", MatrixActivationState::Enabled),
+            "operator-alpha",
+            5,
+        )
+        .expect("insert credential projection");
+    let prepared = resolve_matrix_inbound_installation(
+        &credential_cache
+            .installations()
+            .cloned()
+            .collect::<Vec<_>>(),
+        &ctx,
+    )
+    .expect("prepared credential snapshot");
+    credential_cache
+        .apply_policy_mutation(
+            &credential_id,
+            MatrixInstallationMutation::RebindCredential {
+                credential_handle: credential("matrix-access-token"),
+            },
+            &authorized,
+            "operator-alpha",
+            6,
+        )
+        .expect("durable credential rebind");
+    let current_revision = credential_cache
+        .installation(&credential_id)
+        .expect("updated installation")
+        .policy_revision;
+    let err = authorize_matrix_outbound(
+        &prepared,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: credential_id.clone(),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: current_revision,
+        },
+    )
+    .expect_err("stale prepared credential snapshot fails closed");
     assert_eq!(
         err,
         MatrixInstallationPolicyRejection::PolicyRevisionMismatch

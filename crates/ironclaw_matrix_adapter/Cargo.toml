@@ -32,4 +32,5 @@ chrono = { version = "0.4", features = ["serde"] }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0", features = ["test-support"] }
 ironclaw_turns = { path = "../ironclaw_turns", version = "0.1.0" }
 proptest = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

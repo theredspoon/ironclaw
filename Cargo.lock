@@ -4615,6 +4615,7 @@ dependencies = [
  "pulldown-cmark 0.9.6",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

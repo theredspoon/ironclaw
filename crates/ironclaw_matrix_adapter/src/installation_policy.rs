@@ -6,7 +6,11 @@
 //! state.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 
 use ironclaw_extensions::{
     ExtensionActivationState, ExtensionInstallationError, ExtensionInstallationId,
@@ -19,8 +23,10 @@ use ironclaw_product_adapters::{
     ProductAdapterId, ProtocolAuthEvidence,
 };
 use ironclaw_wasm_product_adapters::{EgressPolicy, EgressPolicyError, EgressPolicyTarget};
+use serde::{Deserialize, Deserializer, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixInstallationPolicyRejection {
     InstallationNotFound,
     AmbiguousInstallation,
@@ -100,13 +106,19 @@ impl MatrixInstallationPolicyRejection {
     }
 }
 
+impl std::fmt::Display for MatrixInstallationPolicyRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExternalPolicyRejectionShape {
     pub status: u16,
     pub body_code: &'static str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct MatrixHomeserverOrigin {
     scheme: String,
     host: String,
@@ -141,6 +153,29 @@ impl MatrixHomeserverOrigin {
 
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+}
+
+impl<'de> Deserialize<'de> for MatrixHomeserverOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            scheme: String,
+            host: String,
+            port: Option<u16>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let mut origin = format!("{}://{}", wire.scheme, wire.host);
+        if let Some(port) = wire.port {
+            origin.push(':');
+            origin.push_str(&port.to_string());
+        }
+        Self::parse(origin).map_err(serde::de::Error::custom)
     }
 }
 
@@ -265,7 +300,8 @@ fn ipv6_mapped_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct MatrixRoomId(String);
 
 impl MatrixRoomId {
@@ -285,7 +321,18 @@ impl MatrixRoomId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl<'de> Deserialize<'de> for MatrixRoomId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct MatrixUserId(String);
 
 impl MatrixUserId {
@@ -304,7 +351,18 @@ impl MatrixUserId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl<'de> Deserialize<'de> for MatrixUserId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct EgressTargetIndex(u32);
 
 impl EgressTargetIndex {
@@ -317,7 +375,8 @@ impl EgressTargetIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
 pub struct PolicyRevision(u64);
 
 impl PolicyRevision {
@@ -334,7 +393,18 @@ impl PolicyRevision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for PolicyRevision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct ComponentArtifactId(String);
 
 impl ComponentArtifactId {
@@ -343,7 +413,18 @@ impl ComponentArtifactId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for ComponentArtifactId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct ArtifactSha256(String);
 
 impl ArtifactSha256 {
@@ -357,7 +438,18 @@ impl ArtifactSha256 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for ArtifactSha256 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct WitPackageName(String);
 
 impl WitPackageName {
@@ -366,7 +458,18 @@ impl WitPackageName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for WitPackageName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct WitWorldName(String);
 
 impl WitWorldName {
@@ -375,12 +478,33 @@ impl WitWorldName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for WitWorldName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
 pub struct StaticManifestBinding(String);
 
 impl StaticManifestBinding {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixInstallationPolicyRejection> {
         non_empty(value.into()).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for StaticManifestBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -392,7 +516,7 @@ fn non_empty(value: String) -> Result<String, MatrixInstallationPolicyRejection>
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentArtifactBinding {
     pub artifact_id: ComponentArtifactId,
     pub artifact_sha256: ArtifactSha256,
@@ -402,7 +526,7 @@ pub struct ComponentArtifactBinding {
     pub declared_egress_targets: Vec<DeclaredEgressTarget>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixRuntimeArtifactEvidence {
     pub artifact_id: ComponentArtifactId,
     pub artifact_sha256: ArtifactSha256,
@@ -443,7 +567,7 @@ pub fn project_matrix_installation_from_runtime_entry(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComponentArtifactInspection {
     pub artifact_sha256: ArtifactSha256,
     pub wit_package: WitPackageName,
@@ -480,14 +604,15 @@ pub fn validate_component_artifact(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixActivationState {
     Disabled,
     Enabled,
     Deleting,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InstallationAuditMetadata {
     pub created_by: String,
     pub created_at_ms: u64,
@@ -495,6 +620,39 @@ pub struct InstallationAuditMetadata {
     pub updated_at_ms: u64,
     pub last_enable_actor: Option<String>,
     pub last_enable_at_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for InstallationAuditMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            created_by: String,
+            created_at_ms: u64,
+            updated_by: String,
+            updated_at_ms: u64,
+            last_enable_actor: Option<String>,
+            last_enable_at_ms: Option<u64>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let audit = Self {
+            created_by: non_empty(wire.created_by).map_err(serde::de::Error::custom)?,
+            created_at_ms: wire.created_at_ms,
+            updated_by: non_empty(wire.updated_by).map_err(serde::de::Error::custom)?,
+            updated_at_ms: wire.updated_at_ms,
+            last_enable_actor: wire
+                .last_enable_actor
+                .map(non_empty)
+                .transpose()
+                .map_err(serde::de::Error::custom)?,
+            last_enable_at_ms: wire.last_enable_at_ms,
+        };
+        Ok(audit)
+    }
 }
 
 impl InstallationAuditMetadata {
@@ -537,13 +695,40 @@ impl InstallationAuditMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MatrixInstallationPolicy {
     pub homeserver: MatrixHomeserverOrigin,
     pub allowed_rooms: BTreeSet<MatrixRoomId>,
     pub allowed_senders: BTreeSet<MatrixUserId>,
     pub egress_target_index: EgressTargetIndex,
     pub credential_handle: EgressCredentialHandle,
+}
+
+impl<'de> Deserialize<'de> for MatrixInstallationPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            homeserver: MatrixHomeserverOrigin,
+            allowed_rooms: BTreeSet<MatrixRoomId>,
+            allowed_senders: BTreeSet<MatrixUserId>,
+            egress_target_index: EgressTargetIndex,
+            credential_handle: EgressCredentialHandle,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.homeserver,
+            wire.allowed_rooms,
+            wire.allowed_senders,
+            wire.egress_target_index,
+            wire.credential_handle,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl MatrixInstallationPolicy {
@@ -567,7 +752,7 @@ impl MatrixInstallationPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MatrixProductAdapterInstallation {
     pub adapter_id: ProductAdapterId,
     pub installation_id: AdapterInstallationId,
@@ -576,6 +761,37 @@ pub struct MatrixProductAdapterInstallation {
     pub activation: MatrixActivationState,
     pub policy_revision: PolicyRevision,
     pub audit: InstallationAuditMetadata,
+}
+
+impl<'de> Deserialize<'de> for MatrixProductAdapterInstallation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            adapter_id: ProductAdapterId,
+            installation_id: AdapterInstallationId,
+            component: ComponentArtifactBinding,
+            policy: MatrixInstallationPolicy,
+            activation: MatrixActivationState,
+            policy_revision: PolicyRevision,
+            audit: InstallationAuditMetadata,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Self::new(
+            wire.adapter_id,
+            wire.installation_id,
+            wire.component,
+            wire.policy,
+            wire.activation,
+            wire.policy_revision,
+            wire.audit,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl MatrixProductAdapterInstallation {
@@ -693,7 +909,7 @@ impl MatrixProductAdapterInstallation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixInstallationMutationAuthority {
     pub can_manage_installations: bool,
 }
@@ -721,7 +937,8 @@ impl MatrixInstallationMutationAuthority {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixInstallationMutation {
     Enable {
         artifact_inspection: ComponentArtifactInspection,
@@ -753,7 +970,8 @@ impl MatrixInstallationMutation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixInstallationMutationOperation {
     Create,
     Enable,
@@ -764,7 +982,8 @@ pub enum MatrixInstallationMutationOperation {
     RebindCredential,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixExtensionLifecycleMutation {
     Enable,
     Disable,
@@ -842,7 +1061,7 @@ fn matrix_rejection_from_extension_error(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MatrixInstallationAuditEvent {
     pub actor: String,
     pub operation: MatrixInstallationMutationOperation,
@@ -853,6 +1072,40 @@ pub struct MatrixInstallationAuditEvent {
     pub next_revision: PolicyRevision,
     pub rejected_reason: Option<MatrixInstallationPolicyRejection>,
     pub at_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for MatrixInstallationAuditEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            actor: String,
+            operation: MatrixInstallationMutationOperation,
+            installation_id: AdapterInstallationId,
+            previous_activation: MatrixActivationState,
+            next_activation: MatrixActivationState,
+            previous_revision: PolicyRevision,
+            next_revision: PolicyRevision,
+            rejected_reason: Option<MatrixInstallationPolicyRejection>,
+            at_ms: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            actor: non_empty(wire.actor).map_err(serde::de::Error::custom)?,
+            operation: wire.operation,
+            installation_id: wire.installation_id,
+            previous_activation: wire.previous_activation,
+            next_activation: wire.next_activation,
+            previous_revision: wire.previous_revision,
+            next_revision: wire.next_revision,
+            rejected_reason: wire.rejected_reason,
+            at_ms: wire.at_ms,
+        })
+    }
 }
 
 impl MatrixInstallationAuditEvent {
@@ -898,15 +1151,141 @@ impl MatrixInstallationAuditEvent {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct MatrixInstallationProjectionCache {
     installations: BTreeMap<AdapterInstallationId, MatrixProductAdapterInstallation>,
     audit_events: Vec<MatrixInstallationAuditEvent>,
 }
 
+impl<'de> Deserialize<'de> for MatrixInstallationProjectionCache {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            installations: BTreeMap<AdapterInstallationId, MatrixProductAdapterInstallation>,
+            #[serde(default)]
+            audit_events: Vec<MatrixInstallationAuditEvent>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let cache = Self {
+            installations: wire.installations,
+            audit_events: wire.audit_events,
+        };
+        cache
+            .validate_persisted_state()
+            .map_err(serde::de::Error::custom)?;
+        Ok(cache)
+    }
+}
+
+#[derive(Debug)]
+pub enum MatrixInstallationProjectionStoreError {
+    Read(io::Error),
+    Decode(serde_json::Error),
+    Encode(serde_json::Error),
+    CreateDirectory(io::Error),
+    Write(io::Error),
+    Commit(io::Error),
+}
+
+impl fmt::Display for MatrixInstallationProjectionStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(source) => write!(f, "failed to read Matrix policy snapshot: {source}"),
+            Self::Decode(source) => {
+                write!(f, "failed to decode Matrix policy snapshot: {source}")
+            }
+            Self::Encode(source) => {
+                write!(f, "failed to encode Matrix policy snapshot: {source}")
+            }
+            Self::CreateDirectory(source) => {
+                write!(
+                    f,
+                    "failed to create Matrix policy snapshot directory: {source}"
+                )
+            }
+            Self::Write(source) => write!(f, "failed to write Matrix policy snapshot: {source}"),
+            Self::Commit(source) => write!(f, "failed to commit Matrix policy snapshot: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for MatrixInstallationProjectionStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(source)
+            | Self::CreateDirectory(source)
+            | Self::Write(source)
+            | Self::Commit(source) => Some(source),
+            Self::Decode(source) | Self::Encode(source) => Some(source),
+        }
+    }
+}
+
+fn durable_snapshot_tmp_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "matrix-installation-policy.json".into());
+    file_name.push(".tmp");
+    path.with_file_name(file_name)
+}
+
 impl MatrixInstallationProjectionCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+
+    pub fn from_json_str(value: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(value)
+    }
+
+    pub fn load_from_path(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, MatrixInstallationProjectionStoreError> {
+        let bytes = fs::read(path).map_err(MatrixInstallationProjectionStoreError::Read)?;
+        Self::from_json_bytes(&bytes).map_err(MatrixInstallationProjectionStoreError::Decode)
+    }
+
+    pub fn save_to_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(), MatrixInstallationProjectionStoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .map_err(MatrixInstallationProjectionStoreError::CreateDirectory)?;
+            }
+        }
+
+        let bytes = self
+            .to_json_bytes()
+            .map_err(MatrixInstallationProjectionStoreError::Encode)?;
+        let tmp_path = durable_snapshot_tmp_path(path);
+        fs::write(&tmp_path, bytes).map_err(MatrixInstallationProjectionStoreError::Write)?;
+        fs::rename(&tmp_path, path).map_err(|source| {
+            let _ = fs::remove_file(&tmp_path);
+            MatrixInstallationProjectionStoreError::Commit(source)
+        })?;
+        Ok(())
     }
 
     pub fn insert_projection(
@@ -1005,9 +1384,45 @@ impl MatrixInstallationProjectionCache {
     pub fn audit_events(&self) -> &[MatrixInstallationAuditEvent] {
         &self.audit_events
     }
+
+    fn validate_persisted_state(&self) -> Result<(), MatrixInstallationPolicyRejection> {
+        for (key, installation) in &self.installations {
+            if key != &installation.installation_id {
+                return Err(MatrixInstallationPolicyRejection::InstallationMismatch);
+            }
+            validate_persisted_installation(installation)?;
+        }
+        for event in &self.audit_events {
+            non_empty(event.actor.clone())?;
+        }
+        Ok(())
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn validate_persisted_installation(
+    installation: &MatrixProductAdapterInstallation,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    validate_persisted_audit_metadata(&installation.audit)?;
+    if installation.policy.allowed_rooms.is_empty()
+        || installation.policy.allowed_senders.is_empty()
+    {
+        return Err(MatrixInstallationPolicyRejection::InvalidPolicyValue);
+    }
+    validate_component_policy_binding(&installation.component, &installation.policy)
+}
+
+fn validate_persisted_audit_metadata(
+    audit: &InstallationAuditMetadata,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    non_empty(audit.created_by.clone())?;
+    non_empty(audit.updated_by.clone())?;
+    if let Some(actor) = &audit.last_enable_actor {
+        non_empty(actor.clone())?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixInboundRoutingContext {
     pub homeserver: MatrixHomeserverOrigin,
     pub room_id: MatrixRoomId,
@@ -1034,9 +1449,27 @@ impl MatrixInboundRoutingContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedMatrixAuthContext {
     subject: String,
+}
+
+impl<'de> Deserialize<'de> for VerifiedMatrixAuthContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            subject: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            subject: non_empty(wire.subject).map_err(serde::de::Error::custom)?,
+        })
+    }
 }
 
 impl VerifiedMatrixAuthContext {
@@ -1056,7 +1489,7 @@ impl VerifiedMatrixAuthContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixPolicySnapshot {
     pub adapter_id: ProductAdapterId,
     pub installation_id: AdapterInstallationId,
@@ -1167,7 +1600,7 @@ fn validate_component_policy_binding(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixOutboundPolicyCheck {
     pub adapter_id: ProductAdapterId,
     pub installation_id: AdapterInstallationId,
@@ -1231,7 +1664,8 @@ pub async fn authorize_matrix_outbound_with_extension_lifecycle(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixCredentialState {
     Active,
     Missing,
