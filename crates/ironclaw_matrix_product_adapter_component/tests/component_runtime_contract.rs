@@ -12,18 +12,16 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 use ironclaw_wasm_product_adapters::{
-    MatrixProductAdapterInstallationConfig, ProductAdapterAuthConfig,
-    ProductAdapterComponentRuntime, ProductAdapterComponentRuntimeConfig,
-    ProductAdapterEgressTargetConfig, ProductAdapterInstallationConfig, RuntimeError,
+    ProductAdapterComponentRuntime, ProductAdapterComponentRuntimeConfig, RuntimeError,
 };
 use serde_json::{Value, json};
 
 const ADAPTER_ID: &str = "matrix";
-const INSTALLATION_ID: &str = "inst_abc123";
+const INSTALLATION_ID: &str = "matrix-default";
 const ROOM_ID: &str = "!room:example.org";
 const SENDER_ID: &str = "@alice:example.org";
-const MATRIX_HOST: &str = "matrix.example.org";
-const MATRIX_CREDENTIAL_HANDLE: &str = "matrix_access_token";
+const MATRIX_HOST: &str = "matrix.org";
+const MATRIX_CREDENTIAL_HANDLE: &str = "matrix-access-token";
 
 static COMPONENT_ARTIFACT: OnceLock<PathBuf> = OnceLock::new();
 
@@ -47,9 +45,7 @@ fn component_artifact() -> &'static PathBuf {
     })
 }
 
-fn prepared_component_with_config(
-    installation_config: ProductAdapterInstallationConfig,
-) -> (
+fn prepared_component() -> (
     ProductAdapterComponentRuntime,
     ironclaw_wasm_product_adapters::PreparedProductAdapterComponent,
 ) {
@@ -60,46 +56,12 @@ fn prepared_component_with_config(
         .with_memory_bytes(4 * 1024 * 1024)
         .with_fuel(10_000_000);
     testing_config.max_component_bytes = 2 * 1024 * 1024;
-    testing_config.installation_config = installation_config;
     let runtime = ProductAdapterComponentRuntime::new(testing_config).expect("runtime");
     let bytes = std::fs::read(component_artifact()).expect("component artifact");
     let prepared = runtime
         .prepare("matrix", &bytes)
         .expect("prepare component");
     (runtime, prepared)
-}
-
-fn prepared_component() -> (
-    ProductAdapterComponentRuntime,
-    ironclaw_wasm_product_adapters::PreparedProductAdapterComponent,
-) {
-    prepared_component_with_config(ProductAdapterInstallationConfig::matrix_fixture())
-}
-
-fn installation_config(
-    installation_id: &str,
-    host: &str,
-    credential_handle: &str,
-    room_id: &str,
-    sender_id: &str,
-) -> ProductAdapterInstallationConfig {
-    let mut config = ProductAdapterInstallationConfig::matrix_fixture();
-    config.installation_id = installation_id.to_string();
-    config.egress_targets = vec![ProductAdapterEgressTargetConfig {
-        host: host.to_string(),
-        credential_handle: Some(credential_handle.to_string()),
-    }];
-    config.matrix = MatrixProductAdapterInstallationConfig {
-        allowed_rooms: vec![room_id.to_string()],
-        allowed_senders: vec![sender_id.to_string()],
-    };
-    config
-}
-
-fn config_with_auth(auth: ProductAdapterAuthConfig) -> ProductAdapterInstallationConfig {
-    let mut config = ProductAdapterInstallationConfig::matrix_fixture();
-    config.auth = auth;
-    config
 }
 
 fn verified_evidence() -> ProtocolAuthEvidence {
@@ -247,7 +209,7 @@ fn matrix_component_parses_inbound_into_canonical_product_json() {
 
     assert_eq!(
         parsed.external_event_id.as_str(),
-        "matrix-inst_abc123-$event:example.org"
+        "matrix-matrix-default-$event:example.org"
     );
     assert_eq!(parsed.external_actor_ref.id(), SENDER_ID);
     assert_eq!(parsed.external_conversation_ref.conversation_id(), ROOM_ID);
@@ -270,76 +232,7 @@ fn matrix_component_parses_inbound_into_canonical_product_json() {
 }
 
 #[test]
-fn matrix_component_uses_host_installation_config() {
-    let config = installation_config(
-        "install_prod_42",
-        "matrix.prod.example",
-        "prod_matrix_token",
-        "!prod:example.org",
-        "@bob:example.org",
-    );
-    let (runtime, prepared) = prepared_component_with_config(config);
-
-    assert_eq!(
-        prepared.manifest().installation_id.as_str(),
-        "install_prod_42"
-    );
-    assert_eq!(
-        prepared.manifest().declared_egress_targets[0].host.as_str(),
-        "matrix.prod.example"
-    );
-
-    let parsed = runtime
-        .parse_inbound(
-            &prepared,
-            &text_event_for(
-                "!prod:example.org",
-                "@bob:example.org",
-                "$prod:example.org",
-                "configured room",
-            ),
-            &verified_evidence(),
-        )
-        .expect("parse configured inbound");
-    let parsed: ParsedProductInbound =
-        serde_json::from_str(&parsed.parsed_json).expect("canonical parsed inbound");
-    assert_eq!(
-        parsed.external_event_id.as_str(),
-        "matrix-install_prod_42-$prod:example.org"
-    );
-    assert_eq!(
-        parsed.external_conversation_ref.conversation_id(),
-        "!prod:example.org"
-    );
-
-    let envelope = outbound_for(
-        ADAPTER_ID,
-        "install_prod_42",
-        "!prod:example.org",
-        final_reply("configured render"),
-    );
-    let rendered = runtime
-        .render_outbound(
-            &prepared,
-            &serde_json::to_string(&envelope).expect("outbound JSON"),
-        )
-        .expect("render configured outbound");
-    assert_eq!(
-        rendered.egress_request.host().as_str(),
-        "matrix.prod.example"
-    );
-    assert_eq!(
-        rendered
-            .egress_request
-            .credential_handle()
-            .expect("credential")
-            .as_str(),
-        "prod_matrix_token"
-    );
-}
-
-#[test]
-fn matrix_component_rejects_media_policy_and_preserves_attachments() {
+fn matrix_component_preserves_media_attachments() {
     let (runtime, prepared) = prepared_component();
 
     let parsed = runtime
@@ -403,20 +296,6 @@ fn matrix_component_rejects_verified_evidence_for_wrong_auth_requirement() {
 }
 
 #[test]
-fn matrix_component_accepts_configured_bearer_auth_requirement() {
-    let (runtime, prepared) =
-        prepared_component_with_config(config_with_auth(ProductAdapterAuthConfig::BearerToken));
-
-    runtime
-        .parse_inbound(
-            &prepared,
-            &text_event("hello"),
-            &mark_bearer_token_verified("alice"),
-        )
-        .expect("bearer evidence satisfies bearer manifest");
-}
-
-#[test]
 fn matrix_component_renders_final_reply_as_policy_checked_egress() {
     let (runtime, prepared) = prepared_component();
     let envelope = outbound(final_reply("**hello** matrix"));
@@ -470,24 +349,45 @@ fn matrix_component_rejects_unsupported_or_unauthorized_outbound() {
         "{err:?}"
     );
 
-    let mut envelope = outbound(final_reply("wrong room"));
-    envelope.target.external_conversation_ref =
-        ExternalConversationRef::new(None, "!evil:example.org", None, None).expect("conversation");
+    let envelope = outbound_for(
+        "telegram",
+        INSTALLATION_ID,
+        ROOM_ID,
+        final_reply("wrong adapter"),
+    );
     let err = runtime
         .render_outbound(
             &prepared,
             &serde_json::to_string(&envelope).expect("outbound JSON"),
         )
-        .expect_err("target room is unauthorized");
+        .expect_err("adapter id mismatch");
     assert!(
         matches!(err, RuntimeError::ExecutionFailed { ref message, .. }
-            if message.contains("unauthorized_target_room")),
+            if message.contains("invalid_adapter_id")),
+        "{err:?}"
+    );
+
+    let envelope = outbound_for(
+        ADAPTER_ID,
+        "other-install",
+        ROOM_ID,
+        final_reply("wrong install"),
+    );
+    let err = runtime
+        .render_outbound(
+            &prepared,
+            &serde_json::to_string(&envelope).expect("outbound JSON"),
+        )
+        .expect_err("installation id mismatch");
+    assert!(
+        matches!(err, RuntimeError::ExecutionFailed { ref message, .. }
+            if message.contains("invalid_installation_id")),
         "{err:?}"
     );
 }
 
 #[test]
-fn matrix_component_rejects_malformed_and_policy_violating_inbound() {
+fn matrix_component_rejects_malformed_inbound_but_does_not_own_policy() {
     let (runtime, prepared) = prepared_component();
 
     let err = runtime
@@ -499,35 +399,23 @@ fn matrix_component_rejects_malformed_and_policy_violating_inbound() {
         "{err:?}"
     );
 
-    let err = runtime
-        .parse_inbound(
-            &prepared,
-            &text_event_for("!evil:example.org", SENDER_ID, "$evil:example.org", "no"),
-            &verified_evidence(),
-        )
-        .expect_err("unauthorized room");
-    assert!(
-        matches!(err, RuntimeError::ExecutionFailed { ref message, .. }
-            if message.contains("UnauthorizedRoom")),
-        "{err:?}"
-    );
-
-    let err = runtime
+    let parsed = runtime
         .parse_inbound(
             &prepared,
             &text_event_for(
-                ROOM_ID,
+                "!other:example.org",
                 "@mallory:example.org",
-                "$mallory:example.org",
-                "no",
+                "$other:example.org",
+                "pre-transport parse",
             ),
             &verified_evidence(),
         )
-        .expect_err("unauthorized sender");
-    assert!(
-        matches!(err, RuntimeError::ExecutionFailed { ref message, .. }
-            if message.contains("UnauthorizedSender")),
-        "{err:?}"
+        .expect("guest parser is not the installation policy boundary");
+    let parsed: ParsedProductInbound =
+        serde_json::from_str(&parsed.parsed_json).expect("canonical parsed inbound");
+    assert_eq!(
+        parsed.external_conversation_ref.conversation_id(),
+        "!other:example.org"
     );
 }
 
@@ -620,7 +508,6 @@ fn matrix_component_maps_encrypted_events_to_no_op() {
 fn matrix_component_source_does_not_define_product_dto_shadows() {
     let source = [
         include_str!("../src/lib.rs"),
-        include_str!("../src/config.rs"),
         include_str!("../src/inbound.rs"),
         include_str!("../src/outbound.rs"),
         include_str!("../src/egress.rs"),
@@ -638,6 +525,39 @@ fn matrix_component_source_does_not_define_product_dto_shadows() {
         assert!(
             !source.contains(forbidden),
             "component must not define product DTO shadow `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn group0_forbidden_config_boundary_changes_are_absent() {
+    let source = [
+        include_str!("../../ironclaw_wasm_product_adapters/wit/product_adapter.wit"),
+        include_str!("../../ironclaw_wasm_product_adapters/src/config.rs"),
+        include_str!("../../ironclaw_wasm_product_adapters/src/lib.rs"),
+        include_str!("../../ironclaw_wasm_product_adapters/src/store.rs"),
+        include_str!("../../ironclaw_wasm_product_adapters/src/component_runtime.rs"),
+        include_str!("../src/lib.rs"),
+        include_str!("../src/inbound.rs"),
+        include_str!("../src/outbound.rs"),
+        include_str!("../src/manifest.rs"),
+    ]
+    .join("\n");
+
+    for forbidden in [
+        "installation-config-json",
+        "matrix-config-json",
+        "installation_config_json",
+        "ProductAdapterInstallationConfig",
+        "MatrixProductAdapterInstallationConfig",
+        "ProductAdapterAuthConfig",
+        "ProductAdapterEgressTargetConfig",
+        "product_adapter_host::installation_config_json",
+        "product_adapter_host::http_egress",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "R002A must not expose forbidden Group 0 boundary `{forbidden}`"
         );
     }
 }

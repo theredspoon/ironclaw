@@ -4,7 +4,6 @@ wit_bindgen::generate!({
 });
 
 mod auth;
-mod config;
 mod egress;
 mod inbound;
 mod limits;

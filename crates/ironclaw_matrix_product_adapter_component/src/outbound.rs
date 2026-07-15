@@ -3,12 +3,11 @@ use std::collections::{HashMap, HashSet};
 use pulldown_cmark::{Options, Parser, html};
 use serde_json::Value;
 
-use crate::config::installation_config;
 use crate::egress::matrix_send_egress;
 use crate::limits::{MAX_OUTBOUND_JSON_BYTES, ensure_input_size, ensure_json_depth};
+use crate::manifest::{ADAPTER_ID, INSTALLATION_ID};
 
 pub(crate) fn render_outbound(outbound_json: String) -> Result<String, String> {
-    let config = installation_config()?;
     ensure_input_size(
         "outbound_json",
         outbound_json.len(),
@@ -17,8 +16,8 @@ pub(crate) fn render_outbound(outbound_json: String) -> Result<String, String> {
     let envelope: Value =
         serde_json::from_str(&outbound_json).map_err(|_| "invalid_outbound_json".to_string())?;
     ensure_json_depth(&envelope)?;
-    require_match(&envelope, "adapter_id", &config.adapter_id)?;
-    require_match(&envelope, "installation_id", &config.installation_id)?;
+    require_match(&envelope, "adapter_id", ADAPTER_ID)?;
+    require_match(&envelope, "installation_id", INSTALLATION_ID)?;
     let payload = envelope
         .get("payload")
         .and_then(Value::as_object)
@@ -36,14 +35,6 @@ pub(crate) fn render_outbound(outbound_json: String) -> Result<String, String> {
         .and_then(Value::as_str)
         .filter(|room| !room.is_empty())
         .ok_or_else(|| "missing_route_metadata".to_string())?;
-    if !config
-        .matrix
-        .allowed_rooms
-        .iter()
-        .any(|allowed| allowed == room_id)
-    {
-        return Err("unauthorized_target_room".to_string());
-    }
     let txn_id = envelope
         .get("delivery_attempt_id")
         .and_then(Value::as_str)

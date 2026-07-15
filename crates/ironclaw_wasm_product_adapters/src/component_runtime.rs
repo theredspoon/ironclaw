@@ -267,11 +267,7 @@ impl ProductAdapterComponentRuntime {
     ) -> Result<(Store<StoreData>, bindings::ProductAdapterComponent), RuntimeError> {
         let mut store = Store::new(
             &self.engine,
-            StoreData::new(
-                limits.memory_bytes,
-                limits.timeout,
-                self.installation_config_json()?,
-            ),
+            StoreData::new(limits.memory_bytes, limits.timeout),
         );
         configure_store(&mut store, limits)?;
         let linker = create_linker(&self.engine)?;
@@ -279,15 +275,6 @@ impl ProductAdapterComponentRuntime {
             bindings::ProductAdapterComponent::instantiate(&mut store, component, &linker)
                 .map_err(|error| classify_instantiation_error(error.to_string()))?;
         Ok((store, instance))
-    }
-
-    fn installation_config_json(&self) -> Result<String, RuntimeError> {
-        serde_json::to_string(&self.config.installation_config).map_err(|error| {
-            RuntimeError::InvalidJson {
-                field: "product-adapter-host.installation-config-json",
-                message: error.to_string(),
-            }
-        })
     }
 }
 

@@ -48,9 +48,8 @@ pub use component_runtime::{
     ProductAdapterComponentRuntime, RenderOutboundResult, RuntimeError,
 };
 pub use config::{
-    MatrixProductAdapterInstallationConfig, PRODUCT_ADAPTER_WIT_VERSION, ProductAdapterAuthConfig,
-    ProductAdapterComponentLimits, ProductAdapterComponentRuntimeConfig,
-    ProductAdapterEgressTargetConfig, ProductAdapterInstallationConfig,
+    PRODUCT_ADAPTER_WIT_VERSION, ProductAdapterComponentLimits,
+    ProductAdapterComponentRuntimeConfig,
 };
 pub use egress_policy::{EgressPolicy, EgressPolicyError, EgressPolicyTarget};
 pub use runner::{
