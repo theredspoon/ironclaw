@@ -8,7 +8,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use ironclaw_extensions::InstallationOwner;
+use ironclaw_extensions::{
+    ExtensionActivationState, ExtensionInstallationError, ExtensionInstallationId,
+    ExtensionInstallationStore, InstallationOwner,
+};
 use ironclaw_host_api::UserId;
 use ironclaw_product_adapter_registry::ProductAdapterRuntimeEntry;
 use ironclaw_product_adapters::{
@@ -585,6 +588,7 @@ impl MatrixProductAdapterInstallation {
         policy_revision: PolicyRevision,
         audit: InstallationAuditMetadata,
     ) -> Result<Self, MatrixInstallationPolicyRejection> {
+        validate_component_policy_binding(&component, &policy)?;
         Ok(Self {
             adapter_id,
             installation_id,
@@ -634,6 +638,7 @@ impl MatrixProductAdapterInstallation {
                 artifact_inspection,
             } => {
                 validate_component_artifact(&self.component, &artifact_inspection)?;
+                validate_component_policy_binding(&self.component, &self.policy)?;
                 self.activation = MatrixActivationState::Enabled;
                 self.policy_revision = self.policy_revision.next();
                 self.audit.record_enable(actor.clone(), at_ms)?;
@@ -649,6 +654,7 @@ impl MatrixProductAdapterInstallation {
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::UpdatePolicy { policy } => {
+                validate_component_policy_binding(&self.component, &policy)?;
                 self.policy = policy;
                 self.policy_revision = self.policy_revision.next();
                 self.audit.record_update(actor.clone(), at_ms)?;
@@ -658,12 +664,16 @@ impl MatrixProductAdapterInstallation {
                 artifact_inspection,
             } => {
                 validate_component_artifact(&component, &artifact_inspection)?;
+                validate_component_policy_binding(&component, &self.policy)?;
                 self.component = component;
                 self.policy_revision = self.policy_revision.next();
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::RebindCredential { credential_handle } => {
-                self.policy.credential_handle = credential_handle;
+                let mut policy = self.policy.clone();
+                policy.credential_handle = credential_handle;
+                validate_component_policy_binding(&self.component, &policy)?;
+                self.policy = policy;
                 self.policy_revision = self.policy_revision.next();
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
@@ -754,6 +764,84 @@ pub enum MatrixInstallationMutationOperation {
     RebindCredential,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixExtensionLifecycleMutation {
+    Enable,
+    Disable,
+    Delete,
+}
+
+impl MatrixExtensionLifecycleMutation {
+    fn activation_state(self) -> Option<ExtensionActivationState> {
+        match self {
+            Self::Enable => Some(ExtensionActivationState::Enabled),
+            Self::Disable => Some(ExtensionActivationState::Disabled),
+            Self::Delete => None,
+        }
+    }
+}
+
+pub async fn apply_matrix_extension_lifecycle_mutation(
+    store: &dyn ExtensionInstallationStore,
+    installation_id: &AdapterInstallationId,
+    mutation: MatrixExtensionLifecycleMutation,
+    actor: &UserId,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    let extension_installation_id = extension_installation_id(installation_id)?;
+    let installation = store
+        .get_installation(&extension_installation_id)
+        .await
+        .map_err(matrix_rejection_from_extension_error)?
+        .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
+    let authority =
+        MatrixInstallationMutationAuthority::from_installation_owner(installation.owner(), actor);
+    if !authority.can_manage_installations {
+        return Err(MatrixInstallationPolicyRejection::MutationUnauthorized);
+    }
+
+    if let Some(state) = mutation.activation_state() {
+        store
+            .set_activation_state(&extension_installation_id, state)
+            .await
+            .map_err(matrix_rejection_from_extension_error)
+    } else {
+        store
+            .delete_installation(&extension_installation_id)
+            .await
+            .map_err(matrix_rejection_from_extension_error)
+    }
+}
+
+fn extension_installation_id(
+    installation_id: &AdapterInstallationId,
+) -> Result<ExtensionInstallationId, MatrixInstallationPolicyRejection> {
+    ExtensionInstallationId::new(installation_id.as_str())
+        .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)
+}
+
+fn matrix_rejection_from_extension_error(
+    error: ExtensionInstallationError,
+) -> MatrixInstallationPolicyRejection {
+    match error {
+        ExtensionInstallationError::InstallationNotFound { .. } => {
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        }
+        ExtensionInstallationError::ManifestHashMismatch { .. }
+        | ExtensionInstallationError::ConflictingManifestReference { .. } => {
+            MatrixInstallationPolicyRejection::ManifestHashMismatch
+        }
+        ExtensionInstallationError::ManifestNotFound { .. }
+        | ExtensionInstallationError::UnknownManifest { .. } => {
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        }
+        ExtensionInstallationError::DuplicateCredentialBinding { .. }
+        | ExtensionInstallationError::ConflictingCredentialBinding { .. } => {
+            MatrixInstallationPolicyRejection::CredentialHandleMismatch
+        }
+        _ => MatrixInstallationPolicyRejection::MutationRejected,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixInstallationAuditEvent {
     pub actor: String,
@@ -811,35 +899,23 @@ impl MatrixInstallationAuditEvent {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct MatrixInstallationPolicyRegistry {
+pub struct MatrixInstallationProjectionCache {
     installations: BTreeMap<AdapterInstallationId, MatrixProductAdapterInstallation>,
     audit_events: Vec<MatrixInstallationAuditEvent>,
 }
 
-impl MatrixInstallationPolicyRegistry {
+impl MatrixInstallationProjectionCache {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn create_installation(
+    pub fn insert_projection(
         &mut self,
         installation: MatrixProductAdapterInstallation,
-        authority: &MatrixInstallationMutationAuthority,
         actor: impl Into<String>,
         at_ms: u64,
     ) -> Result<(), MatrixInstallationPolicyRejection> {
         let actor = non_empty(actor.into())?;
-        if !authority.can_manage_installations {
-            self.audit_events
-                .push(MatrixInstallationAuditEvent::rejected(
-                    &installation,
-                    MatrixInstallationMutationOperation::Create,
-                    actor,
-                    MatrixInstallationPolicyRejection::MutationUnauthorized,
-                    at_ms,
-                )?);
-            return Err(MatrixInstallationPolicyRejection::MutationUnauthorized);
-        }
         if self
             .installations
             .contains_key(&installation.installation_id)
@@ -866,7 +942,7 @@ impl MatrixInstallationPolicyRegistry {
         Ok(())
     }
 
-    pub fn apply_mutation(
+    pub fn apply_policy_mutation(
         &mut self,
         installation_id: &AdapterInstallationId,
         mutation: MatrixInstallationMutation,
@@ -880,6 +956,22 @@ impl MatrixInstallationPolicyRegistry {
             .installations
             .get_mut(installation_id)
             .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
+        if matches!(
+            mutation,
+            MatrixInstallationMutation::Enable { .. }
+                | MatrixInstallationMutation::Disable
+                | MatrixInstallationMutation::Delete
+        ) {
+            self.audit_events
+                .push(MatrixInstallationAuditEvent::rejected(
+                    installation,
+                    operation,
+                    actor,
+                    MatrixInstallationPolicyRejection::MutationRejected,
+                    at_ms,
+                )?);
+            return Err(MatrixInstallationPolicyRejection::MutationRejected);
+        }
         match installation.apply_mutation(mutation, authority, actor.clone(), at_ms) {
             Ok(event) => {
                 self.audit_events.push(event);
@@ -1118,6 +1210,25 @@ pub fn authorize_matrix_outbound(
     }
     validate_matrix_send_path(&check.path, &check.room_id)?;
     Ok(())
+}
+
+pub async fn authorize_matrix_outbound_with_extension_lifecycle(
+    store: &dyn ExtensionInstallationStore,
+    snapshot: &MatrixPolicySnapshot,
+    check: &MatrixOutboundPolicyCheck,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    let extension_installation_id = extension_installation_id(&snapshot.installation_id)?;
+    let installation = store
+        .get_installation(&extension_installation_id)
+        .await
+        .map_err(matrix_rejection_from_extension_error)?
+        .ok_or(MatrixInstallationPolicyRejection::InstallationDeleting)?;
+    match installation.activation_state() {
+        ExtensionActivationState::Enabled => authorize_matrix_outbound(snapshot, check),
+        ExtensionActivationState::Installed | ExtensionActivationState::Disabled => {
+            Err(MatrixInstallationPolicyRejection::InstallationDisabled)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
