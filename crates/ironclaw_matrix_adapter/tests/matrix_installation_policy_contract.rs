@@ -1,15 +1,28 @@
 use std::collections::BTreeSet;
+use std::sync::{Arc, Barrier, Mutex};
 
+use chrono::Utc;
+use ironclaw_extensions::{
+    ExtensionActivationState, ExtensionCredentialBinding, ExtensionCredentialHandle,
+    ExtensionInstallation, ExtensionInstallationId, ExtensionInstallationStore,
+    ExtensionManifestRef, InMemoryExtensionInstallationStore, InstallationOwner,
+    MANIFEST_SCHEMA_VERSION, ManifestSource,
+};
+use ironclaw_host_api::{ExtensionId, HostPortCatalog, SecretHandle, UserId};
 use ironclaw_matrix_adapter::installation_policy::{
     ArtifactSha256, ComponentArtifactBinding, ComponentArtifactId, ComponentArtifactInspection,
     EgressTargetIndex, InstallationAuditMetadata, MatrixActivationState, MatrixCredentialState,
-    MatrixHomeserverOrigin, MatrixInboundRoutingContext, MatrixInstallationMutation,
-    MatrixInstallationMutationAuthority, MatrixInstallationMutationOperation,
-    MatrixInstallationPolicy, MatrixInstallationPolicyRejection, MatrixOutboundPolicyCheck,
-    MatrixProductAdapterInstallation, MatrixRoomId, MatrixUserId, PolicyRevision,
-    StaticManifestBinding, WitPackageName, WitWorldName, authorize_matrix_outbound,
-    resolve_matrix_inbound_installation, validate_component_artifact,
-    validate_matrix_credential_state,
+    MatrixHomeserverOrigin, MatrixInboundRoutingContext, MatrixInstallationAuditEvent,
+    MatrixInstallationMutation, MatrixInstallationMutationAuthority,
+    MatrixInstallationMutationOperation, MatrixInstallationPolicy,
+    MatrixInstallationPolicyRegistry, MatrixInstallationPolicyRejection, MatrixOutboundPolicyCheck,
+    MatrixProductAdapterInstallation, MatrixRoomId, MatrixRuntimeArtifactEvidence, MatrixUserId,
+    PolicyRevision, StaticManifestBinding, WitPackageName, WitWorldName, authorize_matrix_outbound,
+    project_matrix_installation_from_runtime_entry, resolve_matrix_inbound_installation,
+    validate_component_artifact, validate_matrix_credential_state,
+};
+use ironclaw_product_adapter_registry::{
+    ManifestHash, list_enabled_product_adapter_entries, parse_product_adapter_manifest_record,
 };
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
@@ -98,6 +111,18 @@ fn artifact_inspection() -> ComponentArtifactInspection {
         unexpected_imports: Vec::new(),
         direct_http_egress_import: false,
         signature_valid: Some(true),
+    }
+}
+
+fn runtime_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
+    MatrixRuntimeArtifactEvidence {
+        artifact_id: ComponentArtifactId::new("matrix-component").expect("artifact id"),
+        artifact_sha256: ArtifactSha256::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("sha"),
+        wit_package: WitPackageName::new("near:product-adapter@0.1.0").expect("wit package"),
+        wit_world: WitWorldName::new("product-adapter-component").expect("wit world"),
     }
 }
 
@@ -271,6 +296,94 @@ fn matrix_policy_rejects_installation_when_manifest_egress_binding_mismatches_po
     );
 }
 
+#[tokio::test]
+async fn matrix_policy_projects_from_enabled_product_adapter_registry_entry() {
+    let raw = format!(
+        r#"
+schema_version = "{schema}"
+id = "matrix-product-adapter"
+name = "Matrix"
+version = "0.1.0"
+description = "Matrix product adapter"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "adapters/matrix.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "shared_secret_header"
+header_name = "x-matrix-webhook-secret"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages", "external_final_reply_push"]
+
+[[product_adapter.inbound.required_credentials]]
+handle = "matrix-access-token"
+
+[[product_adapter.inbound.egress]]
+host = "matrix.example.org"
+credential_handle = "matrix-access-token"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION
+    );
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    let installation_id = ExtensionInstallationId::new("matrix-install-alpha").expect("install id");
+    let manifest_hash = ManifestHash::new("sha256:matrix-manifest").expect("manifest hash");
+    let manifest = parse_product_adapter_manifest_record(
+        raw,
+        ManifestSource::InstalledLocal,
+        &HostPortCatalog::empty(),
+        Some(manifest_hash.clone()),
+    )
+    .expect("manifest");
+    let installation = ExtensionInstallation::new(
+        installation_id,
+        extension_id.clone(),
+        ExtensionActivationState::Enabled,
+        ExtensionManifestRef::new(extension_id, Some(manifest_hash)),
+        vec![ExtensionCredentialBinding::new(
+            ExtensionCredentialHandle::new("matrix-access-token").expect("credential handle"),
+            SecretHandle::new("secret_matrix_access_token").expect("secret handle"),
+        )],
+        Utc::now(),
+        InstallationOwner::Tenant,
+    )
+    .expect("installation");
+    let store = InMemoryExtensionInstallationStore::default();
+    store
+        .upsert_manifest_and_installation(manifest, installation)
+        .await
+        .expect("store");
+
+    let entries = list_enabled_product_adapter_entries(&store)
+        .await
+        .expect("entries");
+    assert_eq!(entries.len(), 1);
+
+    let install = project_matrix_installation_from_runtime_entry(
+        &entries[0],
+        runtime_artifact_evidence(),
+        policy(),
+        audit(),
+    )
+    .expect("projected Matrix installation");
+    assert_eq!(install.installation_id.as_str(), "matrix-install-alpha");
+    assert_eq!(
+        install.adapter_id.as_str(),
+        "matrix-product-adapter/inbound"
+    );
+    assert_eq!(install.activation, MatrixActivationState::Enabled);
+    assert_eq!(install.component.declared_egress_targets.len(), 1);
+}
+
 #[test]
 fn matrix_policy_lifecycle_mutations_require_authority_and_emit_audit() {
     let mut install = MatrixProductAdapterInstallation::create_disabled(
@@ -298,6 +411,19 @@ fn matrix_policy_lifecycle_mutations_require_authority_and_emit_audit() {
         .expect_err("mutation requires authority");
     assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
     assert_eq!(install.activation, MatrixActivationState::Disabled);
+    let rejected = MatrixInstallationAuditEvent::rejected(
+        &install,
+        MatrixInstallationMutationOperation::Enable,
+        "operator-beta",
+        err,
+        2,
+    )
+    .expect("rejected audit event");
+    assert_eq!(
+        rejected.rejected_reason,
+        Some(MatrixInstallationPolicyRejection::MutationUnauthorized)
+    );
+    assert_eq!(rejected.previous_activation, rejected.next_activation);
 
     let authorized = MatrixInstallationMutationAuthority {
         can_manage_installations: true,
@@ -346,6 +472,361 @@ fn matrix_policy_lifecycle_mutations_require_authority_and_emit_audit() {
         )
         .expect("authorized delete");
     assert_eq!(install.activation, MatrixActivationState::Deleting);
+}
+
+#[test]
+fn matrix_policy_registry_records_authorized_and_rejected_mutation_audits() {
+    let installation = MatrixProductAdapterInstallation::create_disabled(
+        ProductAdapterId::new("matrix").expect("adapter id"),
+        AdapterInstallationId::new("matrix-install-alpha").expect("installation id"),
+        artifact(),
+        policy(),
+        audit(),
+    )
+    .expect("disabled installation");
+    let installation_id = installation.installation_id.clone();
+    let unauthorized = MatrixInstallationMutationAuthority {
+        can_manage_installations: false,
+    };
+    let authorized = MatrixInstallationMutationAuthority {
+        can_manage_installations: true,
+    };
+    let mut registry = MatrixInstallationPolicyRegistry::new();
+
+    let err = registry
+        .create_installation(installation.clone(), &unauthorized, "operator-beta", 2)
+        .expect_err("create requires authority");
+    assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
+    assert_eq!(registry.audit_events().len(), 1);
+    assert_eq!(
+        registry.audit_events()[0].operation,
+        MatrixInstallationMutationOperation::Create
+    );
+    assert_eq!(
+        registry.audit_events()[0].rejected_reason,
+        Some(MatrixInstallationPolicyRejection::MutationUnauthorized)
+    );
+
+    registry
+        .create_installation(installation, &authorized, "operator-alpha", 3)
+        .expect("authorized create");
+    registry
+        .apply_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Enable {
+                artifact_inspection: artifact_inspection(),
+            },
+            &authorized,
+            "operator-alpha",
+            4,
+        )
+        .expect("authorized enable");
+    let err = registry
+        .apply_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Disable,
+            &unauthorized,
+            "operator-beta",
+            5,
+        )
+        .expect_err("disable requires authority");
+    assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
+
+    let stored = registry
+        .installation(&installation_id)
+        .expect("stored installation");
+    assert_eq!(stored.activation, MatrixActivationState::Enabled);
+    assert_eq!(
+        registry
+            .audit_events()
+            .iter()
+            .map(|event| event.operation)
+            .collect::<Vec<_>>(),
+        vec![
+            MatrixInstallationMutationOperation::Create,
+            MatrixInstallationMutationOperation::Create,
+            MatrixInstallationMutationOperation::Enable,
+            MatrixInstallationMutationOperation::Disable,
+        ]
+    );
+    assert_eq!(
+        registry
+            .audit_events()
+            .last()
+            .and_then(|event| event.rejected_reason),
+        Some(MatrixInstallationPolicyRejection::MutationUnauthorized)
+    );
+}
+
+#[test]
+fn matrix_policy_mutation_authority_uses_extension_installation_owner() {
+    let alice = UserId::new("alice").expect("alice");
+    let bob = UserId::new("bob").expect("bob");
+    let owner = InstallationOwner::users(BTreeSet::from([alice.clone()])).expect("owner");
+
+    assert!(
+        MatrixInstallationMutationAuthority::from_installation_owner(&owner, &alice)
+            .can_manage_installations
+    );
+    assert!(
+        !MatrixInstallationMutationAuthority::from_installation_owner(&owner, &bob)
+            .can_manage_installations
+    );
+    assert!(
+        MatrixInstallationMutationAuthority::from_installation_owner(
+            &InstallationOwner::Tenant,
+            &bob
+        )
+        .can_manage_installations
+    );
+}
+
+#[test]
+fn matrix_policy_registry_rollout_rollback_and_atomic_update_contracts_fail_closed() {
+    let installation = MatrixProductAdapterInstallation::create_disabled(
+        ProductAdapterId::new("matrix").expect("adapter id"),
+        AdapterInstallationId::new("matrix-install-alpha").expect("installation id"),
+        artifact(),
+        policy(),
+        audit(),
+    )
+    .expect("disabled installation");
+    let installation_id = installation.installation_id.clone();
+    let authorized = MatrixInstallationMutationAuthority::tenant_operator();
+    let mut registry = MatrixInstallationPolicyRegistry::new();
+    registry
+        .create_installation(installation, &authorized, "operator-alpha", 1)
+        .expect("create");
+
+    let ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+    );
+    let err = resolve_matrix_inbound_installation(
+        &registry.installations().cloned().collect::<Vec<_>>(),
+        &ctx,
+    )
+    .expect_err("disabled-by-default registration rejects inbound");
+    assert_eq!(err, MatrixInstallationPolicyRejection::InstallationDisabled);
+
+    registry
+        .apply_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Enable {
+                artifact_inspection: artifact_inspection(),
+            },
+            &authorized,
+            "operator-alpha",
+            2,
+        )
+        .expect("enable one installation");
+    let enabled = registry.installations().cloned().collect::<Vec<_>>();
+    let snapshot = resolve_matrix_inbound_installation(&enabled, &ctx).expect("snapshot");
+
+    registry
+        .apply_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Disable,
+            &authorized,
+            "operator-alpha",
+            3,
+        )
+        .expect("disable during in-flight request");
+    let current = registry.installation(&installation_id).expect("current");
+    let err = authorize_matrix_outbound(
+        &snapshot,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: installation_id.clone(),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: current.policy_revision,
+        },
+    )
+    .expect_err("stale snapshot after disable fails closed");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+    );
+
+    registry
+        .apply_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Enable {
+                artifact_inspection: artifact_inspection(),
+            },
+            &authorized,
+            "operator-alpha",
+            4,
+        )
+        .expect("re-enable");
+    registry
+        .apply_mutation(
+            &installation_id,
+            MatrixInstallationMutation::Delete,
+            &authorized,
+            "operator-alpha",
+            5,
+        )
+        .expect("rollback/delete");
+    let deleting = registry.installations().cloned().collect::<Vec<_>>();
+    let err = resolve_matrix_inbound_installation(&deleting, &ctx)
+        .expect_err("deleted component reference fails closed");
+    assert_eq!(err, MatrixInstallationPolicyRejection::InstallationDeleting);
+}
+
+#[test]
+fn matrix_policy_artifact_rebind_invalidates_prepared_snapshot() {
+    let mut install = installation("install-alpha", MatrixActivationState::Enabled);
+    let ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+    );
+    let snapshot = resolve_matrix_inbound_installation(&[install.clone()], &ctx).expect("snapshot");
+    let authorized = MatrixInstallationMutationAuthority::tenant_operator();
+    let mut rebound = artifact();
+    rebound.artifact_sha256 =
+        ArtifactSha256::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("sha");
+    let mut inspection = artifact_inspection();
+    inspection.artifact_sha256 = rebound.artifact_sha256.clone();
+    install
+        .apply_mutation(
+            MatrixInstallationMutation::RebindArtifact {
+                component: rebound,
+                artifact_inspection: inspection,
+            },
+            &authorized,
+            "operator-beta",
+            2,
+        )
+        .expect("artifact rebind");
+
+    let err = authorize_matrix_outbound(
+        &snapshot,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: installation_id("install-alpha"),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: install.policy_revision,
+        },
+    )
+    .expect_err("stale prepared component snapshot fails closed");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+    );
+}
+
+#[test]
+fn matrix_policy_concurrent_enable_disable_mutations_serialize_with_monotonic_revisions() {
+    let installation = MatrixProductAdapterInstallation::create_disabled(
+        ProductAdapterId::new("matrix").expect("adapter id"),
+        AdapterInstallationId::new("matrix-install-alpha").expect("installation id"),
+        artifact(),
+        policy(),
+        audit(),
+    )
+    .expect("disabled installation");
+    let installation_id = installation.installation_id.clone();
+    let authorized = MatrixInstallationMutationAuthority::tenant_operator();
+    let mut registry = MatrixInstallationPolicyRegistry::new();
+    registry
+        .create_installation(installation, &authorized, "operator-alpha", 1)
+        .expect("create");
+    let registry = Arc::new(Mutex::new(registry));
+    let barrier = Arc::new(Barrier::new(2));
+
+    let enable_registry = Arc::clone(&registry);
+    let enable_barrier = Arc::clone(&barrier);
+    let enable_id = installation_id.clone();
+    let enable_authority = authorized.clone();
+    let enable = std::thread::spawn(move || {
+        enable_barrier.wait();
+        enable_registry
+            .lock()
+            .expect("registry lock")
+            .apply_mutation(
+                &enable_id,
+                MatrixInstallationMutation::Enable {
+                    artifact_inspection: artifact_inspection(),
+                },
+                &enable_authority,
+                "operator-alpha",
+                2,
+            )
+            .expect("enable");
+    });
+
+    let disable_registry = Arc::clone(&registry);
+    let disable_barrier = Arc::clone(&barrier);
+    let disable_id = installation_id.clone();
+    let disable_authority = authorized.clone();
+    let disable = std::thread::spawn(move || {
+        disable_barrier.wait();
+        disable_registry
+            .lock()
+            .expect("registry lock")
+            .apply_mutation(
+                &disable_id,
+                MatrixInstallationMutation::Disable,
+                &disable_authority,
+                "operator-beta",
+                3,
+            )
+            .expect("disable");
+    });
+
+    enable.join().expect("enable thread");
+    disable.join().expect("disable thread");
+
+    let registry = registry.lock().expect("registry lock");
+    let install = registry
+        .installation(&installation_id)
+        .expect("stored installation");
+    assert_eq!(
+        install.policy_revision,
+        PolicyRevision::new(3).expect("revision")
+    );
+    let mut operations = registry
+        .audit_events()
+        .iter()
+        .map(|event| event.operation)
+        .collect::<Vec<_>>();
+    operations.sort_by_key(|operation| match operation {
+        MatrixInstallationMutationOperation::Create => 0,
+        MatrixInstallationMutationOperation::Enable => 1,
+        MatrixInstallationMutationOperation::Disable => 2,
+        MatrixInstallationMutationOperation::Delete => 3,
+        MatrixInstallationMutationOperation::UpdatePolicy => 4,
+        MatrixInstallationMutationOperation::RebindArtifact => 5,
+        MatrixInstallationMutationOperation::RebindCredential => 6,
+    });
+    assert_eq!(
+        operations,
+        vec![
+            MatrixInstallationMutationOperation::Create,
+            MatrixInstallationMutationOperation::Enable,
+            MatrixInstallationMutationOperation::Disable,
+        ]
+    );
+    assert!(
+        registry
+            .audit_events()
+            .iter()
+            .all(|event| event.rejected_reason.is_none())
+    );
 }
 
 #[test]
