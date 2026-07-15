@@ -666,7 +666,7 @@ fn map_matrix_diagnostic_to_adapter_error(
             kind: ProductWorkflowRejectionKind::Unauthorized,
             status_code: 403,
             retryable: false,
-            reason: RedactedString::new(diagnostic.to_string()),
+            reason: RedactedString::new("matrix policy denied"),
         },
         MatrixReasonCode::UnsupportedEventType
         | MatrixReasonCode::UnsupportedMsgtype

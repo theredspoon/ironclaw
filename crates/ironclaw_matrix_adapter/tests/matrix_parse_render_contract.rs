@@ -124,6 +124,51 @@ fn matrix_product_adapter_rejects_unverified_inbound_payload() {
 }
 
 #[test]
+fn matrix_product_adapter_policy_denials_share_public_error_shape() {
+    let adapter = adapter();
+    let evidence =
+        ProtocolAuthEvidence::test_verified(adapter.auth_requirement().clone(), "matrix-webhook");
+
+    let mut wrong_room = text_event(json!({"msgtype": "m.text", "body": "hello"}));
+    wrong_room["room_id"] = json!("!other:example.org");
+    let wrong_room = serde_json::to_vec(&wrong_room).expect("event json");
+    let room_err = adapter
+        .parse_inbound(&wrong_room, &evidence)
+        .expect_err("wrong room should reject");
+
+    let mut wrong_sender = text_event(json!({"msgtype": "m.text", "body": "hello"}));
+    wrong_sender["sender"] = json!("@bob:example.org");
+    let wrong_sender = serde_json::to_vec(&wrong_sender).expect("event json");
+    let sender_err = adapter
+        .parse_inbound(&wrong_sender, &evidence)
+        .expect_err("wrong sender should reject");
+
+    let ProductAdapterError::WorkflowRejected {
+        kind: room_kind,
+        status_code: room_status,
+        retryable: room_retryable,
+        reason: room_reason,
+    } = room_err
+    else {
+        panic!("expected workflow rejection for room policy");
+    };
+    let ProductAdapterError::WorkflowRejected {
+        kind: sender_kind,
+        status_code: sender_status,
+        retryable: sender_retryable,
+        reason: sender_reason,
+    } = sender_err
+    else {
+        panic!("expected workflow rejection for sender policy");
+    };
+
+    assert_eq!(room_kind, sender_kind);
+    assert_eq!(room_status, sender_status);
+    assert_eq!(room_retryable, sender_retryable);
+    assert_eq!(room_reason.to_string(), sender_reason.to_string());
+}
+
+#[test]
 fn matrix_product_adapter_requires_explicit_production_policy() {
     let err = MatrixProductAdapter::new(MatrixProductAdapterConfig {
         adapter_id: ProductAdapterId::new("matrix").expect("adapter id"),
@@ -958,7 +1003,7 @@ fn matrix_dto_shapes_match_product_adapter_wit_json_shim() {
         "path": format!(
             "/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
             room_id,
-            "txn-r002a-handoff"
+            "txn-product-adapter-handoff"
         ),
         "headers": [{"name": "content-type", "value": "application/json"}],
         "body": serde_json::to_vec(&body).expect("matrix request body"),
