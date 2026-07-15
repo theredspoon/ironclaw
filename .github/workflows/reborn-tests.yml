@@ -122,6 +122,7 @@ jobs:
                         or (.name == "ironclaw_architecture")
                         or (.name == "ironclaw_slack_v2_adapter")
                         or (.name == "ironclaw_telegram_v2_adapter")
+                        or (.name == "ironclaw_matrix_product_adapter_component")
                         or (.name == "ironclaw_wasm_product_adapters")
                         or (.name | startswith("ironclaw_webui_v2"))
                       )

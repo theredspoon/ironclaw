@@ -60,12 +60,45 @@ const FIXTURE_ADAPTER_WAT: &str = r#"
     i32.const 44
     i32.const 1
     i32.store
-    ;; declared-auth-requirements: empty list
-    i32.const 48
+    ;; declared-auth-requirements: [bearer-token]
+    i32.const 6144
+    i32.const 3
+    i32.store8
+    ;; header-name: none
+    i32.const 6148
     i32.const 0
     i32.store
-    i32.const 52
+    i32.const 6152
     i32.const 0
+    i32.store
+    i32.const 6156
+    i32.const 0
+    i32.store
+    ;; timestamp-header-name: none
+    i32.const 6160
+    i32.const 0
+    i32.store
+    i32.const 6164
+    i32.const 0
+    i32.store
+    i32.const 6168
+    i32.const 0
+    i32.store
+    ;; cookie-name: none
+    i32.const 6172
+    i32.const 0
+    i32.store
+    i32.const 6176
+    i32.const 0
+    i32.store
+    i32.const 6180
+    i32.const 0
+    i32.store
+    i32.const 48
+    i32.const 6144
+    i32.store
+    i32.const 52
+    i32.const 1
     i32.store
     i32.const 16)
 
