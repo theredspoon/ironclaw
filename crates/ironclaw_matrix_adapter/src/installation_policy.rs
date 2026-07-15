@@ -1281,11 +1281,11 @@ impl MatrixInstallationProjectionCache {
         path: impl AsRef<Path>,
     ) -> Result<(), MatrixInstallationProjectionStoreError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(MatrixInstallationProjectionStoreError::CreateDirectory)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(MatrixInstallationProjectionStoreError::CreateDirectory)?;
         }
 
         let bytes = self
@@ -1385,23 +1385,23 @@ impl MatrixInstallationProjectionCache {
                 )?);
             return Err(MatrixInstallationPolicyRejection::MutationUnauthorized);
         }
-        if let MatrixInstallationMutation::UpdatePolicy { policy } = &mutation {
-            if installation_for_precheck.activation == MatrixActivationState::Enabled {
-                let mut candidate = installation_for_precheck.clone();
-                candidate.policy = policy.clone();
-                if let Err(reason) =
-                    self.validate_no_enabled_scope_overlap(&candidate, Some(installation_id))
-                {
-                    self.audit_events
-                        .push(MatrixInstallationAuditEvent::rejected(
-                            installation_for_precheck,
-                            operation,
-                            actor,
-                            reason,
-                            at_ms,
-                        )?);
-                    return Err(reason);
-                }
+        if let MatrixInstallationMutation::UpdatePolicy { policy } = &mutation
+            && installation_for_precheck.activation == MatrixActivationState::Enabled
+        {
+            let mut candidate = installation_for_precheck.clone();
+            candidate.policy = policy.clone();
+            if let Err(reason) =
+                self.validate_no_enabled_scope_overlap(&candidate, Some(installation_id))
+            {
+                self.audit_events
+                    .push(MatrixInstallationAuditEvent::rejected(
+                        installation_for_precheck,
+                        operation,
+                        actor,
+                        reason,
+                        at_ms,
+                    )?);
+                return Err(reason);
             }
         }
         let installation = self
