@@ -264,6 +264,9 @@ pub struct MatrixRoomId(String);
 impl MatrixRoomId {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixInstallationPolicyRejection> {
         let value = value.into();
+        // Matrix localparts can be case-sensitive. Until a Matrix SDK-backed
+        // canonicalizer owns server-name normalization, store IDs verbatim and
+        // fail closed on mismatches rather than guessing.
         if value.starts_with('!')
             && value.contains(':')
             && !value.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -281,6 +284,8 @@ pub struct MatrixUserId(String);
 impl MatrixUserId {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixInstallationPolicyRejection> {
         let value = value.into();
+        // See MatrixRoomId: this policy layer intentionally avoids partial
+        // normalization that could rewrite a case-sensitive identifier.
         if value.starts_with('@')
             && value.contains(':')
             && !value.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -315,6 +320,10 @@ impl PolicyRevision {
         } else {
             Ok(Self(value))
         }
+    }
+
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
     }
 }
 
@@ -384,6 +393,43 @@ pub struct ComponentArtifactBinding {
     pub wit_world: WitWorldName,
     pub manifest: StaticManifestBinding,
     pub declared_egress_targets: Vec<DeclaredEgressTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentArtifactInspection {
+    pub artifact_sha256: ArtifactSha256,
+    pub wit_package: WitPackageName,
+    pub wit_world: WitWorldName,
+    pub manifest: StaticManifestBinding,
+    pub required_exports_present: bool,
+    pub unexpected_imports: Vec<String>,
+    pub direct_http_egress_import: bool,
+    pub signature_valid: Option<bool>,
+}
+
+pub fn validate_component_artifact(
+    binding: &ComponentArtifactBinding,
+    inspection: &ComponentArtifactInspection,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    if binding.artifact_sha256 != inspection.artifact_sha256 {
+        return Err(MatrixInstallationPolicyRejection::ArtifactHashMismatch);
+    }
+    if binding.manifest != inspection.manifest {
+        return Err(MatrixInstallationPolicyRejection::ManifestHashMismatch);
+    }
+    if binding.wit_package != inspection.wit_package || binding.wit_world != inspection.wit_world {
+        return Err(MatrixInstallationPolicyRejection::WitWorldMismatch);
+    }
+    if !inspection.required_exports_present
+        || !inspection.unexpected_imports.is_empty()
+        || inspection.direct_http_egress_import
+    {
+        return Err(MatrixInstallationPolicyRejection::UnexpectedGuestImport);
+    }
+    if inspection.signature_valid != Some(true) {
+        return Err(MatrixInstallationPolicyRejection::ArtifactSignatureInvalid);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,6 +550,152 @@ impl MatrixProductAdapterInstallation {
             audit,
         })
     }
+
+    pub fn create_disabled(
+        adapter_id: ProductAdapterId,
+        installation_id: AdapterInstallationId,
+        component: ComponentArtifactBinding,
+        policy: MatrixInstallationPolicy,
+        audit: InstallationAuditMetadata,
+    ) -> Result<Self, MatrixInstallationPolicyRejection> {
+        Self::new(
+            adapter_id,
+            installation_id,
+            component,
+            policy,
+            MatrixActivationState::Disabled,
+            PolicyRevision::new(1)?,
+            audit,
+        )
+    }
+
+    pub fn apply_mutation(
+        &mut self,
+        mutation: MatrixInstallationMutation,
+        authority: &MatrixInstallationMutationAuthority,
+        actor: impl Into<String>,
+        at_ms: u64,
+    ) -> Result<MatrixInstallationAuditEvent, MatrixInstallationPolicyRejection> {
+        if !authority.can_manage_installations {
+            return Err(MatrixInstallationPolicyRejection::MutationUnauthorized);
+        }
+        let actor = non_empty(actor.into())?;
+        let previous_activation = self.activation;
+        let previous_revision = self.policy_revision;
+        let operation = mutation.operation();
+
+        match mutation {
+            MatrixInstallationMutation::Enable {
+                artifact_inspection,
+            } => {
+                validate_component_artifact(&self.component, &artifact_inspection)?;
+                self.activation = MatrixActivationState::Enabled;
+                self.policy_revision = self.policy_revision.next();
+                self.audit.record_enable(actor.clone(), at_ms)?;
+            }
+            MatrixInstallationMutation::Disable => {
+                self.activation = MatrixActivationState::Disabled;
+                self.policy_revision = self.policy_revision.next();
+                self.audit.record_update(actor.clone(), at_ms)?;
+            }
+            MatrixInstallationMutation::Delete => {
+                self.activation = MatrixActivationState::Deleting;
+                self.policy_revision = self.policy_revision.next();
+                self.audit.record_update(actor.clone(), at_ms)?;
+            }
+            MatrixInstallationMutation::UpdatePolicy { policy } => {
+                self.policy = policy;
+                self.policy_revision = self.policy_revision.next();
+                self.audit.record_update(actor.clone(), at_ms)?;
+            }
+            MatrixInstallationMutation::RebindArtifact {
+                component,
+                artifact_inspection,
+            } => {
+                validate_component_artifact(&component, &artifact_inspection)?;
+                self.component = component;
+                self.policy_revision = self.policy_revision.next();
+                self.audit.record_update(actor.clone(), at_ms)?;
+            }
+            MatrixInstallationMutation::RebindCredential { credential_handle } => {
+                self.policy.credential_handle = credential_handle;
+                self.policy_revision = self.policy_revision.next();
+                self.audit.record_update(actor.clone(), at_ms)?;
+            }
+        }
+
+        Ok(MatrixInstallationAuditEvent {
+            actor,
+            operation,
+            installation_id: self.installation_id.clone(),
+            previous_activation,
+            next_activation: self.activation,
+            previous_revision,
+            next_revision: self.policy_revision,
+            rejected_reason: None,
+            at_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixInstallationMutationAuthority {
+    pub can_manage_installations: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixInstallationMutation {
+    Enable {
+        artifact_inspection: ComponentArtifactInspection,
+    },
+    Disable,
+    Delete,
+    UpdatePolicy {
+        policy: MatrixInstallationPolicy,
+    },
+    RebindArtifact {
+        component: ComponentArtifactBinding,
+        artifact_inspection: ComponentArtifactInspection,
+    },
+    RebindCredential {
+        credential_handle: EgressCredentialHandle,
+    },
+}
+
+impl MatrixInstallationMutation {
+    fn operation(&self) -> MatrixInstallationMutationOperation {
+        match self {
+            Self::Enable { .. } => MatrixInstallationMutationOperation::Enable,
+            Self::Disable => MatrixInstallationMutationOperation::Disable,
+            Self::Delete => MatrixInstallationMutationOperation::Delete,
+            Self::UpdatePolicy { .. } => MatrixInstallationMutationOperation::UpdatePolicy,
+            Self::RebindArtifact { .. } => MatrixInstallationMutationOperation::RebindArtifact,
+            Self::RebindCredential { .. } => MatrixInstallationMutationOperation::RebindCredential,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixInstallationMutationOperation {
+    Enable,
+    Disable,
+    Delete,
+    UpdatePolicy,
+    RebindArtifact,
+    RebindCredential,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixInstallationAuditEvent {
+    pub actor: String,
+    pub operation: MatrixInstallationMutationOperation,
+    pub installation_id: AdapterInstallationId,
+    pub previous_activation: MatrixActivationState,
+    pub next_activation: MatrixActivationState,
+    pub previous_revision: PolicyRevision,
+    pub next_revision: PolicyRevision,
+    pub rejected_reason: Option<MatrixInstallationPolicyRejection>,
+    pub at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +881,35 @@ pub fn authorize_matrix_outbound(
     }
     validate_matrix_send_path(&check.path, &check.room_id)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixCredentialState {
+    Active,
+    Missing,
+    Stale,
+    Revoked,
+    Rotated,
+    WrongHomeserver,
+}
+
+pub fn validate_matrix_credential_state(
+    state: MatrixCredentialState,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    match state {
+        MatrixCredentialState::Active => Ok(()),
+        MatrixCredentialState::Missing => {
+            Err(MatrixInstallationPolicyRejection::CredentialHandleMissing)
+        }
+        MatrixCredentialState::Stale
+        | MatrixCredentialState::Revoked
+        | MatrixCredentialState::Rotated => {
+            Err(MatrixInstallationPolicyRejection::CredentialHandleRevoked)
+        }
+        MatrixCredentialState::WrongHomeserver => {
+            Err(MatrixInstallationPolicyRejection::HomeserverMismatch)
+        }
+    }
 }
 
 fn validate_matrix_send_path(

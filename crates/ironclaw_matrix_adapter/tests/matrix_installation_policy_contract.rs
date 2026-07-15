@@ -1,12 +1,15 @@
 use std::collections::BTreeSet;
 
 use ironclaw_matrix_adapter::installation_policy::{
-    ArtifactSha256, ComponentArtifactBinding, ComponentArtifactId, EgressTargetIndex,
-    InstallationAuditMetadata, MatrixActivationState, MatrixHomeserverOrigin,
-    MatrixInboundRoutingContext, MatrixInstallationPolicy, MatrixInstallationPolicyRejection,
-    MatrixOutboundPolicyCheck, MatrixProductAdapterInstallation, MatrixRoomId, MatrixUserId,
-    PolicyRevision, StaticManifestBinding, WitPackageName, WitWorldName, authorize_matrix_outbound,
-    resolve_matrix_inbound_installation,
+    ArtifactSha256, ComponentArtifactBinding, ComponentArtifactId, ComponentArtifactInspection,
+    EgressTargetIndex, InstallationAuditMetadata, MatrixActivationState, MatrixCredentialState,
+    MatrixHomeserverOrigin, MatrixInboundRoutingContext, MatrixInstallationMutation,
+    MatrixInstallationMutationAuthority, MatrixInstallationMutationOperation,
+    MatrixInstallationPolicy, MatrixInstallationPolicyRejection, MatrixOutboundPolicyCheck,
+    MatrixProductAdapterInstallation, MatrixRoomId, MatrixUserId, PolicyRevision,
+    StaticManifestBinding, WitPackageName, WitWorldName, authorize_matrix_outbound,
+    resolve_matrix_inbound_installation, validate_component_artifact,
+    validate_matrix_credential_state,
 };
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
@@ -79,6 +82,22 @@ fn artifact() -> ComponentArtifactBinding {
             DeclaredEgressHost::new("matrix.example.org").expect("declared host"),
             Some(credential("matrix-access-token")),
         )],
+    }
+}
+
+fn artifact_inspection() -> ComponentArtifactInspection {
+    ComponentArtifactInspection {
+        artifact_sha256: ArtifactSha256::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("sha"),
+        wit_package: WitPackageName::new("near:product-adapter@0.1.0").expect("wit package"),
+        wit_world: WitWorldName::new("product-adapter-component").expect("wit world"),
+        manifest: StaticManifestBinding::new("manifest-hash-alpha").expect("manifest hash"),
+        required_exports_present: true,
+        unexpected_imports: Vec::new(),
+        direct_http_egress_import: false,
+        signature_valid: Some(true),
     }
 }
 
@@ -249,6 +268,232 @@ fn matrix_policy_rejects_installation_when_manifest_egress_binding_mismatches_po
     assert_eq!(
         err,
         MatrixInstallationPolicyRejection::EgressTargetOutOfBounds
+    );
+}
+
+#[test]
+fn matrix_policy_lifecycle_mutations_require_authority_and_emit_audit() {
+    let mut install = MatrixProductAdapterInstallation::create_disabled(
+        adapter_id(),
+        installation_id("install-alpha"),
+        artifact(),
+        policy(),
+        audit(),
+    )
+    .expect("disabled install");
+    assert_eq!(install.activation, MatrixActivationState::Disabled);
+
+    let unauthorized = MatrixInstallationMutationAuthority {
+        can_manage_installations: false,
+    };
+    let err = install
+        .apply_mutation(
+            MatrixInstallationMutation::Enable {
+                artifact_inspection: artifact_inspection(),
+            },
+            &unauthorized,
+            "operator-beta",
+            2,
+        )
+        .expect_err("mutation requires authority");
+    assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
+    assert_eq!(install.activation, MatrixActivationState::Disabled);
+
+    let authorized = MatrixInstallationMutationAuthority {
+        can_manage_installations: true,
+    };
+    let event = install
+        .apply_mutation(
+            MatrixInstallationMutation::Enable {
+                artifact_inspection: artifact_inspection(),
+            },
+            &authorized,
+            "operator-beta",
+            2,
+        )
+        .expect("authorized enable");
+    assert_eq!(event.operation, MatrixInstallationMutationOperation::Enable);
+    assert_eq!(event.previous_activation, MatrixActivationState::Disabled);
+    assert_eq!(event.next_activation, MatrixActivationState::Enabled);
+    assert_eq!(
+        install.audit.last_enable_actor.as_deref(),
+        Some("operator-beta")
+    );
+
+    let previous_revision = install.policy_revision;
+    let event = install
+        .apply_mutation(
+            MatrixInstallationMutation::Disable,
+            &authorized,
+            "operator-gamma",
+            3,
+        )
+        .expect("authorized disable");
+    assert_eq!(
+        event.operation,
+        MatrixInstallationMutationOperation::Disable
+    );
+    assert_eq!(event.previous_revision, previous_revision);
+    assert_eq!(event.next_activation, MatrixActivationState::Disabled);
+    assert_eq!(install.audit.updated_by, "operator-gamma");
+
+    install
+        .apply_mutation(
+            MatrixInstallationMutation::Delete,
+            &authorized,
+            "operator-delta",
+            4,
+        )
+        .expect("authorized delete");
+    assert_eq!(install.activation, MatrixActivationState::Deleting);
+}
+
+#[test]
+fn matrix_policy_artifact_inspection_rejects_mismatch_and_direct_egress_imports() {
+    validate_component_artifact(&artifact(), &artifact_inspection()).expect("valid artifact");
+
+    let mut inspection = artifact_inspection();
+    inspection.artifact_sha256 =
+        ArtifactSha256::new("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+            .expect("sha");
+    let err = validate_component_artifact(&artifact(), &inspection).expect_err("hash mismatch");
+    assert_eq!(err, MatrixInstallationPolicyRejection::ArtifactHashMismatch);
+
+    let mut inspection = artifact_inspection();
+    inspection.direct_http_egress_import = true;
+    let err = validate_component_artifact(&artifact(), &inspection)
+        .expect_err("direct egress import must reject");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::UnexpectedGuestImport
+    );
+
+    let mut inspection = artifact_inspection();
+    inspection.signature_valid = Some(false);
+    let err = validate_component_artifact(&artifact(), &inspection)
+        .expect_err("invalid signature must reject");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::ArtifactSignatureInvalid
+    );
+
+    let mut inspection = artifact_inspection();
+    inspection.signature_valid = None;
+    let err = validate_component_artifact(&artifact(), &inspection)
+        .expect_err("missing signature verdict must reject");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::ArtifactSignatureInvalid
+    );
+}
+
+#[test]
+fn matrix_policy_snapshot_revision_fails_closed_after_policy_update() {
+    let mut install = installation("install-alpha", MatrixActivationState::Enabled);
+    let ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+    );
+    let snapshot = resolve_matrix_inbound_installation(&[install.clone()], &ctx).expect("snapshot");
+    let authorized = MatrixInstallationMutationAuthority {
+        can_manage_installations: true,
+    };
+    install
+        .apply_mutation(
+            MatrixInstallationMutation::RebindCredential {
+                credential_handle: credential("matrix-rotated-token"),
+            },
+            &authorized,
+            "operator-beta",
+            2,
+        )
+        .expect("credential rotation");
+
+    let err = authorize_matrix_outbound(
+        &snapshot,
+        &MatrixOutboundPolicyCheck {
+            adapter_id: adapter_id(),
+            installation_id: installation_id("install-alpha"),
+            homeserver: homeserver("https://matrix.example.org"),
+            room_id: room("!room:example.org"),
+            egress_target_index: EgressTargetIndex::new(0),
+            credential_handle: credential("matrix-access-token"),
+            path: "/_matrix/client/v3/rooms/!room:example.org/send/m.room.message/txn".to_string(),
+            guest_authorization_header_present: false,
+            policy_revision: install.policy_revision,
+        },
+    )
+    .expect_err("stale snapshot must fail closed on revision mismatch");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+    );
+}
+
+#[test]
+fn matrix_policy_credential_lifecycle_states_fail_closed() {
+    assert_eq!(
+        validate_matrix_credential_state(MatrixCredentialState::Active),
+        Ok(())
+    );
+    assert_eq!(
+        validate_matrix_credential_state(MatrixCredentialState::Missing),
+        Err(MatrixInstallationPolicyRejection::CredentialHandleMissing)
+    );
+    for state in [
+        MatrixCredentialState::Stale,
+        MatrixCredentialState::Revoked,
+        MatrixCredentialState::Rotated,
+    ] {
+        assert_eq!(
+            validate_matrix_credential_state(state),
+            Err(MatrixInstallationPolicyRejection::CredentialHandleRevoked)
+        );
+    }
+    assert_eq!(
+        validate_matrix_credential_state(MatrixCredentialState::WrongHomeserver),
+        Err(MatrixInstallationPolicyRejection::HomeserverMismatch)
+    );
+}
+
+#[test]
+fn matrix_policy_isolates_installations_and_rejection_diagnostics() {
+    let alpha = installation("install-alpha", MatrixActivationState::Enabled);
+    let mut beta = installation("install-beta", MatrixActivationState::Enabled);
+    beta.policy.allowed_rooms = set([room("!beta:example.org")]);
+    beta.policy.allowed_senders = set([user("@bob:example.org")]);
+    beta.policy.credential_handle = credential("matrix-beta-token");
+    beta.component.declared_egress_targets[0] = DeclaredEgressTarget::new(
+        DeclaredEgressHost::new("matrix.example.org").expect("declared host"),
+        Some(credential("matrix-beta-token")),
+    );
+
+    let alpha_ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+    );
+    let snapshot = resolve_matrix_inbound_installation(&[alpha, beta.clone()], &alpha_ctx)
+        .expect("alpha snapshot");
+    assert_eq!(snapshot.installation_id, installation_id("install-alpha"));
+    assert_eq!(
+        snapshot.credential_handle,
+        credential("matrix-access-token")
+    );
+
+    let beta_ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!beta:example.org"),
+        user("@bob:example.org"),
+    );
+    let snapshot = resolve_matrix_inbound_installation(&[beta], &beta_ctx).expect("beta snapshot");
+    assert_eq!(snapshot.installation_id, installation_id("install-beta"));
+    assert_eq!(snapshot.credential_handle, credential("matrix-beta-token"));
+
+    assert_eq!(
+        MatrixInstallationPolicyRejection::CredentialHandleMismatch.external_response_shape(),
+        MatrixInstallationPolicyRejection::RoomNotAllowed.external_response_shape()
     );
 }
 
