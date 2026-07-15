@@ -1,39 +1,55 @@
+use crate::config::{self, AuthConfig};
 use crate::exports::near::product_adapter::product_adapter::{
     AdapterManifest, AuthRequirement, AuthRequirementKind, DeclaredEgressTarget,
 };
 
-pub(crate) const ADAPTER_ID: &str = "matrix";
-pub(crate) const INSTALLATION_ID: &str = "inst_abc123";
-pub(crate) const MATRIX_EGRESS_HOST: &str = "matrix.example.org";
-pub(crate) const MATRIX_CREDENTIAL_HANDLE: &str = "matrix_access_token";
-
 pub(crate) fn manifest() -> AdapterManifest {
+    let config =
+        config::installation_config().expect("host must provide valid installation config");
     AdapterManifest {
-        adapter_id: ADAPTER_ID.to_string(),
-        installation_id: INSTALLATION_ID.to_string(),
-        capabilities_json: capabilities_json(),
-        declared_egress_targets: vec![DeclaredEgressTarget {
-            host: MATRIX_EGRESS_HOST.to_string(),
-            credential_handle: Some(MATRIX_CREDENTIAL_HANDLE.to_string()),
-        }],
-        declared_auth_requirements: vec![AuthRequirement {
-            kind: AuthRequirementKind::SharedSecretHeader,
-            header_name: Some("x-matrix-webhook-secret".to_string()),
-            timestamp_header_name: None,
-            cookie_name: None,
-        }],
+        adapter_id: config.adapter_id,
+        installation_id: config.installation_id,
+        capabilities_json: config.capabilities_json,
+        declared_egress_targets: config
+            .egress_targets
+            .into_iter()
+            .map(|target| DeclaredEgressTarget {
+                host: target.host,
+                credential_handle: target.credential_handle,
+            })
+            .collect(),
+        declared_auth_requirements: vec![auth_requirement(config.auth)],
     }
 }
 
-pub(crate) fn capabilities_json() -> String {
-    serde_json::json!({
-        "flags": [
-            "inbound_messages",
-            "inbound_commands",
-            "inbound_attachments",
-            "external_final_reply_push",
-            "delivery_status_reporting"
-        ]
-    })
-    .to_string()
+fn auth_requirement(auth: AuthConfig) -> AuthRequirement {
+    match auth {
+        AuthConfig::RequestSignature {
+            header_name,
+            timestamp_header_name,
+        } => AuthRequirement {
+            kind: AuthRequirementKind::RequestSignature,
+            header_name: Some(header_name),
+            timestamp_header_name,
+            cookie_name: None,
+        },
+        AuthConfig::SharedSecretHeader { header_name } => AuthRequirement {
+            kind: AuthRequirementKind::SharedSecretHeader,
+            header_name: Some(header_name),
+            timestamp_header_name: None,
+            cookie_name: None,
+        },
+        AuthConfig::SessionCookie { name } => AuthRequirement {
+            kind: AuthRequirementKind::SessionCookie,
+            header_name: None,
+            timestamp_header_name: None,
+            cookie_name: Some(name),
+        },
+        AuthConfig::BearerToken => AuthRequirement {
+            kind: AuthRequirementKind::BearerToken,
+            header_name: None,
+            timestamp_header_name: None,
+            cookie_name: None,
+        },
+    }
 }

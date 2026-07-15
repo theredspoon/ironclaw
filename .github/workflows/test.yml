@@ -177,6 +177,7 @@ jobs:
         run: |
           ./scripts/build-wasm-extensions.sh --channels
           ./scripts/build-wasm-extensions.sh --first-party
+          ./scripts/build-product-adapter-components.sh
       - name: Run Tests
         run: |
           timeout --signal=INT --kill-after=30s 40m \

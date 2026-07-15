@@ -294,7 +294,9 @@ jobs:
       - name: Install cargo-component
         uses: ./.github/actions/install-cargo-component
       - name: Build all WASM extensions against current WIT
-        run: ./scripts/build-wasm-extensions.sh
+        run: |
+          ./scripts/build-wasm-extensions.sh
+          ./scripts/build-product-adapter-components.sh
       - name: Instantiation test (host linker compatibility)
         run: |
           timeout --signal=INT --kill-after=30s 20m \

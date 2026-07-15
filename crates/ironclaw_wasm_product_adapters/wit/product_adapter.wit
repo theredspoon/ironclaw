@@ -72,6 +72,14 @@ interface product-adapter-host {
     /// idempotency comparisons.
     now-millis: func() -> u64;
 
+    /// Host-owned per-installation configuration for components that need
+    /// adapter/install ids, protocol allowlists, egress declarations, and
+    /// auth declaration metadata before parsing or rendering. JSON is used
+    /// here for the same temporary DTO-shim reason as the ProductAdapter
+    /// payload records: the host remains authoritative and validates the
+    /// component's manifest/egress outputs after every call.
+    installation-config-json: func() -> string;
+
     record egress-headers {
         entries: list<tuple<string, string>>,
     }

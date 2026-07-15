@@ -4,6 +4,7 @@ use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
     EgressCredentialHandle, EgressHeader, EgressMethod, EgressPath, EgressRequest,
     ParsedProductInbound, ProductAdapterCapabilities, ProductAdapterId, ProtocolAuthEvidence,
+    ProtocolAuthFailure,
 };
 
 /// Maximum size of a component-returned JSON document the host will
@@ -60,6 +61,8 @@ pub enum RuntimeError {
         field: &'static str,
         message: String,
     },
+    #[error("ProductAdapter component auth evidence rejected: {0}")]
+    AuthenticationFailed(String),
 }
 
 impl From<SandboxError> for RuntimeError {
@@ -189,6 +192,7 @@ impl ProductAdapterComponentRuntime {
         evidence: &ProtocolAuthEvidence,
     ) -> Result<ParsedInboundResult, RuntimeError> {
         let started = Instant::now();
+        ensure_evidence_matches_manifest(evidence, &prepared.manifest)?;
         let evidence_json =
             serde_json::to_string(evidence).map_err(|error| RuntimeError::InvalidJson {
                 field: "auth-evidence.evidence-json",
@@ -263,7 +267,11 @@ impl ProductAdapterComponentRuntime {
     ) -> Result<(Store<StoreData>, bindings::ProductAdapterComponent), RuntimeError> {
         let mut store = Store::new(
             &self.engine,
-            StoreData::new(limits.memory_bytes, limits.timeout),
+            StoreData::new(
+                limits.memory_bytes,
+                limits.timeout,
+                self.installation_config_json()?,
+            ),
         );
         configure_store(&mut store, limits)?;
         let linker = create_linker(&self.engine)?;
@@ -271,6 +279,15 @@ impl ProductAdapterComponentRuntime {
             bindings::ProductAdapterComponent::instantiate(&mut store, component, &linker)
                 .map_err(|error| classify_instantiation_error(error.to_string()))?;
         Ok((store, instance))
+    }
+
+    fn installation_config_json(&self) -> Result<String, RuntimeError> {
+        serde_json::to_string(&self.config.installation_config).map_err(|error| {
+            RuntimeError::InvalidJson {
+                field: "product-adapter-host.installation-config-json",
+                message: error.to_string(),
+            }
+        })
     }
 }
 
@@ -383,6 +400,69 @@ fn ensure_parsed_inbound_json(json: &str) -> Result<(), RuntimeError> {
             field,
             message: error.to_string(),
         })
+}
+
+fn ensure_evidence_matches_manifest(
+    evidence: &ProtocolAuthEvidence,
+    manifest: &ComponentManifest,
+) -> Result<(), RuntimeError> {
+    let Some(claim) = evidence.claim() else {
+        return Err(RuntimeError::AuthenticationFailed(
+            ProtocolAuthFailure::Missing.to_string(),
+        ));
+    };
+    if manifest
+        .declared_auth_requirements
+        .iter()
+        .any(|requirement| auth_requirements_equivalent(claim.requirement(), requirement))
+    {
+        return Ok(());
+    }
+    Err(RuntimeError::AuthenticationFailed(
+        "verified auth evidence does not match component manifest requirements".to_string(),
+    ))
+}
+
+fn header_name_matches(configured: &str, required: &str) -> bool {
+    configured.eq_ignore_ascii_case(required)
+}
+
+fn auth_requirements_equivalent(left: &AuthRequirement, right: &AuthRequirement) -> bool {
+    match (left, right) {
+        (
+            AuthRequirement::RequestSignature {
+                header_name: left_header,
+                timestamp_header_name: left_timestamp,
+            },
+            AuthRequirement::RequestSignature {
+                header_name: right_header,
+                timestamp_header_name: right_timestamp,
+            },
+        ) => {
+            header_name_matches(left_header, right_header)
+                && match (left_timestamp, right_timestamp) {
+                    (Some(left_timestamp), Some(right_timestamp)) => {
+                        header_name_matches(left_timestamp, right_timestamp)
+                    }
+                    (None, None) => true,
+                    (Some(_), None) | (None, Some(_)) => false,
+                }
+        }
+        (
+            AuthRequirement::SharedSecretHeader {
+                header_name: left_header,
+            },
+            AuthRequirement::SharedSecretHeader {
+                header_name: right_header,
+            },
+        ) => header_name_matches(left_header, right_header),
+        (
+            AuthRequirement::SessionCookie { name: left },
+            AuthRequirement::SessionCookie { name: right },
+        ) => left == right,
+        (AuthRequirement::BearerToken, AuthRequirement::BearerToken) => true,
+        _ => false,
+    }
 }
 
 /// Reject component-returned JSON above the host's own ceiling before letting

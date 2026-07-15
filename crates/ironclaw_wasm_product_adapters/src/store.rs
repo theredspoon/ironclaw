@@ -25,13 +25,19 @@ pub struct ComponentLogRecord {
 pub(crate) struct StoreData {
     sandbox: SandboxStoreCore,
     pub(crate) logs: Vec<ComponentLogRecord>,
+    installation_config_json: String,
 }
 
 impl StoreData {
-    pub(crate) fn new(memory_limit: u64, timeout: Duration) -> Self {
+    pub(crate) fn new(
+        memory_limit: u64,
+        timeout: Duration,
+        installation_config_json: String,
+    ) -> Self {
         Self {
             sandbox: SandboxStoreCore::new(memory_limit, timeout),
             logs: Vec::new(),
+            installation_config_json,
         }
     }
 
@@ -98,6 +104,10 @@ impl bindings::near::product_adapter::product_adapter_host::Host for StoreData {
         u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
     }
 
+    fn installation_config_json(&mut self) -> String {
+        self.installation_config_json.clone()
+    }
+
     fn http_egress(
         &mut self,
         _request: bindings::near::product_adapter::product_adapter_host::EgressRequest,
@@ -144,7 +154,7 @@ mod tests {
 
     #[test]
     fn host_log_import_caps_records_at_runtime_boundary() {
-        let mut data = StoreData::new(1024 * 1024, Duration::from_secs(1));
+        let mut data = StoreData::new(1024 * 1024, Duration::from_secs(1), "{}".to_string());
 
         for index in 0..=MAX_LOGS_PER_EXECUTION {
             Host::log(&mut data, LogLevel::Info, format!("log-{index}"));
@@ -159,7 +169,7 @@ mod tests {
 
     #[test]
     fn host_log_import_truncates_messages_at_runtime_boundary() {
-        let mut data = StoreData::new(1024 * 1024, Duration::from_secs(1));
+        let mut data = StoreData::new(1024 * 1024, Duration::from_secs(1), "{}".to_string());
 
         Host::log(&mut data, LogLevel::Warn, "é".repeat(MAX_LOG_MESSAGE_BYTES));
 
