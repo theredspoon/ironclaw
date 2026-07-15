@@ -18,8 +18,9 @@ use ironclaw_matrix_adapter::installation_policy::{
     MatrixInstallationPolicyRejection, MatrixInstallationProjectionCache,
     MatrixOutboundPolicyCheck, MatrixProductAdapterInstallation, MatrixRoomId,
     MatrixRuntimeArtifactEvidence, MatrixUserId, PolicyRevision, StaticManifestBinding,
-    WitPackageName, WitWorldName, apply_matrix_extension_lifecycle_mutation,
-    authorize_matrix_outbound, authorize_matrix_outbound_with_extension_lifecycle,
+    VerifiedMatrixAuthContext, WitPackageName, WitWorldName,
+    apply_matrix_extension_lifecycle_mutation, authorize_matrix_outbound,
+    authorize_matrix_outbound_with_extension_lifecycle,
     project_matrix_installation_from_runtime_entry, resolve_matrix_inbound_installation,
     validate_component_artifact, validate_matrix_credential_state,
 };
@@ -218,6 +219,17 @@ fn policy() -> MatrixInstallationPolicy {
         credential("matrix-access-token"),
     )
     .expect("policy")
+}
+
+fn incomplete_policy() -> MatrixInstallationPolicy {
+    MatrixInstallationPolicy::new(
+        homeserver("https://matrix.example.org"),
+        BTreeSet::new(),
+        BTreeSet::new(),
+        EgressTargetIndex::new(0),
+        credential("matrix-access-token"),
+    )
+    .expect("draft policy")
 }
 
 fn installation(id: &str, activation: MatrixActivationState) -> MatrixProductAdapterInstallation {
@@ -516,6 +528,148 @@ fn matrix_policy_lifecycle_mutations_require_authority_and_emit_audit() {
         )
         .expect("authorized delete");
     assert_eq!(install.activation, MatrixActivationState::Deleting);
+}
+
+#[test]
+fn matrix_policy_revision_overflow_fails_closed_without_mutation() {
+    let mut install = MatrixProductAdapterInstallation::new(
+        adapter_id(),
+        installation_id("install-alpha"),
+        artifact(),
+        policy(),
+        MatrixActivationState::Disabled,
+        PolicyRevision::new(u64::MAX).expect("max revision"),
+        audit(),
+    )
+    .expect("installation");
+    let original_revision = install.policy_revision;
+    let original_policy = install.policy.clone();
+
+    let err = install
+        .apply_mutation(
+            MatrixInstallationMutation::UpdatePolicy { policy: policy() },
+            &MatrixInstallationMutationAuthority::tenant_operator(),
+            "operator-alpha",
+            2,
+        )
+        .expect_err("revision overflow must fail closed");
+
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::PolicyRevisionOverflow
+    );
+    assert_eq!(install.policy_revision, original_revision);
+    assert_eq!(install.policy, original_policy);
+}
+
+#[test]
+fn matrix_policy_allows_disabled_incomplete_records_but_rejects_enablement() {
+    let mut install = MatrixProductAdapterInstallation::create_disabled(
+        adapter_id(),
+        installation_id("install-draft"),
+        artifact(),
+        incomplete_policy(),
+        audit(),
+    )
+    .expect("disabled draft installation");
+    assert!(install.policy.allowed_rooms.is_empty());
+    assert!(install.policy.allowed_senders.is_empty());
+
+    let mut registry = MatrixInstallationProjectionCache::new();
+    registry
+        .insert_projection(install.clone(), "operator-alpha", 1)
+        .expect("disabled draft can be persisted");
+    let encoded = registry.to_json_string().expect("snapshot json");
+    MatrixInstallationProjectionCache::from_json_str(&encoded)
+        .expect("disabled draft can be reloaded");
+
+    let err = MatrixProductAdapterInstallation::new(
+        adapter_id(),
+        installation_id("install-enabled-empty"),
+        artifact(),
+        incomplete_policy(),
+        MatrixActivationState::Enabled,
+        PolicyRevision::new(1).expect("revision"),
+        audit(),
+    )
+    .expect_err("enabled installation requires explicit allowlists");
+    assert_eq!(err, MatrixInstallationPolicyRejection::InvalidPolicyValue);
+
+    let err = install
+        .apply_mutation(
+            MatrixInstallationMutation::Enable {
+                artifact_inspection: artifact_inspection(),
+            },
+            &MatrixInstallationMutationAuthority::tenant_operator(),
+            "operator-alpha",
+            2,
+        )
+        .expect_err("enablement requires explicit allowlists");
+    assert_eq!(err, MatrixInstallationPolicyRejection::InvalidPolicyValue);
+    assert_eq!(install.activation, MatrixActivationState::Disabled);
+}
+
+#[test]
+fn matrix_policy_projection_cache_rejects_overlapping_enabled_scopes() {
+    let mut registry = MatrixInstallationProjectionCache::new();
+    let alpha = installation("install-alpha", MatrixActivationState::Enabled);
+    registry
+        .insert_projection(alpha, "operator-alpha", 1)
+        .expect("insert alpha");
+
+    let overlapping = installation("install-overlap", MatrixActivationState::Enabled);
+    let err = registry
+        .insert_projection(overlapping, "operator-alpha", 2)
+        .expect_err("overlapping enabled scope is ambiguous");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::AmbiguousInstallation
+    );
+
+    let mut disjoint_room = installation("install-disjoint-room", MatrixActivationState::Enabled);
+    disjoint_room.policy.allowed_rooms = set([room("!other:example.org")]);
+    registry
+        .insert_projection(disjoint_room, "operator-alpha", 3)
+        .expect("same homeserver with disjoint room is allowed");
+
+    let mut disjoint_sender =
+        installation("install-disjoint-sender", MatrixActivationState::Enabled);
+    disjoint_sender.policy.allowed_senders = set([user("@bob:example.org")]);
+    registry
+        .insert_projection(disjoint_sender, "operator-alpha", 4)
+        .expect("same homeserver and room with disjoint sender is allowed");
+
+    let err = registry
+        .apply_policy_mutation(
+            &installation_id("install-disjoint-room"),
+            MatrixInstallationMutation::UpdatePolicy { policy: policy() },
+            &MatrixInstallationMutationAuthority::tenant_operator(),
+            "operator-alpha",
+            5,
+        )
+        .expect_err("policy update cannot create overlapping enabled scope");
+    assert_eq!(
+        err,
+        MatrixInstallationPolicyRejection::AmbiguousInstallation
+    );
+
+    let ctx = routing_context(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+    );
+    let ambiguous = resolve_matrix_inbound_installation(
+        &[
+            installation("install-ambiguous-a", MatrixActivationState::Enabled),
+            installation("install-ambiguous-b", MatrixActivationState::Enabled),
+        ],
+        &ctx,
+    )
+    .expect_err("inbound still fails closed if ambiguous state is encountered");
+    assert_eq!(
+        ambiguous,
+        MatrixInstallationPolicyRejection::AmbiguousInstallation
+    );
 }
 
 #[test]
@@ -1437,6 +1591,26 @@ fn matrix_policy_rejects_unverified_routing_context() {
     .expect_err("failed auth evidence must not create a routing context");
 
     assert_eq!(err, MatrixInstallationPolicyRejection::AuthInvalid);
+}
+
+#[test]
+fn matrix_policy_auth_context_is_host_minted_from_protocol_evidence() {
+    let ctx = MatrixInboundRoutingContext::from_verified_auth(
+        homeserver("https://matrix.example.org"),
+        room("!room:example.org"),
+        user("@alice:example.org"),
+        &auth_evidence(),
+        1_710_000_000_001,
+    )
+    .expect("host-minted auth context");
+    assert_eq!(ctx.auth.subject(), "matrix-webhook");
+
+    let err = serde_json::from_str::<VerifiedMatrixAuthContext>(r#"{"subject":"guest-supplied"}"#)
+        .expect_err("guest-visible JSON cannot mint verified auth context");
+    assert!(
+        err.to_string()
+            .contains("host-minted from protocol auth evidence")
+    );
 }
 
 #[test]

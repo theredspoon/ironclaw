@@ -43,6 +43,7 @@ pub enum MatrixInstallationPolicyRejection {
     AuthMissing,
     AuthInvalid,
     AuthReplay,
+    PolicyRevisionOverflow,
     RoomNotAllowed,
     SenderNotAllowed,
     HomeserverMismatch,
@@ -63,7 +64,7 @@ pub enum MatrixInstallationPolicyRejection {
 }
 
 impl MatrixInstallationPolicyRejection {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::InstallationNotFound,
         Self::AmbiguousInstallation,
         Self::InstallationDisabled,
@@ -79,6 +80,7 @@ impl MatrixInstallationPolicyRejection {
         Self::AuthMissing,
         Self::AuthInvalid,
         Self::AuthReplay,
+        Self::PolicyRevisionOverflow,
         Self::RoomNotAllowed,
         Self::SenderNotAllowed,
         Self::HomeserverMismatch,
@@ -388,8 +390,11 @@ impl PolicyRevision {
         }
     }
 
-    pub fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+    pub fn next(self) -> Result<Self, MatrixInstallationPolicyRejection> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(MatrixInstallationPolicyRejection::PolicyRevisionOverflow)
     }
 }
 
@@ -488,6 +493,8 @@ impl<'de> Deserialize<'de> for WitWorldName {
     }
 }
 
+/// Typed binding to the source-verified ProductAdapter manifest/runtime identity.
+/// The Matrix policy layer stores the manifest identity, not a duplicate manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct StaticManifestBinding(String);
@@ -739,9 +746,6 @@ impl MatrixInstallationPolicy {
         egress_target_index: EgressTargetIndex,
         credential_handle: EgressCredentialHandle,
     ) -> Result<Self, MatrixInstallationPolicyRejection> {
-        if allowed_rooms.is_empty() || allowed_senders.is_empty() {
-            return Err(MatrixInstallationPolicyRejection::InvalidPolicyValue);
-        }
         Ok(Self {
             homeserver,
             allowed_rooms,
@@ -805,6 +809,9 @@ impl MatrixProductAdapterInstallation {
         audit: InstallationAuditMetadata,
     ) -> Result<Self, MatrixInstallationPolicyRejection> {
         validate_component_policy_binding(&component, &policy)?;
+        if activation == MatrixActivationState::Enabled {
+            validate_enabled_policy_allowlists(&policy)?;
+        }
         Ok(Self {
             adapter_id,
             installation_id,
@@ -848,6 +855,7 @@ impl MatrixProductAdapterInstallation {
         let previous_activation = self.activation;
         let previous_revision = self.policy_revision;
         let operation = mutation.operation();
+        let next_revision = self.policy_revision.next()?;
 
         match mutation {
             MatrixInstallationMutation::Enable {
@@ -855,24 +863,28 @@ impl MatrixProductAdapterInstallation {
             } => {
                 validate_component_artifact(&self.component, &artifact_inspection)?;
                 validate_component_policy_binding(&self.component, &self.policy)?;
+                validate_enabled_policy_allowlists(&self.policy)?;
                 self.activation = MatrixActivationState::Enabled;
-                self.policy_revision = self.policy_revision.next();
+                self.policy_revision = next_revision;
                 self.audit.record_enable(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::Disable => {
                 self.activation = MatrixActivationState::Disabled;
-                self.policy_revision = self.policy_revision.next();
+                self.policy_revision = next_revision;
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::Delete => {
                 self.activation = MatrixActivationState::Deleting;
-                self.policy_revision = self.policy_revision.next();
+                self.policy_revision = next_revision;
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::UpdatePolicy { policy } => {
                 validate_component_policy_binding(&self.component, &policy)?;
+                if self.activation == MatrixActivationState::Enabled {
+                    validate_enabled_policy_allowlists(&policy)?;
+                }
                 self.policy = policy;
-                self.policy_revision = self.policy_revision.next();
+                self.policy_revision = next_revision;
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::RebindArtifact {
@@ -882,7 +894,7 @@ impl MatrixProductAdapterInstallation {
                 validate_component_artifact(&component, &artifact_inspection)?;
                 validate_component_policy_binding(&component, &self.policy)?;
                 self.component = component;
-                self.policy_revision = self.policy_revision.next();
+                self.policy_revision = next_revision;
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
             MatrixInstallationMutation::RebindCredential { credential_handle } => {
@@ -890,7 +902,7 @@ impl MatrixProductAdapterInstallation {
                 policy.credential_handle = credential_handle;
                 validate_component_policy_binding(&self.component, &policy)?;
                 self.policy = policy;
-                self.policy_revision = self.policy_revision.next();
+                self.policy_revision = next_revision;
                 self.audit.record_update(actor.clone(), at_ms)?;
             }
         }
@@ -1309,6 +1321,17 @@ impl MatrixInstallationProjectionCache {
                 )?);
             return Err(MatrixInstallationPolicyRejection::MutationRejected);
         }
+        if let Err(reason) = self.validate_no_enabled_scope_overlap(&installation, None) {
+            self.audit_events
+                .push(MatrixInstallationAuditEvent::rejected(
+                    &installation,
+                    MatrixInstallationMutationOperation::Create,
+                    actor,
+                    reason,
+                    at_ms,
+                )?);
+            return Err(reason);
+        }
         self.audit_events
             .push(MatrixInstallationAuditEvent::accepted(
                 &installation,
@@ -1331,9 +1354,9 @@ impl MatrixInstallationProjectionCache {
     ) -> Result<(), MatrixInstallationPolicyRejection> {
         let actor = non_empty(actor.into())?;
         let operation = mutation.operation();
-        let installation = self
+        let installation_for_precheck = self
             .installations
-            .get_mut(installation_id)
+            .get(installation_id)
             .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
         if matches!(
             mutation,
@@ -1343,7 +1366,7 @@ impl MatrixInstallationProjectionCache {
         ) {
             self.audit_events
                 .push(MatrixInstallationAuditEvent::rejected(
-                    installation,
+                    installation_for_precheck,
                     operation,
                     actor,
                     MatrixInstallationPolicyRejection::MutationRejected,
@@ -1351,6 +1374,40 @@ impl MatrixInstallationProjectionCache {
                 )?);
             return Err(MatrixInstallationPolicyRejection::MutationRejected);
         }
+        if !authority.can_manage_installations {
+            self.audit_events
+                .push(MatrixInstallationAuditEvent::rejected(
+                    installation_for_precheck,
+                    operation,
+                    actor,
+                    MatrixInstallationPolicyRejection::MutationUnauthorized,
+                    at_ms,
+                )?);
+            return Err(MatrixInstallationPolicyRejection::MutationUnauthorized);
+        }
+        if let MatrixInstallationMutation::UpdatePolicy { policy } = &mutation {
+            if installation_for_precheck.activation == MatrixActivationState::Enabled {
+                let mut candidate = installation_for_precheck.clone();
+                candidate.policy = policy.clone();
+                if let Err(reason) =
+                    self.validate_no_enabled_scope_overlap(&candidate, Some(installation_id))
+                {
+                    self.audit_events
+                        .push(MatrixInstallationAuditEvent::rejected(
+                            installation_for_precheck,
+                            operation,
+                            actor,
+                            reason,
+                            at_ms,
+                        )?);
+                    return Err(reason);
+                }
+            }
+        }
+        let installation = self
+            .installations
+            .get_mut(installation_id)
+            .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
         match installation.apply_mutation(mutation, authority, actor.clone(), at_ms) {
             Ok(event) => {
                 self.audit_events.push(event);
@@ -1397,18 +1454,65 @@ impl MatrixInstallationProjectionCache {
         }
         Ok(())
     }
+
+    fn validate_no_enabled_scope_overlap(
+        &self,
+        candidate: &MatrixProductAdapterInstallation,
+        replacing: Option<&AdapterInstallationId>,
+    ) -> Result<(), MatrixInstallationPolicyRejection> {
+        if candidate.activation != MatrixActivationState::Enabled {
+            return Ok(());
+        }
+        validate_enabled_policy_allowlists(&candidate.policy)?;
+        for existing in self.installations.values() {
+            if Some(&existing.installation_id) == replacing {
+                continue;
+            }
+            if enabled_matrix_scopes_overlap(candidate, existing) {
+                return Err(MatrixInstallationPolicyRejection::AmbiguousInstallation);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_persisted_installation(
     installation: &MatrixProductAdapterInstallation,
 ) -> Result<(), MatrixInstallationPolicyRejection> {
     validate_persisted_audit_metadata(&installation.audit)?;
-    if installation.policy.allowed_rooms.is_empty()
-        || installation.policy.allowed_senders.is_empty()
-    {
-        return Err(MatrixInstallationPolicyRejection::InvalidPolicyValue);
+    if installation.activation == MatrixActivationState::Enabled {
+        validate_enabled_policy_allowlists(&installation.policy)?;
     }
     validate_component_policy_binding(&installation.component, &installation.policy)
+}
+
+fn validate_enabled_policy_allowlists(
+    policy: &MatrixInstallationPolicy,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    if policy.allowed_rooms.is_empty() || policy.allowed_senders.is_empty() {
+        Err(MatrixInstallationPolicyRejection::InvalidPolicyValue)
+    } else {
+        Ok(())
+    }
+}
+
+fn enabled_matrix_scopes_overlap(
+    left: &MatrixProductAdapterInstallation,
+    right: &MatrixProductAdapterInstallation,
+) -> bool {
+    left.activation == MatrixActivationState::Enabled
+        && right.activation == MatrixActivationState::Enabled
+        && left.policy.homeserver == right.policy.homeserver
+        && left
+            .policy
+            .allowed_rooms
+            .iter()
+            .any(|room| right.policy.allowed_rooms.contains(room))
+        && left
+            .policy
+            .allowed_senders
+            .iter()
+            .any(|sender| right.policy.allowed_senders.contains(sender))
 }
 
 fn validate_persisted_audit_metadata(
@@ -1459,16 +1563,10 @@ impl<'de> Deserialize<'de> for VerifiedMatrixAuthContext {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            subject: String,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            subject: non_empty(wire.subject).map_err(serde::de::Error::custom)?,
-        })
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(
+            "VerifiedMatrixAuthContext is host-minted from protocol auth evidence",
+        ))
     }
 }
 
