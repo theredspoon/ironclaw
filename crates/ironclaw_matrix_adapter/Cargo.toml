@@ -21,11 +21,16 @@ serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-trait = "0.1"
+ironclaw_extensions = { path = "../ironclaw_extensions", version = "0.1.0" }
+ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
+ironclaw_product_adapter_registry = { path = "../ironclaw_product_adapter_registry", version = "0.1.0" }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0" }
+ironclaw_wasm_product_adapters = { path = "../ironclaw_wasm_product_adapters", version = "0.1.0" }
 
 [dev-dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0", features = ["test-support"] }
 ironclaw_turns = { path = "../ironclaw_turns", version = "0.1.0" }
 proptest = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
