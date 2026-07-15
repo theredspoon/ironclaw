@@ -673,6 +673,41 @@ fn matrix_policy_projection_cache_rejects_overlapping_enabled_scopes() {
 }
 
 #[test]
+fn matrix_policy_projection_cache_rejects_overlapping_enabled_scopes_on_reload() {
+    let mut first = installation("install-alpha", MatrixActivationState::Enabled);
+    let second = installation("install-beta", MatrixActivationState::Enabled);
+    first.policy.allowed_rooms = set([room("!room:example.org"), room("!other:example.org")]);
+
+    let raw = serde_json::json!({
+        "installations": {
+            first.installation_id.as_str(): first,
+            second.installation_id.as_str(): second,
+        },
+        "audit_events": []
+    })
+    .to_string();
+
+    let err = MatrixInstallationProjectionCache::from_json_str(&raw)
+        .expect_err("persisted overlapping enabled scopes must fail closed");
+    assert!(
+        err.to_string().contains("AmbiguousInstallation"),
+        "unexpected reload error: {err}"
+    );
+}
+
+#[test]
+fn matrix_policy_projection_cache_reloads_public_ipv6_homeserver_origins() {
+    let origin = homeserver("https://[2606:4700:4700::1111]:8448");
+    let encoded = serde_json::to_value(&origin).expect("serialize ipv6 homeserver");
+    assert_eq!(encoded["host"], "2606:4700:4700::1111");
+
+    let restored: MatrixHomeserverOrigin =
+        serde_json::from_value(encoded).expect("reload ipv6 homeserver");
+    assert_eq!(restored.host(), "2606:4700:4700::1111");
+    assert_eq!(restored.port(), Some(8448));
+}
+
+#[test]
 fn matrix_policy_projection_cache_records_policy_mutation_audits() {
     let installation = MatrixProductAdapterInstallation::create_disabled(
         ProductAdapterId::new("matrix").expect("adapter id"),
@@ -959,20 +994,38 @@ fn matrix_policy_mutations_reject_invalid_component_policy_bindings_before_stori
 fn matrix_policy_mutation_authority_uses_extension_installation_owner() {
     let alice = UserId::new("alice").expect("alice");
     let bob = UserId::new("bob").expect("bob");
+    let tenant_operator = UserId::new("operator-alpha").expect("operator");
     let owner = InstallationOwner::users(BTreeSet::from([alice.clone()])).expect("owner");
 
     assert!(
-        MatrixInstallationMutationAuthority::from_installation_owner(&owner, &alice)
-            .can_manage_installations
+        MatrixInstallationMutationAuthority::from_installation_owner(
+            &owner,
+            &alice,
+            &tenant_operator
+        )
+        .can_manage_installations
     );
     assert!(
-        !MatrixInstallationMutationAuthority::from_installation_owner(&owner, &bob)
-            .can_manage_installations
+        !MatrixInstallationMutationAuthority::from_installation_owner(
+            &owner,
+            &bob,
+            &tenant_operator
+        )
+        .can_manage_installations
     );
     assert!(
         MatrixInstallationMutationAuthority::from_installation_owner(
             &InstallationOwner::Tenant,
-            &bob
+            &tenant_operator,
+            &tenant_operator,
+        )
+        .can_manage_installations
+    );
+    assert!(
+        !MatrixInstallationMutationAuthority::from_installation_owner(
+            &InstallationOwner::Tenant,
+            &bob,
+            &tenant_operator,
         )
         .can_manage_installations
     );
@@ -999,10 +1052,23 @@ async fn matrix_extension_store_owns_rollout_rollback_and_lifecycle_authorizatio
     );
 
     let operator = UserId::new("operator-alpha").expect("operator");
+    let non_operator = UserId::new("alice").expect("alice");
+    let err = apply_matrix_extension_lifecycle_mutation(
+        &store,
+        &installation_id,
+        MatrixExtensionLifecycleMutation::Enable,
+        &non_operator,
+        &operator,
+    )
+    .await
+    .expect_err("non-operator cannot mutate tenant-wide installation");
+    assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
+
     apply_matrix_extension_lifecycle_mutation(
         &store,
         &installation_id,
         MatrixExtensionLifecycleMutation::Enable,
+        &operator,
         &operator,
     )
     .await
@@ -1024,6 +1090,7 @@ async fn matrix_extension_store_owns_rollout_rollback_and_lifecycle_authorizatio
         &store,
         &installation_id,
         MatrixExtensionLifecycleMutation::Disable,
+        &operator,
         &operator,
     )
     .await
@@ -1052,6 +1119,7 @@ async fn matrix_extension_store_owns_rollout_rollback_and_lifecycle_authorizatio
         &installation_id,
         MatrixExtensionLifecycleMutation::Delete,
         &operator,
+        &operator,
     )
     .await
     .expect("delete through extension store");
@@ -1076,9 +1144,10 @@ async fn matrix_extension_store_owns_rollout_rollback_and_lifecycle_authorizatio
 
     let alice = UserId::new("alice").expect("alice");
     let bob = UserId::new("bob").expect("bob");
+    let tenant_operator = UserId::new("operator-alpha").expect("operator");
     let (private_store, private_installation_id) = matrix_extension_store_with_installation(
         ExtensionActivationState::Disabled,
-        InstallationOwner::users(BTreeSet::from([alice])).expect("owner"),
+        InstallationOwner::users(BTreeSet::from([alice.clone()])).expect("owner"),
     )
     .await;
     let err = apply_matrix_extension_lifecycle_mutation(
@@ -1086,10 +1155,20 @@ async fn matrix_extension_store_owns_rollout_rollback_and_lifecycle_authorizatio
         &private_installation_id,
         MatrixExtensionLifecycleMutation::Enable,
         &bob,
+        &tenant_operator,
     )
     .await
     .expect_err("non-owner cannot enable installation");
     assert_eq!(err, MatrixInstallationPolicyRejection::MutationUnauthorized);
+    apply_matrix_extension_lifecycle_mutation(
+        &private_store,
+        &private_installation_id,
+        MatrixExtensionLifecycleMutation::Enable,
+        &alice,
+        &tenant_operator,
+    )
+    .await
+    .expect("member owner can enable private installation");
 }
 
 #[test]

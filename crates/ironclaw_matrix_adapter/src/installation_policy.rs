@@ -172,7 +172,12 @@ impl<'de> Deserialize<'de> for MatrixHomeserverOrigin {
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        let mut origin = format!("{}://{}", wire.scheme, wire.host);
+        let host = if wire.host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{}]", wire.host)
+        } else {
+            wire.host
+        };
+        let mut origin = format!("{}://{}", wire.scheme, host);
         if let Some(port) = wire.port {
             origin.push(':');
             origin.push_str(&port.to_string());
@@ -939,12 +944,19 @@ impl MatrixInstallationMutationAuthority {
         }
     }
 
-    pub fn from_installation_owner(owner: &InstallationOwner, actor: &UserId) -> Self {
+    pub fn from_installation_owner(
+        owner: &InstallationOwner,
+        actor: &UserId,
+        tenant_operator: &UserId,
+    ) -> Self {
         Self {
-            can_manage_installations: owner.is_tenant()
-                || owner
+            can_manage_installations: if owner.is_tenant() {
+                actor == tenant_operator
+            } else {
+                owner
                     .members()
-                    .is_some_and(|members| members.contains(actor)),
+                    .is_some_and(|members| members.contains(actor))
+            },
         }
     }
 }
@@ -1017,6 +1029,7 @@ pub async fn apply_matrix_extension_lifecycle_mutation(
     installation_id: &AdapterInstallationId,
     mutation: MatrixExtensionLifecycleMutation,
     actor: &UserId,
+    tenant_operator: &UserId,
 ) -> Result<(), MatrixInstallationPolicyRejection> {
     let extension_installation_id = extension_installation_id(installation_id)?;
     let installation = store
@@ -1024,8 +1037,11 @@ pub async fn apply_matrix_extension_lifecycle_mutation(
         .await
         .map_err(matrix_rejection_from_extension_error)?
         .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
-    let authority =
-        MatrixInstallationMutationAuthority::from_installation_owner(installation.owner(), actor);
+    let authority = MatrixInstallationMutationAuthority::from_installation_owner(
+        installation.owner(),
+        actor,
+        tenant_operator,
+    );
     if !authority.can_manage_installations {
         return Err(MatrixInstallationPolicyRejection::MutationUnauthorized);
     }
@@ -1448,6 +1464,7 @@ impl MatrixInstallationProjectionCache {
                 return Err(MatrixInstallationPolicyRejection::InstallationMismatch);
             }
             validate_persisted_installation(installation)?;
+            self.validate_no_enabled_scope_overlap(installation, Some(key))?;
         }
         for event in &self.audit_events {
             non_empty(event.actor.clone())?;
