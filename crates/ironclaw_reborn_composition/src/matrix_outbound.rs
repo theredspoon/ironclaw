@@ -1840,7 +1840,7 @@ mod tests {
         validator.allow(workflow_reply_target());
         let preferences = RecordingPreferenceRepository::default();
         preferences.seed(workflow_preference_record(&workflow_scope));
-        let resolver = RecordingProductOutboundTargetResolver::default();
+        let resolver = RecordingProductOutboundTargetResolver;
         let access_policy = AllowAllProjectionAccessPolicy;
         let outbound_policy =
             OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
