@@ -3,6 +3,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_arch = "wasm32"))]
 use async_trait::async_trait;
@@ -10,12 +12,13 @@ use async_trait::async_trait;
 use ironclaw_product_adapters::redaction::RedactedString;
 #[cfg(not(target_arch = "wasm32"))]
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, ExternalActorRef, ExternalConversationRef,
-    ExternalEventId, OutboundDeliverySink, ParsedProductInbound, ProductAdapter,
-    ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId, ProductAttachmentDescriptor,
-    ProductAttachmentKind, ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload,
-    ProductRenderOutcome, ProductSurfaceKind, ProductTriggerReason, ProductWorkflowRejectionKind,
-    ProtocolAuthEvidence, ProtocolAuthFailure, ProtocolHttpEgress, UserMessagePayload,
+    AdapterInstallationId, AuthRequirement, DeliveryAttemptId, ExternalActorRef,
+    ExternalConversationRef, ExternalEventId, OutboundDeliverySink, ParsedProductInbound,
+    ProductAdapter, ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId,
+    ProductAttachmentDescriptor, ProductAttachmentKind, ProductInboundPayload,
+    ProductOutboundEnvelope, ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind,
+    ProductTriggerReason, ProductWorkflowRejectionKind, ProtocolAuthEvidence, ProtocolAuthFailure,
+    ProtocolHttpEgress, UserMessagePayload,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use pulldown_cmark::{Options, Parser, html};
@@ -97,6 +100,31 @@ pub struct MatrixProductAdapterConfig {
 pub struct MatrixProductAdapter {
     config: MatrixProductAdapterConfig,
     capabilities: ProductAdapterCapabilities,
+    pending_intents: MatrixPendingIntentStore,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Default)]
+pub struct MatrixPendingIntentStore {
+    intents: Arc<Mutex<HashMap<DeliveryAttemptId, MatrixOutboundCommand>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl MatrixPendingIntentStore {
+    pub fn insert(&self, attempt_id: DeliveryAttemptId, command: MatrixOutboundCommand) {
+        self.intents
+            .lock()
+            .expect("matrix pending intent store lock")
+            .insert(attempt_id, command);
+    }
+
+    pub fn get(&self, attempt_id: DeliveryAttemptId) -> Option<MatrixOutboundCommand> {
+        self.intents
+            .lock()
+            .expect("matrix pending intent store lock")
+            .get(&attempt_id)
+            .cloned()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -112,11 +140,19 @@ impl MatrixProductAdapter {
         Ok(Self {
             config,
             capabilities: ProductAdapterCapabilities::external_channel_default(),
+            pending_intents: MatrixPendingIntentStore::default(),
         })
     }
 
     pub fn config(&self) -> &MatrixProductAdapterConfig {
         &self.config
+    }
+
+    pub fn pending_matrix_intent(
+        &self,
+        attempt_id: DeliveryAttemptId,
+    ) -> Option<MatrixOutboundCommand> {
+        self.pending_intents.get(attempt_id)
     }
 }
 
@@ -634,8 +670,10 @@ impl ProductAdapter for MatrixProductAdapter {
             route_metadata,
             allowed_target_rooms: self.config.parse_policy.allowed_rooms.clone(),
         };
-        render_matrix_outbound(MatrixRenderInput { envelope, context })
+        let attempt_id = envelope.delivery_attempt_id;
+        let command = render_matrix_outbound(MatrixRenderInput { envelope, context })
             .map_err(map_matrix_diagnostic_to_adapter_error)?;
+        self.pending_intents.insert(attempt_id, command);
 
         Ok(ProductRenderOutcome::Deferred)
     }

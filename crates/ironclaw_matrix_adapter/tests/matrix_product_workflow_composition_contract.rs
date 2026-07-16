@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_matrix_adapter::{
-    MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
+    MatrixOutboundCommand, MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
 };
 use ironclaw_outbound::{
     CommunicationDeliveryIntent, CommunicationDeliveryResolutionRequest, CommunicationModality,
@@ -239,6 +239,32 @@ async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_
         matches!(render_outcome, ProductRenderOutcome::Deferred),
         "Matrix command JSON or SynchronousResponse is not delivery evidence"
     );
+    let Some(MatrixOutboundCommand::SendMessage {
+        room_id,
+        txn_id,
+        body,
+    }) = adapter.pending_matrix_intent(attempt.delivery_id.as_uuid())
+    else {
+        panic!("R002D must preserve exact Matrix send intent for the R003A bridge");
+    };
+    assert_eq!(room_id, "!room:example.org");
+    assert_eq!(
+        txn_id,
+        format!("ironclaw-{}", attempt.delivery_id.as_uuid())
+    );
+    assert_eq!(body["msgtype"], "m.text");
+    assert_eq!(body["body"], "hello Matrix through ProductWorkflow");
+    assert_eq!(body["m.relates_to"]["rel_type"], "m.thread");
+    assert_eq!(body["m.relates_to"]["event_id"], "$root:example.org");
+    assert_eq!(
+        body["m.relates_to"]["m.in_reply_to"]["event_id"],
+        "$reply:example.org"
+    );
+    let stored_intent_json =
+        serde_json::to_string(&adapter.pending_matrix_intent(attempt.delivery_id.as_uuid()))
+            .expect("intent json");
+    assert!(!stored_intent_json.contains("credential"));
+    assert!(!stored_intent_json.contains("token"));
     assert_eq!(validator.calls(), vec![reply_target()]);
     assert_eq!(preferences.load_calls(), 0);
     assert_eq!(resolver.calls(), vec![reply_target()]);

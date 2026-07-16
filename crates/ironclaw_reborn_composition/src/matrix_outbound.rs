@@ -69,8 +69,20 @@ pub struct FrozenProductDeliveryRoute {
     metadata: MatrixRouteMetadata,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MatrixRoutePolicyOwnerToken {
+    _private: (),
+}
+
+impl MatrixRoutePolicyOwnerToken {
+    pub(crate) fn r003a_policy_owner() -> Self {
+        Self { _private: () }
+    }
+}
+
 impl FrozenProductDeliveryRoute {
     pub fn mint_for_matrix(
+        _owner: &MatrixRoutePolicyOwnerToken,
         delivery_id: OutboundDeliveryId,
         installation_id: impl Into<String>,
         adapter_id: impl Into<String>,
@@ -103,7 +115,10 @@ pub struct SealedDeliveryGrant {
 }
 
 impl SealedDeliveryGrant {
-    pub fn mint_for_matrix(route: &FrozenProductDeliveryRoute) -> Self {
+    pub fn mint_for_matrix(
+        _owner: &MatrixRoutePolicyOwnerToken,
+        route: &FrozenProductDeliveryRoute,
+    ) -> Self {
         Self {
             delivery_id: route.delivery_id,
             installation_id: route.installation_id.clone(),
@@ -124,6 +139,10 @@ pub struct ValidatedDeliveryRoute {
 }
 
 impl ValidatedDeliveryRoute {
+    pub fn delivery_id(&self) -> OutboundDeliveryId {
+        self.route.delivery_id
+    }
+
     pub fn matrix_metadata(&self) -> &MatrixRouteMetadata {
         self.route.matrix_metadata()
     }
@@ -280,6 +299,11 @@ pub enum MatrixTerminalStatus {
     FailedExhausted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixOrchestratorOutcome {
+    pub status: MatrixTerminalStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixRetryDecision {
     DoNotRetry {
@@ -350,11 +374,145 @@ pub trait MatrixDeliveryPort: Send + Sync {
 }
 
 pub trait MatrixOutboundMetadataStore: Send + Sync {
+    fn persist_terminal_status(
+        &self,
+        delivery_id: OutboundDeliveryId,
+        status: MatrixTerminalStatus,
+        reason: Option<DeliveryReasonCode>,
+    ) -> Result<(), MatrixOutboundContractError>;
+
     fn persist_evidence(
         &self,
         delivery_id: OutboundDeliveryId,
         evidence: MatrixDeliveryEvidenceV1,
     ) -> Result<(), MatrixOutboundContractError>;
+}
+
+pub struct MatrixOutboundOrchestrator<'a> {
+    port: &'a dyn MatrixDeliveryPort,
+    credential_resolver: &'a dyn MatrixCredentialResolver,
+    metadata_store: &'a dyn MatrixOutboundMetadataStore,
+}
+
+impl<'a> MatrixOutboundOrchestrator<'a> {
+    pub fn new(
+        port: &'a dyn MatrixDeliveryPort,
+        credential_resolver: &'a dyn MatrixCredentialResolver,
+        metadata_store: &'a dyn MatrixOutboundMetadataStore,
+    ) -> Self {
+        Self {
+            port,
+            credential_resolver,
+            metadata_store,
+        }
+    }
+
+    pub async fn consume_pending_intent(
+        &self,
+        command: MatrixOutboundCommand,
+        route: FrozenProductDeliveryRoute,
+        grant: SealedDeliveryGrant,
+        attempt: DeliveryAttemptContext,
+    ) -> Result<MatrixOrchestratorOutcome, DeliveryError> {
+        let validated = match validate_matrix_route_grant(&command, route, &grant) {
+            Ok(validated) => validated,
+            Err(error) => {
+                self.persist_terminal_status(
+                    attempt.delivery_id,
+                    MatrixTerminalStatus::FailedUnauthorized,
+                    Some(error.reason),
+                )?;
+                return Err(error);
+            }
+        };
+        if attempt.delivery_id != validated.delivery_id() {
+            let error = DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget);
+            self.persist_terminal_status(
+                attempt.delivery_id,
+                MatrixTerminalStatus::FailedUnauthorized,
+                Some(error.reason),
+            )?;
+            return Err(error);
+        }
+        let metadata = validated.matrix_metadata();
+        let Some(credential) = self.credential_resolver.resolve(&validated) else {
+            let error = DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget);
+            self.persist_terminal_status(
+                attempt.delivery_id,
+                MatrixTerminalStatus::FailedUnauthorized,
+                Some(error.reason),
+            )?;
+            return Err(error);
+        };
+        if credential.credential_handle_fingerprint != metadata.credential_handle_fingerprint {
+            let error = DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget);
+            self.persist_terminal_status(
+                attempt.delivery_id,
+                MatrixTerminalStatus::FailedUnauthorized,
+                Some(error.reason),
+            )?;
+            return Err(error);
+        }
+
+        match self
+            .port
+            .deliver(
+                ProtocolDeliveryIntent::Matrix(command),
+                validated,
+                credential,
+                attempt.clone(),
+            )
+            .await
+        {
+            DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(evidence)) => {
+                evidence.validate_redacted()?;
+                self.metadata_store
+                    .persist_evidence(attempt.delivery_id, evidence)?;
+                self.persist_terminal_status(
+                    attempt.delivery_id,
+                    MatrixTerminalStatus::Delivered,
+                    None,
+                )?;
+                Ok(MatrixOrchestratorOutcome {
+                    status: MatrixTerminalStatus::Delivered,
+                })
+            }
+            DeliveryPortResult::Rejected(error) => {
+                let status = terminal_status_for_error(&error);
+                self.persist_terminal_status(attempt.delivery_id, status, Some(error.reason))?;
+                Err(error)
+            }
+        }
+    }
+
+    fn persist_terminal_status(
+        &self,
+        delivery_id: OutboundDeliveryId,
+        status: MatrixTerminalStatus,
+        reason: Option<DeliveryReasonCode>,
+    ) -> Result<(), MatrixOutboundContractError> {
+        self.metadata_store
+            .persist_terminal_status(delivery_id, status, reason)
+    }
+}
+
+fn terminal_status_for_error(error: &DeliveryError) -> MatrixTerminalStatus {
+    match error.reason {
+        DeliveryReasonCode::UnauthorizedTarget => MatrixTerminalStatus::FailedUnauthorized,
+        DeliveryReasonCode::MaxAttemptsExceeded => MatrixTerminalStatus::FailedExhausted,
+        DeliveryReasonCode::MissingMatrixRoute
+        | DeliveryReasonCode::UnsupportedMatrixCommand
+        | DeliveryReasonCode::MatrixRateLimited
+        | DeliveryReasonCode::MatrixTimeout
+        | DeliveryReasonCode::MatrixServerError
+        | DeliveryReasonCode::MatrixMalformedResponse => MatrixTerminalStatus::FailedPermanent,
+    }
+}
+
+impl From<MatrixOutboundContractError> for DeliveryError {
+    fn from(_value: MatrixOutboundContractError) -> Self {
+        Self::new(DeliveryReasonCode::MatrixMalformedResponse)
+    }
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -440,16 +598,45 @@ pub mod fakes {
 
     #[derive(Debug, Default)]
     pub struct FakeMatrixOutboundMetadataStore {
+        statuses: Mutex<
+            Vec<(
+                OutboundDeliveryId,
+                MatrixTerminalStatus,
+                Option<DeliveryReasonCode>,
+            )>,
+        >,
         evidence: Mutex<Vec<(OutboundDeliveryId, MatrixDeliveryEvidenceV1)>>,
     }
 
     impl FakeMatrixOutboundMetadataStore {
+        pub fn statuses(&self) -> Vec<MatrixTerminalStatus> {
+            self.statuses
+                .lock()
+                .expect("status lock")
+                .iter()
+                .map(|(_, status, _)| *status)
+                .collect()
+        }
+
         pub fn evidence(&self) -> Vec<(OutboundDeliveryId, MatrixDeliveryEvidenceV1)> {
             self.evidence.lock().expect("evidence lock").clone()
         }
     }
 
     impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
+        fn persist_terminal_status(
+            &self,
+            delivery_id: OutboundDeliveryId,
+            status: MatrixTerminalStatus,
+            reason: Option<DeliveryReasonCode>,
+        ) -> Result<(), MatrixOutboundContractError> {
+            self.statuses
+                .lock()
+                .expect("status lock")
+                .push((delivery_id, status, reason));
+            Ok(())
+        }
+
         fn persist_evidence(
             &self,
             delivery_id: OutboundDeliveryId,
@@ -486,7 +673,8 @@ pub mod fakes {
         route: &FrozenProductDeliveryRoute,
         egress_target_index: u32,
     ) -> SealedDeliveryGrant {
-        let mut grant = SealedDeliveryGrant::mint_for_matrix(route);
+        let owner = MatrixRoutePolicyOwnerToken::r003a_policy_owner();
+        let mut grant = SealedDeliveryGrant::mint_for_matrix(&owner, route);
         grant.egress_target_index = egress_target_index;
         grant
     }
@@ -495,7 +683,10 @@ pub mod fakes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matrix_outbound::fakes::route_forgery_fixture;
+    use crate::matrix_outbound::fakes::{
+        FakeMatrixCredentialResolver, FakeMatrixDeliveryPort, FakeMatrixOutboundMetadataStore,
+        route_forgery_fixture,
+    };
 
     fn binding() -> ReplyTargetBindingRef {
         ReplyTargetBindingRef::new("matrix-room-binding").expect("valid binding")
@@ -510,8 +701,14 @@ mod tests {
         }
     }
 
+    fn owner() -> MatrixRoutePolicyOwnerToken {
+        MatrixRoutePolicyOwnerToken::r003a_policy_owner()
+    }
+
     fn route() -> FrozenProductDeliveryRoute {
+        let owner = owner();
         FrozenProductDeliveryRoute::mint_for_matrix(
+            &owner,
             OutboundDeliveryId::new(),
             "matrix-install",
             "matrix-adapter",
@@ -525,6 +722,174 @@ mod tests {
                 allowed_command_kinds: vec![MatrixCommandKind::SendText],
             },
         )
+    }
+
+    fn attempt(
+        route: &FrozenProductDeliveryRoute,
+        command: &MatrixOutboundCommand,
+    ) -> DeliveryAttemptContext {
+        DeliveryAttemptContext {
+            delivery_id: route.delivery_id,
+            attempt_number: 1,
+            transaction_id: command.transaction_id.clone(),
+            started_at: Utc::now(),
+        }
+    }
+
+    fn accepted_evidence(command: &MatrixOutboundCommand) -> MatrixDeliveryEvidenceV1 {
+        MatrixDeliveryEvidenceV1 {
+            schema_version: 1,
+            event_id_fingerprint: "event_fp_1".into(),
+            transaction_id: command.transaction_id.clone(),
+            command_kind: command.command_kind,
+            delivered_at: Utc::now(),
+            verified: false,
+            homeserver_origin_fingerprint: "hs_fp_1".into(),
+            room_fingerprint: "room_fp_1".into(),
+            installation_scoped_credential_ref: "cred_ref_1".into(),
+            http_status: 200,
+            latency_ms: 12,
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_consumes_pending_matrix_intent_and_records_delivered_evidence() {
+        let command = command();
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: "cred_fp_1".into(),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let orchestrator = MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store);
+
+        let outcome = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                attempt(&route, &command),
+            )
+            .await
+            .expect("pending intent should be consumed");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::Delivered);
+        assert_eq!(
+            port.calls(),
+            vec![ProtocolDeliveryIntent::Matrix(command.clone())]
+        );
+        assert_eq!(store.statuses(), vec![MatrixTerminalStatus::Delivered]);
+        assert_eq!(store.evidence().len(), 1);
+        assert_eq!(store.evidence()[0].1.event_id_fingerprint, "event_fp_1");
+    }
+
+    #[tokio::test]
+    async fn orchestrator_fails_closed_before_port_when_credential_fingerprint_mismatches() {
+        let command = command();
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: "wrong_cred_fp".into(),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let orchestrator = MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store);
+
+        let error = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                attempt(&route, &command),
+            )
+            .await
+            .expect_err("credential mismatch must fail");
+
+        assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+        assert!(port.calls().is_empty());
+        assert_eq!(
+            store.statuses(),
+            vec![MatrixTerminalStatus::FailedUnauthorized]
+        );
+        assert!(store.evidence().is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_fails_closed_before_port_when_policy_revision_is_stale() {
+        let command = command();
+        let route = route();
+        let mut stale_route = route.clone();
+        stale_route.metadata.policy_revision = "policy-rev-stale".into();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &stale_route);
+        let port = FakeMatrixDeliveryPort::default();
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: "cred_fp_1".into(),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let orchestrator = MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store);
+
+        let error = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                attempt(&route, &command),
+            )
+            .await
+            .expect_err("stale policy grant must fail");
+
+        assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+        assert!(port.calls().is_empty());
+        assert_eq!(
+            store.statuses(),
+            vec![MatrixTerminalStatus::FailedUnauthorized]
+        );
+        assert!(store.evidence().is_empty());
+    }
+
+    #[tokio::test]
+    async fn orchestrator_fails_closed_before_port_when_room_fingerprint_differs() {
+        let command = command();
+        let route = route();
+        let mut wrong_room_route = route.clone();
+        wrong_room_route.metadata.room_fingerprint = "room_fp_other".into();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &wrong_room_route);
+        let port = FakeMatrixDeliveryPort::default();
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: "cred_fp_1".into(),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let orchestrator = MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store);
+
+        let error = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                attempt(&route, &command),
+            )
+            .await
+            .expect_err("wrong room grant must fail");
+
+        assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+        assert!(port.calls().is_empty());
+        assert_eq!(
+            store.statuses(),
+            vec![MatrixTerminalStatus::FailedUnauthorized]
+        );
+        assert!(store.evidence().is_empty());
     }
 
     #[test]

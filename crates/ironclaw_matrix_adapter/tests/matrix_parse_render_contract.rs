@@ -924,20 +924,32 @@ async fn matrix_product_adapter_defers_outbound_delivery_after_render_validation
     let adapter = adapter();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let sink = FakeOutboundDeliverySink::new();
+    let envelope = outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
+        turn_run_id: ironclaw_turns::TurnRunId::new(),
+        text: "**hello** matrix".to_string(),
+        generated_at: Utc::now(),
+    }));
+    let attempt_id = envelope.delivery_attempt_id;
+    let expected_command = render_matrix_outbound(MatrixRenderInput {
+        envelope: envelope.clone(),
+        context: render_context("!room:example.org"),
+    })
+    .expect("expected Matrix command");
     let outcome = adapter
-        .render_outbound(
-            outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
-                turn_run_id: ironclaw_turns::TurnRunId::new(),
-                text: "**hello** matrix".to_string(),
-                generated_at: Utc::now(),
-            })),
-            &egress,
-            &sink,
-        )
+        .render_outbound(envelope, &egress, &sink)
         .await
         .expect("product adapter render should succeed");
 
     assert!(matches!(outcome, ProductRenderOutcome::Deferred));
+    assert_eq!(
+        adapter.pending_matrix_intent(attempt_id),
+        Some(expected_command),
+        "Deferred Matrix render must preserve exact command intent for R003A"
+    );
+    let stored_intent_json =
+        serde_json::to_string(&adapter.pending_matrix_intent(attempt_id)).expect("intent json");
+    assert!(!stored_intent_json.contains("credential"));
+    assert!(!stored_intent_json.contains("token"));
     assert!(egress.calls().is_empty());
     assert!(sink.statuses().is_empty());
 }
