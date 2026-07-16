@@ -14,9 +14,8 @@ use ironclaw_product_adapters::{
     ExternalEventId, OutboundDeliverySink, ParsedProductInbound, ProductAdapter,
     ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId, ProductAttachmentDescriptor,
     ProductAttachmentKind, ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload,
-    ProductRenderOutcome, ProductSurfaceKind, ProductSynchronousResponse, ProductTriggerReason,
-    ProductWorkflowRejectionKind, ProtocolAuthEvidence, ProtocolAuthFailure, ProtocolHttpEgress,
-    UserMessagePayload,
+    ProductRenderOutcome, ProductSurfaceKind, ProductTriggerReason, ProductWorkflowRejectionKind,
+    ProtocolAuthEvidence, ProtocolAuthFailure, ProtocolHttpEgress, UserMessagePayload,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use pulldown_cmark::{Options, Parser, html};
@@ -635,20 +634,10 @@ impl ProductAdapter for MatrixProductAdapter {
             route_metadata,
             allowed_target_rooms: self.config.parse_policy.allowed_rooms.clone(),
         };
-        let command = render_matrix_outbound(MatrixRenderInput { envelope, context })
+        render_matrix_outbound(MatrixRenderInput { envelope, context })
             .map_err(map_matrix_diagnostic_to_adapter_error)?;
-        let body = serde_json::to_vec(&command).map_err(|err| ProductAdapterError::Internal {
-            detail: RedactedString::new(format!(
-                "matrix outbound command serialization failed: {err}"
-            )),
-        })?;
 
-        Ok(ProductRenderOutcome::SynchronousResponse(
-            ProductSynchronousResponse {
-                content_type: "application/vnd.ironclaw.matrix-command+json".to_string(),
-                body,
-            },
-        ))
+        Ok(ProductRenderOutcome::Deferred)
     }
 }
 

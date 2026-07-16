@@ -920,8 +920,10 @@ fn renders_final_reply_to_matrix_command_with_markdown_html() {
 }
 
 #[tokio::test]
-async fn matrix_product_adapter_renders_outbound_at_product_boundary() {
+async fn matrix_product_adapter_defers_outbound_delivery_after_render_validation() {
     let adapter = adapter();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let sink = FakeOutboundDeliverySink::new();
     let outcome = adapter
         .render_outbound(
             outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
@@ -929,23 +931,15 @@ async fn matrix_product_adapter_renders_outbound_at_product_boundary() {
                 text: "**hello** matrix".to_string(),
                 generated_at: Utc::now(),
             })),
-            &FakeProtocolHttpEgress::new(Vec::<String>::new()),
-            &FakeOutboundDeliverySink::new(),
+            &egress,
+            &sink,
         )
         .await
         .expect("product adapter render should succeed");
 
-    let ProductRenderOutcome::SynchronousResponse(response) = outcome else {
-        panic!("expected synchronous Matrix command response");
-    };
-    assert_eq!(
-        response.content_type,
-        "application/vnd.ironclaw.matrix-command+json"
-    );
-    let command: ironclaw_matrix_adapter::MatrixOutboundCommand =
-        serde_json::from_slice(&response.body).expect("matrix command json");
-    assert_eq!(command.room_id(), "!room:example.org");
-    assert_eq!(command.body()["body"], "hello matrix");
+    assert!(matches!(outcome, ProductRenderOutcome::Deferred));
+    assert!(egress.calls().is_empty());
+    assert!(sink.statuses().is_empty());
 }
 
 #[test]
