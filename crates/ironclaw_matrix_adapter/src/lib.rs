@@ -142,7 +142,7 @@ impl MatrixPendingIntentStore {
         let mut intents = self
             .intents
             .lock()
-            .expect("matrix pending intent store lock");
+            .map_err(|_| MatrixPendingIntentStoreError::LockUnavailable)?;
         if !intents.contains_key(&attempt_id) && intents.len() >= self.max_intents {
             return Err(MatrixPendingIntentStoreError::CapacityExceeded {
                 max_intents: self.max_intents,
@@ -153,10 +153,7 @@ impl MatrixPendingIntentStore {
     }
 
     pub fn take(&self, attempt_id: DeliveryAttemptId) -> Option<MatrixOutboundCommand> {
-        self.intents
-            .lock()
-            .expect("matrix pending intent store lock")
-            .remove(&attempt_id)
+        self.intents.lock().ok()?.remove(&attempt_id)
     }
 }
 
@@ -164,6 +161,7 @@ impl MatrixPendingIntentStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatrixPendingIntentStoreError {
     CapacityExceeded { max_intents: usize },
+    LockUnavailable,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -176,6 +174,7 @@ impl fmt::Display for MatrixPendingIntentStoreError {
                     "matrix pending intent store capacity exceeded: {max_intents}"
                 )
             }
+            Self::LockUnavailable => write!(f, "matrix pending intent store unavailable"),
         }
     }
 }
