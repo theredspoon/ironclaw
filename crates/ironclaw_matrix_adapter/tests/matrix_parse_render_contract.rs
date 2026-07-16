@@ -1,12 +1,12 @@
 use chrono::Utc;
 use ironclaw_matrix_adapter::{
     EncryptionState, MatrixOutboundCommand, MatrixParseInput, MatrixParsePolicy,
-    MatrixProductAdapter, MatrixProductAdapterConfig, MatrixReasonCode, MatrixRenderContext,
-    MatrixRenderInput, MatrixRouteMetadata, RelationKind, parse_matrix_event,
-    render_matrix_outbound,
+    MatrixPendingIntentStore, MatrixPendingIntentStoreError, MatrixProductAdapter,
+    MatrixProductAdapterConfig, MatrixReasonCode, MatrixRenderContext, MatrixRenderInput,
+    MatrixRouteMetadata, RelationKind, parse_matrix_event, render_matrix_outbound,
 };
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, EgressRequest, ExternalActorRef,
+    AdapterInstallationId, AuthRequirement, DeliveryAttemptId, EgressRequest, ExternalActorRef,
     ExternalConversationRef, FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView,
     ParsedProductInbound, ProductAdapter, ProductAdapterError, ProductAdapterId,
     ProductAttachmentKind, ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload,
@@ -920,32 +920,65 @@ fn renders_final_reply_to_matrix_command_with_markdown_html() {
 }
 
 #[tokio::test]
-async fn matrix_product_adapter_renders_outbound_at_product_boundary() {
+async fn matrix_product_adapter_defers_outbound_delivery_after_render_validation() {
     let adapter = adapter();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let sink = FakeOutboundDeliverySink::new();
+    let envelope = outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
+        turn_run_id: ironclaw_turns::TurnRunId::new(),
+        text: "**hello** matrix".to_string(),
+        generated_at: Utc::now(),
+    }));
+    let attempt_id = envelope.delivery_attempt_id;
+    let expected_command = render_matrix_outbound(MatrixRenderInput {
+        envelope: envelope.clone(),
+        context: render_context("!room:example.org"),
+    })
+    .expect("expected Matrix command");
     let outcome = adapter
-        .render_outbound(
-            outbound(ProductOutboundPayload::FinalReply(FinalReplyView {
-                turn_run_id: ironclaw_turns::TurnRunId::new(),
-                text: "**hello** matrix".to_string(),
-                generated_at: Utc::now(),
-            })),
-            &FakeProtocolHttpEgress::new(Vec::<String>::new()),
-            &FakeOutboundDeliverySink::new(),
-        )
+        .render_outbound(envelope, &egress, &sink)
         .await
         .expect("product adapter render should succeed");
 
-    let ProductRenderOutcome::SynchronousResponse(response) = outcome else {
-        panic!("expected synchronous Matrix command response");
-    };
+    assert!(matches!(outcome, ProductRenderOutcome::Deferred));
+    let stored_intent = adapter.pending_matrix_intent(attempt_id);
     assert_eq!(
-        response.content_type,
-        "application/vnd.ironclaw.matrix-command+json"
+        stored_intent,
+        Some(expected_command),
+        "Deferred Matrix render must preserve exact command intent for the shared outbound bridge"
     );
-    let command: ironclaw_matrix_adapter::MatrixOutboundCommand =
-        serde_json::from_slice(&response.body).expect("matrix command json");
-    assert_eq!(command.room_id(), "!room:example.org");
-    assert_eq!(command.body()["body"], "hello matrix");
+    assert_eq!(
+        adapter.pending_matrix_intent(attempt_id),
+        None,
+        "pending Matrix intent must be consumed once by the shared outbound bridge"
+    );
+    let stored_intent_json = serde_json::to_string(&stored_intent).expect("intent json");
+    assert!(!stored_intent_json.contains("credential"));
+    assert!(!stored_intent_json.contains("token"));
+    assert!(egress.calls().is_empty());
+    assert!(sink.statuses().is_empty());
+}
+
+#[test]
+fn matrix_pending_intent_store_rejects_unbounded_growth() {
+    let store = MatrixPendingIntentStore::with_capacity(1);
+    let first_attempt = DeliveryAttemptId::new_v4();
+    let second_attempt = DeliveryAttemptId::new_v4();
+    let command = MatrixOutboundCommand::SendMessage {
+        room_id: "!room:example.org".to_string(),
+        txn_id: "txn-1".to_string(),
+        body: json!({"msgtype": "m.text", "body": "hello"}),
+    };
+
+    store
+        .insert(first_attempt, command.clone())
+        .expect("first pending intent fits");
+    assert_eq!(
+        store.insert(second_attempt, command),
+        Err(MatrixPendingIntentStoreError::CapacityExceeded { max_intents: 1 })
+    );
+    assert!(store.take(first_attempt).is_some());
+    assert_eq!(store.take(first_attempt), None);
 }
 
 #[test]
