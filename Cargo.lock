@@ -4944,6 +4944,7 @@ dependencies = [
  "ironclaw_host_runtime",
  "ironclaw_llm",
  "ironclaw_loop_host",
+ "ironclaw_matrix_adapter",
  "ironclaw_mcp",
  "ironclaw_network",
  "ironclaw_observability",
