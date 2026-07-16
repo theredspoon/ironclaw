@@ -114,7 +114,7 @@ pub struct MatrixRoutePolicyOwnerToken {
 }
 
 impl MatrixRoutePolicyOwnerToken {
-    pub(crate) fn r003a_policy_owner() -> Self {
+    pub(crate) fn matrix_policy_owner() -> Self {
         Self { _private: () }
     }
 }
@@ -785,7 +785,7 @@ pub mod fakes {
         route: &FrozenProductDeliveryRoute,
         egress_target_index: u32,
     ) -> SealedDeliveryGrant {
-        let owner = MatrixRoutePolicyOwnerToken::r003a_policy_owner();
+        let owner = MatrixRoutePolicyOwnerToken::matrix_policy_owner();
         let mut grant = SealedDeliveryGrant::mint_for_matrix(&owner, route);
         grant.egress_target_index = egress_target_index;
         grant
@@ -832,7 +832,7 @@ mod tests {
     }
 
     fn owner() -> MatrixRoutePolicyOwnerToken {
-        MatrixRoutePolicyOwnerToken::r003a_policy_owner()
+        MatrixRoutePolicyOwnerToken::matrix_policy_owner()
     }
 
     fn retry_policy() -> BoundedMatrixRetryPolicy {
