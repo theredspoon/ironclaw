@@ -341,6 +341,7 @@ impl MatrixDeliveryEvidenceV1 {
             || self.command_kind != command.command_kind
             || self.homeserver_origin_fingerprint != metadata.homeserver_origin_fingerprint
             || self.room_fingerprint != metadata.room_fingerprint
+            || self.installation_scoped_credential_ref != metadata.credential_handle_fingerprint
         {
             return Err(MatrixOutboundContractError::UnverifiedEvidence);
         }
@@ -1538,7 +1539,7 @@ mod tests {
             verified: true,
             homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
             room_fingerprint: command.room_id.fingerprint(),
-            installation_scoped_credential_ref: canonical_fingerprint("credential-ref-1"),
+            installation_scoped_credential_ref: canonical_fingerprint("credential-handle-1"),
             http_status: 200,
             latency_ms: 12,
         }
@@ -2447,6 +2448,56 @@ mod tests {
             )
             .await
             .expect("unverified evidence should schedule retry without marking delivery");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::RetryScheduled);
+        assert_eq!(
+            outcome.retry,
+            Some(MatrixRetryDecision::RetryAfter {
+                after: Duration::from_secs(1),
+                reason: DeliveryReasonCode::MatrixMalformedResponse
+            })
+        );
+        assert!(store.statuses().is_empty());
+        assert!(store.evidence().is_empty());
+        let retry_schedules = store.retry_schedules();
+        assert_eq!(retry_schedules.len(), 1);
+        assert_eq!(retry_schedules[0].delivery_id, route.delivery_id);
+        assert_eq!(
+            retry_schedules[0].reason,
+            DeliveryReasonCode::MatrixMalformedResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_rejects_evidence_bound_to_wrong_credential_without_marking_delivered() {
+        let command = command();
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let mut evidence = accepted_evidence(&command);
+        evidence.installation_scoped_credential_ref = canonical_fingerprint("other-credential");
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(evidence),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let retry_policy = retry_policy();
+        let orchestrator =
+            MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+
+        let outcome = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                attempt(&route, &command),
+            )
+            .await
+            .expect("wrong credential evidence should schedule retry without marking delivery");
 
         assert_eq!(outcome.status, MatrixTerminalStatus::RetryScheduled);
         assert_eq!(
