@@ -5,13 +5,20 @@
 //! Matrix command intent pending; this bridge records terminal status only
 //! after a delivery port returns protocol evidence or a sanitized error.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_common::hashing::sha256_hex;
+use ironclaw_filesystem::{
+    CasApply, CasUpdateError, ContentType, Entry, FilesystemError, RootFilesystem,
+    ScopedFilesystem, cas_update,
+};
+use ironclaw_host_api::ScopedPath;
 use ironclaw_outbound::{
-    DeliveryFailureKind, OutboundDeliveryId, OutboundDeliveryStatus, UpdateDeliveryStatusRequest,
+    DeliveryFailureKind, OutboundDeliveryId, OutboundDeliveryStatus, OutboundError,
+    OutboundStateStore, UpdateDeliveryStatusRequest,
 };
 use ironclaw_turns::{ReplyTargetBindingRef, TurnScope};
 use serde::{Deserialize, Serialize};
@@ -273,7 +280,12 @@ impl MatrixDeliveryEvidenceV1 {
             self.room_fingerprint.as_str(),
             self.installation_scoped_credential_ref.as_str(),
         ];
-        if self.schema_version != 1 || fields.iter().any(|field| leaks_raw_matrix_value(field)) {
+        if self.schema_version != 1
+            || fields
+                .iter()
+                .any(|field| !is_canonical_sha256_fingerprint(field))
+            || fields.iter().any(|field| leaks_raw_matrix_value(field))
+        {
             return Err(MatrixOutboundContractError::UnsafeEvidence);
         }
         Ok(())
@@ -377,7 +389,8 @@ impl MatrixErrcode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryReasonCode {
     UnauthorizedTarget,
     MissingMatrixRoute,
@@ -389,7 +402,8 @@ pub enum DeliveryReasonCode {
     MaxAttemptsExceeded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HttpStatusFamily {
     Informational,
     Success,
@@ -422,7 +436,8 @@ impl SafeOperatorSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MatrixTerminalStatus {
     Delivered,
     RetryScheduled,
@@ -507,19 +522,21 @@ pub trait MatrixDeliveryPort: Send + Sync {
     ) -> DeliveryPortResult;
 }
 
+#[async_trait]
 pub trait MatrixOutboundMetadataStore: Send + Sync {
-    fn update_delivery_status(
+    async fn update_delivery_status(
         &self,
         request: UpdateDeliveryStatusRequest,
     ) -> Result<(), MatrixOutboundContractError>;
 
-    fn persist_evidence(
+    async fn persist_evidence(
         &self,
         delivery_id: OutboundDeliveryId,
+        scope: TurnScope,
         evidence: ValidatedMatrixDeliveryEvidence,
     ) -> Result<(), MatrixOutboundContractError>;
 
-    fn record_retry_scheduled(
+    async fn record_retry_scheduled(
         &self,
         schedule: MatrixRetrySchedule,
     ) -> Result<(), MatrixOutboundContractError>;
@@ -533,6 +550,293 @@ pub struct MatrixRetrySchedule {
     pub retry_after: Duration,
     pub reason: DeliveryReasonCode,
     pub recorded_at: DateTime<Utc>,
+}
+
+const MATRIX_METADATA_SCHEMA_VERSION: u32 = 1;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixOutboundMetadataV1 {
+    schema_version: u32,
+    delivery_id: OutboundDeliveryId,
+    scope: TurnScope,
+    evidence: Option<MatrixDeliveryEvidenceV1>,
+    status: Option<StoredMatrixDeliveryStatusV1>,
+    retry_schedule: Option<StoredMatrixRetryScheduleV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixDeliveryStatusV1 {
+    status: OutboundDeliveryStatus,
+    updated_at: DateTime<Utc>,
+    failure_kind: Option<DeliveryFailureKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixRetryScheduleV1 {
+    attempt_number: u32,
+    retry_after_millis: u64,
+    reason: DeliveryReasonCode,
+    recorded_at: DateTime<Utc>,
+}
+
+impl StoredMatrixOutboundMetadataV1 {
+    fn empty(delivery_id: OutboundDeliveryId, scope: TurnScope) -> Self {
+        Self {
+            schema_version: MATRIX_METADATA_SCHEMA_VERSION,
+            delivery_id,
+            scope,
+            evidence: None,
+            status: None,
+            retry_schedule: None,
+        }
+    }
+}
+
+impl From<&MatrixRetrySchedule> for StoredMatrixRetryScheduleV1 {
+    fn from(schedule: &MatrixRetrySchedule) -> Self {
+        Self {
+            attempt_number: schedule.attempt_number,
+            retry_after_millis: schedule.retry_after.as_millis().min(u128::from(u64::MAX)) as u64,
+            reason: schedule.reason,
+            recorded_at: schedule.recorded_at,
+        }
+    }
+}
+
+impl StoredMatrixRetryScheduleV1 {
+    fn into_schedule(
+        self,
+        delivery_id: OutboundDeliveryId,
+        scope: TurnScope,
+    ) -> MatrixRetrySchedule {
+        MatrixRetrySchedule {
+            delivery_id,
+            scope,
+            attempt_number: self.attempt_number,
+            retry_after: Duration::from_millis(self.retry_after_millis),
+            reason: self.reason,
+            recorded_at: self.recorded_at,
+        }
+    }
+}
+
+pub struct FilesystemMatrixOutboundMetadataStore<F>
+where
+    F: RootFilesystem,
+{
+    filesystem: Arc<ScopedFilesystem<F>>,
+    outbound_state_store: Arc<dyn OutboundStateStore>,
+}
+
+impl<F> FilesystemMatrixOutboundMetadataStore<F>
+where
+    F: RootFilesystem,
+{
+    pub fn new(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        outbound_state_store: Arc<dyn OutboundStateStore>,
+    ) -> Self {
+        Self {
+            filesystem,
+            outbound_state_store,
+        }
+    }
+
+    pub async fn load_evidence(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<MatrixDeliveryEvidenceV1>, MatrixOutboundContractError> {
+        Ok(self
+            .load_record(&scope, delivery_id)
+            .await?
+            .and_then(|record| record.evidence))
+    }
+
+    pub async fn load_delivery_status(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<UpdateDeliveryStatusRequest>, MatrixOutboundContractError> {
+        Ok(self
+            .load_record(&scope, delivery_id)
+            .await?
+            .and_then(|record| {
+                record.status.map(|status| UpdateDeliveryStatusRequest {
+                    delivery_id,
+                    scope,
+                    status: status.status,
+                    updated_at: status.updated_at,
+                    failure_kind: status.failure_kind,
+                })
+            }))
+    }
+
+    pub async fn load_retry_schedule(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<MatrixRetrySchedule>, MatrixOutboundContractError> {
+        Ok(self
+            .load_record(&scope, delivery_id)
+            .await?
+            .and_then(|record| {
+                record
+                    .retry_schedule
+                    .map(|schedule| schedule.into_schedule(delivery_id, scope))
+            }))
+    }
+
+    async fn load_record(
+        &self,
+        scope: &TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<StoredMatrixOutboundMetadataV1>, MatrixOutboundContractError> {
+        let resource_scope = scope.to_resource_scope();
+        let path = matrix_metadata_path(scope, delivery_id)?;
+        let Some(versioned) = self.filesystem.get(&resource_scope, &path).await? else {
+            return Ok(None);
+        };
+        let record: StoredMatrixOutboundMetadataV1 = serde_json::from_slice(&versioned.entry.body)?;
+        validate_stored_matrix_metadata(&record, scope, delivery_id)?;
+        Ok(Some(record))
+    }
+
+    async fn mutate_record(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        mutate: impl Fn(StoredMatrixOutboundMetadataV1) -> StoredMatrixOutboundMetadataV1,
+    ) -> Result<(), MatrixOutboundContractError> {
+        let resource_scope = scope.to_resource_scope();
+        let path = matrix_metadata_path(&scope, delivery_id)?;
+        cas_update(
+            self.filesystem.as_ref(),
+            &resource_scope,
+            &path,
+            |bytes: &[u8]| {
+                serde_json::from_slice::<StoredMatrixOutboundMetadataV1>(bytes).map_err(Into::into)
+            },
+            |record: &StoredMatrixOutboundMetadataV1| {
+                Ok(
+                    Entry::bytes(serde_json::to_vec(record)?)
+                        .with_content_type(ContentType::json()),
+                )
+            },
+            |current: Option<StoredMatrixOutboundMetadataV1>| {
+                let outcome = (|| {
+                    let record = current.unwrap_or_else(|| {
+                        StoredMatrixOutboundMetadataV1::empty(delivery_id, scope.clone())
+                    });
+                    validate_stored_matrix_metadata(&record, &scope, delivery_id)?;
+                    let record = mutate(record);
+                    Ok(CasApply::new(record, ()))
+                })();
+                async move { outcome }
+            },
+        )
+        .await
+        .map_err(map_matrix_metadata_cas_error)
+    }
+}
+
+#[async_trait]
+impl<F> MatrixOutboundMetadataStore for FilesystemMatrixOutboundMetadataStore<F>
+where
+    F: RootFilesystem + 'static,
+{
+    async fn update_delivery_status(
+        &self,
+        request: UpdateDeliveryStatusRequest,
+    ) -> Result<(), MatrixOutboundContractError> {
+        self.outbound_state_store
+            .update_delivery_status(request.clone())
+            .await
+            .map_err(MatrixOutboundContractError::from)?;
+        self.mutate_record(request.scope.clone(), request.delivery_id, |mut record| {
+            record.status = Some(StoredMatrixDeliveryStatusV1 {
+                status: request.status,
+                updated_at: request.updated_at,
+                failure_kind: request.failure_kind,
+            });
+            if is_terminal_delivery_status(request.status) {
+                record.retry_schedule = None;
+            }
+            record
+        })
+        .await
+    }
+
+    async fn persist_evidence(
+        &self,
+        delivery_id: OutboundDeliveryId,
+        scope: TurnScope,
+        evidence: ValidatedMatrixDeliveryEvidence,
+    ) -> Result<(), MatrixOutboundContractError> {
+        self.mutate_record(scope, delivery_id, |mut record| {
+            record.evidence = Some(evidence.clone().into_inner());
+            record
+        })
+        .await
+    }
+
+    async fn record_retry_scheduled(
+        &self,
+        schedule: MatrixRetrySchedule,
+    ) -> Result<(), MatrixOutboundContractError> {
+        let delivery_id = schedule.delivery_id;
+        let scope = schedule.scope.clone();
+        self.mutate_record(scope, delivery_id, |mut record| {
+            record.retry_schedule = Some(StoredMatrixRetryScheduleV1::from(&schedule));
+            record
+        })
+        .await
+    }
+}
+
+fn matrix_metadata_path(
+    scope: &TurnScope,
+    delivery_id: OutboundDeliveryId,
+) -> Result<ScopedPath, MatrixOutboundContractError> {
+    let scope_json = serde_json::to_vec(scope)?;
+    let key = format!("{}:{}", sha256_hex(&scope_json), delivery_id);
+    ScopedPath::new(format!(
+        "/outbound/matrix/metadata/{}.json",
+        sha256_hex(key.as_bytes())
+    ))
+    .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
+}
+
+fn validate_stored_matrix_metadata(
+    record: &StoredMatrixOutboundMetadataV1,
+    scope: &TurnScope,
+    delivery_id: OutboundDeliveryId,
+) -> Result<(), MatrixOutboundContractError> {
+    if record.schema_version != MATRIX_METADATA_SCHEMA_VERSION
+        || record.delivery_id != delivery_id
+        || record.scope != *scope
+    {
+        return Err(MatrixOutboundContractError::Backend(
+            "matrix metadata identity mismatch".to_string(),
+        ));
+    }
+    if let Some(evidence) = &record.evidence {
+        evidence.validate_redacted()?;
+    }
+    Ok(())
+}
+
+fn map_matrix_metadata_cas_error(
+    error: CasUpdateError<MatrixOutboundContractError>,
+) -> MatrixOutboundContractError {
+    match error {
+        CasUpdateError::Apply(error) => error,
+        CasUpdateError::Backend(error) => error.into(),
+        error @ (CasUpdateError::Timeout
+        | CasUpdateError::RetriesExhausted
+        | CasUpdateError::CasUnsupported) => {
+            MatrixOutboundContractError::Backend(error.to_string())
+        }
+    }
 }
 
 pub struct MatrixOutboundOrchestrator<'a> {
@@ -573,7 +877,8 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                     route_scope,
                     MatrixTerminalStatus::FailedUnauthorized,
                     Some(error.reason),
-                )?;
+                )
+                .await?;
                 return Err(error);
             }
         };
@@ -584,7 +889,8 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 validated.route.scope().clone(),
                 MatrixTerminalStatus::FailedUnauthorized,
                 Some(error.reason),
-            )?;
+            )
+            .await?;
             return Err(error);
         }
         let metadata = validated.matrix_metadata().clone();
@@ -595,7 +901,8 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 validated.route.scope().clone(),
                 MatrixTerminalStatus::FailedUnauthorized,
                 Some(error.reason),
-            )?;
+            )
+            .await?;
             return Err(error);
         };
         if credential.credential_handle_fingerprint != metadata.credential_handle_fingerprint {
@@ -605,7 +912,8 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 validated.route.scope().clone(),
                 MatrixTerminalStatus::FailedUnauthorized,
                 Some(error.reason),
-            )?;
+            )
+            .await?;
             return Err(error);
         }
         let validated_scope = validated.route.scope().clone();
@@ -626,21 +934,25 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 ) {
                     Ok(evidence) => evidence,
                     Err(error) => {
-                        return self.apply_delivery_error(
-                            DeliveryError::from(error),
-                            &attempt,
-                            validated_scope,
-                        );
+                        return self
+                            .apply_delivery_error(
+                                DeliveryError::from(error),
+                                &attempt,
+                                validated_scope,
+                            )
+                            .await;
                     }
                 };
                 self.metadata_store
-                    .persist_evidence(attempt.delivery_id, evidence)?;
+                    .persist_evidence(attempt.delivery_id, validated_scope.clone(), evidence)
+                    .await?;
                 self.persist_terminal_status(
                     attempt.delivery_id,
                     validated_scope,
                     MatrixTerminalStatus::Delivered,
                     None,
-                )?;
+                )
+                .await?;
                 Ok(MatrixOrchestratorOutcome {
                     status: MatrixTerminalStatus::Delivered,
                     retry: None,
@@ -648,11 +960,12 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
             }
             DeliveryPortResult::Rejected(error) => {
                 self.apply_delivery_error(error, &attempt, validated_scope)
+                    .await
             }
         }
     }
 
-    fn apply_delivery_error(
+    async fn apply_delivery_error(
         &self,
         error: DeliveryError,
         attempt: &DeliveryAttemptContext,
@@ -669,7 +982,8 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                         retry_after: after,
                         reason,
                         recorded_at: Utc::now(),
-                    })?;
+                    })
+                    .await?;
                 Ok(MatrixOrchestratorOutcome {
                     status: MatrixTerminalStatus::RetryScheduled,
                     retry: Some(decision),
@@ -681,13 +995,14 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                     scope,
                     terminal_status,
                     Some(error.reason),
-                )?;
+                )
+                .await?;
                 Err(error)
             }
         }
     }
 
-    fn persist_terminal_status(
+    async fn persist_terminal_status(
         &self,
         delivery_id: OutboundDeliveryId,
         scope: TurnScope,
@@ -702,6 +1017,7 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 updated_at: Utc::now(),
                 failure_kind: reason.map(delivery_failure_kind_for_reason),
             })
+            .await
     }
 }
 
@@ -746,15 +1062,59 @@ pub enum MatrixOutboundContractError {
     UnsafeEvidence,
     #[error("unverified matrix evidence")]
     UnverifiedEvidence,
+    #[error("matrix metadata serialization failed: {0}")]
+    Serialization(String),
+    #[error("matrix metadata backend failed: {0}")]
+    Backend(String),
+}
+
+impl From<serde_json::Error> for MatrixOutboundContractError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Serialization(value.to_string())
+    }
+}
+
+impl From<FilesystemError> for MatrixOutboundContractError {
+    fn from(value: FilesystemError) -> Self {
+        Self::Backend(value.to_string())
+    }
+}
+
+impl From<OutboundError> for MatrixOutboundContractError {
+    fn from(value: OutboundError) -> Self {
+        Self::Backend(value.to_string())
+    }
 }
 
 fn leaks_raw_matrix_value(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
     value.starts_with('$')
         || value.starts_with('!')
         || value.starts_with('@')
         || value.contains("://")
-        || value.contains("access_token")
+        || normalized.contains("access_token")
         || value.contains("Bearer ")
+        || normalized.starts_with("secret:")
+        || normalized.contains(".secret.")
+}
+
+fn is_canonical_sha256_fingerprint(value: &str) -> bool {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_terminal_delivery_status(status: OutboundDeliveryStatus) -> bool {
+    matches!(
+        status,
+        OutboundDeliveryStatus::Delivered
+            | OutboundDeliveryStatus::Failed
+            | OutboundDeliveryStatus::DeadLettered
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -863,8 +1223,9 @@ pub mod fakes {
         }
     }
 
+    #[async_trait]
     impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
-        fn update_delivery_status(
+        async fn update_delivery_status(
             &self,
             request: UpdateDeliveryStatusRequest,
         ) -> Result<(), MatrixOutboundContractError> {
@@ -872,9 +1233,10 @@ pub mod fakes {
             Ok(())
         }
 
-        fn persist_evidence(
+        async fn persist_evidence(
             &self,
             delivery_id: OutboundDeliveryId,
+            _scope: TurnScope,
             evidence: ValidatedMatrixDeliveryEvidence,
         ) -> Result<(), MatrixOutboundContractError> {
             self.evidence
@@ -884,7 +1246,7 @@ pub mod fakes {
             Ok(())
         }
 
-        fn record_retry_scheduled(
+        async fn record_retry_scheduled(
             &self,
             schedule: MatrixRetrySchedule,
         ) -> Result<(), MatrixOutboundContractError> {
@@ -932,8 +1294,20 @@ mod tests {
         FakeMatrixCredentialResolver, FakeMatrixDeliveryPort, FakeMatrixOutboundMetadataStore,
         route_forgery_fixture,
     };
-    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+    use ironclaw_event_projections::ProjectionCursor;
+    use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
+    use ironclaw_host_api::{
+        AgentId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId, TenantId,
+        ThreadId, UserId, VirtualPath,
+    };
+    use ironclaw_outbound::{
+        AdvanceSubscriptionCursorRequest, LoadSubscriptionCursorRequest, OutboundDeliveryAttempt,
+        OutboundPushPlan, OutboundPushTargetRequest, ProjectionSubscriptionRecord,
+        ThreadNotificationPolicy,
+    };
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     fn binding() -> ReplyTargetBindingRef {
         ReplyTargetBindingRef::new("matrix-room-binding").expect("valid binding")
@@ -952,6 +1326,86 @@ mod tests {
             }))
             .expect("valid body"),
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeOutboundStateStore {
+        statuses: Mutex<Vec<UpdateDeliveryStatusRequest>>,
+        fail_update_delivery_status: bool,
+    }
+
+    #[async_trait]
+    impl OutboundStateStore for FakeOutboundStateStore {
+        async fn put_thread_notification_policy(
+            &self,
+            _policy: ThreadNotificationPolicy,
+        ) -> Result<(), OutboundError> {
+            Ok(())
+        }
+
+        async fn load_thread_notification_policy(
+            &self,
+            scope: TurnScope,
+        ) -> Result<ThreadNotificationPolicy, OutboundError> {
+            Ok(ThreadNotificationPolicy::default_for_scope(scope))
+        }
+
+        async fn plan_push_targets(
+            &self,
+            _request: OutboundPushTargetRequest,
+        ) -> Result<OutboundPushPlan, OutboundError> {
+            Err(OutboundError::Backend)
+        }
+
+        async fn upsert_subscription(
+            &self,
+            _record: ProjectionSubscriptionRecord,
+        ) -> Result<(), OutboundError> {
+            Err(OutboundError::Backend)
+        }
+
+        async fn load_subscription_cursor(
+            &self,
+            _request: LoadSubscriptionCursorRequest,
+        ) -> Result<Option<ProjectionCursor>, OutboundError> {
+            Err(OutboundError::Backend)
+        }
+
+        async fn advance_subscription_cursor(
+            &self,
+            _request: AdvanceSubscriptionCursorRequest,
+        ) -> Result<(), OutboundError> {
+            Err(OutboundError::Backend)
+        }
+
+        async fn record_delivery_attempt(
+            &self,
+            _attempt: OutboundDeliveryAttempt,
+        ) -> Result<(), OutboundError> {
+            Ok(())
+        }
+
+        async fn update_delivery_status(
+            &self,
+            request: UpdateDeliveryStatusRequest,
+        ) -> Result<(), OutboundError> {
+            if self.fail_update_delivery_status {
+                return Err(OutboundError::Backend);
+            }
+            self.statuses.lock().expect("status lock").push(request);
+            Ok(())
+        }
+
+        async fn list_delivery_attempts(
+            &self,
+            _scope: TurnScope,
+        ) -> Result<Vec<OutboundDeliveryAttempt>, OutboundError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn outbound_state_store() -> Arc<dyn OutboundStateStore> {
+        Arc::new(FakeOutboundStateStore::default())
     }
 
     fn scope() -> TurnScope {
@@ -976,6 +1430,10 @@ mod tests {
         }
     }
 
+    fn canonical_fingerprint(value: &str) -> String {
+        format!("sha256:{}", sha256_hex(value.as_bytes()))
+    }
+
     fn route() -> FrozenProductDeliveryRoute {
         let command = command();
         let owner = owner();
@@ -987,10 +1445,10 @@ mod tests {
             "matrix-adapter",
             MatrixRouteMetadata {
                 policy_revision: "policy-rev-1".into(),
-                homeserver_origin_fingerprint: "hs_fp_1".into(),
+                homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
                 room_fingerprint: command.room_id.fingerprint(),
                 egress_target_index: 0,
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
                 reply_target_binding_ref: binding(),
                 allowed_command_kinds: vec![MatrixCommandKind::SendText],
             },
@@ -1012,17 +1470,58 @@ mod tests {
     fn accepted_evidence(command: &MatrixOutboundCommand) -> MatrixDeliveryEvidenceV1 {
         MatrixDeliveryEvidenceV1 {
             schema_version: 1,
-            event_id_fingerprint: "event_fp_1".into(),
+            event_id_fingerprint: canonical_fingerprint("event-1"),
             transaction_id: command.transaction_id.clone(),
             command_kind: command.command_kind,
             delivered_at: Utc::now(),
             verified: true,
-            homeserver_origin_fingerprint: "hs_fp_1".into(),
+            homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
             room_fingerprint: command.room_id.fingerprint(),
-            installation_scoped_credential_ref: "cred_ref_1".into(),
+            installation_scoped_credential_ref: canonical_fingerprint("credential-ref-1"),
             http_status: 200,
             latency_ms: 12,
         }
+    }
+
+    fn retry_schedule(route: &FrozenProductDeliveryRoute) -> MatrixRetrySchedule {
+        MatrixRetrySchedule {
+            delivery_id: route.delivery_id,
+            scope: route.scope().clone(),
+            attempt_number: 2,
+            retry_after: Duration::from_secs(30),
+            reason: DeliveryReasonCode::MatrixRateLimited,
+            recorded_at: Utc::now(),
+        }
+    }
+
+    fn delivery_status_request(
+        route: &FrozenProductDeliveryRoute,
+        status: OutboundDeliveryStatus,
+    ) -> UpdateDeliveryStatusRequest {
+        UpdateDeliveryStatusRequest {
+            delivery_id: route.delivery_id,
+            scope: route.scope().clone(),
+            status,
+            updated_at: Utc::now(),
+            failure_kind: match status {
+                OutboundDeliveryStatus::Failed | OutboundDeliveryStatus::DeadLettered => {
+                    Some(DeliveryFailureKind::Rejected)
+                }
+                OutboundDeliveryStatus::Pending | OutboundDeliveryStatus::Delivered => None,
+            },
+        }
+    }
+
+    fn matrix_metadata_filesystem(
+        backend: Arc<InMemoryBackend>,
+    ) -> Arc<ScopedFilesystem<InMemoryBackend>> {
+        let mounts = MountView::new(vec![MountGrant::new(
+            MountAlias::new("/outbound").expect("alias"),
+            VirtualPath::new("/engine/matrix-outbound-test").expect("target"),
+            MountPermissions::read_write_list_delete(),
+        )])
+        .expect("mount view");
+        Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts))
     }
 
     #[tokio::test]
@@ -1037,7 +1536,7 @@ mod tests {
         ));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1063,7 +1562,10 @@ mod tests {
         assert_eq!(store.statuses(), vec![OutboundDeliveryStatus::Delivered]);
         assert_eq!(store.failure_kinds(), vec![None]);
         assert_eq!(store.evidence().len(), 1);
-        assert_eq!(store.evidence()[0].1.event_id_fingerprint, "event_fp_1");
+        assert_eq!(
+            store.evidence()[0].1.event_id_fingerprint,
+            canonical_fingerprint("event-1")
+        );
     }
 
     #[tokio::test]
@@ -1075,7 +1577,7 @@ mod tests {
         let port = FakeMatrixDeliveryPort::default();
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "wrong_cred_fp".into(),
+                credential_handle_fingerprint: canonical_fingerprint("wrong-credential-handle"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1113,7 +1615,7 @@ mod tests {
         let port = FakeMatrixDeliveryPort::default();
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1141,13 +1643,13 @@ mod tests {
         let command = command();
         let route = route();
         let mut wrong_room_route = route.clone();
-        wrong_room_route.metadata.room_fingerprint = "room_fp_other".into();
+        wrong_room_route.metadata.room_fingerprint = canonical_fingerprint("room-other");
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &wrong_room_route);
         let port = FakeMatrixDeliveryPort::default();
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1180,7 +1682,7 @@ mod tests {
         let port = FakeMatrixDeliveryPort::default();
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1223,7 +1725,7 @@ mod tests {
             command_kind: MatrixCommandKind::SendText,
             delivered_at: Utc::now(),
             verified: true,
-            homeserver_origin_fingerprint: "hs_fp_1".into(),
+            homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
             room_fingerprint: "room_fp_1".into(),
             installation_scoped_credential_ref: "cred_ref_1".into(),
             http_status: 200,
@@ -1234,6 +1736,307 @@ mod tests {
             evidence.validate_redacted(),
             Err(MatrixOutboundContractError::UnsafeEvidence)
         );
+    }
+
+    #[test]
+    fn matrix_evidence_rejects_secret_like_credential_refs() {
+        for credential_ref in [
+            "matrix_access_token",
+            "secret:matrix",
+            "matrix.secret.handle",
+        ] {
+            let mut evidence = accepted_evidence(&command());
+            evidence.installation_scoped_credential_ref = credential_ref.into();
+
+            assert_eq!(
+                evidence.validate_redacted(),
+                Err(MatrixOutboundContractError::UnsafeEvidence),
+                "credential ref {credential_ref:?} must not be persisted as delivery evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_evidence_fingerprint_fields_require_canonical_sha256_format() {
+        let command = command();
+        let valid_fingerprint = canonical_fingerprint("valid-fingerprint");
+        let invalid_cases = [
+            ("event_id_fingerprint", "event_fp_1"),
+            (
+                "homeserver_origin_fingerprint",
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            ),
+            (
+                "room_fingerprint",
+                "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            ("installation_scoped_credential_ref", "credential-ref-1"),
+        ];
+
+        for (field, invalid_fingerprint) in invalid_cases {
+            let mut evidence = MatrixDeliveryEvidenceV1 {
+                schema_version: 1,
+                event_id_fingerprint: valid_fingerprint.clone(),
+                transaction_id: command.transaction_id.clone(),
+                command_kind: command.command_kind,
+                delivered_at: Utc::now(),
+                verified: true,
+                homeserver_origin_fingerprint: valid_fingerprint.clone(),
+                room_fingerprint: valid_fingerprint.clone(),
+                installation_scoped_credential_ref: valid_fingerprint.clone(),
+                http_status: 200,
+                latency_ms: 12,
+            };
+            match field {
+                "event_id_fingerprint" => {
+                    evidence.event_id_fingerprint = invalid_fingerprint.into();
+                }
+                "homeserver_origin_fingerprint" => {
+                    evidence.homeserver_origin_fingerprint = invalid_fingerprint.into();
+                }
+                "room_fingerprint" => {
+                    evidence.room_fingerprint = invalid_fingerprint.into();
+                }
+                "installation_scoped_credential_ref" => {
+                    evidence.installation_scoped_credential_ref = invalid_fingerprint.into();
+                }
+                _ => unreachable!("covered by invalid_cases"),
+            }
+
+            assert_eq!(
+                evidence.validate_redacted(),
+                Err(MatrixOutboundContractError::UnsafeEvidence),
+                "{field} must use sha256:<64 lowercase hex> fingerprint format"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_outbound_contract_error_display_preserves_serde_cause() {
+        let serde_error = serde_json::from_str::<StoredMatrixOutboundMetadataV1>("{")
+            .expect_err("malformed json should produce serde error");
+        let serde_cause = serde_error.to_string();
+        let contract_error = MatrixOutboundContractError::from(serde_error);
+
+        assert!(
+            contract_error.to_string().contains(&serde_cause),
+            "display must include serde cause {serde_cause:?}, got {contract_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_metadata_store_does_not_write_local_status_when_canonical_update_fails()
+    {
+        let backend = Arc::new(InMemoryBackend::new());
+        let failing_outbound_store = Arc::new(FakeOutboundStateStore {
+            statuses: Mutex::new(Vec::new()),
+            fail_update_delivery_status: true,
+        });
+        let writer = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            failing_outbound_store,
+        );
+        let route = route();
+
+        let error = writer
+            .update_delivery_status(delivery_status_request(
+                &route,
+                OutboundDeliveryStatus::Delivered,
+            ))
+            .await
+            .expect_err("canonical outbound status failure must be returned");
+
+        assert!(matches!(error, MatrixOutboundContractError::Backend(_)));
+
+        let reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(backend),
+            outbound_state_store(),
+        );
+        let loaded_status = reader
+            .load_delivery_status(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load status after failed canonical update");
+
+        assert_eq!(
+            loaded_status, None,
+            "Matrix-local status must not be written when canonical status update fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_metadata_store_reloads_delivered_evidence_and_terminal_status() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let writer = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let command = command();
+        let route = route();
+        let evidence = ValidatedMatrixDeliveryEvidence::new_redacted(accepted_evidence(&command))
+            .expect("fixture evidence is redacted");
+
+        writer
+            .persist_evidence(route.delivery_id, route.scope().clone(), evidence)
+            .await
+            .expect("persist evidence");
+        writer
+            .update_delivery_status(UpdateDeliveryStatusRequest {
+                delivery_id: route.delivery_id,
+                scope: route.scope().clone(),
+                status: OutboundDeliveryStatus::Delivered,
+                updated_at: Utc::now(),
+                failure_kind: None,
+            })
+            .await
+            .expect("persist delivered status");
+
+        let reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(backend),
+            outbound_state_store(),
+        );
+        let loaded_evidence = reader
+            .load_evidence(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load evidence")
+            .expect("evidence should persist across store instances");
+        let loaded_status = reader
+            .load_delivery_status(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load status")
+            .expect("status should persist across store instances");
+
+        assert_eq!(
+            loaded_evidence.event_id_fingerprint,
+            canonical_fingerprint("event-1")
+        );
+        assert_eq!(loaded_evidence.transaction_id, command.transaction_id);
+        assert_eq!(loaded_status.status, OutboundDeliveryStatus::Delivered);
+        assert_eq!(loaded_status.failure_kind, None);
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_metadata_store_reloads_retry_schedule_without_terminal_status() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let writer = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let route = route();
+        let schedule = MatrixRetrySchedule {
+            delivery_id: route.delivery_id,
+            scope: route.scope().clone(),
+            attempt_number: 2,
+            retry_after: Duration::from_secs(30),
+            reason: DeliveryReasonCode::MatrixRateLimited,
+            recorded_at: Utc::now(),
+        };
+
+        writer
+            .record_retry_scheduled(schedule.clone())
+            .await
+            .expect("persist retry schedule");
+
+        let reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(backend),
+            outbound_state_store(),
+        );
+        let loaded_schedule = reader
+            .load_retry_schedule(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load retry schedule")
+            .expect("retry schedule should persist across store instances");
+        let loaded_status = reader
+            .load_delivery_status(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load absent status");
+
+        assert_eq!(loaded_schedule.delivery_id, route.delivery_id);
+        assert_eq!(loaded_schedule.scope, route.scope().clone());
+        assert_eq!(loaded_schedule.attempt_number, 2);
+        assert_eq!(loaded_schedule.retry_after, Duration::from_secs(30));
+        assert_eq!(
+            loaded_schedule.reason,
+            DeliveryReasonCode::MatrixRateLimited
+        );
+        assert_eq!(loaded_status, None);
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_metadata_store_clears_retry_schedule_on_terminal_status() {
+        for status in [
+            OutboundDeliveryStatus::Delivered,
+            OutboundDeliveryStatus::Failed,
+            OutboundDeliveryStatus::DeadLettered,
+        ] {
+            let backend = Arc::new(InMemoryBackend::new());
+            let writer = FilesystemMatrixOutboundMetadataStore::new(
+                matrix_metadata_filesystem(Arc::clone(&backend)),
+                outbound_state_store(),
+            );
+            let route = route();
+
+            writer
+                .record_retry_scheduled(retry_schedule(&route))
+                .await
+                .expect("persist retry schedule");
+            writer
+                .update_delivery_status(delivery_status_request(&route, status))
+                .await
+                .expect("persist terminal status");
+
+            let reader = FilesystemMatrixOutboundMetadataStore::new(
+                matrix_metadata_filesystem(backend),
+                outbound_state_store(),
+            );
+            let loaded_schedule = reader
+                .load_retry_schedule(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load retry schedule after terminal status");
+
+            assert_eq!(
+                loaded_schedule, None,
+                "terminal status {status:?} must clear stale retry schedule"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_metadata_store_preserves_retry_schedule_on_pending_status() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let writer = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let route = route();
+        let schedule = retry_schedule(&route);
+
+        writer
+            .record_retry_scheduled(schedule.clone())
+            .await
+            .expect("persist retry schedule");
+        writer
+            .update_delivery_status(delivery_status_request(
+                &route,
+                OutboundDeliveryStatus::Pending,
+            ))
+            .await
+            .expect("persist pending status");
+
+        let reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(backend),
+            outbound_state_store(),
+        );
+        let loaded_schedule = reader
+            .load_retry_schedule(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load retry schedule after pending status")
+            .expect("pending status should preserve retry schedule");
+
+        assert_eq!(loaded_schedule.delivery_id, schedule.delivery_id);
+        assert_eq!(loaded_schedule.scope, schedule.scope);
+        assert_eq!(loaded_schedule.attempt_number, schedule.attempt_number);
+        assert_eq!(loaded_schedule.retry_after, schedule.retry_after);
+        assert_eq!(loaded_schedule.reason, schedule.reason);
     }
 
     #[tokio::test]
@@ -1250,7 +2053,7 @@ mod tests {
         ));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1300,7 +2103,7 @@ mod tests {
         ));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
@@ -1336,7 +2139,7 @@ mod tests {
         )));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
-                credential_handle_fingerprint: "cred_fp_1".into(),
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             });
         let store = FakeMatrixOutboundMetadataStore::default();
         let retry_policy = retry_policy();
