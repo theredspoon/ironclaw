@@ -289,11 +289,40 @@ impl MatrixDeliveryEvidenceV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedMatrixDeliveryEvidence(MatrixDeliveryEvidenceV1);
+
+impl ValidatedMatrixDeliveryEvidence {
+    pub fn new_redacted(
+        evidence: MatrixDeliveryEvidenceV1,
+    ) -> Result<Self, MatrixOutboundContractError> {
+        evidence.validate_redacted()?;
+        Ok(Self(evidence))
+    }
+
+    pub fn new_for_delivery(
+        evidence: MatrixDeliveryEvidenceV1,
+        command: &MatrixOutboundCommand,
+        metadata: &MatrixRouteMetadata,
+    ) -> Result<Self, MatrixOutboundContractError> {
+        evidence.validate_for_delivery(command, metadata)?;
+        Ok(Self(evidence))
+    }
+
+    pub fn as_inner(&self) -> &MatrixDeliveryEvidenceV1 {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> MatrixDeliveryEvidenceV1 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryError {
     pub reason: DeliveryReasonCode,
     pub retry_hint: Option<RetryHint>,
     pub status_family: Option<HttpStatusFamily>,
-    pub matrix_errcode: Option<String>,
+    pub matrix_errcode: Option<MatrixErrcode>,
     pub operator_summary: SafeOperatorSummary,
 }
 
@@ -305,6 +334,35 @@ impl DeliveryError {
             status_family: None,
             matrix_errcode: None,
             operator_summary: SafeOperatorSummary::for_reason(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixErrcode {
+    Forbidden,
+    UnknownToken,
+    UserDeactivated,
+    LimitExceeded,
+    NotFound,
+    BadJson,
+    TooLarge,
+    UnsupportedRoomVersion,
+    Other,
+}
+
+impl MatrixErrcode {
+    pub fn from_matrix_errcode(value: &str) -> Self {
+        match value {
+            "M_FORBIDDEN" => Self::Forbidden,
+            "M_UNKNOWN_TOKEN" => Self::UnknownToken,
+            "M_USER_DEACTIVATED" => Self::UserDeactivated,
+            "M_LIMIT_EXCEEDED" => Self::LimitExceeded,
+            "M_NOT_FOUND" => Self::NotFound,
+            "M_BAD_JSON" | "M_NOT_JSON" => Self::BadJson,
+            "M_TOO_LARGE" => Self::TooLarge,
+            "M_UNSUPPORTED_ROOM_VERSION" => Self::UnsupportedRoomVersion,
+            _ => Self::Other,
         }
     }
 }
@@ -388,6 +446,7 @@ pub trait RetryPolicy: Send + Sync {
 pub struct BoundedMatrixRetryPolicy {
     pub max_attempts: u32,
     pub fallback_after: Duration,
+    pub max_retry_after: Duration,
 }
 
 impl RetryPolicy for BoundedMatrixRetryPolicy {
@@ -410,9 +469,9 @@ impl RetryPolicy for BoundedMatrixRetryPolicy {
             };
         }
         MatrixRetryDecision::RetryAfter {
-            after: err
-                .retry_hint
-                .map_or(self.fallback_after, |hint| hint.after),
+            after: err.retry_hint.map_or(self.fallback_after, |hint| {
+                hint.after.min(self.max_retry_after)
+            }),
             reason: err.reason,
         }
     }
@@ -447,8 +506,23 @@ pub trait MatrixOutboundMetadataStore: Send + Sync {
     fn persist_evidence(
         &self,
         delivery_id: OutboundDeliveryId,
-        evidence: MatrixDeliveryEvidenceV1,
+        evidence: ValidatedMatrixDeliveryEvidence,
     ) -> Result<(), MatrixOutboundContractError>;
+
+    fn record_retry_scheduled(
+        &self,
+        schedule: MatrixRetrySchedule,
+    ) -> Result<(), MatrixOutboundContractError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRetrySchedule {
+    pub delivery_id: OutboundDeliveryId,
+    pub scope: TurnScope,
+    pub attempt_number: u32,
+    pub retry_after: Duration,
+    pub reason: DeliveryReasonCode,
+    pub recorded_at: DateTime<Utc>,
 }
 
 pub struct MatrixOutboundOrchestrator<'a> {
@@ -537,7 +611,9 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
             .await
         {
             DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(evidence)) => {
-                evidence.validate_for_delivery(&command, &metadata)?;
+                let evidence = ValidatedMatrixDeliveryEvidence::new_for_delivery(
+                    evidence, &command, &metadata,
+                )?;
                 self.metadata_store
                     .persist_evidence(attempt.delivery_id, evidence)?;
                 self.persist_terminal_status(
@@ -554,10 +630,21 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
             DeliveryPortResult::Rejected(error) => {
                 let decision = self.retry_policy.classify(&error, attempt.attempt_number);
                 match decision {
-                    MatrixRetryDecision::RetryAfter { .. } => Ok(MatrixOrchestratorOutcome {
-                        status: MatrixTerminalStatus::RetryScheduled,
-                        retry: Some(decision),
-                    }),
+                    MatrixRetryDecision::RetryAfter { after, reason } => {
+                        self.metadata_store
+                            .record_retry_scheduled(MatrixRetrySchedule {
+                                delivery_id: attempt.delivery_id,
+                                scope: validated_scope,
+                                attempt_number: attempt.attempt_number,
+                                retry_after: after,
+                                reason,
+                                recorded_at: Utc::now(),
+                            })?;
+                        Ok(MatrixOrchestratorOutcome {
+                            status: MatrixTerminalStatus::RetryScheduled,
+                            retry: Some(decision),
+                        })
+                    }
                     MatrixRetryDecision::DoNotRetry { terminal_status } => {
                         self.persist_terminal_status(
                             attempt.delivery_id,
@@ -710,6 +797,7 @@ pub mod fakes {
     pub struct FakeMatrixOutboundMetadataStore {
         statuses: Mutex<Vec<UpdateDeliveryStatusRequest>>,
         evidence: Mutex<Vec<(OutboundDeliveryId, MatrixDeliveryEvidenceV1)>>,
+        retry_schedules: Mutex<Vec<MatrixRetrySchedule>>,
     }
 
     impl FakeMatrixOutboundMetadataStore {
@@ -738,6 +826,13 @@ pub mod fakes {
         pub fn evidence(&self) -> Vec<(OutboundDeliveryId, MatrixDeliveryEvidenceV1)> {
             self.evidence.lock().expect("evidence lock").clone()
         }
+
+        pub fn retry_schedules(&self) -> Vec<MatrixRetrySchedule> {
+            self.retry_schedules
+                .lock()
+                .expect("retry schedule lock")
+                .clone()
+        }
     }
 
     impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
@@ -752,13 +847,23 @@ pub mod fakes {
         fn persist_evidence(
             &self,
             delivery_id: OutboundDeliveryId,
-            evidence: MatrixDeliveryEvidenceV1,
+            evidence: ValidatedMatrixDeliveryEvidence,
         ) -> Result<(), MatrixOutboundContractError> {
-            evidence.validate_redacted()?;
             self.evidence
                 .lock()
                 .expect("evidence lock")
-                .push((delivery_id, evidence));
+                .push((delivery_id, evidence.into_inner()));
+            Ok(())
+        }
+
+        fn record_retry_scheduled(
+            &self,
+            schedule: MatrixRetrySchedule,
+        ) -> Result<(), MatrixOutboundContractError> {
+            self.retry_schedules
+                .lock()
+                .expect("retry schedule lock")
+                .push(schedule);
             Ok(())
         }
     }
@@ -839,6 +944,7 @@ mod tests {
         BoundedMatrixRetryPolicy {
             max_attempts: 3,
             fallback_after: Duration::from_secs(1),
+            max_retry_after: Duration::from_secs(60),
         }
     }
 
@@ -1102,6 +1208,7 @@ mod tests {
         assert_eq!(error.reason, DeliveryReasonCode::MatrixMalformedResponse);
         assert!(store.statuses().is_empty());
         assert!(store.evidence().is_empty());
+        assert!(store.retry_schedules().is_empty());
     }
 
     #[tokio::test]
@@ -1143,5 +1250,42 @@ mod tests {
         );
         assert!(store.statuses().is_empty());
         assert!(store.evidence().is_empty());
+        let retry_schedules = store.retry_schedules();
+        assert_eq!(retry_schedules.len(), 1);
+        assert_eq!(retry_schedules[0].delivery_id, route.delivery_id);
+        assert_eq!(retry_schedules[0].attempt_number, 1);
+        assert_eq!(retry_schedules[0].retry_after, Duration::from_secs(1));
+        assert_eq!(retry_schedules[0].reason, DeliveryReasonCode::MatrixTimeout);
+    }
+
+    #[test]
+    fn retry_policy_caps_untrusted_retry_hint_duration() {
+        let policy = retry_policy();
+        let error = DeliveryError {
+            retry_hint: Some(RetryHint {
+                after: Duration::from_secs(60 * 60 * 24),
+            }),
+            ..DeliveryError::new(DeliveryReasonCode::MatrixRateLimited)
+        };
+
+        assert_eq!(
+            policy.classify(&error, 1),
+            MatrixRetryDecision::RetryAfter {
+                after: Duration::from_secs(60),
+                reason: DeliveryReasonCode::MatrixRateLimited
+            }
+        );
+    }
+
+    #[test]
+    fn matrix_errcode_is_bounded_to_known_variants_or_other() {
+        assert_eq!(
+            MatrixErrcode::from_matrix_errcode("M_LIMIT_EXCEEDED"),
+            MatrixErrcode::LimitExceeded
+        );
+        assert_eq!(
+            MatrixErrcode::from_matrix_errcode("M_FORBIDDEN_WITH_UNBOUNDED_TEXT"),
+            MatrixErrcode::Other
+        );
     }
 }

@@ -1,12 +1,12 @@
 use chrono::Utc;
 use ironclaw_matrix_adapter::{
     EncryptionState, MatrixOutboundCommand, MatrixParseInput, MatrixParsePolicy,
-    MatrixProductAdapter, MatrixProductAdapterConfig, MatrixReasonCode, MatrixRenderContext,
-    MatrixRenderInput, MatrixRouteMetadata, RelationKind, parse_matrix_event,
-    render_matrix_outbound,
+    MatrixPendingIntentStore, MatrixPendingIntentStoreError, MatrixProductAdapter,
+    MatrixProductAdapterConfig, MatrixReasonCode, MatrixRenderContext, MatrixRenderInput,
+    MatrixRouteMetadata, RelationKind, parse_matrix_event, render_matrix_outbound,
 };
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, EgressRequest, ExternalActorRef,
+    AdapterInstallationId, AuthRequirement, DeliveryAttemptId, EgressRequest, ExternalActorRef,
     ExternalConversationRef, FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView,
     ParsedProductInbound, ProductAdapter, ProductAdapterError, ProductAdapterId,
     ProductAttachmentKind, ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload,
@@ -957,6 +957,28 @@ async fn matrix_product_adapter_defers_outbound_delivery_after_render_validation
     assert!(!stored_intent_json.contains("token"));
     assert!(egress.calls().is_empty());
     assert!(sink.statuses().is_empty());
+}
+
+#[test]
+fn matrix_pending_intent_store_rejects_unbounded_growth() {
+    let store = MatrixPendingIntentStore::with_capacity(1);
+    let first_attempt = DeliveryAttemptId::new_v4();
+    let second_attempt = DeliveryAttemptId::new_v4();
+    let command = MatrixOutboundCommand::SendMessage {
+        room_id: "!room:example.org".to_string(),
+        txn_id: "txn-1".to_string(),
+        body: json!({"msgtype": "m.text", "body": "hello"}),
+    };
+
+    store
+        .insert(first_attempt, command.clone())
+        .expect("first pending intent fits");
+    assert_eq!(
+        store.insert(second_attempt, command),
+        Err(MatrixPendingIntentStoreError::CapacityExceeded { max_intents: 1 })
+    );
+    assert!(store.take(first_attempt).is_some());
+    assert_eq!(store.take(first_attempt), None);
 }
 
 #[test]

@@ -4,6 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
+use std::fmt;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -30,6 +32,8 @@ use serde_json::{Map, Value};
 #[cfg(not(target_arch = "wasm32"))]
 pub mod installation_policy;
 
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PENDING_MATRIX_INTENTS: usize = 1024;
 const DIAGNOSTIC_MESSAGE_MAX: usize = 100;
 const MAX_EVENT_FIELD: usize = 512;
 const MAX_FORMATTED_BODY: usize = 64 * 1024;
@@ -104,18 +108,48 @@ pub struct MatrixProductAdapter {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MatrixPendingIntentStore {
     intents: Arc<Mutex<HashMap<DeliveryAttemptId, MatrixOutboundCommand>>>,
+    max_intents: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for MatrixPendingIntentStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl MatrixPendingIntentStore {
-    pub fn insert(&self, attempt_id: DeliveryAttemptId, command: MatrixOutboundCommand) {
-        self.intents
+    pub fn new() -> Self {
+        Self::with_capacity(MAX_PENDING_MATRIX_INTENTS)
+    }
+
+    pub fn with_capacity(max_intents: usize) -> Self {
+        Self {
+            intents: Arc::new(Mutex::new(HashMap::new())),
+            max_intents,
+        }
+    }
+
+    pub fn insert(
+        &self,
+        attempt_id: DeliveryAttemptId,
+        command: MatrixOutboundCommand,
+    ) -> Result<(), MatrixPendingIntentStoreError> {
+        let mut intents = self
+            .intents
             .lock()
-            .expect("matrix pending intent store lock")
-            .insert(attempt_id, command);
+            .expect("matrix pending intent store lock");
+        if !intents.contains_key(&attempt_id) && intents.len() >= self.max_intents {
+            return Err(MatrixPendingIntentStoreError::CapacityExceeded {
+                max_intents: self.max_intents,
+            });
+        }
+        intents.insert(attempt_id, command);
+        Ok(())
     }
 
     pub fn take(&self, attempt_id: DeliveryAttemptId) -> Option<MatrixOutboundCommand> {
@@ -125,6 +159,29 @@ impl MatrixPendingIntentStore {
             .remove(&attempt_id)
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixPendingIntentStoreError {
+    CapacityExceeded { max_intents: usize },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl fmt::Display for MatrixPendingIntentStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExceeded { max_intents } => {
+                write!(
+                    f,
+                    "matrix pending intent store capacity exceeded: {max_intents}"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::error::Error for MatrixPendingIntentStoreError {}
 
 #[cfg(not(target_arch = "wasm32"))]
 impl MatrixProductAdapter {
@@ -139,7 +196,7 @@ impl MatrixProductAdapter {
         Ok(Self {
             config,
             capabilities: ProductAdapterCapabilities::external_channel_default(),
-            pending_intents: MatrixPendingIntentStore::default(),
+            pending_intents: MatrixPendingIntentStore::new(),
         })
     }
 
@@ -672,7 +729,11 @@ impl ProductAdapter for MatrixProductAdapter {
         let attempt_id = envelope.delivery_attempt_id;
         let command = render_matrix_outbound(MatrixRenderInput { envelope, context })
             .map_err(map_matrix_diagnostic_to_adapter_error)?;
-        self.pending_intents.insert(attempt_id, command);
+        self.pending_intents
+            .insert(attempt_id, command)
+            .map_err(|error| ProductAdapterError::WorkflowTransient {
+                reason: RedactedString::new(error.to_string()),
+            })?;
 
         Ok(ProductRenderOutcome::Deferred)
     }
