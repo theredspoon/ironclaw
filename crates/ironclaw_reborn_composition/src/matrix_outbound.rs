@@ -2557,6 +2557,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orchestrator_terminalizes_wrong_credential_evidence_after_retry_exhaustion() {
+        let command = command();
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let mut evidence = accepted_evidence(&command);
+        evidence.installation_scoped_credential_ref = canonical_fingerprint("other-credential");
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(evidence),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let retry_policy = retry_policy();
+        let orchestrator =
+            MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+        let mut exhausted_attempt = attempt(&route, &command);
+        exhausted_attempt.attempt_number = 3;
+
+        let error = orchestrator
+            .consume_pending_intent(command.clone(), route.clone(), grant, exhausted_attempt)
+            .await
+            .expect_err("wrong credential evidence at max attempts must terminalize");
+
+        assert_eq!(error.reason, DeliveryReasonCode::MatrixMalformedResponse);
+        assert_eq!(store.statuses(), vec![OutboundDeliveryStatus::Failed]);
+        assert_eq!(
+            store.failure_kinds(),
+            vec![Some(DeliveryFailureKind::TransportUnavailable)]
+        );
+        assert!(store.evidence().is_empty());
+        assert!(store.retry_schedules().is_empty());
+    }
+
+    #[tokio::test]
     async fn orchestrator_schedules_retry_without_terminal_status_for_retryable_error() {
         let command = command();
         let route = route();
