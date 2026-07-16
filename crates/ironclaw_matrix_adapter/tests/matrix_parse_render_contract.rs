@@ -941,13 +941,18 @@ async fn matrix_product_adapter_defers_outbound_delivery_after_render_validation
         .expect("product adapter render should succeed");
 
     assert!(matches!(outcome, ProductRenderOutcome::Deferred));
+    let stored_intent = adapter.pending_matrix_intent(attempt_id);
+    assert_eq!(
+        stored_intent,
+        Some(expected_command),
+        "Deferred Matrix render must preserve exact command intent for the shared outbound bridge"
+    );
     assert_eq!(
         adapter.pending_matrix_intent(attempt_id),
-        Some(expected_command),
-        "Deferred Matrix render must preserve exact command intent for R003A"
+        None,
+        "pending Matrix intent must be consumed once by the shared outbound bridge"
     );
-    let stored_intent_json =
-        serde_json::to_string(&adapter.pending_matrix_intent(attempt_id)).expect("intent json");
+    let stored_intent_json = serde_json::to_string(&stored_intent).expect("intent json");
     assert!(!stored_intent_json.contains("credential"));
     assert!(!stored_intent_json.contains("token"));
     assert!(egress.calls().is_empty());

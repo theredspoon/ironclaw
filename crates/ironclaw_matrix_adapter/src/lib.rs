@@ -118,12 +118,11 @@ impl MatrixPendingIntentStore {
             .insert(attempt_id, command);
     }
 
-    pub fn get(&self, attempt_id: DeliveryAttemptId) -> Option<MatrixOutboundCommand> {
+    pub fn take(&self, attempt_id: DeliveryAttemptId) -> Option<MatrixOutboundCommand> {
         self.intents
             .lock()
             .expect("matrix pending intent store lock")
-            .get(&attempt_id)
-            .cloned()
+            .remove(&attempt_id)
     }
 }
 
@@ -152,7 +151,7 @@ impl MatrixProductAdapter {
         &self,
         attempt_id: DeliveryAttemptId,
     ) -> Option<MatrixOutboundCommand> {
-        self.pending_intents.get(attempt_id)
+        self.pending_intents.take(attempt_id)
     }
 }
 

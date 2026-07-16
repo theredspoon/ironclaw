@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-// Source-owner verification for ICWM-R002D Group 0:
+// Source-owner verification for Matrix ProductWorkflow composition:
 // - ProductAdapter boundary: ironclaw_matrix_adapter::MatrixProductAdapter
 //   implements ironclaw_product_adapters::ProductAdapter.
 // - ProductWorkflow outbound composition: ironclaw_product_workflow owns
@@ -10,7 +10,7 @@ use std::sync::Mutex;
 // - Outbound target resolution and attempt/status metadata: ironclaw_outbound
 //   owns OutboundPolicyService, ReplyTargetBindingValidator,
 //   InMemoryOutboundStateStore, and OutboundDeliveryStatus.
-// - Matrix transport and R003A terminal delivery evidence are intentionally not
+// - Matrix transport and terminal delivery evidence are intentionally not
 //   modeled here; ProductRenderOutcome::Deferred is the required handoff shape.
 
 use async_trait::async_trait;
@@ -196,7 +196,7 @@ impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
 }
 
 #[tokio::test]
-async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_r003a() {
+async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_bridge() {
     let scope = scope();
     let store = InMemoryOutboundStateStore::default();
     let validator = RecordingReplyTargetBindingValidator::default();
@@ -239,17 +239,20 @@ async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_
         matches!(render_outcome, ProductRenderOutcome::Deferred),
         "Matrix command JSON or SynchronousResponse is not delivery evidence"
     );
+    let stored_intent = adapter.pending_matrix_intent(attempt.delivery_id.as_uuid());
     let Some(MatrixOutboundCommand::SendMessage {
-        room_id,
-        txn_id,
-        body,
-    }) = adapter.pending_matrix_intent(attempt.delivery_id.as_uuid())
+        ref room_id,
+        ref txn_id,
+        ref body,
+    }) = stored_intent
     else {
-        panic!("R002D must preserve exact Matrix send intent for the R003A bridge");
+        panic!(
+            "ProductWorkflow must preserve exact Matrix send intent for the shared outbound bridge"
+        );
     };
     assert_eq!(room_id, "!room:example.org");
     assert_eq!(
-        txn_id,
+        txn_id.as_str(),
         format!("ironclaw-{}", attempt.delivery_id.as_uuid())
     );
     assert_eq!(body["msgtype"], "m.text");
@@ -260,9 +263,12 @@ async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_
         body["m.relates_to"]["m.in_reply_to"]["event_id"],
         "$reply:example.org"
     );
-    let stored_intent_json =
-        serde_json::to_string(&adapter.pending_matrix_intent(attempt.delivery_id.as_uuid()))
-            .expect("intent json");
+    assert_eq!(
+        adapter.pending_matrix_intent(attempt.delivery_id.as_uuid()),
+        None,
+        "shared outbound bridge must consume the Matrix intent exactly once"
+    );
+    let stored_intent_json = serde_json::to_string(&stored_intent).expect("intent json");
     assert!(!stored_intent_json.contains("credential"));
     assert!(!stored_intent_json.contains("token"));
     assert_eq!(validator.calls(), vec![reply_target()]);
