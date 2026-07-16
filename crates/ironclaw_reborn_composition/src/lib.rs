@@ -41,6 +41,7 @@ mod local_dev_authorization;
 mod local_dev_capability_policy;
 mod local_dev_mounts;
 mod local_runtime_profile;
+pub mod matrix_outbound;
 mod observability;
 mod outbound;
 mod product_auth;

@@ -447,6 +447,86 @@ impl ProductAdapter for SynchronousResponseAdapter {
     }
 }
 
+struct MatrixCommandJsonAdapter {
+    adapter_id: ProductAdapterId,
+    installation_id: AdapterInstallationId,
+    command_intents: Mutex<Vec<ProductSynchronousResponse>>,
+}
+
+impl MatrixCommandJsonAdapter {
+    fn new() -> Self {
+        Self {
+            adapter_id: ProductAdapterId::new("matrix_command_intent").expect("valid adapter id"),
+            installation_id: AdapterInstallationId::new("matrix_install").expect("valid install"),
+            command_intents: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn command_intents(&self) -> Vec<ProductSynchronousResponse> {
+        self.command_intents
+            .lock()
+            .expect("matrix command intent lock")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl ProductAdapter for MatrixCommandJsonAdapter {
+    fn adapter_id(&self) -> &ProductAdapterId {
+        &self.adapter_id
+    }
+
+    fn installation_id(&self) -> &AdapterInstallationId {
+        &self.installation_id
+    }
+
+    fn surface_kind(&self) -> ProductSurfaceKind {
+        ProductSurfaceKind::SynchronousApi
+    }
+
+    fn capabilities(&self) -> &ProductAdapterCapabilities {
+        &SYNC_ADAPTER_CAPABILITIES
+    }
+
+    fn auth_requirement(&self) -> &AuthRequirement {
+        static AUTH_REQUIREMENT: AuthRequirement = AuthRequirement::BearerToken;
+        &AUTH_REQUIREMENT
+    }
+
+    fn parse_inbound(
+        &self,
+        _raw_payload: &[u8],
+        _auth_evidence: &ironclaw_product_adapters::ProtocolAuthEvidence,
+    ) -> Result<ironclaw_product_adapters::ParsedProductInbound, ProductAdapterError> {
+        Err(ProductAdapterError::Internal {
+            detail: ironclaw_product_adapters::RedactedString::new("not used"),
+        })
+    }
+
+    async fn render_outbound(
+        &self,
+        _envelope: ProductOutboundEnvelope,
+        _egress: &dyn ProtocolHttpEgress,
+        _delivery_sink: &dyn OutboundDeliverySink,
+    ) -> Result<ProductRenderOutcome, ProductAdapterError> {
+        self.command_intents
+            .lock()
+            .expect("matrix command intent lock")
+            .push(ProductSynchronousResponse {
+                content_type: "application/json".into(),
+                body: br#"{
+                    "protocol": "matrix",
+                    "command_kind": "send_text",
+                    "transaction_id": "txn-product-workflow-matrix-1",
+                    "reply_target_binding_ref": "matrix-room-binding",
+                    "egress_target_index": 0
+                }"#
+                .to_vec(),
+            });
+        Ok(ProductRenderOutcome::Deferred)
+    }
+}
+
 struct DeferredAdapter {
     adapter_id: ProductAdapterId,
     installation_id: AdapterInstallationId,
@@ -828,6 +908,58 @@ async fn synchronous_response_marks_attempt_delivered() {
     assert_eq!(
         attempts[0].status,
         ironclaw_outbound::OutboundDeliveryStatus::Delivered
+    );
+}
+
+#[tokio::test]
+async fn matrix_command_intent_wrapper_returns_deferred_and_keeps_attempt_pending() {
+    let scope = scope();
+    let store = InMemoryOutboundStateStore::default();
+    let validator = FakeReplyTargetBindingValidator::default();
+    validator.allow(validated_reply_target());
+    let preferences = FakePreferenceRepository::default();
+    seed_preference(&preferences, &scope);
+    let resolver = FakeProductOutboundTargetResolver::default();
+    let policy = configured_policy(&store, &validator);
+    let adapter = MatrixCommandJsonAdapter::new();
+    let egress = FakeProtocolHttpEgress::new(["matrix.example.test".to_string()]);
+    let sink = FakeOutboundDeliverySink::new();
+
+    let outcome = prepare_and_render_product_outbound(
+        &policy,
+        &preferences,
+        &resolver,
+        ProductOutboundDeliveryRequest {
+            delivery: delivery_request(scope.clone()),
+            payload: final_reply_payload(),
+            projection_cursor: ProjectionCursor::new("cursor:outbound:matrix-command")
+                .expect("valid cursor"),
+            adapter: &adapter,
+            egress: &egress,
+            delivery_sink: &sink,
+            require_direct_message_target: false,
+        },
+    )
+    .await
+    .expect("delivery succeeds");
+
+    let ProductOutboundDeliveryOutcome::Rendered { render_outcome, .. } = outcome else {
+        panic!("expected rendered outcome");
+    };
+    assert!(matches!(render_outcome, ProductRenderOutcome::Deferred));
+    let command_intents = adapter.command_intents();
+    assert_eq!(command_intents.len(), 1);
+    let command_json: serde_json::Value =
+        serde_json::from_slice(&command_intents[0].body).expect("matrix command intent json");
+    assert_eq!(command_json["protocol"], "matrix");
+    assert_eq!(command_json["command_kind"], "send_text");
+    assert!(egress.calls().is_empty());
+    assert!(sink.statuses().is_empty());
+    let attempts = store.list_delivery_attempts(scope).await.unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].status,
+        ironclaw_outbound::OutboundDeliveryStatus::Pending
     );
 }
 
