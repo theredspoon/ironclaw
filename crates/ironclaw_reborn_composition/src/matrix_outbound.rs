@@ -40,6 +40,44 @@ pub struct MatrixOutboundCommand {
     pub body: MatrixMessageBody,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixPendingIntentBridgeContext {
+    pub reply_target_binding_ref: ReplyTargetBindingRef,
+    pub egress_target_index: u32,
+}
+
+#[cfg(test)]
+impl MatrixOutboundCommand {
+    pub fn from_adapter_pending_intent(
+        intent: ironclaw_matrix_adapter::MatrixOutboundCommand,
+        context: MatrixPendingIntentBridgeContext,
+    ) -> Result<Self, DeliveryError> {
+        let ironclaw_matrix_adapter::MatrixOutboundCommand::SendMessage {
+            room_id,
+            txn_id,
+            body,
+        } = intent
+        else {
+            return Err(DeliveryError::new(
+                DeliveryReasonCode::UnsupportedMatrixCommand,
+            ));
+        };
+
+        Ok(Self {
+            command_kind: MatrixCommandKind::SendText,
+            transaction_id: MatrixTransactionId::new(txn_id)
+                .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnsupportedMatrixCommand))?,
+            reply_target_binding_ref: context.reply_target_binding_ref,
+            egress_target_index: context.egress_target_index,
+            room_id: MatrixRoomId::new(room_id)
+                .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnsupportedMatrixCommand))?,
+            body: MatrixMessageBody::new(body)
+                .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnsupportedMatrixCommand))?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixCommandKind {
@@ -1294,18 +1332,41 @@ mod tests {
         FakeMatrixCredentialResolver, FakeMatrixDeliveryPort, FakeMatrixOutboundMetadataStore,
         route_forgery_fixture,
     };
+    use async_trait::async_trait;
     use ironclaw_event_projections::ProjectionCursor;
     use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
     use ironclaw_host_api::{
         AgentId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId, TenantId,
         ThreadId, UserId, VirtualPath,
     };
-    use ironclaw_outbound::{
-        AdvanceSubscriptionCursorRequest, LoadSubscriptionCursorRequest, OutboundDeliveryAttempt,
-        OutboundPushPlan, OutboundPushTargetRequest, ProjectionSubscriptionRecord,
-        ThreadNotificationPolicy,
+    use ironclaw_matrix_adapter::{
+        MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
     };
+    use ironclaw_outbound::{
+        AdvanceSubscriptionCursorRequest, CommunicationDeliveryIntent,
+        CommunicationDeliveryResolutionRequest, CommunicationModality, CommunicationPreferenceKey,
+        CommunicationPreferenceRecord, CommunicationPreferenceRepository,
+        CommunicationPreferenceVersion, DeliveryDefaultScope, InMemoryOutboundStateStore,
+        LoadSubscriptionCursorRequest, OutboundDeliveryAttempt, OutboundPolicyService,
+        OutboundPushPlan, OutboundPushTargetRequest, ProjectionSubscriptionRecord,
+        ReplyTargetBindingClaim, ReplyTargetBindingValidator, RequestedOutboundContext,
+        RequestedOutboundKind, ThreadNotificationPolicy, ThreadProjectionAccessClaim,
+        ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
+        VersionedCommunicationPreferenceRecord, WriteCommunicationPreferenceRequest,
+    };
+    use ironclaw_product_adapters::{
+        AdapterInstallationId, AuthRequirement, ExternalConversationRef, FakeOutboundDeliverySink,
+        FakeProtocolHttpEgress, FinalReplyView, ProductAdapterId, ProductOutboundPayload,
+        ProductRenderOutcome, ProjectionCursor as ProductProjectionCursor,
+    };
+    use ironclaw_product_workflow::{
+        ProductOutboundDeliveryOutcome, ProductOutboundDeliveryRequest,
+        ProductOutboundTargetResolver, ProductWorkflowError, VerifiedProductOutboundTargetMetadata,
+        prepare_and_render_product_outbound,
+    };
+    use ironclaw_turns::{TurnActor, TurnRunId};
     use serde_json::json;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::Mutex;
 
@@ -1524,6 +1585,209 @@ mod tests {
         Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts))
     }
 
+    #[derive(Default)]
+    struct AllowAllProjectionAccessPolicy;
+
+    #[async_trait]
+    impl ThreadProjectionAccessPolicy for AllowAllProjectionAccessPolicy {
+        async fn authorize_projection_access(
+            &self,
+            request: ThreadProjectionAccessRequest,
+        ) -> Result<ThreadProjectionAccessClaim, OutboundError> {
+            Ok(ThreadProjectionAccessClaim {
+                actor: request.actor,
+                scope: request.scope,
+                thread_id: request.thread_id,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingReplyTargetBindingValidator {
+        allowed_targets: Mutex<HashSet<ReplyTargetBindingRef>>,
+        calls: Mutex<Vec<ReplyTargetBindingRef>>,
+    }
+
+    impl RecordingReplyTargetBindingValidator {
+        fn allow(&self, target: ReplyTargetBindingRef) {
+            self.allowed_targets
+                .lock()
+                .expect("validator lock")
+                .insert(target);
+        }
+    }
+
+    #[async_trait]
+    impl ReplyTargetBindingValidator for RecordingReplyTargetBindingValidator {
+        async fn validate_reply_target(
+            &self,
+            request: ironclaw_outbound::ReplyTargetValidationRequest,
+        ) -> Result<ReplyTargetBindingClaim, OutboundError> {
+            self.calls
+                .lock()
+                .expect("validator lock")
+                .push(request.candidate.target.clone());
+            if self
+                .allowed_targets
+                .lock()
+                .expect("validator lock")
+                .contains(&request.candidate.target)
+            {
+                Ok(ReplyTargetBindingClaim::new(request.candidate.target))
+            } else {
+                Err(OutboundError::AccessDenied)
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingPreferenceRepository {
+        records: Mutex<HashMap<CommunicationPreferenceKey, VersionedCommunicationPreferenceRecord>>,
+    }
+
+    impl RecordingPreferenceRepository {
+        fn seed(&self, record: CommunicationPreferenceRecord) {
+            self.records.lock().expect("preference lock").insert(
+                record.key(),
+                VersionedCommunicationPreferenceRecord {
+                    record,
+                    version: CommunicationPreferenceVersion::from_raw(1),
+                },
+            );
+        }
+    }
+
+    #[async_trait]
+    impl CommunicationPreferenceRepository for RecordingPreferenceRepository {
+        async fn put_communication_preference(
+            &self,
+            record: CommunicationPreferenceRecord,
+        ) -> Result<(), OutboundError> {
+            self.seed(record);
+            Ok(())
+        }
+
+        async fn load_communication_preference(
+            &self,
+            key: CommunicationPreferenceKey,
+        ) -> Result<Option<VersionedCommunicationPreferenceRecord>, OutboundError> {
+            Ok(self
+                .records
+                .lock()
+                .expect("preference lock")
+                .get(&key)
+                .cloned())
+        }
+
+        async fn write_communication_preference(
+            &self,
+            request: WriteCommunicationPreferenceRequest,
+        ) -> Result<VersionedCommunicationPreferenceRecord, OutboundError> {
+            let record = VersionedCommunicationPreferenceRecord {
+                record: request.record,
+                version: CommunicationPreferenceVersion::from_raw(1),
+            };
+            self.records
+                .lock()
+                .expect("preference lock")
+                .insert(record.record.key(), record.clone());
+            Ok(record)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProductOutboundTargetResolver;
+
+    #[async_trait]
+    impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
+        async fn resolve_product_outbound_target_metadata(
+            &self,
+            _target: &ironclaw_outbound::ValidatedReplyTargetBinding,
+            _require_direct_message: bool,
+        ) -> Result<VerifiedProductOutboundTargetMetadata, ProductWorkflowError> {
+            Ok(VerifiedProductOutboundTargetMetadata {
+                external_conversation_ref: ExternalConversationRef::new(
+                    None,
+                    "!room:example.org",
+                    Some("$root:example.org"),
+                    Some("$reply:example.org"),
+                )
+                .expect("valid Matrix conversation ref"),
+                external_actor_ref: None,
+            })
+        }
+    }
+
+    fn matrix_product_adapter() -> MatrixProductAdapter {
+        MatrixProductAdapter::new(MatrixProductAdapterConfig {
+            adapter_id: ProductAdapterId::new("matrix").expect("valid adapter id"),
+            installation_id: AdapterInstallationId::new("inst_matrix")
+                .expect("valid installation id"),
+            parse_policy: MatrixParsePolicy {
+                allowed_rooms: vec!["!room:example.org".to_string()],
+                allowed_senders: vec!["@alice:example.org".to_string()],
+            },
+            auth_requirement: AuthRequirement::SharedSecretHeader {
+                header_name: "x-matrix-webhook-secret".to_string(),
+            },
+        })
+        .expect("explicit Matrix policy")
+    }
+
+    fn workflow_actor() -> TurnActor {
+        TurnActor::new(UserId::new("user-matrix-outbound").expect("valid user"))
+    }
+
+    fn workflow_reply_target() -> ReplyTargetBindingRef {
+        ReplyTargetBindingRef::new("matrix:!room:example.org").expect("valid reply target")
+    }
+
+    fn requested_matrix_delivery(
+        scope: TurnScope,
+    ) -> ironclaw_outbound::PrepareCommunicationDeliveryRequest {
+        ironclaw_outbound::PrepareCommunicationDeliveryRequest {
+            resolution_request: CommunicationDeliveryResolutionRequest {
+                scope,
+                actor: workflow_actor(),
+                modality: CommunicationModality::Text,
+                intent: CommunicationDeliveryIntent::RequestedOutbound(RequestedOutboundContext {
+                    requested_target: workflow_reply_target(),
+                    requested_kind: RequestedOutboundKind::ProductMessage,
+                }),
+            },
+            turn_run_id: Some(TurnRunId::new()),
+            projection_ref: ironclaw_outbound::ProjectionUpdateRef::new(
+                "projection:matrix:composition-bridge",
+            )
+            .expect("valid projection ref"),
+            attempted_at: Utc::now(),
+        }
+    }
+
+    fn workflow_preference_record(scope: &TurnScope) -> CommunicationPreferenceRecord {
+        CommunicationPreferenceRecord {
+            scope: DeliveryDefaultScope::personal(
+                scope.tenant_id.clone(),
+                workflow_actor().user_id.clone(),
+            ),
+            final_reply_target: Some(workflow_reply_target()),
+            progress_target: None,
+            approval_prompt_target: None,
+            auth_prompt_target: None,
+            default_modality: Some(CommunicationModality::Text),
+            updated_at: Utc::now(),
+            updated_by: UserId::new("pref-updater").expect("valid updater"),
+        }
+    }
+
+    fn matrix_workflow_payload() -> ProductOutboundPayload {
+        ProductOutboundPayload::FinalReply(FinalReplyView {
+            turn_run_id: TurnRunId::new(),
+            text: "hello Matrix through ProductWorkflow".to_string(),
+            generated_at: Utc::now(),
+        })
+    }
+
     #[tokio::test]
     async fn orchestrator_consumes_pending_matrix_intent_and_records_delivered_evidence() {
         let command = command();
@@ -1566,6 +1830,120 @@ mod tests {
             store.evidence()[0].1.event_id_fingerprint,
             canonical_fingerprint("event-1")
         );
+    }
+
+    #[tokio::test]
+    async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without_http() {
+        let workflow_scope = scope();
+        let outbound_store = InMemoryOutboundStateStore::default();
+        let validator = RecordingReplyTargetBindingValidator::default();
+        validator.allow(workflow_reply_target());
+        let preferences = RecordingPreferenceRepository::default();
+        preferences.seed(workflow_preference_record(&workflow_scope));
+        let resolver = RecordingProductOutboundTargetResolver;
+        let access_policy = AllowAllProjectionAccessPolicy;
+        let outbound_policy =
+            OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
+        let adapter = matrix_product_adapter();
+        let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+        let delivery_sink = FakeOutboundDeliverySink::new();
+
+        let outcome = prepare_and_render_product_outbound(
+            &outbound_policy,
+            &preferences,
+            &resolver,
+            ProductOutboundDeliveryRequest {
+                delivery: requested_matrix_delivery(workflow_scope.clone()),
+                payload: matrix_workflow_payload(),
+                projection_cursor: ProductProjectionCursor::new("cursor:matrix:composition-bridge")
+                    .expect("valid projection cursor"),
+                adapter: &adapter,
+                egress: &egress,
+                delivery_sink: &delivery_sink,
+                require_direct_message_target: false,
+            },
+        )
+        .await
+        .expect("Matrix adapter should render through shared ProductWorkflow outbound");
+
+        let ProductOutboundDeliveryOutcome::Rendered {
+            attempt: outbound_attempt,
+            render_outcome,
+        } = outcome
+        else {
+            panic!("expected Matrix outbound to reach shared render path");
+        };
+        assert!(matches!(render_outcome, ProductRenderOutcome::Deferred));
+        let attempts = outbound_store
+            .list_delivery_attempts(workflow_scope.clone())
+            .await
+            .expect("list attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].delivery_id, outbound_attempt.delivery_id);
+        assert_eq!(attempts[0].status, OutboundDeliveryStatus::Pending);
+
+        let adapter_intent = adapter
+            .pending_matrix_intent(outbound_attempt.delivery_id.as_uuid())
+            .expect("adapter should hold pending Matrix intent for bridge handoff");
+        let command = MatrixOutboundCommand::from_adapter_pending_intent(
+            adapter_intent,
+            MatrixPendingIntentBridgeContext {
+                reply_target_binding_ref: workflow_reply_target(),
+                egress_target_index: 0,
+            },
+        )
+        .expect("composition bridge should convert trusted Matrix intent");
+        let owner = owner();
+        let route = FrozenProductDeliveryRoute::mint_for_matrix(
+            &owner,
+            outbound_attempt.delivery_id,
+            workflow_scope,
+            "inst_matrix",
+            "matrix",
+            MatrixRouteMetadata {
+                policy_revision: "policy-rev-1".into(),
+                homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
+                room_fingerprint: command.room_id.fingerprint(),
+                egress_target_index: 0,
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                reply_target_binding_ref: workflow_reply_target(),
+                allowed_command_kinds: vec![MatrixCommandKind::SendText],
+            },
+        );
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let retry_policy = retry_policy();
+        let orchestrator =
+            MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+
+        let outcome = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                DeliveryAttemptContext {
+                    delivery_id: outbound_attempt.delivery_id,
+                    attempt_number: 1,
+                    transaction_id: command.transaction_id.clone(),
+                    started_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("converted pending intent should be delivered by fake port");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::Delivered);
+        assert_eq!(port.calls(), vec![ProtocolDeliveryIntent::Matrix(command)]);
+        assert_eq!(store.statuses(), vec![OutboundDeliveryStatus::Delivered]);
+        assert_eq!(store.failure_kinds(), vec![None]);
+        assert_eq!(store.evidence().len(), 1);
     }
 
     #[tokio::test]
