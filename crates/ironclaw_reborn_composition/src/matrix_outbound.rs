@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ironclaw_common::hashing::sha256_hex;
 use ironclaw_outbound::{
     DeliveryFailureKind, OutboundDeliveryId, OutboundDeliveryStatus, UpdateDeliveryStatusRequest,
 };
@@ -55,6 +56,10 @@ impl MatrixTransactionId {
     }
 }
 
+fn matrix_room_fingerprint(room_id: &str) -> String {
+    format!("sha256:{}", sha256_hex(room_id.as_bytes()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixRoomId(String);
 
@@ -69,6 +74,10 @@ impl MatrixRoomId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn fingerprint(&self) -> String {
+        matrix_room_fingerprint(&self.0)
     }
 }
 
@@ -212,7 +221,8 @@ pub fn validate_matrix_route_grant(
         .contains(&command.command_kind)
         && grant.allowed_command_kinds.contains(&command.command_kind)
         && metadata.reply_target_binding_ref == command.reply_target_binding_ref
-        && metadata.egress_target_index == command.egress_target_index;
+        && metadata.egress_target_index == command.egress_target_index
+        && metadata.room_fingerprint == command.room_id.fingerprint();
 
     if matches_route && command_allowed {
         Ok(ValidatedDeliveryRoute { route })
@@ -611,9 +621,18 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
             .await
         {
             DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(evidence)) => {
-                let evidence = ValidatedMatrixDeliveryEvidence::new_for_delivery(
+                let evidence = match ValidatedMatrixDeliveryEvidence::new_for_delivery(
                     evidence, &command, &metadata,
-                )?;
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        return self.apply_delivery_error(
+                            DeliveryError::from(error),
+                            &attempt,
+                            validated_scope,
+                        );
+                    }
+                };
                 self.metadata_store
                     .persist_evidence(attempt.delivery_id, evidence)?;
                 self.persist_terminal_status(
@@ -628,33 +647,42 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 })
             }
             DeliveryPortResult::Rejected(error) => {
-                let decision = self.retry_policy.classify(&error, attempt.attempt_number);
-                match decision {
-                    MatrixRetryDecision::RetryAfter { after, reason } => {
-                        self.metadata_store
-                            .record_retry_scheduled(MatrixRetrySchedule {
-                                delivery_id: attempt.delivery_id,
-                                scope: validated_scope,
-                                attempt_number: attempt.attempt_number,
-                                retry_after: after,
-                                reason,
-                                recorded_at: Utc::now(),
-                            })?;
-                        Ok(MatrixOrchestratorOutcome {
-                            status: MatrixTerminalStatus::RetryScheduled,
-                            retry: Some(decision),
-                        })
-                    }
-                    MatrixRetryDecision::DoNotRetry { terminal_status } => {
-                        self.persist_terminal_status(
-                            attempt.delivery_id,
-                            validated_scope,
-                            terminal_status,
-                            Some(error.reason),
-                        )?;
-                        Err(error)
-                    }
-                }
+                self.apply_delivery_error(error, &attempt, validated_scope)
+            }
+        }
+    }
+
+    fn apply_delivery_error(
+        &self,
+        error: DeliveryError,
+        attempt: &DeliveryAttemptContext,
+        scope: TurnScope,
+    ) -> Result<MatrixOrchestratorOutcome, DeliveryError> {
+        let decision = self.retry_policy.classify(&error, attempt.attempt_number);
+        match decision {
+            MatrixRetryDecision::RetryAfter { after, reason } => {
+                self.metadata_store
+                    .record_retry_scheduled(MatrixRetrySchedule {
+                        delivery_id: attempt.delivery_id,
+                        scope,
+                        attempt_number: attempt.attempt_number,
+                        retry_after: after,
+                        reason,
+                        recorded_at: Utc::now(),
+                    })?;
+                Ok(MatrixOrchestratorOutcome {
+                    status: MatrixTerminalStatus::RetryScheduled,
+                    retry: Some(decision),
+                })
+            }
+            MatrixRetryDecision::DoNotRetry { terminal_status } => {
+                self.persist_terminal_status(
+                    attempt.delivery_id,
+                    scope,
+                    terminal_status,
+                    Some(error.reason),
+                )?;
+                Err(error)
             }
         }
     }
@@ -949,6 +977,7 @@ mod tests {
     }
 
     fn route() -> FrozenProductDeliveryRoute {
+        let command = command();
         let owner = owner();
         FrozenProductDeliveryRoute::mint_for_matrix(
             &owner,
@@ -959,7 +988,7 @@ mod tests {
             MatrixRouteMetadata {
                 policy_revision: "policy-rev-1".into(),
                 homeserver_origin_fingerprint: "hs_fp_1".into(),
-                room_fingerprint: "room_fp_1".into(),
+                room_fingerprint: command.room_id.fingerprint(),
                 egress_target_index: 0,
                 credential_handle_fingerprint: "cred_fp_1".into(),
                 reply_target_binding_ref: binding(),
@@ -989,7 +1018,7 @@ mod tests {
             delivered_at: Utc::now(),
             verified: true,
             homeserver_origin_fingerprint: "hs_fp_1".into(),
-            room_fingerprint: "room_fp_1".into(),
+            room_fingerprint: command.room_id.fingerprint(),
             installation_scoped_credential_ref: "cred_ref_1".into(),
             http_status: 200,
             latency_ms: 12,
@@ -1141,6 +1170,39 @@ mod tests {
         assert!(store.evidence().is_empty());
     }
 
+    #[tokio::test]
+    async fn orchestrator_fails_closed_before_port_when_command_room_differs_from_route() {
+        let mut command = command();
+        command.room_id = MatrixRoomId::new("!other-room:matrix.example").expect("valid room");
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: "cred_fp_1".into(),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let retry_policy = retry_policy();
+        let orchestrator =
+            MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+
+        let error = orchestrator
+            .consume_pending_intent(
+                command.clone(),
+                route.clone(),
+                grant,
+                attempt(&route, &command),
+            )
+            .await
+            .expect_err("command room mismatch must fail before delivery");
+
+        assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+        assert!(port.calls().is_empty());
+        assert_eq!(store.statuses(), vec![OutboundDeliveryStatus::Failed]);
+        assert!(store.evidence().is_empty());
+    }
+
     #[test]
     fn forged_route_grant_fails_before_delivery_port() {
         let route = route();
@@ -1195,7 +1257,7 @@ mod tests {
         let orchestrator =
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
 
-        let error = orchestrator
+        let outcome = orchestrator
             .consume_pending_intent(
                 command.clone(),
                 route.clone(),
@@ -1203,10 +1265,61 @@ mod tests {
                 attempt(&route, &command),
             )
             .await
-            .expect_err("unverified evidence must not mark delivery");
+            .expect("unverified evidence should schedule retry without marking delivery");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::RetryScheduled);
+        assert_eq!(
+            outcome.retry,
+            Some(MatrixRetryDecision::RetryAfter {
+                after: Duration::from_secs(1),
+                reason: DeliveryReasonCode::MatrixMalformedResponse
+            })
+        );
+        assert!(store.statuses().is_empty());
+        assert!(store.evidence().is_empty());
+        let retry_schedules = store.retry_schedules();
+        assert_eq!(retry_schedules.len(), 1);
+        assert_eq!(retry_schedules[0].delivery_id, route.delivery_id);
+        assert_eq!(
+            retry_schedules[0].reason,
+            DeliveryReasonCode::MatrixMalformedResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_terminalizes_invalid_accepted_evidence_after_retry_exhaustion() {
+        let command = command();
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let mut evidence = accepted_evidence(&command);
+        evidence.verified = false;
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(evidence),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: "cred_fp_1".into(),
+            });
+        let store = FakeMatrixOutboundMetadataStore::default();
+        let retry_policy = retry_policy();
+        let orchestrator =
+            MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+        let mut exhausted_attempt = attempt(&route, &command);
+        exhausted_attempt.attempt_number = 3;
+
+        let error = orchestrator
+            .consume_pending_intent(command.clone(), route.clone(), grant, exhausted_attempt)
+            .await
+            .expect_err("invalid accepted evidence at max attempts must terminalize");
 
         assert_eq!(error.reason, DeliveryReasonCode::MatrixMalformedResponse);
-        assert!(store.statuses().is_empty());
+        assert_eq!(store.statuses(), vec![OutboundDeliveryStatus::Failed]);
+        assert_eq!(
+            store.failure_kinds(),
+            vec![Some(DeliveryFailureKind::TransportUnavailable)]
+        );
         assert!(store.evidence().is_empty());
         assert!(store.retry_schedules().is_empty());
     }
