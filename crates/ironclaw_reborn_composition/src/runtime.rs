@@ -7326,18 +7326,20 @@ output_schema_ref = "schemas/write.output.json"
         })
         .with_model_gateway_override(gateway);
 
-        let runtime = build_reborn_runtime(input)
-            .await
-            .expect("validated production readiness should start runtime");
+        let error = match build_reborn_runtime(input).await {
+            Ok(runtime) => {
+                runtime.shutdown().await.expect("runtime shutdown");
+                panic!("matrix retry worker production blocker should prevent runtime start");
+            }
+            Err(error) => error,
+        };
 
-        assert_eq!(
-            runtime.services().readiness.state,
-            RebornReadinessState::ProductionValidated
+        assert!(
+            error
+                .to_string()
+                .contains("component=MatrixRetryWorker, reason=Missing"),
+            "unexpected error: {error}"
         );
-        assert!(runtime.services().readiness.diagnostics.is_empty());
-        assert!(runtime.services().readiness.workers.turn_runner);
-
-        runtime.shutdown().await.expect("runtime shutdown");
     }
 
     /// Regression guard for Firat's review: a trajectory observer is only wired

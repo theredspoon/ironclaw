@@ -207,7 +207,8 @@ fn readiness_serializes_diagnostics_with_stable_redacted_vocabulary() {
             },
             "workers": {
                 "turn_runner": false,
-                "trigger_poller": false
+                "trigger_poller": false,
+                "matrix_retry": false
             },
             "diagnostics": [{
                 "profile": "production",
@@ -263,7 +264,8 @@ fn hosted_single_tenant_readiness_serializes_as_ready_single_tenant_profile() {
             },
             "workers": {
                 "turn_runner": false,
-                "trigger_poller": false
+                "trigger_poller": false,
+                "matrix_retry": false
             },
             "diagnostics": [{
                 "profile": "hosted-single-tenant",
@@ -286,10 +288,11 @@ fn readiness_deserializes_diagnostics_payload_into_typed_enums() {
             "turn_coordinator": true,
             "product_auth": true
         },
-        "workers": {
-            "turn_runner": false,
-            "trigger_poller": false
-        },
+            "workers": {
+                "turn_runner": false,
+                "trigger_poller": false,
+                "matrix_retry": false
+            },
         "diagnostics": [{
             "profile": "production",
             "component": "runtime_http_egress",
@@ -733,6 +736,7 @@ fn readiness_for_contract(
         workers: RebornWorkerReadiness {
             turn_runner: false,
             trigger_poller: false,
+            matrix_retry: false,
         },
         diagnostics,
     }
