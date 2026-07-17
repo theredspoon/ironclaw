@@ -42,6 +42,7 @@ mod local_dev_capability_policy;
 mod local_dev_mounts;
 mod local_runtime_profile;
 pub mod matrix_outbound;
+pub mod matrix_outbound_targets;
 mod observability;
 mod outbound;
 mod product_auth;
@@ -148,6 +149,9 @@ pub use local_runtime_profile::{
     hosted_single_tenant_runtime_policy, hosted_single_tenant_volume_runtime_policy,
     local_dev_runtime_policy, local_dev_yolo_runtime_policy, local_runtime_build_input,
     local_runtime_build_input_with_options,
+};
+pub use matrix_outbound_targets::{
+    MatrixConfiguredRoomRoute, MatrixHostOutboundTargetProvider, MatrixOutboundTargetProviderConfig,
 };
 pub use observability::budget::build_default_budget_accountant;
 pub use observability::budget_events::{BudgetEventObserver, TracingBudgetEventObserver};
