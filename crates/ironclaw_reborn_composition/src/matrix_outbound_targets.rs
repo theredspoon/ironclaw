@@ -10,22 +10,16 @@ use ironclaw_product_workflow::{
 use ironclaw_turns::ReplyTargetBindingRef;
 
 use crate::matrix_outbound::MatrixRoomId;
-use crate::outbound::OutboundDeliveryTargetProvider;
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
+use crate::outbound::{
+    MutableOutboundDeliveryTargetRegistry, OutboundDeliveryTargetProvider,
+    OutboundDeliveryTargetRegistrationOutcome,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MatrixConfiguredRoomRoute {
     pub(crate) room_id: String,
     pub(crate) subject_user_id: UserId,
-}
-
-impl MatrixConfiguredRoomRoute {
-    pub(crate) fn new(room_id: String, subject_user_id: UserId) -> Self {
-        Self {
-            room_id,
-            subject_user_id,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +200,22 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
     }
 }
 
+pub(crate) fn register_matrix_outbound_target_provider(
+    registry: &MutableOutboundDeliveryTargetRegistry,
+    config: MatrixOutboundTargetProviderConfig,
+) -> Result<OutboundDeliveryTargetRegistrationOutcome, RebornServicesError> {
+    let provider_key = matrix_outbound_target_provider_key(&config.installation_id);
+    let provider = MatrixHostOutboundTargetProvider::new(config)?;
+    registry.register_provider(provider_key, std::sync::Arc::new(provider))
+}
+
+fn matrix_outbound_target_provider_key(installation_id: &AdapterInstallationId) -> String {
+    format!(
+        "matrix:outbound-target-provider:{}",
+        installation_id.as_str()
+    )
+}
+
 fn matrix_route_key(
     config: &MatrixOutboundTargetProviderConfig,
     subject_user_id: &str,
@@ -268,7 +278,10 @@ mod tests {
         MatrixConfiguredRoomRoute, MatrixHostOutboundTargetProvider,
         MatrixOutboundTargetProviderConfig,
     };
-    use crate::outbound::OutboundDeliveryTargetProvider;
+    use crate::outbound::{
+        MutableOutboundDeliveryTargetRegistry, OutboundDeliveryTargetProvider,
+        OutboundDeliveryTargetRegistrationOutcome,
+    };
 
     const TENANT: &str = "tenant:matrix";
     const OTHER_TENANT: &str = "tenant:other";
@@ -316,14 +329,47 @@ mod tests {
         MatrixHostOutboundTargetProvider::new(provider_config(
             installation_id,
             vec![
-                MatrixConfiguredRoomRoute::new(ROOM.to_string(), UserId::new(USER).expect("user")),
-                MatrixConfiguredRoomRoute::new(
-                    OTHER_ROOM.to_string(),
-                    UserId::new(OTHER_USER).expect("other user"),
-                ),
+                MatrixConfiguredRoomRoute {
+                    room_id: ROOM.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                },
+                MatrixConfiguredRoomRoute {
+                    room_id: OTHER_ROOM.to_string(),
+                    subject_user_id: UserId::new(OTHER_USER).expect("other user"),
+                },
             ],
         ))
         .expect("valid Matrix target provider config")
+    }
+
+    #[tokio::test]
+    async fn matrix_private_provider_registers_through_shared_outbound_target_registry() {
+        let registry = MutableOutboundDeliveryTargetRegistry::default();
+
+        let outcome = super::register_matrix_outbound_target_provider(
+            &registry,
+            provider_config(
+                INSTALLATION,
+                vec![MatrixConfiguredRoomRoute {
+                    room_id: ROOM.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                }],
+            ),
+        )
+        .expect("Matrix outbound target provider should register");
+
+        assert_eq!(
+            outcome,
+            OutboundDeliveryTargetRegistrationOutcome::Registered
+        );
+        let listed = registry
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("registered Matrix provider should list through shared registry");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary.channel.as_str(), "matrix");
+        assert!(listed[0].capabilities.final_replies);
     }
 
     #[tokio::test]
@@ -504,10 +550,10 @@ mod tests {
         ] {
             let result = MatrixHostOutboundTargetProvider::new(provider_config(
                 INSTALLATION,
-                vec![MatrixConfiguredRoomRoute::new(
-                    invalid_room_id.to_string(),
-                    UserId::new(USER).expect("user"),
-                )],
+                vec![MatrixConfiguredRoomRoute {
+                    room_id: invalid_room_id.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                }],
             ));
 
             assert!(

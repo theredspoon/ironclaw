@@ -108,6 +108,7 @@ use self::latency::{trace_runtime_latency_error, trace_runtime_latency_ok};
 use self::runtime_turn_scheduler::RuntimeTurnScheduler;
 use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore, builtin_extension_registry};
 use crate::local_dev_capability_policy::{LocalDevCapabilityPolicy, local_dev_capability_policy};
+use crate::matrix_outbound_targets::register_matrix_outbound_target_provider;
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{
@@ -3044,6 +3045,7 @@ pub async fn build_reborn_runtime(
         default_project_id,
         regex_skill_activation_enabled,
         skill_context_source: configured_skill_context_source,
+        matrix_outbound_target_providers,
         hooks: hooks_config,
         budget_defaults,
         budget_event_observer,
@@ -3461,6 +3463,24 @@ pub async fn build_reborn_runtime(
     // targets against the same registry product hosts register into.
     let outbound_delivery_target_registry =
         local_runtime.map(|local_runtime| Arc::clone(&local_runtime.outbound_delivery_targets));
+    if !matrix_outbound_target_providers.is_empty() {
+        let Some(registry) = outbound_delivery_target_registry.as_ref() else {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason:
+                    "Matrix outbound target providers require a local runtime outbound registry"
+                        .to_string(),
+            });
+        };
+        for config in matrix_outbound_target_providers {
+            register_matrix_outbound_target_provider(registry, config).map_err(|error| {
+                RebornRuntimeError::InvalidArgument {
+                    reason: format!(
+                        "Matrix outbound delivery target provider registration failed: {error}"
+                    ),
+                }
+            })?;
+        }
+    }
     let outbound_preferences_facade: Option<Arc<dyn OutboundPreferencesProductFacade>> =
         match (local_runtime, &outbound_delivery_target_registry) {
             (Some(local_runtime), Some(registry)) => {

@@ -38,6 +38,7 @@ use ironclaw_runner::runtime::{
 use ironclaw_triggers::{TriggerId, TriggerPollerWorkerConfig};
 
 use crate::input::RebornBuildInput;
+use crate::matrix_outbound_targets::MatrixOutboundTargetProviderConfig;
 use crate::observability::hooks::HooksActivationConfig;
 
 /// Caller-owned identity for an assembled Reborn runtime.
@@ -424,6 +425,7 @@ pub struct RebornRuntimeInput {
     pub default_project_id: Option<ProjectId>,
     pub regex_skill_activation_enabled: bool,
     pub skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    pub(crate) matrix_outbound_target_providers: Vec<MatrixOutboundTargetProviderConfig>,
     /// Hook-framework activation knobs. Default OFF. Callers resolve
     /// environment or config into this typed value once at the edge.
     pub hooks: HooksActivationConfig,
@@ -492,6 +494,7 @@ impl RebornRuntimeInput {
             default_project_id: None,
             regex_skill_activation_enabled: true,
             skill_context_source: None,
+            matrix_outbound_target_providers: Vec::new(),
             hooks: HooksActivationConfig::default(),
             budget_defaults: None,
             budget_event_observer: None,
