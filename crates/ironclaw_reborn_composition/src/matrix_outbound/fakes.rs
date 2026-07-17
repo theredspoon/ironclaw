@@ -1,7 +1,14 @@
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use super::*;
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct FakeMatrixDeliveryPort {
@@ -11,11 +18,11 @@ pub struct FakeMatrixDeliveryPort {
 
 impl FakeMatrixDeliveryPort {
     pub fn push_result(&self, result: DeliveryPortResult) {
-        self.results.lock().expect("result lock").push_back(result);
+        lock_or_recover(&self.results).push_back(result);
     }
 
     pub fn calls(&self) -> Vec<ProtocolDeliveryIntent> {
-        self.calls.lock().expect("call lock").clone()
+        lock_or_recover(&self.calls).clone()
     }
 }
 
@@ -28,10 +35,8 @@ impl MatrixDeliveryPort for FakeMatrixDeliveryPort {
         _credential: ResolvedCredentialHandle,
         _attempt: DeliveryAttemptContext,
     ) -> DeliveryPortResult {
-        self.calls.lock().expect("call lock").push(command);
-        self.results
-            .lock()
-            .expect("result lock")
+        lock_or_recover(&self.calls).push(command);
+        lock_or_recover(&self.results)
             .pop_front()
             .unwrap_or_else(|| {
                 DeliveryPortResult::Rejected(DeliveryError::new(DeliveryReasonCode::MatrixTimeout))
@@ -67,36 +72,29 @@ pub struct FakeMatrixOutboundMetadataStore {
 
 impl FakeMatrixOutboundMetadataStore {
     pub fn statuses(&self) -> Vec<OutboundDeliveryStatus> {
-        self.statuses
-            .lock()
-            .expect("status lock")
+        lock_or_recover(&self.statuses)
             .iter()
             .map(|request| request.status)
             .collect()
     }
 
     pub fn status_requests(&self) -> Vec<UpdateDeliveryStatusRequest> {
-        self.statuses.lock().expect("status lock").clone()
+        lock_or_recover(&self.statuses).clone()
     }
 
     pub fn failure_kinds(&self) -> Vec<Option<DeliveryFailureKind>> {
-        self.statuses
-            .lock()
-            .expect("status lock")
+        lock_or_recover(&self.statuses)
             .iter()
             .map(|request| request.failure_kind)
             .collect()
     }
 
     pub fn evidence(&self) -> Vec<(OutboundDeliveryId, MatrixDeliveryEvidenceV1)> {
-        self.evidence.lock().expect("evidence lock").clone()
+        lock_or_recover(&self.evidence).clone()
     }
 
     pub fn retry_schedules(&self) -> Vec<MatrixRetrySchedule> {
-        self.retry_schedules
-            .lock()
-            .expect("retry schedule lock")
-            .clone()
+        lock_or_recover(&self.retry_schedules).clone()
     }
 }
 
@@ -107,10 +105,7 @@ impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
         scope: TurnScope,
         delivery_id: OutboundDeliveryId,
     ) -> Result<Option<UpdateDeliveryStatusRequest>, MatrixOutboundContractError> {
-        Ok(self
-            .statuses
-            .lock()
-            .expect("status lock")
+        Ok(lock_or_recover(&self.statuses)
             .iter()
             .rev()
             .find(|request| request.delivery_id == delivery_id && request.scope == scope)
@@ -121,7 +116,7 @@ impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
         &self,
         request: UpdateDeliveryStatusRequest,
     ) -> Result<(), MatrixOutboundContractError> {
-        self.statuses.lock().expect("status lock").push(request);
+        lock_or_recover(&self.statuses).push(request);
         Ok(())
     }
 
@@ -131,10 +126,7 @@ impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
         _scope: TurnScope,
         evidence: ValidatedMatrixDeliveryEvidence,
     ) -> Result<(), MatrixOutboundContractError> {
-        self.evidence
-            .lock()
-            .expect("evidence lock")
-            .push((delivery_id, evidence.into_inner()));
+        lock_or_recover(&self.evidence).push((delivery_id, evidence.into_inner()));
         Ok(())
     }
 
@@ -143,10 +135,7 @@ impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
         schedule: MatrixRetrySchedule,
         _context: MatrixRetryExecutionContext,
     ) -> Result<(), MatrixOutboundContractError> {
-        self.retry_schedules
-            .lock()
-            .expect("retry schedule lock")
-            .push(schedule);
+        lock_or_recover(&self.retry_schedules).push(schedule);
         Ok(())
     }
 }
@@ -158,14 +147,11 @@ pub struct RetryStateProbe {
 
 impl RetryStateProbe {
     pub fn record(&self, decision: MatrixRetryDecision) {
-        self.decisions
-            .lock()
-            .expect("retry probe lock")
-            .push(decision);
+        lock_or_recover(&self.decisions).push(decision);
     }
 
     pub fn decisions(&self) -> Vec<MatrixRetryDecision> {
-        self.decisions.lock().expect("retry probe lock").clone()
+        lock_or_recover(&self.decisions).clone()
     }
 }
 
