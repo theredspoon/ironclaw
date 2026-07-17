@@ -796,7 +796,10 @@ impl MatrixDeliveryPort for MatrixHttpDeliveryPort {
         }
 
         let request = matrix_send_request(&route, &command, &endpoint);
-        let host_request = matrix_host_http_request(request, &endpoint);
+        let host_request = match matrix_host_http_request(request, &endpoint) {
+            Ok(request) => request,
+            Err(error) => return DeliveryPortResult::Rejected(error),
+        };
         let started_at = Utc::now();
         match self.egress.execute_matrix_http(host_request).await {
             Ok(response) => classify_matrix_http_response(
@@ -844,9 +847,9 @@ fn matrix_send_request(
 fn matrix_host_http_request(
     request: RuntimeHttpEgressRequest,
     endpoint: &MatrixHttpDeliveryEndpoint,
-) -> HostRuntimeHttpEgressRequest {
-    HostRuntimeHttpEgressRequest {
-        extension_id: matrix_extension_id(),
+) -> Result<HostRuntimeHttpEgressRequest, DeliveryError> {
+    Ok(HostRuntimeHttpEgressRequest {
+        extension_id: matrix_extension_id()?,
         trust: TrustClass::System,
         request,
         credentials: vec![HostRuntimeCredentialMaterial {
@@ -858,11 +861,12 @@ fn matrix_host_http_request(
             },
             required: true,
         }],
-    }
+    })
 }
 
-fn matrix_extension_id() -> ExtensionId {
-    ExtensionId::new("ironclaw_matrix").expect("static Matrix extension id must be valid")
+fn matrix_extension_id() -> Result<ExtensionId, DeliveryError> {
+    ExtensionId::new("ironclaw_matrix")
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::MatrixBadRequest))
 }
 
 fn classify_matrix_http_response(
