@@ -42,7 +42,6 @@ mod local_dev_capability_policy;
 mod local_dev_mounts;
 mod local_runtime_profile;
 pub mod matrix_outbound;
-#[cfg(test)]
 mod matrix_outbound_targets;
 mod observability;
 mod outbound;
