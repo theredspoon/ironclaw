@@ -14,13 +14,13 @@ use crate::outbound::OutboundDeliveryTargetProvider;
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatrixConfiguredRoomRoute {
-    pub room_id: String,
-    pub subject_user_id: UserId,
+pub(crate) struct MatrixConfiguredRoomRoute {
+    pub(crate) room_id: String,
+    pub(crate) subject_user_id: UserId,
 }
 
 impl MatrixConfiguredRoomRoute {
-    pub fn new(room_id: String, subject_user_id: UserId) -> Self {
+    pub(crate) fn new(room_id: String, subject_user_id: UserId) -> Self {
         Self {
             room_id,
             subject_user_id,
@@ -29,16 +29,16 @@ impl MatrixConfiguredRoomRoute {
 }
 
 #[derive(Debug, Clone)]
-pub struct MatrixOutboundTargetProviderConfig {
-    pub tenant_id: TenantId,
-    pub agent_id: AgentId,
-    pub project_id: Option<ProjectId>,
-    pub installation_id: AdapterInstallationId,
-    pub configured_room_routes: Vec<MatrixConfiguredRoomRoute>,
+pub(crate) struct MatrixOutboundTargetProviderConfig {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) agent_id: AgentId,
+    pub(crate) project_id: Option<ProjectId>,
+    pub(crate) installation_id: AdapterInstallationId,
+    pub(crate) configured_room_routes: Vec<MatrixConfiguredRoomRoute>,
 }
 
 #[derive(Debug, Clone)]
-pub struct MatrixHostOutboundTargetProvider {
+pub(crate) struct MatrixHostOutboundTargetProvider {
     tenant_id: TenantId,
     agent_id: AgentId,
     project_id: Option<ProjectId>,
@@ -55,7 +55,9 @@ struct ValidatedMatrixConfiguredRoomRoute {
 }
 
 impl MatrixHostOutboundTargetProvider {
-    pub fn new(config: MatrixOutboundTargetProviderConfig) -> Result<Self, RebornServicesError> {
+    pub(crate) fn new(
+        config: MatrixOutboundTargetProviderConfig,
+    ) -> Result<Self, RebornServicesError> {
         let room_target_id_prefix = format!("matrix:room:{}:", config.installation_id.as_str());
         let room_binding_ref_prefix =
             format!("reply:matrix:room:{}:", config.installation_id.as_str());
