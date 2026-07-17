@@ -6,6 +6,7 @@
 //! after a delivery port returns protocol evidence or a sanitized error.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,17 +17,26 @@ use ironclaw_filesystem::{
     CasApply, CasUpdateError, ContentType, Entry, FileType, FilesystemError, RootFilesystem,
     ScopedFilesystem, cas_update,
 };
-use ironclaw_host_api::{ResourceScope, ScopedPath};
+use ironclaw_host_api::{
+    CapabilityId, ExtensionId, NetworkMethod, NetworkPolicy, NetworkScheme, NetworkTargetPattern,
+    ResourceScope, RuntimeCredentialTarget, RuntimeHttpEgressError, RuntimeHttpEgressRequest,
+    RuntimeHttpEgressResponse, RuntimeKind, ScopedPath, SecretHandle, TrustClass,
+};
+use ironclaw_host_runtime::{
+    HostRuntimeCredentialMaterial, HostRuntimeHttpEgressPort, HostRuntimeHttpEgressRequest,
+};
 use ironclaw_outbound::{
     DeliveryFailureKind, OutboundDeliveryId, OutboundDeliveryStatus, OutboundError,
     OutboundStateStore, UpdateDeliveryStatusRequest,
 };
+use ironclaw_secrets::SecretMaterial;
 use ironclaw_turns::{ReplyTargetBindingRef, TurnScope};
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,6 +374,8 @@ pub enum ProtocolDeliveryEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatrixDeliveryEvidenceV1 {
     pub schema_version: u32,
+    pub delivery_id: OutboundDeliveryId,
+    pub attempt_number: u32,
     pub event_id_fingerprint: String,
     pub transaction_id: MatrixTransactionId,
     pub command_kind: MatrixCommandKind,
@@ -399,11 +411,15 @@ impl MatrixDeliveryEvidenceV1 {
         &self,
         command: &MatrixOutboundCommand,
         metadata: &MatrixRouteMetadata,
+        attempt: &DeliveryAttemptContext,
     ) -> Result<(), MatrixOutboundContractError> {
         self.validate_redacted()?;
         if !self.verified
             || !(200..300).contains(&self.http_status)
+            || self.delivery_id != attempt.delivery_id
+            || self.attempt_number != attempt.attempt_number
             || self.transaction_id != command.transaction_id
+            || self.transaction_id != attempt.transaction_id
             || self.command_kind != command.command_kind
             || self.homeserver_origin_fingerprint != metadata.homeserver_origin_fingerprint
             || self.room_fingerprint != metadata.room_fingerprint
@@ -419,19 +435,13 @@ impl MatrixDeliveryEvidenceV1 {
 pub struct ValidatedMatrixDeliveryEvidence(MatrixDeliveryEvidenceV1);
 
 impl ValidatedMatrixDeliveryEvidence {
-    pub fn new_redacted(
-        evidence: MatrixDeliveryEvidenceV1,
-    ) -> Result<Self, MatrixOutboundContractError> {
-        evidence.validate_redacted()?;
-        Ok(Self(evidence))
-    }
-
     pub fn new_for_delivery(
         evidence: MatrixDeliveryEvidenceV1,
         command: &MatrixOutboundCommand,
         metadata: &MatrixRouteMetadata,
+        attempt: &DeliveryAttemptContext,
     ) -> Result<Self, MatrixOutboundContractError> {
-        evidence.validate_for_delivery(command, metadata)?;
+        evidence.validate_for_delivery(command, metadata, attempt)?;
         Ok(Self(evidence))
     }
 
@@ -462,6 +472,21 @@ impl DeliveryError {
             matrix_errcode: None,
             operator_summary: SafeOperatorSummary::for_reason(reason),
         }
+    }
+
+    pub fn with_retry_hint(mut self, after: Duration) -> Self {
+        self.retry_hint = Some(RetryHint { after });
+        self
+    }
+
+    pub fn with_status_family(mut self, status_family: Option<HttpStatusFamily>) -> Self {
+        self.status_family = status_family;
+        self
+    }
+
+    pub fn with_matrix_errcode(mut self, matrix_errcode: MatrixErrcode) -> Self {
+        self.matrix_errcode = Some(matrix_errcode);
+        self
     }
 }
 
@@ -504,6 +529,10 @@ pub enum DeliveryReasonCode {
     MatrixTimeout,
     MatrixServerError,
     MatrixMalformedResponse,
+    MatrixBadRequest,
+    MatrixNotFound,
+    MatrixMessageTooLarge,
+    MatrixUnsupportedRoomVersion,
     MaxAttemptsExceeded,
 }
 
@@ -535,6 +564,12 @@ impl SafeOperatorSummary {
             DeliveryReasonCode::MatrixTimeout => "matrix delivery timed out",
             DeliveryReasonCode::MatrixServerError => "matrix homeserver returned a server error",
             DeliveryReasonCode::MatrixMalformedResponse => "matrix response was malformed",
+            DeliveryReasonCode::MatrixBadRequest => "matrix homeserver rejected the request",
+            DeliveryReasonCode::MatrixNotFound => "matrix homeserver could not find the target",
+            DeliveryReasonCode::MatrixMessageTooLarge => "matrix message was too large",
+            DeliveryReasonCode::MatrixUnsupportedRoomVersion => {
+                "matrix room version is unsupported"
+            }
             DeliveryReasonCode::MaxAttemptsExceeded => "matrix retry attempts were exhausted",
         };
         Self(summary.to_string())
@@ -625,6 +660,447 @@ pub trait MatrixDeliveryPort: Send + Sync {
         credential: ResolvedCredentialHandle,
         attempt: DeliveryAttemptContext,
     ) -> DeliveryPortResult;
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixHttpDeliveryEndpoint {
+    homeserver_origin: String,
+    scheme: NetworkScheme,
+    host: String,
+    port: Option<u16>,
+    credential_secret: SecretHandle,
+    credential_material: SecretMaterial,
+    credential_handle_fingerprint: String,
+    capability_id: CapabilityId,
+    response_body_limit: u64,
+    timeout_ms: Option<u32>,
+}
+
+impl MatrixHttpDeliveryEndpoint {
+    pub fn new(
+        homeserver_origin: impl Into<String>,
+        credential_secret: SecretHandle,
+        credential_material: SecretMaterial,
+        credential_handle_fingerprint: impl Into<String>,
+        capability_id: CapabilityId,
+    ) -> Result<Self, DeliveryError> {
+        let homeserver_origin = homeserver_origin.into();
+        let (scheme, host, port) = parse_matrix_homeserver_origin(&homeserver_origin)?;
+        let credential_handle_fingerprint = credential_handle_fingerprint.into();
+        if !is_canonical_sha256_fingerprint(&credential_handle_fingerprint) {
+            return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget));
+        }
+        Ok(Self {
+            homeserver_origin: canonical_matrix_homeserver_origin(scheme, &host, port),
+            scheme,
+            host,
+            port,
+            credential_secret,
+            credential_material,
+            credential_handle_fingerprint,
+            capability_id,
+            response_body_limit: 4096,
+            timeout_ms: Some(10_000),
+        })
+    }
+
+    pub fn with_response_body_limit(
+        mut self,
+        response_body_limit: u64,
+    ) -> Result<Self, DeliveryError> {
+        if !(256..=16 * 1024 * 1024).contains(&response_body_limit) {
+            return Err(DeliveryError::new(DeliveryReasonCode::MatrixBadRequest));
+        }
+        self.response_body_limit = response_body_limit;
+        Ok(self)
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: Option<u32>) -> Result<Self, DeliveryError> {
+        if let Some(timeout_ms) = timeout_ms
+            && !(100..=120_000).contains(&timeout_ms)
+        {
+            return Err(DeliveryError::new(DeliveryReasonCode::MatrixBadRequest));
+        }
+        self.timeout_ms = timeout_ms;
+        Ok(self)
+    }
+}
+
+pub trait MatrixHttpDeliveryEndpointResolver: Send + Sync {
+    fn resolve_endpoint(
+        &self,
+        route: &ValidatedDeliveryRoute,
+        credential: &ResolvedCredentialHandle,
+    ) -> Option<MatrixHttpDeliveryEndpoint>;
+}
+
+pub struct MatrixHttpDeliveryPort {
+    egress: Arc<dyn MatrixHostHttpEgress>,
+    endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
+}
+
+impl MatrixHttpDeliveryPort {
+    pub fn new(
+        egress: Arc<dyn MatrixHostHttpEgress>,
+        endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
+    ) -> Self {
+        Self {
+            egress,
+            endpoint_resolver,
+        }
+    }
+}
+
+#[async_trait]
+pub trait MatrixHostHttpEgress: Send + Sync {
+    async fn execute_matrix_http(
+        &self,
+        request: HostRuntimeHttpEgressRequest,
+    ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError>;
+}
+
+#[async_trait]
+impl MatrixHostHttpEgress for HostRuntimeHttpEgressPort {
+    async fn execute_matrix_http(
+        &self,
+        request: HostRuntimeHttpEgressRequest,
+    ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
+        self.execute(request).await
+    }
+}
+
+#[async_trait]
+impl MatrixDeliveryPort for MatrixHttpDeliveryPort {
+    async fn deliver(
+        &self,
+        command: ProtocolDeliveryIntent,
+        route: ValidatedDeliveryRoute,
+        credential: ResolvedCredentialHandle,
+        attempt: DeliveryAttemptContext,
+    ) -> DeliveryPortResult {
+        let ProtocolDeliveryIntent::Matrix(command) = command;
+        let metadata = route.matrix_metadata().clone();
+        let Some(endpoint) = self.endpoint_resolver.resolve_endpoint(&route, &credential) else {
+            return DeliveryPortResult::Rejected(DeliveryError::new(
+                DeliveryReasonCode::MissingMatrixRoute,
+            ));
+        };
+        if endpoint.credential_handle_fingerprint != credential.credential_handle_fingerprint
+            || endpoint.credential_handle_fingerprint != metadata.credential_handle_fingerprint
+            || redacted_sha256_fingerprint(endpoint.homeserver_origin.as_bytes())
+                != metadata.homeserver_origin_fingerprint
+        {
+            return DeliveryPortResult::Rejected(DeliveryError::new(
+                DeliveryReasonCode::UnauthorizedTarget,
+            ));
+        }
+
+        let request = matrix_send_request(&route, &command, &endpoint);
+        let host_request = match matrix_host_http_request(request, &endpoint) {
+            Ok(request) => request,
+            Err(error) => return DeliveryPortResult::Rejected(error),
+        };
+        let started_at = Utc::now();
+        match self.egress.execute_matrix_http(host_request).await {
+            Ok(response) => classify_matrix_http_response(
+                response, &command, &metadata, &endpoint, &attempt, started_at,
+            ),
+            Err(error) => DeliveryPortResult::Rejected(matrix_delivery_error_from_egress(error)),
+        }
+    }
+}
+
+fn matrix_send_request(
+    route: &ValidatedDeliveryRoute,
+    command: &MatrixOutboundCommand,
+    endpoint: &MatrixHttpDeliveryEndpoint,
+) -> RuntimeHttpEgressRequest {
+    let room = encode_matrix_path_segment(command.room_id.as_str());
+    let txn = encode_matrix_path_segment(command.transaction_id.as_str());
+    RuntimeHttpEgressRequest {
+        runtime: RuntimeKind::FirstParty,
+        scope: route.route.scope().to_resource_scope(),
+        capability_id: endpoint.capability_id.clone(),
+        method: NetworkMethod::Put,
+        url: format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            endpoint.homeserver_origin, room, txn
+        ),
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: serde_json::to_vec(command.body.as_json()).unwrap_or_else(|_| b"{}".to_vec()),
+        network_policy: NetworkPolicy {
+            allowed_targets: vec![NetworkTargetPattern {
+                scheme: Some(endpoint.scheme),
+                host_pattern: endpoint.host.clone(),
+                port: endpoint.port,
+            }],
+            deny_private_ip_ranges: true,
+            max_egress_bytes: Some(endpoint.response_body_limit),
+        },
+        credential_injections: Vec::new(),
+        response_body_limit: Some(endpoint.response_body_limit),
+        save_body_to: None,
+        timeout_ms: endpoint.timeout_ms,
+    }
+}
+
+fn matrix_host_http_request(
+    request: RuntimeHttpEgressRequest,
+    endpoint: &MatrixHttpDeliveryEndpoint,
+) -> Result<HostRuntimeHttpEgressRequest, DeliveryError> {
+    Ok(HostRuntimeHttpEgressRequest {
+        extension_id: matrix_extension_id()?,
+        trust: TrustClass::System,
+        request,
+        credentials: vec![HostRuntimeCredentialMaterial {
+            handle: endpoint.credential_secret.clone(),
+            material: endpoint.credential_material.clone(),
+            target: RuntimeCredentialTarget::Header {
+                name: "authorization".to_string(),
+                prefix: Some("Bearer ".to_string()),
+            },
+            required: true,
+        }],
+    })
+}
+
+fn matrix_extension_id() -> Result<ExtensionId, DeliveryError> {
+    ExtensionId::new("ironclaw_matrix")
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::MatrixBadRequest))
+}
+
+fn classify_matrix_http_response(
+    response: RuntimeHttpEgressResponse,
+    command: &MatrixOutboundCommand,
+    metadata: &MatrixRouteMetadata,
+    endpoint: &MatrixHttpDeliveryEndpoint,
+    attempt: &DeliveryAttemptContext,
+    started_at: DateTime<Utc>,
+) -> DeliveryPortResult {
+    let status_family = http_status_family(response.status);
+    let body = serde_json::from_slice::<Value>(&response.body).ok();
+    if (200..300).contains(&response.status) {
+        let Some(event_id) = body
+            .as_ref()
+            .and_then(|body| body.get("event_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+        else {
+            return DeliveryPortResult::Rejected(
+                DeliveryError::new(DeliveryReasonCode::MatrixMalformedResponse)
+                    .with_status_family(status_family),
+            );
+        };
+        return DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(
+            MatrixDeliveryEvidenceV1 {
+                schema_version: 1,
+                delivery_id: attempt.delivery_id,
+                attempt_number: attempt.attempt_number,
+                event_id_fingerprint: redacted_sha256_fingerprint(event_id.as_bytes()),
+                transaction_id: command.transaction_id.clone(),
+                command_kind: command.command_kind,
+                delivered_at: Utc::now(),
+                verified: true,
+                homeserver_origin_fingerprint: metadata.homeserver_origin_fingerprint.clone(),
+                room_fingerprint: metadata.room_fingerprint.clone(),
+                installation_scoped_credential_ref: endpoint.credential_handle_fingerprint.clone(),
+                http_status: response.status,
+                latency_ms: Utc::now()
+                    .signed_duration_since(started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            },
+        ));
+    }
+
+    let matrix_errcode = body
+        .as_ref()
+        .and_then(|body| body.get("errcode"))
+        .and_then(Value::as_str)
+        .map(MatrixErrcode::from_matrix_errcode);
+    let mut error = DeliveryError::new(reason_for_matrix_http_status(
+        response.status,
+        matrix_errcode,
+    ))
+    .with_status_family(status_family);
+    if let Some(errcode) = matrix_errcode {
+        error = error.with_matrix_errcode(errcode);
+    }
+    if matches!(error.reason, DeliveryReasonCode::MatrixRateLimited)
+        && let Some(after) = matrix_retry_after(&response, body.as_ref())
+    {
+        error = error.with_retry_hint(after);
+    }
+    DeliveryPortResult::Rejected(error)
+}
+
+fn reason_for_matrix_http_status(
+    status: u16,
+    matrix_errcode: Option<MatrixErrcode>,
+) -> DeliveryReasonCode {
+    match (status, matrix_errcode) {
+        (429, _) | (_, Some(MatrixErrcode::LimitExceeded)) => DeliveryReasonCode::MatrixRateLimited,
+        (401 | 403, _)
+        | (
+            _,
+            Some(
+                MatrixErrcode::Forbidden
+                | MatrixErrcode::UnknownToken
+                | MatrixErrcode::UserDeactivated,
+            ),
+        ) => DeliveryReasonCode::UnauthorizedTarget,
+        (_, Some(MatrixErrcode::TooLarge)) => DeliveryReasonCode::MatrixMessageTooLarge,
+        (_, Some(MatrixErrcode::UnsupportedRoomVersion)) => {
+            DeliveryReasonCode::MatrixUnsupportedRoomVersion
+        }
+        (_, Some(MatrixErrcode::NotFound)) => DeliveryReasonCode::MatrixNotFound,
+        (_, Some(MatrixErrcode::BadJson)) => DeliveryReasonCode::MatrixBadRequest,
+        (500..=599, _) => DeliveryReasonCode::MatrixServerError,
+        (300..=399, _) => DeliveryReasonCode::UnauthorizedTarget,
+        (400..=499, _) => DeliveryReasonCode::MatrixBadRequest,
+        _ => DeliveryReasonCode::MatrixMalformedResponse,
+    }
+}
+
+fn matrix_delivery_error_from_egress(error: RuntimeHttpEgressError) -> DeliveryError {
+    match error.reason_code() {
+        ironclaw_host_api::RuntimeHttpEgressReasonCode::CredentialUnavailable
+        | ironclaw_host_api::RuntimeHttpEgressReasonCode::RequestDenied
+        | ironclaw_host_api::RuntimeHttpEgressReasonCode::PolicyDenied => {
+            DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget)
+        }
+        ironclaw_host_api::RuntimeHttpEgressReasonCode::NetworkError => {
+            DeliveryError::new(DeliveryReasonCode::MatrixTimeout)
+        }
+        ironclaw_host_api::RuntimeHttpEgressReasonCode::ResponseError => {
+            DeliveryError::new(DeliveryReasonCode::MatrixServerError)
+        }
+        ironclaw_host_api::RuntimeHttpEgressReasonCode::ResponseBodyLimitExceeded => {
+            DeliveryError::new(DeliveryReasonCode::MatrixMalformedResponse)
+        }
+    }
+}
+
+fn matrix_retry_after(
+    response: &RuntimeHttpEgressResponse,
+    body: Option<&Value>,
+) -> Option<Duration> {
+    body.and_then(|body| body.get("retry_after_ms"))
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
+        .or_else(|| {
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs)
+        })
+}
+
+fn http_status_family(status: u16) -> Option<HttpStatusFamily> {
+    Some(match status {
+        100..=199 => HttpStatusFamily::Informational,
+        200..=299 => HttpStatusFamily::Success,
+        300..=399 => HttpStatusFamily::Redirect,
+        400..=499 => HttpStatusFamily::ClientError,
+        500..=599 => HttpStatusFamily::ServerError,
+        _ => return None,
+    })
+}
+
+fn parse_matrix_homeserver_origin(
+    origin: &str,
+) -> Result<(NetworkScheme, String, Option<u16>), DeliveryError> {
+    let parsed = Url::parse(origin)
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+    if parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.cannot_be_a_base()
+        || parsed.path() != "/"
+    {
+        return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget));
+    }
+    let scheme = match parsed.scheme() {
+        "https" => NetworkScheme::Https,
+        _ => return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget)),
+    };
+    let Some(host) = parsed.host_str().map(str::to_ascii_lowercase) else {
+        return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget));
+    };
+    if host_is_disallowed_matrix_origin(&host) {
+        return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget));
+    }
+    Ok((scheme, host, parsed.port()))
+}
+
+fn host_is_disallowed_matrix_origin(host: &str) -> bool {
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return disallowed_matrix_ip(ip);
+    }
+    host.chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+}
+
+fn disallowed_matrix_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
+    }
+}
+
+fn canonical_matrix_homeserver_origin(
+    scheme: NetworkScheme,
+    host: &str,
+    port: Option<u16>,
+) -> String {
+    let scheme = match scheme {
+        NetworkScheme::Http => "http",
+        NetworkScheme::Https => "https",
+    };
+    match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+fn redacted_sha256_fingerprint(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
+}
+
+fn encode_matrix_path_segment(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[async_trait]
@@ -1748,7 +2224,7 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
         {
             DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(evidence)) => {
                 let evidence = match ValidatedMatrixDeliveryEvidence::new_for_delivery(
-                    evidence, &command, &metadata,
+                    evidence, &command, &metadata, &attempt,
                 ) {
                     Ok(evidence) => evidence,
                     Err(error) => {
@@ -1863,6 +2339,10 @@ fn delivery_failure_kind_for_reason(reason: DeliveryReasonCode) -> DeliveryFailu
         | DeliveryReasonCode::MatrixMalformedResponse => DeliveryFailureKind::TransportUnavailable,
         DeliveryReasonCode::MissingMatrixRoute
         | DeliveryReasonCode::UnsupportedMatrixCommand
+        | DeliveryReasonCode::MatrixBadRequest
+        | DeliveryReasonCode::MatrixNotFound
+        | DeliveryReasonCode::MatrixMessageTooLarge
+        | DeliveryReasonCode::MatrixUnsupportedRoomVersion
         | DeliveryReasonCode::MaxAttemptsExceeded => DeliveryFailureKind::Rejected,
     }
 }
@@ -2886,6 +3366,27 @@ mod tests {
         )
     }
 
+    fn route_for_homeserver_origin(origin: &str) -> FrozenProductDeliveryRoute {
+        let command = command();
+        let owner = owner();
+        FrozenProductDeliveryRoute::mint_for_matrix(
+            &owner,
+            OutboundDeliveryId::new(),
+            scope(),
+            "matrix-install",
+            "matrix-adapter",
+            MatrixRouteMetadata {
+                policy_revision: "policy-rev-1".into(),
+                homeserver_origin_fingerprint: canonical_fingerprint(origin),
+                room_fingerprint: command.room_id.fingerprint(),
+                egress_target_index: 0,
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                reply_target_binding_ref: binding(),
+                allowed_command_kinds: vec![MatrixCommandKind::SendText],
+            },
+        )
+    }
+
     fn attempt(
         route: &FrozenProductDeliveryRoute,
         command: &MatrixOutboundCommand,
@@ -2898,17 +3399,29 @@ mod tests {
         }
     }
 
-    fn accepted_evidence(command: &MatrixOutboundCommand) -> MatrixDeliveryEvidenceV1 {
+    fn accepted_evidence(
+        command: &MatrixOutboundCommand,
+        route: &FrozenProductDeliveryRoute,
+        attempt: &DeliveryAttemptContext,
+    ) -> MatrixDeliveryEvidenceV1 {
         MatrixDeliveryEvidenceV1 {
             schema_version: 1,
+            delivery_id: attempt.delivery_id,
+            attempt_number: attempt.attempt_number,
             event_id_fingerprint: canonical_fingerprint("event-1"),
             transaction_id: command.transaction_id.clone(),
             command_kind: command.command_kind,
             delivered_at: Utc::now(),
             verified: true,
-            homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
+            homeserver_origin_fingerprint: route
+                .matrix_metadata()
+                .homeserver_origin_fingerprint
+                .clone(),
             room_fingerprint: command.room_id.fingerprint(),
-            installation_scoped_credential_ref: canonical_fingerprint("credential-handle-1"),
+            installation_scoped_credential_ref: route
+                .matrix_metadata()
+                .credential_handle_fingerprint
+                .clone(),
             http_status: 200,
             latency_ms: 12,
         }
@@ -2965,17 +3478,19 @@ mod tests {
         async fn deliver(
             &self,
             command: ProtocolDeliveryIntent,
-            _route: ValidatedDeliveryRoute,
+            route: ValidatedDeliveryRoute,
             _credential: ResolvedCredentialHandle,
             attempt: DeliveryAttemptContext,
         ) -> DeliveryPortResult {
             self.calls
                 .lock()
                 .expect("recorded call lock")
-                .push((command.clone(), attempt));
+                .push((command.clone(), attempt.clone()));
             let ProtocolDeliveryIntent::Matrix(matrix_command) = command;
             DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(accepted_evidence(
                 &matrix_command,
+                &route.route,
+                &attempt,
             )))
         }
     }
@@ -3023,6 +3538,74 @@ mod tests {
             Arc::new(retry_policy()),
             retry_send_authorizer,
         ))
+    }
+
+    struct StaticMatrixHttpEndpointResolver {
+        endpoint: Option<MatrixHttpDeliveryEndpoint>,
+    }
+
+    impl MatrixHttpDeliveryEndpointResolver for StaticMatrixHttpEndpointResolver {
+        fn resolve_endpoint(
+            &self,
+            _route: &ValidatedDeliveryRoute,
+            _credential: &ResolvedCredentialHandle,
+        ) -> Option<MatrixHttpDeliveryEndpoint> {
+            self.endpoint.clone()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedMatrixHostRequest {
+        request: RuntimeHttpEgressRequest,
+        credential_targets: Vec<RuntimeCredentialTarget>,
+        credential_count: usize,
+    }
+
+    struct RecordingMatrixHostEgress {
+        response: Mutex<Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError>>,
+        requests: Mutex<Vec<RecordedMatrixHostRequest>>,
+    }
+
+    impl RecordingMatrixHostEgress {
+        fn ok(status: u16, headers: Vec<(String, String)>, body: Value) -> Self {
+            Self {
+                response: Mutex::new(Ok(RuntimeHttpEgressResponse {
+                    status,
+                    headers,
+                    body: serde_json::to_vec(&body).expect("json response body"),
+                    saved_body: None,
+                    request_bytes: 128,
+                    response_bytes: 64,
+                    redaction_applied: false,
+                })),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<RecordedMatrixHostRequest> {
+            self.requests.lock().expect("request lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl MatrixHostHttpEgress for RecordingMatrixHostEgress {
+        async fn execute_matrix_http(
+            &self,
+            request: HostRuntimeHttpEgressRequest,
+        ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
+            let credential_count = request.credentials.len();
+            let recorded = RecordedMatrixHostRequest {
+                request: request.request,
+                credential_targets: request
+                    .credentials
+                    .into_iter()
+                    .map(|credential| credential.target)
+                    .collect(),
+                credential_count,
+            };
+            self.requests.lock().expect("request lock").push(recorded);
+            self.response.lock().expect("response lock").clone()
+        }
     }
 
     #[derive(Debug, Default)]
@@ -3311,15 +3894,395 @@ mod tests {
         })
     }
 
+    fn matrix_endpoint(origin: &str) -> MatrixHttpDeliveryEndpoint {
+        MatrixHttpDeliveryEndpoint::new(
+            origin,
+            SecretHandle::new("matrix_access_token").expect("valid secret handle"),
+            SecretMaterial::from("matrix-access-token"),
+            canonical_fingerprint("credential-handle-1"),
+            CapabilityId::new("matrix.send").expect("valid capability"),
+        )
+        .expect("valid Matrix endpoint")
+    }
+
+    #[tokio::test]
+    async fn matrix_http_delivery_port_sends_one_attempt_through_runtime_egress() {
+        let origin = "https://matrix.example";
+        let command = command();
+        let route = route_for_homeserver_origin(origin);
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+        let attempt = attempt(&route, &command);
+        let validated = validate_matrix_route_grant(&command, route, &grant)
+            .expect("route and grant should validate");
+        let endpoint = matrix_endpoint(origin);
+        let egress = Arc::new(RecordingMatrixHostEgress::ok(
+            200,
+            Vec::new(),
+            json!({"event_id":"$event:matrix.example"}),
+        ));
+        let port = MatrixHttpDeliveryPort::new(
+            egress.clone(),
+            Arc::new(StaticMatrixHttpEndpointResolver {
+                endpoint: Some(endpoint),
+            }),
+        );
+
+        let result = port
+            .deliver(
+                ProtocolDeliveryIntent::Matrix(command.clone()),
+                validated,
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+                attempt,
+            )
+            .await;
+
+        let DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(evidence)) = result
+        else {
+            panic!("expected accepted Matrix evidence");
+        };
+        assert_eq!(evidence.transaction_id, command.transaction_id);
+        assert_eq!(
+            evidence.event_id_fingerprint,
+            canonical_fingerprint("$event:matrix.example")
+        );
+        assert_eq!(
+            evidence.homeserver_origin_fingerprint,
+            canonical_fingerprint(origin)
+        );
+        assert_eq!(evidence.room_fingerprint, command.room_id.fingerprint());
+        assert_eq!(
+            evidence.installation_scoped_credential_ref,
+            canonical_fingerprint("credential-handle-1")
+        );
+        let requests = egress.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request.method, NetworkMethod::Put);
+        assert_eq!(
+            requests[0].request.url,
+            "https://matrix.example/_matrix/client/v3/rooms/%21room%3Amatrix.example/send/m.room.message/txn-matrix-1"
+        );
+        assert_eq!(
+            requests[0].request.headers,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+        assert!(requests[0].request.credential_injections.is_empty());
+        assert_eq!(requests[0].credential_count, 1);
+        assert_eq!(
+            requests[0].credential_targets[0],
+            RuntimeCredentialTarget::Header {
+                name: "authorization".to_string(),
+                prefix: Some("Bearer ".to_string()),
+            }
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&requests[0].request.body).expect("json request body"),
+            *command.body.as_json()
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_http_delivery_port_classifies_rate_limit_retry_hint() {
+        let origin = "https://matrix.example";
+        let command = command();
+        let route = route_for_homeserver_origin(origin);
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+        let attempt = attempt(&route, &command);
+        let validated = validate_matrix_route_grant(&command, route, &grant)
+            .expect("route and grant should validate");
+        let endpoint = matrix_endpoint(origin);
+        let egress = Arc::new(RecordingMatrixHostEgress::ok(
+            429,
+            vec![("retry-after".to_string(), "99".to_string())],
+            json!({"errcode":"M_LIMIT_EXCEEDED","retry_after_ms":5000}),
+        ));
+        let port = MatrixHttpDeliveryPort::new(
+            egress,
+            Arc::new(StaticMatrixHttpEndpointResolver {
+                endpoint: Some(endpoint),
+            }),
+        );
+
+        let result = port
+            .deliver(
+                ProtocolDeliveryIntent::Matrix(command),
+                validated,
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+                attempt,
+            )
+            .await;
+
+        let DeliveryPortResult::Rejected(error) = result else {
+            panic!("expected rejected rate limit");
+        };
+        assert_eq!(error.reason, DeliveryReasonCode::MatrixRateLimited);
+        assert_eq!(error.status_family, Some(HttpStatusFamily::ClientError));
+        assert_eq!(error.matrix_errcode, Some(MatrixErrcode::LimitExceeded));
+        assert_eq!(
+            error.retry_hint.expect("retry hint").after,
+            Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_http_delivery_port_rejects_endpoint_fingerprint_mismatch_before_egress() {
+        let command = command();
+        let route = route_for_homeserver_origin("https://matrix.example");
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+        let attempt = attempt(&route, &command);
+        let validated = validate_matrix_route_grant(&command, route, &grant)
+            .expect("route and grant should validate");
+        let endpoint = matrix_endpoint("https://evil.example");
+        let egress = Arc::new(RecordingMatrixHostEgress::ok(
+            200,
+            Vec::new(),
+            json!({"event_id":"$event:matrix.example"}),
+        ));
+        let port = MatrixHttpDeliveryPort::new(
+            egress.clone(),
+            Arc::new(StaticMatrixHttpEndpointResolver {
+                endpoint: Some(endpoint),
+            }),
+        );
+
+        let result = port
+            .deliver(
+                ProtocolDeliveryIntent::Matrix(command),
+                validated,
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+                attempt,
+            )
+            .await;
+
+        let DeliveryPortResult::Rejected(error) = result else {
+            panic!("expected rejected endpoint mismatch");
+        };
+        assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+        assert!(egress.requests().is_empty());
+    }
+
+    #[test]
+    fn matrix_http_delivery_endpoint_rejects_plaintext_and_private_origins() {
+        for origin in [
+            "http://matrix.example",
+            "https://user:pass@matrix.example",
+            "https://matrix.example/path",
+            "https://matrix.example?access_token=secret",
+            "https://matrix.example#fragment",
+            "https://localhost",
+            "https://matrix.local",
+            "https://matrix.internal",
+            "https://127.0.0.1",
+            "https://10.0.0.1",
+            "https://172.16.0.1",
+            "https://192.168.1.10",
+            "https://[::1]",
+            "https://[fd00::1]",
+        ] {
+            let error = MatrixHttpDeliveryEndpoint::new(
+                origin,
+                SecretHandle::new("matrix_access_token").expect("valid secret handle"),
+                SecretMaterial::from("matrix-access-token"),
+                canonical_fingerprint("credential-handle-1"),
+                CapabilityId::new("matrix.send").expect("valid capability"),
+            )
+            .expect_err("unsafe Matrix origin must be rejected");
+
+            assert_eq!(
+                error.reason,
+                DeliveryReasonCode::UnauthorizedTarget,
+                "origin {origin:?} should fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_http_delivery_endpoint_validates_limits_and_fingerprint() {
+        let bad_fingerprint = MatrixHttpDeliveryEndpoint::new(
+            "https://matrix.example",
+            SecretHandle::new("matrix_access_token").expect("valid secret handle"),
+            SecretMaterial::from("matrix-access-token"),
+            "credential-handle-1",
+            CapabilityId::new("matrix.send").expect("valid capability"),
+        )
+        .expect_err("non-fingerprint credential refs must be rejected");
+        assert_eq!(
+            bad_fingerprint.reason,
+            DeliveryReasonCode::UnauthorizedTarget
+        );
+
+        assert_eq!(
+            matrix_endpoint("https://matrix.example")
+                .with_response_body_limit(0)
+                .expect_err("zero response body limit must be rejected")
+                .reason,
+            DeliveryReasonCode::MatrixBadRequest
+        );
+        assert_eq!(
+            matrix_endpoint("https://matrix.example")
+                .with_timeout_ms(Some(0))
+                .expect_err("zero timeout must be rejected")
+                .reason,
+            DeliveryReasonCode::MatrixBadRequest
+        );
+    }
+
+    #[test]
+    fn matrix_path_segments_are_percent_encoded() {
+        assert_eq!(
+            encode_matrix_path_segment("!room/../?#% snow:matrix.example"),
+            "%21room%2F..%2F%3F%23%25%20snow%3Amatrix.example"
+        );
+        assert_eq!(
+            encode_matrix_path_segment("txn/with spaces/☃"),
+            "txn%2Fwith%20spaces%2F%E2%98%83"
+        );
+    }
+
+    #[test]
+    fn matrix_http_status_taxonomy_keeps_permanent_protocol_errors_non_retryable() {
+        for (status, errcode, reason) in [
+            (
+                403,
+                Some(MatrixErrcode::Forbidden),
+                DeliveryReasonCode::UnauthorizedTarget,
+            ),
+            (
+                403,
+                Some(MatrixErrcode::UserDeactivated),
+                DeliveryReasonCode::UnauthorizedTarget,
+            ),
+            (
+                404,
+                Some(MatrixErrcode::NotFound),
+                DeliveryReasonCode::MatrixNotFound,
+            ),
+            (
+                400,
+                Some(MatrixErrcode::BadJson),
+                DeliveryReasonCode::MatrixBadRequest,
+            ),
+            (
+                413,
+                Some(MatrixErrcode::TooLarge),
+                DeliveryReasonCode::MatrixMessageTooLarge,
+            ),
+            (
+                400,
+                Some(MatrixErrcode::UnsupportedRoomVersion),
+                DeliveryReasonCode::MatrixUnsupportedRoomVersion,
+            ),
+        ] {
+            let error = DeliveryError::new(reason_for_matrix_http_status(status, errcode));
+            assert_eq!(error.reason, reason);
+            assert_eq!(
+                retry_policy().classify(&error, 1),
+                MatrixRetryDecision::DoNotRetry {
+                    terminal_status: MatrixTerminalStatus::FailedPermanent
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_http_delivery_port_rejects_malformed_success_response() {
+        let origin = "https://matrix.example";
+        let command = command();
+        let route = route_for_homeserver_origin(origin);
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+        let attempt = attempt(&route, &command);
+        let validated = validate_matrix_route_grant(&command, route, &grant)
+            .expect("route and grant should validate");
+        let egress = Arc::new(RecordingMatrixHostEgress::ok(200, Vec::new(), json!({})));
+        let port = MatrixHttpDeliveryPort::new(
+            egress,
+            Arc::new(StaticMatrixHttpEndpointResolver {
+                endpoint: Some(matrix_endpoint(origin)),
+            }),
+        );
+
+        let result = port
+            .deliver(
+                ProtocolDeliveryIntent::Matrix(command),
+                validated,
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+                attempt,
+            )
+            .await;
+
+        let DeliveryPortResult::Rejected(error) = result else {
+            panic!("expected malformed success response to be rejected");
+        };
+        assert_eq!(error.reason, DeliveryReasonCode::MatrixMalformedResponse);
+    }
+
+    #[tokio::test]
+    async fn matrix_http_delivery_port_preserves_explicit_homeserver_port() {
+        let origin = "https://matrix.example:8448";
+        let command = command();
+        let route = route_for_homeserver_origin(origin);
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+        let attempt = attempt(&route, &command);
+        let validated = validate_matrix_route_grant(&command, route, &grant)
+            .expect("route and grant should validate");
+        let egress = Arc::new(RecordingMatrixHostEgress::ok(
+            200,
+            Vec::new(),
+            json!({"event_id":"$event:matrix.example"}),
+        ));
+        let port = MatrixHttpDeliveryPort::new(
+            egress.clone(),
+            Arc::new(StaticMatrixHttpEndpointResolver {
+                endpoint: Some(matrix_endpoint(origin)),
+            }),
+        );
+
+        let result = port
+            .deliver(
+                ProtocolDeliveryIntent::Matrix(command),
+                validated,
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+                attempt,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(_))
+            ),
+            "explicit port delivery should succeed"
+        );
+        let requests = egress.requests();
+        assert_eq!(
+            requests[0].request.url,
+            "https://matrix.example:8448/_matrix/client/v3/rooms/%21room%3Amatrix.example/send/m.room.message/txn-matrix-1"
+        );
+        assert_eq!(
+            requests[0].request.network_policy.allowed_targets[0].port,
+            Some(8448)
+        );
+    }
+
     #[tokio::test]
     async fn orchestrator_consumes_pending_matrix_intent_and_records_delivered_evidence() {
         let command = command();
         let route = route();
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let attempt_ctx = attempt(&route, &command);
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
-            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command, &route, &attempt_ctx)),
         ));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
@@ -3331,12 +4294,7 @@ mod tests {
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
 
         let outcome = orchestrator
-            .consume_pending_intent(
-                command.clone(),
-                route.clone(),
-                grant,
-                attempt(&route, &command),
-            )
+            .consume_pending_intent(command.clone(), route.clone(), grant, attempt_ctx)
             .await
             .expect("pending intent should be consumed");
 
@@ -3434,9 +4392,15 @@ mod tests {
             },
         );
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let attempt_ctx = DeliveryAttemptContext {
+            delivery_id: outbound_attempt.delivery_id,
+            attempt_number: 1,
+            transaction_id: command.transaction_id.clone(),
+            started_at: Utc::now(),
+        };
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
-            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command, &route, &attempt_ctx)),
         ));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
@@ -3448,17 +4412,7 @@ mod tests {
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
 
         let outcome = orchestrator
-            .consume_pending_intent(
-                command.clone(),
-                route.clone(),
-                grant,
-                DeliveryAttemptContext {
-                    delivery_id: outbound_attempt.delivery_id,
-                    attempt_number: 1,
-                    transaction_id: command.transaction_id.clone(),
-                    started_at: Utc::now(),
-                },
-            )
+            .consume_pending_intent(command.clone(), route.clone(), grant, attempt_ctx)
             .await
             .expect("converted pending intent should be delivered by fake port");
 
@@ -3619,8 +4573,11 @@ mod tests {
 
     #[test]
     fn matrix_evidence_rejects_raw_identifiers() {
+        let route = route();
         let evidence = MatrixDeliveryEvidenceV1 {
             schema_version: 1,
+            delivery_id: route.delivery_id,
+            attempt_number: 1,
             event_id_fingerprint: "$raw-event-id".into(),
             transaction_id: MatrixTransactionId::new("txn-matrix-1").expect("valid txn"),
             command_kind: MatrixCommandKind::SendText,
@@ -3646,7 +4603,10 @@ mod tests {
             "secret:matrix",
             "matrix.secret.handle",
         ] {
-            let mut evidence = accepted_evidence(&command());
+            let command = command();
+            let route = route();
+            let attempt = attempt(&route, &command);
+            let mut evidence = accepted_evidence(&command, &route, &attempt);
             evidence.installation_scoped_credential_ref = credential_ref.into();
 
             assert_eq!(
@@ -3660,6 +4620,7 @@ mod tests {
     #[test]
     fn matrix_evidence_fingerprint_fields_require_canonical_sha256_format() {
         let command = command();
+        let route = route();
         let valid_fingerprint = canonical_fingerprint("valid-fingerprint");
         let invalid_cases = [
             ("event_id_fingerprint", "event_fp_1"),
@@ -3677,6 +4638,8 @@ mod tests {
         for (field, invalid_fingerprint) in invalid_cases {
             let mut evidence = MatrixDeliveryEvidenceV1 {
                 schema_version: 1,
+                delivery_id: route.delivery_id,
+                attempt_number: 1,
                 event_id_fingerprint: valid_fingerprint.clone(),
                 transaction_id: command.transaction_id.clone(),
                 command_kind: command.command_kind,
@@ -3710,6 +4673,28 @@ mod tests {
                 "{field} must use sha256:<64 lowercase hex> fingerprint format"
             );
         }
+    }
+
+    #[test]
+    fn matrix_evidence_must_match_delivery_attempt_identity() {
+        let command = command();
+        let route = route();
+        let attempt = attempt(&route, &command);
+        let metadata = route.matrix_metadata().clone();
+
+        let mut wrong_delivery = accepted_evidence(&command, &route, &attempt);
+        wrong_delivery.delivery_id = OutboundDeliveryId::new();
+        assert_eq!(
+            wrong_delivery.validate_for_delivery(&command, &metadata, &attempt),
+            Err(MatrixOutboundContractError::UnverifiedEvidence)
+        );
+
+        let mut wrong_attempt = accepted_evidence(&command, &route, &attempt);
+        wrong_attempt.attempt_number += 1;
+        assert_eq!(
+            wrong_attempt.validate_for_delivery(&command, &metadata, &attempt),
+            Err(MatrixOutboundContractError::UnverifiedEvidence)
+        );
     }
 
     #[test]
@@ -3773,8 +4758,14 @@ mod tests {
         );
         let command = command();
         let route = route();
-        let evidence = ValidatedMatrixDeliveryEvidence::new_redacted(accepted_evidence(&command))
-            .expect("fixture evidence is redacted");
+        let attempt = attempt(&route, &command);
+        let evidence = ValidatedMatrixDeliveryEvidence::new_for_delivery(
+            accepted_evidence(&command, &route, &attempt),
+            &command,
+            route.matrix_metadata(),
+            &attempt,
+        )
+        .expect("fixture evidence is valid for delivery");
 
         writer
             .persist_evidence(route.delivery_id, route.scope().clone(), evidence)
@@ -3986,9 +4977,10 @@ mod tests {
 
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let attempt_ctx = attempt(&route, &command);
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
-            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command, &route, &attempt_ctx)),
         ));
         let credential_resolver =
             FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
@@ -4011,16 +5003,7 @@ mod tests {
         let bridge = MatrixProductionDeliveryBridge::new(&pending_reader, &orchestrator);
 
         let outcome = bridge
-            .recover_pending_command(
-                route.clone(),
-                grant,
-                DeliveryAttemptContext {
-                    delivery_id: route.delivery_id,
-                    attempt_number: 1,
-                    transaction_id: command.transaction_id.clone(),
-                    started_at: Utc::now(),
-                },
-            )
+            .recover_pending_command(route.clone(), grant, attempt_ctx)
             .await
             .expect("production bridge should recover and deliver the durable pending command");
 
@@ -5939,7 +6922,8 @@ mod tests {
         let route = route();
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
-        let mut evidence = accepted_evidence(&command);
+        let attempt_ctx = attempt(&route, &command);
+        let mut evidence = accepted_evidence(&command, &route, &attempt_ctx);
         evidence.verified = false;
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
@@ -5955,12 +6939,7 @@ mod tests {
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
 
         let outcome = orchestrator
-            .consume_pending_intent(
-                command.clone(),
-                route.clone(),
-                grant,
-                attempt(&route, &command),
-            )
+            .consume_pending_intent(command.clone(), route.clone(), grant, attempt_ctx)
             .await
             .expect("unverified evidence should schedule retry without marking delivery");
 
@@ -5989,7 +6968,8 @@ mod tests {
         let route = route();
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
-        let mut evidence = accepted_evidence(&command);
+        let attempt_ctx = attempt(&route, &command);
+        let mut evidence = accepted_evidence(&command, &route, &attempt_ctx);
         evidence.installation_scoped_credential_ref = canonical_fingerprint("other-credential");
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
@@ -6005,12 +6985,7 @@ mod tests {
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
 
         let outcome = orchestrator
-            .consume_pending_intent(
-                command.clone(),
-                route.clone(),
-                grant,
-                attempt(&route, &command),
-            )
+            .consume_pending_intent(command.clone(), route.clone(), grant, attempt_ctx)
             .await
             .expect("wrong credential evidence should schedule retry without marking delivery");
 
@@ -6039,7 +7014,9 @@ mod tests {
         let route = route();
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
-        let mut evidence = accepted_evidence(&command);
+        let mut exhausted_attempt = attempt(&route, &command);
+        exhausted_attempt.attempt_number = 3;
+        let mut evidence = accepted_evidence(&command, &route, &exhausted_attempt);
         evidence.verified = false;
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
@@ -6053,9 +7030,6 @@ mod tests {
         let retry_policy = retry_policy();
         let orchestrator =
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
-        let mut exhausted_attempt = attempt(&route, &command);
-        exhausted_attempt.attempt_number = 3;
-
         let error = orchestrator
             .consume_pending_intent(command.clone(), route.clone(), grant, exhausted_attempt)
             .await
@@ -6077,7 +7051,9 @@ mod tests {
         let route = route();
         let owner = owner();
         let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
-        let mut evidence = accepted_evidence(&command);
+        let mut exhausted_attempt = attempt(&route, &command);
+        exhausted_attempt.attempt_number = 3;
+        let mut evidence = accepted_evidence(&command, &route, &exhausted_attempt);
         evidence.installation_scoped_credential_ref = canonical_fingerprint("other-credential");
         let port = FakeMatrixDeliveryPort::default();
         port.push_result(DeliveryPortResult::Accepted(
@@ -6091,9 +7067,6 @@ mod tests {
         let retry_policy = retry_policy();
         let orchestrator =
             MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
-        let mut exhausted_attempt = attempt(&route, &command);
-        exhausted_attempt.attempt_number = 3;
-
         let error = orchestrator
             .consume_pending_intent(command.clone(), route.clone(), grant, exhausted_attempt)
             .await
