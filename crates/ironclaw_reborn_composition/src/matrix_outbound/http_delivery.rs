@@ -7,7 +7,6 @@ pub struct MatrixHttpDeliveryEndpoint {
     host: String,
     port: Option<u16>,
     credential_secret: SecretHandle,
-    credential_material: SecretMaterial,
     credential_handle_fingerprint: String,
     capability_id: CapabilityId,
     response_body_limit: u64,
@@ -18,7 +17,6 @@ impl MatrixHttpDeliveryEndpoint {
     pub fn new(
         homeserver_origin: impl Into<String>,
         credential_secret: SecretHandle,
-        credential_material: SecretMaterial,
         credential_handle_fingerprint: impl Into<String>,
         capability_id: CapabilityId,
     ) -> Result<Self, DeliveryError> {
@@ -34,7 +32,6 @@ impl MatrixHttpDeliveryEndpoint {
             host,
             port,
             credential_secret,
-            credential_material,
             credential_handle_fingerprint,
             capability_id,
             response_body_limit: 4096,
@@ -62,6 +59,80 @@ impl MatrixHttpDeliveryEndpoint {
         self.timeout_ms = timeout_ms;
         Ok(self)
     }
+
+    pub fn homeserver_origin_fingerprint(&self) -> String {
+        redacted_sha256_fingerprint(self.homeserver_origin.as_bytes())
+    }
+
+    pub fn credential_handle_fingerprint(&self) -> &str {
+        &self.credential_handle_fingerprint
+    }
+
+    pub(crate) fn credential_secret(&self) -> &SecretHandle {
+        &self.credential_secret
+    }
+}
+
+#[async_trait]
+pub trait MatrixHttpCredentialMaterialProvider: Send + Sync {
+    async fn resolve_matrix_credential_material(
+        &self,
+        scope: &ResourceScope,
+        endpoint: &MatrixHttpDeliveryEndpoint,
+    ) -> Result<HostRuntimeCredentialMaterial, DeliveryError>;
+}
+
+pub struct MatrixSecretStoreCredentialMaterialProvider {
+    secret_store: Arc<dyn SecretStore>,
+}
+
+impl MatrixSecretStoreCredentialMaterialProvider {
+    pub(crate) fn new(secret_store: Arc<dyn SecretStore>) -> Self {
+        Self { secret_store }
+    }
+}
+
+#[async_trait]
+impl MatrixHttpCredentialMaterialProvider for MatrixSecretStoreCredentialMaterialProvider {
+    async fn resolve_matrix_credential_material(
+        &self,
+        scope: &ResourceScope,
+        endpoint: &MatrixHttpDeliveryEndpoint,
+    ) -> Result<HostRuntimeCredentialMaterial, DeliveryError> {
+        let lease = self
+            .secret_store
+            .lease_once(scope, endpoint.credential_secret())
+            .await
+            .map_err(matrix_credential_store_error)?;
+        let material = self
+            .secret_store
+            .consume(scope, lease.id)
+            .await
+            .map_err(matrix_credential_store_error)?;
+        Ok(HostRuntimeCredentialMaterial {
+            handle: endpoint.credential_secret().clone(),
+            material,
+            target: RuntimeCredentialTarget::Header {
+                name: "authorization".to_string(),
+                prefix: Some("Bearer ".to_string()),
+            },
+            required: true,
+        })
+    }
+}
+
+fn matrix_credential_store_error(error: SecretStoreError) -> DeliveryError {
+    let reason = match error {
+        SecretStoreError::BackendMisconfigured { .. }
+        | SecretStoreError::StoreUnavailable { .. } => DeliveryReasonCode::MatrixServerError,
+        SecretStoreError::UnknownSecret { .. }
+        | SecretStoreError::UnknownLease { .. }
+        | SecretStoreError::LeaseConsumed { .. }
+        | SecretStoreError::LeaseRevoked { .. }
+        | SecretStoreError::LeaseExpired { .. }
+        | SecretStoreError::SecretExpired => DeliveryReasonCode::UnauthorizedTarget,
+    };
+    DeliveryError::new(reason)
 }
 
 pub trait MatrixHttpDeliveryEndpointResolver: Send + Sync {
@@ -75,16 +146,19 @@ pub trait MatrixHttpDeliveryEndpointResolver: Send + Sync {
 pub struct MatrixHttpDeliveryPort {
     egress: Arc<dyn MatrixHostHttpEgress>,
     endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
+    credential_material_provider: Arc<dyn MatrixHttpCredentialMaterialProvider>,
 }
 
 impl MatrixHttpDeliveryPort {
     pub fn new(
         egress: Arc<dyn MatrixHostHttpEgress>,
         endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
+        credential_material_provider: Arc<dyn MatrixHttpCredentialMaterialProvider>,
     ) -> Self {
         Self {
             egress,
             endpoint_resolver,
+            credential_material_provider,
         }
     }
 }
@@ -134,7 +208,16 @@ impl MatrixDeliveryPort for MatrixHttpDeliveryPort {
         }
 
         let request = matrix_send_request(&route, &command, &endpoint);
-        let host_request = match matrix_host_http_request(request, &endpoint) {
+        let resource_scope = route.scope().to_resource_scope();
+        let credential_material = match self
+            .credential_material_provider
+            .resolve_matrix_credential_material(&resource_scope, &endpoint)
+            .await
+        {
+            Ok(credential) => credential,
+            Err(error) => return DeliveryPortResult::Rejected(error),
+        };
+        let host_request = match matrix_host_http_request(request, credential_material) {
             Ok(request) => request,
             Err(error) => return DeliveryPortResult::Rejected(error),
         };
@@ -184,21 +267,13 @@ fn matrix_send_request(
 
 fn matrix_host_http_request(
     request: RuntimeHttpEgressRequest,
-    endpoint: &MatrixHttpDeliveryEndpoint,
+    credential_material: HostRuntimeCredentialMaterial,
 ) -> Result<HostRuntimeHttpEgressRequest, DeliveryError> {
     Ok(HostRuntimeHttpEgressRequest {
         extension_id: matrix_extension_id()?,
         trust: TrustClass::System,
         request,
-        credentials: vec![HostRuntimeCredentialMaterial {
-            handle: endpoint.credential_secret.clone(),
-            material: endpoint.credential_material.clone(),
-            target: RuntimeCredentialTarget::Header {
-                name: "authorization".to_string(),
-                prefix: Some("Bearer ".to_string()),
-            },
-            required: true,
-        }],
+        credentials: vec![credential_material],
     })
 }
 

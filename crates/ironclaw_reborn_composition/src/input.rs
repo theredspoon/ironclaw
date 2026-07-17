@@ -11,14 +11,14 @@ use ironclaw_host_api::runtime_policy::{DeploymentMode, RuntimeProfile};
 use ironclaw_host_api::runtime_policy::{
     EffectiveRuntimePolicy, FilesystemBackendKind, NetworkMode, SecretMode,
 };
-use ironclaw_host_api::{AgentId, TenantId};
+use ironclaw_host_api::{AgentId, CapabilityId, SecretHandle, TenantId};
 #[cfg(all(test, feature = "slack-v2-host-beta"))]
 use ironclaw_host_runtime::HostRuntimeHttpEgressPort;
 use ironclaw_host_runtime::TenantSandboxProcessPort;
 #[cfg(any(test, feature = "test-support"))]
 use ironclaw_network::NetworkHttpEgress;
 use ironclaw_trust::HostTrustPolicy;
-use ironclaw_turns::{InMemoryTurnStateStoreLimits, TurnRunWakeNotifier};
+use ironclaw_turns::{InMemoryTurnStateStoreLimits, TurnRunWakeNotifier, TurnScope};
 use secrecy::SecretString;
 
 #[cfg(feature = "postgres")]
@@ -28,6 +28,7 @@ use ironclaw_reborn_event_store::{PostgresPoolTlsOptions, RebornPostgresSslMode}
 
 #[cfg(feature = "postgres")]
 use crate::RebornBuildError;
+use crate::matrix_outbound::{MatrixRetryWorkerSettings, MatrixRoomId};
 use crate::product_auth::oauth::google_oauth::google_provider_spec;
 use crate::product_auth::oauth::notion_oauth::notion_provider_spec;
 use crate::product_auth::oauth::oauth_dcr::OAuthDcrProviderConfig;
@@ -112,6 +113,76 @@ pub(crate) struct OAuthDcrProviderBackendConfig {
     pub(crate) config: OAuthDcrProviderConfig,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MatrixRetryProductionConfig {
+    pub(crate) settings: MatrixRetryWorkerSettings,
+    pub(crate) scopes: Vec<TurnScope>,
+    pub(crate) homeserver_origin: String,
+    pub(crate) policy_revision: String,
+    pub(crate) allowed_room_fingerprints: Vec<String>,
+    pub(crate) credential_secret: SecretHandle,
+    pub(crate) credential_handle_fingerprint: String,
+    pub(crate) capability_id: CapabilityId,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixRetryWorkerProductionConfig {
+    settings: MatrixRetryWorkerSettings,
+    scopes: Vec<TurnScope>,
+    homeserver_origin: String,
+    policy_revision: String,
+    allowed_room_ids: Vec<MatrixRoomId>,
+    credential_secret: SecretHandle,
+    credential_handle_fingerprint: String,
+    capability_id: CapabilityId,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixRetryWorkerProductionConfigInput {
+    pub settings: MatrixRetryWorkerSettings,
+    pub scopes: Vec<TurnScope>,
+    pub homeserver_origin: String,
+    pub policy_revision: String,
+    pub allowed_room_ids: Vec<MatrixRoomId>,
+    pub credential_secret: SecretHandle,
+    pub credential_handle_fingerprint: String,
+    pub capability_id: CapabilityId,
+}
+
+impl MatrixRetryWorkerProductionConfig {
+    pub fn new(input: MatrixRetryWorkerProductionConfigInput) -> Self {
+        Self {
+            settings: input.settings,
+            scopes: input.scopes,
+            homeserver_origin: input.homeserver_origin,
+            policy_revision: input.policy_revision,
+            allowed_room_ids: input.allowed_room_ids,
+            credential_secret: input.credential_secret,
+            credential_handle_fingerprint: input.credential_handle_fingerprint,
+            capability_id: input.capability_id,
+        }
+    }
+}
+
+impl From<MatrixRetryWorkerProductionConfig> for MatrixRetryProductionConfig {
+    fn from(config: MatrixRetryWorkerProductionConfig) -> Self {
+        Self {
+            settings: config.settings,
+            scopes: config.scopes,
+            homeserver_origin: config.homeserver_origin,
+            policy_revision: config.policy_revision,
+            allowed_room_fingerprints: config
+                .allowed_room_ids
+                .into_iter()
+                .map(|room_id| room_id.fingerprint())
+                .collect(),
+            credential_secret: config.credential_secret,
+            credential_handle_fingerprint: config.credential_handle_fingerprint,
+            capability_id: config.capability_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum RebornRuntimeProcessBinding {
     #[default]
@@ -194,6 +265,7 @@ pub struct RebornBuildInput {
     pub(crate) product_auth_ports: Option<RebornProductAuthServicePorts>,
     pub(crate) oauth_provider_configs: Vec<OAuthProviderBackendConfig>,
     pub(crate) oauth_dcr_provider_configs: Vec<OAuthDcrProviderBackendConfig>,
+    pub(crate) matrix_retry_production_config: Option<MatrixRetryProductionConfig>,
     #[cfg(feature = "slack-v2-host-beta")]
     pub(crate) slack_personal_oauth_lazy_slot: Option<SlackPersonalSetupServiceSlot>,
     pub(crate) nearai_mcp_bootstrap_config:
@@ -634,6 +706,14 @@ impl RebornBuildInput {
         self
     }
 
+    pub fn with_matrix_retry_production_config(
+        mut self,
+        config: MatrixRetryWorkerProductionConfig,
+    ) -> Self {
+        self.matrix_retry_production_config = Some(config.into());
+        self
+    }
+
     pub fn with_nearai_mcp_bootstrap_config(
         mut self,
         config: crate::llm_admin::nearai_mcp::NearAiMcpBootstrapConfig,
@@ -797,6 +877,7 @@ impl RebornBuildInput {
             product_auth_ports: None,
             oauth_provider_configs: Vec::new(),
             oauth_dcr_provider_configs: Vec::new(),
+            matrix_retry_production_config: None,
             #[cfg(feature = "slack-v2-host-beta")]
             slack_personal_oauth_lazy_slot: None,
             nearai_mcp_bootstrap_config: None,

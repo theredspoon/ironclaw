@@ -375,6 +375,31 @@ impl MatrixHttpDeliveryEndpointResolver for StaticMatrixHttpEndpointResolver {
     }
 }
 
+struct StaticMatrixHttpCredentialMaterialProvider;
+
+#[async_trait]
+impl MatrixHttpCredentialMaterialProvider for StaticMatrixHttpCredentialMaterialProvider {
+    async fn resolve_matrix_credential_material(
+        &self,
+        _scope: &ResourceScope,
+        endpoint: &MatrixHttpDeliveryEndpoint,
+    ) -> Result<HostRuntimeCredentialMaterial, DeliveryError> {
+        Ok(HostRuntimeCredentialMaterial {
+            handle: endpoint.credential_secret().clone(),
+            material: ironclaw_secrets::SecretMaterial::from("matrix-access-token".to_string()),
+            target: RuntimeCredentialTarget::Header {
+                name: "authorization".to_string(),
+                prefix: Some("Bearer ".to_string()),
+            },
+            required: true,
+        })
+    }
+}
+
+fn matrix_credential_material_provider() -> Arc<dyn MatrixHttpCredentialMaterialProvider> {
+    Arc::new(StaticMatrixHttpCredentialMaterialProvider)
+}
+
 #[derive(Debug, Clone)]
 struct RecordedMatrixHostRequest {
     request: RuntimeHttpEgressRequest,
@@ -718,7 +743,6 @@ fn matrix_endpoint(origin: &str) -> MatrixHttpDeliveryEndpoint {
     MatrixHttpDeliveryEndpoint::new(
         origin,
         SecretHandle::new("matrix_access_token").expect("valid secret handle"),
-        SecretMaterial::from("matrix-access-token"),
         canonical_fingerprint("credential-handle-1"),
         CapabilityId::new("matrix.send").expect("valid capability"),
     )
@@ -745,6 +769,7 @@ async fn matrix_http_delivery_port_sends_one_attempt_through_runtime_egress() {
         Arc::new(StaticMatrixHttpEndpointResolver {
             endpoint: Some(endpoint),
         }),
+        matrix_credential_material_provider(),
     );
 
     let result = port
@@ -821,6 +846,7 @@ async fn matrix_http_delivery_port_classifies_rate_limit_retry_hint() {
         Arc::new(StaticMatrixHttpEndpointResolver {
             endpoint: Some(endpoint),
         }),
+        matrix_credential_material_provider(),
     );
 
     let result = port
@@ -865,6 +891,7 @@ async fn matrix_http_delivery_port_rejects_endpoint_fingerprint_mismatch_before_
         Arc::new(StaticMatrixHttpEndpointResolver {
             endpoint: Some(endpoint),
         }),
+        matrix_credential_material_provider(),
     );
 
     let result = port
@@ -880,6 +907,48 @@ async fn matrix_http_delivery_port_rejects_endpoint_fingerprint_mismatch_before_
 
     let DeliveryPortResult::Rejected(error) = result else {
         panic!("expected rejected endpoint mismatch");
+    };
+    assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+    assert!(egress.requests().is_empty());
+}
+
+#[tokio::test]
+async fn matrix_http_delivery_port_rejects_missing_current_secret_before_egress() {
+    let origin = "https://matrix.example";
+    let command = command();
+    let route = route_for_homeserver_origin(origin);
+    let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+    let attempt = attempt(&route, &command);
+    let validated = validate_matrix_route_grant(&command, route, &grant)
+        .expect("route and grant should validate");
+    let egress = Arc::new(RecordingMatrixHostEgress::ok(
+        200,
+        Vec::new(),
+        json!({"event_id":"$event:matrix.example"}),
+    ));
+    let port = MatrixHttpDeliveryPort::new(
+        egress.clone(),
+        Arc::new(StaticMatrixHttpEndpointResolver {
+            endpoint: Some(matrix_endpoint(origin)),
+        }),
+        Arc::new(MatrixSecretStoreCredentialMaterialProvider::new(Arc::new(
+            ironclaw_secrets::InMemorySecretStore::new(),
+        ))),
+    );
+
+    let result = port
+        .deliver(
+            ProtocolDeliveryIntent::Matrix(command),
+            validated,
+            ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            },
+            attempt,
+        )
+        .await;
+
+    let DeliveryPortResult::Rejected(error) = result else {
+        panic!("missing current secret must reject before HTTP egress");
     };
     assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
     assert!(egress.requests().is_empty());
@@ -906,7 +975,6 @@ fn matrix_http_delivery_endpoint_rejects_plaintext_and_private_origins() {
         let error = MatrixHttpDeliveryEndpoint::new(
             origin,
             SecretHandle::new("matrix_access_token").expect("valid secret handle"),
-            SecretMaterial::from("matrix-access-token"),
             canonical_fingerprint("credential-handle-1"),
             CapabilityId::new("matrix.send").expect("valid capability"),
         )
@@ -925,7 +993,6 @@ fn matrix_http_delivery_endpoint_validates_limits_and_fingerprint() {
     let bad_fingerprint = MatrixHttpDeliveryEndpoint::new(
         "https://matrix.example",
         SecretHandle::new("matrix_access_token").expect("valid secret handle"),
-        SecretMaterial::from("matrix-access-token"),
         "credential-handle-1",
         CapabilityId::new("matrix.send").expect("valid capability"),
     )
@@ -1023,6 +1090,7 @@ async fn matrix_http_delivery_port_rejects_malformed_success_response() {
         Arc::new(StaticMatrixHttpEndpointResolver {
             endpoint: Some(matrix_endpoint(origin)),
         }),
+        matrix_credential_material_provider(),
     );
 
     let result = port
@@ -1061,6 +1129,7 @@ async fn matrix_http_delivery_port_preserves_explicit_homeserver_port() {
         Arc::new(StaticMatrixHttpEndpointResolver {
             endpoint: Some(matrix_endpoint(origin)),
         }),
+        matrix_credential_material_provider(),
     );
 
     let result = port
@@ -2619,6 +2688,105 @@ async fn matrix_retry_worker_tick_executes_due_rehydrated_retry() {
     let calls = port.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, ProtocolDeliveryIntent::Matrix(command));
+}
+
+#[tokio::test]
+async fn matrix_retry_production_dependency_bundle_uses_real_delivery_port_stores_and_config() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let metadata_filesystem = matrix_metadata_filesystem(Arc::clone(&backend));
+    let pending_filesystem = matrix_metadata_filesystem(Arc::clone(&backend));
+    let outbound_state = outbound_state_store();
+    let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+        Arc::clone(&metadata_filesystem),
+        Arc::clone(&outbound_state),
+    );
+    let pending_store = FilesystemMatrixPendingIntentStore::new(Arc::clone(&pending_filesystem));
+    let host_egress = Arc::new(RecordingMatrixHostEgress::ok(
+        200,
+        Vec::new(),
+        json!({"event_id":"$event:matrix.example"}),
+    ));
+    let endpoint_resolver = Arc::new(StaticMatrixHttpEndpointResolver {
+        endpoint: Some(matrix_endpoint("https://matrix.example")),
+    });
+    let settings = MatrixRetryWorkerSettings {
+        enabled: true,
+        poll_interval: Duration::from_millis(50),
+        startup_jitter_max: Duration::ZERO,
+        tick_jitter_max: Duration::ZERO,
+        max_entries_per_scope: 10,
+    };
+    let route = route_for_homeserver_origin("https://matrix.example");
+    let command = command();
+    pending_store
+        .persist_pending_command(
+            route.scope().clone(),
+            route.delivery_id,
+            route.delivery_id.as_uuid(),
+            command,
+        )
+        .await
+        .expect("persist pending command");
+    let mut schedule = retry_schedule(&route);
+    schedule.recorded_at = Utc::now() - chrono::Duration::seconds(60);
+    metadata_store
+        .record_retry_scheduled(schedule, retry_context(&route))
+        .await
+        .expect("persist retry schedule");
+
+    let bundle =
+        MatrixRetryProductionDependencyBundle::new(MatrixRetryProductionDependencyBundleInput {
+            settings: settings.clone(),
+            metadata_filesystem,
+            pending_filesystem,
+            outbound_state_store: outbound_state,
+            host_egress: host_egress.clone(),
+            endpoint_resolver,
+            credential_material_provider: matrix_credential_material_provider(),
+            retry_policy: Arc::new(retry_policy()),
+            retry_send_authorizer: Arc::new(AllowRetrySendAuthorizer),
+        })
+        .expect("production Matrix retry dependencies should compose");
+
+    assert_eq!(bundle.settings(), &settings);
+    let report = matrix_retry_worker_tick_once(
+        bundle.settings(),
+        &bundle.worker_deps(vec![route.scope().clone()]),
+        Utc::now(),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("retry tick uses production bundle");
+    assert_eq!(report.delivered, 1);
+    let requests = host_egress.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].request.method, NetworkMethod::Put);
+    assert!(
+        requests[0]
+            .request
+            .url
+            .contains("/_matrix/client/v3/rooms/")
+    );
+    assert_eq!(requests[0].credential_count, 1);
+}
+
+#[tokio::test]
+async fn matrix_configured_retry_authorizer_rejects_stale_policy_revision() {
+    let route = route_for_homeserver_origin("https://matrix.example");
+    let metadata = route.matrix_metadata().clone();
+    let authorizer = MatrixConfiguredRetrySendAuthorizer::new(
+        "policy-rev-current".to_string(),
+        metadata.homeserver_origin_fingerprint,
+        metadata.credential_handle_fingerprint,
+        vec![metadata.room_fingerprint],
+    );
+
+    let error = authorizer
+        .authorize_retry_send(&retry_context(&route))
+        .await
+        .expect_err("stale stored policy must not authorize retry send");
+
+    assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
 }
 
 #[tokio::test]
