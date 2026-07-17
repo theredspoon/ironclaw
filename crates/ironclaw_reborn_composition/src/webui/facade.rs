@@ -924,6 +924,12 @@ fn status_response_from_readiness(readiness: &RebornReadiness) -> RebornOperator
         "trigger poller worker is ready",
         "trigger poller worker is not running",
     ));
+    checks.push(bool_check(
+        "matrix_retry",
+        readiness.workers.matrix_retry,
+        "Matrix retry worker is ready",
+        "Matrix retry worker is not running",
+    ));
     checks.push(status_check(
         "channels",
         RebornOperatorStatusState::Unsupported,
@@ -1483,6 +1489,7 @@ mod tests {
             workers: crate::RebornWorkerReadiness {
                 turn_runner: true,
                 trigger_poller: true,
+                matrix_retry: false,
             },
             diagnostics: vec![RebornReadinessDiagnostic {
                 profile: crate::RebornCompositionProfile::Production,

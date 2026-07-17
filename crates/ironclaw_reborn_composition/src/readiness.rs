@@ -29,6 +29,8 @@ pub struct RebornFacadeReadiness {
 pub struct RebornWorkerReadiness {
     pub turn_runner: bool,
     pub trigger_poller: bool,
+    #[serde(default)]
+    pub matrix_retry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +162,7 @@ pub enum RebornReadinessDiagnosticComponent {
     McpRuntime,
     WasmRuntime,
     FirstPartyRuntime,
+    MatrixRetryWorker,
     TurnState,
     RunProfileResolver,
     TurnRunWakeNotifier,
@@ -193,6 +196,7 @@ impl RebornReadinessDiagnosticComponent {
             Self::McpRuntime => "mcp_runtime",
             Self::WasmRuntime => "wasm_runtime",
             Self::FirstPartyRuntime => "first_party_runtime",
+            Self::MatrixRetryWorker => "matrix_retry_worker",
             Self::TurnState => "turn_state",
             Self::RunProfileResolver => "run_profile_resolver",
             Self::TurnRunWakeNotifier => "turn_run_wake_notifier",
@@ -241,6 +245,7 @@ impl<'de> Deserialize<'de> for RebornReadinessDiagnosticComponent {
             "mcp_runtime" => Self::McpRuntime,
             "wasm_runtime" => Self::WasmRuntime,
             "first_party_runtime" => Self::FirstPartyRuntime,
+            "matrix_retry_worker" => Self::MatrixRetryWorker,
             "turn_state" => Self::TurnState,
             "run_profile_resolver" => Self::RunProfileResolver,
             "turn_run_wake_notifier" => Self::TurnRunWakeNotifier,
@@ -465,6 +470,7 @@ impl RebornReadiness {
             workers: RebornWorkerReadiness {
                 turn_runner: false,
                 trigger_poller: false,
+                matrix_retry: false,
             },
             diagnostics: vec![RebornReadinessDiagnostic::disabled()],
         }

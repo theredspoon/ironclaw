@@ -1767,7 +1767,16 @@ async fn migration_dry_run_validates_libsql_shape() {
         services.readiness.state,
         RebornReadinessState::MigrationDryRunValidated
     );
-    assert!(services.readiness.diagnostics.is_empty());
+    assert_eq!(services.readiness.diagnostics.len(), 1);
+    assert_eq!(
+        services.readiness.diagnostics[0].component,
+        RebornReadinessDiagnosticComponent::MatrixRetryWorker
+    );
+    assert_eq!(
+        services.readiness.diagnostics[0].reason,
+        RebornReadinessDiagnosticReason::Missing
+    );
+    assert!(services.readiness.diagnostics[0].blocks_production);
     assert!(services.host_runtime.is_some());
     assert!(services.turn_coordinator.is_some());
 }

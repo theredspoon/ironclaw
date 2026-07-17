@@ -201,7 +201,8 @@ use crate::runtime_input::RebornRuntimeIdentity;
 use crate::web_access::register_bundled_web_access_first_party_handlers;
 use crate::{
     RebornAuthContinuationDispatcher, RebornBuildError, RebornBuildInput, RebornCompositionProfile,
-    RebornFacadeReadiness, RebornProductAuthServices, RebornReadiness, RebornWorkerReadiness,
+    RebornFacadeReadiness, RebornProductAuthServices, RebornReadiness, RebornReadinessDiagnostic,
+    RebornReadinessDiagnosticComponent, RebornReadinessDiagnosticReason, RebornWorkerReadiness,
 };
 
 pub(crate) type LocalDevRootFilesystem = CompositeRootFilesystem;
@@ -5290,7 +5291,17 @@ fn readiness_for(
     turn_coordinator: bool,
     product_auth: bool,
 ) -> RebornReadiness {
-    let (state, diagnostics) = crate::readiness::readiness_contract_for_profile(profile);
+    let (state, mut diagnostics) = crate::readiness::readiness_contract_for_profile(profile);
+    let matrix_retry = false;
+    if !matrix_retry
+        && let Some(diagnostic) = RebornReadinessDiagnostic::production_blocker(
+            profile,
+            RebornReadinessDiagnosticComponent::MatrixRetryWorker,
+            RebornReadinessDiagnosticReason::Missing,
+        )
+    {
+        diagnostics.push(diagnostic);
+    }
 
     RebornReadiness {
         profile,
@@ -5303,6 +5314,7 @@ fn readiness_for(
         workers: RebornWorkerReadiness {
             turn_runner: false,
             trigger_poller: false,
+            matrix_retry,
         },
         diagnostics,
     }
@@ -7750,12 +7762,30 @@ mod tests {
             RebornReadinessState::ProductionValidated
         );
         assert!(!without_auth.facades.product_auth);
-        assert!(without_auth.diagnostics.is_empty());
+        assert_eq!(without_auth.diagnostics.len(), 1);
+        assert_eq!(
+            without_auth.diagnostics[0].component,
+            RebornReadinessDiagnosticComponent::MatrixRetryWorker
+        );
+        assert_eq!(
+            without_auth.diagnostics[0].reason,
+            RebornReadinessDiagnosticReason::Missing
+        );
+        assert!(without_auth.diagnostics[0].blocks_production);
 
         let with_auth = readiness_for(RebornCompositionProfile::Production, true, true, true);
         assert_eq!(with_auth.state, RebornReadinessState::ProductionValidated);
         assert!(with_auth.facades.product_auth);
-        assert!(with_auth.diagnostics.is_empty());
+        assert_eq!(with_auth.diagnostics.len(), 1);
+        assert_eq!(
+            with_auth.diagnostics[0].component,
+            RebornReadinessDiagnosticComponent::MatrixRetryWorker
+        );
+        assert_eq!(
+            with_auth.diagnostics[0].reason,
+            RebornReadinessDiagnosticReason::Missing
+        );
+        assert!(with_auth.diagnostics[0].blocks_production);
     }
 
     #[test]
@@ -7765,7 +7795,16 @@ mod tests {
             migration.state,
             RebornReadinessState::MigrationDryRunValidated
         );
-        assert!(migration.diagnostics.is_empty());
+        assert_eq!(migration.diagnostics.len(), 1);
+        assert_eq!(
+            migration.diagnostics[0].component,
+            RebornReadinessDiagnosticComponent::MatrixRetryWorker
+        );
+        assert_eq!(
+            migration.diagnostics[0].reason,
+            RebornReadinessDiagnosticReason::Missing
+        );
+        assert!(migration.diagnostics[0].blocks_production);
 
         let yolo = readiness_for(RebornCompositionProfile::LocalDevYolo, true, true, true);
         assert_eq!(yolo.state, RebornReadinessState::DevOnly);
