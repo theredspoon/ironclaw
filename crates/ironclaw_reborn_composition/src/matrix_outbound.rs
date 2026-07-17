@@ -5,6 +5,7 @@
 //! Matrix command intent pending; this bridge records terminal status only
 //! after a delivery port returns protocol evidence or a sanitized error.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,10 +13,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_common::hashing::sha256_hex;
 use ironclaw_filesystem::{
-    CasApply, CasUpdateError, ContentType, Entry, FilesystemError, RootFilesystem,
+    CasApply, CasUpdateError, ContentType, Entry, FileType, FilesystemError, RootFilesystem,
     ScopedFilesystem, cas_update,
 };
-use ironclaw_host_api::ScopedPath;
+use ironclaw_host_api::{ResourceScope, ScopedPath};
 use ironclaw_outbound::{
     DeliveryFailureKind, OutboundDeliveryId, OutboundDeliveryStatus, OutboundError,
     OutboundStateStore, UpdateDeliveryStatusRequest,
@@ -224,6 +225,26 @@ pub struct SealedDeliveryGrant {
     allowed_command_kinds: Vec<MatrixCommandKind>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRetryExecutionContext {
+    route: FrozenProductDeliveryRoute,
+    grant: SealedDeliveryGrant,
+}
+
+impl MatrixRetryExecutionContext {
+    fn new(
+        route: FrozenProductDeliveryRoute,
+        grant: SealedDeliveryGrant,
+    ) -> Result<Self, MatrixOutboundContractError> {
+        validate_retry_execution_context(&route, &grant)?;
+        Ok(Self { route, grant })
+    }
+
+    pub fn into_parts(self) -> (FrozenProductDeliveryRoute, SealedDeliveryGrant) {
+        (self.route, self.grant)
+    }
+}
+
 impl SealedDeliveryGrant {
     pub fn mint_for_matrix(
         _owner: &MatrixRoutePolicyOwnerToken,
@@ -284,6 +305,29 @@ pub fn validate_matrix_route_grant(
         Ok(ValidatedDeliveryRoute { route })
     } else {
         Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))
+    }
+}
+
+fn validate_retry_execution_context(
+    route: &FrozenProductDeliveryRoute,
+    grant: &SealedDeliveryGrant,
+) -> Result<(), MatrixOutboundContractError> {
+    let metadata = route.matrix_metadata();
+    let matches_route = grant.delivery_id == route.delivery_id
+        && grant.installation_id == route.installation_id
+        && grant.adapter_id == route.adapter_id
+        && grant.policy_revision == metadata.policy_revision
+        && grant.homeserver_origin_fingerprint == metadata.homeserver_origin_fingerprint
+        && grant.room_fingerprint == metadata.room_fingerprint
+        && grant.egress_target_index == metadata.egress_target_index
+        && grant.credential_handle_fingerprint == metadata.credential_handle_fingerprint
+        && grant.allowed_command_kinds == metadata.allowed_command_kinds;
+    if matches_route {
+        Ok(())
+    } else {
+        Err(MatrixOutboundContractError::Backend(
+            "matrix retry execution context route/grant mismatch".to_string(),
+        ))
     }
 }
 
@@ -595,6 +639,7 @@ pub trait MatrixOutboundMetadataStore: Send + Sync {
     async fn record_retry_scheduled(
         &self,
         schedule: MatrixRetrySchedule,
+        context: MatrixRetryExecutionContext,
     ) -> Result<(), MatrixOutboundContractError>;
 }
 
@@ -620,6 +665,8 @@ struct StoredMatrixOutboundMetadataV1 {
     evidence: Option<MatrixDeliveryEvidenceV1>,
     status: Option<StoredMatrixDeliveryStatusV1>,
     retry_schedule: Option<StoredMatrixRetryScheduleV1>,
+    #[serde(default)]
+    retry_execution_context: Option<StoredMatrixRetryExecutionContextV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,6 +689,45 @@ struct StoredMatrixRetryScheduleV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixRetryExecutionContextV1 {
+    route: StoredFrozenProductDeliveryRouteV1,
+    grant: StoredSealedDeliveryGrantV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredFrozenProductDeliveryRouteV1 {
+    delivery_id: OutboundDeliveryId,
+    scope: TurnScope,
+    installation_id: String,
+    adapter_id: String,
+    metadata: StoredMatrixRouteMetadataV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixRouteMetadataV1 {
+    policy_revision: String,
+    homeserver_origin_fingerprint: String,
+    room_fingerprint: String,
+    egress_target_index: u32,
+    credential_handle_fingerprint: String,
+    reply_target_binding_ref: ReplyTargetBindingRef,
+    allowed_command_kinds: Vec<MatrixCommandKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredSealedDeliveryGrantV1 {
+    delivery_id: OutboundDeliveryId,
+    installation_id: String,
+    adapter_id: String,
+    policy_revision: String,
+    homeserver_origin_fingerprint: String,
+    room_fingerprint: String,
+    egress_target_index: u32,
+    credential_handle_fingerprint: String,
+    allowed_command_kinds: Vec<MatrixCommandKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredMatrixPendingIntentV1 {
     schema_version: u32,
     delivery_id: OutboundDeliveryId,
@@ -659,6 +745,7 @@ impl StoredMatrixOutboundMetadataV1 {
             evidence: None,
             status: None,
             retry_schedule: None,
+            retry_execution_context: None,
         }
     }
 }
@@ -724,6 +811,126 @@ impl StoredMatrixRetryScheduleV1 {
             retry_after: Duration::from_millis(self.retry_after_millis),
             reason: self.reason,
             recorded_at: self.recorded_at,
+        }
+    }
+}
+
+impl From<&MatrixRouteMetadata> for StoredMatrixRouteMetadataV1 {
+    fn from(metadata: &MatrixRouteMetadata) -> Self {
+        Self {
+            policy_revision: metadata.policy_revision.clone(),
+            homeserver_origin_fingerprint: metadata.homeserver_origin_fingerprint.clone(),
+            room_fingerprint: metadata.room_fingerprint.clone(),
+            egress_target_index: metadata.egress_target_index,
+            credential_handle_fingerprint: metadata.credential_handle_fingerprint.clone(),
+            reply_target_binding_ref: metadata.reply_target_binding_ref.clone(),
+            allowed_command_kinds: metadata.allowed_command_kinds.clone(),
+        }
+    }
+}
+
+impl From<StoredMatrixRouteMetadataV1> for MatrixRouteMetadata {
+    fn from(metadata: StoredMatrixRouteMetadataV1) -> Self {
+        Self {
+            policy_revision: metadata.policy_revision,
+            homeserver_origin_fingerprint: metadata.homeserver_origin_fingerprint,
+            room_fingerprint: metadata.room_fingerprint,
+            egress_target_index: metadata.egress_target_index,
+            credential_handle_fingerprint: metadata.credential_handle_fingerprint,
+            reply_target_binding_ref: metadata.reply_target_binding_ref,
+            allowed_command_kinds: metadata.allowed_command_kinds,
+        }
+    }
+}
+
+impl From<&FrozenProductDeliveryRoute> for StoredFrozenProductDeliveryRouteV1 {
+    fn from(route: &FrozenProductDeliveryRoute) -> Self {
+        Self {
+            delivery_id: route.delivery_id,
+            scope: route.scope.clone(),
+            installation_id: route.installation_id.clone(),
+            adapter_id: route.adapter_id.clone(),
+            metadata: StoredMatrixRouteMetadataV1::from(&route.metadata),
+        }
+    }
+}
+
+impl From<StoredFrozenProductDeliveryRouteV1> for FrozenProductDeliveryRoute {
+    fn from(route: StoredFrozenProductDeliveryRouteV1) -> Self {
+        Self {
+            delivery_id: route.delivery_id,
+            scope: route.scope,
+            installation_id: route.installation_id,
+            adapter_id: route.adapter_id,
+            metadata: route.metadata.into(),
+        }
+    }
+}
+
+impl From<&SealedDeliveryGrant> for StoredSealedDeliveryGrantV1 {
+    fn from(grant: &SealedDeliveryGrant) -> Self {
+        Self {
+            delivery_id: grant.delivery_id,
+            installation_id: grant.installation_id.clone(),
+            adapter_id: grant.adapter_id.clone(),
+            policy_revision: grant.policy_revision.clone(),
+            homeserver_origin_fingerprint: grant.homeserver_origin_fingerprint.clone(),
+            room_fingerprint: grant.room_fingerprint.clone(),
+            egress_target_index: grant.egress_target_index,
+            credential_handle_fingerprint: grant.credential_handle_fingerprint.clone(),
+            allowed_command_kinds: grant.allowed_command_kinds.clone(),
+        }
+    }
+}
+
+impl From<StoredSealedDeliveryGrantV1> for SealedDeliveryGrant {
+    fn from(grant: StoredSealedDeliveryGrantV1) -> Self {
+        Self {
+            delivery_id: grant.delivery_id,
+            installation_id: grant.installation_id,
+            adapter_id: grant.adapter_id,
+            policy_revision: grant.policy_revision,
+            homeserver_origin_fingerprint: grant.homeserver_origin_fingerprint,
+            room_fingerprint: grant.room_fingerprint,
+            egress_target_index: grant.egress_target_index,
+            credential_handle_fingerprint: grant.credential_handle_fingerprint,
+            allowed_command_kinds: grant.allowed_command_kinds,
+        }
+    }
+}
+
+impl StoredMatrixRetryExecutionContextV1 {
+    fn new(route: &FrozenProductDeliveryRoute, grant: &SealedDeliveryGrant) -> Self {
+        Self {
+            route: StoredFrozenProductDeliveryRouteV1::from(route),
+            grant: StoredSealedDeliveryGrantV1::from(grant),
+        }
+    }
+
+    fn into_context(self) -> Result<MatrixRetryExecutionContext, MatrixOutboundContractError> {
+        let route = FrozenProductDeliveryRoute::from(self.route);
+        let grant = SealedDeliveryGrant::from(self.grant);
+        MatrixRetryExecutionContext::new(route, grant)
+    }
+
+    fn validate(&self) -> Result<(), MatrixOutboundContractError> {
+        let matches_route = self.grant.delivery_id == self.route.delivery_id
+            && self.grant.installation_id == self.route.installation_id
+            && self.grant.adapter_id == self.route.adapter_id
+            && self.grant.policy_revision == self.route.metadata.policy_revision
+            && self.grant.homeserver_origin_fingerprint
+                == self.route.metadata.homeserver_origin_fingerprint
+            && self.grant.room_fingerprint == self.route.metadata.room_fingerprint
+            && self.grant.egress_target_index == self.route.metadata.egress_target_index
+            && self.grant.credential_handle_fingerprint
+                == self.route.metadata.credential_handle_fingerprint
+            && self.grant.allowed_command_kinds == self.route.metadata.allowed_command_kinds;
+        if matches_route {
+            Ok(())
+        } else {
+            Err(MatrixOutboundContractError::Backend(
+                "matrix retry execution context route/grant mismatch".to_string(),
+            ))
         }
     }
 }
@@ -971,6 +1178,109 @@ where
             }))
     }
 
+    pub async fn list_due_retry_schedules(
+        &self,
+        scope: TurnScope,
+        now: DateTime<Utc>,
+        max_entries: usize,
+    ) -> Result<Vec<MatrixRetrySchedule>, MatrixOutboundContractError> {
+        if max_entries == 0 {
+            return Ok(Vec::new());
+        }
+
+        let resource_scope = scope.to_resource_scope();
+        let metadata_dir = matrix_metadata_dir_path()?;
+        let entries = match self
+            .filesystem
+            .list_dir(&resource_scope, &metadata_dir)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(FilesystemError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let terminal_delivery_ids = self
+            .outbound_state_store
+            .list_delivery_attempts(scope.clone())
+            .await?
+            .into_iter()
+            .filter(|attempt| is_terminal_delivery_status(attempt.status))
+            .map(|attempt| attempt.delivery_id)
+            .collect::<HashSet<_>>();
+        let mut schedules = Vec::new();
+        for entry in entries {
+            if entry.file_type != FileType::File {
+                continue;
+            }
+            let record_path = ScopedPath::new(format!("/outbound/matrix/metadata/{}", entry.name))
+                .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))?;
+            let Some(record) = self
+                .load_record_at_path(&resource_scope, &record_path)
+                .await?
+            else {
+                continue;
+            };
+            if record.scope != scope
+                || terminal_delivery_ids.contains(&record.delivery_id)
+                || record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| is_terminal_delivery_status(status.status))
+            {
+                continue;
+            }
+            let Some(schedule) = record.retry_schedule else {
+                continue;
+            };
+            if retry_schedule_due_and_unclaimed(&schedule, now)? {
+                schedules.push(schedule.into_schedule(record.delivery_id, record.scope));
+                if schedules.len() == max_entries {
+                    break;
+                }
+            }
+        }
+        Ok(schedules)
+    }
+
+    pub async fn persist_retry_execution_context(
+        &self,
+        _owner: &MatrixRoutePolicyOwnerToken,
+        route: &FrozenProductDeliveryRoute,
+        grant: &SealedDeliveryGrant,
+    ) -> Result<(), MatrixOutboundContractError> {
+        validate_retry_execution_context(route, grant)?;
+        self.mutate_record(route.scope().clone(), route.delivery_id, |mut record| {
+            record.retry_execution_context =
+                Some(StoredMatrixRetryExecutionContextV1::new(route, grant));
+            record
+        })
+        .await
+    }
+
+    pub async fn load_retry_execution_context(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<MatrixRetryExecutionContext>, MatrixOutboundContractError> {
+        let Some(record) = self.load_record(&scope, delivery_id).await? else {
+            return Ok(None);
+        };
+        if record.retry_schedule.is_none() {
+            return Ok(None);
+        }
+        if record
+            .status
+            .as_ref()
+            .is_some_and(|status| is_terminal_delivery_status(status.status))
+        {
+            return Ok(None);
+        }
+        record
+            .retry_execution_context
+            .map(StoredMatrixRetryExecutionContextV1::into_context)
+            .transpose()
+    }
+
     pub async fn claim_due_retry_schedule(
         &self,
         scope: TurnScope,
@@ -1059,6 +1369,19 @@ where
         Ok(Some(record))
     }
 
+    async fn load_record_at_path(
+        &self,
+        resource_scope: &ResourceScope,
+        path: &ScopedPath,
+    ) -> Result<Option<StoredMatrixOutboundMetadataV1>, MatrixOutboundContractError> {
+        let Some(versioned) = self.filesystem.get(resource_scope, path).await? else {
+            return Ok(None);
+        };
+        let record: StoredMatrixOutboundMetadataV1 = serde_json::from_slice(&versioned.entry.body)?;
+        validate_stored_matrix_metadata(&record, &record.scope, record.delivery_id)?;
+        Ok(Some(record))
+    }
+
     async fn mutate_record(
         &self,
         scope: TurnScope,
@@ -1126,6 +1449,7 @@ where
             });
             if is_terminal_delivery_status(request.status) {
                 record.retry_schedule = None;
+                record.retry_execution_context = None;
             }
             record
         })
@@ -1148,11 +1472,21 @@ where
     async fn record_retry_scheduled(
         &self,
         schedule: MatrixRetrySchedule,
+        context: MatrixRetryExecutionContext,
     ) -> Result<(), MatrixOutboundContractError> {
         let delivery_id = schedule.delivery_id;
         let scope = schedule.scope.clone();
+        if context.route.delivery_id != delivery_id || context.route.scope != scope {
+            return Err(MatrixOutboundContractError::Backend(
+                "matrix retry schedule context identity mismatch".to_string(),
+            ));
+        }
         self.mutate_record(scope, delivery_id, |mut record| {
             record.retry_schedule = Some(StoredMatrixRetryScheduleV1::from(&schedule));
+            record.retry_execution_context = Some(StoredMatrixRetryExecutionContextV1::new(
+                &context.route,
+                &context.grant,
+            ));
             record
         })
         .await
@@ -1170,6 +1504,11 @@ fn matrix_metadata_path(
         sha256_hex(key.as_bytes())
     ))
     .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
+}
+
+fn matrix_metadata_dir_path() -> Result<ScopedPath, MatrixOutboundContractError> {
+    ScopedPath::new("/outbound/matrix/metadata")
+        .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
 }
 
 fn matrix_pending_intent_path(
@@ -1207,6 +1546,18 @@ fn retry_due_at(
         })
 }
 
+fn retry_schedule_due_and_unclaimed(
+    schedule: &StoredMatrixRetryScheduleV1,
+    now: DateTime<Utc>,
+) -> Result<bool, MatrixOutboundContractError> {
+    Ok(
+        now >= retry_due_at(schedule.recorded_at, schedule.retry_after_millis)?
+            && schedule
+                .claim_expires_at
+                .is_none_or(|claim_expires_at| now >= claim_expires_at),
+    )
+}
+
 fn validate_stored_matrix_metadata(
     record: &StoredMatrixOutboundMetadataV1,
     scope: &TurnScope,
@@ -1222,6 +1573,14 @@ fn validate_stored_matrix_metadata(
     }
     if let Some(evidence) = &record.evidence {
         evidence.validate_redacted()?;
+    }
+    if let Some(context) = &record.retry_execution_context {
+        if context.route.delivery_id != record.delivery_id || context.route.scope != record.scope {
+            return Err(MatrixOutboundContractError::Backend(
+                "matrix retry execution context identity mismatch".to_string(),
+            ));
+        }
+        context.validate()?;
     }
     Ok(())
 }
@@ -1338,6 +1697,9 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
             .await?;
             return Err(error);
         }
+        let retry_context =
+            MatrixRetryExecutionContext::new(validated.route.clone(), grant.clone())
+                .map_err(DeliveryError::from)?;
         let metadata = validated.matrix_metadata().clone();
         let Some(credential) = self.credential_resolver.resolve(&validated) else {
             let error = DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget);
@@ -1384,6 +1746,7 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                                 DeliveryError::from(error),
                                 &attempt,
                                 validated_scope,
+                                retry_context.clone(),
                             )
                             .await;
                     }
@@ -1404,7 +1767,7 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 })
             }
             DeliveryPortResult::Rejected(error) => {
-                self.apply_delivery_error(error, &attempt, validated_scope)
+                self.apply_delivery_error(error, &attempt, validated_scope, retry_context)
                     .await
             }
         }
@@ -1415,19 +1778,23 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
         error: DeliveryError,
         attempt: &DeliveryAttemptContext,
         scope: TurnScope,
+        retry_context: MatrixRetryExecutionContext,
     ) -> Result<MatrixOrchestratorOutcome, DeliveryError> {
         let decision = self.retry_policy.classify(&error, attempt.attempt_number);
         match decision {
             MatrixRetryDecision::RetryAfter { after, reason } => {
                 self.metadata_store
-                    .record_retry_scheduled(MatrixRetrySchedule {
-                        delivery_id: attempt.delivery_id,
-                        scope,
-                        attempt_number: attempt.attempt_number,
-                        retry_after: after,
-                        reason,
-                        recorded_at: Utc::now(),
-                    })
+                    .record_retry_scheduled(
+                        MatrixRetrySchedule {
+                            delivery_id: attempt.delivery_id,
+                            scope,
+                            attempt_number: attempt.attempt_number,
+                            retry_after: after,
+                            reason,
+                            recorded_at: Utc::now(),
+                        },
+                        retry_context,
+                    )
                     .await?;
                 Ok(MatrixOrchestratorOutcome {
                     status: MatrixTerminalStatus::RetryScheduled,
@@ -1593,12 +1960,31 @@ where
     }
 }
 
-// Executes one known Matrix route/grant retry. Production worker wiring remains
-// blocked until a later slice adds durable due-retry enumeration and trusted
-// route/grant rehydration for this helper.
+// Executes one Matrix retry schedule. Production worker wiring remains blocked
+// until a later slice adds the runtime worker lifecycle around these durable
+// listing, claim, and rehydration primitives.
 pub struct MatrixRetryExecutor;
 
 impl MatrixRetryExecutor {
+    pub async fn execute_due_retry_from_store<F>(
+        metadata_store: &FilesystemMatrixOutboundMetadataStore<F>,
+        pending_store: &FilesystemMatrixPendingIntentStore<F>,
+        bridge: &MatrixProductionDeliveryBridge<'_, F>,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        now: DateTime<Utc>,
+    ) -> Result<Option<MatrixOrchestratorOutcome>, DeliveryError>
+    where
+        F: RootFilesystem,
+    {
+        let context = metadata_store
+            .load_retry_execution_context(scope, delivery_id)
+            .await?
+            .ok_or_else(|| DeliveryError::new(DeliveryReasonCode::MissingMatrixRoute))?;
+        let (route, grant) = context.into_parts();
+        Self::execute_due_retry(metadata_store, pending_store, bridge, route, grant, now).await
+    }
+
     pub async fn execute_due_retry<F>(
         metadata_store: &FilesystemMatrixOutboundMetadataStore<F>,
         pending_store: &FilesystemMatrixPendingIntentStore<F>,
@@ -1883,6 +2269,7 @@ pub mod fakes {
         async fn record_retry_scheduled(
             &self,
             schedule: MatrixRetrySchedule,
+            _context: MatrixRetryExecutionContext,
         ) -> Result<(), MatrixOutboundContractError> {
             self.retry_schedules
                 .lock()
@@ -2149,6 +2536,12 @@ mod tests {
             reason: DeliveryReasonCode::MatrixRateLimited,
             recorded_at: Utc::now(),
         }
+    }
+
+    fn retry_context(route: &FrozenProductDeliveryRoute) -> MatrixRetryExecutionContext {
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, route);
+        MatrixRetryExecutionContext::new(route.clone(), grant).expect("valid retry context")
     }
 
     fn delivery_status_request(
@@ -2957,7 +3350,7 @@ mod tests {
         };
 
         writer
-            .record_retry_scheduled(schedule.clone())
+            .record_retry_scheduled(schedule.clone(), retry_context(&route))
             .await
             .expect("persist retry schedule");
 
@@ -3258,6 +3651,447 @@ mod tests {
                 .expect("load retry schedule")
                 .is_some()
         );
+        assert!(
+            metadata_store
+                .load_retry_execution_context(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load retry execution context")
+                .is_some(),
+            "retryable production delivery must persist executable route/grant context"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_store_lists_due_unclaimed_retry_schedules_within_scope() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let now = Utc::now();
+        let due_route = route();
+        let second_due_route = route();
+        let not_due_route = route();
+
+        let due_schedule = MatrixRetrySchedule {
+            recorded_at: now - chrono::Duration::seconds(60),
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&due_route)
+        };
+        let second_due_schedule = MatrixRetrySchedule {
+            recorded_at: now - chrono::Duration::seconds(45),
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&second_due_route)
+        };
+        let not_due_schedule = MatrixRetrySchedule {
+            recorded_at: now,
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&not_due_route)
+        };
+
+        metadata_store
+            .record_retry_scheduled(due_schedule.clone(), retry_context(&due_route))
+            .await
+            .expect("persist due retry schedule");
+        metadata_store
+            .record_retry_scheduled(
+                second_due_schedule.clone(),
+                retry_context(&second_due_route),
+            )
+            .await
+            .expect("persist second due retry schedule");
+        metadata_store
+            .record_retry_scheduled(not_due_schedule, retry_context(&not_due_route))
+            .await
+            .expect("persist not-due retry schedule");
+
+        let due = metadata_store
+            .list_due_retry_schedules(scope(), now, 10)
+            .await
+            .expect("list due retry schedules");
+        let due_ids: HashSet<_> = due.iter().map(|schedule| schedule.delivery_id).collect();
+
+        assert_eq!(due.len(), 2);
+        assert!(due_ids.contains(&due_route.delivery_id));
+        assert!(due_ids.contains(&second_due_route.delivery_id));
+        assert!(!due_ids.contains(&not_due_route.delivery_id));
+        assert!(
+            metadata_store
+                .list_due_retry_schedules(scope(), now, 0)
+                .await
+                .expect("zero bound due retry list")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_store_returns_exact_max_due_retries_after_filtering() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let now = Utc::now();
+        let routes = [route(), route(), route()];
+
+        for route in &routes {
+            metadata_store
+                .record_retry_scheduled(
+                    MatrixRetrySchedule {
+                        recorded_at: now - chrono::Duration::seconds(60),
+                        retry_after: Duration::from_secs(30),
+                        ..retry_schedule(route)
+                    },
+                    retry_context(route),
+                )
+                .await
+                .expect("persist due retry schedule");
+        }
+
+        let due = metadata_store
+            .list_due_retry_schedules(scope(), now, 2)
+            .await
+            .expect("list due retry schedules with max bound");
+
+        assert_eq!(due.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn metadata_store_due_retry_bound_applies_after_filtering_skipped_records() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let now = Utc::now();
+        let not_due_route = route();
+        let due_route = route();
+
+        metadata_store
+            .record_retry_scheduled(
+                MatrixRetrySchedule {
+                    recorded_at: now,
+                    retry_after: Duration::from_secs(30),
+                    ..retry_schedule(&not_due_route)
+                },
+                retry_context(&not_due_route),
+            )
+            .await
+            .expect("persist skipped not-due retry schedule");
+        metadata_store
+            .record_retry_scheduled(
+                MatrixRetrySchedule {
+                    recorded_at: now - chrono::Duration::seconds(60),
+                    retry_after: Duration::from_secs(30),
+                    ..retry_schedule(&due_route)
+                },
+                retry_context(&due_route),
+            )
+            .await
+            .expect("persist due retry schedule");
+
+        let due = metadata_store
+            .list_due_retry_schedules(scope(), now, 1)
+            .await
+            .expect("list due retry schedules");
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].delivery_id, due_route.delivery_id);
+    }
+
+    #[tokio::test]
+    async fn metadata_store_lists_empty_due_retries_before_metadata_exists() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+
+        let due = metadata_store
+            .list_due_retry_schedules(scope(), Utc::now(), 10)
+            .await
+            .expect("empty retry queue should list successfully");
+
+        assert!(due.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_store_lists_retry_after_claim_lease_expires() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let route = route();
+        let now = Utc::now();
+        let schedule = MatrixRetrySchedule {
+            recorded_at: now - chrono::Duration::seconds(60),
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&route)
+        };
+
+        metadata_store
+            .record_retry_scheduled(schedule, retry_context(&route))
+            .await
+            .expect("persist retry schedule");
+        metadata_store
+            .claim_due_retry_schedule(
+                route.scope().clone(),
+                route.delivery_id,
+                now,
+                MATRIX_RETRY_CLAIM_LEASE,
+            )
+            .await
+            .expect("claim retry schedule")
+            .expect("retry should be claimed");
+
+        let after_lease = now
+            + chrono::Duration::from_std(MATRIX_RETRY_CLAIM_LEASE).expect("claim lease")
+            + chrono::Duration::milliseconds(1);
+        let due = metadata_store
+            .list_due_retry_schedules(scope(), after_lease, 10)
+            .await
+            .expect("list due retries after lease expiry");
+
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].delivery_id, route.delivery_id);
+    }
+
+    #[tokio::test]
+    async fn metadata_store_concurrent_due_retry_claims_allow_one_winner() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        ));
+        let route = route();
+        let now = Utc::now();
+        let schedule = MatrixRetrySchedule {
+            recorded_at: now - chrono::Duration::seconds(60),
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&route)
+        };
+
+        metadata_store
+            .record_retry_scheduled(schedule, retry_context(&route))
+            .await
+            .expect("persist retry schedule");
+
+        let first_store = Arc::clone(&metadata_store);
+        let second_store = Arc::clone(&metadata_store);
+        let first_scope = route.scope().clone();
+        let second_scope = route.scope().clone();
+        let delivery_id = route.delivery_id;
+        let (first, second) = tokio::join!(
+            async move {
+                first_store
+                    .claim_due_retry_schedule(
+                        first_scope,
+                        delivery_id,
+                        now,
+                        MATRIX_RETRY_CLAIM_LEASE,
+                    )
+                    .await
+            },
+            async move {
+                second_store
+                    .claim_due_retry_schedule(
+                        second_scope,
+                        delivery_id,
+                        now,
+                        MATRIX_RETRY_CLAIM_LEASE,
+                    )
+                    .await
+            }
+        );
+
+        let claimed = [first.expect("first claim"), second.expect("second claim")]
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+        assert_eq!(claimed, 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_store_excludes_claimed_and_terminal_retry_schedules_from_due_list() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let now = Utc::now();
+        let claimed_route = route();
+        let terminal_route = route();
+        let claimed_schedule = MatrixRetrySchedule {
+            recorded_at: now - chrono::Duration::seconds(60),
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&claimed_route)
+        };
+        let terminal_schedule = MatrixRetrySchedule {
+            recorded_at: now - chrono::Duration::seconds(60),
+            retry_after: Duration::from_secs(30),
+            ..retry_schedule(&terminal_route)
+        };
+
+        metadata_store
+            .record_retry_scheduled(claimed_schedule.clone(), retry_context(&claimed_route))
+            .await
+            .expect("persist claimed retry schedule");
+        metadata_store
+            .record_retry_scheduled(terminal_schedule, retry_context(&terminal_route))
+            .await
+            .expect("persist terminal retry schedule");
+        metadata_store
+            .claim_due_retry_schedule(
+                claimed_route.scope().clone(),
+                claimed_route.delivery_id,
+                now,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim due retry schedule")
+            .expect("schedule should be claimed");
+        metadata_store
+            .update_delivery_status(delivery_status_request(
+                &terminal_route,
+                OutboundDeliveryStatus::Delivered,
+            ))
+            .await
+            .expect("persist terminal delivery status");
+
+        let due = metadata_store
+            .list_due_retry_schedules(scope(), now, 10)
+            .await
+            .expect("list due retry schedules");
+
+        assert!(due.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_store_rehydrates_retry_execution_context() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let writer = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+
+        writer
+            .persist_retry_execution_context(&owner, &route, &grant)
+            .await
+            .expect("persist retry execution context");
+        writer
+            .record_retry_scheduled(retry_schedule(&route), retry_context(&route))
+            .await
+            .expect("persist retry schedule");
+
+        let context = reader
+            .load_retry_execution_context(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load retry execution context")
+            .expect("retry execution context should exist");
+        let (rehydrated_route, rehydrated_grant) = context.into_parts();
+
+        assert_eq!(rehydrated_route, route);
+        assert_eq!(rehydrated_grant, grant);
+    }
+
+    #[tokio::test]
+    async fn metadata_store_does_not_rehydrate_retry_execution_context_without_schedule() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let route = route();
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+
+        metadata_store
+            .persist_retry_execution_context(&owner, &route, &grant)
+            .await
+            .expect("persist retry execution context without retry schedule");
+
+        assert!(
+            metadata_store
+                .load_retry_execution_context(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load retry execution context")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_store_rejects_mismatched_retry_execution_context() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let route = route();
+        let owner = owner();
+        let forged_grant = route_forgery_fixture(&route, 9);
+
+        let error = metadata_store
+            .persist_retry_execution_context(&owner, &route, &forged_grant)
+            .await
+            .expect_err("mismatched route/grant context must fail");
+
+        assert!(matches!(error, MatrixOutboundContractError::Backend(_)));
+    }
+
+    #[tokio::test]
+    async fn metadata_store_clears_retry_execution_context_on_all_terminal_statuses() {
+        for status in [
+            OutboundDeliveryStatus::Delivered,
+            OutboundDeliveryStatus::Failed,
+            OutboundDeliveryStatus::DeadLettered,
+        ] {
+            let backend = Arc::new(InMemoryBackend::new());
+            let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+                matrix_metadata_filesystem(Arc::clone(&backend)),
+                outbound_state_store(),
+            );
+            let route = route();
+            let owner = owner();
+            let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+
+            metadata_store
+                .persist_retry_execution_context(&owner, &route, &grant)
+                .await
+                .expect("persist retry execution context");
+            metadata_store
+                .record_retry_scheduled(retry_schedule(&route), retry_context(&route))
+                .await
+                .expect("persist retry schedule");
+            metadata_store
+                .update_delivery_status(delivery_status_request(&route, status))
+                .await
+                .expect("persist terminal delivery status");
+
+            assert!(
+                metadata_store
+                    .load_retry_execution_context(route.scope().clone(), route.delivery_id)
+                    .await
+                    .expect("load retry execution context after terminal status")
+                    .is_none(),
+                "terminal status {status:?} must clear retry execution context"
+            );
+            assert!(
+                metadata_store
+                    .load_retry_schedule(route.scope().clone(), route.delivery_id)
+                    .await
+                    .expect("load retry schedule after terminal status")
+                    .is_none(),
+                "terminal status {status:?} must clear retry schedule"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3350,7 +4184,7 @@ mod tests {
             .await
             .expect("persist durable pending Matrix command");
         metadata_store
-            .record_retry_scheduled(schedule.clone())
+            .record_retry_scheduled(schedule.clone(), retry_context(&route))
             .await
             .expect("persist durable Matrix retry schedule");
 
@@ -3398,6 +4232,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_executor_rehydrates_route_grant_context_before_execution() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let pending_store = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let schedule = retry_schedule(&route);
+        let due_at =
+            schedule.recorded_at + chrono::Duration::from_std(schedule.retry_after).expect("due");
+
+        pending_store
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                route.delivery_id.as_uuid(),
+                command.clone(),
+            )
+            .await
+            .expect("persist durable pending Matrix command");
+        metadata_store
+            .record_retry_scheduled(schedule.clone(), retry_context(&route))
+            .await
+            .expect("persist retry schedule and execution context");
+
+        let port = RecordingMatrixDeliveryPort::default();
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let retry_policy = retry_policy();
+        let orchestrator = MatrixOutboundOrchestrator::new(
+            &port,
+            &credential_resolver,
+            &metadata_store,
+            &retry_policy,
+        );
+        let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+
+        let outcome = MatrixRetryExecutor::execute_due_retry_from_store(
+            &metadata_store,
+            &pending_store,
+            &bridge,
+            route.scope().clone(),
+            route.delivery_id,
+            due_at,
+        )
+        .await
+        .expect("rehydrated retry should execute")
+        .expect("due retry should produce outcome");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::Delivered);
+        let calls = port.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, ProtocolDeliveryIntent::Matrix(command));
+    }
+
+    #[tokio::test]
     async fn retry_executor_skips_retry_before_persisted_schedule_is_due() {
         let backend = Arc::new(InMemoryBackend::new());
         let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
@@ -3426,7 +4322,7 @@ mod tests {
             .await
             .expect("persist durable pending Matrix command");
         metadata_store
-            .record_retry_scheduled(schedule.clone())
+            .record_retry_scheduled(schedule.clone(), retry_context(&route))
             .await
             .expect("persist durable Matrix retry schedule");
 
@@ -3487,7 +4383,7 @@ mod tests {
             .await
             .expect("persist durable pending Matrix command");
         metadata_store
-            .record_retry_scheduled(schedule)
+            .record_retry_scheduled(schedule, retry_context(&route))
             .await
             .expect("persist retry schedule");
         let claimed = metadata_store
@@ -3561,7 +4457,7 @@ mod tests {
             .await
             .expect("persist durable pending Matrix command");
         metadata_store
-            .record_retry_scheduled(schedule)
+            .record_retry_scheduled(schedule, retry_context(&route))
             .await
             .expect("persist retry schedule");
         metadata_store
@@ -3642,7 +4538,7 @@ mod tests {
             .await
             .expect("persist terminal status");
         metadata_store
-            .record_retry_scheduled(schedule)
+            .record_retry_scheduled(schedule, retry_context(&route))
             .await
             .expect("persist stale retry schedule after terminal status");
 
@@ -3711,7 +4607,7 @@ mod tests {
             .await
             .expect("persist durable pending Matrix command");
         metadata_store
-            .record_retry_scheduled(schedule)
+            .record_retry_scheduled(schedule, retry_context(&route))
             .await
             .expect("persist exhausted retry schedule");
 
@@ -3782,7 +4678,7 @@ mod tests {
             schedule.recorded_at + chrono::Duration::from_std(schedule.retry_after).expect("due");
 
         metadata_store
-            .record_retry_scheduled(schedule)
+            .record_retry_scheduled(schedule, retry_context(&route))
             .await
             .expect("persist retry schedule without pending command");
 
@@ -3844,7 +4740,7 @@ mod tests {
             .await
             .expect("persist durable pending Matrix command");
         metadata_store
-            .record_retry_scheduled(schedule)
+            .record_retry_scheduled(schedule, retry_context(&route))
             .await
             .expect("persist overflowing retry schedule");
 
@@ -4151,7 +5047,7 @@ mod tests {
             let route = route();
 
             writer
-                .record_retry_scheduled(retry_schedule(&route))
+                .record_retry_scheduled(retry_schedule(&route), retry_context(&route))
                 .await
                 .expect("persist retry schedule");
             writer
@@ -4186,7 +5082,7 @@ mod tests {
         let schedule = retry_schedule(&route);
 
         writer
-            .record_retry_scheduled(schedule.clone())
+            .record_retry_scheduled(schedule.clone(), retry_context(&route))
             .await
             .expect("persist retry schedule");
         writer
