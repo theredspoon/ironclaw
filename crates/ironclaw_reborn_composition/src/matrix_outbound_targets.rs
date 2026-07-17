@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use ironclaw_common::hashing::sha256_hex;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
 use ironclaw_product_adapters::AdapterInstallationId;
 use ironclaw_product_workflow::{
@@ -8,6 +9,7 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 
+use crate::matrix_outbound::MatrixRoomId;
 use crate::outbound::OutboundDeliveryTargetProvider;
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 
@@ -40,24 +42,49 @@ pub struct MatrixHostOutboundTargetProvider {
     tenant_id: TenantId,
     agent_id: AgentId,
     project_id: Option<ProjectId>,
-    configured_room_routes: Vec<MatrixConfiguredRoomRoute>,
+    configured_room_routes: Vec<ValidatedMatrixConfiguredRoomRoute>,
     room_target_id_prefix: String,
     room_binding_ref_prefix: String,
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedMatrixConfiguredRoomRoute {
+    room_id: MatrixRoomId,
+    subject_user_id: UserId,
+    route_key: String,
+}
+
 impl MatrixHostOutboundTargetProvider {
-    pub fn new(config: MatrixOutboundTargetProviderConfig) -> Self {
+    pub fn new(config: MatrixOutboundTargetProviderConfig) -> Result<Self, RebornServicesError> {
         let room_target_id_prefix = format!("matrix:room:{}:", config.installation_id.as_str());
         let room_binding_ref_prefix =
             format!("reply:matrix:room:{}:", config.installation_id.as_str());
-        Self {
+        let configured_room_routes = config
+            .configured_room_routes
+            .iter()
+            .cloned()
+            .map(|route| {
+                MatrixRoomId::new(route.room_id)
+                    .map_err(|_| matrix_target_config_error())
+                    .map(|room_id| ValidatedMatrixConfiguredRoomRoute {
+                        route_key: matrix_route_key(
+                            &config,
+                            route.subject_user_id.as_str(),
+                            room_id.as_str(),
+                        ),
+                        room_id,
+                        subject_user_id: route.subject_user_id,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             tenant_id: config.tenant_id,
             agent_id: config.agent_id,
             project_id: config.project_id,
-            configured_room_routes: config.configured_room_routes,
+            configured_room_routes,
             room_target_id_prefix,
             room_binding_ref_prefix,
-        }
+        })
     }
 
     fn caller_matches_provider_context(&self, caller: &WebUiAuthenticatedCaller) -> bool {
@@ -66,33 +93,37 @@ impl MatrixHostOutboundTargetProvider {
             && caller.project_id == self.project_id
     }
 
-    fn room_id_for_target_id<'a>(
+    fn route_key_for_target_id<'a>(
         &self,
         target_id: &'a RebornOutboundDeliveryTargetId,
     ) -> Option<&'a str> {
         target_id.as_str().strip_prefix(&self.room_target_id_prefix)
     }
 
-    fn room_id_for_reply_target_binding_ref<'a>(
+    fn route_key_for_reply_target_binding_ref<'a>(
         &self,
         target: &'a ReplyTargetBindingRef,
     ) -> Option<&'a str> {
         target.as_str().strip_prefix(&self.room_binding_ref_prefix)
     }
 
-    fn configured_route_for_room(&self, room_id: &str) -> Option<&MatrixConfiguredRoomRoute> {
+    fn configured_route_for_key(
+        &self,
+        route_key: &str,
+    ) -> Option<&ValidatedMatrixConfiguredRoomRoute> {
         self.configured_room_routes
             .iter()
-            .find(|route| route.room_id == room_id)
+            .find(|route| route.route_key == route_key)
     }
 
     fn entry_for_room_route(
         &self,
-        route: &MatrixConfiguredRoomRoute,
+        route: &ValidatedMatrixConfiguredRoomRoute,
     ) -> Result<OutboundDeliveryTargetEntry, RebornServicesError> {
+        debug_assert!(route.room_id.as_str().starts_with('!'));
         let target_id = RebornOutboundDeliveryTargetId::new(format!(
             "{}{}",
-            self.room_target_id_prefix, route.room_id
+            self.room_target_id_prefix, route.route_key
         ))
         .map_err(|_| matrix_target_backend_error())?;
         Ok(OutboundDeliveryTargetEntry {
@@ -100,7 +131,7 @@ impl MatrixHostOutboundTargetProvider {
                 target_id,
                 "matrix",
                 "Matrix room",
-                Some(format!("Matrix room {}", route.room_id)),
+                Some("Configured Matrix room".to_string()),
             )
             .map_err(|_| matrix_target_backend_error())?,
             capabilities: RebornOutboundDeliveryTargetCapabilities {
@@ -110,21 +141,21 @@ impl MatrixHostOutboundTargetProvider {
             },
             reply_target_binding_ref: ReplyTargetBindingRef::new(format!(
                 "{}{}",
-                self.room_binding_ref_prefix, route.room_id
+                self.room_binding_ref_prefix, route.route_key
             ))
             .map_err(|_| matrix_target_backend_error())?,
         })
     }
 
-    fn resolve_for_room_id(
+    fn resolve_for_route_key(
         &self,
         caller: &WebUiAuthenticatedCaller,
-        room_id: &str,
+        route_key: &str,
     ) -> Result<Option<OutboundDeliveryTargetEntry>, RebornServicesError> {
         if !self.caller_matches_provider_context(caller) {
             return Ok(None);
         }
-        let Some(route) = self.configured_route_for_room(room_id) else {
+        let Some(route) = self.configured_route_for_key(route_key) else {
             return Ok(None);
         };
         if route.subject_user_id != caller.user_id {
@@ -155,10 +186,10 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
         caller: &WebUiAuthenticatedCaller,
         target_id: &RebornOutboundDeliveryTargetId,
     ) -> Result<Option<OutboundDeliveryTargetEntry>, RebornServicesError> {
-        let Some(room_id) = self.room_id_for_target_id(target_id) else {
+        let Some(route_key) = self.route_key_for_target_id(target_id) else {
             return Ok(None);
         };
-        self.resolve_for_room_id(caller, room_id)
+        self.resolve_for_route_key(caller, route_key)
     }
 
     async fn resolve_reply_target_binding(
@@ -166,10 +197,50 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
         caller: &WebUiAuthenticatedCaller,
         target: &ReplyTargetBindingRef,
     ) -> Result<Option<OutboundDeliveryTargetEntry>, RebornServicesError> {
-        let Some(room_id) = self.room_id_for_reply_target_binding_ref(target) else {
+        let Some(route_key) = self.route_key_for_reply_target_binding_ref(target) else {
             return Ok(None);
         };
-        self.resolve_for_room_id(caller, room_id)
+        self.resolve_for_route_key(caller, route_key)
+    }
+}
+
+fn matrix_route_key(
+    config: &MatrixOutboundTargetProviderConfig,
+    subject_user_id: &str,
+    room_id: &str,
+) -> String {
+    let mut input = Vec::new();
+    push_route_key_segment(&mut input, config.tenant_id.as_str());
+    push_route_key_segment(&mut input, config.agent_id.as_str());
+    push_route_key_segment(
+        &mut input,
+        config
+            .project_id
+            .as_ref()
+            .map(ProjectId::as_str)
+            .unwrap_or(""),
+    );
+    push_route_key_segment(&mut input, config.installation_id.as_str());
+    push_route_key_segment(&mut input, subject_user_id);
+    push_route_key_segment(&mut input, room_id);
+    sha256_hex(&input)
+}
+
+fn push_route_key_segment(input: &mut Vec<u8>, segment: &str) {
+    input.extend_from_slice(segment.len().to_string().as_bytes());
+    input.push(b':');
+    input.extend_from_slice(segment.as_bytes());
+    input.push(b'|');
+}
+
+fn matrix_target_config_error() -> RebornServicesError {
+    RebornServicesError {
+        code: RebornServicesErrorCode::InvalidRequest,
+        kind: RebornServicesErrorKind::Validation,
+        status_code: 400,
+        retryable: false,
+        field: Some("configured_room_routes.room_id".to_string()),
+        validation_code: None,
     }
 }
 
@@ -189,6 +260,7 @@ mod tests {
     use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
     use ironclaw_product_adapters::AdapterInstallationId;
     use ironclaw_product_workflow::{RebornOutboundDeliveryTargetId, WebUiAuthenticatedCaller};
+    use ironclaw_turns::ReplyTargetBindingRef;
 
     use crate::matrix_outbound_targets::{
         MatrixConfiguredRoomRoute, MatrixHostOutboundTargetProvider,
@@ -225,24 +297,35 @@ mod tests {
         )
     }
 
-    fn build_provider(installation_id: &str) -> MatrixHostOutboundTargetProvider {
-        MatrixHostOutboundTargetProvider::new(MatrixOutboundTargetProviderConfig {
+    fn provider_config(
+        installation_id: &str,
+        configured_room_routes: Vec<MatrixConfiguredRoomRoute>,
+    ) -> MatrixOutboundTargetProviderConfig {
+        MatrixOutboundTargetProviderConfig {
             tenant_id: TenantId::new(TENANT).expect("tenant"),
             agent_id: AgentId::new(AGENT).expect("agent"),
             project_id: Some(ProjectId::new(PROJECT).expect("project")),
             installation_id: AdapterInstallationId::new(installation_id).expect("installation"),
-            configured_room_routes: vec![
+            configured_room_routes,
+        }
+    }
+
+    fn build_provider(installation_id: &str) -> MatrixHostOutboundTargetProvider {
+        MatrixHostOutboundTargetProvider::new(provider_config(
+            installation_id,
+            vec![
                 MatrixConfiguredRoomRoute::new(ROOM.to_string(), UserId::new(USER).expect("user")),
                 MatrixConfiguredRoomRoute::new(
                     OTHER_ROOM.to_string(),
                     UserId::new(OTHER_USER).expect("other user"),
                 ),
             ],
-        })
+        ))
+        .expect("valid Matrix target provider config")
     }
 
     #[tokio::test]
-    async fn matrix_room_target_lists_and_resolves_only_authenticated_owner_rooms() {
+    async fn matrix_room_target_lists_opaque_refs_without_room_id_leakage() {
         let provider = build_provider(INSTALLATION);
 
         let listed = provider
@@ -251,47 +334,75 @@ mod tests {
             .expect("target list");
 
         assert_eq!(listed.len(), 1);
-        assert_eq!(
-            listed[0].summary.target_id.as_str(),
-            "matrix:room:inst_matrix:!room:example.org"
-        );
         assert_eq!(listed[0].summary.channel.as_str(), "matrix");
-        assert_eq!(listed[0].summary.display_name.as_str(), "Matrix room");
         assert!(listed[0].capabilities.final_replies);
+        assert!(
+            !listed[0].summary.target_id.as_str().contains(ROOM),
+            "listed target id must not expose raw Matrix room id"
+        );
+        assert!(
+            !listed[0].reply_target_binding_ref.as_str().contains(ROOM),
+            "listed reply binding ref must not expose raw Matrix room id"
+        );
+        assert!(
+            !listed[0].summary.display_name.as_str().contains(ROOM),
+            "listed display name must not expose raw Matrix room id"
+        );
+        assert!(
+            !listed[0]
+                .summary
+                .description
+                .as_ref()
+                .map(|description| description.as_str().contains(ROOM))
+                .unwrap_or(false),
+            "listed description must not expose raw Matrix room id"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_target_resolves_listed_opaque_refs_for_owner() {
+        let provider = build_provider(INSTALLATION);
+
+        let listed = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("target list");
+        let listed = listed.first().expect("owned Matrix room target");
 
         let resolved = provider
-            .resolve_outbound_delivery_target(
-                &caller(USER),
-                &RebornOutboundDeliveryTargetId::new("matrix:room:inst_matrix:!room:example.org")
-                    .expect("target id"),
-            )
+            .resolve_outbound_delivery_target(&caller(USER), &listed.summary.target_id)
             .await
             .expect("target resolve")
             .expect("owned Matrix room target");
 
         assert_eq!(
             resolved.reply_target_binding_ref,
-            listed[0].reply_target_binding_ref
+            listed.reply_target_binding_ref
         );
         assert_eq!(
             provider
-                .resolve_reply_target_binding(&caller(USER), &resolved.reply_target_binding_ref)
+                .resolve_reply_target_binding(&caller(USER), &listed.reply_target_binding_ref)
                 .await
                 .expect("binding resolve")
                 .expect("owned Matrix room binding")
                 .summary
-                .target_id
-                .as_str(),
-            "matrix:room:inst_matrix:!room:example.org"
+                .target_id,
+            listed.summary.target_id
         );
     }
 
     #[tokio::test]
     async fn matrix_room_target_refuses_foreign_tenant_user_and_installation_targets() {
         let provider = build_provider(INSTALLATION);
-        let owner_target =
-            RebornOutboundDeliveryTargetId::new("matrix:room:inst_matrix:!room:example.org")
-                .expect("target id");
+        let owner_target = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("owner target list")
+            .into_iter()
+            .next()
+            .expect("owner Matrix room target")
+            .summary
+            .target_id;
 
         assert!(
             provider
@@ -326,5 +437,81 @@ mod tests {
                 .expect("foreign installation binding lookup")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_target_rejects_tampered_opaque_refs_for_other_room_key() {
+        let provider = build_provider(INSTALLATION);
+
+        let owner_target = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("owner target list")
+            .into_iter()
+            .next()
+            .expect("owner Matrix room target");
+        let other_user_target = provider
+            .list_outbound_delivery_targets(&caller(OTHER_USER))
+            .await
+            .expect("other user target list")
+            .into_iter()
+            .next()
+            .expect("other Matrix room target");
+
+        let tampered_target_id =
+            RebornOutboundDeliveryTargetId::new(other_user_target.summary.target_id.as_str())
+                .expect("tampered target id");
+        let tampered_reply_binding_ref = ReplyTargetBindingRef::new(
+            other_user_target
+                .reply_target_binding_ref
+                .as_str()
+                .to_owned(),
+        )
+        .expect("tampered reply binding ref");
+
+        assert_ne!(owner_target.summary.target_id, tampered_target_id);
+        assert_ne!(
+            owner_target.reply_target_binding_ref,
+            tampered_reply_binding_ref
+        );
+        assert!(
+            provider
+                .resolve_outbound_delivery_target(&caller(USER), &tampered_target_id)
+                .await
+                .expect("tampered target lookup")
+                .is_none()
+        );
+        assert!(
+            provider
+                .resolve_reply_target_binding(&caller(USER), &tampered_reply_binding_ref)
+                .await
+                .expect("tampered binding lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn matrix_room_target_rejects_invalid_configured_room_ids_before_provider_use() {
+        for invalid_room_id in [
+            "#alias:example.org",
+            "!room",
+            "!room:",
+            " !room:example.org",
+            "!room:example.org ",
+            "!room:\nexample.org",
+        ] {
+            let result = MatrixHostOutboundTargetProvider::new(provider_config(
+                INSTALLATION,
+                vec![MatrixConfiguredRoomRoute::new(
+                    invalid_room_id.to_string(),
+                    UserId::new(USER).expect("user"),
+                )],
+            ));
+
+            assert!(
+                result.is_err(),
+                "invalid configured Matrix room id must be rejected before provider use: {invalid_room_id:?}"
+            );
+        }
     }
 }
