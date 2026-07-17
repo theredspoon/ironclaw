@@ -662,6 +662,8 @@ pub struct RebornRuntime {
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     credential_refresh_worker_handle:
         Option<crate::product_auth::credentials::credential_refresh_worker::CredentialRefreshWorkerRuntimeHandle>,
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    matrix_retry_worker_handle: Option<crate::matrix_outbound::MatrixRetryWorkerRuntimeHandle>,
     trace_flush_worker: crate::observability::trace_capture::TraceQueueFlushWorkerHandle,
     #[cfg(feature = "root-llm-provider")]
     skill_learning_extraction_tasks:
@@ -1396,6 +1398,18 @@ impl RebornRuntime {
     /// Exposed for diagnostics / readiness reporting; **not** for traffic.
     pub fn services(&self) -> &RebornServices {
         &self.services
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matrix_retry_worker_is_running_for_test(&self) -> bool {
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        {
+            self.matrix_retry_worker_handle.is_some()
+        }
+        #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+        {
+            false
+        }
     }
 
     /// Seed a bare `secret_handle` secret for an owner scope so keyed
@@ -2504,6 +2518,12 @@ impl RebornRuntime {
                 .shutdown(
                     crate::product_auth::credentials::credential_refresh_worker::CREDENTIAL_REFRESH_WORKER_SHUTDOWN_TIMEOUT,
                 )
+                .await;
+        }
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        if let Some(matrix_retry_worker) = self.matrix_retry_worker_handle {
+            matrix_retry_worker
+                .shutdown(crate::matrix_outbound::MATRIX_RETRY_WORKER_SHUTDOWN_TIMEOUT)
                 .await;
         }
         self.trace_flush_worker.shutdown().await;
@@ -4042,11 +4062,30 @@ pub async fn build_reborn_runtime(
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     let _ = credential_refresh;
 
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    let matrix_retry_worker_handle = match std::mem::replace(
+        &mut services.matrix_retry_worker,
+        crate::factory::MatrixRetryWorkerReady::Absent,
+    ) {
+        crate::factory::MatrixRetryWorkerReady::Ready { settings, deps } => {
+            crate::matrix_outbound::spawn_matrix_retry_worker(settings, deps).map_err(|error| {
+                RebornRuntimeError::InvalidArgument {
+                    reason: format!("Matrix retry worker could not be started: {error}"),
+                }
+            })?
+        }
+        crate::factory::MatrixRetryWorkerReady::Absent => None,
+    };
+
     let trace_flush_worker =
         crate::observability::trace_capture::spawn_trace_queue_flush_worker(trace_capture_scopes);
     // Scheduler is running (started inside build_default_planned_runtime); mark readiness.
     services.readiness.workers.turn_runner = true;
     services.readiness.workers.trigger_poller = trigger_poller_handle.is_some();
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    {
+        services.readiness.workers.matrix_retry = matrix_retry_worker_handle.is_some();
+    }
     let turn_coordinator = planned_turn_coordinator;
 
     // Spawn the budget-event projection task as the production owner
@@ -4084,6 +4123,8 @@ pub async fn build_reborn_runtime(
         trigger_poller_handle,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         credential_refresh_worker_handle,
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        matrix_retry_worker_handle,
         trace_flush_worker,
         #[cfg(feature = "root-llm-provider")]
         skill_learning_extraction_tasks,
@@ -7340,6 +7381,110 @@ output_schema_ref = "schemas/write.output.json"
                 .contains("component=MatrixRetryWorker, reason=Missing"),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn build_reborn_runtime_spawns_and_shuts_down_configured_matrix_retry_worker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            libsql::Builder::new_local(dir.path().join("reborn.db"))
+                .build()
+                .await
+                .expect("libsql db"),
+        );
+        let gateway = Arc::new(RecordingGateway {
+            reply: "validated production runtime with matrix retry".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let matrix_retry_scope = ironclaw_turns::TurnScope::new_with_owner(
+            TenantId::new("matrix-retry-tenant").expect("valid tenant"),
+            Some(AgentId::new("matrix-retry-agent").expect("valid agent")),
+            None,
+            ThreadId::new("matrix-retry-thread").expect("valid thread"),
+            Some(UserId::new("matrix-retry-owner").expect("valid owner")),
+        );
+
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::libsql(
+                crate::RebornCompositionProfile::Production,
+                "runtime-matrix-retry-worker-owner",
+                db,
+                dir.path().join("events.db").to_string_lossy(),
+                None,
+                ironclaw_secrets::SecretMaterial::from("01234567890123456789012345678901"),
+            )
+            .with_production_trust_policy(Arc::new(
+                crate::builtin_first_party_trust_policy().expect("trust policy"),
+            ))
+            .with_runtime_policy(EffectiveRuntimePolicy {
+                deployment: DeploymentMode::HostedMultiTenant,
+                requested_profile: RuntimeProfile::SecureDefault,
+                resolved_profile: RuntimeProfile::SecureDefault,
+                filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+                process_backend: ProcessBackendKind::TenantSandbox,
+                network_mode: NetworkMode::Deny,
+                secret_mode: SecretMode::BrokeredHandles,
+                approval_policy: ApprovalPolicy::AskAlways,
+                audit_mode: AuditMode::Standard,
+            })
+            .with_runtime_process_binding(RebornRuntimeProcessBinding::tenant_sandbox(Arc::new(
+                ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
+                    RecordingSandboxTransport,
+                )),
+            )))
+            .with_matrix_retry_production_config(
+                crate::input::MatrixRetryWorkerProductionConfig::new(
+                    crate::input::MatrixRetryWorkerProductionConfigInput {
+                        settings: crate::matrix_outbound::MatrixRetryWorkerSettings {
+                            enabled: true,
+                            poll_interval: Duration::from_millis(50),
+                            startup_jitter_max: Duration::ZERO,
+                            tick_jitter_max: Duration::ZERO,
+                            max_entries_per_scope: 10,
+                        },
+                        scopes: vec![matrix_retry_scope],
+                        homeserver_origin: "https://matrix.example".to_string(),
+                        policy_revision: "policy-rev-1".to_string(),
+                        allowed_room_ids: vec![
+                            crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
+                                .expect("valid Matrix room id"),
+                        ],
+                        credential_secret: ironclaw_host_api::SecretHandle::new(
+                            "matrix_access_token",
+                        )
+                        .expect("valid Matrix credential secret"),
+                        credential_handle_fingerprint: format!(
+                            "sha256:{}",
+                            ironclaw_common::hashing::sha256_hex(b"credential-handle-1")
+                        ),
+                        capability_id: CapabilityId::new("matrix.send")
+                            .expect("valid Matrix capability id"),
+                    },
+                ),
+            ),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-matrix-retry-worker-tenant".to_string(),
+            agent_id: "runtime-matrix-retry-worker-agent".to_string(),
+            source_binding_id: "runtime-matrix-retry-worker-source".to_string(),
+            reply_target_binding_id: "runtime-matrix-retry-worker-reply".to_string(),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input)
+            .await
+            .expect("configured Matrix retry worker should satisfy production readiness");
+
+        assert!(runtime.services().readiness.workers.matrix_retry);
+        assert!(
+            runtime.matrix_retry_worker_is_running_for_test(),
+            "ready production bundle should spawn the Matrix retry worker"
+        );
+        tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
+            .await
+            .expect("Matrix retry worker shutdown should not hang")
+            .expect("runtime shutdown");
     }
 
     /// Regression guard for Firat's review: a trajectory observer is only wired

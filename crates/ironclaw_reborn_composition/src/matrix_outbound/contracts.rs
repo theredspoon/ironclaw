@@ -259,6 +259,10 @@ impl ValidatedDeliveryRoute {
     pub fn matrix_metadata(&self) -> &MatrixRouteMetadata {
         self.route.matrix_metadata()
     }
+
+    pub fn scope(&self) -> &TurnScope {
+        self.route.scope()
+    }
 }
 
 pub fn validate_matrix_route_grant(

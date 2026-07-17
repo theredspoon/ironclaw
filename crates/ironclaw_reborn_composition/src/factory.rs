@@ -84,13 +84,13 @@ use ironclaw_host_runtime::{
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_loop_host::FilesystemCheckpointStateStore;
-use ironclaw_outbound::CommunicationPreferenceRepository;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_outbound::FilesystemOutboundStateStore;
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
 use ironclaw_outbound::InMemoryOutboundStateStore;
+use ironclaw_outbound::{CommunicationPreferenceRepository, OutboundStateStore};
 #[cfg(feature = "slack-v2-host-beta")]
-use ironclaw_outbound::{DeliveredGateRouteStore, OutboundStateStore, TriggeredRunDeliveryStore};
+use ironclaw_outbound::{DeliveredGateRouteStore, TriggeredRunDeliveryStore};
 #[cfg(all(
     not(any(feature = "libsql", feature = "postgres")),
     feature = "slack-v2-host-beta"
@@ -492,6 +492,8 @@ pub struct RebornServices {
     /// the only consumer; this field must never leak through any public facade.
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     pub(crate) credential_refresh_worker: CredentialRefreshWorkerReady,
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    pub(crate) matrix_retry_worker: MatrixRetryWorkerReady,
 }
 
 /// Whether the background credential keepalive worker can be started, with its
@@ -516,6 +518,15 @@ pub(crate) enum CredentialRefreshWorkerReady {
     /// Deps intentionally absent: local-dev (single-user, no cross-owner
     /// enumeration), `disabled()`, or a caller-supplied `product_auth_ports`
     /// override/test path. The worker never starts.
+    Absent,
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+pub(crate) enum MatrixRetryWorkerReady {
+    Ready {
+        settings: crate::matrix_outbound::MatrixRetryWorkerSettings,
+        deps: crate::matrix_outbound::MatrixRetryWorkerDeps,
+    },
     Absent,
 }
 
@@ -1243,6 +1254,8 @@ impl RebornServices {
             local_dev_wasm_runtime_credential_provider_captured: false,
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             credential_refresh_worker: CredentialRefreshWorkerReady::Absent,
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            matrix_retry_worker: MatrixRetryWorkerReady::Absent,
         }
     }
 }
@@ -1378,6 +1391,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
+        matrix_retry_production_config: _,
         #[cfg(feature = "slack-v2-host-beta")]
         slack_personal_oauth_lazy_slot,
         nearai_mcp_bootstrap_config,
@@ -2025,6 +2039,8 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         // Local-dev is single-user; no cross-owner enumeration or leader lock needed.
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         credential_refresh_worker: CredentialRefreshWorkerReady::Absent,
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        matrix_retry_worker: MatrixRetryWorkerReady::Absent,
     })
 }
 
@@ -4229,6 +4245,7 @@ async fn build_production_shaped(
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
+        matrix_retry_production_config,
         #[cfg(feature = "slack-v2-host-beta")]
         slack_personal_oauth_lazy_slot,
         nearai_mcp_bootstrap_config: _,
@@ -4253,6 +4270,7 @@ async fn build_production_shaped(
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
+        matrix_retry_production_config,
         turn_state_store_limits,
     );
     #[cfg(feature = "slack-v2-host-beta")]
@@ -4306,6 +4324,7 @@ async fn build_production_shaped(
                 product_auth_ports,
                 oauth_provider_configs,
                 oauth_dcr_provider_configs,
+                matrix_retry_production_config,
                 #[cfg(feature = "slack-v2-host-beta")]
                 slack_personal_oauth_lazy_slot,
                 owner_id,
@@ -4353,6 +4372,7 @@ async fn build_production_shaped(
                 product_auth_ports,
                 oauth_provider_configs,
                 oauth_dcr_provider_configs,
+                matrix_retry_production_config,
                 #[cfg(feature = "slack-v2-host-beta")]
                 slack_personal_oauth_lazy_slot,
                 owner_id,
@@ -4398,6 +4418,7 @@ struct RebornProductionBuildContext {
     product_auth_ports: Option<RebornProductAuthServicePorts>,
     oauth_provider_configs: Vec<crate::input::OAuthProviderBackendConfig>,
     oauth_dcr_provider_configs: Vec<crate::input::OAuthDcrProviderBackendConfig>,
+    matrix_retry_production_config: Option<crate::input::MatrixRetryProductionConfig>,
     #[cfg(feature = "slack-v2-host-beta")]
     slack_personal_oauth_lazy_slot:
         Option<crate::slack::slack_setup::SlackPersonalSetupServiceSlot>,
@@ -4831,6 +4852,7 @@ where
 {
     filesystem: Arc<F>,
     scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    outbound_state: Arc<dyn OutboundStateStore>,
     resource_governor: FilesystemResourceGovernor<F>,
     leases: Arc<FilesystemCapabilityLeaseStore<F>>,
     persistent_approval_policies: Arc<FilesystemPersistentApprovalPolicyStore<F>>,
@@ -4856,6 +4878,13 @@ where
         let persistent_approval_policies = Arc::new(FilesystemPersistentApprovalPolicyStore::new(
             Arc::clone(&scoped_filesystem),
         ));
+        // Composition-owned construction site: every production consumer takes
+        // a clone of this handle instead of reopening outbound state over the
+        // same filesystem mount.
+        #[allow(clippy::disallowed_methods)]
+        let outbound_state: Arc<dyn OutboundStateStore> = Arc::new(
+            FilesystemOutboundStateStore::new(Arc::clone(&scoped_filesystem)),
+        );
         let secret_credentials = FilesystemSecretCredentialStores::from_master_key(
             Arc::clone(&scoped_filesystem),
             secret_master_key,
@@ -4865,6 +4894,7 @@ where
         Ok(Self {
             filesystem,
             scoped_filesystem,
+            outbound_state,
             resource_governor,
             leases,
             persistent_approval_policies,
@@ -4885,6 +4915,80 @@ where
         reason: format!("resource governor warm-up task failed: {error}"),
     })
     .await
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn build_matrix_retry_worker_ready<F>(
+    config: Option<crate::input::MatrixRetryProductionConfig>,
+    scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    outbound_state_store: Arc<dyn OutboundStateStore>,
+    secret_store: Arc<dyn SecretStore>,
+    host_runtime_http_egress: Option<HostRuntimeHttpEgressPort>,
+) -> Result<MatrixRetryWorkerReady, RebornBuildError>
+where
+    F: RootFilesystem + Send + Sync + 'static,
+{
+    let Some(config) = config else {
+        return Ok(MatrixRetryWorkerReady::Absent);
+    };
+    if !config.settings.enabled {
+        return Ok(MatrixRetryWorkerReady::Absent);
+    }
+    let host_runtime_http_egress =
+        host_runtime_http_egress.ok_or_else(|| RebornBuildError::InvalidConfig {
+            reason: "Matrix retry worker requires host runtime HTTP egress".to_string(),
+        })?;
+    if config.scopes.is_empty() {
+        return Err(RebornBuildError::InvalidConfig {
+            reason: "Matrix retry worker requires at least one retry scope".to_string(),
+        });
+    }
+    let endpoint = crate::matrix_outbound::MatrixHttpDeliveryEndpoint::new(
+        config.homeserver_origin,
+        config.credential_secret,
+        config.credential_handle_fingerprint.clone(),
+        config.capability_id,
+    )
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("Matrix retry worker endpoint invalid: {error:?}"),
+    })?;
+    let retry_send_authorizer = crate::matrix_outbound::MatrixConfiguredRetrySendAuthorizer::new(
+        config.policy_revision,
+        endpoint.homeserver_origin_fingerprint(),
+        config.credential_handle_fingerprint,
+        config.allowed_room_fingerprints,
+    );
+    let bundle = crate::matrix_outbound::MatrixRetryProductionDependencyBundle::new(
+        crate::matrix_outbound::MatrixRetryProductionDependencyBundleInput {
+            settings: config.settings,
+            metadata_filesystem: Arc::clone(&scoped_filesystem),
+            pending_filesystem: scoped_filesystem,
+            outbound_state_store,
+            host_egress: Arc::new(host_runtime_http_egress),
+            endpoint_resolver: Arc::new(
+                crate::matrix_outbound::MatrixStaticHttpEndpointResolver::new(endpoint),
+            ),
+            credential_material_provider: Arc::new(
+                crate::matrix_outbound::MatrixSecretStoreCredentialMaterialProvider::new(
+                    secret_store,
+                ),
+            ),
+            retry_policy: Arc::new(crate::matrix_outbound::BoundedMatrixRetryPolicy {
+                max_attempts: 3,
+                fallback_after: std::time::Duration::from_secs(1),
+                max_retry_after: std::time::Duration::from_secs(60),
+            }),
+            retry_send_authorizer: Arc::new(retry_send_authorizer),
+        },
+    )
+    .map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("Matrix retry worker dependencies invalid: {error}"),
+    })?;
+    let deps = bundle.worker_deps(config.scopes);
+    Ok(MatrixRetryWorkerReady::Ready {
+        settings: bundle.settings().clone(),
+        deps,
+    })
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -4932,6 +5036,7 @@ where
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
+        matrix_retry_production_config,
         #[cfg(feature = "slack-v2-host-beta")]
         slack_personal_oauth_lazy_slot,
         owner_id,
@@ -5152,6 +5257,14 @@ where
         reason: format!("GSuite first-party handlers are invalid: {error}"),
     })?;
     let services = services.with_first_party_capabilities(Arc::new(first_party_registry));
+    let matrix_retry_worker = build_matrix_retry_worker_ready(
+        matrix_retry_production_config,
+        Arc::clone(&stores.scoped_filesystem),
+        Arc::clone(&stores.outbound_state),
+        Arc::clone(&secret_store),
+        services.host_runtime_http_egress_port(),
+    )?;
+    let matrix_retry_ready = matches!(matrix_retry_worker, MatrixRetryWorkerReady::Ready { .. });
 
     #[cfg(any(test, feature = "test-support"))]
     let local_dev_wasm_runtime_credential_provider_captured =
@@ -5162,7 +5275,13 @@ where
     Ok(RebornServices {
         host_runtime: Some(host_runtime),
         turn_coordinator: Some(turn_coordinator),
-        readiness: readiness_for(profile, true, true, product_auth_ready),
+        readiness: readiness_for_matrix_retry_state(
+            profile,
+            true,
+            true,
+            product_auth_ready,
+            matrix_retry_ready,
+        ),
         product_auth: Some(product_auth_services),
         skill_management: Some(skill_management),
         local_runtime: None,
@@ -5177,6 +5296,7 @@ where
         // caller-supplied product_auth_ports override); `Absent` otherwise. The
         // leader lock is always available on this production path.
         credential_refresh_worker,
+        matrix_retry_worker,
     })
 }
 
@@ -5291,8 +5411,17 @@ fn readiness_for(
     turn_coordinator: bool,
     product_auth: bool,
 ) -> RebornReadiness {
+    readiness_for_matrix_retry_state(profile, host_runtime, turn_coordinator, product_auth, false)
+}
+
+fn readiness_for_matrix_retry_state(
+    profile: RebornCompositionProfile,
+    host_runtime: bool,
+    turn_coordinator: bool,
+    product_auth: bool,
+    matrix_retry: bool,
+) -> RebornReadiness {
     let (state, mut diagnostics) = crate::readiness::readiness_contract_for_profile(profile);
-    let matrix_retry = false;
     if !matrix_retry
         && let Some(diagnostic) = RebornReadinessDiagnostic::production_blocker(
             profile,
@@ -5318,6 +5447,23 @@ fn readiness_for(
         },
         diagnostics,
     }
+}
+
+#[cfg(test)]
+fn readiness_for_with_matrix_retry_worker(
+    profile: RebornCompositionProfile,
+    host_runtime: bool,
+    turn_coordinator: bool,
+    product_auth: bool,
+    settings: crate::matrix_outbound::MatrixRetryWorkerSettings,
+) -> RebornReadiness {
+    readiness_for_matrix_retry_state(
+        profile,
+        host_runtime,
+        turn_coordinator,
+        product_auth,
+        settings.enabled,
+    )
 }
 
 #[cfg(test)]
@@ -5403,6 +5549,41 @@ mod tests {
         );
 
         assert!(matches!(store, FilesystemTurnStateStoreKind::Row(_)));
+    }
+
+    #[test]
+    fn production_readiness_without_matrix_retry_config_keeps_missing_blocker() {
+        let readiness = readiness_for(RebornCompositionProfile::Production, true, true, true);
+
+        assert!(!readiness.workers.matrix_retry);
+        assert!(readiness.diagnostics.iter().any(|diagnostic| {
+            diagnostic.component == RebornReadinessDiagnosticComponent::MatrixRetryWorker
+                && diagnostic.reason == RebornReadinessDiagnosticReason::Missing
+                && diagnostic.blocks_production
+        }));
+    }
+
+    #[test]
+    fn production_readiness_with_matrix_retry_config_omits_missing_blocker() {
+        let readiness = readiness_for_with_matrix_retry_worker(
+            RebornCompositionProfile::Production,
+            true,
+            true,
+            true,
+            crate::matrix_outbound::MatrixRetryWorkerSettings {
+                enabled: true,
+                poll_interval: std::time::Duration::from_millis(50),
+                startup_jitter_max: std::time::Duration::ZERO,
+                tick_jitter_max: std::time::Duration::ZERO,
+                max_entries_per_scope: 10,
+            },
+        );
+
+        assert!(readiness.workers.matrix_retry);
+        assert!(!readiness.diagnostics.iter().any(|diagnostic| {
+            diagnostic.component == RebornReadinessDiagnosticComponent::MatrixRetryWorker
+                && diagnostic.reason == RebornReadinessDiagnosticReason::Missing
+        }));
     }
 
     #[cfg(any(feature = "libsql", feature = "postgres"))]

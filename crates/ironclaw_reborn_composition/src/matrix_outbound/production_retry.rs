@@ -150,6 +150,82 @@ pub trait MatrixRetrySendAuthorizer: Send + Sync {
     ) -> Result<(), DeliveryError>;
 }
 
+pub(crate) struct MatrixConfiguredRetrySendAuthorizer {
+    policy_revision: String,
+    homeserver_origin_fingerprint: String,
+    credential_handle_fingerprint: String,
+    allowed_room_fingerprints: HashSet<String>,
+}
+
+impl MatrixConfiguredRetrySendAuthorizer {
+    pub(crate) fn new(
+        policy_revision: String,
+        homeserver_origin_fingerprint: String,
+        credential_handle_fingerprint: String,
+        allowed_room_fingerprints: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            policy_revision,
+            homeserver_origin_fingerprint,
+            credential_handle_fingerprint,
+            allowed_room_fingerprints: allowed_room_fingerprints.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl MatrixRetrySendAuthorizer for MatrixConfiguredRetrySendAuthorizer {
+    async fn authorize_retry_send(
+        &self,
+        context: &MatrixRetryExecutionContext,
+    ) -> Result<(), DeliveryError> {
+        validate_retry_execution_context(context.route(), context.grant())
+            .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        let metadata = context.route().matrix_metadata();
+        if metadata.policy_revision != self.policy_revision
+            || metadata.homeserver_origin_fingerprint != self.homeserver_origin_fingerprint
+            || metadata.credential_handle_fingerprint != self.credential_handle_fingerprint
+            || !self
+                .allowed_room_fingerprints
+                .contains(&metadata.room_fingerprint)
+        {
+            return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct MatrixStaticHttpEndpointResolver {
+    endpoint: MatrixHttpDeliveryEndpoint,
+}
+
+impl MatrixStaticHttpEndpointResolver {
+    pub(crate) fn new(endpoint: MatrixHttpDeliveryEndpoint) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl MatrixHttpDeliveryEndpointResolver for MatrixStaticHttpEndpointResolver {
+    fn resolve_endpoint(
+        &self,
+        route: &ValidatedDeliveryRoute,
+        credential: &ResolvedCredentialHandle,
+    ) -> Option<MatrixHttpDeliveryEndpoint> {
+        let metadata = route.matrix_metadata();
+        if self.endpoint.credential_handle_fingerprint()
+            == metadata.credential_handle_fingerprint.as_str()
+            && self.endpoint.credential_handle_fingerprint()
+                == credential.credential_handle_fingerprint.as_str()
+            && self.endpoint.homeserver_origin_fingerprint()
+                == metadata.homeserver_origin_fingerprint
+        {
+            Some(self.endpoint.clone())
+        } else {
+            None
+        }
+    }
+}
+
 #[async_trait]
 pub trait MatrixRetryWorkPort: Send + Sync {
     async fn list_due_retry_schedules(
@@ -177,6 +253,88 @@ where
     credential_resolver: Arc<dyn MatrixCredentialResolver>,
     retry_policy: Arc<dyn RetryPolicy>,
     retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
+}
+
+pub(crate) struct MatrixRetryProductionDependencyBundleInput<F>
+where
+    F: RootFilesystem + 'static,
+{
+    pub settings: MatrixRetryWorkerSettings,
+    pub metadata_filesystem: Arc<ScopedFilesystem<F>>,
+    pub pending_filesystem: Arc<ScopedFilesystem<F>>,
+    pub outbound_state_store: Arc<dyn OutboundStateStore>,
+    pub host_egress: Arc<dyn MatrixHostHttpEgress>,
+    pub endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
+    pub credential_material_provider: Arc<dyn MatrixHttpCredentialMaterialProvider>,
+    pub retry_policy: Arc<dyn RetryPolicy>,
+    pub retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
+}
+
+pub(crate) struct MatrixRetryProductionDependencyBundle {
+    settings: MatrixRetryWorkerSettings,
+    work_port: Arc<dyn MatrixRetryWorkPort>,
+}
+
+impl MatrixRetryProductionDependencyBundle {
+    pub(crate) fn new<F>(
+        input: MatrixRetryProductionDependencyBundleInput<F>,
+    ) -> Result<Self, MatrixOutboundContractError>
+    where
+        F: RootFilesystem + Send + Sync + 'static,
+    {
+        input.settings.validate()?;
+        let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+            input.metadata_filesystem,
+            input.outbound_state_store,
+        ));
+        let pending_store = Arc::new(FilesystemMatrixPendingIntentStore::new(
+            input.pending_filesystem,
+        ));
+        let delivery_port = Arc::new(MatrixHttpDeliveryPort::new(
+            input.host_egress,
+            input.endpoint_resolver,
+            input.credential_material_provider,
+        ));
+        let delivery_port_dyn: Arc<dyn MatrixDeliveryPort> = delivery_port.clone();
+        let credential_resolver: Arc<dyn MatrixCredentialResolver> =
+            Arc::new(MatrixRouteMetadataCredentialResolver);
+        let work_port = Arc::new(MatrixRetryProductionWorkPort::new(
+            Arc::clone(&metadata_store),
+            Arc::clone(&pending_store),
+            Arc::clone(&delivery_port_dyn),
+            credential_resolver,
+            input.retry_policy,
+            input.retry_send_authorizer,
+        ));
+        Ok(Self {
+            settings: input.settings,
+            work_port,
+        })
+    }
+
+    pub(crate) fn settings(&self) -> &MatrixRetryWorkerSettings {
+        &self.settings
+    }
+
+    pub(crate) fn worker_deps(&self, scopes: Vec<TurnScope>) -> MatrixRetryWorkerDeps {
+        MatrixRetryWorkerDeps {
+            work_port: Arc::clone(&self.work_port),
+            scopes,
+        }
+    }
+}
+
+struct MatrixRouteMetadataCredentialResolver;
+
+impl MatrixCredentialResolver for MatrixRouteMetadataCredentialResolver {
+    fn resolve(&self, route: &ValidatedDeliveryRoute) -> Option<ResolvedCredentialHandle> {
+        Some(ResolvedCredentialHandle {
+            credential_handle_fingerprint: route
+                .matrix_metadata()
+                .credential_handle_fingerprint
+                .clone(),
+        })
+    }
 }
 
 impl<F> MatrixRetryProductionWorkPort<F>

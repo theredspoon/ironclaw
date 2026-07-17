@@ -29,7 +29,7 @@ use ironclaw_outbound::{
     DeliveryFailureKind, OutboundDeliveryId, OutboundDeliveryStatus, OutboundError,
     OutboundStateStore, UpdateDeliveryStatusRequest,
 };
-use ironclaw_secrets::SecretMaterial;
+use ironclaw_secrets::{SecretStore, SecretStoreError};
 use ironclaw_turns::{ReplyTargetBindingRef, TurnScope};
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
