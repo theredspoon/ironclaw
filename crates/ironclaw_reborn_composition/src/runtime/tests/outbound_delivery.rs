@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ironclaw_host_api::CapabilityId;
+use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, UserId};
 use ironclaw_loop_host::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
 };
+use ironclaw_product_adapters::AdapterInstallationId;
 use ironclaw_product_workflow::{
     RebornOutboundDeliveryTargetCapabilities, RebornOutboundDeliveryTargetId,
     RebornOutboundDeliveryTargetSummary, RebornServicesError, WebUiAuthenticatedCaller,
@@ -19,6 +20,9 @@ use ironclaw_turns::{
 
 use crate::RebornCompositionProfile;
 use crate::input::RebornBuildInput;
+use crate::matrix_outbound_targets::{
+    MatrixConfiguredRoomRoute, MatrixOutboundTargetProviderConfig,
+};
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{OutboundDeliveryTargetProvider, OutboundDeliveryTargetRegistrationOutcome};
 use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
@@ -165,6 +169,110 @@ fn provider_tool_call(
 fn model_capability_error(error: impl std::fmt::Display) -> HostManagedModelError {
     let safe_summary = error.to_string();
     HostManagedModelError::safe(HostManagedModelErrorKind::Unavailable, safe_summary)
+}
+
+#[tokio::test]
+async fn local_dev_runtime_registers_private_matrix_outbound_target_provider_at_build() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let host_home = root.path().join("host-home");
+    std::fs::create_dir_all(&host_home).expect("host home");
+    let tenant_id = TenantId::new("runtime-matrix-target-tenant").expect("tenant");
+    let user_id = UserId::new("runtime-matrix-target-user").expect("user");
+    let agent_id = AgentId::new("runtime-matrix-target-agent").expect("agent");
+    let project_id = ProjectId::new("runtime-matrix-target-project").expect("project");
+
+    let mut input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev_with_profile(
+            RebornCompositionProfile::LocalDevYolo,
+            "runtime-matrix-target-owner",
+            root.path().join("local-dev"),
+        )
+        .with_runtime_policy(
+            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
+        )
+        .with_local_dev_confirmed_host_home_root(host_home),
+    );
+    input
+        .matrix_outbound_target_providers
+        .push(MatrixOutboundTargetProviderConfig {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: Some(project_id.clone()),
+            installation_id: AdapterInstallationId::new("runtime-matrix-installation")
+                .expect("installation"),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!runtime-room:example.org".to_string(),
+                subject_user_id: user_id.clone(),
+            }],
+        });
+
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    let provider = runtime
+        .outbound_delivery_target_provider()
+        .expect("local runtime outbound target provider");
+    let listed = provider
+        .list_outbound_delivery_targets(&WebUiAuthenticatedCaller::new(
+            tenant_id,
+            user_id,
+            Some(agent_id),
+            Some(project_id),
+        ))
+        .await
+        .expect("Matrix target listing");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].summary.channel.as_str(), "matrix");
+    assert!(listed[0].capabilities.final_replies);
+}
+
+#[tokio::test]
+async fn local_dev_runtime_rejects_duplicate_matrix_outbound_target_provider_scope() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let host_home = root.path().join("host-home");
+    std::fs::create_dir_all(&host_home).expect("host home");
+    let tenant_id = TenantId::new("runtime-matrix-duplicate-tenant").expect("tenant");
+    let user_id = UserId::new("runtime-matrix-duplicate-user").expect("user");
+    let agent_id = AgentId::new("runtime-matrix-duplicate-agent").expect("agent");
+    let project_id = ProjectId::new("runtime-matrix-duplicate-project").expect("project");
+    let duplicate_config = MatrixOutboundTargetProviderConfig {
+        tenant_id,
+        agent_id,
+        project_id: Some(project_id),
+        installation_id: AdapterInstallationId::new("runtime-matrix-duplicate-installation")
+            .expect("installation"),
+        configured_room_routes: vec![MatrixConfiguredRoomRoute {
+            room_id: "!runtime-duplicate-room:example.org".to_string(),
+            subject_user_id: user_id,
+        }],
+    };
+
+    let mut input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev_with_profile(
+            RebornCompositionProfile::LocalDevYolo,
+            "runtime-matrix-duplicate-owner",
+            root.path().join("local-dev"),
+        )
+        .with_runtime_policy(
+            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
+        )
+        .with_local_dev_confirmed_host_home_root(host_home),
+    );
+    input
+        .matrix_outbound_target_providers
+        .push(duplicate_config.clone());
+    input
+        .matrix_outbound_target_providers
+        .push(duplicate_config);
+
+    let error = match build_reborn_runtime(input).await {
+        Ok(_) => panic!("duplicate Matrix provider scope should fail runtime build"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("duplicate Matrix outbound"),
+        "unexpected duplicate provider error: {error}"
+    );
 }
 
 #[tokio::test]

@@ -574,6 +574,12 @@ pub trait MatrixDeliveryPort: Send + Sync {
 
 #[async_trait]
 pub trait MatrixOutboundMetadataStore: Send + Sync {
+    async fn load_delivery_status(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<UpdateDeliveryStatusRequest>, MatrixOutboundContractError>;
+
     async fn update_delivery_status(
         &self,
         request: UpdateDeliveryStatusRequest,
@@ -1016,6 +1022,14 @@ impl<F> MatrixOutboundMetadataStore for FilesystemMatrixOutboundMetadataStore<F>
 where
     F: RootFilesystem + 'static,
 {
+    async fn load_delivery_status(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+    ) -> Result<Option<UpdateDeliveryStatusRequest>, MatrixOutboundContractError> {
+        self.load_delivery_status(scope, delivery_id).await
+    }
+
     async fn update_delivery_status(
         &self,
         request: UpdateDeliveryStatusRequest,
@@ -1375,8 +1389,92 @@ fn delivery_failure_kind_for_reason(reason: DeliveryReasonCode) -> DeliveryFailu
 }
 
 impl From<MatrixOutboundContractError> for DeliveryError {
-    fn from(_value: MatrixOutboundContractError) -> Self {
+    fn from(value: MatrixOutboundContractError) -> Self {
+        tracing::debug!(
+            target = "ironclaw::reborn::matrix_outbound",
+            error = %value,
+            "matrix outbound contract error mapped to sanitized delivery error"
+        );
         Self::new(DeliveryReasonCode::MatrixMalformedResponse)
+    }
+}
+
+pub struct MatrixProductionDeliveryBridge<'a, F>
+where
+    F: RootFilesystem,
+{
+    pending_store: &'a FilesystemMatrixPendingIntentStore<F>,
+    orchestrator: &'a MatrixOutboundOrchestrator<'a>,
+}
+
+impl<'a, F> MatrixProductionDeliveryBridge<'a, F>
+where
+    F: RootFilesystem,
+{
+    pub fn new(
+        pending_store: &'a FilesystemMatrixPendingIntentStore<F>,
+        orchestrator: &'a MatrixOutboundOrchestrator<'a>,
+    ) -> Self {
+        Self {
+            pending_store,
+            orchestrator,
+        }
+    }
+
+    pub async fn recover_pending_command(
+        &self,
+        route: FrozenProductDeliveryRoute,
+        grant: SealedDeliveryGrant,
+        attempt: DeliveryAttemptContext,
+    ) -> Result<MatrixOrchestratorOutcome, DeliveryError> {
+        let attempt_id = route.delivery_id.as_uuid();
+        let command = self
+            .pending_store
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await?
+            .ok_or_else(|| DeliveryError::new(DeliveryReasonCode::MissingMatrixRoute))?;
+        let attempt_number = attempt.attempt_number;
+        let tombstone_scope = route.scope().clone();
+        let delivery_id = route.delivery_id;
+        let outcome = match self
+            .orchestrator
+            .consume_pending_intent(command, route, grant, attempt)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let durable_status = self
+                    .orchestrator
+                    .metadata_store
+                    .load_delivery_status(tombstone_scope.clone(), delivery_id)
+                    .await?;
+                if durable_status
+                    .as_ref()
+                    .is_some_and(|request| is_terminal_delivery_status(request.status))
+                    && matches!(
+                        self.orchestrator
+                            .retry_policy
+                            .classify(&error, attempt_number),
+                        MatrixRetryDecision::DoNotRetry { .. }
+                    )
+                {
+                    self.pending_store
+                        .mark_pending_command_consumed(
+                            tombstone_scope.clone(),
+                            delivery_id,
+                            attempt_id,
+                        )
+                        .await?;
+                }
+                return Err(error);
+            }
+        };
+        if outcome.status != MatrixTerminalStatus::RetryScheduled {
+            self.pending_store
+                .mark_pending_command_consumed(tombstone_scope, delivery_id, attempt_id)
+                .await?;
+        }
+        Ok(outcome)
     }
 }
 
@@ -1555,6 +1653,21 @@ pub mod fakes {
 
     #[async_trait]
     impl MatrixOutboundMetadataStore for FakeMatrixOutboundMetadataStore {
+        async fn load_delivery_status(
+            &self,
+            scope: TurnScope,
+            delivery_id: OutboundDeliveryId,
+        ) -> Result<Option<UpdateDeliveryStatusRequest>, MatrixOutboundContractError> {
+            Ok(self
+                .statuses
+                .lock()
+                .expect("status lock")
+                .iter()
+                .rev()
+                .find(|request| request.delivery_id == delivery_id && request.scope == scope)
+                .cloned())
+        }
+
         async fn update_delivery_status(
             &self,
             request: UpdateDeliveryStatusRequest,
@@ -2750,6 +2863,258 @@ mod tests {
         assert_eq!(
             after_consumed, None,
             "explicit consume should tombstone the pending command"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bridge_recovers_pending_command_after_restart() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pending_writer = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        pending_writer
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command before adapter instance is dropped");
+
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let retry_policy = retry_policy();
+        let orchestrator = MatrixOutboundOrchestrator::new(
+            &port,
+            &credential_resolver,
+            &metadata_store,
+            &retry_policy,
+        );
+        let pending_reader = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let bridge = MatrixProductionDeliveryBridge::new(&pending_reader, &orchestrator);
+
+        let outcome = bridge
+            .recover_pending_command(
+                route.clone(),
+                grant,
+                DeliveryAttemptContext {
+                    delivery_id: route.delivery_id,
+                    attempt_number: 1,
+                    transaction_id: command.transaction_id.clone(),
+                    started_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("production bridge should recover and deliver the durable pending command");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::Delivered);
+        assert_eq!(port.calls(), vec![ProtocolDeliveryIntent::Matrix(command)]);
+
+        let metadata_reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        assert!(
+            metadata_reader
+                .load_evidence(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load durable evidence after recovered delivery")
+                .is_some(),
+            "bridge must persist delivery evidence before tombstoning the pending command"
+        );
+        assert_eq!(
+            metadata_reader
+                .load_delivery_status(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load durable status after recovered delivery")
+                .expect("status should be durable before pending consume")
+                .status,
+            OutboundDeliveryStatus::Delivered
+        );
+        assert_eq!(
+            pending_reader
+                .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+                .await
+                .expect("load pending command after recovered delivery"),
+            None,
+            "bridge must tombstone the pending command only after durable evidence/status"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bridge_preserves_pending_command_when_retry_is_scheduled() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pending_writer = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        pending_writer
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command before adapter instance is dropped");
+
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Rejected(DeliveryError::new(
+            DeliveryReasonCode::MatrixTimeout,
+        )));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let retry_policy = retry_policy();
+        let orchestrator = MatrixOutboundOrchestrator::new(
+            &port,
+            &credential_resolver,
+            &metadata_store,
+            &retry_policy,
+        );
+        let pending_reader = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let bridge = MatrixProductionDeliveryBridge::new(&pending_reader, &orchestrator);
+
+        let outcome = bridge
+            .recover_pending_command(
+                route.clone(),
+                grant,
+                DeliveryAttemptContext {
+                    delivery_id: route.delivery_id,
+                    attempt_number: 1,
+                    transaction_id: command.transaction_id.clone(),
+                    started_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("retryable delivery should schedule retry");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::RetryScheduled);
+        assert_eq!(
+            pending_reader
+                .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+                .await
+                .expect("load pending command after retry scheduling"),
+            Some(command),
+            "bridge must preserve the durable command while retry remains scheduled"
+        );
+        assert!(
+            metadata_store
+                .load_retry_schedule(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load retry schedule")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bridge_tombstones_pending_command_after_terminal_failure() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pending_writer = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        pending_writer
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command before adapter instance is dropped");
+
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Rejected(DeliveryError::new(
+            DeliveryReasonCode::MatrixTimeout,
+        )));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let retry_policy = retry_policy();
+        let orchestrator = MatrixOutboundOrchestrator::new(
+            &port,
+            &credential_resolver,
+            &metadata_store,
+            &retry_policy,
+        );
+        let pending_reader = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let bridge = MatrixProductionDeliveryBridge::new(&pending_reader, &orchestrator);
+
+        let error = bridge
+            .recover_pending_command(
+                route.clone(),
+                grant,
+                DeliveryAttemptContext {
+                    delivery_id: route.delivery_id,
+                    attempt_number: retry_policy.max_attempts,
+                    transaction_id: command.transaction_id.clone(),
+                    started_at: Utc::now(),
+                },
+            )
+            .await
+            .expect_err("exhausted retryable delivery should return the terminal delivery error");
+
+        assert_eq!(error.reason, DeliveryReasonCode::MatrixTimeout);
+        assert_eq!(
+            pending_reader
+                .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+                .await
+                .expect("load pending command after terminal failure"),
+            None,
+            "bridge must tombstone the pending command after terminal failure status is durable"
+        );
+        assert_eq!(
+            metadata_store
+                .load_delivery_status(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load terminal status")
+                .expect("terminal status should be durable")
+                .status,
+            OutboundDeliveryStatus::Failed
         );
     }
 
