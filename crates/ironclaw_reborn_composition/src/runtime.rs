@@ -3472,13 +3472,25 @@ pub async fn build_reborn_runtime(
             });
         };
         for config in matrix_outbound_target_providers {
-            register_matrix_outbound_target_provider(registry, config).map_err(|error| {
-                RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "Matrix outbound delivery target provider registration failed: {error}"
-                    ),
-                }
-            })?;
+            let outcome =
+                register_matrix_outbound_target_provider(registry, config).map_err(|error| {
+                    tracing::warn!(
+                        target = "ironclaw::reborn::matrix_outbound_targets",
+                        error = %error,
+                        "Matrix outbound delivery target provider registration failed"
+                    );
+                    RebornRuntimeError::InvalidArgument {
+                        reason: format!(
+                            "Matrix outbound delivery target provider registration failed: {error}"
+                        ),
+                    }
+                })?;
+            if outcome == OutboundDeliveryTargetRegistrationOutcome::Replaced {
+                return Err(RebornRuntimeError::InvalidArgument {
+                    reason: "duplicate Matrix outbound delivery target provider registration"
+                        .to_string(),
+                });
+            }
         }
     }
     let outbound_preferences_facade: Option<Arc<dyn OutboundPreferencesProductFacade>> =

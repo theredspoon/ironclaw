@@ -226,6 +226,56 @@ async fn local_dev_runtime_registers_private_matrix_outbound_target_provider_at_
 }
 
 #[tokio::test]
+async fn local_dev_runtime_rejects_duplicate_matrix_outbound_target_provider_scope() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let host_home = root.path().join("host-home");
+    std::fs::create_dir_all(&host_home).expect("host home");
+    let tenant_id = TenantId::new("runtime-matrix-duplicate-tenant").expect("tenant");
+    let user_id = UserId::new("runtime-matrix-duplicate-user").expect("user");
+    let agent_id = AgentId::new("runtime-matrix-duplicate-agent").expect("agent");
+    let project_id = ProjectId::new("runtime-matrix-duplicate-project").expect("project");
+    let duplicate_config = MatrixOutboundTargetProviderConfig {
+        tenant_id,
+        agent_id,
+        project_id: Some(project_id),
+        installation_id: AdapterInstallationId::new("runtime-matrix-duplicate-installation")
+            .expect("installation"),
+        configured_room_routes: vec![MatrixConfiguredRoomRoute {
+            room_id: "!runtime-duplicate-room:example.org".to_string(),
+            subject_user_id: user_id,
+        }],
+    };
+
+    let mut input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev_with_profile(
+            RebornCompositionProfile::LocalDevYolo,
+            "runtime-matrix-duplicate-owner",
+            root.path().join("local-dev"),
+        )
+        .with_runtime_policy(
+            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
+        )
+        .with_local_dev_confirmed_host_home_root(host_home),
+    );
+    input
+        .matrix_outbound_target_providers
+        .push(duplicate_config.clone());
+    input
+        .matrix_outbound_target_providers
+        .push(duplicate_config);
+
+    let error = match build_reborn_runtime(input).await {
+        Ok(_) => panic!("duplicate Matrix provider scope should fail runtime build"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("duplicate Matrix outbound"),
+        "unexpected duplicate provider error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn local_dev_runtime_selects_outbound_delivery_target_before_trigger_create() {
     let root = tempfile::tempdir().expect("tempdir");
     let host_home = root.path().join("host-home");
