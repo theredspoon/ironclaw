@@ -1380,6 +1380,53 @@ impl From<MatrixOutboundContractError> for DeliveryError {
     }
 }
 
+pub struct MatrixProductionDeliveryBridge<'a, F>
+where
+    F: RootFilesystem,
+{
+    pending_store: &'a FilesystemMatrixPendingIntentStore<F>,
+    orchestrator: &'a MatrixOutboundOrchestrator<'a>,
+}
+
+impl<'a, F> MatrixProductionDeliveryBridge<'a, F>
+where
+    F: RootFilesystem,
+{
+    pub fn new(
+        pending_store: &'a FilesystemMatrixPendingIntentStore<F>,
+        orchestrator: &'a MatrixOutboundOrchestrator<'a>,
+    ) -> Self {
+        Self {
+            pending_store,
+            orchestrator,
+        }
+    }
+
+    pub async fn recover_pending_command(
+        &self,
+        route: FrozenProductDeliveryRoute,
+        grant: SealedDeliveryGrant,
+        attempt: DeliveryAttemptContext,
+    ) -> Result<MatrixOrchestratorOutcome, DeliveryError> {
+        let attempt_id = route.delivery_id.as_uuid();
+        let command = self
+            .pending_store
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await?
+            .ok_or_else(|| DeliveryError::new(DeliveryReasonCode::MissingMatrixRoute))?;
+        let tombstone_scope = route.scope().clone();
+        let delivery_id = route.delivery_id;
+        let outcome = self
+            .orchestrator
+            .consume_pending_intent(command, route, grant, attempt)
+            .await?;
+        self.pending_store
+            .mark_pending_command_consumed(tombstone_scope, delivery_id, attempt_id)
+            .await?;
+        Ok(outcome)
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum MatrixOutboundContractError {
     #[error("invalid matrix transaction id")]
@@ -2750,6 +2797,100 @@ mod tests {
         assert_eq!(
             after_consumed, None,
             "explicit consume should tombstone the pending command"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_bridge_recovers_pending_command_after_restart() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let pending_writer = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        pending_writer
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command before adapter instance is dropped");
+
+        let owner = owner();
+        let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+        let port = FakeMatrixDeliveryPort::default();
+        port.push_result(DeliveryPortResult::Accepted(
+            ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command)),
+        ));
+        let credential_resolver =
+            FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            });
+        let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        let retry_policy = retry_policy();
+        let orchestrator = MatrixOutboundOrchestrator::new(
+            &port,
+            &credential_resolver,
+            &metadata_store,
+            &retry_policy,
+        );
+        let pending_reader = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let bridge = MatrixProductionDeliveryBridge::new(&pending_reader, &orchestrator);
+
+        let outcome = bridge
+            .recover_pending_command(
+                route.clone(),
+                grant,
+                DeliveryAttemptContext {
+                    delivery_id: route.delivery_id,
+                    attempt_number: 1,
+                    transaction_id: command.transaction_id.clone(),
+                    started_at: Utc::now(),
+                },
+            )
+            .await
+            .expect("production bridge should recover and deliver the durable pending command");
+
+        assert_eq!(outcome.status, MatrixTerminalStatus::Delivered);
+        assert_eq!(port.calls(), vec![ProtocolDeliveryIntent::Matrix(command)]);
+
+        let metadata_reader = FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        );
+        assert!(
+            metadata_reader
+                .load_evidence(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load durable evidence after recovered delivery")
+                .is_some(),
+            "bridge must persist delivery evidence before tombstoning the pending command"
+        );
+        assert_eq!(
+            metadata_reader
+                .load_delivery_status(route.scope().clone(), route.delivery_id)
+                .await
+                .expect("load durable status after recovered delivery")
+                .expect("status should be durable before pending consume")
+                .status,
+            OutboundDeliveryStatus::Delivered
+        );
+        assert_eq!(
+            pending_reader
+                .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+                .await
+                .expect("load pending command after recovered delivery"),
+            None,
+            "bridge must tombstone the pending command only after durable evidence/status"
         );
     }
 
