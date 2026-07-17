@@ -219,11 +219,7 @@ pub(crate) fn delivery_failure_kind_for_reason(reason: DeliveryReasonCode) -> De
 
 impl From<MatrixOutboundContractError> for DeliveryError {
     fn from(value: MatrixOutboundContractError) -> Self {
-        tracing::debug!(
-            target = "ironclaw::reborn::matrix_outbound",
-            error = %value,
-            "matrix outbound contract error mapped to sanitized delivery error"
-        );
+        observability::record_contract_error(&value);
         Self::new(DeliveryReasonCode::MatrixMalformedResponse)
     }
 }

@@ -322,18 +322,15 @@ impl MatrixRetryWorkerRuntimeHandle {
         match tokio::time::timeout(timeout, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                tracing::debug!(?error, "matrix retry worker task join failed");
+                observability::record_retry_worker_task_failed(&error);
             }
             Err(_) => {
-                tracing::debug!(
-                    ?timeout,
-                    "matrix retry worker did not stop before shutdown timeout; aborting"
-                );
+                observability::record_retry_worker_shutdown_timeout(timeout);
                 handle.abort();
                 if let Err(error) = handle.await
                     && error.is_panic()
                 {
-                    tracing::debug!(?error, "aborted matrix retry worker task panicked");
+                    observability::record_retry_worker_task_panicked(&error);
                 }
             }
         }
@@ -377,19 +374,10 @@ async fn run_matrix_retry_worker(
     loop {
         match matrix_retry_worker_tick_once(&settings, &deps, Utc::now(), &cancel).await {
             Ok(report) => {
-                tracing::debug!(
-                    scopes_scanned = report.scopes_scanned,
-                    due_schedules = report.due_schedules,
-                    attempted = report.attempted,
-                    delivered = report.delivered,
-                    retry_scheduled = report.retry_scheduled,
-                    skipped = report.skipped,
-                    failed = report.failed,
-                    "matrix retry worker tick completed"
-                );
+                observability::record_retry_worker_tick_completed(&report);
             }
             Err(error) => {
-                tracing::debug!(?error, "matrix retry worker tick failed");
+                observability::record_retry_worker_tick_failed(&error);
             }
         }
         let delay = settings.poll_interval + matrix_retry_jitter_delay(settings.tick_jitter_max);
@@ -439,11 +427,7 @@ pub async fn matrix_retry_worker_tick_once(
                 Ok(None) => report.skipped += 1,
                 Err(error) => {
                     report.failed += 1;
-                    tracing::debug!(
-                        delivery_id = %schedule.delivery_id,
-                        reason = ?error.reason,
-                        "matrix retry worker attempt failed"
-                    );
+                    observability::record_retry_attempt_failed(schedule.delivery_id, error.reason);
                 }
             }
         }

@@ -41,6 +41,7 @@ use uuid::Uuid;
 mod contracts;
 mod evidence;
 mod http_delivery;
+mod observability;
 mod orchestrator;
 mod production_retry;
 mod stores;
