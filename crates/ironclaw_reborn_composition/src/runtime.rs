@@ -5012,6 +5012,7 @@ output_schema_ref = "schemas/write.output.json"
             workers: crate::RebornWorkerReadiness {
                 turn_runner: true,
                 trigger_poller: false,
+                matrix_retry: false,
             },
             diagnostics,
         }

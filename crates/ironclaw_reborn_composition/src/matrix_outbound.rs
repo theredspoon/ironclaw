@@ -22,8 +22,11 @@ use ironclaw_outbound::{
     OutboundStateStore, UpdateDeliveryStatusRequest,
 };
 use ironclaw_turns::{ReplyTargetBindingRef, TurnScope};
+use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -937,7 +940,7 @@ impl StoredMatrixRetryExecutionContextV1 {
 
 pub struct FilesystemMatrixPendingIntentStore<F>
 where
-    F: RootFilesystem,
+    F: RootFilesystem + 'static,
 {
     filesystem: Arc<ScopedFilesystem<F>>,
 }
@@ -1869,7 +1872,7 @@ impl From<MatrixOutboundContractError> for DeliveryError {
 
 pub struct MatrixProductionDeliveryBridge<'a, F>
 where
-    F: RootFilesystem,
+    F: RootFilesystem + 'static,
 {
     pending_store: &'a FilesystemMatrixPendingIntentStore<F>,
     orchestrator: &'a MatrixOutboundOrchestrator<'a>,
@@ -1877,7 +1880,7 @@ where
 
 impl<'a, F> MatrixProductionDeliveryBridge<'a, F>
 where
-    F: RootFilesystem,
+    F: RootFilesystem + 'static,
 {
     pub fn new(
         pending_store: &'a FilesystemMatrixPendingIntentStore<F>,
@@ -1960,9 +1963,9 @@ where
     }
 }
 
-// Executes one Matrix retry schedule. Production worker wiring remains blocked
-// until a later slice adds the runtime worker lifecycle around these durable
-// listing, claim, and rehydration primitives.
+// Executes one Matrix retry schedule. Production worker ticks use the
+// rehydrating entrypoint so stored route/grant context is validated again by
+// the shared orchestrator before every send.
 pub struct MatrixRetryExecutor;
 
 impl MatrixRetryExecutor {
@@ -2053,6 +2056,278 @@ impl MatrixRetryExecutor {
             .await
             .map(Some)
     }
+}
+
+pub const MATRIX_RETRY_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRetryWorkerSettings {
+    pub enabled: bool,
+    pub poll_interval: Duration,
+    pub startup_jitter_max: Duration,
+    pub tick_jitter_max: Duration,
+    pub max_entries_per_scope: usize,
+}
+
+impl Default for MatrixRetryWorkerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: Duration::from_secs(30),
+            startup_jitter_max: Duration::ZERO,
+            tick_jitter_max: Duration::ZERO,
+            max_entries_per_scope: 50,
+        }
+    }
+}
+
+impl MatrixRetryWorkerSettings {
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            startup_jitter_max: Duration::from_secs(30),
+            ..Self::default()
+        }
+    }
+
+    fn validate(&self) -> Result<(), MatrixOutboundContractError> {
+        if self.enabled && self.poll_interval.is_zero() {
+            return Err(MatrixOutboundContractError::Backend(
+                "matrix retry worker poll interval must be non-zero".to_string(),
+            ));
+        }
+        if self.enabled && self.max_entries_per_scope == 0 {
+            return Err(MatrixOutboundContractError::Backend(
+                "matrix retry worker max entries per scope must be non-zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub struct MatrixRetryWorkerDeps<F>
+where
+    F: RootFilesystem + 'static,
+{
+    pub metadata_store: Arc<FilesystemMatrixOutboundMetadataStore<F>>,
+    pub pending_store: Arc<FilesystemMatrixPendingIntentStore<F>>,
+    pub delivery_port: Arc<dyn MatrixDeliveryPort>,
+    pub credential_resolver: Arc<dyn MatrixCredentialResolver>,
+    pub retry_policy: Arc<dyn RetryPolicy>,
+    pub scopes: Vec<TurnScope>,
+}
+
+impl<F> Clone for MatrixRetryWorkerDeps<F>
+where
+    F: RootFilesystem + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            metadata_store: Arc::clone(&self.metadata_store),
+            pending_store: Arc::clone(&self.pending_store),
+            delivery_port: Arc::clone(&self.delivery_port),
+            credential_resolver: Arc::clone(&self.credential_resolver),
+            retry_policy: Arc::clone(&self.retry_policy),
+            scopes: self.scopes.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MatrixRetryWorkerTickReport {
+    pub scopes_scanned: usize,
+    pub due_schedules: usize,
+    pub attempted: usize,
+    pub delivered: usize,
+    pub retry_scheduled: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+pub struct MatrixRetryWorkerRuntimeHandle {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
+impl MatrixRetryWorkerRuntimeHandle {
+    pub async fn shutdown(self, timeout: Duration) {
+        self.cancel.cancel();
+        self.join_with_timeout(timeout).await;
+    }
+
+    pub async fn join_with_timeout(self, timeout: Duration) {
+        let mut handle = self.handle;
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(?error, "matrix retry worker task join failed");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    ?timeout,
+                    "matrix retry worker did not stop before shutdown timeout; aborting"
+                );
+                handle.abort();
+                if let Err(error) = handle.await
+                    && error.is_panic()
+                {
+                    tracing::debug!(?error, "aborted matrix retry worker task panicked");
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_matrix_retry_worker<F>(
+    settings: MatrixRetryWorkerSettings,
+    deps: MatrixRetryWorkerDeps<F>,
+) -> Result<Option<MatrixRetryWorkerRuntimeHandle>, MatrixOutboundContractError>
+where
+    F: RootFilesystem + Send + Sync + 'static,
+{
+    if !settings.enabled {
+        return Ok(None);
+    }
+    settings.validate()?;
+    if deps.scopes.is_empty() {
+        return Err(MatrixOutboundContractError::Backend(
+            "matrix retry worker requires at least one scope".to_string(),
+        ));
+    }
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let handle = tokio::spawn(async move {
+        run_matrix_retry_worker(settings, deps, task_cancel).await;
+    });
+    Ok(Some(MatrixRetryWorkerRuntimeHandle { cancel, handle }))
+}
+
+async fn run_matrix_retry_worker<F>(
+    settings: MatrixRetryWorkerSettings,
+    deps: MatrixRetryWorkerDeps<F>,
+    cancel: CancellationToken,
+) where
+    F: RootFilesystem + Send + Sync + 'static,
+{
+    if !matrix_retry_sleep_or_cancel(
+        matrix_retry_jitter_delay(settings.startup_jitter_max),
+        &cancel,
+    )
+    .await
+    {
+        return;
+    }
+    loop {
+        match matrix_retry_worker_tick_once(&settings, &deps, Utc::now(), &cancel).await {
+            Ok(report) => {
+                tracing::debug!(
+                    scopes_scanned = report.scopes_scanned,
+                    due_schedules = report.due_schedules,
+                    attempted = report.attempted,
+                    delivered = report.delivered,
+                    retry_scheduled = report.retry_scheduled,
+                    skipped = report.skipped,
+                    failed = report.failed,
+                    "matrix retry worker tick completed"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(?error, "matrix retry worker tick failed");
+            }
+        }
+        let delay = settings.poll_interval + matrix_retry_jitter_delay(settings.tick_jitter_max);
+        if !matrix_retry_sleep_or_cancel(delay, &cancel).await {
+            return;
+        }
+    }
+}
+
+pub async fn matrix_retry_worker_tick_once<F>(
+    settings: &MatrixRetryWorkerSettings,
+    deps: &MatrixRetryWorkerDeps<F>,
+    now: DateTime<Utc>,
+    cancel: &CancellationToken,
+) -> Result<MatrixRetryWorkerTickReport, MatrixOutboundContractError>
+where
+    F: RootFilesystem + 'static,
+{
+    settings.validate()?;
+    let mut report = MatrixRetryWorkerTickReport {
+        scopes_scanned: deps.scopes.len(),
+        ..MatrixRetryWorkerTickReport::default()
+    };
+    for scope in &deps.scopes {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let schedules = deps
+            .metadata_store
+            .list_due_retry_schedules(scope.clone(), now, settings.max_entries_per_scope)
+            .await?;
+        report.due_schedules += schedules.len();
+        for schedule in schedules {
+            if cancel.is_cancelled() {
+                break;
+            }
+            report.attempted += 1;
+            let orchestrator = MatrixOutboundOrchestrator::new(
+                deps.delivery_port.as_ref(),
+                deps.credential_resolver.as_ref(),
+                deps.metadata_store.as_ref(),
+                deps.retry_policy.as_ref(),
+            );
+            let bridge =
+                MatrixProductionDeliveryBridge::new(deps.pending_store.as_ref(), &orchestrator);
+            match MatrixRetryExecutor::execute_due_retry_from_store(
+                deps.metadata_store.as_ref(),
+                deps.pending_store.as_ref(),
+                &bridge,
+                schedule.scope,
+                schedule.delivery_id,
+                now,
+            )
+            .await
+            {
+                Ok(Some(outcome)) => match outcome.status {
+                    MatrixTerminalStatus::Delivered => report.delivered += 1,
+                    MatrixTerminalStatus::RetryScheduled => report.retry_scheduled += 1,
+                    MatrixTerminalStatus::FailedPermanent
+                    | MatrixTerminalStatus::FailedUnauthorized
+                    | MatrixTerminalStatus::FailedExhausted => report.failed += 1,
+                },
+                Ok(None) => report.skipped += 1,
+                Err(error) => {
+                    report.failed += 1;
+                    tracing::debug!(
+                        delivery_id = %schedule.delivery_id,
+                        reason = ?error.reason,
+                        "matrix retry worker attempt failed"
+                    );
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+async fn matrix_retry_sleep_or_cancel(delay: Duration, cancel: &CancellationToken) -> bool {
+    if delay.is_zero() {
+        return !cancel.is_cancelled();
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+fn matrix_retry_jitter_delay(max: Duration) -> Duration {
+    if max.is_zero() {
+        return Duration::ZERO;
+    }
+    let max_nanos = max.as_nanos().min(u64::MAX as u128);
+    let nanos = rand::rng().random_range(0..=max_nanos);
+    let nanos = u64::try_from(nanos).unwrap_or(u64::MAX);
+    Duration::from_nanos(nanos)
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -4291,6 +4566,185 @@ mod tests {
         let calls = port.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, ProtocolDeliveryIntent::Matrix(command));
+    }
+
+    #[tokio::test]
+    async fn matrix_retry_worker_tick_executes_due_rehydrated_retry() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        ));
+        let pending_store = Arc::new(FilesystemMatrixPendingIntentStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+        ));
+        let route = route();
+        let command = command();
+        let schedule = retry_schedule(&route);
+        let due_at =
+            schedule.recorded_at + chrono::Duration::from_std(schedule.retry_after).expect("due");
+
+        pending_store
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                route.delivery_id.as_uuid(),
+                command.clone(),
+            )
+            .await
+            .expect("persist pending command");
+        metadata_store
+            .record_retry_scheduled(schedule, retry_context(&route))
+            .await
+            .expect("persist retry schedule and context");
+
+        let port = Arc::new(RecordingMatrixDeliveryPort::default());
+        let deps = MatrixRetryWorkerDeps {
+            metadata_store: Arc::clone(&metadata_store),
+            pending_store,
+            delivery_port: Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+            credential_resolver: Arc::new(FakeMatrixCredentialResolver::with_credential(
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+            )),
+            retry_policy: Arc::new(retry_policy()),
+            scopes: vec![route.scope().clone()],
+        };
+        let settings = MatrixRetryWorkerSettings {
+            enabled: true,
+            max_entries_per_scope: 10,
+            ..MatrixRetryWorkerSettings::default()
+        };
+
+        let report =
+            matrix_retry_worker_tick_once(&settings, &deps, due_at, &CancellationToken::new())
+                .await
+                .expect("worker tick succeeds");
+
+        assert_eq!(report.scopes_scanned, 1);
+        assert_eq!(report.due_schedules, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.failed, 0);
+        let calls = port.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, ProtocolDeliveryIntent::Matrix(command));
+    }
+
+    #[tokio::test]
+    async fn matrix_retry_worker_revalidates_current_credential_before_retry_send() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        ));
+        let pending_store = Arc::new(FilesystemMatrixPendingIntentStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+        ));
+        let route = route();
+        let command = command();
+        let schedule = retry_schedule(&route);
+        let due_at =
+            schedule.recorded_at + chrono::Duration::from_std(schedule.retry_after).expect("due");
+
+        pending_store
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                route.delivery_id.as_uuid(),
+                command,
+            )
+            .await
+            .expect("persist pending command");
+        metadata_store
+            .record_retry_scheduled(schedule, retry_context(&route))
+            .await
+            .expect("persist retry schedule and context");
+
+        let port = Arc::new(RecordingMatrixDeliveryPort::default());
+        let deps = MatrixRetryWorkerDeps {
+            metadata_store: Arc::clone(&metadata_store),
+            pending_store,
+            delivery_port: Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+            credential_resolver: Arc::new(FakeMatrixCredentialResolver::with_credential(
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("revoked-credential"),
+                },
+            )),
+            retry_policy: Arc::new(retry_policy()),
+            scopes: vec![route.scope().clone()],
+        };
+        let settings = MatrixRetryWorkerSettings {
+            enabled: true,
+            max_entries_per_scope: 10,
+            ..MatrixRetryWorkerSettings::default()
+        };
+
+        let report =
+            matrix_retry_worker_tick_once(&settings, &deps, due_at, &CancellationToken::new())
+                .await
+                .expect("worker tick succeeds");
+
+        assert_eq!(report.due_schedules, 1);
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.delivered, 0);
+        assert_eq!(report.failed, 1);
+        assert!(port.calls().is_empty());
+        let status = metadata_store
+            .load_delivery_status(route.scope().clone(), route.delivery_id)
+            .await
+            .expect("load terminal status")
+            .expect("status recorded");
+        assert_eq!(status.status, OutboundDeliveryStatus::Failed);
+        assert_eq!(
+            status.failure_kind,
+            Some(DeliveryFailureKind::AuthorizationRevoked)
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_retry_worker_spawn_disabled_and_shutdown_paths_are_explicit() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        ));
+        let pending_store = Arc::new(FilesystemMatrixPendingIntentStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+        ));
+        let deps = MatrixRetryWorkerDeps {
+            metadata_store,
+            pending_store,
+            delivery_port: Arc::new(RecordingMatrixDeliveryPort::default()),
+            credential_resolver: Arc::new(FakeMatrixCredentialResolver::with_credential(
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+            )),
+            retry_policy: Arc::new(retry_policy()),
+            scopes: vec![scope()],
+        };
+
+        let disabled =
+            spawn_matrix_retry_worker(MatrixRetryWorkerSettings::default(), deps.clone())
+                .expect("disabled worker is valid");
+        assert!(disabled.is_none());
+
+        let enabled = spawn_matrix_retry_worker(
+            MatrixRetryWorkerSettings {
+                enabled: true,
+                poll_interval: Duration::from_secs(3600),
+                startup_jitter_max: Duration::from_secs(3600),
+                tick_jitter_max: Duration::ZERO,
+                max_entries_per_scope: 10,
+            },
+            deps,
+        )
+        .expect("enabled worker starts")
+        .expect("runtime handle returned");
+
+        enabled.shutdown(Duration::from_secs(1)).await;
     }
 
     #[tokio::test]

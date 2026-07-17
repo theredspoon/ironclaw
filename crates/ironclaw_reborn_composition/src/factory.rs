@@ -5303,6 +5303,7 @@ fn readiness_for(
         workers: RebornWorkerReadiness {
             turn_runner: false,
             trigger_poller: false,
+            matrix_retry: false,
         },
         diagnostics,
     }

@@ -1483,6 +1483,7 @@ mod tests {
             workers: crate::RebornWorkerReadiness {
                 turn_runner: true,
                 trigger_poller: true,
+                matrix_retry: false,
             },
             diagnostics: vec![RebornReadinessDiagnostic {
                 profile: crate::RebornCompositionProfile::Production,
