@@ -23,6 +23,7 @@ use ironclaw_outbound::{
 use ironclaw_turns::{ReplyTargetBindingRef, TurnScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -592,6 +593,8 @@ pub struct MatrixRetrySchedule {
 }
 
 const MATRIX_METADATA_SCHEMA_VERSION: u32 = 1;
+const MATRIX_PENDING_INTENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredMatrixOutboundMetadataV1 {
     schema_version: u32,
@@ -617,6 +620,15 @@ struct StoredMatrixRetryScheduleV1 {
     recorded_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixPendingIntentV1 {
+    schema_version: u32,
+    delivery_id: OutboundDeliveryId,
+    scope: TurnScope,
+    attempt_id: Uuid,
+    command: Option<MatrixOutboundCommand>,
+}
+
 impl StoredMatrixOutboundMetadataV1 {
     fn empty(delivery_id: OutboundDeliveryId, scope: TurnScope) -> Self {
         Self {
@@ -627,6 +639,41 @@ impl StoredMatrixOutboundMetadataV1 {
             status: None,
             retry_schedule: None,
         }
+    }
+}
+
+impl StoredMatrixPendingIntentV1 {
+    fn pending(
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+        command: MatrixOutboundCommand,
+    ) -> Self {
+        Self {
+            schema_version: MATRIX_PENDING_INTENT_SCHEMA_VERSION,
+            delivery_id,
+            scope,
+            attempt_id,
+            command: Some(command),
+        }
+    }
+
+    fn consumed_tombstone(
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+    ) -> Self {
+        Self {
+            schema_version: MATRIX_PENDING_INTENT_SCHEMA_VERSION,
+            delivery_id,
+            scope,
+            attempt_id,
+            command: None,
+        }
+    }
+
+    fn is_consumed_tombstone(&self) -> bool {
+        self.command.is_none()
     }
 }
 
@@ -655,6 +702,182 @@ impl StoredMatrixRetryScheduleV1 {
             reason: self.reason,
             recorded_at: self.recorded_at,
         }
+    }
+}
+
+pub struct FilesystemMatrixPendingIntentStore<F>
+where
+    F: RootFilesystem,
+{
+    filesystem: Arc<ScopedFilesystem<F>>,
+}
+
+enum PendingRecordMutation<T> {
+    Write {
+        record: Box<StoredMatrixPendingIntentV1>,
+        outcome: T,
+    },
+    NoOp {
+        outcome: T,
+    },
+}
+
+impl<F> FilesystemMatrixPendingIntentStore<F>
+where
+    F: RootFilesystem,
+{
+    pub fn new(filesystem: Arc<ScopedFilesystem<F>>) -> Self {
+        Self { filesystem }
+    }
+
+    pub async fn persist_pending_command(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+        command: MatrixOutboundCommand,
+    ) -> Result<(), MatrixOutboundContractError> {
+        let record_scope = scope.clone();
+        self.mutate_pending_record(scope, delivery_id, attempt_id, |current| {
+            let record = match current {
+                Some(mut record) => {
+                    if record.is_consumed_tombstone() {
+                        return Ok(PendingRecordMutation::Write {
+                            record: Box::new(record),
+                            outcome: (),
+                        });
+                    }
+                    record.command = Some(command.clone());
+                    record
+                }
+                None => StoredMatrixPendingIntentV1::pending(
+                    record_scope.clone(),
+                    delivery_id,
+                    attempt_id,
+                    command.clone(),
+                ),
+            };
+            Ok(PendingRecordMutation::Write {
+                record: Box::new(record),
+                outcome: (),
+            })
+        })
+        .await
+    }
+
+    pub async fn load_pending_command(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+    ) -> Result<Option<MatrixOutboundCommand>, MatrixOutboundContractError> {
+        let resource_scope = scope.to_resource_scope();
+        let path = matrix_pending_intent_path(&scope, delivery_id, attempt_id)?;
+        let Some(versioned) = self.filesystem.get(&resource_scope, &path).await? else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice::<StoredMatrixPendingIntentV1>(&versioned.entry.body)?;
+        validate_stored_matrix_pending_intent(&record, &scope, delivery_id, attempt_id)?;
+        Ok(record.command)
+    }
+
+    pub async fn mark_pending_command_consumed(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+    ) -> Result<bool, MatrixOutboundContractError> {
+        self.mutate_pending_record(scope, delivery_id, attempt_id, |current| {
+            let Some(mut record) = current else {
+                return Ok(PendingRecordMutation::NoOp { outcome: false });
+            };
+            let consumed = record.command.take().is_some();
+            Ok(PendingRecordMutation::Write {
+                record: Box::new(record),
+                outcome: consumed,
+            })
+        })
+        .await
+    }
+
+    pub async fn take_pending_command(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+    ) -> Result<Option<MatrixOutboundCommand>, MatrixOutboundContractError> {
+        self.mutate_pending_record(scope, delivery_id, attempt_id, |current| {
+            let Some(mut record) = current else {
+                return Ok(PendingRecordMutation::NoOp { outcome: None });
+            };
+            let command = record.command.take();
+            Ok(PendingRecordMutation::Write {
+                record: Box::new(record),
+                outcome: command,
+            })
+        })
+        .await
+    }
+
+    async fn mutate_pending_record<T>(
+        &self,
+        scope: TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+        mutate: impl Fn(
+            Option<StoredMatrixPendingIntentV1>,
+        ) -> Result<PendingRecordMutation<T>, MatrixOutboundContractError>,
+    ) -> Result<T, MatrixOutboundContractError> {
+        let resource_scope = scope.to_resource_scope();
+        let path = matrix_pending_intent_path(&scope, delivery_id, attempt_id)?;
+        cas_update(
+            self.filesystem.as_ref(),
+            &resource_scope,
+            &path,
+            |bytes: &[u8]| {
+                serde_json::from_slice::<StoredMatrixPendingIntentV1>(bytes).map_err(Into::into)
+            },
+            |record: &StoredMatrixPendingIntentV1| {
+                Ok(
+                    Entry::bytes(serde_json::to_vec(record)?)
+                        .with_content_type(ContentType::json()),
+                )
+            },
+            |current: Option<StoredMatrixPendingIntentV1>| {
+                let outcome = (|| {
+                    if let Some(record) = &current {
+                        validate_stored_matrix_pending_intent(
+                            record,
+                            &scope,
+                            delivery_id,
+                            attempt_id,
+                        )?;
+                    }
+                    match mutate(current)? {
+                        PendingRecordMutation::Write { record, outcome } => {
+                            validate_stored_matrix_pending_intent(
+                                record.as_ref(),
+                                &scope,
+                                delivery_id,
+                                attempt_id,
+                            )?;
+                            Ok(CasApply::new(*record, outcome))
+                        }
+                        PendingRecordMutation::NoOp { outcome } => Ok(CasApply::no_op(
+                            StoredMatrixPendingIntentV1::consumed_tombstone(
+                                scope.clone(),
+                                delivery_id,
+                                attempt_id,
+                            ),
+                            outcome,
+                        )),
+                    }
+                })();
+                async move { outcome }
+            },
+        )
+        .await
+        .map_err(map_matrix_pending_intent_cas_error)
     }
 }
 
@@ -845,6 +1068,20 @@ fn matrix_metadata_path(
     .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
 }
 
+fn matrix_pending_intent_path(
+    scope: &TurnScope,
+    delivery_id: OutboundDeliveryId,
+    attempt_id: Uuid,
+) -> Result<ScopedPath, MatrixOutboundContractError> {
+    let scope_json = serde_json::to_vec(scope)?;
+    let key = format!("{}:{}:{}", sha256_hex(&scope_json), delivery_id, attempt_id);
+    ScopedPath::new(format!(
+        "/outbound/matrix/pending-intents/{}.json",
+        sha256_hex(key.as_bytes())
+    ))
+    .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
+}
+
 fn validate_stored_matrix_metadata(
     record: &StoredMatrixOutboundMetadataV1,
     scope: &TurnScope,
@@ -864,7 +1101,51 @@ fn validate_stored_matrix_metadata(
     Ok(())
 }
 
+fn validate_stored_matrix_pending_intent(
+    record: &StoredMatrixPendingIntentV1,
+    scope: &TurnScope,
+    delivery_id: OutboundDeliveryId,
+    attempt_id: Uuid,
+) -> Result<(), MatrixOutboundContractError> {
+    if record.schema_version != MATRIX_PENDING_INTENT_SCHEMA_VERSION
+        || record.delivery_id != delivery_id
+        || record.scope != *scope
+        || record.attempt_id != attempt_id
+    {
+        return Err(MatrixOutboundContractError::Backend(
+            "matrix pending intent identity mismatch".to_string(),
+        ));
+    }
+    if let Some(command) = &record.command {
+        validate_stored_matrix_pending_command(command)?;
+    }
+    Ok(())
+}
+
+fn validate_stored_matrix_pending_command(
+    command: &MatrixOutboundCommand,
+) -> Result<(), MatrixOutboundContractError> {
+    MatrixTransactionId::new(command.transaction_id.as_str().to_owned())?;
+    MatrixRoomId::new(command.room_id.as_str().to_owned())?;
+    MatrixMessageBody::new(command.body.as_json().clone())?;
+    Ok(())
+}
+
 fn map_matrix_metadata_cas_error(
+    error: CasUpdateError<MatrixOutboundContractError>,
+) -> MatrixOutboundContractError {
+    match error {
+        CasUpdateError::Apply(error) => error,
+        CasUpdateError::Backend(error) => error.into(),
+        error @ (CasUpdateError::Timeout
+        | CasUpdateError::RetriesExhausted
+        | CasUpdateError::CasUnsupported) => {
+            MatrixOutboundContractError::Backend(error.to_string())
+        }
+    }
+}
+
+fn map_matrix_pending_intent_cas_error(
     error: CasUpdateError<MatrixOutboundContractError>,
 ) -> MatrixOutboundContractError {
     match error {
@@ -1335,7 +1616,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use ironclaw_event_projections::ProjectionCursor;
-    use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
+    use ironclaw_filesystem::{CasExpectation, InMemoryBackend, ScopedFilesystem};
     use ironclaw_host_api::{
         AgentId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId, TenantId,
         ThreadId, UserId, VirtualPath,
@@ -1584,6 +1865,26 @@ mod tests {
         )])
         .expect("mount view");
         Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts))
+    }
+
+    async fn put_pending_intent_bytes(
+        filesystem: &ScopedFilesystem<InMemoryBackend>,
+        scope: &TurnScope,
+        delivery_id: OutboundDeliveryId,
+        attempt_id: Uuid,
+        bytes: Vec<u8>,
+    ) {
+        let path = matrix_pending_intent_path(scope, delivery_id, attempt_id)
+            .expect("pending intent path");
+        filesystem
+            .put(
+                &scope.to_resource_scope(),
+                &path,
+                Entry::bytes(bytes).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await
+            .expect("write pending intent fixture");
     }
 
     #[derive(Default)]
@@ -2338,6 +2639,285 @@ mod tests {
             DeliveryReasonCode::MatrixRateLimited
         );
         assert_eq!(loaded_status, None);
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_pending_intent_store_reloads_pending_command_across_store_instances() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let writer = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        writer
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command");
+
+        let reader = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(backend));
+        let loaded = reader
+            .take_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("take pending Matrix command")
+            .expect("pending command should persist across store instances");
+
+        assert_eq!(loaded, command);
+
+        let loaded_again = reader
+            .take_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("take pending Matrix command again");
+
+        assert_eq!(
+            loaded_again, None,
+            "taking a pending command should consume the durable record exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_pending_intent_load_is_non_destructive_until_consumed() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let writer = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        writer
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command");
+
+        let first_reader = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(
+            Arc::clone(&backend),
+        ));
+        let first_load = first_reader
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("load pending Matrix command")
+            .expect("pending command should load");
+
+        assert_eq!(first_load, command);
+
+        let fresh_reader =
+            FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(backend));
+        let second_load = fresh_reader
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("load pending Matrix command after prior load")
+            .expect("load must not consume the durable pending command");
+
+        assert_eq!(second_load, command);
+
+        let consumed = fresh_reader
+            .mark_pending_command_consumed(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("mark pending Matrix command consumed");
+
+        assert!(
+            consumed,
+            "consuming a present pending command should report a state change"
+        );
+
+        let after_consumed = fresh_reader
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("load pending Matrix command after explicit consume");
+
+        assert_eq!(
+            after_consumed, None,
+            "explicit consume should tombstone the pending command"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_pending_intent_consumed_record_cannot_be_resurrected_by_persist() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(backend));
+        let route = route();
+        let command = command();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        store
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command.clone(),
+            )
+            .await
+            .expect("persist pending Matrix command");
+
+        let consumed = store
+            .mark_pending_command_consumed(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("mark pending Matrix command consumed");
+
+        assert!(consumed, "pending command should be consumed once");
+
+        let loaded_after_consumed = store
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("load consumed Matrix command");
+
+        assert_eq!(loaded_after_consumed, None);
+
+        let _persist_after_consumed = store
+            .persist_pending_command(
+                route.scope().clone(),
+                route.delivery_id,
+                attempt_id,
+                command,
+            )
+            .await;
+
+        let loaded_after_repersist = store
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("load consumed Matrix command after repersist attempt");
+
+        assert_eq!(
+            loaded_after_repersist, None,
+            "persist_pending_command must not resurrect a consumed pending command"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_pending_intent_absent_load_does_not_create_consumable_record() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(backend));
+        let route = route();
+        let attempt_id = route.delivery_id.as_uuid();
+
+        let absent = store
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("load absent pending Matrix command");
+
+        assert_eq!(absent, None);
+
+        let consumed = store
+            .mark_pending_command_consumed(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect("consume absent pending Matrix command");
+
+        assert!(
+            !consumed,
+            "loading an absent pending command must not create a durable record that can be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_pending_intent_corrupt_json_and_identity_mismatch_error() {
+        let corrupt_backend = Arc::new(InMemoryBackend::new());
+        let corrupt_filesystem = matrix_metadata_filesystem(Arc::clone(&corrupt_backend));
+        let corrupt_store =
+            FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(corrupt_backend));
+        let corrupt_route = route();
+        let corrupt_attempt_id = corrupt_route.delivery_id.as_uuid();
+
+        put_pending_intent_bytes(
+            corrupt_filesystem.as_ref(),
+            corrupt_route.scope(),
+            corrupt_route.delivery_id,
+            corrupt_attempt_id,
+            b"{ not valid matrix pending intent json".to_vec(),
+        )
+        .await;
+
+        corrupt_store
+            .load_pending_command(
+                corrupt_route.scope().clone(),
+                corrupt_route.delivery_id,
+                corrupt_attempt_id,
+            )
+            .await
+            .expect_err("corrupt pending intent JSON must error");
+
+        let mismatch_backend = Arc::new(InMemoryBackend::new());
+        let mismatch_filesystem = matrix_metadata_filesystem(Arc::clone(&mismatch_backend));
+        let mismatch_store =
+            FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(mismatch_backend));
+        let mismatch_route = route();
+        let mismatch_attempt_id = mismatch_route.delivery_id.as_uuid();
+        let mismatched = StoredMatrixPendingIntentV1 {
+            schema_version: MATRIX_PENDING_INTENT_SCHEMA_VERSION,
+            delivery_id: OutboundDeliveryId::new(),
+            scope: mismatch_route.scope().clone(),
+            attempt_id: mismatch_attempt_id,
+            command: Some(command()),
+        };
+
+        put_pending_intent_bytes(
+            mismatch_filesystem.as_ref(),
+            mismatch_route.scope(),
+            mismatch_route.delivery_id,
+            mismatch_attempt_id,
+            serde_json::to_vec(&mismatched).expect("serialize mismatched pending intent"),
+        )
+        .await;
+
+        mismatch_store
+            .load_pending_command(
+                mismatch_route.scope().clone(),
+                mismatch_route.delivery_id,
+                mismatch_attempt_id,
+            )
+            .await
+            .expect_err("identity-mismatched pending intent must error");
+    }
+
+    #[tokio::test]
+    async fn durable_matrix_pending_intent_invalid_command_record_bypassing_constructors_errors() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let filesystem = matrix_metadata_filesystem(Arc::clone(&backend));
+        let store = FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(backend));
+        let route = route();
+        let attempt_id = route.delivery_id.as_uuid();
+        let invalid_record = json!({
+            "schema_version": MATRIX_PENDING_INTENT_SCHEMA_VERSION,
+            "delivery_id": route.delivery_id,
+            "scope": route.scope(),
+            "attempt_id": attempt_id,
+            "command": {
+                "command_kind": "send_text",
+                "transaction_id": "",
+                "reply_target_binding_ref": binding(),
+                "egress_target_index": 0,
+                "room_id": "not-a-matrix-room",
+                "body": {
+                    "msgtype": "m.text",
+                    "body": "hello matrix"
+                }
+            }
+        });
+
+        put_pending_intent_bytes(
+            filesystem.as_ref(),
+            route.scope(),
+            route.delivery_id,
+            attempt_id,
+            serde_json::to_vec(&invalid_record).expect("serialize invalid pending intent"),
+        )
+        .await;
+
+        store
+            .load_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
+            .await
+            .expect_err("invalid pending command fields must error after deserialization");
     }
 
     #[tokio::test]
