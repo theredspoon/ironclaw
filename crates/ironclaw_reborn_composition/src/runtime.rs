@@ -52,6 +52,7 @@ use ironclaw_loop_host::{
     LoopCapabilityResultWriter, ModelGatewayBackedSystemInferencePort,
 };
 use ironclaw_observability::live_latency_started_at;
+use ironclaw_outbound::CommunicationPreferenceRepository;
 use ironclaw_product_adapters::ProjectionStream;
 use ironclaw_product_workflow::{
     ApprovalBlockedTurnRun, ApprovalInteractionScope, ApprovalInteractionService,
@@ -209,6 +210,8 @@ struct RuntimeStoreParts<'a> {
     subagent_await_edge_settler: Arc<dyn AwaitEdgeSettler>,
     subagent_await_edge_evidence: Arc<dyn AwaitDependentRunEvidenceStore>,
     trigger_repository: Option<Arc<dyn ironclaw_triggers::TriggerRepository>>,
+    outbound_preferences: Arc<dyn CommunicationPreferenceRepository>,
+    outbound_delivery_target_registry: Arc<MutableOutboundDeliveryTargetRegistry>,
 }
 
 /// Non-durable await-edge fallback for the composition profile with neither
@@ -356,6 +359,8 @@ fn local_runtime_parts(
         subagent_await_edge_settler,
         subagent_await_edge_evidence,
         trigger_repository: Some(Arc::clone(&local_runtime.trigger_repository)),
+        outbound_preferences: Arc::clone(&local_runtime.outbound_preferences),
+        outbound_delivery_target_registry: Arc::clone(&local_runtime.outbound_delivery_targets),
     }
 }
 
@@ -401,6 +406,10 @@ where
         subagent_await_edge_settler: await_edge_resolver as Arc<dyn AwaitEdgeSettler>,
         subagent_await_edge_evidence: await_edge_store as Arc<dyn AwaitDependentRunEvidenceStore>,
         trigger_repository: Some(Arc::clone(&graph.trigger_repository)),
+        outbound_preferences: Arc::clone(&graph.outbound_preferences),
+        outbound_delivery_target_registry: Arc::new(
+            MutableOutboundDeliveryTargetRegistry::default(),
+        ),
     }
 }
 
@@ -3243,6 +3252,8 @@ pub async fn build_reborn_runtime(
         subagent_await_edge_settler,
         subagent_await_edge_evidence,
         trigger_repository: _trigger_repository,
+        outbound_preferences,
+        outbound_delivery_target_registry,
     } = runtime_parts;
     let (skill_context_source, skill_activation_source, skill_execution_adapter) =
         match (configured_skill_context_source, local_runtime) {
@@ -3478,33 +3489,27 @@ pub async fn build_reborn_runtime(
             )
             .map_err(|error| RebornRuntimeError::SkillExecution(error.to_string()))?;
     }
-    // The registry is created with the local-runtime services (one instance
-    // per runtime) so the trigger-create hook validates per-trigger delivery
-    // targets against the same registry product hosts register into.
-    let outbound_delivery_target_registry =
-        local_runtime.map(|local_runtime| Arc::clone(&local_runtime.outbound_delivery_targets));
+    // One registry is created with the runtime store parts for both local and
+    // production profiles. The trigger-create hook validates per-trigger
+    // delivery targets against the same registry product hosts register into.
     if !matrix_outbound_target_providers.is_empty() {
-        let Some(registry) = outbound_delivery_target_registry.as_ref() else {
-            return Err(RebornRuntimeError::InvalidArgument {
-                reason:
-                    "Matrix outbound target providers require a local runtime outbound registry"
-                        .to_string(),
-            });
-        };
         for config in matrix_outbound_target_providers {
-            let outcome =
-                register_matrix_outbound_target_provider(registry, config).map_err(|error| {
-                    tracing::warn!(
-                        target = "ironclaw::reborn::matrix_outbound_targets",
-                        error = %error,
-                        "Matrix outbound delivery target provider registration failed"
-                    );
-                    RebornRuntimeError::InvalidArgument {
-                        reason: format!(
-                            "Matrix outbound delivery target provider registration failed: {error}"
-                        ),
-                    }
-                })?;
+            let outcome = register_matrix_outbound_target_provider(
+                &outbound_delivery_target_registry,
+                config,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    target = "ironclaw::reborn::matrix_outbound_targets",
+                    error = %error,
+                    "Matrix outbound delivery target provider registration failed"
+                );
+                RebornRuntimeError::InvalidArgument {
+                    reason: format!(
+                        "Matrix outbound delivery target provider registration failed: {error}"
+                    ),
+                }
+            })?;
             if outcome == OutboundDeliveryTargetRegistrationOutcome::Replaced {
                 return Err(RebornRuntimeError::InvalidArgument {
                     reason: "duplicate Matrix outbound delivery target provider registration"
@@ -3513,19 +3518,18 @@ pub async fn build_reborn_runtime(
             }
         }
     }
+    let provider: Arc<dyn OutboundDeliveryTargetProvider> =
+        Arc::clone(&outbound_delivery_target_registry) as Arc<dyn OutboundDeliveryTargetProvider>;
+    // Every runtime profile owns the outbound preferences facade now that
+    // production hosts can mount Matrix target providers directly.
+    // Keep the `Option` wrapper because downstream composition APIs still model
+    // communication preferences as optional wiring, but this assembly path
+    // intentionally provides it for both profiles.
     let outbound_preferences_facade: Option<Arc<dyn OutboundPreferencesProductFacade>> =
-        match (local_runtime, &outbound_delivery_target_registry) {
-            (Some(local_runtime), Some(registry)) => {
-                let registry = Arc::clone(registry);
-                let provider: Arc<dyn OutboundDeliveryTargetProvider> = registry;
-                Some(Arc::new(RebornOutboundPreferencesFacade::new(
-                    Arc::clone(&local_runtime.outbound_preferences),
-                    provider,
-                ))
-                    as Arc<dyn OutboundPreferencesProductFacade>)
-            }
-            _ => None,
-        };
+        Some(Arc::new(RebornOutboundPreferencesFacade::new(
+            Arc::clone(&outbound_preferences),
+            provider,
+        )) as Arc<dyn OutboundPreferencesProductFacade>);
     // Clone the live projection publisher for the skill-learning sink before
     // the milestone-sink builder consumes the original by value.
     #[cfg(feature = "root-llm-provider")]
@@ -3727,28 +3731,30 @@ pub async fn build_reborn_runtime(
 
     let communication_context_provider: Option<
         Arc<dyn ironclaw_turns::run_profile::CommunicationContextProvider>,
-    > = match (local_runtime, outbound_preferences_facade.clone()) {
-        (Some(local_runtime), Some(outbound_preferences_facade)) => {
-            let mut lifecycle_facade =
-                crate::extension_host::lifecycle::RebornLocalLifecycleFacade::new(Arc::clone(
-                    &local_runtime.skill_management,
-                ));
-            if let Some(extension_management) = &local_runtime.extension_management {
-                lifecycle_facade =
-                    lifecycle_facade.with_extension_management(Arc::clone(extension_management));
-            }
-            Some(Arc::new(
+    > = outbound_preferences_facade
+        .clone()
+        .map(|outbound_preferences_facade| {
+            let mut provider =
                 crate::root::communication_context::RuntimeCommunicationContextProvider::new(
                     outbound_preferences_facade,
-                )
-                .with_lifecycle_facade(Arc::new(lifecycle_facade)),
-            )
-                as Arc<
-                    dyn ironclaw_turns::run_profile::CommunicationContextProvider,
-                >)
-        }
-        _ => None,
-    };
+                );
+            if let Some(local_runtime) = local_runtime {
+                let mut lifecycle_facade =
+                    crate::extension_host::lifecycle::RebornLocalLifecycleFacade::new(Arc::clone(
+                        &local_runtime.skill_management,
+                    ));
+                if let Some(extension_management) = &local_runtime.extension_management {
+                    lifecycle_facade = lifecycle_facade
+                        .with_extension_management(Arc::clone(extension_management));
+                }
+                provider = provider.with_lifecycle_facade(Arc::new(lifecycle_facade));
+            }
+            // Production profiles deliberately use preferences-only context for
+            // now: delivery target state can be resolved from the durable
+            // outbound store while connected-channel discovery remains unknown
+            // until a production lifecycle facade exists.
+            Arc::new(provider) as Arc<dyn ironclaw_turns::run_profile::CommunicationContextProvider>
+        });
 
     // Resolve the disclosure mode once so the runtime config and the system-prompt
     // disclosure-protocol injection agree on a single value.
@@ -4132,7 +4138,7 @@ pub async fn build_reborn_runtime(
         post_submit_hook_slot: runtime_post_submit_hook_slot,
         #[cfg(any(test, feature = "test-support"))]
         trigger_conversation_pairing: trigger_conversation_pairing_value,
-        outbound_delivery_target_registry,
+        outbound_delivery_target_registry: Some(outbound_delivery_target_registry),
         budget_event_projection,
         poll_settings: poll,
         #[cfg(feature = "webui-v2-beta")]
@@ -5238,7 +5244,9 @@ output_schema_ref = "schemas/write.output.json"
         HostSkillContextCandidate, HostSkillContextSource, ModelCost, SpawnSubagentMode,
         SubagentKindId, SubagentThreadKind, SubagentThreadMetadata,
     };
-    use ironclaw_product_adapters::{ProductOutboundPayload, ProductProjectionItem};
+    use ironclaw_product_adapters::{
+        AdapterInstallationId, ProductOutboundPayload, ProductProjectionItem,
+    };
     use ironclaw_product_workflow::{
         LifecyclePackageKind, LifecyclePackageRef, LifecyclePhase, LifecycleProductPayload,
         LifecycleReadinessBlocker, RebornExtensionCredentialSetup, RebornServicesErrorCode,
@@ -7481,6 +7489,140 @@ output_schema_ref = "schemas/write.output.json"
             runtime.matrix_retry_worker_is_running_for_test(),
             "ready production bundle should spawn the Matrix retry worker"
         );
+        tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
+            .await
+            .expect("Matrix retry worker shutdown should not hang")
+            .expect("runtime shutdown");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn production_runtime_registers_matrix_outbound_target_mount() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            libsql::Builder::new_local(dir.path().join("reborn.db"))
+                .build()
+                .await
+                .expect("libsql db"),
+        );
+        let gateway = Arc::new(RecordingGateway {
+            reply: "validated production runtime with matrix target".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let tenant_id = TenantId::new("runtime-production-matrix-target-tenant").expect("tenant");
+        let user_id = UserId::new("runtime-production-matrix-target-user").expect("user");
+        let agent_id = AgentId::new("runtime-production-matrix-target-agent").expect("agent");
+        let matrix_retry_scope = TurnScope::new_with_owner(
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            None,
+            ThreadId::new("runtime-production-matrix-target-thread").expect("valid thread"),
+            Some(user_id.clone()),
+        );
+
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::libsql(
+                crate::RebornCompositionProfile::Production,
+                "runtime-production-matrix-target-owner",
+                db,
+                dir.path().join("events.db").to_string_lossy(),
+                None,
+                ironclaw_secrets::SecretMaterial::from("01234567890123456789012345678901"),
+            )
+            .with_production_trust_policy(Arc::new(
+                crate::builtin_first_party_trust_policy().expect("trust policy"),
+            ))
+            .with_runtime_policy(EffectiveRuntimePolicy {
+                deployment: DeploymentMode::HostedMultiTenant,
+                requested_profile: RuntimeProfile::SecureDefault,
+                resolved_profile: RuntimeProfile::SecureDefault,
+                filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+                process_backend: ProcessBackendKind::TenantSandbox,
+                network_mode: NetworkMode::Deny,
+                secret_mode: SecretMode::BrokeredHandles,
+                approval_policy: ApprovalPolicy::AskAlways,
+                audit_mode: AuditMode::Standard,
+            })
+            .with_runtime_process_binding(RebornRuntimeProcessBinding::tenant_sandbox(Arc::new(
+                ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
+                    RecordingSandboxTransport,
+                )),
+            )))
+            .with_matrix_retry_production_config(
+                crate::input::MatrixRetryWorkerProductionConfig::new(
+                    crate::input::MatrixRetryWorkerProductionConfigInput {
+                        settings: crate::matrix_outbound::MatrixRetryWorkerSettings {
+                            enabled: true,
+                            poll_interval: Duration::from_millis(50),
+                            startup_jitter_max: Duration::ZERO,
+                            tick_jitter_max: Duration::ZERO,
+                            max_entries_per_scope: 10,
+                        },
+                        scopes: vec![matrix_retry_scope],
+                        homeserver_origin: "https://matrix.example".to_string(),
+                        policy_revision: "policy-rev-1".to_string(),
+                        allowed_room_ids: vec![
+                            crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
+                                .expect("valid Matrix room id"),
+                        ],
+                        credential_secret: ironclaw_host_api::SecretHandle::new(
+                            "matrix_access_token",
+                        )
+                        .expect("valid Matrix credential secret"),
+                        credential_handle_fingerprint: format!(
+                            "sha256:{}",
+                            ironclaw_common::hashing::sha256_hex(b"credential-handle-1")
+                        ),
+                        capability_id: CapabilityId::new("matrix.send")
+                            .expect("valid Matrix capability id"),
+                    },
+                ),
+            ),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: tenant_id.as_str().to_string(),
+            agent_id: agent_id.as_str().to_string(),
+            source_binding_id: "runtime-production-matrix-target-source".to_string(),
+            reply_target_binding_id: "runtime-production-matrix-target-reply".to_string(),
+        })
+        .with_model_gateway_override(gateway)
+        .with_matrix_outbound_target_mount(crate::MatrixOutboundTargetMountConfig::new(
+            crate::MatrixOutboundTargetMountConfigInput {
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                project_id: None,
+                installation_id: AdapterInstallationId::new(
+                    "runtime-production-matrix-target-installation",
+                )
+                .expect("installation"),
+                room_targets: vec![crate::MatrixOutboundRoomTargetConfig::new(
+                    crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
+                        .expect("valid Matrix room id"),
+                    user_id.clone(),
+                )],
+            },
+        ));
+
+        let runtime = build_reborn_runtime(input)
+            .await
+            .expect("production runtime should build with Matrix target mount");
+        let provider = runtime
+            .outbound_delivery_target_provider()
+            .expect("production runtime outbound target provider");
+        let listed = provider
+            .list_outbound_delivery_targets(&WebUiAuthenticatedCaller::new(
+                tenant_id,
+                user_id,
+                Some(agent_id),
+                None,
+            ))
+            .await
+            .expect("Matrix target listing");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary.channel.as_str(), "matrix");
+        assert!(listed[0].capabilities.final_replies);
+
         tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
             .await
             .expect("Matrix retry worker shutdown should not hang")
