@@ -31,7 +31,7 @@ ironclaw_wasm_product_adapters = { path = "../ironclaw_wasm_product_adapters", v
 [dev-dependencies]
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0", features = ["test-support"] }
 ironclaw_product_workflow = { path = "../ironclaw_product_workflow", version = "0.1.0" }
-ironclaw_outbound = { path = "../ironclaw_outbound", version = "0.1.0" }
+ironclaw_outbound = { path = "../ironclaw_outbound", version = "0.1.0", features = ["test-support"] }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_threads = { path = "../ironclaw_threads", version = "0.1.0" }
 ironclaw_turns = { path = "../ironclaw_turns", version = "0.1.0" }

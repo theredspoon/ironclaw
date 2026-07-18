@@ -150,6 +150,7 @@ pub trait MatrixRetrySendAuthorizer: Send + Sync {
     ) -> Result<(), DeliveryError>;
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 pub(crate) struct MatrixConfiguredRetrySendAuthorizer {
     policy_revision: String,
     homeserver_origin_fingerprint: String,
@@ -157,6 +158,7 @@ pub(crate) struct MatrixConfiguredRetrySendAuthorizer {
     allowed_room_fingerprints: HashSet<String>,
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixConfiguredRetrySendAuthorizer {
     pub(crate) fn new(
         policy_revision: String,
@@ -174,6 +176,7 @@ impl MatrixConfiguredRetrySendAuthorizer {
 }
 
 #[async_trait]
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixRetrySendAuthorizer for MatrixConfiguredRetrySendAuthorizer {
     async fn authorize_retry_send(
         &self,
@@ -195,16 +198,19 @@ impl MatrixRetrySendAuthorizer for MatrixConfiguredRetrySendAuthorizer {
     }
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 pub(crate) struct MatrixStaticHttpEndpointResolver {
     endpoint: MatrixHttpDeliveryEndpoint,
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixStaticHttpEndpointResolver {
     pub(crate) fn new(endpoint: MatrixHttpDeliveryEndpoint) -> Self {
         Self { endpoint }
     }
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixHttpDeliveryEndpointResolver for MatrixStaticHttpEndpointResolver {
     fn resolve_endpoint(
         &self,
@@ -255,6 +261,7 @@ where
     retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 pub(crate) struct MatrixRetryProductionDependencyBundleInput<F>
 where
     F: RootFilesystem + 'static,
@@ -270,11 +277,13 @@ where
     pub retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 pub(crate) struct MatrixRetryProductionDependencyBundle {
     settings: MatrixRetryWorkerSettings,
     work_port: Arc<dyn MatrixRetryWorkPort>,
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixRetryProductionDependencyBundle {
     pub(crate) fn new<F>(
         input: MatrixRetryProductionDependencyBundleInput<F>,
@@ -324,8 +333,10 @@ impl MatrixRetryProductionDependencyBundle {
     }
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 struct MatrixRouteMetadataCredentialResolver;
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixCredentialResolver for MatrixRouteMetadataCredentialResolver {
     fn resolve(&self, route: &ValidatedDeliveryRoute) -> Option<ResolvedCredentialHandle> {
         Some(ResolvedCredentialHandle {

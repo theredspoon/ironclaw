@@ -87,6 +87,7 @@ pub struct MatrixSecretStoreCredentialMaterialProvider {
 }
 
 impl MatrixSecretStoreCredentialMaterialProvider {
+    #[cfg(any(test, feature = "libsql", feature = "postgres"))]
     pub(crate) fn new(secret_store: Arc<dyn SecretStore>) -> Self {
         Self { secret_store }
     }

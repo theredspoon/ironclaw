@@ -11,14 +11,18 @@ use ironclaw_host_api::runtime_policy::{DeploymentMode, RuntimeProfile};
 use ironclaw_host_api::runtime_policy::{
     EffectiveRuntimePolicy, FilesystemBackendKind, NetworkMode, SecretMode,
 };
-use ironclaw_host_api::{AgentId, CapabilityId, SecretHandle, TenantId};
+use ironclaw_host_api::{AgentId, TenantId};
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_host_api::{CapabilityId, SecretHandle};
 #[cfg(all(test, feature = "slack-v2-host-beta"))]
 use ironclaw_host_runtime::HostRuntimeHttpEgressPort;
 use ironclaw_host_runtime::TenantSandboxProcessPort;
 #[cfg(any(test, feature = "test-support"))]
 use ironclaw_network::NetworkHttpEgress;
 use ironclaw_trust::HostTrustPolicy;
-use ironclaw_turns::{InMemoryTurnStateStoreLimits, TurnRunWakeNotifier, TurnScope};
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_turns::TurnScope;
+use ironclaw_turns::{InMemoryTurnStateStoreLimits, TurnRunWakeNotifier};
 use secrecy::SecretString;
 
 #[cfg(feature = "postgres")]
@@ -28,6 +32,7 @@ use ironclaw_reborn_event_store::{PostgresPoolTlsOptions, RebornPostgresSslMode}
 
 #[cfg(feature = "postgres")]
 use crate::RebornBuildError;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 use crate::matrix_outbound::{MatrixRetryWorkerSettings, MatrixRoomId};
 use crate::product_auth::oauth::google_oauth::google_provider_spec;
 use crate::product_auth::oauth::notion_oauth::notion_provider_spec;
@@ -113,6 +118,7 @@ pub(crate) struct OAuthDcrProviderBackendConfig {
     pub(crate) config: OAuthDcrProviderConfig,
 }
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 #[derive(Debug, Clone)]
 pub(crate) struct MatrixRetryProductionConfig {
     pub(crate) settings: MatrixRetryWorkerSettings,
@@ -125,6 +131,7 @@ pub(crate) struct MatrixRetryProductionConfig {
     pub(crate) capability_id: CapabilityId,
 }
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 #[derive(Debug, Clone)]
 pub struct MatrixRetryWorkerProductionConfig {
     settings: MatrixRetryWorkerSettings,
@@ -137,6 +144,7 @@ pub struct MatrixRetryWorkerProductionConfig {
     capability_id: CapabilityId,
 }
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 #[derive(Debug, Clone)]
 pub struct MatrixRetryWorkerProductionConfigInput {
     pub settings: MatrixRetryWorkerSettings,
@@ -149,6 +157,7 @@ pub struct MatrixRetryWorkerProductionConfigInput {
     pub capability_id: CapabilityId,
 }
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 impl MatrixRetryWorkerProductionConfig {
     pub fn new(input: MatrixRetryWorkerProductionConfigInput) -> Self {
         Self {
@@ -164,6 +173,7 @@ impl MatrixRetryWorkerProductionConfig {
     }
 }
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 impl From<MatrixRetryWorkerProductionConfig> for MatrixRetryProductionConfig {
     fn from(config: MatrixRetryWorkerProductionConfig) -> Self {
         Self {
@@ -265,6 +275,7 @@ pub struct RebornBuildInput {
     pub(crate) product_auth_ports: Option<RebornProductAuthServicePorts>,
     pub(crate) oauth_provider_configs: Vec<OAuthProviderBackendConfig>,
     pub(crate) oauth_dcr_provider_configs: Vec<OAuthDcrProviderBackendConfig>,
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
     pub(crate) matrix_retry_production_config: Option<MatrixRetryProductionConfig>,
     #[cfg(feature = "slack-v2-host-beta")]
     pub(crate) slack_personal_oauth_lazy_slot: Option<SlackPersonalSetupServiceSlot>,
@@ -706,6 +717,7 @@ impl RebornBuildInput {
         self
     }
 
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
     pub fn with_matrix_retry_production_config(
         mut self,
         config: MatrixRetryWorkerProductionConfig,
@@ -877,6 +889,7 @@ impl RebornBuildInput {
             product_auth_ports: None,
             oauth_provider_configs: Vec::new(),
             oauth_dcr_provider_configs: Vec::new(),
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
             matrix_retry_production_config: None,
             #[cfg(feature = "slack-v2-host-beta")]
             slack_personal_oauth_lazy_slot: None,

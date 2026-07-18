@@ -154,6 +154,7 @@ pub struct MatrixRoutePolicyOwnerToken {
 }
 
 impl MatrixRoutePolicyOwnerToken {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn matrix_policy_owner() -> Self {
         Self { _private: () }
     }
