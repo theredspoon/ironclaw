@@ -68,7 +68,10 @@ const MAX_HTML_NESTING: usize = 20;
 ///         allowed_senders: vec!["@alice:example.org".to_string()],
 ///     },
 /// }).expect("valid Matrix event");
-/// assert_eq!(parsed.facts.deduplication_key, "matrix-inst_abc123-$event:example.org");
+/// assert_eq!(
+///     parsed.facts.deduplication_key,
+///     "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
+/// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixParseInput {
@@ -686,7 +689,8 @@ pub fn parse_matrix_event(
     })?;
     let partial = partial_facts(object);
     let mut facts = facts_from_object(object, partial)?;
-    facts.deduplication_key = format!("matrix-{}-{}", input.installation_id, facts.event_id);
+    facts.deduplication_key =
+        matrix_external_event_key(&input.installation_id, &facts.room_id, &facts.event_id);
 
     if !input.policy.allowed_rooms.is_empty()
         && !input
@@ -1199,16 +1203,18 @@ fn product_result(
     payload: ProductInboundPayload,
     installation_id: &str,
 ) -> Result<ParsedMatrixInbound, MatrixAdapterDiagnostic> {
-    let external_event_id =
-        ExternalEventId::new(format!("matrix-{installation_id}-{}", facts.event_id)).map_err(
-            |_| {
-                diagnostic_for_facts(
-                    MatrixReasonCode::MalformedMatrixEvent,
-                    &facts,
-                    "matrix event id is not a valid product external event id",
-                )
-            },
-        )?;
+    let external_event_id = ExternalEventId::new(matrix_external_event_key(
+        installation_id,
+        &facts.room_id,
+        &facts.event_id,
+    ))
+    .map_err(|_| {
+        diagnostic_for_facts(
+            MatrixReasonCode::MalformedMatrixEvent,
+            &facts,
+            "matrix event id is not a valid product external event id",
+        )
+    })?;
     let actor = ExternalActorRef::new("matrix_user", facts.sender.clone(), None::<String>)
         .map_err(|_| {
             diagnostic_for_facts(
@@ -1247,6 +1253,10 @@ fn product_result(
         metadata,
         product,
     })
+}
+
+fn matrix_external_event_key(installation_id: &str, room_id: &str, event_id: &str) -> String {
+    format!("matrix:{installation_id}:room:{room_id}:event:{event_id}")
 }
 
 #[cfg(not(target_arch = "wasm32"))]

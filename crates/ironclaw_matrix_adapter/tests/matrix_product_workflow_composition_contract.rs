@@ -55,6 +55,8 @@ use ironclaw_turns::{
 };
 use serde_json::json;
 
+type StageTimeline = Arc<Mutex<Vec<&'static str>>>;
+
 #[derive(Default)]
 struct AllowAllProjectionAccessPolicy;
 
@@ -213,6 +215,7 @@ impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
 #[derive(Default)]
 struct RecordingConversationBindingService {
     requests: Mutex<Vec<ResolveBindingRequest>>,
+    timeline: StageTimeline,
 }
 
 impl RecordingConversationBindingService {
@@ -227,6 +230,10 @@ impl ConversationBindingService for RecordingConversationBindingService {
         &self,
         request: ResolveBindingRequest,
     ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("workflow.resolve_binding");
         self.requests.lock().expect("binding lock").push(request);
         Ok(resolved_binding())
     }
@@ -235,6 +242,10 @@ impl ConversationBindingService for RecordingConversationBindingService {
         &self,
         request: ResolveBindingRequest,
     ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("workflow.lookup_binding");
         self.requests.lock().expect("binding lock").push(request);
         Ok(resolved_binding())
     }
@@ -243,6 +254,7 @@ impl ConversationBindingService for RecordingConversationBindingService {
 #[derive(Default)]
 struct RecordingTurnCoordinator {
     submitted: Mutex<Vec<SubmitTurnRequest>>,
+    timeline: StageTimeline,
 }
 
 impl RecordingTurnCoordinator {
@@ -261,6 +273,10 @@ impl TurnCoordinator for RecordingTurnCoordinator {
         &self,
         request: SubmitTurnRequest,
     ) -> Result<SubmitTurnResponse, TurnError> {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("turn.submit");
         self.submitted
             .lock()
             .expect("turn lock")
@@ -309,11 +325,19 @@ struct WorkflowFixture {
     workflow: DefaultProductWorkflow,
     binding_service: Arc<RecordingConversationBindingService>,
     turn_coordinator: Arc<RecordingTurnCoordinator>,
+    timeline: StageTimeline,
 }
 
 fn workflow_fixture() -> WorkflowFixture {
-    let binding_service = Arc::new(RecordingConversationBindingService::default());
-    let turn_coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let timeline = StageTimeline::default();
+    let binding_service = Arc::new(RecordingConversationBindingService {
+        requests: Mutex::default(),
+        timeline: timeline.clone(),
+    });
+    let turn_coordinator = Arc::new(RecordingTurnCoordinator {
+        submitted: Mutex::default(),
+        timeline: timeline.clone(),
+    });
     let inbound_turn_service = Arc::new(DefaultInboundTurnService::new(
         binding_service.clone(),
         InMemorySessionThreadService::default(),
@@ -327,6 +351,7 @@ fn workflow_fixture() -> WorkflowFixture {
         ),
         binding_service,
         turn_coordinator,
+        timeline,
     }
 }
 
@@ -457,7 +482,7 @@ async fn matrix_verified_inbound_enters_product_workflow_idempotency_and_binding
     );
     assert_eq!(
         binding_request.external_event_id.as_str(),
-        "matrix-inst_matrix-$event:example.org"
+        "matrix:inst_matrix:room:!room:example.org:event:$event:example.org"
     );
     assert_eq!(
         binding_request.external_conversation_ref.conversation_id(),
@@ -466,6 +491,11 @@ async fn matrix_verified_inbound_enters_product_workflow_idempotency_and_binding
     assert_eq!(
         binding_request.external_actor_ref.id(),
         "@alice:example.org"
+    );
+    assert_eq!(
+        fixture.timeline.lock().expect("timeline lock").as_slice(),
+        ["workflow.resolve_binding", "turn.submit"],
+        "Matrix inbound must enter ProductWorkflow binding before turn submission"
     );
     let submitted = fixture.turn_coordinator.submitted();
     assert_eq!(submitted.len(), 1);
@@ -503,6 +533,77 @@ async fn matrix_verified_inbound_enters_product_workflow_idempotency_and_binding
         1,
         "duplicate Matrix event must not submit a second turn"
     );
+    assert_eq!(
+        fixture.timeline.lock().expect("timeline lock").as_slice(),
+        ["workflow.resolve_binding", "turn.submit"],
+        "duplicate Matrix event must replay idempotency before binding/turn side effects"
+    );
+}
+
+#[tokio::test]
+async fn matrix_inbound_same_event_id_in_different_room_does_not_collide() {
+    let adapter = matrix_adapter();
+    let fixture = workflow_fixture();
+    let auth_evidence =
+        ProtocolAuthEvidence::test_verified(adapter.auth_requirement().clone(), "matrix-webhook");
+    let installations = [matrix_installation_with_rooms(
+        MatrixActivationState::Enabled,
+        &["!room:example.org", "!other:example.org"],
+    )];
+
+    let first_ack = adapter
+        .submit_verified_inbound(
+            &fixture.workflow,
+            &installations,
+            matrix_homeserver(),
+            raw_matrix_message_in_room("!room:example.org")
+                .to_string()
+                .as_bytes(),
+            &auth_evidence,
+            Utc::now(),
+        )
+        .await
+        .expect("first Matrix event should be accepted");
+    let second_ack = adapter
+        .submit_verified_inbound(
+            &fixture.workflow,
+            &installations,
+            matrix_homeserver(),
+            raw_matrix_message_in_room("!other:example.org")
+                .to_string()
+                .as_bytes(),
+            &auth_evidence,
+            Utc::now(),
+        )
+        .await
+        .expect("same Matrix event id in another room should be accepted");
+
+    assert!(matches!(first_ack, ProductInboundAck::Accepted { .. }));
+    assert!(
+        matches!(second_ack, ProductInboundAck::Accepted { .. }),
+        "same Matrix event id in a different room must not replay as duplicate"
+    );
+    let binding_requests = fixture.binding_service.requests();
+    assert_eq!(binding_requests.len(), 2);
+    assert_eq!(
+        binding_requests[0].external_event_id.as_str(),
+        "matrix:inst_matrix:room:!room:example.org:event:$event:example.org"
+    );
+    assert_eq!(
+        binding_requests[1].external_event_id.as_str(),
+        "matrix:inst_matrix:room:!other:example.org:event:$event:example.org"
+    );
+    assert_eq!(fixture.turn_coordinator.submitted().len(), 2);
+    assert_eq!(
+        fixture.timeline.lock().expect("timeline lock").as_slice(),
+        [
+            "workflow.resolve_binding",
+            "turn.submit",
+            "workflow.resolve_binding",
+            "turn.submit"
+        ],
+        "same event id in another room must run a separate binding/turn sequence"
+    );
 }
 
 #[tokio::test]
@@ -531,6 +632,7 @@ async fn matrix_unverified_inbound_fails_before_product_workflow() {
         "unverified Matrix inbound must not reach ProductWorkflow"
     );
     assert!(fixture.turn_coordinator.submitted().is_empty());
+    assert!(fixture.timeline.lock().expect("timeline lock").is_empty());
 }
 
 #[tokio::test]
@@ -571,6 +673,7 @@ async fn matrix_disabled_installation_fails_before_product_workflow_and_guest_pa
         "disabled Matrix installation must not reach ProductWorkflow"
     );
     assert!(fixture.turn_coordinator.submitted().is_empty());
+    assert!(fixture.timeline.lock().expect("timeline lock").is_empty());
 }
 
 #[tokio::test]
@@ -611,6 +714,46 @@ async fn matrix_policy_denial_fails_before_product_workflow_and_guest_parse() {
         "policy-denied Matrix event must not reach ProductWorkflow"
     );
     assert!(fixture.turn_coordinator.submitted().is_empty());
+    assert!(fixture.timeline.lock().expect("timeline lock").is_empty());
+}
+
+#[tokio::test]
+async fn matrix_overlong_routing_ids_fail_before_policy_parse_or_workflow() {
+    let adapter = matrix_adapter();
+    let fixture = workflow_fixture();
+    let auth_evidence =
+        ProtocolAuthEvidence::test_verified(adapter.auth_requirement().clone(), "matrix-webhook");
+    let overlong_room = format!("!{}:example.org", "r".repeat(600));
+
+    let error = adapter
+        .submit_verified_inbound(
+            &fixture.workflow,
+            &[matrix_installation(MatrixActivationState::Enabled)],
+            matrix_homeserver(),
+            raw_unsupported_matrix_message(&overlong_room)
+                .to_string()
+                .as_bytes(),
+            &auth_evidence,
+            Utc::now(),
+        )
+        .await
+        .expect_err("overlong Matrix routing ids should fail before policy/workflow");
+
+    assert!(
+        matches!(
+            error,
+            ProductAdapterError::WorkflowRejected {
+                kind: ironclaw_product_adapters::ProductWorkflowRejectionKind::InvalidRequest,
+                status_code: 400,
+                retryable: false,
+                ..
+            }
+        ),
+        "overlong routing ids should be malformed input, not policy denial"
+    );
+    assert!(fixture.binding_service.requests().is_empty());
+    assert!(fixture.turn_coordinator.submitted().is_empty());
+    assert!(fixture.timeline.lock().expect("timeline lock").is_empty());
 }
 
 fn matrix_adapter() -> MatrixProductAdapter {
@@ -629,11 +772,18 @@ fn matrix_adapter() -> MatrixProductAdapter {
 }
 
 fn matrix_installation(activation: MatrixActivationState) -> MatrixProductAdapterInstallation {
+    matrix_installation_with_rooms(activation, &["!room:example.org"])
+}
+
+fn matrix_installation_with_rooms(
+    activation: MatrixActivationState,
+    rooms: &[&str],
+) -> MatrixProductAdapterInstallation {
     MatrixProductAdapterInstallation::new(
         ProductAdapterId::new("matrix").expect("valid adapter id"),
         AdapterInstallationId::new("inst_matrix").expect("valid installation id"),
         matrix_component_artifact(),
-        matrix_installation_policy(),
+        matrix_installation_policy_with_rooms(rooms),
         activation,
         PolicyRevision::new(7).expect("valid policy revision"),
         InstallationAuditMetadata::new("matrix-admin", 1_710_000_000_001).expect("audit"),
@@ -641,10 +791,13 @@ fn matrix_installation(activation: MatrixActivationState) -> MatrixProductAdapte
     .expect("valid Matrix installation")
 }
 
-fn matrix_installation_policy() -> MatrixInstallationPolicy {
+fn matrix_installation_policy_with_rooms(rooms: &[&str]) -> MatrixInstallationPolicy {
     MatrixInstallationPolicy::new(
         matrix_homeserver(),
-        BTreeSet::from([MatrixRoomId::new("!room:example.org").expect("room")]),
+        rooms
+            .iter()
+            .map(|room| MatrixRoomId::new(*room).expect("room"))
+            .collect(),
         BTreeSet::from([MatrixUserId::new("@alice:example.org").expect("sender")]),
         EgressTargetIndex::new(0),
         ironclaw_product_adapters::EgressCredentialHandle::new("matrix-access-token")
@@ -679,10 +832,14 @@ fn matrix_homeserver() -> MatrixHomeserverOrigin {
 }
 
 fn raw_matrix_message() -> serde_json::Value {
+    raw_matrix_message_in_room("!room:example.org")
+}
+
+fn raw_matrix_message_in_room(room_id: &str) -> serde_json::Value {
     json!({
         "type": "m.room.message",
         "event_id": "$event:example.org",
-        "room_id": "!room:example.org",
+        "room_id": room_id,
         "sender": "@alice:example.org",
         "content": {
             "msgtype": "m.text",

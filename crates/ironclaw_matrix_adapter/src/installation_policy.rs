@@ -25,6 +25,8 @@ use ironclaw_product_adapters::{
 use ironclaw_wasm_product_adapters::{EgressPolicy, EgressPolicyError, EgressPolicyTarget};
 use serde::{Deserialize, Deserializer, Serialize};
 
+const MAX_MATRIX_ROUTE_ID_BYTES: usize = 255;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixInstallationPolicyRejection {
@@ -318,6 +320,7 @@ impl MatrixRoomId {
         // canonicalizer owns server-name normalization, store IDs verbatim and
         // fail closed on mismatches rather than guessing.
         if value.starts_with('!')
+            && value.len() <= MAX_MATRIX_ROUTE_ID_BYTES
             && value.contains(':')
             && !value.chars().any(|c| c.is_control() || c.is_whitespace())
         {
@@ -352,6 +355,7 @@ impl MatrixUserId {
         // See MatrixRoomId: this policy layer intentionally avoids partial
         // normalization that could rewrite a case-sensitive identifier.
         if value.starts_with('@')
+            && value.len() <= MAX_MATRIX_ROUTE_ID_BYTES
             && value.contains(':')
             && !value.chars().any(|c| c.is_control() || c.is_whitespace())
         {
