@@ -41,6 +41,7 @@ mod local_dev_mounts;
 mod local_runtime_profile;
 pub mod matrix_outbound;
 mod matrix_outbound_targets;
+pub mod matrix_product_outbound;
 mod observability;
 mod outbound;
 mod product_auth;

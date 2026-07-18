@@ -38,9 +38,10 @@ use ironclaw_outbound::{
 };
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, ExternalConversationRef, FakeOutboundDeliverySink,
-    FakeProtocolHttpEgress, FinalReplyView, ProductAdapter, ProductAdapterError, ProductAdapterId,
-    ProductInboundAck, ProductOutboundPayload, ProductRenderOutcome, ProjectionCursor,
-    ProtocolAuthEvidence, ProtocolAuthFailure,
+    FakeProtocolHttpEgress, FinalReplyView, OutboundDeliverySink, ProductAdapter,
+    ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId, ProductInboundAck,
+    ProductOutboundEnvelope, ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind,
+    ProjectionCursor, ProtocolAuthEvidence, ProtocolAuthFailure, ProtocolHttpEgress,
 };
 use ironclaw_product_workflow::{
     ConversationBindingService, DefaultInboundTurnService, DefaultProductWorkflow,
@@ -80,6 +81,7 @@ impl ThreadProjectionAccessPolicy for AllowAllProjectionAccessPolicy {
 struct RecordingReplyTargetBindingValidator {
     allowed_targets: Mutex<HashSet<ReplyTargetBindingRef>>,
     calls: Mutex<Vec<ReplyTargetBindingRef>>,
+    timeline: StageTimeline,
 }
 
 impl RecordingReplyTargetBindingValidator {
@@ -105,6 +107,10 @@ impl ReplyTargetBindingValidator for RecordingReplyTargetBindingValidator {
             .lock()
             .expect("validator lock")
             .push(request.candidate.target.clone());
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("outbound.validate_reply_target");
         if self
             .allowed_targets
             .lock()
@@ -179,12 +185,34 @@ impl CommunicationPreferenceRepository for RecordingPreferenceRepository {
     }
 }
 
-#[derive(Default)]
 struct RecordingProductOutboundTargetResolver {
     calls: Mutex<Vec<ReplyTargetBindingRef>>,
+    room_id: String,
+    fail: bool,
+    timeline: StageTimeline,
+}
+
+impl Default for RecordingProductOutboundTargetResolver {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::default(),
+            room_id: "!room:example.org".to_string(),
+            fail: false,
+            timeline: StageTimeline::default(),
+        }
+    }
 }
 
 impl RecordingProductOutboundTargetResolver {
+    fn for_room(room_id: impl Into<String>, timeline: StageTimeline) -> Self {
+        Self {
+            calls: Mutex::default(),
+            room_id: room_id.into(),
+            fail: false,
+            timeline,
+        }
+    }
+
     fn calls(&self) -> Vec<ReplyTargetBindingRef> {
         self.calls.lock().expect("target resolver lock").clone()
     }
@@ -201,16 +229,86 @@ impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
             .lock()
             .expect("target resolver lock")
             .push(target.target().clone());
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("outbound.resolve_target");
+        if self.fail {
+            return Err(ProductWorkflowError::BindingRequired {
+                reason: "Matrix target not resolved".to_string(),
+            });
+        }
         Ok(VerifiedProductOutboundTargetMetadata {
             external_conversation_ref: ExternalConversationRef::new(
                 None,
-                "!room:example.org",
+                &self.room_id,
                 Some("$root:example.org"),
                 Some("$reply:example.org"),
             )
             .expect("valid Matrix conversation ref"),
             external_actor_ref: None,
         })
+    }
+}
+
+struct RecordingRenderAdapter<'a> {
+    inner: &'a MatrixProductAdapter,
+    timeline: StageTimeline,
+}
+
+impl<'a> RecordingRenderAdapter<'a> {
+    fn new(inner: &'a MatrixProductAdapter, timeline: StageTimeline) -> Self {
+        Self { inner, timeline }
+    }
+}
+
+#[async_trait]
+impl ProductAdapter for RecordingRenderAdapter<'_> {
+    fn adapter_id(&self) -> &ProductAdapterId {
+        self.inner.adapter_id()
+    }
+
+    fn installation_id(&self) -> &AdapterInstallationId {
+        self.inner.installation_id()
+    }
+
+    fn surface_kind(&self) -> ProductSurfaceKind {
+        self.inner.surface_kind()
+    }
+
+    fn capabilities(&self) -> &ProductAdapterCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn auth_requirement(&self) -> &AuthRequirement {
+        self.inner.auth_requirement()
+    }
+
+    fn declared_egress(&self) -> &[ironclaw_product_adapters::DeclaredEgressTarget] {
+        self.inner.declared_egress()
+    }
+
+    fn parse_inbound(
+        &self,
+        raw_payload: &[u8],
+        auth_evidence: &ProtocolAuthEvidence,
+    ) -> Result<ironclaw_product_adapters::ParsedProductInbound, ProductAdapterError> {
+        self.inner.parse_inbound(raw_payload, auth_evidence)
+    }
+
+    async fn render_outbound(
+        &self,
+        envelope: ProductOutboundEnvelope,
+        egress: &dyn ProtocolHttpEgress,
+        delivery_sink: &dyn OutboundDeliverySink,
+    ) -> Result<ProductRenderOutcome, ProductAdapterError> {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("matrix.render");
+        self.inner
+            .render_outbound(envelope, egress, delivery_sink)
+            .await
     }
 }
 
@@ -360,15 +458,21 @@ fn workflow_fixture() -> WorkflowFixture {
 #[tokio::test]
 async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_bridge() {
     let scope = scope();
+    let timeline = StageTimeline::default();
     let store = in_memory_backed_outbound_state_store();
-    let validator = RecordingReplyTargetBindingValidator::default();
+    let validator = RecordingReplyTargetBindingValidator {
+        timeline: timeline.clone(),
+        ..Default::default()
+    };
     validator.allow(reply_target());
     let preferences = RecordingPreferenceRepository::default();
     preferences.seed(preference_record(&scope));
-    let resolver = RecordingProductOutboundTargetResolver::default();
+    let resolver =
+        RecordingProductOutboundTargetResolver::for_room("!room:example.org", timeline.clone());
     let access_policy = AllowAllProjectionAccessPolicy;
     let outbound_policy = OutboundPolicyService::new(&store, &access_policy, &validator);
     let adapter = matrix_adapter();
+    let render_adapter = RecordingRenderAdapter::new(&adapter, timeline.clone());
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
@@ -381,14 +485,14 @@ async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_
             payload: matrix_final_reply_payload(),
             projection_cursor: ProjectionCursor::new("cursor:matrix:final-reply")
                 .expect("valid projection cursor"),
-            adapter: &adapter,
+            adapter: &render_adapter,
             egress: &egress,
             delivery_sink: &delivery_sink,
             require_direct_message_target: false,
         },
     )
     .await
-    .expect("Matrix composition should render through shared ProductWorkflow outbound");
+    .expect("Matrix adapter should render through shared ProductWorkflow outbound");
 
     let ProductOutboundDeliveryOutcome::Rendered {
         attempt,
@@ -438,6 +542,15 @@ async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_
     assert_eq!(resolver.calls(), vec![reply_target()]);
     assert!(egress.calls().is_empty());
     assert!(delivery_sink.statuses().is_empty());
+    assert_eq!(
+        timeline.lock().expect("timeline lock").as_slice(),
+        [
+            "outbound.validate_reply_target",
+            "outbound.resolve_target",
+            "matrix.render"
+        ],
+        "Matrix outbound must resolve ProductOutbound target before adapter render"
+    );
 
     let attempts = store
         .list_delivery_attempts(scope)
