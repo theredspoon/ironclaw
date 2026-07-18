@@ -326,6 +326,10 @@ impl MatrixRoomId {
             Err(MatrixInstallationPolicyRejection::InvalidPolicyValue)
         }
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl<'de> Deserialize<'de> for MatrixRoomId {
@@ -355,6 +359,10 @@ impl MatrixUserId {
         } else {
             Err(MatrixInstallationPolicyRejection::InvalidPolicyValue)
         }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
