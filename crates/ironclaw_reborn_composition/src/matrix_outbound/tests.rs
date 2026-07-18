@@ -922,7 +922,7 @@ impl MatrixPolicySnapshotSource for StaticMatrixPolicySnapshotSource {
     }
 }
 
-fn matrix_product_outbound_entrypoint<'a>(
+struct MatrixProductOutboundEntrypointFixture<'a> {
     extension_installation_store: &'a dyn ExtensionInstallationStore,
     snapshot_source: &'a dyn MatrixPolicySnapshotSource,
     policy_authorizer: &'a dyn MatrixOutboundPolicyAuthorizer,
@@ -932,17 +932,21 @@ fn matrix_product_outbound_entrypoint<'a>(
     adapter: &'a dyn ProductAdapter,
     egress: &'a dyn ProtocolHttpEgress,
     delivery_sink: &'a dyn OutboundDeliverySink,
+}
+
+fn matrix_product_outbound_entrypoint<'a>(
+    fixture: MatrixProductOutboundEntrypointFixture<'a>,
 ) -> MatrixProductOutboundEntrypoint<'a> {
     MatrixProductOutboundEntrypoint {
-        extension_installation_store,
-        snapshot_source,
-        policy_authorizer,
-        outbound_policy,
-        communication_preferences,
-        target_resolver,
-        adapter,
-        egress,
-        delivery_sink,
+        extension_installation_store: fixture.extension_installation_store,
+        snapshot_source: fixture.snapshot_source,
+        policy_authorizer: fixture.policy_authorizer,
+        outbound_policy: fixture.outbound_policy,
+        communication_preferences: fixture.communication_preferences,
+        target_resolver: fixture.target_resolver,
+        adapter: fixture.adapter,
+        egress: fixture.egress,
+        delivery_sink: fixture.delivery_sink,
     }
 }
 
@@ -1796,17 +1800,17 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let entrypoint = matrix_product_outbound_entrypoint(
-        &extension_store,
-        &snapshot_source,
-        &policy_authorizer,
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        &adapter,
-        &egress,
-        &delivery_sink,
-    );
+    let entrypoint = matrix_product_outbound_entrypoint(MatrixProductOutboundEntrypointFixture {
+        extension_installation_store: &extension_store,
+        snapshot_source: &snapshot_source,
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+    });
     let outcome = entrypoint
         .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
@@ -1924,17 +1928,17 @@ async fn matrix_product_outbound_disabled_lifecycle_rejects_before_target_resolu
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let entrypoint = matrix_product_outbound_entrypoint(
-        &extension_store,
-        &snapshot_source,
-        &policy_authorizer,
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        &adapter,
-        &egress,
-        &delivery_sink,
-    );
+    let entrypoint = matrix_product_outbound_entrypoint(MatrixProductOutboundEntrypointFixture {
+        extension_installation_store: &extension_store,
+        snapshot_source: &snapshot_source,
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+    });
     let error = entrypoint
         .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
@@ -1985,17 +1989,17 @@ async fn matrix_product_outbound_deleting_lifecycle_rejects_before_target_resolu
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let entrypoint = matrix_product_outbound_entrypoint(
-        &extension_store,
-        &snapshot_source,
-        &policy_authorizer,
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        &adapter,
-        &egress,
-        &delivery_sink,
-    );
+    let entrypoint = matrix_product_outbound_entrypoint(MatrixProductOutboundEntrypointFixture {
+        extension_installation_store: &extension_store,
+        snapshot_source: &snapshot_source,
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+    });
     let error = entrypoint
         .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
@@ -2045,17 +2049,17 @@ async fn matrix_product_outbound_unresolved_target_stops_before_matrix_policy_an
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let entrypoint = matrix_product_outbound_entrypoint(
-        &extension_store,
-        &snapshot_source,
-        &policy_authorizer,
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        &adapter,
-        &egress,
-        &delivery_sink,
-    );
+    let entrypoint = matrix_product_outbound_entrypoint(MatrixProductOutboundEntrypointFixture {
+        extension_installation_store: &extension_store,
+        snapshot_source: &snapshot_source,
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+    });
     let error = entrypoint
         .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
@@ -2106,17 +2110,17 @@ async fn matrix_product_outbound_invalid_resolved_room_reports_policy_stage_with
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let entrypoint = matrix_product_outbound_entrypoint(
-        &extension_store,
-        &snapshot_source,
-        &policy_authorizer,
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        &adapter,
-        &egress,
-        &delivery_sink,
-    );
+    let entrypoint = matrix_product_outbound_entrypoint(MatrixProductOutboundEntrypointFixture {
+        extension_installation_store: &extension_store,
+        snapshot_source: &snapshot_source,
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+    });
     let error = entrypoint
         .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
@@ -2176,17 +2180,17 @@ async fn matrix_product_outbound_policy_denial_after_target_resolution_stops_bef
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let entrypoint = matrix_product_outbound_entrypoint(
-        &extension_store,
-        &snapshot_source,
-        &policy_authorizer,
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        &adapter,
-        &egress,
-        &delivery_sink,
-    );
+    let entrypoint = matrix_product_outbound_entrypoint(MatrixProductOutboundEntrypointFixture {
+        extension_installation_store: &extension_store,
+        snapshot_source: &snapshot_source,
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+    });
     let error = entrypoint
         .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
