@@ -11,16 +11,25 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use async_trait::async_trait;
 #[cfg(not(target_arch = "wasm32"))]
+use chrono::{DateTime, Utc};
+#[cfg(not(target_arch = "wasm32"))]
+use installation_policy::{
+    MatrixHomeserverOrigin, MatrixInboundRoutingContext, MatrixInstallationPolicyRejection,
+    MatrixPolicySnapshot, MatrixProductAdapterInstallation, MatrixRoomId, MatrixUserId,
+    resolve_matrix_inbound_installation,
+};
+#[cfg(not(target_arch = "wasm32"))]
 use ironclaw_product_adapters::redaction::RedactedString;
 #[cfg(not(target_arch = "wasm32"))]
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, DeliveryAttemptId, ExternalActorRef,
     ExternalConversationRef, ExternalEventId, OutboundDeliverySink, ParsedProductInbound,
     ProductAdapter, ProductAdapterCapabilities, ProductAdapterError, ProductAdapterId,
-    ProductAttachmentDescriptor, ProductAttachmentKind, ProductInboundPayload,
-    ProductOutboundEnvelope, ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind,
-    ProductTriggerReason, ProductWorkflowRejectionKind, ProtocolAuthEvidence, ProtocolAuthFailure,
-    ProtocolHttpEgress, UserMessagePayload,
+    ProductAttachmentDescriptor, ProductAttachmentKind, ProductInboundAck, ProductInboundEnvelope,
+    ProductInboundPayload, ProductOutboundEnvelope, ProductOutboundPayload, ProductRenderOutcome,
+    ProductSurfaceKind, ProductTriggerReason, ProductWorkflow, ProductWorkflowRejectionKind,
+    ProtocolAuthEvidence, ProtocolAuthFailure, ProtocolHttpEgress, TrustedInboundContext,
+    UserMessagePayload,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use pulldown_cmark::{Options, Parser, html};
@@ -59,7 +68,10 @@ const MAX_HTML_NESTING: usize = 20;
 ///         allowed_senders: vec!["@alice:example.org".to_string()],
 ///     },
 /// }).expect("valid Matrix event");
-/// assert_eq!(parsed.facts.deduplication_key, "matrix-inst_abc123-$event:example.org");
+/// assert_eq!(
+///     parsed.facts.deduplication_key,
+///     "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
+/// );
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixParseInput {
@@ -208,6 +220,165 @@ impl MatrixProductAdapter {
         attempt_id: DeliveryAttemptId,
     ) -> Option<MatrixOutboundCommand> {
         self.pending_intents.take(attempt_id)
+    }
+
+    pub async fn submit_verified_inbound(
+        &self,
+        workflow: &dyn ProductWorkflow,
+        installations: &[MatrixProductAdapterInstallation],
+        homeserver: MatrixHomeserverOrigin,
+        raw_payload: &[u8],
+        auth_evidence: &ProtocolAuthEvidence,
+        received_at: DateTime<Utc>,
+    ) -> Result<ProductInboundAck, ProductAdapterError> {
+        let (raw_event, routing_context) = matrix_inbound_routing_context_from_payload(
+            homeserver,
+            raw_payload,
+            auth_evidence,
+            received_at,
+        )?;
+        let snapshot = resolve_matrix_inbound_installation(installations, &routing_context)
+            .map_err(map_matrix_policy_rejection_to_adapter_error)?;
+        self.submit_policy_admitted_inbound(
+            workflow,
+            raw_event,
+            auth_evidence,
+            received_at,
+            &snapshot,
+        )
+        .await
+    }
+
+    async fn submit_policy_admitted_inbound(
+        &self,
+        workflow: &dyn ProductWorkflow,
+        raw_event: Value,
+        auth_evidence: &ProtocolAuthEvidence,
+        received_at: DateTime<Utc>,
+        snapshot: &MatrixPolicySnapshot,
+    ) -> Result<ProductInboundAck, ProductAdapterError> {
+        if snapshot.adapter_id != self.config.adapter_id {
+            return Err(ProductAdapterError::WorkflowRejected {
+                kind: ProductWorkflowRejectionKind::Unauthorized,
+                status_code: 403,
+                retryable: false,
+                reason: RedactedString::new("matrix policy adapter mismatch"),
+            });
+        }
+        if snapshot.installation_id != self.config.installation_id {
+            return Err(ProductAdapterError::WorkflowRejected {
+                kind: ProductWorkflowRejectionKind::Unauthorized,
+                status_code: 403,
+                retryable: false,
+                reason: RedactedString::new("matrix policy installation mismatch"),
+            });
+        }
+
+        let parsed = parse_matrix_event(MatrixParseInput {
+            raw_event,
+            installation_id: snapshot.installation_id.as_str().to_string(),
+            policy: MatrixParsePolicy {
+                allowed_rooms: snapshot
+                    .allowed_rooms
+                    .iter()
+                    .map(|room| room.as_str().to_string())
+                    .collect(),
+                allowed_senders: snapshot
+                    .allowed_senders
+                    .iter()
+                    .map(|sender| sender.as_str().to_string())
+                    .collect(),
+            },
+        })
+        .map(|parsed| parsed.product)
+        .map_err(map_matrix_diagnostic_to_adapter_error)?;
+        let context = TrustedInboundContext::from_verified_evidence(
+            snapshot.adapter_id.clone(),
+            snapshot.installation_id.clone(),
+            received_at,
+            auth_evidence,
+        )?;
+        let envelope = ProductInboundEnvelope::from_trusted_parse(context, parsed)?;
+        workflow.submit_inbound(envelope).await
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn matrix_inbound_routing_context_from_payload(
+    homeserver: MatrixHomeserverOrigin,
+    raw_payload: &[u8],
+    auth_evidence: &ProtocolAuthEvidence,
+    received_at: DateTime<Utc>,
+) -> Result<(Value, MatrixInboundRoutingContext), ProductAdapterError> {
+    let raw_event: Value = serde_json::from_slice(raw_payload).map_err(|err| {
+        ProductAdapterError::MalformedInboundPayload {
+            reason: RedactedString::new(format!("matrix webhook payload is not JSON: {err}")),
+        }
+    })?;
+    let object =
+        raw_event
+            .as_object()
+            .ok_or_else(|| ProductAdapterError::MalformedInboundPayload {
+                reason: RedactedString::new("matrix event must be a JSON object"),
+            })?;
+    let room_id = matrix_routing_string(object, "room_id").and_then(|value| {
+        MatrixRoomId::new(value).map_err(map_matrix_policy_rejection_to_adapter_error)
+    })?;
+    let sender = matrix_routing_string(object, "sender").and_then(|value| {
+        MatrixUserId::new(value).map_err(map_matrix_policy_rejection_to_adapter_error)
+    })?;
+    let routing_context = MatrixInboundRoutingContext::from_verified_auth(
+        homeserver,
+        room_id,
+        sender,
+        auth_evidence,
+        u64::try_from(received_at.timestamp_millis()).map_err(|_| {
+            ProductAdapterError::MalformedInboundPayload {
+                reason: RedactedString::new("matrix inbound received_at is before unix epoch"),
+            }
+        })?,
+    )
+    .map_err(map_matrix_policy_rejection_to_adapter_error)?;
+    Ok((raw_event, routing_context))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn matrix_routing_string(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<String, ProductAdapterError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| ProductAdapterError::MalformedInboundPayload {
+            reason: RedactedString::new(format!("matrix event missing `{field}`")),
+        })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn map_matrix_policy_rejection_to_adapter_error(
+    rejection: MatrixInstallationPolicyRejection,
+) -> ProductAdapterError {
+    let (kind, status_code) = match rejection {
+        MatrixInstallationPolicyRejection::AuthInvalid => {
+            return ProductAdapterError::Authentication(ProtocolAuthFailure::Missing);
+        }
+        MatrixInstallationPolicyRejection::InstallationDisabled
+        | MatrixInstallationPolicyRejection::InstallationDeleting
+        | MatrixInstallationPolicyRejection::RoomNotAllowed
+        | MatrixInstallationPolicyRejection::SenderNotAllowed
+        | MatrixInstallationPolicyRejection::InstallationNotFound
+        | MatrixInstallationPolicyRejection::AmbiguousInstallation => {
+            (ProductWorkflowRejectionKind::Unauthorized, 403)
+        }
+        _ => (ProductWorkflowRejectionKind::InvalidRequest, 400),
+    };
+    ProductAdapterError::WorkflowRejected {
+        kind,
+        status_code,
+        retryable: false,
+        reason: RedactedString::new(format!("matrix installation policy denied: {rejection}")),
     }
 }
 
@@ -518,7 +689,8 @@ pub fn parse_matrix_event(
     })?;
     let partial = partial_facts(object);
     let mut facts = facts_from_object(object, partial)?;
-    facts.deduplication_key = format!("matrix-{}-{}", input.installation_id, facts.event_id);
+    facts.deduplication_key =
+        matrix_external_event_key(&input.installation_id, &facts.room_id, &facts.event_id);
 
     if !input.policy.allowed_rooms.is_empty()
         && !input
@@ -1031,16 +1203,18 @@ fn product_result(
     payload: ProductInboundPayload,
     installation_id: &str,
 ) -> Result<ParsedMatrixInbound, MatrixAdapterDiagnostic> {
-    let external_event_id =
-        ExternalEventId::new(format!("matrix-{installation_id}-{}", facts.event_id)).map_err(
-            |_| {
-                diagnostic_for_facts(
-                    MatrixReasonCode::MalformedMatrixEvent,
-                    &facts,
-                    "matrix event id is not a valid product external event id",
-                )
-            },
-        )?;
+    let external_event_id = ExternalEventId::new(matrix_external_event_key(
+        installation_id,
+        &facts.room_id,
+        &facts.event_id,
+    ))
+    .map_err(|_| {
+        diagnostic_for_facts(
+            MatrixReasonCode::MalformedMatrixEvent,
+            &facts,
+            "matrix event id is not a valid product external event id",
+        )
+    })?;
     let actor = ExternalActorRef::new("matrix_user", facts.sender.clone(), None::<String>)
         .map_err(|_| {
             diagnostic_for_facts(
@@ -1079,6 +1253,10 @@ fn product_result(
         metadata,
         product,
     })
+}
+
+fn matrix_external_event_key(installation_id: &str, room_id: &str, event_id: &str) -> String {
+    format!("matrix:{installation_id}:room:{room_id}:event:{event_id}")
 }
 
 #[cfg(not(target_arch = "wasm32"))]

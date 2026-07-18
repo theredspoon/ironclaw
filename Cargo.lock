@@ -4614,6 +4614,7 @@ dependencies = [
  "ironclaw_product_adapter_registry",
  "ironclaw_product_adapters",
  "ironclaw_product_workflow",
+ "ironclaw_threads",
  "ironclaw_turns",
  "ironclaw_wasm_product_adapters",
  "proptest",

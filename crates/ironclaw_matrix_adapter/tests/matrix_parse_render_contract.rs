@@ -94,7 +94,7 @@ fn matrix_product_adapter_parses_authenticated_inbound_payload() {
 
     assert_eq!(
         parsed.external_event_id.as_str(),
-        "matrix-inst_abc123-$event:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
     );
     match parsed.payload {
         ProductInboundPayload::UserMessage(payload) => {
@@ -195,11 +195,11 @@ fn parses_plain_text_into_product_user_message() {
     assert_eq!(parsed.facts.event_id, "$event:example.org");
     assert_eq!(
         parsed.facts.deduplication_key,
-        "matrix-inst_abc123-$event:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
     );
     assert_eq!(
         parsed.product.external_event_id.as_str(),
-        "matrix-inst_abc123-$event:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
     );
     assert_eq!(parsed.facts.room_id, "!room:example.org");
     assert_eq!(parsed.facts.sender, "@alice:example.org");
@@ -364,7 +364,7 @@ fn preserves_reply_thread_and_dedup_metadata() {
 
     assert_eq!(
         parsed.facts.deduplication_key,
-        "matrix-inst_abc123-$event:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
     );
     assert_eq!(
         parsed.metadata.reply_to_event_id.as_deref(),
@@ -462,7 +462,7 @@ fn event_id_validation_accepts_current_and_legacy_matrix_forms() {
     ));
     assert_eq!(
         current.facts.deduplication_key,
-        "matrix-inst_abc123-$opaqueBase64Hash"
+        "matrix:inst_abc123:room:!room:example.org:event:$opaqueBase64Hash"
     );
 
     let legacy = parse(text_event_with_id(
@@ -471,7 +471,7 @@ fn event_id_validation_accepts_current_and_legacy_matrix_forms() {
     ));
     assert_eq!(
         legacy.facts.deduplication_key,
-        "matrix-inst_abc123-$opaque:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$opaque:example.org"
     );
 
     let invalid = parse_matrix_event(MatrixParseInput {
@@ -998,7 +998,7 @@ fn matrix_dto_shapes_match_product_adapter_wit_json_shim() {
         serde_json::from_str(&parsed_json).expect("parsed-inbound.parsed-json");
     assert_eq!(
         parsed_round_trip.external_event_id.as_str(),
-        "matrix-inst_abc123-$event:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
     );
     assert_eq!(
         parsed_round_trip.external_conversation_ref.topic_id(),
@@ -1156,7 +1156,7 @@ fn test_parse_render_round_trip_preserves_semantics() {
     assert_eq!(body["m.relates_to"]["rel_type"], "m.thread");
     assert_eq!(
         parsed.facts.deduplication_key,
-        "matrix-inst_abc123-$event:example.org"
+        "matrix:inst_abc123:room:!room:example.org:event:$event:example.org"
     );
 
     let reparsed = parse(text_event_with_id("$rendered:example.org", body));
