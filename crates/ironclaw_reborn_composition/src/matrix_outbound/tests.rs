@@ -4,17 +4,16 @@ use crate::matrix_outbound::fakes::{
     route_forgery_fixture,
 };
 use crate::matrix_product_outbound::{
-    DefaultMatrixOutboundPolicyAuthorizer, MatrixOutboundPolicyAuthorizer,
-    MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryRequest,
-    prepare_and_render_matrix_product_outbound,
+    MatrixOutboundPolicyAuthorizer, MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
+    MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
 };
 use async_trait::async_trait;
 use ironclaw_event_projections::ProjectionCursor;
 use ironclaw_extensions::{
-    ExtensionActivationState, ExtensionInstallation, ExtensionInstallationId,
-    ExtensionInstallationStore, ExtensionManifestRecord, ExtensionManifestRef,
-    InMemoryExtensionInstallationStore, InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash,
-    ManifestSource,
+    ExtensionActivationState, ExtensionHealthSnapshot, ExtensionInstallation,
+    ExtensionInstallationError, ExtensionInstallationId, ExtensionInstallationStore,
+    ExtensionManifestRecord, ExtensionManifestRef, InMemoryExtensionInstallationStore,
+    InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash, ManifestSource,
 };
 use ironclaw_filesystem::{CasExpectation, InMemoryBackend, ScopedFilesystem};
 use ironclaw_host_api::{
@@ -46,9 +45,12 @@ use ironclaw_outbound::{
     VersionedCommunicationPreferenceRecord, WriteCommunicationPreferenceRequest,
 };
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, ExternalConversationRef, FakeOutboundDeliverySink,
-    FakeProtocolHttpEgress, FinalReplyView, ProductAdapterId, ProductOutboundPayload,
-    ProductRenderOutcome, ProjectionCursor as ProductProjectionCursor,
+    AdapterInstallationId, AuthRequirement, DeclaredEgressTarget, ExternalConversationRef,
+    FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView, OutboundDeliverySink,
+    ParsedProductInbound, ProductAdapter, ProductAdapterCapabilities, ProductAdapterError,
+    ProductAdapterHealth, ProductAdapterId, ProductOutboundEnvelope, ProductOutboundPayload,
+    ProductRenderOutcome, ProductSurfaceKind, ProjectionCursor as ProductProjectionCursor,
+    ProtocolAuthEvidence, ProtocolHttpEgress,
 };
 use ironclaw_product_workflow::{
     ProductOutboundDeliveryOutcome, ProductOutboundTargetResolver, ProductWorkflowError,
@@ -59,6 +61,114 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
+
+type StageTimeline = Arc<Mutex<Vec<&'static str>>>;
+
+struct RecordingExtensionInstallationStore {
+    inner: InMemoryExtensionInstallationStore,
+    timeline: StageTimeline,
+}
+
+impl RecordingExtensionInstallationStore {
+    fn new(inner: InMemoryExtensionInstallationStore, timeline: StageTimeline) -> Self {
+        Self { inner, timeline }
+    }
+}
+
+#[async_trait]
+impl ExtensionInstallationStore for RecordingExtensionInstallationStore {
+    async fn list_manifests(
+        &self,
+    ) -> Result<Vec<ExtensionManifestRecord>, ExtensionInstallationError> {
+        self.inner.list_manifests().await
+    }
+
+    async fn get_manifest(
+        &self,
+        extension_id: &ExtensionId,
+    ) -> Result<Option<ExtensionManifestRecord>, ExtensionInstallationError> {
+        self.inner.get_manifest(extension_id).await
+    }
+
+    async fn upsert_manifest(
+        &self,
+        manifest: ExtensionManifestRecord,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner.upsert_manifest(manifest).await
+    }
+
+    async fn upsert_manifest_and_installation(
+        &self,
+        manifest: ExtensionManifestRecord,
+        installation: ExtensionInstallation,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner
+            .upsert_manifest_and_installation(manifest, installation)
+            .await
+    }
+
+    async fn list_installations(
+        &self,
+    ) -> Result<Vec<ExtensionInstallation>, ExtensionInstallationError> {
+        self.inner.list_installations().await
+    }
+
+    async fn list_enabled_installations(
+        &self,
+    ) -> Result<Vec<ExtensionInstallation>, ExtensionInstallationError> {
+        self.inner.list_enabled_installations().await
+    }
+
+    async fn get_installation(
+        &self,
+        installation_id: &ExtensionInstallationId,
+    ) -> Result<Option<ExtensionInstallation>, ExtensionInstallationError> {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("lifecycle.check");
+        self.inner.get_installation(installation_id).await
+    }
+
+    async fn upsert_installation(
+        &self,
+        installation: ExtensionInstallation,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner.upsert_installation(installation).await
+    }
+
+    async fn set_activation_state(
+        &self,
+        installation_id: &ExtensionInstallationId,
+        state: ExtensionActivationState,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner
+            .set_activation_state(installation_id, state)
+            .await
+    }
+
+    async fn delete_installation(
+        &self,
+        installation_id: &ExtensionInstallationId,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner.delete_installation(installation_id).await
+    }
+
+    async fn delete_manifest(
+        &self,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner.delete_manifest(extension_id).await
+    }
+
+    async fn update_health(
+        &self,
+        installation_id: &ExtensionInstallationId,
+        health: ExtensionHealthSnapshot,
+    ) -> Result<(), ExtensionInstallationError> {
+        self.inner.update_health(installation_id, health).await
+    }
+}
 
 fn binding() -> ReplyTargetBindingRef {
     ReplyTargetBindingRef::new("matrix-room-binding").expect("valid binding")
@@ -577,6 +687,7 @@ impl ThreadProjectionAccessPolicy for AllowAllProjectionAccessPolicy {
 struct RecordingReplyTargetBindingValidator {
     allowed_targets: Mutex<HashSet<ReplyTargetBindingRef>>,
     calls: Mutex<Vec<ReplyTargetBindingRef>>,
+    timeline: StageTimeline,
 }
 
 impl RecordingReplyTargetBindingValidator {
@@ -602,6 +713,10 @@ impl ReplyTargetBindingValidator for RecordingReplyTargetBindingValidator {
             .lock()
             .expect("validator lock")
             .push(request.candidate.target.clone());
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("outbound.validate_reply_target");
         if self
             .allowed_targets
             .lock()
@@ -675,6 +790,7 @@ struct RecordingProductOutboundTargetResolver {
     calls: Mutex<Vec<ReplyTargetBindingRef>>,
     room_id: String,
     fail: bool,
+    timeline: StageTimeline,
 }
 
 impl Default for RecordingProductOutboundTargetResolver {
@@ -683,6 +799,7 @@ impl Default for RecordingProductOutboundTargetResolver {
             calls: Mutex::default(),
             room_id: "!room:example.org".to_string(),
             fail: false,
+            timeline: StageTimeline::default(),
         }
     }
 }
@@ -692,6 +809,15 @@ impl RecordingProductOutboundTargetResolver {
         Self {
             room_id: room_id.into(),
             ..Default::default()
+        }
+    }
+
+    fn for_room_with_timeline(room_id: impl Into<String>, timeline: StageTimeline) -> Self {
+        Self {
+            calls: Mutex::default(),
+            room_id: room_id.into(),
+            fail: false,
+            timeline,
         }
     }
 
@@ -718,6 +844,10 @@ impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
             .lock()
             .expect("target resolver lock")
             .push(target.target().clone());
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("outbound.resolve_target");
         if self.fail {
             return Err(ProductWorkflowError::BindingRequired {
                 reason: "Matrix target not resolved".to_string(),
@@ -739,6 +869,7 @@ impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
 #[derive(Debug, Default)]
 struct RecordingMatrixOutboundPolicyAuthorizer {
     calls: Mutex<Vec<AdapterMatrixOutboundPolicyCheck>>,
+    timeline: StageTimeline,
 }
 
 impl RecordingMatrixOutboundPolicyAuthorizer {
@@ -754,7 +885,129 @@ impl MatrixOutboundPolicyAuthorizer for RecordingMatrixOutboundPolicyAuthorizer 
         check: &AdapterMatrixOutboundPolicyCheck,
     ) -> Result<(), AdapterMatrixInstallationPolicyRejection> {
         self.calls.lock().expect("policy lock").push(check.clone());
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("matrix.policy");
         authorize_adapter_matrix_outbound(snapshot, check)
+    }
+}
+
+struct StaticMatrixPolicySnapshotSource {
+    snapshot: AdapterMatrixPolicySnapshot,
+}
+
+impl Default for StaticMatrixPolicySnapshotSource {
+    fn default() -> Self {
+        Self {
+            snapshot: matrix_policy_snapshot(),
+        }
+    }
+}
+
+#[async_trait]
+impl MatrixPolicySnapshotSource for StaticMatrixPolicySnapshotSource {
+    async fn resolve_matrix_policy_snapshot(
+        &self,
+        adapter_id: &ProductAdapterId,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<AdapterMatrixPolicySnapshot, AdapterMatrixInstallationPolicyRejection> {
+        if adapter_id != &self.snapshot.adapter_id {
+            return Err(AdapterMatrixInstallationPolicyRejection::AdapterMismatch);
+        }
+        if installation_id != &self.snapshot.installation_id {
+            return Err(AdapterMatrixInstallationPolicyRejection::InstallationMismatch);
+        }
+        Ok(self.snapshot.clone())
+    }
+}
+
+fn matrix_product_outbound_entrypoint<'a>(
+    extension_installation_store: &'a dyn ExtensionInstallationStore,
+    snapshot_source: &'a dyn MatrixPolicySnapshotSource,
+    policy_authorizer: &'a dyn MatrixOutboundPolicyAuthorizer,
+    outbound_policy: &'a OutboundPolicyService<'a>,
+    communication_preferences: &'a dyn CommunicationPreferenceRepository,
+    target_resolver: &'a dyn ProductOutboundTargetResolver,
+    adapter: &'a dyn ProductAdapter,
+    egress: &'a dyn ProtocolHttpEgress,
+    delivery_sink: &'a dyn OutboundDeliverySink,
+) -> MatrixProductOutboundEntrypoint<'a> {
+    MatrixProductOutboundEntrypoint {
+        extension_installation_store,
+        snapshot_source,
+        policy_authorizer,
+        outbound_policy,
+        communication_preferences,
+        target_resolver,
+        adapter,
+        egress,
+        delivery_sink,
+    }
+}
+
+struct RecordingMatrixRenderAdapter<'a> {
+    inner: &'a dyn ProductAdapter,
+    timeline: StageTimeline,
+}
+
+impl<'a> RecordingMatrixRenderAdapter<'a> {
+    fn new(inner: &'a dyn ProductAdapter, timeline: StageTimeline) -> Self {
+        Self { inner, timeline }
+    }
+}
+
+#[async_trait]
+impl ProductAdapter for RecordingMatrixRenderAdapter<'_> {
+    fn adapter_id(&self) -> &ProductAdapterId {
+        self.inner.adapter_id()
+    }
+
+    fn installation_id(&self) -> &AdapterInstallationId {
+        self.inner.installation_id()
+    }
+
+    fn surface_kind(&self) -> ProductSurfaceKind {
+        self.inner.surface_kind()
+    }
+
+    fn capabilities(&self) -> &ProductAdapterCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn auth_requirement(&self) -> &AuthRequirement {
+        self.inner.auth_requirement()
+    }
+
+    fn declared_egress(&self) -> &[DeclaredEgressTarget] {
+        self.inner.declared_egress()
+    }
+
+    fn parse_inbound(
+        &self,
+        raw_payload: &[u8],
+        auth_evidence: &ProtocolAuthEvidence,
+    ) -> Result<ParsedProductInbound, ProductAdapterError> {
+        self.inner.parse_inbound(raw_payload, auth_evidence)
+    }
+
+    async fn render_outbound(
+        &self,
+        envelope: ProductOutboundEnvelope,
+        egress: &dyn ProtocolHttpEgress,
+        delivery_sink: &dyn OutboundDeliverySink,
+    ) -> Result<ProductRenderOutcome, ProductAdapterError> {
+        self.timeline
+            .lock()
+            .expect("timeline lock")
+            .push("matrix.render");
+        self.inner
+            .render_outbound(envelope, egress, delivery_sink)
+            .await
+    }
+
+    fn health(&self) -> ProductAdapterHealth {
+        self.inner.health()
     }
 }
 
@@ -1513,36 +1766,53 @@ async fn orchestrator_records_redacted_delivery_status_observability() {
 
 #[tokio::test]
 async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without_http() {
+    let timeline = StageTimeline::default();
     let workflow_scope = scope();
     let outbound_store = in_memory_backed_outbound_state_store();
-    let validator = RecordingReplyTargetBindingValidator::default();
+    let validator = RecordingReplyTargetBindingValidator {
+        timeline: timeline.clone(),
+        ..Default::default()
+    };
     validator.allow(workflow_reply_target());
     let preferences = RecordingPreferenceRepository::default();
     preferences.seed(workflow_preference_record(&workflow_scope));
-    let resolver = RecordingProductOutboundTargetResolver::default();
+    let resolver = RecordingProductOutboundTargetResolver::for_room_with_timeline(
+        "!room:example.org",
+        timeline.clone(),
+    );
     let access_policy = AllowAllProjectionAccessPolicy;
     let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
-    let adapter = matrix_product_adapter();
-    let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
-    let policy_authorizer = DefaultMatrixOutboundPolicyAuthorizer;
+    let inner_adapter = matrix_product_adapter();
+    let adapter = RecordingMatrixRenderAdapter::new(&inner_adapter, timeline.clone());
+    let extension_store = RecordingExtensionInstallationStore::new(
+        matrix_extension_store(ExtensionActivationState::Enabled).await,
+        timeline.clone(),
+    );
+    let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer {
+        timeline: timeline.clone(),
+        ..Default::default()
+    };
+    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let outcome =
-        prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
-            extension_installation_store: &extension_store,
-            snapshot: matrix_policy_snapshot(),
-            policy_authorizer: &policy_authorizer,
-            outbound_policy: &outbound_policy,
-            communication_preferences: &preferences,
-            target_resolver: &resolver,
+    let entrypoint = matrix_product_outbound_entrypoint(
+        &extension_store,
+        &snapshot_source,
+        &policy_authorizer,
+        &outbound_policy,
+        &preferences,
+        &resolver,
+        &adapter,
+        &egress,
+        &delivery_sink,
+    );
+    let outcome = entrypoint
+        .prepare_and_render(MatrixProductOutboundDeliveryInput {
             delivery: requested_matrix_delivery(workflow_scope.clone()),
             payload: matrix_workflow_payload(),
             projection_cursor: ProductProjectionCursor::new("cursor:matrix:composition-bridge")
                 .expect("valid projection cursor"),
-            adapter: &adapter,
-            egress: &egress,
-            delivery_sink: &delivery_sink,
             require_direct_message_target: false,
         })
         .await
@@ -1563,8 +1833,19 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].delivery_id, outbound_attempt.delivery_id);
     assert_eq!(attempts[0].status, OutboundDeliveryStatus::Pending);
+    assert_eq!(
+        timeline.lock().expect("timeline lock").as_slice(),
+        [
+            "lifecycle.check",
+            "outbound.validate_reply_target",
+            "outbound.resolve_target",
+            "matrix.policy",
+            "matrix.render"
+        ],
+        "Matrix outbound must pass lifecycle, shared target resolution, R002C policy, and render in order"
+    );
 
-    let adapter_intent = adapter
+    let adapter_intent = inner_adapter
         .pending_matrix_intent(outbound_attempt.delivery_id.as_uuid())
         .expect("adapter should hold pending Matrix intent for bridge handoff");
     let command = MatrixOutboundCommand::from_adapter_pending_intent(
@@ -1583,7 +1864,7 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
         "inst_matrix",
         "matrix",
         MatrixRouteMetadata {
-            policy_revision: "policy-rev-1".into(),
+            policy_revision: "7".into(),
             homeserver_origin_fingerprint: canonical_fingerprint("homeserver-1"),
             room_fingerprint: command.room_id.fingerprint(),
             egress_target_index: 0,
@@ -1639,27 +1920,31 @@ async fn matrix_product_outbound_disabled_lifecycle_rejects_before_target_resolu
     let adapter = matrix_product_adapter();
     let extension_store = matrix_extension_store(ExtensionActivationState::Disabled).await;
     let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
-        extension_installation_store: &extension_store,
-        snapshot: matrix_policy_snapshot(),
-        policy_authorizer: &policy_authorizer,
-        outbound_policy: &outbound_policy,
-        communication_preferences: &preferences,
-        target_resolver: &resolver,
-        delivery: requested_matrix_delivery(workflow_scope.clone()),
-        payload: matrix_workflow_payload(),
-        projection_cursor: ProductProjectionCursor::new("cursor:matrix:disabled")
-            .expect("valid projection cursor"),
-        adapter: &adapter,
-        egress: &egress,
-        delivery_sink: &delivery_sink,
-        require_direct_message_target: false,
-    })
-    .await
-    .expect_err("disabled lifecycle should fail before target resolution");
+    let entrypoint = matrix_product_outbound_entrypoint(
+        &extension_store,
+        &snapshot_source,
+        &policy_authorizer,
+        &outbound_policy,
+        &preferences,
+        &resolver,
+        &adapter,
+        &egress,
+        &delivery_sink,
+    );
+    let error = entrypoint
+        .prepare_and_render(MatrixProductOutboundDeliveryInput {
+            delivery: requested_matrix_delivery(workflow_scope.clone()),
+            payload: matrix_workflow_payload(),
+            projection_cursor: ProductProjectionCursor::new("cursor:matrix:disabled")
+                .expect("valid projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect_err("disabled lifecycle should fail before target resolution");
 
     assert!(matches!(
         error,
@@ -1696,27 +1981,31 @@ async fn matrix_product_outbound_deleting_lifecycle_rejects_before_target_resolu
     let adapter = matrix_product_adapter();
     let extension_store = InMemoryExtensionInstallationStore::default();
     let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
-        extension_installation_store: &extension_store,
-        snapshot: matrix_policy_snapshot(),
-        policy_authorizer: &policy_authorizer,
-        outbound_policy: &outbound_policy,
-        communication_preferences: &preferences,
-        target_resolver: &resolver,
-        delivery: requested_matrix_delivery(workflow_scope.clone()),
-        payload: matrix_workflow_payload(),
-        projection_cursor: ProductProjectionCursor::new("cursor:matrix:deleting")
-            .expect("valid projection cursor"),
-        adapter: &adapter,
-        egress: &egress,
-        delivery_sink: &delivery_sink,
-        require_direct_message_target: false,
-    })
-    .await
-    .expect_err("deleting lifecycle should fail before target resolution");
+    let entrypoint = matrix_product_outbound_entrypoint(
+        &extension_store,
+        &snapshot_source,
+        &policy_authorizer,
+        &outbound_policy,
+        &preferences,
+        &resolver,
+        &adapter,
+        &egress,
+        &delivery_sink,
+    );
+    let error = entrypoint
+        .prepare_and_render(MatrixProductOutboundDeliveryInput {
+            delivery: requested_matrix_delivery(workflow_scope.clone()),
+            payload: matrix_workflow_payload(),
+            projection_cursor: ProductProjectionCursor::new("cursor:matrix:deleting")
+                .expect("valid projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect_err("deleting lifecycle should fail before target resolution");
 
     assert!(matches!(
         error,
@@ -1752,27 +2041,31 @@ async fn matrix_product_outbound_unresolved_target_stops_before_matrix_policy_an
     let adapter = matrix_product_adapter();
     let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
     let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
-        extension_installation_store: &extension_store,
-        snapshot: matrix_policy_snapshot(),
-        policy_authorizer: &policy_authorizer,
-        outbound_policy: &outbound_policy,
-        communication_preferences: &preferences,
-        target_resolver: &resolver,
-        delivery: requested_matrix_delivery(workflow_scope.clone()),
-        payload: matrix_workflow_payload(),
-        projection_cursor: ProductProjectionCursor::new("cursor:matrix:unresolved")
-            .expect("valid projection cursor"),
-        adapter: &adapter,
-        egress: &egress,
-        delivery_sink: &delivery_sink,
-        require_direct_message_target: false,
-    })
-    .await
-    .expect_err("unresolved target should stop before Matrix policy");
+    let entrypoint = matrix_product_outbound_entrypoint(
+        &extension_store,
+        &snapshot_source,
+        &policy_authorizer,
+        &outbound_policy,
+        &preferences,
+        &resolver,
+        &adapter,
+        &egress,
+        &delivery_sink,
+    );
+    let error = entrypoint
+        .prepare_and_render(MatrixProductOutboundDeliveryInput {
+            delivery: requested_matrix_delivery(workflow_scope.clone()),
+            payload: matrix_workflow_payload(),
+            projection_cursor: ProductProjectionCursor::new("cursor:matrix:unresolved")
+                .expect("valid projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect_err("unresolved target should stop before Matrix policy");
 
     assert!(matches!(
         error,
@@ -1809,27 +2102,31 @@ async fn matrix_product_outbound_invalid_resolved_room_reports_policy_stage_with
     let adapter = matrix_product_adapter();
     let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
     let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
-        extension_installation_store: &extension_store,
-        snapshot: matrix_policy_snapshot(),
-        policy_authorizer: &policy_authorizer,
-        outbound_policy: &outbound_policy,
-        communication_preferences: &preferences,
-        target_resolver: &resolver,
-        delivery: requested_matrix_delivery(workflow_scope.clone()),
-        payload: matrix_workflow_payload(),
-        projection_cursor: ProductProjectionCursor::new("cursor:matrix:invalid-room")
-            .expect("valid projection cursor"),
-        adapter: &adapter,
-        egress: &egress,
-        delivery_sink: &delivery_sink,
-        require_direct_message_target: false,
-    })
-    .await
-    .expect_err("invalid Matrix room should be reported as a Matrix policy-stage failure");
+    let entrypoint = matrix_product_outbound_entrypoint(
+        &extension_store,
+        &snapshot_source,
+        &policy_authorizer,
+        &outbound_policy,
+        &preferences,
+        &resolver,
+        &adapter,
+        &egress,
+        &delivery_sink,
+    );
+    let error = entrypoint
+        .prepare_and_render(MatrixProductOutboundDeliveryInput {
+            delivery: requested_matrix_delivery(workflow_scope.clone()),
+            payload: matrix_workflow_payload(),
+            projection_cursor: ProductProjectionCursor::new("cursor:matrix:invalid-room")
+                .expect("valid projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect_err("invalid Matrix room should be reported as a Matrix policy-stage failure");
 
     assert!(matches!(
         error,
@@ -1875,27 +2172,31 @@ async fn matrix_product_outbound_policy_denial_after_target_resolution_stops_bef
     let adapter = matrix_product_adapter();
     let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
     let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
-        extension_installation_store: &extension_store,
-        snapshot: matrix_policy_snapshot(),
-        policy_authorizer: &policy_authorizer,
-        outbound_policy: &outbound_policy,
-        communication_preferences: &preferences,
-        target_resolver: &resolver,
-        delivery: requested_matrix_delivery(workflow_scope.clone()),
-        payload: matrix_workflow_payload(),
-        projection_cursor: ProductProjectionCursor::new("cursor:matrix:policy-denied")
-            .expect("valid projection cursor"),
-        adapter: &adapter,
-        egress: &egress,
-        delivery_sink: &delivery_sink,
-        require_direct_message_target: false,
-    })
-    .await
-    .expect_err("policy-denied Matrix room should not render");
+    let entrypoint = matrix_product_outbound_entrypoint(
+        &extension_store,
+        &snapshot_source,
+        &policy_authorizer,
+        &outbound_policy,
+        &preferences,
+        &resolver,
+        &adapter,
+        &egress,
+        &delivery_sink,
+    );
+    let error = entrypoint
+        .prepare_and_render(MatrixProductOutboundDeliveryInput {
+            delivery: requested_matrix_delivery(workflow_scope.clone()),
+            payload: matrix_workflow_payload(),
+            projection_cursor: ProductProjectionCursor::new("cursor:matrix:policy-denied")
+                .expect("valid projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect_err("policy-denied Matrix room should not render");
 
     assert!(matches!(
         error,

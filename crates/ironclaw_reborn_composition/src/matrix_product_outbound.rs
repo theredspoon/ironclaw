@@ -32,6 +32,9 @@ pub trait MatrixOutboundPolicyAuthorizer: Send + Sync {
 pub struct DefaultMatrixOutboundPolicyAuthorizer;
 
 impl MatrixOutboundPolicyAuthorizer for DefaultMatrixOutboundPolicyAuthorizer {
+    /// Validates a source-verified R002C policy snapshot. Production callers must
+    /// pass a current snapshot from the policy owner; this type does not rehydrate
+    /// policy state on its own.
     fn authorize_matrix_outbound(
         &self,
         snapshot: &MatrixPolicySnapshot,
@@ -41,20 +44,72 @@ impl MatrixOutboundPolicyAuthorizer for DefaultMatrixOutboundPolicyAuthorizer {
     }
 }
 
-pub struct MatrixProductOutboundDeliveryRequest<'a> {
+#[async_trait]
+pub trait MatrixPolicySnapshotSource: Send + Sync {
+    async fn resolve_matrix_policy_snapshot(
+        &self,
+        adapter_id: &ProductAdapterId,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection>;
+}
+
+pub struct MatrixProductOutboundEntrypoint<'a> {
     pub extension_installation_store: &'a dyn ExtensionInstallationStore,
-    pub snapshot: MatrixPolicySnapshot,
+    pub snapshot_source: &'a dyn MatrixPolicySnapshotSource,
     pub policy_authorizer: &'a dyn MatrixOutboundPolicyAuthorizer,
     pub outbound_policy: &'a ironclaw_outbound::OutboundPolicyService<'a>,
     pub communication_preferences: &'a dyn ironclaw_outbound::CommunicationPreferenceRepository,
     pub target_resolver: &'a dyn ProductOutboundTargetResolver,
-    pub delivery: ironclaw_outbound::PrepareCommunicationDeliveryRequest,
-    pub payload: ProductOutboundPayload,
-    pub projection_cursor: ironclaw_product_adapters::ProjectionCursor,
     pub adapter: &'a dyn ProductAdapter,
     pub egress: &'a dyn ProtocolHttpEgress,
     pub delivery_sink: &'a dyn OutboundDeliverySink,
+}
+
+pub struct MatrixProductOutboundDeliveryInput {
+    pub delivery: ironclaw_outbound::PrepareCommunicationDeliveryRequest,
+    pub payload: ProductOutboundPayload,
+    pub projection_cursor: ironclaw_product_adapters::ProjectionCursor,
     pub require_direct_message_target: bool,
+}
+
+impl MatrixProductOutboundEntrypoint<'_> {
+    pub async fn prepare_and_render(
+        &self,
+        input: MatrixProductOutboundDeliveryInput,
+    ) -> Result<ProductOutboundDeliveryOutcome, MatrixProductOutboundDeliveryError> {
+        prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+            extension_installation_store: self.extension_installation_store,
+            snapshot_source: self.snapshot_source,
+            policy_authorizer: self.policy_authorizer,
+            outbound_policy: self.outbound_policy,
+            communication_preferences: self.communication_preferences,
+            target_resolver: self.target_resolver,
+            delivery: input.delivery,
+            payload: input.payload,
+            projection_cursor: input.projection_cursor,
+            adapter: self.adapter,
+            egress: self.egress,
+            delivery_sink: self.delivery_sink,
+            require_direct_message_target: input.require_direct_message_target,
+        })
+        .await
+    }
+}
+
+struct MatrixProductOutboundDeliveryRequest<'a> {
+    extension_installation_store: &'a dyn ExtensionInstallationStore,
+    snapshot_source: &'a dyn MatrixPolicySnapshotSource,
+    policy_authorizer: &'a dyn MatrixOutboundPolicyAuthorizer,
+    outbound_policy: &'a ironclaw_outbound::OutboundPolicyService<'a>,
+    communication_preferences: &'a dyn ironclaw_outbound::CommunicationPreferenceRepository,
+    target_resolver: &'a dyn ProductOutboundTargetResolver,
+    delivery: ironclaw_outbound::PrepareCommunicationDeliveryRequest,
+    payload: ProductOutboundPayload,
+    projection_cursor: ironclaw_product_adapters::ProjectionCursor,
+    adapter: &'a dyn ProductAdapter,
+    egress: &'a dyn ProtocolHttpEgress,
+    delivery_sink: &'a dyn OutboundDeliverySink,
+    require_direct_message_target: bool,
 }
 
 #[derive(Debug)]
@@ -71,20 +126,38 @@ pub enum MatrixProductOutboundDeliveryError {
     Delivery(ProductOutboundDeliveryError),
 }
 
-pub async fn prepare_and_render_matrix_product_outbound(
+async fn prepare_and_render_matrix_product_outbound(
     request: MatrixProductOutboundDeliveryRequest<'_>,
 ) -> Result<ProductOutboundDeliveryOutcome, MatrixProductOutboundDeliveryError> {
+    let snapshot = request
+        .snapshot_source
+        .resolve_matrix_policy_snapshot(
+            request.adapter.adapter_id(),
+            request.adapter.installation_id(),
+        )
+        .await
+        .map_err(|rejection| {
+            record_matrix_product_outbound_policy_failure("snapshot", &rejection);
+            MatrixProductOutboundDeliveryError::Policy {
+                rejection,
+                status_update_error: None,
+            }
+        })?;
+
     ensure_matrix_extension_lifecycle_enabled(
         request.extension_installation_store,
-        &request.snapshot.installation_id,
+        &snapshot.installation_id,
     )
     .await
-    .map_err(MatrixProductOutboundDeliveryError::Lifecycle)?;
+    .map_err(|rejection| {
+        record_matrix_product_outbound_policy_failure("lifecycle", &rejection);
+        MatrixProductOutboundDeliveryError::Lifecycle(rejection)
+    })?;
 
     let policy_failure = Arc::new(Mutex::new(None));
     let gated_adapter = MatrixPolicyGatedProductAdapter {
         inner: request.adapter,
-        snapshot: request.snapshot,
+        snapshot,
         policy_authorizer: request.policy_authorizer,
         policy_failure: Arc::clone(&policy_failure),
     };
@@ -116,19 +189,23 @@ fn map_matrix_product_outbound_delivery_error(
         ProductOutboundDeliveryError::Workflow {
             source,
             status_update_error,
-        } => MatrixProductOutboundDeliveryError::TargetResolution {
-            source,
-            status_update_error,
-        },
+        } => {
+            record_matrix_product_outbound_workflow_failure("target_resolution", &source);
+            MatrixProductOutboundDeliveryError::TargetResolution {
+                source,
+                status_update_error,
+            }
+        }
         ProductOutboundDeliveryError::Adapter {
             source,
             status_update_error,
         } => {
             if let Some(rejection) = policy_failure
                 .lock()
-                .ok()
-                .and_then(|mut failure| failure.take())
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
             {
+                record_matrix_product_outbound_policy_failure("policy", &rejection);
                 MatrixProductOutboundDeliveryError::Policy {
                     rejection,
                     status_update_error,
@@ -196,9 +273,10 @@ impl ProductAdapter for MatrixPolicyGatedProductAdapter<'_> {
         let check = match matrix_outbound_policy_check_from_envelope(&self.snapshot, &envelope) {
             Ok(check) => check,
             Err(error) => {
-                if let Ok(mut failure) = self.policy_failure.lock() {
-                    *failure = Some(error);
-                }
+                *self
+                    .policy_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
                 return Err(map_matrix_policy_rejection_to_adapter_error(error));
             }
         };
@@ -206,9 +284,10 @@ impl ProductAdapter for MatrixPolicyGatedProductAdapter<'_> {
             .policy_authorizer
             .authorize_matrix_outbound(&self.snapshot, &check)
         {
-            if let Ok(mut failure) = self.policy_failure.lock() {
-                *failure = Some(rejection);
-            }
+            *self
+                .policy_failure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(rejection);
             return Err(map_matrix_policy_rejection_to_adapter_error(rejection));
         }
         self.inner
@@ -275,4 +354,28 @@ fn map_matrix_policy_rejection_to_adapter_error(
         retryable: false,
         reason: RedactedString::new(format!("matrix outbound policy rejected: {rejection:?}")),
     }
+}
+
+fn record_matrix_product_outbound_policy_failure(
+    stage: &'static str,
+    rejection: &MatrixInstallationPolicyRejection,
+) {
+    tracing::debug!(
+        target = "ironclaw::reborn::matrix_product_outbound",
+        stage,
+        reason_code = ?rejection,
+        "matrix product outbound policy gate failed"
+    );
+}
+
+fn record_matrix_product_outbound_workflow_failure(
+    stage: &'static str,
+    source: &ProductOutboundWorkflowError,
+) {
+    tracing::debug!(
+        target = "ironclaw::reborn::matrix_product_outbound",
+        stage,
+        reason = %source,
+        "matrix product outbound shared workflow stage failed"
+    );
 }

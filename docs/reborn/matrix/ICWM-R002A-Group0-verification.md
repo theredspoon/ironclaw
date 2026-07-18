@@ -65,11 +65,11 @@ R002B follow-on work.
 
 ## Handoff Conflict
 
-`docs/reborn/matrix/ICWM-R002A-handoff.md` still says the Matrix manifest
-`installation-id` is host-provided. The later Lighthouse spec supersedes that
-line: R002A must not add a guest-visible config channel, so this component uses
-the static sentinel and leaves actual installation binding to host-owned
-composition/installation state.
+The Lighthouse Matrix epic handoff for ICWM-R002A records an earlier
+host-provided manifest `installation-id` assumption. The later Lighthouse spec
+supersedes that line: R002A must not add a guest-visible config channel, so this
+component uses the static sentinel and leaves actual installation binding to
+host-owned composition/installation state.
 
 ## Verification Commands
 
