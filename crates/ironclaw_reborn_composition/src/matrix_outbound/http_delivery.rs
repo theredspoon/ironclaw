@@ -221,6 +221,7 @@ impl MatrixDeliveryPort for MatrixHttpDeliveryPort {
             Ok(request) => request,
             Err(error) => return DeliveryPortResult::Rejected(error),
         };
+        observability::record_send_attempt_started(&attempt, command.command_kind, &metadata);
         let started_at = Utc::now();
         match self.egress.execute_matrix_http(host_request).await {
             Ok(response) => classify_matrix_http_response(
@@ -299,11 +300,30 @@ fn classify_matrix_http_response(
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
         else {
+            observability::record_http_response_classified(
+                attempt,
+                metadata,
+                response.status,
+                status_family,
+                None,
+                Some(DeliveryReasonCode::MatrixMalformedResponse),
+                elapsed_ms_since(started_at),
+            );
             return DeliveryPortResult::Rejected(
                 DeliveryError::new(DeliveryReasonCode::MatrixMalformedResponse)
                     .with_status_family(status_family),
             );
         };
+        let latency_ms = elapsed_ms_since(started_at);
+        observability::record_http_response_classified(
+            attempt,
+            metadata,
+            response.status,
+            status_family,
+            None,
+            None,
+            latency_ms,
+        );
         return DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(
             MatrixDeliveryEvidenceV1 {
                 schema_version: 1,
@@ -318,10 +338,7 @@ fn classify_matrix_http_response(
                 room_fingerprint: metadata.room_fingerprint.clone(),
                 installation_scoped_credential_ref: endpoint.credential_handle_fingerprint.clone(),
                 http_status: response.status,
-                latency_ms: Utc::now()
-                    .signed_duration_since(started_at)
-                    .num_milliseconds()
-                    .max(0) as u64,
+                latency_ms,
             },
         ));
     }
@@ -344,7 +361,23 @@ fn classify_matrix_http_response(
     {
         error = error.with_retry_hint(after);
     }
+    observability::record_http_response_classified(
+        attempt,
+        metadata,
+        response.status,
+        status_family,
+        matrix_errcode,
+        Some(error.reason),
+        elapsed_ms_since(started_at),
+    );
     DeliveryPortResult::Rejected(error)
+}
+
+fn elapsed_ms_since(started_at: DateTime<Utc>) -> u64 {
+    Utc::now()
+        .signed_duration_since(started_at)
+        .num_milliseconds()
+        .max(0) as u64
 }
 
 pub(crate) fn reason_for_matrix_http_status(
