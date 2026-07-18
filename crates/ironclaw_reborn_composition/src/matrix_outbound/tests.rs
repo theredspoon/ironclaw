@@ -13,16 +13,16 @@ use ironclaw_host_api::{
 use ironclaw_matrix_adapter::{
     MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
 };
+use ironclaw_outbound::test_support::in_memory_backed_outbound_state_store;
 use ironclaw_outbound::{
     AdvanceSubscriptionCursorRequest, CommunicationDeliveryIntent,
     CommunicationDeliveryResolutionRequest, CommunicationModality, CommunicationPreferenceKey,
     CommunicationPreferenceRecord, CommunicationPreferenceRepository,
-    CommunicationPreferenceVersion, DeliveryDefaultScope, InMemoryOutboundStateStore,
-    LoadSubscriptionCursorRequest, OutboundDeliveryAttempt, OutboundPolicyService,
-    OutboundPushPlan, OutboundPushTargetRequest, ProjectionSubscriptionRecord,
-    ReplyTargetBindingClaim, ReplyTargetBindingValidator, RequestedOutboundContext,
-    RequestedOutboundKind, ThreadNotificationPolicy, ThreadProjectionAccessClaim,
-    ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
+    CommunicationPreferenceVersion, DeliveryDefaultScope, LoadSubscriptionCursorRequest,
+    OutboundDeliveryAttempt, OutboundPolicyService, OutboundPushPlan, OutboundPushTargetRequest,
+    ProjectionSubscriptionRecord, ReplyTargetBindingClaim, ReplyTargetBindingValidator,
+    RequestedOutboundContext, RequestedOutboundKind, ThreadNotificationPolicy,
+    ThreadProjectionAccessClaim, ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
     VersionedCommunicationPreferenceRecord, WriteCommunicationPreferenceRequest,
 };
 use ironclaw_product_adapters::{
@@ -1345,7 +1345,7 @@ async fn orchestrator_records_redacted_delivery_status_observability() {
 #[tokio::test]
 async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without_http() {
     let workflow_scope = scope();
-    let outbound_store = InMemoryOutboundStateStore::default();
+    let outbound_store = in_memory_backed_outbound_state_store();
     let validator = RecordingReplyTargetBindingValidator::default();
     validator.allow(workflow_reply_target());
     let preferences = RecordingPreferenceRepository::default();

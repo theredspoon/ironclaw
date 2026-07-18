@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 //   the ProductOutboundDeliveryOutcome contract.
 // - Outbound target resolution and attempt/status metadata: ironclaw_outbound
 //   owns OutboundPolicyService, ReplyTargetBindingValidator,
-//   InMemoryOutboundStateStore, and OutboundDeliveryStatus.
+//   FilesystemOutboundStateStore over an in-memory backend, and
+//   OutboundDeliveryStatus.
 // - Matrix transport and terminal delivery evidence are intentionally not
 //   modeled here; ProductRenderOutcome::Deferred is the required handoff shape.
 
@@ -25,13 +26,14 @@ use ironclaw_matrix_adapter::installation_policy::{
 use ironclaw_matrix_adapter::{
     MatrixOutboundCommand, MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
 };
+use ironclaw_outbound::test_support::in_memory_backed_outbound_state_store;
 use ironclaw_outbound::{
     CommunicationDeliveryIntent, CommunicationDeliveryResolutionRequest, CommunicationModality,
     CommunicationPreferenceKey, CommunicationPreferenceRecord, CommunicationPreferenceRepository,
-    CommunicationPreferenceVersion, DeliveryDefaultScope, InMemoryOutboundStateStore,
-    OutboundError, OutboundPolicyService, OutboundStateStore, ReplyTargetBindingClaim,
-    ReplyTargetBindingValidator, RequestedOutboundContext, RequestedOutboundKind,
-    ThreadProjectionAccessClaim, ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
+    CommunicationPreferenceVersion, DeliveryDefaultScope, OutboundError, OutboundPolicyService,
+    OutboundStateStore, ReplyTargetBindingClaim, ReplyTargetBindingValidator,
+    RequestedOutboundContext, RequestedOutboundKind, ThreadProjectionAccessClaim,
+    ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
     VersionedCommunicationPreferenceRecord, WriteCommunicationPreferenceRequest,
 };
 use ironclaw_product_adapters::{
@@ -358,7 +360,7 @@ fn workflow_fixture() -> WorkflowFixture {
 #[tokio::test]
 async fn matrix_final_reply_uses_shared_outbound_and_leaves_attempt_pending_for_bridge() {
     let scope = scope();
-    let store = InMemoryOutboundStateStore::default();
+    let store = in_memory_backed_outbound_state_store();
     let validator = RecordingReplyTargetBindingValidator::default();
     validator.allow(reply_target());
     let preferences = RecordingPreferenceRepository::default();
