@@ -354,14 +354,17 @@ impl RebornLocalExtensionManagementPort {
         self
     }
 
+    pub(crate) fn installation_store(&self) -> Arc<dyn ExtensionInstallationStore> {
+        Arc::clone(&self.installation_store)
+    }
+
     /// Test-support access to the extension installation store.
     ///
     /// Mirrors the `installation_store` field that `build_local_runtime` wires
-    /// in when constructing `RebornLocalExtensionManagementPort`. For tests
-    /// only — zero bytes shipped in production builds.
+    /// in when constructing `RebornLocalExtensionManagementPort`.
     #[cfg(feature = "test-support")]
     pub(crate) fn installation_store_for_test(&self) -> Arc<dyn ExtensionInstallationStore> {
-        Arc::clone(&self.installation_store)
+        self.installation_store()
     }
 
     /// C-JOURNEY: test-support access to the active-extension publisher

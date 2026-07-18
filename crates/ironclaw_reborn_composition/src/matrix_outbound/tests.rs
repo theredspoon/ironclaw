@@ -4,7 +4,8 @@ use crate::matrix_outbound::fakes::{
     route_forgery_fixture,
 };
 use crate::matrix_product_outbound::{
-    MatrixOutboundPolicyAuthorizer, MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
+    FilesystemMatrixPolicySnapshotSource, MatrixOutboundPolicyAuthorizer,
+    MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
     MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
 };
 use async_trait::async_trait;
@@ -15,18 +16,22 @@ use ironclaw_extensions::{
     ExtensionManifestRecord, ExtensionManifestRef, InMemoryExtensionInstallationStore,
     InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash, ManifestSource,
 };
-use ironclaw_filesystem::{CasExpectation, InMemoryBackend, ScopedFilesystem};
+use ironclaw_filesystem::{CasExpectation, ContentType, Entry, InMemoryBackend, ScopedFilesystem};
 use ironclaw_host_api::{
     AgentId, ExtensionId, HostPortCatalog, MountAlias, MountGrant, MountPermissions, MountView,
-    ProjectId, TenantId, ThreadId, UserId, VirtualPath,
+    ProjectId, ScopedPath, TenantId, ThreadId, UserId, VirtualPath,
 };
 use ironclaw_matrix_adapter::installation_policy::{
-    EgressTargetIndex as AdapterEgressTargetIndex,
-    MatrixHomeserverOrigin as AdapterMatrixHomeserverOrigin,
+    ArtifactSha256, ComponentArtifactBinding, ComponentArtifactId,
+    EgressTargetIndex as AdapterEgressTargetIndex, InstallationAuditMetadata,
+    MatrixActivationState, MatrixHomeserverOrigin as AdapterMatrixHomeserverOrigin,
+    MatrixInstallationPolicy,
     MatrixInstallationPolicyRejection as AdapterMatrixInstallationPolicyRejection,
+    MatrixInstallationProjectionCache,
     MatrixOutboundPolicyCheck as AdapterMatrixOutboundPolicyCheck,
-    MatrixPolicySnapshot as AdapterMatrixPolicySnapshot, MatrixRoomId as AdapterMatrixRoomId,
-    MatrixUserId as AdapterMatrixUserId, PolicyRevision as AdapterPolicyRevision,
+    MatrixPolicySnapshot as AdapterMatrixPolicySnapshot, MatrixProductAdapterInstallation,
+    MatrixRoomId as AdapterMatrixRoomId, MatrixUserId as AdapterMatrixUserId,
+    PolicyRevision as AdapterPolicyRevision, StaticManifestBinding, WitPackageName, WitWorldName,
     authorize_matrix_outbound as authorize_adapter_matrix_outbound,
 };
 use ironclaw_matrix_adapter::{
@@ -45,12 +50,12 @@ use ironclaw_outbound::{
     VersionedCommunicationPreferenceRecord, WriteCommunicationPreferenceRequest,
 };
 use ironclaw_product_adapters::{
-    AdapterInstallationId, AuthRequirement, DeclaredEgressTarget, ExternalConversationRef,
-    FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView, OutboundDeliverySink,
-    ParsedProductInbound, ProductAdapter, ProductAdapterCapabilities, ProductAdapterError,
-    ProductAdapterHealth, ProductAdapterId, ProductOutboundEnvelope, ProductOutboundPayload,
-    ProductRenderOutcome, ProductSurfaceKind, ProjectionCursor as ProductProjectionCursor,
-    ProtocolAuthEvidence, ProtocolHttpEgress,
+    AdapterInstallationId, AuthRequirement, DeclaredEgressHost, DeclaredEgressTarget,
+    ExternalConversationRef, FakeOutboundDeliverySink, FakeProtocolHttpEgress, FinalReplyView,
+    OutboundDeliverySink, ParsedProductInbound, ProductAdapter, ProductAdapterCapabilities,
+    ProductAdapterError, ProductAdapterHealth, ProductAdapterId, ProductOutboundEnvelope,
+    ProductOutboundPayload, ProductRenderOutcome, ProductSurfaceKind,
+    ProjectionCursor as ProductProjectionCursor, ProtocolAuthEvidence, ProtocolHttpEgress,
 };
 use ironclaw_product_workflow::{
     ProductOutboundDeliveryOutcome, ProductOutboundTargetResolver, ProductWorkflowError,
@@ -1051,6 +1056,85 @@ fn matrix_policy_snapshot() -> AdapterMatrixPolicySnapshot {
         .expect("credential handle"),
         policy_revision: AdapterPolicyRevision::new(7).expect("policy revision"),
     }
+}
+
+fn matrix_projection_installation(
+    snapshot: &AdapterMatrixPolicySnapshot,
+) -> MatrixProductAdapterInstallation {
+    let component = ComponentArtifactBinding {
+        artifact_id: ComponentArtifactId::new("matrix-component").expect("artifact id"),
+        artifact_sha256: ArtifactSha256::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("artifact sha"),
+        wit_package: WitPackageName::new("near:product-adapter@0.1.0").expect("wit package"),
+        wit_world: WitWorldName::new("product-adapter-component").expect("wit world"),
+        manifest: StaticManifestBinding::new("manifest-hash-matrix").expect("manifest hash"),
+        declared_egress_targets: vec![DeclaredEgressTarget::new(
+            DeclaredEgressHost::new("matrix.example.org").expect("declared Matrix host"),
+            Some(snapshot.credential_handle.clone()),
+        )],
+    };
+    let policy = MatrixInstallationPolicy::new(
+        snapshot.homeserver.clone(),
+        snapshot.allowed_rooms.clone(),
+        snapshot.allowed_senders.clone(),
+        snapshot.egress_target_index,
+        snapshot.credential_handle.clone(),
+    )
+    .expect("valid Matrix installation policy");
+    MatrixProductAdapterInstallation::new(
+        snapshot.adapter_id.clone(),
+        snapshot.installation_id.clone(),
+        component,
+        policy,
+        MatrixActivationState::Enabled,
+        snapshot.policy_revision,
+        InstallationAuditMetadata::new("matrix-policy-owner", 1_710_000_000_000)
+            .expect("audit metadata"),
+    )
+    .expect("valid Matrix projection installation")
+}
+
+#[tokio::test]
+async fn filesystem_matrix_policy_snapshot_source_reads_projection_cache_via_scoped_filesystem() {
+    let snapshot = matrix_policy_snapshot();
+    let mut cache = MatrixInstallationProjectionCache::new();
+    cache
+        .insert_projection(
+            matrix_projection_installation(&snapshot),
+            "matrix-policy-owner",
+            1_710_000_000_001,
+        )
+        .expect("projection cache accepts installation");
+
+    let backend = Arc::new(InMemoryBackend::default());
+    let filesystem = matrix_metadata_filesystem(backend);
+    let resource_scope = scope().to_resource_scope();
+    let cache_path = ScopedPath::new("/outbound/matrix/policy/installation-projection-cache.json")
+        .expect("policy cache path");
+    filesystem
+        .put(
+            &resource_scope,
+            &cache_path,
+            Entry::bytes(cache.to_json_bytes().expect("policy cache json"))
+                .with_content_type(ContentType::json()),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write policy projection cache");
+
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        Arc::clone(&filesystem),
+        resource_scope,
+        cache_path,
+    );
+    let resolved = source
+        .resolve_matrix_policy_snapshot(&snapshot.adapter_id, &snapshot.installation_id)
+        .await
+        .expect("projection-backed policy snapshot resolves");
+
+    assert_eq!(resolved, snapshot);
 }
 
 async fn matrix_extension_store(

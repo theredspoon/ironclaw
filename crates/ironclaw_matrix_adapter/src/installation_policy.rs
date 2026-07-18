@@ -155,6 +155,20 @@ impl MatrixHomeserverOrigin {
         &self.host
     }
 
+    pub fn as_origin(&self) -> String {
+        let host = if self.host.parse::<Ipv6Addr>().is_ok() {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let mut origin = format!("{}://{}", self.scheme, host);
+        if let Some(port) = self.port {
+            origin.push(':');
+            origin.push_str(&port.to_string());
+        }
+        origin
+    }
+
     pub fn port(&self) -> Option<u16> {
         self.port
     }
@@ -405,6 +419,10 @@ impl PolicyRevision {
         } else {
             Ok(Self(value))
         }
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
     }
 
     pub fn next(self) -> Result<Self, MatrixInstallationPolicyRejection> {

@@ -2,9 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ironclaw_extensions::ExtensionInstallationStore;
+use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
+use ironclaw_host_api::{ResourceScope, ScopedPath};
 use ironclaw_matrix_adapter::installation_policy::{
-    MatrixInstallationPolicyRejection, MatrixOutboundPolicyCheck, MatrixPolicySnapshot,
-    MatrixRoomId, authorize_matrix_outbound, ensure_matrix_extension_lifecycle_enabled,
+    MatrixInstallationPolicyRejection, MatrixInstallationProjectionCache,
+    MatrixOutboundPolicyCheck, MatrixPolicySnapshot, MatrixRoomId, authorize_matrix_outbound,
+    ensure_matrix_extension_lifecycle_enabled,
 };
 use ironclaw_product_adapters::redaction::RedactedString;
 use ironclaw_product_adapters::{
@@ -19,6 +22,9 @@ use ironclaw_product_workflow::{
     ProductOutboundStatusUpdateFailure, ProductOutboundTargetResolver,
     ProductWorkflowError as ProductOutboundWorkflowError, prepare_and_render_product_outbound,
 };
+
+pub const MATRIX_POLICY_PROJECTION_CACHE_PATH: &str =
+    "/outbound/matrix/policy/installation-projection-cache.json";
 
 pub trait MatrixOutboundPolicyAuthorizer: Send + Sync {
     fn authorize_matrix_outbound(
@@ -53,6 +59,67 @@ pub trait MatrixPolicySnapshotSource: Send + Sync {
     ) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection>;
 }
 
+#[derive(Clone)]
+pub struct FilesystemMatrixPolicySnapshotSource<F: ?Sized> {
+    filesystem: Arc<ScopedFilesystem<F>>,
+    scope: ResourceScope,
+    cache_path: ScopedPath,
+}
+
+impl<F> FilesystemMatrixPolicySnapshotSource<F>
+where
+    F: RootFilesystem + ?Sized,
+{
+    pub fn new(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        scope: ResourceScope,
+        cache_path: ScopedPath,
+    ) -> Self {
+        Self {
+            filesystem,
+            scope,
+            cache_path,
+        }
+    }
+}
+
+#[async_trait]
+impl<F> MatrixPolicySnapshotSource for FilesystemMatrixPolicySnapshotSource<F>
+where
+    F: RootFilesystem + Send + Sync + ?Sized,
+{
+    async fn resolve_matrix_policy_snapshot(
+        &self,
+        adapter_id: &ProductAdapterId,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection> {
+        let entry = self
+            .filesystem
+            .get(&self.scope, &self.cache_path)
+            .await
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?
+            .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
+        let cache = MatrixInstallationProjectionCache::from_json_bytes(&entry.entry.body)
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        let installation = cache
+            .installation(installation_id)
+            .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
+        if &installation.adapter_id != adapter_id {
+            return Err(MatrixInstallationPolicyRejection::AdapterMismatch);
+        }
+        Ok(MatrixPolicySnapshot {
+            adapter_id: installation.adapter_id.clone(),
+            installation_id: installation.installation_id.clone(),
+            homeserver: installation.policy.homeserver.clone(),
+            allowed_rooms: installation.policy.allowed_rooms.clone(),
+            allowed_senders: installation.policy.allowed_senders.clone(),
+            egress_target_index: installation.policy.egress_target_index,
+            credential_handle: installation.policy.credential_handle.clone(),
+            policy_revision: installation.policy_revision,
+        })
+    }
+}
+
 pub struct MatrixProductOutboundEntrypoint<'a> {
     pub extension_installation_store: &'a dyn ExtensionInstallationStore,
     pub snapshot_source: &'a dyn MatrixPolicySnapshotSource,
@@ -80,6 +147,31 @@ impl MatrixProductOutboundEntrypoint<'_> {
         prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
             extension_installation_store: self.extension_installation_store,
             snapshot_source: self.snapshot_source,
+            resolved_snapshot: None,
+            policy_authorizer: self.policy_authorizer,
+            outbound_policy: self.outbound_policy,
+            communication_preferences: self.communication_preferences,
+            target_resolver: self.target_resolver,
+            delivery: input.delivery,
+            payload: input.payload,
+            projection_cursor: input.projection_cursor,
+            adapter: self.adapter,
+            egress: self.egress,
+            delivery_sink: self.delivery_sink,
+            require_direct_message_target: input.require_direct_message_target,
+        })
+        .await
+    }
+
+    pub async fn prepare_and_render_with_snapshot(
+        &self,
+        input: MatrixProductOutboundDeliveryInput,
+        snapshot: MatrixPolicySnapshot,
+    ) -> Result<ProductOutboundDeliveryOutcome, MatrixProductOutboundDeliveryError> {
+        prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+            extension_installation_store: self.extension_installation_store,
+            snapshot_source: self.snapshot_source,
+            resolved_snapshot: Some(snapshot),
             policy_authorizer: self.policy_authorizer,
             outbound_policy: self.outbound_policy,
             communication_preferences: self.communication_preferences,
@@ -99,6 +191,7 @@ impl MatrixProductOutboundEntrypoint<'_> {
 struct MatrixProductOutboundDeliveryRequest<'a> {
     extension_installation_store: &'a dyn ExtensionInstallationStore,
     snapshot_source: &'a dyn MatrixPolicySnapshotSource,
+    resolved_snapshot: Option<MatrixPolicySnapshot>,
     policy_authorizer: &'a dyn MatrixOutboundPolicyAuthorizer,
     outbound_policy: &'a ironclaw_outbound::OutboundPolicyService<'a>,
     communication_preferences: &'a dyn ironclaw_outbound::CommunicationPreferenceRepository,
@@ -114,6 +207,9 @@ struct MatrixProductOutboundDeliveryRequest<'a> {
 
 #[derive(Debug)]
 pub enum MatrixProductOutboundDeliveryError {
+    Unavailable {
+        reason: String,
+    },
     Lifecycle(MatrixInstallationPolicyRejection),
     TargetResolution {
         source: ProductOutboundWorkflowError,
@@ -129,20 +225,23 @@ pub enum MatrixProductOutboundDeliveryError {
 async fn prepare_and_render_matrix_product_outbound(
     request: MatrixProductOutboundDeliveryRequest<'_>,
 ) -> Result<ProductOutboundDeliveryOutcome, MatrixProductOutboundDeliveryError> {
-    let snapshot = request
-        .snapshot_source
-        .resolve_matrix_policy_snapshot(
-            request.adapter.adapter_id(),
-            request.adapter.installation_id(),
-        )
-        .await
-        .map_err(|rejection| {
-            record_matrix_product_outbound_policy_failure("snapshot", &rejection);
-            MatrixProductOutboundDeliveryError::Policy {
-                rejection,
-                status_update_error: None,
-            }
-        })?;
+    let snapshot = match request.resolved_snapshot {
+        Some(snapshot) => snapshot,
+        None => request
+            .snapshot_source
+            .resolve_matrix_policy_snapshot(
+                request.adapter.adapter_id(),
+                request.adapter.installation_id(),
+            )
+            .await
+            .map_err(|rejection| {
+                record_matrix_product_outbound_policy_failure("snapshot", &rejection);
+                MatrixProductOutboundDeliveryError::Policy {
+                    rejection,
+                    status_update_error: None,
+                }
+            })?,
+    };
 
     ensure_matrix_extension_lifecycle_enabled(
         request.extension_installation_store,

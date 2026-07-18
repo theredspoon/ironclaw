@@ -16,14 +16,12 @@ pub struct MatrixOutboundCommand {
     pub body: MatrixMessageBody,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixPendingIntentBridgeContext {
     pub reply_target_binding_ref: ReplyTargetBindingRef,
     pub egress_target_index: u32,
 }
 
-#[cfg(test)]
 impl MatrixOutboundCommand {
     pub fn from_adapter_pending_intent(
         intent: ironclaw_matrix_adapter::MatrixOutboundCommand,
@@ -154,7 +152,6 @@ pub struct MatrixRoutePolicyOwnerToken {
 }
 
 impl MatrixRoutePolicyOwnerToken {
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn matrix_policy_owner() -> Self {
         Self { _private: () }
     }

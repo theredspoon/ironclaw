@@ -1,11 +1,18 @@
 use async_trait::async_trait;
 use ironclaw_common::hashing::sha256_hex;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
+use ironclaw_outbound::{
+    CommunicationDeliveryIntent, OutboundError, ReplyTargetBindingClaim,
+    ReplyTargetBindingValidator, ReplyTargetValidationRequest, RunNotificationOrigin,
+    ThreadProjectionAccessClaim, ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
+};
 use ironclaw_product_adapters::AdapterInstallationId;
+use ironclaw_product_adapters::ExternalConversationRef;
 use ironclaw_product_workflow::{
-    RebornOutboundDeliveryTargetCapabilities, RebornOutboundDeliveryTargetId,
-    RebornOutboundDeliveryTargetSummary, RebornServicesError, RebornServicesErrorCode,
-    RebornServicesErrorKind, WebUiAuthenticatedCaller,
+    ProductOutboundTargetResolver, RebornOutboundDeliveryTargetCapabilities,
+    RebornOutboundDeliveryTargetId, RebornOutboundDeliveryTargetSummary, RebornServicesError,
+    RebornServicesErrorCode, RebornServicesErrorKind, VerifiedProductOutboundTargetMetadata,
+    WebUiAuthenticatedCaller,
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 
@@ -41,9 +48,27 @@ pub(crate) struct MatrixHostOutboundTargetProvider {
     tenant_id: TenantId,
     agent_id: AgentId,
     project_id: Option<ProjectId>,
+    installation_id: AdapterInstallationId,
     configured_room_routes: Vec<ValidatedMatrixConfiguredRoomRoute>,
     room_target_id_prefix: String,
     room_binding_ref_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MatrixHostProductOutboundTargetResolver {
+    providers: Vec<MatrixHostOutboundTargetProvider>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MatrixHostReplyTargetPolicy {
+    resolver: MatrixHostProductOutboundTargetResolver,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedMatrixOutboundTarget {
+    pub(crate) installation_id: AdapterInstallationId,
+    pub(crate) room_id: MatrixRoomId,
+    pub(crate) reply_target_binding_ref: ReplyTargetBindingRef,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +76,161 @@ struct ValidatedMatrixConfiguredRoomRoute {
     room_id: MatrixRoomId,
     subject_user_id: UserId,
     route_key: String,
+}
+
+impl MatrixHostProductOutboundTargetResolver {
+    pub(crate) fn new(
+        configs: impl IntoIterator<Item = MatrixOutboundTargetProviderConfig>,
+    ) -> Result<Self, RebornServicesError> {
+        let providers = configs
+            .into_iter()
+            .map(MatrixHostOutboundTargetProvider::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { providers })
+    }
+
+    pub(crate) fn resolve_requested_target(
+        &self,
+        request: &ironclaw_outbound::CommunicationDeliveryResolutionRequest,
+    ) -> Option<ResolvedMatrixOutboundTarget> {
+        let requested_target = match &request.intent {
+            CommunicationDeliveryIntent::RequestedOutbound(context) => &context.requested_target,
+            CommunicationDeliveryIntent::RunNotification(context) => match &context.origin {
+                RunNotificationOrigin::LiveSourceRoute { source_route }
+                | RunNotificationOrigin::TriggeredFromSourceRoute { source_route, .. } => {
+                    &source_route.reply_target_binding_ref
+                }
+                RunNotificationOrigin::Triggered { .. }
+                | RunNotificationOrigin::SystemEvent { .. } => return None,
+            },
+        };
+        self.providers.iter().find_map(|provider| {
+            if provider.tenant_id != request.scope.tenant_id
+                || Some(&provider.agent_id) != request.scope.agent_id.as_ref()
+                || provider.project_id != request.scope.project_id
+            {
+                return None;
+            }
+            let route_key = provider.route_key_for_reply_target_binding_ref(requested_target)?;
+            let route = provider.configured_route_for_key(route_key)?;
+            if route.subject_user_id == request.actor.user_id {
+                Some(ResolvedMatrixOutboundTarget {
+                    installation_id: provider.installation_id.clone(),
+                    room_id: route.room_id.clone(),
+                    reply_target_binding_ref: requested_target.clone(),
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    fn resolve_target(
+        &self,
+        target: &ReplyTargetBindingRef,
+    ) -> Option<(
+        &MatrixHostOutboundTargetProvider,
+        &ValidatedMatrixConfiguredRoomRoute,
+    )> {
+        self.providers.iter().find_map(|provider| {
+            let route_key = provider.route_key_for_reply_target_binding_ref(target)?;
+            provider
+                .configured_route_for_key(route_key)
+                .map(|route| (provider, route))
+        })
+    }
+
+    fn resolve_candidate(
+        &self,
+        request: &ReplyTargetValidationRequest,
+    ) -> Option<&ValidatedMatrixConfiguredRoomRoute> {
+        self.providers.iter().find_map(|provider| {
+            if provider.tenant_id != request.candidate.tenant_id
+                || Some(&provider.agent_id) != request.candidate.agent_id.as_ref()
+                || provider.project_id != request.candidate.project_id
+            {
+                return None;
+            }
+            let route_key =
+                provider.route_key_for_reply_target_binding_ref(&request.candidate.target)?;
+            let route = provider.configured_route_for_key(route_key)?;
+            if route.subject_user_id == request.actor.user_id {
+                Some(route)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+impl MatrixHostReplyTargetPolicy {
+    pub(crate) fn new(resolver: MatrixHostProductOutboundTargetResolver) -> Self {
+        Self { resolver }
+    }
+}
+
+#[async_trait]
+impl ThreadProjectionAccessPolicy for MatrixHostReplyTargetPolicy {
+    /// Matrix final-reply delivery validates reply targets only. Projection
+    /// subscriptions are denied here so this policy cannot accidentally grant
+    /// broader thread-read authority for a Matrix room binding.
+    async fn authorize_projection_access(
+        &self,
+        _request: ThreadProjectionAccessRequest,
+    ) -> Result<ThreadProjectionAccessClaim, OutboundError> {
+        Err(OutboundError::AccessDenied)
+    }
+}
+
+#[async_trait]
+impl ReplyTargetBindingValidator for MatrixHostReplyTargetPolicy {
+    async fn validate_reply_target(
+        &self,
+        request: ReplyTargetValidationRequest,
+    ) -> Result<ReplyTargetBindingClaim, OutboundError> {
+        if self.resolver.resolve_candidate(&request).is_some() {
+            Ok(ReplyTargetBindingClaim::new(request.candidate.target))
+        } else {
+            Err(OutboundError::AccessDenied)
+        }
+    }
+}
+
+#[async_trait]
+impl ProductOutboundTargetResolver for MatrixHostProductOutboundTargetResolver {
+    async fn resolve_product_outbound_target_metadata(
+        &self,
+        target: &ironclaw_outbound::ValidatedReplyTargetBinding,
+        require_direct_message: bool,
+    ) -> Result<
+        VerifiedProductOutboundTargetMetadata,
+        ironclaw_product_workflow::ProductWorkflowError,
+    > {
+        if require_direct_message {
+            return Err(
+                ironclaw_product_workflow::ProductWorkflowError::OutboundTargetNotDirectMessage,
+            );
+        }
+        let (_provider, route) = self.resolve_target(target.target()).ok_or_else(|| {
+            ironclaw_product_workflow::ProductWorkflowError::BindingRequired {
+                reason: "Matrix outbound target binding is not configured".to_string(),
+            }
+        })?;
+        Ok(VerifiedProductOutboundTargetMetadata {
+            external_conversation_ref: ExternalConversationRef::new(
+                None,
+                route.room_id.as_str(),
+                None,
+                None,
+            )
+            .map_err(|error| {
+                ironclaw_product_workflow::ProductWorkflowError::BindingRequired {
+                    reason: format!("Matrix outbound target metadata invalid: {error}"),
+                }
+            })?,
+            external_actor_ref: None,
+        })
+    }
 }
 
 impl MatrixHostOutboundTargetProvider {
@@ -82,6 +262,7 @@ impl MatrixHostOutboundTargetProvider {
             tenant_id: config.tenant_id,
             agent_id: config.agent_id,
             project_id: config.project_id,
+            installation_id: config.installation_id,
             configured_room_routes,
             room_target_id_prefix,
             room_binding_ref_prefix,
@@ -283,13 +464,21 @@ fn matrix_target_backend_error() -> RebornServicesError {
 
 #[cfg(test)]
 mod tests {
-    use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
+    use ironclaw_event_projections::ProjectionScope;
+    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+    use ironclaw_outbound::{
+        CommunicationDeliveryIntent, CommunicationDeliveryResolutionRequest, CommunicationModality,
+        RequestedOutboundContext, RequestedOutboundKind, RunNotificationContext,
+        RunNotificationEventKind, RunNotificationOrigin, SourceRouteContext,
+        ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
+    };
     use ironclaw_product_adapters::AdapterInstallationId;
     use ironclaw_product_workflow::{RebornOutboundDeliveryTargetId, WebUiAuthenticatedCaller};
-    use ironclaw_turns::ReplyTargetBindingRef;
+    use ironclaw_turns::{ReplyTargetBindingRef, TurnActor, TurnScope};
 
     use crate::matrix_outbound_targets::{
         MatrixConfiguredRoomRoute, MatrixHostOutboundTargetProvider,
+        MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
         MatrixOutboundTargetProviderConfig,
     };
     use crate::outbound::{
@@ -365,6 +554,47 @@ mod tests {
         .expect("valid Matrix target provider config")
     }
 
+    fn workflow_scope() -> TurnScope {
+        TurnScope::new(
+            TenantId::new(TENANT).expect("tenant"),
+            Some(AgentId::new(AGENT).expect("agent")),
+            Some(ProjectId::new(PROJECT).expect("project")),
+            ThreadId::new("thread:matrix").expect("thread"),
+        )
+    }
+
+    fn delivery_resolution_request(
+        target: ReplyTargetBindingRef,
+    ) -> CommunicationDeliveryResolutionRequest {
+        CommunicationDeliveryResolutionRequest {
+            scope: workflow_scope(),
+            actor: TurnActor::new(UserId::new(USER).expect("user")),
+            modality: CommunicationModality::Text,
+            intent: CommunicationDeliveryIntent::RequestedOutbound(RequestedOutboundContext {
+                requested_target: target,
+                requested_kind: RequestedOutboundKind::ProductMessage,
+            }),
+        }
+    }
+
+    fn live_source_route_resolution_request(
+        target: ReplyTargetBindingRef,
+    ) -> CommunicationDeliveryResolutionRequest {
+        CommunicationDeliveryResolutionRequest {
+            scope: workflow_scope(),
+            actor: TurnActor::new(UserId::new(USER).expect("user")),
+            modality: CommunicationModality::Text,
+            intent: CommunicationDeliveryIntent::RunNotification(RunNotificationContext {
+                event_kind: RunNotificationEventKind::FinalReplyReady,
+                origin: RunNotificationOrigin::LiveSourceRoute {
+                    source_route: SourceRouteContext {
+                        reply_target_binding_ref: target,
+                    },
+                },
+            }),
+        }
+    }
+
     #[tokio::test]
     async fn matrix_private_provider_registers_through_shared_outbound_target_registry() {
         let registry = MutableOutboundDeliveryTargetRegistry::default();
@@ -393,6 +623,116 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].summary.channel.as_str(), "matrix");
         assert!(listed[0].capabilities.final_replies);
+    }
+
+    #[tokio::test]
+    async fn matrix_resolver_derives_installation_from_requested_reply_target() {
+        let second = build_provider(OTHER_INSTALLATION);
+        let second_target = second
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("second installation target list")
+            .into_iter()
+            .next()
+            .expect("second installation target");
+        let resolver = MatrixHostProductOutboundTargetResolver::new([
+            provider_config(
+                INSTALLATION,
+                vec![MatrixConfiguredRoomRoute {
+                    room_id: ROOM.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                }],
+            ),
+            provider_config(
+                OTHER_INSTALLATION,
+                vec![MatrixConfiguredRoomRoute {
+                    room_id: ROOM.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                }],
+            ),
+        ])
+        .expect("multi-installation resolver");
+
+        let resolved = resolver
+            .resolve_requested_target(&delivery_resolution_request(
+                second_target.reply_target_binding_ref,
+            ))
+            .expect("requested Matrix target resolves");
+
+        assert_eq!(
+            resolved.installation_id,
+            AdapterInstallationId::new(OTHER_INSTALLATION).expect("installation")
+        );
+        assert_eq!(resolved.room_id.as_str(), ROOM);
+    }
+
+    #[tokio::test]
+    async fn matrix_resolver_derives_installation_from_live_source_route_notification() {
+        let second = build_provider(OTHER_INSTALLATION);
+        let second_target = second
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("second installation target list")
+            .into_iter()
+            .next()
+            .expect("second installation target");
+        let resolver = MatrixHostProductOutboundTargetResolver::new([
+            provider_config(
+                INSTALLATION,
+                vec![MatrixConfiguredRoomRoute {
+                    room_id: ROOM.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                }],
+            ),
+            provider_config(
+                OTHER_INSTALLATION,
+                vec![MatrixConfiguredRoomRoute {
+                    room_id: ROOM.to_string(),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                }],
+            ),
+        ])
+        .expect("multi-installation resolver");
+
+        let resolved = resolver
+            .resolve_requested_target(&live_source_route_resolution_request(
+                second_target.reply_target_binding_ref,
+            ))
+            .expect("live source-route Matrix target resolves");
+
+        assert_eq!(
+            resolved.installation_id,
+            AdapterInstallationId::new(OTHER_INSTALLATION).expect("installation")
+        );
+        assert_eq!(resolved.room_id.as_str(), ROOM);
+    }
+
+    #[tokio::test]
+    async fn matrix_reply_target_policy_denies_projection_access() {
+        let resolver = MatrixHostProductOutboundTargetResolver::new([provider_config(
+            INSTALLATION,
+            vec![MatrixConfiguredRoomRoute {
+                room_id: ROOM.to_string(),
+                subject_user_id: UserId::new(USER).expect("user"),
+            }],
+        )])
+        .expect("resolver");
+        let policy = MatrixHostReplyTargetPolicy::new(resolver);
+        let scope = workflow_scope();
+
+        let error = policy
+            .authorize_projection_access(ThreadProjectionAccessRequest {
+                actor: TurnActor::new(UserId::new(USER).expect("user")),
+                scope: ProjectionScope::from_resource_scope(&scope.to_resource_scope()),
+                thread_id: scope.thread_id.clone(),
+            })
+            .await
+            .expect_err("Matrix live caller does not authorize projection subscriptions");
+
+        assert!(matches!(
+            error,
+            ironclaw_outbound::OutboundError::AccessDenied
+        ));
     }
 
     #[tokio::test]
