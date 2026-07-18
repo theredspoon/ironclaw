@@ -18,14 +18,14 @@ use ironclaw_turns::{
     run_profile::{LoopCapabilityPort, ProviderToolCall, RegisterProviderToolCallRequest},
 };
 
-use crate::RebornCompositionProfile;
 use crate::input::RebornBuildInput;
-use crate::matrix_outbound_targets::{
-    MatrixConfiguredRoomRoute, MatrixOutboundTargetProviderConfig,
-};
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{OutboundDeliveryTargetProvider, OutboundDeliveryTargetRegistrationOutcome};
 use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
+use crate::{
+    MatrixOutboundRoomTargetConfig, MatrixOutboundTargetMountConfig,
+    MatrixOutboundTargetMountConfigInput, RebornCompositionProfile,
+};
 
 use super::build_reborn_runtime;
 
@@ -181,7 +181,7 @@ async fn local_dev_runtime_registers_private_matrix_outbound_target_provider_at_
     let agent_id = AgentId::new("runtime-matrix-target-agent").expect("agent");
     let project_id = ProjectId::new("runtime-matrix-target-project").expect("project");
 
-    let mut input = RebornRuntimeInput::from_services(
+    let input = RebornRuntimeInput::from_services(
         RebornBuildInput::local_dev_with_profile(
             RebornCompositionProfile::LocalDevYolo,
             "runtime-matrix-target-owner",
@@ -191,20 +191,21 @@ async fn local_dev_runtime_registers_private_matrix_outbound_target_provider_at_
             crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
         )
         .with_local_dev_confirmed_host_home_root(host_home),
-    );
-    input
-        .matrix_outbound_target_providers
-        .push(MatrixOutboundTargetProviderConfig {
+    )
+    .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
+        MatrixOutboundTargetMountConfigInput {
             tenant_id: tenant_id.clone(),
             agent_id: agent_id.clone(),
             project_id: Some(project_id.clone()),
             installation_id: AdapterInstallationId::new("runtime-matrix-installation")
                 .expect("installation"),
-            configured_room_routes: vec![MatrixConfiguredRoomRoute {
-                room_id: "!runtime-room:example.org".to_string(),
-                subject_user_id: user_id.clone(),
-            }],
-        });
+            room_targets: vec![MatrixOutboundRoomTargetConfig::new(
+                crate::matrix_outbound::MatrixRoomId::new("!runtime-room:example.org")
+                    .expect("valid Matrix room id"),
+                user_id.clone(),
+            )],
+        },
+    ));
 
     let runtime = build_reborn_runtime(input).await.expect("runtime builds");
     let provider = runtime
@@ -234,19 +235,21 @@ async fn local_dev_runtime_rejects_duplicate_matrix_outbound_target_provider_sco
     let user_id = UserId::new("runtime-matrix-duplicate-user").expect("user");
     let agent_id = AgentId::new("runtime-matrix-duplicate-agent").expect("agent");
     let project_id = ProjectId::new("runtime-matrix-duplicate-project").expect("project");
-    let duplicate_config = MatrixOutboundTargetProviderConfig {
-        tenant_id,
-        agent_id,
-        project_id: Some(project_id),
-        installation_id: AdapterInstallationId::new("runtime-matrix-duplicate-installation")
-            .expect("installation"),
-        configured_room_routes: vec![MatrixConfiguredRoomRoute {
-            room_id: "!runtime-duplicate-room:example.org".to_string(),
-            subject_user_id: user_id,
-        }],
-    };
+    let duplicate_config =
+        MatrixOutboundTargetMountConfig::new(MatrixOutboundTargetMountConfigInput {
+            tenant_id,
+            agent_id,
+            project_id: Some(project_id),
+            installation_id: AdapterInstallationId::new("runtime-matrix-duplicate-installation")
+                .expect("installation"),
+            room_targets: vec![MatrixOutboundRoomTargetConfig::new(
+                crate::matrix_outbound::MatrixRoomId::new("!runtime-duplicate-room:example.org")
+                    .expect("valid Matrix room id"),
+                user_id,
+            )],
+        });
 
-    let mut input = RebornRuntimeInput::from_services(
+    let input = RebornRuntimeInput::from_services(
         RebornBuildInput::local_dev_with_profile(
             RebornCompositionProfile::LocalDevYolo,
             "runtime-matrix-duplicate-owner",
@@ -256,13 +259,8 @@ async fn local_dev_runtime_rejects_duplicate_matrix_outbound_target_provider_sco
             crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
         )
         .with_local_dev_confirmed_host_home_root(host_home),
-    );
-    input
-        .matrix_outbound_target_providers
-        .push(duplicate_config.clone());
-    input
-        .matrix_outbound_target_providers
-        .push(duplicate_config);
+    )
+    .with_matrix_outbound_target_mounts([duplicate_config.clone(), duplicate_config]);
 
     let error = match build_reborn_runtime(input).await {
         Ok(_) => panic!("duplicate Matrix provider scope should fail runtime build"),

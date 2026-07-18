@@ -652,6 +652,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preferences_only_context_resolves_target_with_unknown_channels() {
+        let provider =
+            RuntimeCommunicationContextProvider::new(Arc::new(TargetSetPreferencesFacade));
+        let ctx = provider
+            .begin_communication_context(scope(), Some(actor()))
+            .resolve(false)
+            .await
+            .expect("context");
+
+        assert!(
+            matches!(ctx.delivery_target, DeliveryTargetState::Set(_)),
+            "preferences-only context must still resolve the delivery target: {:?}",
+            ctx.delivery_target
+        );
+        assert_eq!(
+            ctx.connected_channels,
+            ConnectedChannelsState::Unknown,
+            "without a lifecycle facade connected-channel state remains unknown"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_extension_list_returns_known_no_channels() {
         // Classification is available, so an empty extension list is genuine
         // certainty: no channels connected → Known([]), not Unknown.

@@ -38,7 +38,10 @@ use ironclaw_runner::runtime::{
 use ironclaw_triggers::{TriggerId, TriggerPollerWorkerConfig};
 
 use crate::input::RebornBuildInput;
-use crate::matrix_outbound_targets::MatrixOutboundTargetProviderConfig;
+use crate::matrix_outbound::MatrixRoomId;
+use crate::matrix_outbound_targets::{
+    MatrixConfiguredRoomRoute, MatrixOutboundTargetProviderConfig,
+};
 use crate::observability::hooks::HooksActivationConfig;
 
 /// Caller-owned identity for an assembled Reborn runtime.
@@ -73,6 +76,77 @@ impl Default for RebornRuntimeIdentity {
 
 pub const DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_TURN_RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Host-facing Matrix outbound target mount configuration.
+///
+/// This is the public composition input for registering Matrix room targets with
+/// the shared outbound target registry. It intentionally does not expose the
+/// Matrix provider implementation or opaque route records; callers provide
+/// host-owned installation policy, and runtime assembly converts it to the
+/// private provider config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixOutboundTargetMountConfig {
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    project_id: Option<ProjectId>,
+    installation_id: ironclaw_product_adapters::AdapterInstallationId,
+    room_targets: Vec<MatrixOutboundRoomTargetConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixOutboundTargetMountConfigInput {
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
+    pub project_id: Option<ProjectId>,
+    pub installation_id: ironclaw_product_adapters::AdapterInstallationId,
+    pub room_targets: Vec<MatrixOutboundRoomTargetConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixOutboundRoomTargetConfig {
+    room_id: MatrixRoomId,
+    subject_user_id: UserId,
+}
+
+impl MatrixOutboundRoomTargetConfig {
+    pub fn new(room_id: MatrixRoomId, subject_user_id: UserId) -> Self {
+        Self {
+            room_id,
+            subject_user_id,
+        }
+    }
+}
+
+impl MatrixOutboundTargetMountConfig {
+    pub fn new(input: MatrixOutboundTargetMountConfigInput) -> Self {
+        Self {
+            tenant_id: input.tenant_id,
+            agent_id: input.agent_id,
+            project_id: input.project_id,
+            installation_id: input.installation_id,
+            room_targets: input.room_targets,
+        }
+    }
+}
+
+impl From<MatrixOutboundTargetMountConfig> for MatrixOutboundTargetProviderConfig {
+    fn from(config: MatrixOutboundTargetMountConfig) -> Self {
+        Self {
+            tenant_id: config.tenant_id,
+            agent_id: config.agent_id,
+            project_id: config.project_id,
+            installation_id: config.installation_id,
+            configured_room_routes: config
+                .room_targets
+                .into_iter()
+                .map(|target| MatrixConfiguredRoomRoute {
+                    room_id: target.room_id.as_str().to_string(),
+                    subject_user_id: target.subject_user_id,
+                })
+                .collect(),
+        }
+    }
+}
 
 /// Fire-time access request for a persisted trigger.
 ///
@@ -672,6 +746,26 @@ impl RebornRuntimeInput {
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
         self.skill_context_source = Some(source);
+        self
+    }
+
+    pub fn with_matrix_outbound_target_mount(
+        mut self,
+        config: MatrixOutboundTargetMountConfig,
+    ) -> Self {
+        self.matrix_outbound_target_providers.push(config.into());
+        self
+    }
+
+    pub fn with_matrix_outbound_target_mounts(
+        mut self,
+        configs: impl IntoIterator<Item = MatrixOutboundTargetMountConfig>,
+    ) -> Self {
+        self.matrix_outbound_target_providers.extend(
+            configs
+                .into_iter()
+                .map(MatrixOutboundTargetProviderConfig::from),
+        );
         self
     }
 

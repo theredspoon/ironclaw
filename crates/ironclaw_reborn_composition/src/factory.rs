@@ -1132,6 +1132,7 @@ where
     pub(crate) checkpoint_state_store: Arc<dyn CheckpointStateStore>,
     pub(crate) thread_service: Arc<dyn SessionThreadService>,
     pub(crate) trigger_repository: Arc<dyn TriggerRepository>,
+    pub(crate) outbound_preferences: Arc<dyn CommunicationPreferenceRepository>,
     pub(crate) resource_governor: Arc<dyn ResourceGovernor>,
     pub(crate) budget_gate_store: Arc<dyn BudgetGateStore>,
     pub(crate) broadcast_budget_event_sink: Arc<BroadcastBudgetEventSink>,
@@ -4852,6 +4853,7 @@ where
 {
     filesystem: Arc<F>,
     scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    outbound_preferences: Arc<dyn CommunicationPreferenceRepository>,
     outbound_state: Arc<dyn OutboundStateStore>,
     resource_governor: FilesystemResourceGovernor<F>,
     leases: Arc<FilesystemCapabilityLeaseStore<F>>,
@@ -4882,9 +4884,12 @@ where
         // a clone of this handle instead of reopening outbound state over the
         // same filesystem mount.
         #[allow(clippy::disallowed_methods)]
-        let outbound_state: Arc<dyn OutboundStateStore> = Arc::new(
+        let outbound_store: Arc<FilesystemOutboundStateStore<F>> = Arc::new(
             FilesystemOutboundStateStore::new(Arc::clone(&scoped_filesystem)),
         );
+        let outbound_preferences =
+            Arc::clone(&outbound_store) as Arc<dyn CommunicationPreferenceRepository>;
+        let outbound_state = outbound_store as Arc<dyn OutboundStateStore>;
         let secret_credentials = FilesystemSecretCredentialStores::from_master_key(
             Arc::clone(&scoped_filesystem),
             secret_master_key,
@@ -4894,6 +4899,7 @@ where
         Ok(Self {
             filesystem,
             scoped_filesystem,
+            outbound_preferences,
             outbound_state,
             resource_governor,
             leases,
@@ -5107,6 +5113,7 @@ where
         checkpoint_state_store: Arc::clone(&checkpoint_state_store),
         thread_service,
         trigger_repository: Arc::clone(&trigger_repository),
+        outbound_preferences: Arc::clone(&stores.outbound_preferences),
         resource_governor: production_resource_governor,
         budget_gate_store,
         broadcast_budget_event_sink,
