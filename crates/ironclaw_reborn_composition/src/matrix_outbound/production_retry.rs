@@ -1,4 +1,14 @@
 use super::*;
+use crate::matrix_product_outbound::{
+    DefaultMatrixOutboundPolicyAuthorizer, FilesystemMatrixPolicySnapshotSource,
+    MatrixOutboundPolicyAuthorizer, MatrixPolicySnapshotSource,
+};
+use ironclaw_matrix_adapter::installation_policy::{
+    EgressTargetIndex as AdapterEgressTargetIndex, MatrixInstallationPolicyRejection,
+    MatrixOutboundPolicyCheck as AdapterMatrixOutboundPolicyCheck,
+    MatrixPolicySnapshot as AdapterMatrixPolicySnapshot, PolicyRevision as AdapterPolicyRevision,
+};
+use ironclaw_product_adapters::{AdapterInstallationId, ProductAdapterId};
 
 // Executes one Matrix retry schedule. Production worker ticks use the
 // rehydrating entrypoint so stored route/grant context is validated again by
@@ -10,6 +20,7 @@ impl MatrixRetryExecutor {
         metadata_store: &FilesystemMatrixOutboundMetadataStore<F>,
         pending_store: &FilesystemMatrixPendingIntentStore<F>,
         bridge: &MatrixProductionDeliveryBridge<'_, F>,
+        retry_send_authorizer: &dyn MatrixRetrySendAuthorizer,
         scope: TurnScope,
         delivery_id: OutboundDeliveryId,
         now: DateTime<Utc>,
@@ -22,13 +33,47 @@ impl MatrixRetryExecutor {
             .await?
             .ok_or_else(|| DeliveryError::new(DeliveryReasonCode::MissingMatrixRoute))?;
         let (route, grant) = context.into_parts();
-        Self::execute_due_retry(metadata_store, pending_store, bridge, route, grant, now).await
+        Self::execute_due_retry(
+            metadata_store,
+            pending_store,
+            bridge,
+            retry_send_authorizer,
+            route,
+            grant,
+            now,
+        )
+        .await
     }
 
     pub async fn execute_due_retry<F>(
         metadata_store: &FilesystemMatrixOutboundMetadataStore<F>,
         pending_store: &FilesystemMatrixPendingIntentStore<F>,
         bridge: &MatrixProductionDeliveryBridge<'_, F>,
+        retry_send_authorizer: &dyn MatrixRetrySendAuthorizer,
+        route: FrozenProductDeliveryRoute,
+        grant: SealedDeliveryGrant,
+        now: DateTime<Utc>,
+    ) -> Result<Option<MatrixOrchestratorOutcome>, DeliveryError>
+    where
+        F: RootFilesystem,
+    {
+        Self::execute_due_retry_inner(
+            metadata_store,
+            pending_store,
+            bridge,
+            retry_send_authorizer,
+            route,
+            grant,
+            now,
+        )
+        .await
+    }
+
+    async fn execute_due_retry_inner<F>(
+        metadata_store: &FilesystemMatrixOutboundMetadataStore<F>,
+        pending_store: &FilesystemMatrixPendingIntentStore<F>,
+        bridge: &MatrixProductionDeliveryBridge<'_, F>,
+        retry_send_authorizer: &dyn MatrixRetrySendAuthorizer,
         route: FrozenProductDeliveryRoute,
         grant: SealedDeliveryGrant,
         now: DateTime<Utc>,
@@ -81,6 +126,11 @@ impl MatrixRetryExecutor {
                 .await?;
             return Err(DeliveryError::new(DeliveryReasonCode::MaxAttemptsExceeded));
         }
+        let context = MatrixRetryExecutionContext::new(route.clone(), grant.clone())
+            .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        retry_send_authorizer
+            .authorize_retry_send(&context, &command)
+            .await?;
         let attempt = DeliveryAttemptContext {
             delivery_id,
             transaction_id: command.transaction_id,
@@ -147,54 +197,193 @@ pub trait MatrixRetrySendAuthorizer: Send + Sync {
     async fn authorize_retry_send(
         &self,
         context: &MatrixRetryExecutionContext,
+        command: &MatrixOutboundCommand,
     ) -> Result<(), DeliveryError>;
 }
 
-#[cfg(any(test, feature = "libsql", feature = "postgres"))]
-pub(crate) struct MatrixConfiguredRetrySendAuthorizer {
-    policy_revision: String,
-    homeserver_origin_fingerprint: String,
-    credential_handle_fingerprint: String,
-    allowed_room_fingerprints: HashSet<String>,
+#[cfg(test)]
+pub(crate) struct MatrixSnapshotRetrySendAuthorizer {
+    snapshot_source: Arc<dyn MatrixPolicySnapshotSource>,
+}
+
+#[cfg(test)]
+impl MatrixSnapshotRetrySendAuthorizer {
+    pub(crate) fn new(snapshot_source: Arc<dyn MatrixPolicySnapshotSource>) -> Self {
+        Self { snapshot_source }
+    }
+}
+
+#[async_trait]
+#[cfg(test)]
+impl MatrixRetrySendAuthorizer for MatrixSnapshotRetrySendAuthorizer {
+    async fn authorize_retry_send(
+        &self,
+        context: &MatrixRetryExecutionContext,
+        command: &MatrixOutboundCommand,
+    ) -> Result<(), DeliveryError> {
+        validate_retry_execution_context(context.route(), context.grant())
+            .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        authorize_retry_send_from_policy_snapshot_source(
+            context,
+            command,
+            self.snapshot_source.as_ref(),
+        )
+        .await
+    }
 }
 
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
-impl MatrixConfiguredRetrySendAuthorizer {
-    pub(crate) fn new(
-        policy_revision: String,
-        homeserver_origin_fingerprint: String,
-        credential_handle_fingerprint: String,
-        allowed_room_fingerprints: impl IntoIterator<Item = String>,
-    ) -> Self {
+pub(crate) struct MatrixFilesystemRetrySendAuthorizer<F: ?Sized> {
+    filesystem: Arc<ScopedFilesystem<F>>,
+    cache_path: ScopedPath,
+}
+
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+impl<F> MatrixFilesystemRetrySendAuthorizer<F>
+where
+    F: RootFilesystem + ?Sized,
+{
+    pub(crate) fn new(filesystem: Arc<ScopedFilesystem<F>>, cache_path: ScopedPath) -> Self {
         Self {
-            policy_revision,
-            homeserver_origin_fingerprint,
-            credential_handle_fingerprint,
-            allowed_room_fingerprints: allowed_room_fingerprints.into_iter().collect(),
+            filesystem,
+            cache_path,
         }
     }
 }
 
 #[async_trait]
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
-impl MatrixRetrySendAuthorizer for MatrixConfiguredRetrySendAuthorizer {
+impl<F> MatrixRetrySendAuthorizer for MatrixFilesystemRetrySendAuthorizer<F>
+where
+    F: RootFilesystem + Send + Sync + ?Sized,
+{
     async fn authorize_retry_send(
         &self,
         context: &MatrixRetryExecutionContext,
+        command: &MatrixOutboundCommand,
     ) -> Result<(), DeliveryError> {
         validate_retry_execution_context(context.route(), context.grant())
             .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
-        let metadata = context.route().matrix_metadata();
-        if metadata.policy_revision != self.policy_revision
-            || metadata.homeserver_origin_fingerprint != self.homeserver_origin_fingerprint
-            || metadata.credential_handle_fingerprint != self.credential_handle_fingerprint
-            || !self
-                .allowed_room_fingerprints
-                .contains(&metadata.room_fingerprint)
-        {
-            return Err(DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget));
-        }
+        let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
+            Arc::clone(&self.filesystem),
+            context.route().scope().to_resource_scope(),
+            self.cache_path.clone(),
+        );
+        authorize_retry_send_from_policy_snapshot_source(context, command, &snapshot_source).await
+    }
+}
+
+async fn authorize_retry_send_from_policy_snapshot_source(
+    context: &MatrixRetryExecutionContext,
+    command: &MatrixOutboundCommand,
+    snapshot_source: &dyn MatrixPolicySnapshotSource,
+) -> Result<(), DeliveryError> {
+    let adapter_id = ProductAdapterId::new(context.route().adapter_id.clone())
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+    let installation_id = AdapterInstallationId::new(context.route().installation_id.clone())
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+    let snapshot = snapshot_source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .map_err(|rejection| {
+            DeliveryError::new(delivery_reason_for_matrix_policy_rejection(rejection))
+        })?;
+    let check = retry_matrix_outbound_policy_check(context, command, &snapshot)?;
+    DefaultMatrixOutboundPolicyAuthorizer
+        .authorize_matrix_outbound(&snapshot, &check)
+        .map_err(|rejection| {
+            DeliveryError::new(delivery_reason_for_matrix_policy_rejection(rejection))
+        })
+}
+
+fn retry_matrix_outbound_policy_check(
+    context: &MatrixRetryExecutionContext,
+    command: &MatrixOutboundCommand,
+    snapshot: &AdapterMatrixPolicySnapshot,
+) -> Result<AdapterMatrixOutboundPolicyCheck, DeliveryError> {
+    let metadata = context.route().matrix_metadata();
+    let adapter_id = ProductAdapterId::new(context.route().adapter_id.clone())
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+    let installation_id = AdapterInstallationId::new(context.route().installation_id.clone())
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+    verify_retry_fingerprint(
+        &metadata.homeserver_origin_fingerprint,
+        snapshot.homeserver.as_origin().as_bytes(),
+        DeliveryReasonCode::UnauthorizedTarget,
+    )?;
+    let room_id =
+        ironclaw_matrix_adapter::installation_policy::MatrixRoomId::new(command.room_id.as_str())
+            .map_err(|_| DeliveryError::new(DeliveryReasonCode::RoomNotAllowed))?;
+    let egress_target_index = AdapterEgressTargetIndex::new(command.egress_target_index);
+    verify_retry_fingerprint(
+        &metadata.credential_handle_fingerprint,
+        snapshot.credential_handle.as_str().as_bytes(),
+        DeliveryReasonCode::CredentialMismatch,
+    )?;
+    let policy_revision = AdapterPolicyRevision::new(
+        metadata
+            .policy_revision
+            .parse()
+            .map_err(|_| DeliveryError::new(DeliveryReasonCode::StalePolicyRevision))?,
+    )
+    .map_err(|_| DeliveryError::new(DeliveryReasonCode::StalePolicyRevision))?;
+    let path = matrix_send_policy_path(room_id.as_str(), command.transaction_id.as_str());
+    Ok(AdapterMatrixOutboundPolicyCheck {
+        adapter_id,
+        installation_id,
+        homeserver: snapshot.homeserver.clone(),
+        room_id,
+        egress_target_index,
+        credential_handle: snapshot.credential_handle.clone(),
+        path,
+        guest_authorization_header_present: false,
+        policy_revision,
+    })
+}
+
+fn verify_retry_fingerprint(
+    expected_fingerprint: &str,
+    current_value: &[u8],
+    reason: DeliveryReasonCode,
+) -> Result<(), DeliveryError> {
+    if expected_fingerprint == matrix_retry_sha256_fingerprint(current_value) {
         Ok(())
+    } else {
+        Err(DeliveryError::new(reason))
+    }
+}
+
+fn matrix_retry_sha256_fingerprint(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
+}
+
+fn delivery_reason_for_matrix_policy_rejection(
+    rejection: MatrixInstallationPolicyRejection,
+) -> DeliveryReasonCode {
+    match rejection {
+        MatrixInstallationPolicyRejection::InstallationDisabled
+        | MatrixInstallationPolicyRejection::InstallationDeleting
+        | MatrixInstallationPolicyRejection::InstallationNotFound => {
+            DeliveryReasonCode::InstallationInactive
+        }
+        MatrixInstallationPolicyRejection::PolicyRevisionMismatch
+        | MatrixInstallationPolicyRejection::PolicySnapshotExpired => {
+            DeliveryReasonCode::StalePolicyRevision
+        }
+        MatrixInstallationPolicyRejection::CredentialHandleMissing
+        | MatrixInstallationPolicyRejection::CredentialHandleMismatch
+        | MatrixInstallationPolicyRejection::CredentialHandleRevoked => {
+            DeliveryReasonCode::CredentialMismatch
+        }
+        MatrixInstallationPolicyRejection::RoomNotAllowed => DeliveryReasonCode::RoomNotAllowed,
+        MatrixInstallationPolicyRejection::DirectHttpEgressDenied
+        | MatrixInstallationPolicyRejection::EgressTargetUndeclared
+        | MatrixInstallationPolicyRejection::EgressTargetOutOfBounds
+        | MatrixInstallationPolicyRejection::PrivateNetworkTarget
+        | MatrixInstallationPolicyRejection::UnsafeRedirect => {
+            DeliveryReasonCode::EgressTargetDenied
+        }
+        _ => DeliveryReasonCode::UnauthorizedTarget,
     }
 }
 
@@ -406,16 +595,7 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = self
-            .retry_send_authorizer
-            .authorize_retry_send(&context)
-            .await
-        {
-            self.record_retry_failure(scope, delivery_id, error.reason)
-                .await?;
-            return Err(error);
-        }
-        let (route, grant) = context.into_parts();
+        let (route, grant) = context.clone().into_parts();
         let orchestrator = MatrixOutboundOrchestrator::new(
             self.delivery_port.as_ref(),
             self.credential_resolver.as_ref(),
@@ -424,15 +604,24 @@ where
         );
         let bridge =
             MatrixProductionDeliveryBridge::new(self.pending_store.as_ref(), &orchestrator);
-        MatrixRetryExecutor::execute_due_retry(
+        let outcome = MatrixRetryExecutor::execute_due_retry(
             self.metadata_store.as_ref(),
             self.pending_store.as_ref(),
             &bridge,
+            self.retry_send_authorizer.as_ref(),
             route,
             grant,
             now,
         )
-        .await
+        .await;
+        if let Err(error) = &outcome
+            && delivery_failure_kind_for_reason(error.reason)
+                == DeliveryFailureKind::AuthorizationRevoked
+        {
+            self.record_retry_failure(scope, delivery_id, error.reason)
+                .await?;
+        }
+        outcome
     }
 }
 

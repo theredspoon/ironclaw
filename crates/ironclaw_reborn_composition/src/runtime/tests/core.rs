@@ -2620,11 +2620,6 @@ async fn build_reborn_runtime_spawns_and_shuts_down_configured_matrix_retry_work
                     },
                     scopes: vec![matrix_retry_scope],
                     homeserver_origin: "https://matrix.example".to_string(),
-                    policy_revision: "policy-rev-1".to_string(),
-                    allowed_room_ids: vec![
-                        crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
-                            .expect("valid Matrix room id"),
-                    ],
                     credential_secret: ironclaw_host_api::SecretHandle::new("matrix_access_token")
                         .expect("valid Matrix credential secret"),
                     credential_handle_fingerprint: format!(
@@ -2725,11 +2720,6 @@ async fn production_runtime_registers_matrix_outbound_target_mount() {
                     },
                     scopes: vec![matrix_retry_scope],
                     homeserver_origin: "https://matrix.example".to_string(),
-                    policy_revision: "policy-rev-1".to_string(),
-                    allowed_room_ids: vec![
-                        crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
-                            .expect("valid Matrix room id"),
-                    ],
                     credential_secret: ironclaw_host_api::SecretHandle::new("matrix_access_token")
                         .expect("valid Matrix credential secret"),
                     credential_handle_fingerprint: format!(

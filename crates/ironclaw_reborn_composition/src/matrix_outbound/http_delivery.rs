@@ -240,15 +240,13 @@ fn matrix_send_request(
 ) -> RuntimeHttpEgressRequest {
     let room = encode_matrix_path_segment(command.room_id.as_str());
     let txn = encode_matrix_path_segment(command.transaction_id.as_str());
+    let path = format!("{MATRIX_SEND_PATH_PREFIX}{room}{MATRIX_SEND_EVENT_PATH}{txn}");
     RuntimeHttpEgressRequest {
         runtime: RuntimeKind::FirstParty,
         scope: route.route.scope().to_resource_scope(),
         capability_id: endpoint.capability_id.clone(),
         method: NetworkMethod::Put,
-        url: format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            endpoint.homeserver_origin, room, txn
-        ),
+        url: format!("{}{}", endpoint.homeserver_origin, path),
         headers: vec![("content-type".to_string(), "application/json".to_string())],
         body: serde_json::to_vec(command.body.as_json()).unwrap_or_else(|_| b"{}".to_vec()),
         network_policy: NetworkPolicy {

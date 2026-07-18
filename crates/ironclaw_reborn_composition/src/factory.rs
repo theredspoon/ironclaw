@@ -65,7 +65,7 @@ use ironclaw_host_api::{
     ResourceScope, RuntimeHttpEgress, UserId, VirtualPath,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_host_api::{HostApiError, MountAlias, MountGrant};
+use ironclaw_host_api::{HostApiError, MountAlias, MountGrant, ScopedPath};
 use ironclaw_host_runtime::{
     CapabilitySurfaceVersion, FirstPartyCapabilityRegistry, HostProcessPort,
     HostRuntimeHttpEgressPort, HostRuntimeServices, PostEditCheckConfig,
@@ -5116,11 +5116,14 @@ where
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: format!("Matrix retry worker endpoint invalid: {error:?}"),
     })?;
-    let retry_send_authorizer = crate::matrix_outbound::MatrixConfiguredRetrySendAuthorizer::new(
-        config.policy_revision,
-        endpoint.homeserver_origin_fingerprint(),
-        config.credential_handle_fingerprint,
-        config.allowed_room_fingerprints,
+    let policy_cache_path =
+        ScopedPath::new(crate::matrix_product_outbound::MATRIX_POLICY_PROJECTION_CACHE_PATH)
+            .map_err(|error| RebornBuildError::InvalidConfig {
+                reason: format!("Matrix policy projection cache path is invalid: {error}"),
+            })?;
+    let retry_send_authorizer = crate::matrix_outbound::MatrixFilesystemRetrySendAuthorizer::new(
+        Arc::clone(&scoped_filesystem),
+        policy_cache_path,
     );
     let bundle = crate::matrix_outbound::MatrixRetryProductionDependencyBundle::new(
         crate::matrix_outbound::MatrixRetryProductionDependencyBundleInput {

@@ -194,6 +194,13 @@ fn command() -> MatrixOutboundCommand {
     }
 }
 
+fn command_with_transaction_id(transaction_id: &str) -> MatrixOutboundCommand {
+    MatrixOutboundCommand {
+        transaction_id: MatrixTransactionId::new(transaction_id).expect("valid transaction id"),
+        ..command()
+    }
+}
+
 #[derive(Debug, Default)]
 struct FakeOutboundStateStore {
     statuses: Mutex<Vec<UpdateDeliveryStatusRequest>>,
@@ -458,6 +465,7 @@ impl MatrixRetrySendAuthorizer for AllowRetrySendAuthorizer {
     async fn authorize_retry_send(
         &self,
         _context: &MatrixRetryExecutionContext,
+        _command: &MatrixOutboundCommand,
     ) -> Result<(), DeliveryError> {
         Ok(())
     }
@@ -473,6 +481,7 @@ impl MatrixRetrySendAuthorizer for RejectRetrySendAuthorizer {
     async fn authorize_retry_send(
         &self,
         _context: &MatrixRetryExecutionContext,
+        _command: &MatrixOutboundCommand,
     ) -> Result<(), DeliveryError> {
         Err(DeliveryError::new(self.reason))
     }
@@ -924,6 +933,47 @@ impl MatrixPolicySnapshotSource for StaticMatrixPolicySnapshotSource {
             return Err(AdapterMatrixInstallationPolicyRejection::InstallationMismatch);
         }
         Ok(self.snapshot.clone())
+    }
+}
+
+#[derive(Debug)]
+struct RetryMatrixPolicySnapshotSource {
+    result: Mutex<Result<AdapterMatrixPolicySnapshot, AdapterMatrixInstallationPolicyRejection>>,
+    calls: Mutex<Vec<(ProductAdapterId, AdapterInstallationId)>>,
+}
+
+impl RetryMatrixPolicySnapshotSource {
+    fn returning(snapshot: AdapterMatrixPolicySnapshot) -> Self {
+        Self {
+            result: Mutex::new(Ok(snapshot)),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn rejecting(rejection: AdapterMatrixInstallationPolicyRejection) -> Self {
+        Self {
+            result: Mutex::new(Err(rejection)),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<(ProductAdapterId, AdapterInstallationId)> {
+        self.calls.lock().expect("snapshot source calls").clone()
+    }
+}
+
+#[async_trait]
+impl MatrixPolicySnapshotSource for RetryMatrixPolicySnapshotSource {
+    async fn resolve_matrix_policy_snapshot(
+        &self,
+        adapter_id: &ProductAdapterId,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<AdapterMatrixPolicySnapshot, AdapterMatrixInstallationPolicyRejection> {
+        self.calls
+            .lock()
+            .expect("snapshot source calls")
+            .push((adapter_id.clone(), installation_id.clone()));
+        self.result.lock().expect("snapshot source result").clone()
     }
 }
 
@@ -2465,7 +2515,7 @@ fn forged_route_grant_fails_before_delivery_port() {
     let error = validate_matrix_route_grant(&command(), route, &forged_grant)
         .expect_err("forged grant must fail");
 
-    assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+    assert_eq!(error.reason, DeliveryReasonCode::StalePolicyRevision);
 }
 
 #[test]
@@ -3545,11 +3595,13 @@ async fn retry_executor_invokes_production_bridge_with_next_attempt_from_durable
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let outcome = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route.clone(),
         grant,
         schedule.recorded_at
@@ -3615,11 +3667,13 @@ async fn retry_executor_rehydrates_route_grant_context_before_execution() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let outcome = MatrixRetryExecutor::execute_due_retry_from_store(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route.scope().clone(),
         route.delivery_id,
         due_at,
@@ -3780,23 +3834,285 @@ async fn matrix_retry_production_dependency_bundle_uses_real_delivery_port_store
     assert_eq!(requests[0].credential_count, 1);
 }
 
+fn source_backed_retry_route() -> FrozenProductDeliveryRoute {
+    let mut route = route_for_homeserver_origin("https://matrix.example.org");
+    route.adapter_id = "matrix".into();
+    route.installation_id = "inst_matrix".into();
+    route.metadata.policy_revision = "7".into();
+    route.metadata.credential_handle_fingerprint = canonical_fingerprint("credential-handle-1");
+    route
+}
+
+fn source_backed_retry_policy_snapshot(
+    route: &FrozenProductDeliveryRoute,
+) -> AdapterMatrixPolicySnapshot {
+    let command = command();
+    AdapterMatrixPolicySnapshot {
+        adapter_id: ProductAdapterId::new(route.adapter_id.clone()).expect("adapter id"),
+        installation_id: AdapterInstallationId::new(route.installation_id.clone())
+            .expect("installation id"),
+        homeserver: AdapterMatrixHomeserverOrigin::parse("https://matrix.example.org")
+            .expect("homeserver"),
+        allowed_rooms: std::collections::BTreeSet::from([AdapterMatrixRoomId::new(
+            command.room_id.as_str(),
+        )
+        .expect("room")]),
+        allowed_senders: std::collections::BTreeSet::new(),
+        egress_target_index: AdapterEgressTargetIndex::new(route.metadata.egress_target_index),
+        credential_handle: ironclaw_product_adapters::EgressCredentialHandle::new(
+            "credential-handle-1",
+        )
+        .expect("credential handle"),
+        policy_revision: AdapterPolicyRevision::new(
+            route
+                .metadata
+                .policy_revision
+                .parse()
+                .expect("numeric retry policy revision"),
+        )
+        .expect("policy revision"),
+    }
+}
+
+struct SourceBackedRetryReauthorizationFixture {
+    route: FrozenProductDeliveryRoute,
+    command: MatrixOutboundCommand,
+    source: Arc<RetryMatrixPolicySnapshotSource>,
+}
+
+impl SourceBackedRetryReauthorizationFixture {
+    fn new(
+        route: FrozenProductDeliveryRoute,
+        source: Arc<RetryMatrixPolicySnapshotSource>,
+    ) -> Self {
+        Self::with_command(route, command(), source)
+    }
+
+    fn with_command(
+        route: FrozenProductDeliveryRoute,
+        command: MatrixOutboundCommand,
+        source: Arc<RetryMatrixPolicySnapshotSource>,
+    ) -> Self {
+        Self {
+            route,
+            command,
+            source,
+        }
+    }
+
+    async fn reject_before_delivery(self, expected_reason: DeliveryReasonCode) {
+        let backend = Arc::new(InMemoryBackend::new());
+        let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+            outbound_state_store(),
+        ));
+        let pending_store = Arc::new(FilesystemMatrixPendingIntentStore::new(
+            matrix_metadata_filesystem(Arc::clone(&backend)),
+        ));
+        let schedule = retry_schedule(&self.route);
+        let due_at =
+            schedule.recorded_at + chrono::Duration::from_std(schedule.retry_after).expect("due");
+
+        pending_store
+            .persist_pending_command(
+                self.route.scope().clone(),
+                self.route.delivery_id,
+                self.route.delivery_id.as_uuid(),
+                self.command,
+            )
+            .await
+            .expect("persist durable pending Matrix command");
+        metadata_store
+            .record_retry_scheduled(schedule, retry_context(&self.route))
+            .await
+            .expect("persist retry schedule and context");
+
+        let port = Arc::new(RecordingMatrixDeliveryPort::default());
+        let snapshot_source: Arc<dyn MatrixPolicySnapshotSource> = self.source.clone();
+        let work_port = retry_work_port(
+            Arc::clone(&metadata_store),
+            pending_store,
+            Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+            Arc::new(FakeMatrixCredentialResolver::with_credential(
+                ResolvedCredentialHandle {
+                    credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+                },
+            )),
+            Arc::new(MatrixSnapshotRetrySendAuthorizer::new(snapshot_source)),
+        );
+
+        let error = work_port
+            .execute_due_retry(self.route.scope().clone(), self.route.delivery_id, due_at)
+            .await
+            .expect_err("source-backed retry reauthorization must reject before delivery");
+
+        assert_eq!(error.reason, expected_reason);
+        assert_eq!(
+            self.source.calls(),
+            vec![(
+                ProductAdapterId::new(self.route.adapter_id.clone()).expect("adapter id"),
+                AdapterInstallationId::new(self.route.installation_id.clone())
+                    .expect("installation id")
+            )],
+            "retry authorizer must re-read the current Matrix policy projection"
+        );
+        assert!(
+            port.calls().is_empty(),
+            "retry reauthorization must reject before MatrixDeliveryPort or HTTP delivery"
+        );
+    }
+}
+
+async fn assert_source_backed_retry_reauthorization_rejects_before_delivery(
+    route: FrozenProductDeliveryRoute,
+    source: Arc<RetryMatrixPolicySnapshotSource>,
+    expected_reason: DeliveryReasonCode,
+) {
+    SourceBackedRetryReauthorizationFixture::new(route, source)
+        .reject_before_delivery(expected_reason)
+        .await;
+}
+
+async fn assert_source_backed_retry_reauthorization_rejects_before_delivery_with_command(
+    route: FrozenProductDeliveryRoute,
+    command: MatrixOutboundCommand,
+    source: Arc<RetryMatrixPolicySnapshotSource>,
+    expected_reason: DeliveryReasonCode,
+) {
+    SourceBackedRetryReauthorizationFixture::with_command(route, command, source)
+        .reject_before_delivery(expected_reason)
+        .await;
+}
+
 #[tokio::test]
-async fn matrix_configured_retry_authorizer_rejects_stale_policy_revision() {
-    let route = route_for_homeserver_origin("https://matrix.example");
-    let metadata = route.matrix_metadata().clone();
-    let authorizer = MatrixConfiguredRetrySendAuthorizer::new(
-        "policy-rev-current".to_string(),
-        metadata.homeserver_origin_fingerprint,
-        metadata.credential_handle_fingerprint,
-        vec![metadata.room_fingerprint],
-    );
+async fn matrix_retry_worker_revalidates_source_policy_revision_before_retry_send() {
+    let route = source_backed_retry_route();
+    let mut snapshot = source_backed_retry_policy_snapshot(&route);
+    snapshot.policy_revision = AdapterPolicyRevision::new(8).expect("newer policy revision");
 
-    let error = authorizer
-        .authorize_retry_send(&retry_context(&route))
-        .await
-        .expect_err("stale stored policy must not authorize retry send");
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::returning(snapshot)),
+        DeliveryReasonCode::StalePolicyRevision,
+    )
+    .await;
+}
 
-    assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_installation_active_before_retry_send() {
+    let route = source_backed_retry_route();
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::rejecting(
+            AdapterMatrixInstallationPolicyRejection::InstallationDisabled,
+        )),
+        DeliveryReasonCode::InstallationInactive,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_installation_not_deleting_before_retry_send() {
+    let route = source_backed_retry_route();
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::rejecting(
+            AdapterMatrixInstallationPolicyRejection::InstallationDeleting,
+        )),
+        DeliveryReasonCode::InstallationInactive,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_installation_exists_before_retry_send() {
+    let route = source_backed_retry_route();
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::rejecting(
+            AdapterMatrixInstallationPolicyRejection::InstallationNotFound,
+        )),
+        DeliveryReasonCode::InstallationInactive,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_credential_before_retry_send() {
+    let route = source_backed_retry_route();
+    let mut snapshot = source_backed_retry_policy_snapshot(&route);
+    snapshot.credential_handle =
+        ironclaw_product_adapters::EgressCredentialHandle::new("rotated-credential-handle")
+            .expect("credential handle");
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::returning(snapshot)),
+        DeliveryReasonCode::CredentialMismatch,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_credential_not_revoked_before_retry_send() {
+    let route = source_backed_retry_route();
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::rejecting(
+            AdapterMatrixInstallationPolicyRejection::CredentialHandleRevoked,
+        )),
+        DeliveryReasonCode::CredentialMismatch,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_egress_target_before_retry_send() {
+    let route = source_backed_retry_route();
+    let mut snapshot = source_backed_retry_policy_snapshot(&route);
+    snapshot.egress_target_index = AdapterEgressTargetIndex::new(1);
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::returning(snapshot)),
+        DeliveryReasonCode::EgressTargetDenied,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_source_room_allowed_before_retry_send() {
+    let route = source_backed_retry_route();
+    let mut snapshot = source_backed_retry_policy_snapshot(&route);
+    snapshot.allowed_rooms = std::collections::BTreeSet::from([AdapterMatrixRoomId::new(
+        "!different-room:matrix.example.org",
+    )
+    .expect("different room")]);
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery(
+        route,
+        Arc::new(RetryMatrixPolicySnapshotSource::returning(snapshot)),
+        DeliveryReasonCode::RoomNotAllowed,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn matrix_retry_worker_revalidates_raw_transaction_policy_path_before_retry_send() {
+    let route = source_backed_retry_route();
+    let snapshot = source_backed_retry_policy_snapshot(&route);
+
+    assert_source_backed_retry_reauthorization_rejects_before_delivery_with_command(
+        route,
+        command_with_transaction_id("txn%2Fmatrix-1"),
+        Arc::new(RetryMatrixPolicySnapshotSource::returning(snapshot)),
+        DeliveryReasonCode::UnauthorizedTarget,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -4116,11 +4432,13 @@ async fn retry_executor_skips_retry_before_persisted_schedule_is_due() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let outcome = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route,
         grant,
         schedule.recorded_at,
@@ -4186,11 +4504,13 @@ async fn retry_executor_skips_due_retry_when_schedule_is_already_claimed() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let outcome = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route,
         grant,
         due_at,
@@ -4259,11 +4579,13 @@ async fn retry_executor_reclaims_due_retry_after_claim_lease_expires() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let outcome = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route.clone(),
         grant,
         after_lease,
@@ -4329,11 +4651,13 @@ async fn retry_executor_skips_stale_schedule_after_terminal_status_without_port_
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let outcome = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route.clone(),
         grant,
         due_at,
@@ -4397,11 +4721,13 @@ async fn retry_executor_terminalizes_exhausted_schedule_without_port_call() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let error = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route.clone(),
         grant,
         due_at,
@@ -4467,11 +4793,13 @@ async fn retry_executor_errors_when_due_schedule_has_no_pending_command() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let error = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route,
         grant,
         due_at,
@@ -4528,11 +4856,13 @@ async fn retry_executor_rejects_retry_duration_overflow_before_port_call() {
         &retry_policy,
     );
     let bridge = MatrixProductionDeliveryBridge::new(&pending_store, &orchestrator);
+    let authorizer = AllowRetrySendAuthorizer;
 
     let error = MatrixRetryExecutor::execute_due_retry(
         &metadata_store,
         &pending_store,
         &bridge,
+        &authorizer,
         route,
         grant,
         Utc::now(),
