@@ -1777,14 +1777,22 @@ pub async fn authorize_matrix_outbound_with_extension_lifecycle(
     snapshot: &MatrixPolicySnapshot,
     check: &MatrixOutboundPolicyCheck,
 ) -> Result<(), MatrixInstallationPolicyRejection> {
-    let extension_installation_id = extension_installation_id(&snapshot.installation_id)?;
+    ensure_matrix_extension_lifecycle_enabled(store, &snapshot.installation_id).await?;
+    authorize_matrix_outbound(snapshot, check)
+}
+
+pub async fn ensure_matrix_extension_lifecycle_enabled(
+    store: &dyn ExtensionInstallationStore,
+    installation_id: &AdapterInstallationId,
+) -> Result<(), MatrixInstallationPolicyRejection> {
+    let extension_installation_id = extension_installation_id(installation_id)?;
     let installation = store
         .get_installation(&extension_installation_id)
         .await
         .map_err(matrix_rejection_from_extension_error)?
         .ok_or(MatrixInstallationPolicyRejection::InstallationDeleting)?;
     match installation.activation_state() {
-        ExtensionActivationState::Enabled => authorize_matrix_outbound(snapshot, check),
+        ExtensionActivationState::Enabled => Ok(()),
         ExtensionActivationState::Installed | ExtensionActivationState::Disabled => {
             Err(MatrixInstallationPolicyRejection::InstallationDisabled)
         }

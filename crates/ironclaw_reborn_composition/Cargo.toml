@@ -148,6 +148,7 @@ ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_host_runtime = { path = "../ironclaw_host_runtime" }
 ironclaw_llm = { path = "../ironclaw_llm", optional = true, default-features = false }
 ironclaw_loop_host = { path = "../ironclaw_loop_host" }
+ironclaw_matrix_adapter = { path = "../ironclaw_matrix_adapter" }
 ironclaw_memory = { path = "../ironclaw_memory" }
 ironclaw_mcp = { path = "../ironclaw_mcp" }
 ironclaw_network = { path = "../ironclaw_network" }
@@ -247,7 +248,6 @@ ironclaw_threads = { path = "../ironclaw_threads" }
 ironclaw_turns = { path = "../ironclaw_turns" }
 ironclaw_product_workflow = { path = "../ironclaw_product_workflow", features = ["test-support"] }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters" }
-ironclaw_matrix_adapter = { path = "../ironclaw_matrix_adapter" }
 rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
 rust_decimal_macros = "1"
 sha2 = "0.11"
