@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use ironclaw_common::hashing::sha256_hex;
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
@@ -42,7 +43,7 @@ use ironclaw_first_party_extension_ports::{
 use ironclaw_host_api::{
     ActionResultSummary, ActionSummary, AgentId, ApprovalRequestId, AuditEnvelope, AuditEventId,
     AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, ExtensionId,
-    InvocationId, Principal, ResourceScope, TenantId, ThreadId, UserId,
+    InvocationId, Principal, ResourceScope, ScopedPath, TenantId, ThreadId, UserId,
 };
 use ironclaw_loop_host::{
     AwaitEdgeSettler, AwaitEdgeWriter, CapabilityAllowSet, CapabilityResolveError,
@@ -51,15 +52,23 @@ use ironclaw_loop_host::{
     JsonSpawnSubagentInputCodec, LoopCapabilityInputResolver, LoopCapabilityPortFactory,
     LoopCapabilityResultWriter, ModelGatewayBackedSystemInferencePort,
 };
+use ironclaw_matrix_adapter::{
+    MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
+};
 use ironclaw_observability::live_latency_started_at;
-use ironclaw_outbound::CommunicationPreferenceRepository;
-use ironclaw_product_adapters::ProjectionStream;
+use ironclaw_outbound::{CommunicationPreferenceRepository, OutboundPolicyService};
+use ironclaw_product_adapters::redaction::RedactedString;
+use ironclaw_product_adapters::{
+    AuthRequirement, DeliveryStatus, EgressRequest, EgressResponse, OutboundDeliverySink,
+    ProductAdapterId, ProductRenderOutcome, ProjectionStream, ProtocolHttpEgress,
+    ProtocolHttpEgressError,
+};
 use ironclaw_product_workflow::{
     ApprovalBlockedTurnRun, ApprovalInteractionScope, ApprovalInteractionService,
     ApprovalResolverPort, ApprovalTurnRunLocator, AuthInteractionService,
     DefaultApprovalInteractionService, DefaultAuthInteractionService,
     OutboundPreferencesProductFacade, PersistentApprovalGranteeResolver,
-    RunStateApprovalInteractionReadModel,
+    ProductOutboundDeliveryOutcome, RunStateApprovalInteractionReadModel,
 };
 use ironclaw_runner::loop_exit_applier::{
     ApprovalGateEvidenceStore, AwaitDependentRunEvidenceStore, ThreadCheckpointLoopExitEvidencePort,
@@ -109,7 +118,21 @@ use self::latency::{trace_runtime_latency_error, trace_runtime_latency_ok};
 use self::runtime_turn_scheduler::RuntimeTurnScheduler;
 use crate::factory::{LocalDevTurnStateStore, builtin_extension_registry};
 use crate::local_dev_capability_policy::{LocalDevCapabilityPolicy, local_dev_capability_policy};
-use crate::matrix_outbound_targets::register_matrix_outbound_target_provider;
+use crate::matrix_outbound::{
+    DeliveryReasonCode, FilesystemMatrixOutboundMetadataStore, FilesystemMatrixPendingIntentStore,
+    FrozenProductDeliveryRoute, MatrixCommandKind, MatrixOutboundCommand,
+    MatrixOutboundMetadataStore, MatrixPendingIntentBridgeContext, MatrixRetryExecutionContext,
+    MatrixRetrySchedule, MatrixRouteMetadata, MatrixRoutePolicyOwnerToken, SealedDeliveryGrant,
+};
+use crate::matrix_outbound_targets::{
+    MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
+    register_matrix_outbound_target_provider,
+};
+use crate::matrix_product_outbound::{
+    FilesystemMatrixPolicySnapshotSource, MATRIX_POLICY_PROJECTION_CACHE_PATH,
+    MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
+    MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{
@@ -126,6 +149,33 @@ use ironclaw_filesystem::CompositeRootFilesystem;
 #[derive(Clone)]
 struct StaticOutboundDeliveryTargetProvider {
     entry: OutboundDeliveryTargetEntry,
+}
+
+struct MatrixDeferredRenderEgress;
+
+#[async_trait::async_trait]
+impl ProtocolHttpEgress for MatrixDeferredRenderEgress {
+    async fn send(
+        &self,
+        _request: EgressRequest,
+    ) -> Result<EgressResponse, ProtocolHttpEgressError> {
+        Err(ProtocolHttpEgressError::PolicyDenied {
+            reason: RedactedString::new(
+                "deferred Matrix egress is unavailable in this stage".to_string(),
+            ),
+        })
+    }
+}
+
+struct MatrixDeferredDeliverySink;
+
+#[async_trait::async_trait]
+impl OutboundDeliverySink for MatrixDeferredDeliverySink {
+    async fn record(&self, _status: DeliveryStatus) {}
+}
+
+fn matrix_runtime_fingerprint(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -703,6 +753,7 @@ pub struct RebornRuntime {
     trigger_conversation_pairing:
         Option<Arc<dyn ironclaw_conversations::ConversationActorPairingService>>,
     outbound_delivery_target_registry: Option<Arc<MutableOutboundDeliveryTargetRegistry>>,
+    matrix_product_outbound_target_resolver: Option<Arc<MatrixHostProductOutboundTargetResolver>>,
     budget_event_projection: Option<crate::observability::budget_events::BudgetEventProjection>,
     poll_settings: PollSettings,
     /// Mints the one-time API bearer on admin user creation. Read by
@@ -1841,6 +1892,206 @@ impl RebornRuntime {
                 reason: format!("outbound delivery target provider lookup failed: {error}"),
             })
     }
+
+    pub async fn prepare_matrix_product_outbound(
+        &self,
+        input: MatrixProductOutboundDeliveryInput,
+    ) -> Result<ProductOutboundDeliveryOutcome, MatrixProductOutboundDeliveryError> {
+        let local_runtime = self.services.local_runtime.as_ref().ok_or_else(|| {
+            MatrixProductOutboundDeliveryError::Unavailable {
+                reason: "Matrix product outbound caller requires local runtime services"
+                    .to_string(),
+            }
+        })?;
+        let extension_installation_store = local_runtime
+            .extension_management
+            .as_ref()
+            .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
+                reason: "Matrix product outbound caller requires extension lifecycle management"
+                    .to_string(),
+            })?
+            .installation_store();
+        let target_resolver = self
+            .matrix_product_outbound_target_resolver
+            .as_ref()
+            .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
+                reason: "Matrix product outbound target resolver is not configured".to_string(),
+            })?;
+        let resolved_target = target_resolver
+            .resolve_requested_target(&input.delivery.resolution_request)
+            .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
+                reason: "Matrix product outbound requested target is not configured".to_string(),
+            })?;
+        let cache_path = ScopedPath::new(MATRIX_POLICY_PROJECTION_CACHE_PATH).map_err(|error| {
+            MatrixProductOutboundDeliveryError::Unavailable {
+                reason: format!("Matrix policy projection cache path is invalid: {error}"),
+            }
+        })?;
+        let matrix_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
+        let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
+            Arc::clone(&matrix_filesystem),
+            input.delivery.resolution_request.scope.to_resource_scope(),
+            cache_path,
+        );
+        let adapter_id = ProductAdapterId::new("matrix").map_err(|error| {
+            MatrixProductOutboundDeliveryError::Unavailable {
+                reason: format!("Matrix adapter id is invalid: {error}"),
+            }
+        })?;
+        let snapshot = snapshot_source
+            .resolve_matrix_policy_snapshot(&adapter_id, &resolved_target.installation_id)
+            .await
+            .map_err(|rejection| MatrixProductOutboundDeliveryError::Policy {
+                rejection,
+                status_update_error: None,
+            })?;
+        let adapter = MatrixProductAdapter::new(MatrixProductAdapterConfig {
+            adapter_id: adapter_id.clone(),
+            installation_id: resolved_target.installation_id.clone(),
+            parse_policy: MatrixParsePolicy {
+                allowed_rooms: snapshot
+                    .allowed_rooms
+                    .iter()
+                    .map(|room| room.as_str().to_string())
+                    .collect(),
+                allowed_senders: snapshot
+                    .allowed_senders
+                    .iter()
+                    .map(|sender| sender.as_str().to_string())
+                    .collect(),
+            },
+            auth_requirement: AuthRequirement::SharedSecretHeader {
+                header_name: "x-matrix-webhook-secret".to_string(),
+            },
+        })
+        .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
+            reason: format!("Matrix product adapter configuration is invalid: {error}"),
+        })?;
+        let target_policy = MatrixHostReplyTargetPolicy::new((**target_resolver).clone());
+        let outbound_policy = OutboundPolicyService::new(
+            local_runtime.outbound_state.as_ref(),
+            &target_policy,
+            &target_policy,
+        );
+        let egress = MatrixDeferredRenderEgress;
+        let delivery_sink = MatrixDeferredDeliverySink;
+        let policy_authorizer =
+            crate::matrix_product_outbound::DefaultMatrixOutboundPolicyAuthorizer;
+        let entrypoint = MatrixProductOutboundEntrypoint {
+            extension_installation_store: extension_installation_store.as_ref(),
+            snapshot_source: &snapshot_source,
+            policy_authorizer: &policy_authorizer,
+            outbound_policy: &outbound_policy,
+            communication_preferences: local_runtime.outbound_preferences.as_ref(),
+            target_resolver: target_resolver.as_ref(),
+            adapter: &adapter,
+            egress: &egress,
+            delivery_sink: &delivery_sink,
+        };
+        let outcome = entrypoint
+            .prepare_and_render_with_snapshot(input, snapshot.clone())
+            .await?;
+        let deferred_attempt = match &outcome {
+            ProductOutboundDeliveryOutcome::Rendered {
+                attempt,
+                render_outcome: ProductRenderOutcome::Deferred,
+            }
+            | ProductOutboundDeliveryOutcome::RenderedStatusUpdateFailed {
+                attempt,
+                render_outcome: ProductRenderOutcome::Deferred,
+                ..
+            } => Some(attempt.clone()),
+            _ => None,
+        };
+        if let Some(attempt) = deferred_attempt {
+            let adapter_intent = adapter
+                .pending_matrix_intent(attempt.delivery_id.as_uuid())
+                .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
+                    reason: "Matrix adapter did not retain deferred outbound command".to_string(),
+                })?;
+            let egress_target_index = u32::try_from(snapshot.egress_target_index.as_usize())
+                .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
+                    reason: format!("Matrix egress target index is invalid: {error}"),
+                })?;
+            let command = MatrixOutboundCommand::from_adapter_pending_intent(
+                adapter_intent,
+                MatrixPendingIntentBridgeContext {
+                    reply_target_binding_ref: resolved_target.reply_target_binding_ref.clone(),
+                    egress_target_index,
+                },
+            )
+            .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
+                reason: format!("Matrix deferred command is invalid: {:?}", error.reason),
+            })?;
+            if command.room_id != resolved_target.room_id {
+                return Err(MatrixProductOutboundDeliveryError::Unavailable {
+                    reason: "Matrix deferred command room does not match validated target"
+                        .to_string(),
+                });
+            }
+            let owner = MatrixRoutePolicyOwnerToken::matrix_policy_owner();
+            let route = FrozenProductDeliveryRoute::mint_for_matrix(
+                &owner,
+                attempt.delivery_id,
+                attempt.scope.clone(),
+                resolved_target.installation_id.as_str(),
+                adapter_id.as_str(),
+                MatrixRouteMetadata {
+                    policy_revision: snapshot.policy_revision.as_u64().to_string(),
+                    homeserver_origin_fingerprint: matrix_runtime_fingerprint(
+                        snapshot.homeserver.as_origin().as_bytes(),
+                    ),
+                    room_fingerprint: command.room_id.fingerprint(),
+                    egress_target_index,
+                    credential_handle_fingerprint: matrix_runtime_fingerprint(
+                        snapshot.credential_handle.as_str().as_bytes(),
+                    ),
+                    reply_target_binding_ref: resolved_target.reply_target_binding_ref,
+                    allowed_command_kinds: vec![MatrixCommandKind::SendText],
+                },
+            );
+            let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+            let retry_context = MatrixRetryExecutionContext::new(route.clone(), grant.clone())
+                .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
+                    reason: format!("Matrix retry context is invalid: {error}"),
+                })?;
+            let pending_store =
+                FilesystemMatrixPendingIntentStore::new(Arc::clone(&matrix_filesystem));
+            pending_store
+                .persist_pending_command(
+                    attempt.scope.clone(),
+                    attempt.delivery_id,
+                    attempt.delivery_id.as_uuid(),
+                    command,
+                )
+                .await
+                .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
+                    reason: format!("Matrix pending command persistence failed: {error}"),
+                })?;
+            let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+                matrix_filesystem,
+                Arc::clone(&local_runtime.outbound_state),
+            );
+            metadata_store
+                .record_retry_scheduled(
+                    MatrixRetrySchedule {
+                        delivery_id: attempt.delivery_id,
+                        scope: attempt.scope,
+                        attempt_number: 0,
+                        retry_after: Duration::ZERO,
+                        reason: DeliveryReasonCode::MatrixTimeout,
+                        recorded_at: Utc::now(),
+                    },
+                    retry_context,
+                )
+                .await
+                .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
+                    reason: format!("Matrix initial retry schedule persistence failed: {error}"),
+                })?;
+        }
+        Ok(outcome)
+    }
+
     /// Wire the Slack triggered-run delivery hook into the already-spawned
     /// trigger poller. Must be called after [`build_reborn_runtime`] returns
     /// and after the hook itself is constructed (e.g. inside
@@ -3219,6 +3470,18 @@ pub async fn build_reborn_runtime(
     }
     let trusted_laptop_access = services_input.grants_trusted_laptop_access();
     let owner_id = services_input.owner_id().to_string();
+    let matrix_product_outbound_target_resolver = if matrix_outbound_target_providers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
+            MatrixHostProductOutboundTargetResolver::new(matrix_outbound_target_providers.clone())
+                .map_err(|error| RebornRuntimeError::InvalidArgument {
+                    reason: format!(
+                        "Matrix product outbound target resolver configuration failed: {error}"
+                    ),
+                })?,
+        ))
+    };
     // Thread per-user and per-origin concurrency caps from TurnRunnerSettings into the
     // turn-state store. The factory reads these when constructing the store so limits
     // are applied from the very first claim.
@@ -4228,6 +4491,7 @@ pub async fn build_reborn_runtime(
         #[cfg(any(test, feature = "test-support"))]
         trigger_conversation_pairing: trigger_conversation_pairing_value,
         outbound_delivery_target_registry: Some(outbound_delivery_target_registry),
+        matrix_product_outbound_target_resolver,
         budget_event_projection,
         poll_settings: poll,
         #[cfg(feature = "webui-v2-beta")]

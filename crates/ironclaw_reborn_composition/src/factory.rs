@@ -1047,14 +1047,13 @@ pub(crate) struct RebornLocalRuntimeServices {
     /// layer can resolve at fire time.
     pub(crate) outbound_delivery_targets:
         Arc<crate::outbound::MutableOutboundDeliveryTargetRegistry>,
+    pub(crate) outbound_state: Arc<dyn OutboundStateStore>,
     /// Global default criteria-based skill auto-activation master switch,
     /// shared by reference between the skill activation selector (reads it per
     /// turn) and the WebUI skills facade (toggles it). Defaults to `true`; a
     /// Settings write flips it and the next turn's selection honors the new
     /// value without a restart.
     pub(crate) skill_auto_activate_learned: Arc<AtomicBool>,
-    #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
-    pub(crate) outbound_state: Arc<dyn OutboundStateStore>,
     #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
     pub(crate) delivered_gate_routes: Arc<dyn DeliveredGateRouteStore>,
     #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
@@ -2602,7 +2601,6 @@ async fn build_local_dev_store_graph(
             crate::outbound::MutableOutboundDeliveryTargetRegistry::default(),
         ),
         skill_auto_activate_learned: Arc::new(AtomicBool::new(true)),
-        #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
         outbound_state: outbound_stores.outbound_state,
         #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
         delivered_gate_routes: outbound_stores.delivered_gate_routes,
@@ -2797,7 +2795,6 @@ async fn build_local_dev_store_graph(
             crate::outbound::MutableOutboundDeliveryTargetRegistry::default(),
         ),
         skill_auto_activate_learned: Arc::new(AtomicBool::new(true)),
-        #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
         outbound_state: outbound_stores.outbound_state,
         #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
         delivered_gate_routes: outbound_stores.delivered_gate_routes,
@@ -3862,7 +3859,6 @@ fn local_dev_scoped_filesystem(
 /// See docs/plans/2026-05-29-trigger-loop-delivery-resolution-implementation.md.
 pub(crate) struct OutboundStores {
     pub(crate) outbound_preferences: Arc<dyn CommunicationPreferenceRepository>,
-    #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
     pub(crate) outbound_state: Arc<dyn OutboundStateStore>,
     #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
     pub(crate) delivered_gate_routes: Arc<dyn DeliveredGateRouteStore>,
@@ -3885,7 +3881,6 @@ fn local_dev_outbound_store(filesystem: Arc<CompositeRootFilesystem>) -> Outboun
     );
     OutboundStores {
         outbound_preferences: Arc::clone(&store) as Arc<dyn CommunicationPreferenceRepository>,
-        #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
         outbound_state: Arc::clone(&store) as Arc<dyn OutboundStateStore>,
         #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
         delivered_gate_routes: Arc::clone(&store) as Arc<dyn DeliveredGateRouteStore>,
