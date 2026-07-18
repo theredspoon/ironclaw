@@ -3,12 +3,32 @@ use crate::matrix_outbound::fakes::{
     FakeMatrixCredentialResolver, FakeMatrixDeliveryPort, FakeMatrixOutboundMetadataStore,
     route_forgery_fixture,
 };
+use crate::matrix_product_outbound::{
+    DefaultMatrixOutboundPolicyAuthorizer, MatrixOutboundPolicyAuthorizer,
+    MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryRequest,
+    prepare_and_render_matrix_product_outbound,
+};
 use async_trait::async_trait;
 use ironclaw_event_projections::ProjectionCursor;
+use ironclaw_extensions::{
+    ExtensionActivationState, ExtensionInstallation, ExtensionInstallationId,
+    ExtensionInstallationStore, ExtensionManifestRecord, ExtensionManifestRef,
+    InMemoryExtensionInstallationStore, InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash,
+    ManifestSource,
+};
 use ironclaw_filesystem::{CasExpectation, InMemoryBackend, ScopedFilesystem};
 use ironclaw_host_api::{
-    AgentId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId, TenantId, ThreadId,
-    UserId, VirtualPath,
+    AgentId, ExtensionId, HostPortCatalog, MountAlias, MountGrant, MountPermissions, MountView,
+    ProjectId, TenantId, ThreadId, UserId, VirtualPath,
+};
+use ironclaw_matrix_adapter::installation_policy::{
+    EgressTargetIndex as AdapterEgressTargetIndex,
+    MatrixHomeserverOrigin as AdapterMatrixHomeserverOrigin,
+    MatrixInstallationPolicyRejection as AdapterMatrixInstallationPolicyRejection,
+    MatrixOutboundPolicyCheck as AdapterMatrixOutboundPolicyCheck,
+    MatrixPolicySnapshot as AdapterMatrixPolicySnapshot, MatrixRoomId as AdapterMatrixRoomId,
+    MatrixUserId as AdapterMatrixUserId, PolicyRevision as AdapterPolicyRevision,
+    authorize_matrix_outbound as authorize_adapter_matrix_outbound,
 };
 use ironclaw_matrix_adapter::{
     MatrixParsePolicy, MatrixProductAdapter, MatrixProductAdapterConfig,
@@ -31,9 +51,8 @@ use ironclaw_product_adapters::{
     ProductRenderOutcome, ProjectionCursor as ProductProjectionCursor,
 };
 use ironclaw_product_workflow::{
-    ProductOutboundDeliveryOutcome, ProductOutboundDeliveryRequest, ProductOutboundTargetResolver,
-    ProductWorkflowError, VerifiedProductOutboundTargetMetadata,
-    prepare_and_render_product_outbound,
+    ProductOutboundDeliveryOutcome, ProductOutboundTargetResolver, ProductWorkflowError,
+    VerifiedProductOutboundTargetMetadata,
 };
 use ironclaw_turns::{TurnActor, TurnRunId};
 use serde_json::json;
@@ -567,6 +586,10 @@ impl RecordingReplyTargetBindingValidator {
             .expect("validator lock")
             .insert(target);
     }
+
+    fn calls(&self) -> Vec<ReplyTargetBindingRef> {
+        self.calls.lock().expect("validator lock").clone()
+    }
 }
 
 #[async_trait]
@@ -647,26 +670,91 @@ impl CommunicationPreferenceRepository for RecordingPreferenceRepository {
     }
 }
 
-#[derive(Default)]
-struct RecordingProductOutboundTargetResolver;
+#[derive(Debug)]
+struct RecordingProductOutboundTargetResolver {
+    calls: Mutex<Vec<ReplyTargetBindingRef>>,
+    room_id: String,
+    fail: bool,
+}
+
+impl Default for RecordingProductOutboundTargetResolver {
+    fn default() -> Self {
+        Self {
+            calls: Mutex::default(),
+            room_id: "!room:example.org".to_string(),
+            fail: false,
+        }
+    }
+}
+
+impl RecordingProductOutboundTargetResolver {
+    fn for_room(room_id: impl Into<String>) -> Self {
+        Self {
+            room_id: room_id.into(),
+            ..Default::default()
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            fail: true,
+            ..Default::default()
+        }
+    }
+
+    fn calls(&self) -> Vec<ReplyTargetBindingRef> {
+        self.calls.lock().expect("target resolver lock").clone()
+    }
+}
 
 #[async_trait]
 impl ProductOutboundTargetResolver for RecordingProductOutboundTargetResolver {
     async fn resolve_product_outbound_target_metadata(
         &self,
-        _target: &ironclaw_outbound::ValidatedReplyTargetBinding,
+        target: &ironclaw_outbound::ValidatedReplyTargetBinding,
         _require_direct_message: bool,
     ) -> Result<VerifiedProductOutboundTargetMetadata, ProductWorkflowError> {
+        self.calls
+            .lock()
+            .expect("target resolver lock")
+            .push(target.target().clone());
+        if self.fail {
+            return Err(ProductWorkflowError::BindingRequired {
+                reason: "Matrix target not resolved".to_string(),
+            });
+        }
         Ok(VerifiedProductOutboundTargetMetadata {
             external_conversation_ref: ExternalConversationRef::new(
                 None,
-                "!room:example.org",
+                &self.room_id,
                 Some("$root:example.org"),
                 Some("$reply:example.org"),
             )
             .expect("valid Matrix conversation ref"),
             external_actor_ref: None,
         })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecordingMatrixOutboundPolicyAuthorizer {
+    calls: Mutex<Vec<AdapterMatrixOutboundPolicyCheck>>,
+}
+
+impl RecordingMatrixOutboundPolicyAuthorizer {
+    fn calls(&self) -> Vec<AdapterMatrixOutboundPolicyCheck> {
+        self.calls.lock().expect("policy lock").clone()
+    }
+}
+
+impl MatrixOutboundPolicyAuthorizer for RecordingMatrixOutboundPolicyAuthorizer {
+    fn authorize_matrix_outbound(
+        &self,
+        snapshot: &AdapterMatrixPolicySnapshot,
+        check: &AdapterMatrixOutboundPolicyCheck,
+    ) -> Result<(), AdapterMatrixInstallationPolicyRejection> {
+        self.calls.lock().expect("policy lock").push(check.clone());
+        authorize_adapter_matrix_outbound(snapshot, check)
     }
 }
 
@@ -683,6 +771,87 @@ fn matrix_product_adapter() -> MatrixProductAdapter {
         },
     })
     .expect("explicit Matrix policy")
+}
+
+fn matrix_policy_snapshot() -> AdapterMatrixPolicySnapshot {
+    AdapterMatrixPolicySnapshot {
+        adapter_id: ProductAdapterId::new("matrix").expect("valid adapter id"),
+        installation_id: AdapterInstallationId::new("inst_matrix").expect("valid installation id"),
+        homeserver: AdapterMatrixHomeserverOrigin::parse("https://matrix.example.org")
+            .expect("homeserver"),
+        allowed_rooms: std::collections::BTreeSet::from([AdapterMatrixRoomId::new(
+            "!room:example.org",
+        )
+        .expect("room")]),
+        allowed_senders: std::collections::BTreeSet::from([AdapterMatrixUserId::new(
+            "@alice:example.org",
+        )
+        .expect("sender")]),
+        egress_target_index: AdapterEgressTargetIndex::new(0),
+        credential_handle: ironclaw_product_adapters::EgressCredentialHandle::new(
+            "matrix-access-token",
+        )
+        .expect("credential handle"),
+        policy_revision: AdapterPolicyRevision::new(7).expect("policy revision"),
+    }
+}
+
+async fn matrix_extension_store(
+    activation: ExtensionActivationState,
+) -> InMemoryExtensionInstallationStore {
+    let store = InMemoryExtensionInstallationStore::default();
+    let manifest = matrix_extension_manifest();
+    let installation = ExtensionInstallation::new(
+        ExtensionInstallationId::new("inst_matrix").expect("extension installation id"),
+        ExtensionId::new("matrix-component").expect("extension id"),
+        activation,
+        ExtensionManifestRef::new(
+            ExtensionId::new("matrix-component").expect("extension id"),
+            Some(ManifestHash::new("sha256:matrix-component").expect("manifest hash")),
+        ),
+        vec![],
+        Utc::now(),
+        InstallationOwner::Tenant,
+    )
+    .expect("extension installation");
+    store
+        .upsert_manifest_and_installation(manifest, installation)
+        .await
+        .expect("seed Matrix extension lifecycle");
+    store
+}
+
+fn matrix_extension_manifest() -> ExtensionManifestRecord {
+    ExtensionManifestRecord::from_toml(
+        format!(
+            r#"
+schema_version = "{schema}"
+id = "matrix-component"
+name = "Matrix Component"
+version = "0.1.0"
+description = "Matrix ProductAdapter test component"
+trust = "third_party"
+
+[runtime]
+kind = "wasm"
+module = "wasm/matrix.wasm"
+
+[[capabilities]]
+id = "matrix-component.echo"
+description = "Echoes input"
+default_permission = "allow"
+visibility = "model"
+input_schema_ref = "schemas/matrix/echo.input.v1.json"
+output_schema_ref = "schemas/matrix/echo.output.v1.json"
+prompt_doc_ref = "prompts/matrix/echo.md"
+"#,
+            schema = MANIFEST_SCHEMA_VERSION
+        ),
+        ManifestSource::HostBundled,
+        &HostPortCatalog::empty(),
+        Some(ManifestHash::new("sha256:matrix-component").expect("manifest hash")),
+    )
+    .expect("Matrix extension manifest")
 }
 
 fn workflow_actor() -> TurnActor {
@@ -1350,18 +1519,23 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
     validator.allow(workflow_reply_target());
     let preferences = RecordingPreferenceRepository::default();
     preferences.seed(workflow_preference_record(&workflow_scope));
-    let resolver = RecordingProductOutboundTargetResolver;
+    let resolver = RecordingProductOutboundTargetResolver::default();
     let access_policy = AllowAllProjectionAccessPolicy;
     let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
     let adapter = matrix_product_adapter();
+    let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
+    let policy_authorizer = DefaultMatrixOutboundPolicyAuthorizer;
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
-    let outcome = prepare_and_render_product_outbound(
-        &outbound_policy,
-        &preferences,
-        &resolver,
-        ProductOutboundDeliveryRequest {
+    let outcome =
+        prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+            extension_installation_store: &extension_store,
+            snapshot: matrix_policy_snapshot(),
+            policy_authorizer: &policy_authorizer,
+            outbound_policy: &outbound_policy,
+            communication_preferences: &preferences,
+            target_resolver: &resolver,
             delivery: requested_matrix_delivery(workflow_scope.clone()),
             payload: matrix_workflow_payload(),
             projection_cursor: ProductProjectionCursor::new("cursor:matrix:composition-bridge")
@@ -1370,10 +1544,9 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
             egress: &egress,
             delivery_sink: &delivery_sink,
             require_direct_message_target: false,
-        },
-    )
-    .await
-    .expect("Matrix adapter should render through shared ProductWorkflow outbound");
+        })
+        .await
+        .expect("Matrix adapter should render through shared ProductWorkflow outbound");
 
     let ProductOutboundDeliveryOutcome::Rendered {
         attempt: outbound_attempt,
@@ -1449,6 +1622,313 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
     assert_eq!(store.statuses(), vec![OutboundDeliveryStatus::Delivered]);
     assert_eq!(store.failure_kinds(), vec![None]);
     assert_eq!(store.evidence().len(), 1);
+}
+
+#[tokio::test]
+async fn matrix_product_outbound_disabled_lifecycle_rejects_before_target_resolution_policy_or_render()
+ {
+    let workflow_scope = scope();
+    let outbound_store = in_memory_backed_outbound_state_store();
+    let validator = RecordingReplyTargetBindingValidator::default();
+    validator.allow(workflow_reply_target());
+    let preferences = RecordingPreferenceRepository::default();
+    preferences.seed(workflow_preference_record(&workflow_scope));
+    let resolver = RecordingProductOutboundTargetResolver::default();
+    let access_policy = AllowAllProjectionAccessPolicy;
+    let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
+    let adapter = matrix_product_adapter();
+    let extension_store = matrix_extension_store(ExtensionActivationState::Disabled).await;
+    let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let delivery_sink = FakeOutboundDeliverySink::new();
+
+    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+        extension_installation_store: &extension_store,
+        snapshot: matrix_policy_snapshot(),
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        delivery: requested_matrix_delivery(workflow_scope.clone()),
+        payload: matrix_workflow_payload(),
+        projection_cursor: ProductProjectionCursor::new("cursor:matrix:disabled")
+            .expect("valid projection cursor"),
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+        require_direct_message_target: false,
+    })
+    .await
+    .expect_err("disabled lifecycle should fail before target resolution");
+
+    assert!(matches!(
+        error,
+        MatrixProductOutboundDeliveryError::Lifecycle(
+            AdapterMatrixInstallationPolicyRejection::InstallationDisabled
+        )
+    ));
+    assert!(validator.calls().is_empty());
+    assert!(resolver.calls().is_empty());
+    assert!(policy_authorizer.calls().is_empty());
+    assert!(egress.calls().is_empty());
+    assert!(delivery_sink.statuses().is_empty());
+    assert!(
+        outbound_store
+            .list_delivery_attempts(workflow_scope)
+            .await
+            .expect("list attempts")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn matrix_product_outbound_deleting_lifecycle_rejects_before_target_resolution_policy_or_render()
+ {
+    let workflow_scope = scope();
+    let outbound_store = in_memory_backed_outbound_state_store();
+    let validator = RecordingReplyTargetBindingValidator::default();
+    validator.allow(workflow_reply_target());
+    let preferences = RecordingPreferenceRepository::default();
+    preferences.seed(workflow_preference_record(&workflow_scope));
+    let resolver = RecordingProductOutboundTargetResolver::default();
+    let access_policy = AllowAllProjectionAccessPolicy;
+    let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
+    let adapter = matrix_product_adapter();
+    let extension_store = InMemoryExtensionInstallationStore::default();
+    let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let delivery_sink = FakeOutboundDeliverySink::new();
+
+    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+        extension_installation_store: &extension_store,
+        snapshot: matrix_policy_snapshot(),
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        delivery: requested_matrix_delivery(workflow_scope.clone()),
+        payload: matrix_workflow_payload(),
+        projection_cursor: ProductProjectionCursor::new("cursor:matrix:deleting")
+            .expect("valid projection cursor"),
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+        require_direct_message_target: false,
+    })
+    .await
+    .expect_err("deleting lifecycle should fail before target resolution");
+
+    assert!(matches!(
+        error,
+        MatrixProductOutboundDeliveryError::Lifecycle(
+            AdapterMatrixInstallationPolicyRejection::InstallationDeleting
+        )
+    ));
+    assert!(validator.calls().is_empty());
+    assert!(resolver.calls().is_empty());
+    assert!(policy_authorizer.calls().is_empty());
+    assert!(egress.calls().is_empty());
+    assert!(delivery_sink.statuses().is_empty());
+    assert!(
+        outbound_store
+            .list_delivery_attempts(workflow_scope)
+            .await
+            .expect("list attempts")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn matrix_product_outbound_unresolved_target_stops_before_matrix_policy_and_render() {
+    let workflow_scope = scope();
+    let outbound_store = in_memory_backed_outbound_state_store();
+    let validator = RecordingReplyTargetBindingValidator::default();
+    validator.allow(workflow_reply_target());
+    let preferences = RecordingPreferenceRepository::default();
+    preferences.seed(workflow_preference_record(&workflow_scope));
+    let resolver = RecordingProductOutboundTargetResolver::failing();
+    let access_policy = AllowAllProjectionAccessPolicy;
+    let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
+    let adapter = matrix_product_adapter();
+    let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
+    let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let delivery_sink = FakeOutboundDeliverySink::new();
+
+    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+        extension_installation_store: &extension_store,
+        snapshot: matrix_policy_snapshot(),
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        delivery: requested_matrix_delivery(workflow_scope.clone()),
+        payload: matrix_workflow_payload(),
+        projection_cursor: ProductProjectionCursor::new("cursor:matrix:unresolved")
+            .expect("valid projection cursor"),
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+        require_direct_message_target: false,
+    })
+    .await
+    .expect_err("unresolved target should stop before Matrix policy");
+
+    assert!(matches!(
+        error,
+        MatrixProductOutboundDeliveryError::TargetResolution { .. }
+    ));
+    assert_eq!(validator.calls(), vec![workflow_reply_target()]);
+    assert_eq!(resolver.calls(), vec![workflow_reply_target()]);
+    assert!(policy_authorizer.calls().is_empty());
+    assert!(egress.calls().is_empty());
+    assert!(delivery_sink.statuses().is_empty());
+    let attempts = outbound_store
+        .list_delivery_attempts(workflow_scope)
+        .await
+        .expect("list attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, OutboundDeliveryStatus::Failed);
+    assert_eq!(
+        attempts[0].failure_kind,
+        Some(DeliveryFailureKind::Rejected)
+    );
+}
+
+#[tokio::test]
+async fn matrix_product_outbound_invalid_resolved_room_reports_policy_stage_without_render() {
+    let workflow_scope = scope();
+    let outbound_store = in_memory_backed_outbound_state_store();
+    let validator = RecordingReplyTargetBindingValidator::default();
+    validator.allow(workflow_reply_target());
+    let preferences = RecordingPreferenceRepository::default();
+    preferences.seed(workflow_preference_record(&workflow_scope));
+    let resolver = RecordingProductOutboundTargetResolver::for_room("not-a-matrix-room");
+    let access_policy = AllowAllProjectionAccessPolicy;
+    let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
+    let adapter = matrix_product_adapter();
+    let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
+    let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let delivery_sink = FakeOutboundDeliverySink::new();
+
+    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+        extension_installation_store: &extension_store,
+        snapshot: matrix_policy_snapshot(),
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        delivery: requested_matrix_delivery(workflow_scope.clone()),
+        payload: matrix_workflow_payload(),
+        projection_cursor: ProductProjectionCursor::new("cursor:matrix:invalid-room")
+            .expect("valid projection cursor"),
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+        require_direct_message_target: false,
+    })
+    .await
+    .expect_err("invalid Matrix room should be reported as a Matrix policy-stage failure");
+
+    assert!(matches!(
+        error,
+        MatrixProductOutboundDeliveryError::Policy {
+            rejection: AdapterMatrixInstallationPolicyRejection::InvalidPolicyValue,
+            ..
+        }
+    ));
+    assert_eq!(validator.calls(), vec![workflow_reply_target()]);
+    assert_eq!(resolver.calls(), vec![workflow_reply_target()]);
+    assert!(policy_authorizer.calls().is_empty());
+    assert!(egress.calls().is_empty());
+    assert!(delivery_sink.statuses().is_empty());
+    let attempts = outbound_store
+        .list_delivery_attempts(workflow_scope)
+        .await
+        .expect("list attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, OutboundDeliveryStatus::Failed);
+    assert_eq!(
+        attempts[0].failure_kind,
+        Some(DeliveryFailureKind::Rejected)
+    );
+    assert!(
+        adapter
+            .pending_matrix_intent(attempts[0].delivery_id.as_uuid())
+            .is_none(),
+        "policy-check construction failure must not leave a pending Matrix intent"
+    );
+}
+
+#[tokio::test]
+async fn matrix_product_outbound_policy_denial_after_target_resolution_stops_before_render() {
+    let workflow_scope = scope();
+    let outbound_store = in_memory_backed_outbound_state_store();
+    let validator = RecordingReplyTargetBindingValidator::default();
+    validator.allow(workflow_reply_target());
+    let preferences = RecordingPreferenceRepository::default();
+    preferences.seed(workflow_preference_record(&workflow_scope));
+    let resolver = RecordingProductOutboundTargetResolver::for_room("!other:example.org");
+    let access_policy = AllowAllProjectionAccessPolicy;
+    let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
+    let adapter = matrix_product_adapter();
+    let extension_store = matrix_extension_store(ExtensionActivationState::Enabled).await;
+    let policy_authorizer = RecordingMatrixOutboundPolicyAuthorizer::default();
+    let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
+    let delivery_sink = FakeOutboundDeliverySink::new();
+
+    let error = prepare_and_render_matrix_product_outbound(MatrixProductOutboundDeliveryRequest {
+        extension_installation_store: &extension_store,
+        snapshot: matrix_policy_snapshot(),
+        policy_authorizer: &policy_authorizer,
+        outbound_policy: &outbound_policy,
+        communication_preferences: &preferences,
+        target_resolver: &resolver,
+        delivery: requested_matrix_delivery(workflow_scope.clone()),
+        payload: matrix_workflow_payload(),
+        projection_cursor: ProductProjectionCursor::new("cursor:matrix:policy-denied")
+            .expect("valid projection cursor"),
+        adapter: &adapter,
+        egress: &egress,
+        delivery_sink: &delivery_sink,
+        require_direct_message_target: false,
+    })
+    .await
+    .expect_err("policy-denied Matrix room should not render");
+
+    assert!(matches!(
+        error,
+        MatrixProductOutboundDeliveryError::Policy {
+            rejection: AdapterMatrixInstallationPolicyRejection::RoomNotAllowed,
+            ..
+        }
+    ));
+    assert_eq!(validator.calls(), vec![workflow_reply_target()]);
+    assert_eq!(resolver.calls(), vec![workflow_reply_target()]);
+    assert_eq!(policy_authorizer.calls().len(), 1);
+    assert_eq!(
+        policy_authorizer.calls()[0].room_id.as_str(),
+        "!other:example.org"
+    );
+    assert!(egress.calls().is_empty());
+    assert!(delivery_sink.statuses().is_empty());
+    let attempts = outbound_store
+        .list_delivery_attempts(workflow_scope)
+        .await
+        .expect("list attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, OutboundDeliveryStatus::Failed);
+    assert_eq!(
+        attempts[0].failure_kind,
+        Some(DeliveryFailureKind::Rejected)
+    );
+    assert!(
+        adapter
+            .pending_matrix_intent(attempts[0].delivery_id.as_uuid())
+            .is_none(),
+        "Matrix policy denial must not leave a pending Matrix intent"
+    );
 }
 
 #[tokio::test]
