@@ -5,7 +5,7 @@ use ironclaw_extensions::ExtensionInstallationStore;
 use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{ResourceScope, ScopedPath};
 use ironclaw_matrix_adapter::installation_policy::{
-    MatrixInstallationPolicyRejection, MatrixInstallationProjectionCache,
+    MatrixActivationState, MatrixInstallationPolicyRejection, MatrixInstallationProjectionCache,
     MatrixOutboundPolicyCheck, MatrixPolicySnapshot, MatrixRoomId, authorize_matrix_outbound,
     ensure_matrix_extension_lifecycle_enabled,
 };
@@ -106,6 +106,15 @@ where
             .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
         if &installation.adapter_id != adapter_id {
             return Err(MatrixInstallationPolicyRejection::AdapterMismatch);
+        }
+        match installation.activation {
+            MatrixActivationState::Enabled => {}
+            MatrixActivationState::Disabled => {
+                return Err(MatrixInstallationPolicyRejection::InstallationDisabled);
+            }
+            MatrixActivationState::Deleting => {
+                return Err(MatrixInstallationPolicyRejection::InstallationDeleting);
+            }
         }
         Ok(MatrixPolicySnapshot {
             adapter_id: installation.adapter_id.clone(),
@@ -410,11 +419,8 @@ fn matrix_outbound_policy_check_from_envelope(
             .conversation_id()
             .to_string(),
     )?;
-    let path = format!(
-        "/_matrix/client/v3/rooms/{}/send/m.room.message/ironclaw-{}",
-        room_id.as_str(),
-        envelope.delivery_attempt_id
-    );
+    let transaction_id = format!("ironclaw-{}", envelope.delivery_attempt_id);
+    let path = crate::matrix_outbound::matrix_send_policy_path(room_id.as_str(), &transaction_id);
     Ok(MatrixOutboundPolicyCheck {
         adapter_id: envelope.adapter_id.clone(),
         installation_id: envelope.installation_id.clone(),

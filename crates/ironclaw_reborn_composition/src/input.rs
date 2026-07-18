@@ -33,7 +33,7 @@ use ironclaw_reborn_event_store::{PostgresPoolTlsOptions, RebornPostgresSslMode}
 #[cfg(feature = "postgres")]
 use crate::RebornBuildError;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use crate::matrix_outbound::{MatrixRetryWorkerSettings, MatrixRoomId};
+use crate::matrix_outbound::MatrixRetryWorkerSettings;
 use crate::product_auth::oauth::google_oauth::google_provider_spec;
 use crate::product_auth::oauth::notion_oauth::notion_provider_spec;
 use crate::product_auth::oauth::oauth_dcr::OAuthDcrProviderConfig;
@@ -124,8 +124,6 @@ pub(crate) struct MatrixRetryProductionConfig {
     pub(crate) settings: MatrixRetryWorkerSettings,
     pub(crate) scopes: Vec<TurnScope>,
     pub(crate) homeserver_origin: String,
-    pub(crate) policy_revision: String,
-    pub(crate) allowed_room_fingerprints: Vec<String>,
     pub(crate) credential_secret: SecretHandle,
     pub(crate) credential_handle_fingerprint: String,
     pub(crate) capability_id: CapabilityId,
@@ -137,8 +135,6 @@ pub struct MatrixRetryWorkerProductionConfig {
     settings: MatrixRetryWorkerSettings,
     scopes: Vec<TurnScope>,
     homeserver_origin: String,
-    policy_revision: String,
-    allowed_room_ids: Vec<MatrixRoomId>,
     credential_secret: SecretHandle,
     credential_handle_fingerprint: String,
     capability_id: CapabilityId,
@@ -150,8 +146,6 @@ pub struct MatrixRetryWorkerProductionConfigInput {
     pub settings: MatrixRetryWorkerSettings,
     pub scopes: Vec<TurnScope>,
     pub homeserver_origin: String,
-    pub policy_revision: String,
-    pub allowed_room_ids: Vec<MatrixRoomId>,
     pub credential_secret: SecretHandle,
     pub credential_handle_fingerprint: String,
     pub capability_id: CapabilityId,
@@ -164,8 +158,6 @@ impl MatrixRetryWorkerProductionConfig {
             settings: input.settings,
             scopes: input.scopes,
             homeserver_origin: input.homeserver_origin,
-            policy_revision: input.policy_revision,
-            allowed_room_ids: input.allowed_room_ids,
             credential_secret: input.credential_secret,
             credential_handle_fingerprint: input.credential_handle_fingerprint,
             capability_id: input.capability_id,
@@ -176,19 +168,21 @@ impl MatrixRetryWorkerProductionConfig {
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 impl From<MatrixRetryWorkerProductionConfig> for MatrixRetryProductionConfig {
     fn from(config: MatrixRetryWorkerProductionConfig) -> Self {
+        let MatrixRetryWorkerProductionConfig {
+            settings,
+            scopes,
+            homeserver_origin,
+            credential_secret,
+            credential_handle_fingerprint,
+            capability_id,
+        } = config;
         Self {
-            settings: config.settings,
-            scopes: config.scopes,
-            homeserver_origin: config.homeserver_origin,
-            policy_revision: config.policy_revision,
-            allowed_room_fingerprints: config
-                .allowed_room_ids
-                .into_iter()
-                .map(|room_id| room_id.fingerprint())
-                .collect(),
-            credential_secret: config.credential_secret,
-            credential_handle_fingerprint: config.credential_handle_fingerprint,
-            capability_id: config.capability_id,
+            settings,
+            scopes,
+            homeserver_origin,
+            credential_secret,
+            credential_handle_fingerprint,
+            capability_id,
         }
     }
 }

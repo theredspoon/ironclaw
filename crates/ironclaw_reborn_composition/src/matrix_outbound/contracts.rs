@@ -16,6 +16,16 @@ pub struct MatrixOutboundCommand {
     pub body: MatrixMessageBody,
 }
 
+pub(crate) const MATRIX_SEND_PATH_PREFIX: &str = "/_matrix/client/v3/rooms/";
+pub(crate) const MATRIX_SEND_EVENT_PATH: &str = "/send/m.room.message/";
+
+pub(crate) fn matrix_send_policy_path(room_id: &str, transaction_id: &str) -> String {
+    // Policy authorization uses the logical Matrix path before HTTP delivery
+    // applies percent-encoding. The adapter policy rejects '%' so encoded path
+    // shapes cannot bypass room/transaction canonicalization checks.
+    format!("{MATRIX_SEND_PATH_PREFIX}{room_id}{MATRIX_SEND_EVENT_PATH}{transaction_id}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixPendingIntentBridgeContext {
     pub reply_target_binding_ref: ReplyTargetBindingRef,
@@ -486,6 +496,11 @@ impl MatrixErrcode {
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryReasonCode {
     UnauthorizedTarget,
+    InstallationInactive,
+    StalePolicyRevision,
+    CredentialMismatch,
+    RoomNotAllowed,
+    EgressTargetDenied,
     MissingMatrixRoute,
     UnsupportedMatrixCommand,
     MatrixRateLimited,
@@ -521,6 +536,15 @@ impl SafeOperatorSummary {
     pub fn for_reason(reason: DeliveryReasonCode) -> Self {
         let summary = match reason {
             DeliveryReasonCode::UnauthorizedTarget => "matrix delivery route is unauthorized",
+            DeliveryReasonCode::InstallationInactive => "matrix installation is inactive",
+            DeliveryReasonCode::StalePolicyRevision => "matrix policy revision is stale",
+            DeliveryReasonCode::CredentialMismatch => {
+                "matrix credential fingerprint no longer matches policy"
+            }
+            DeliveryReasonCode::RoomNotAllowed => "matrix room is not allowed by current policy",
+            DeliveryReasonCode::EgressTargetDenied => {
+                "matrix egress target is denied by current policy"
+            }
             DeliveryReasonCode::MissingMatrixRoute => "matrix delivery route is missing",
             DeliveryReasonCode::UnsupportedMatrixCommand => "matrix command is unsupported",
             DeliveryReasonCode::MatrixRateLimited => "matrix homeserver rate limited delivery",

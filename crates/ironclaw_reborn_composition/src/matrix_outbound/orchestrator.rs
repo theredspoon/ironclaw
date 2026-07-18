@@ -209,7 +209,12 @@ fn outbound_status_for_matrix_status(status: MatrixTerminalStatus) -> OutboundDe
 
 pub(crate) fn delivery_failure_kind_for_reason(reason: DeliveryReasonCode) -> DeliveryFailureKind {
     match reason {
-        DeliveryReasonCode::UnauthorizedTarget => DeliveryFailureKind::AuthorizationRevoked,
+        DeliveryReasonCode::UnauthorizedTarget
+        | DeliveryReasonCode::InstallationInactive
+        | DeliveryReasonCode::StalePolicyRevision
+        | DeliveryReasonCode::CredentialMismatch
+        | DeliveryReasonCode::RoomNotAllowed
+        | DeliveryReasonCode::EgressTargetDenied => DeliveryFailureKind::AuthorizationRevoked,
         DeliveryReasonCode::MatrixRateLimited => DeliveryFailureKind::RateLimited,
         DeliveryReasonCode::MatrixTimeout
         | DeliveryReasonCode::MatrixServerError
