@@ -827,6 +827,88 @@ async fn matrix_http_delivery_port_sends_one_attempt_through_runtime_egress() {
 }
 
 #[tokio::test]
+async fn matrix_http_delivery_port_records_redacted_send_observability() {
+    let origin = "https://matrix.example";
+    let command = command();
+    let route = route_for_homeserver_origin(origin);
+    let grant = SealedDeliveryGrant::mint_for_matrix(&owner(), &route);
+    let attempt = attempt(&route, &command);
+    let validated = validate_matrix_route_grant(&command, route, &grant)
+        .expect("route and grant should validate");
+    let endpoint = matrix_endpoint(origin);
+    let egress = Arc::new(RecordingMatrixHostEgress::ok(
+        200,
+        Vec::new(),
+        json!({"event_id":"$event:matrix.example"}),
+    ));
+    let port = MatrixHttpDeliveryPort::new(
+        egress,
+        Arc::new(StaticMatrixHttpEndpointResolver {
+            endpoint: Some(endpoint),
+        }),
+        matrix_credential_material_provider(),
+    );
+    let capture = observability::test_capture::start();
+
+    let result = port
+        .deliver(
+            ProtocolDeliveryIntent::Matrix(command.clone()),
+            validated,
+            ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            },
+            attempt.clone(),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            DeliveryPortResult::Accepted(ProtocolDeliveryEvidence::Matrix(_))
+        ),
+        "send should succeed before inspecting observability"
+    );
+    let events = capture.finish();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            observability::MatrixObservabilityEvent::SendAttemptStarted {
+                delivery_id,
+                attempt_number: 1,
+                command_kind: MatrixCommandKind::SendText,
+                homeserver_origin_fingerprint,
+                room_fingerprint,
+            } if *delivery_id == attempt.delivery_id
+                && homeserver_origin_fingerprint == &canonical_fingerprint(origin)
+                && room_fingerprint == &command.room_id.fingerprint()
+        )),
+        "send attempt start should be recorded with redacted route metadata: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            observability::MatrixObservabilityEvent::HttpResponseClassified {
+                delivery_id,
+                attempt_number: 1,
+                http_status: 200,
+                matrix_errcode: None,
+                reason: None,
+                homeserver_origin_fingerprint,
+                room_fingerprint,
+                ..
+            } if *delivery_id == attempt.delivery_id
+                && homeserver_origin_fingerprint == &canonical_fingerprint(origin)
+                && room_fingerprint == &command.room_id.fingerprint()
+        )),
+        "HTTP response classification should be recorded with redacted route metadata: {events:?}"
+    );
+    let debug = format!("{events:?}");
+    assert!(!debug.contains("!room:matrix.example"));
+    assert!(!debug.contains("$event:matrix.example"));
+    assert!(!debug.contains("matrix-access-token"));
+}
+
+#[tokio::test]
 async fn matrix_http_delivery_port_classifies_rate_limit_retry_hint() {
     let origin = "https://matrix.example";
     let command = command();
@@ -848,6 +930,7 @@ async fn matrix_http_delivery_port_classifies_rate_limit_retry_hint() {
         }),
         matrix_credential_material_provider(),
     );
+    let capture = observability::test_capture::start();
 
     let result = port
         .deliver(
@@ -869,6 +952,20 @@ async fn matrix_http_delivery_port_classifies_rate_limit_retry_hint() {
     assert_eq!(
         error.retry_hint.expect("retry hint").after,
         Duration::from_secs(5)
+    );
+    let events = capture.finish();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            observability::MatrixObservabilityEvent::HttpResponseClassified {
+                http_status: 429,
+                status_family: Some(HttpStatusFamily::ClientError),
+                matrix_errcode: Some(MatrixErrcode::LimitExceeded),
+                reason: Some(DeliveryReasonCode::MatrixRateLimited),
+                ..
+            }
+        )),
+        "rate-limit response classification should be recorded with bounded reason: {events:?}"
     );
 }
 
@@ -1199,6 +1296,50 @@ async fn orchestrator_consumes_pending_matrix_intent_and_records_delivered_evide
         store.evidence()[0].1.event_id_fingerprint,
         canonical_fingerprint("event-1")
     );
+}
+
+#[tokio::test]
+async fn orchestrator_records_redacted_delivery_status_observability() {
+    let command = command();
+    let route = route();
+    let owner = owner();
+    let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
+    let attempt_ctx = attempt(&route, &command);
+    let port = FakeMatrixDeliveryPort::default();
+    port.push_result(DeliveryPortResult::Accepted(
+        ProtocolDeliveryEvidence::Matrix(accepted_evidence(&command, &route, &attempt_ctx)),
+    ));
+    let credential_resolver =
+        FakeMatrixCredentialResolver::with_credential(ResolvedCredentialHandle {
+            credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+        });
+    let store = FakeMatrixOutboundMetadataStore::default();
+    let retry_policy = retry_policy();
+    let orchestrator =
+        MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+    let capture = observability::test_capture::start();
+
+    let outcome = orchestrator
+        .consume_pending_intent(command, route.clone(), grant, attempt_ctx.clone())
+        .await
+        .expect("pending intent should be consumed");
+
+    assert_eq!(outcome.status, MatrixTerminalStatus::Delivered);
+    let events = capture.finish();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            observability::MatrixObservabilityEvent::DeliveryStatusUpdated {
+                delivery_id,
+                status: MatrixTerminalStatus::Delivered,
+                reason: None,
+            } if *delivery_id == attempt_ctx.delivery_id
+        )),
+        "delivered status update should be recorded: {events:?}"
+    );
+    let debug = format!("{events:?}");
+    assert!(!debug.contains("!room:matrix.example"));
+    assert!(!debug.contains("event-1"));
 }
 
 #[tokio::test]
@@ -3981,8 +4122,14 @@ async fn orchestrator_terminalizes_invalid_accepted_evidence_after_retry_exhaust
     let retry_policy = retry_policy();
     let orchestrator =
         MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+    let capture = observability::test_capture::start();
     let error = orchestrator
-        .consume_pending_intent(command.clone(), route.clone(), grant, exhausted_attempt)
+        .consume_pending_intent(
+            command.clone(),
+            route.clone(),
+            grant,
+            exhausted_attempt.clone(),
+        )
         .await
         .expect_err("invalid accepted evidence at max attempts must terminalize");
 
@@ -3994,6 +4141,22 @@ async fn orchestrator_terminalizes_invalid_accepted_evidence_after_retry_exhaust
     );
     assert!(store.evidence().is_empty());
     assert!(store.retry_schedules().is_empty());
+    let events = capture.finish();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            observability::MatrixObservabilityEvent::DeliveryStatusUpdated {
+                delivery_id,
+                status: MatrixTerminalStatus::FailedExhausted,
+                reason: Some(DeliveryReasonCode::MatrixMalformedResponse),
+            } if *delivery_id == exhausted_attempt.delivery_id
+        )),
+        "terminal failed status update should be recorded: {events:?}"
+    );
+    let debug = format!("{events:?}");
+    assert!(!debug.contains("!room:matrix.example"));
+    assert!(!debug.contains("event-1"));
+    assert!(!debug.contains("credential-handle-1"));
 }
 
 #[tokio::test]
@@ -4051,6 +4214,7 @@ async fn orchestrator_schedules_retry_without_terminal_status_for_retryable_erro
     let retry_policy = retry_policy();
     let orchestrator =
         MatrixOutboundOrchestrator::new(&port, &credential_resolver, &store, &retry_policy);
+    let capture = observability::test_capture::start();
 
     let outcome = orchestrator
         .consume_pending_intent(
@@ -4078,6 +4242,18 @@ async fn orchestrator_schedules_retry_without_terminal_status_for_retryable_erro
     assert_eq!(retry_schedules[0].attempt_number, 1);
     assert_eq!(retry_schedules[0].retry_after, Duration::from_secs(1));
     assert_eq!(retry_schedules[0].reason, DeliveryReasonCode::MatrixTimeout);
+    let events = capture.finish();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            observability::MatrixObservabilityEvent::DeliveryStatusUpdated {
+                delivery_id,
+                status: MatrixTerminalStatus::RetryScheduled,
+                reason: Some(DeliveryReasonCode::MatrixTimeout),
+            } if *delivery_id == route.delivery_id
+        )),
+        "retry-scheduled status update should be recorded: {events:?}"
+    );
 }
 
 #[test]

@@ -153,6 +153,11 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                         retry_context,
                     )
                     .await?;
+                observability::record_delivery_status_updated(
+                    attempt.delivery_id,
+                    MatrixTerminalStatus::RetryScheduled,
+                    Some(reason),
+                );
                 Ok(MatrixOrchestratorOutcome {
                     status: MatrixTerminalStatus::RetryScheduled,
                     retry: Some(decision),
@@ -186,7 +191,9 @@ impl<'a> MatrixOutboundOrchestrator<'a> {
                 updated_at: Utc::now(),
                 failure_kind: reason.map(delivery_failure_kind_for_reason),
             })
-            .await
+            .await?;
+        observability::record_delivery_status_updated(delivery_id, status, reason);
+        Ok(())
     }
 }
 
