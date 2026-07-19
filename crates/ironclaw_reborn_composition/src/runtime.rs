@@ -115,7 +115,9 @@ use ironclaw_turns::run_profile::UserProfileContext;
 
 use self::latency::{trace_runtime_latency_error, trace_runtime_latency_ok};
 use self::runtime_turn_scheduler::RuntimeTurnScheduler;
-use crate::extension_host::extension_lifecycle::SharedExtensionInstallationStore;
+use crate::extension_host::extension_lifecycle::{
+    LifecyclePolicyProjectionCacheRefresher, SharedExtensionInstallationStore,
+};
 use crate::factory::{LocalDevTurnStateStore, builtin_extension_registry};
 use crate::local_dev_capability_policy::{LocalDevCapabilityPolicy, local_dev_capability_policy};
 use crate::matrix_outbound::{
@@ -3770,6 +3772,11 @@ pub async fn build_reborn_runtime(
             );
             if let Some(extension_management) = local_extension_management.as_ref() {
                 extension_management.set_policy_projection_cache_refresher(refresher.clone());
+            }
+            if let Some(product_auth) = services.product_auth.as_ref() {
+                let credential_refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher> =
+                    refresher.clone();
+                product_auth.set_policy_projection_cache_refresher(credential_refresher);
             }
             (Some(target_source), Some(refresher))
         } else {

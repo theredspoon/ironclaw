@@ -53,6 +53,12 @@ pub(crate) trait ExtensionCredentialCleanup: Send + Sync {
 
 #[async_trait]
 pub(crate) trait LifecyclePolicyProjectionCacheRefresher: Send + Sync {
+    async fn invalidate_before_credential_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError>;
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         scope: &ResourceScope,
@@ -77,6 +83,14 @@ struct NoopLifecyclePolicyProjectionCacheRefresher;
 
 #[async_trait]
 impl LifecyclePolicyProjectionCacheRefresher for NoopLifecyclePolicyProjectionCacheRefresher {
+    async fn invalidate_before_credential_lifecycle_mutation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        Ok(())
+    }
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         _scope: &ResourceScope,
@@ -1222,6 +1236,7 @@ impl RebornLocalExtensionManagementPort {
             ));
         }
         self.enable_lifecycle_package(extension_id).await?;
+        let policy_projection_refresher = self.policy_projection_cache_refresher();
         if let Err(error) = self
             .installation_store
             .set_activation_state(installation_id, ExtensionActivationState::Enabled)
@@ -1236,7 +1251,6 @@ impl RebornLocalExtensionManagementPort {
             }
             return Err(map_extension_installation_error(error));
         }
-        let policy_projection_refresher = self.policy_projection_cache_refresher();
         if let Err(error) = policy_projection_refresher
             .prepare_lifecycle_activation_refresh(scope, extension_id)
             .await
@@ -2823,6 +2837,10 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum LifecyclePolicyProjectionRefreshCall {
+        InvalidateBeforeCredentialLifecycleMutation {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
         PrepareActivation {
             scope: ResourceScope,
             extension_id: ExtensionId,
@@ -2860,6 +2878,23 @@ mod tests {
 
     #[async_trait]
     impl LifecyclePolicyProjectionCacheRefresher for RecordingLifecyclePolicyProjectionCacheRefresher {
+        async fn invalidate_before_credential_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    LifecyclePolicyProjectionRefreshCall::InvalidateBeforeCredentialLifecycleMutation {
+                        scope: scope.clone(),
+                        extension_id: extension_id.clone(),
+                    },
+                );
+            Ok(())
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -2924,6 +2959,16 @@ mod tests {
 
     #[async_trait]
     impl LifecyclePolicyProjectionCacheRefresher for FailingLifecyclePolicyProjectionCacheRefresher {
+        async fn invalidate_before_credential_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -2984,6 +3029,16 @@ mod tests {
     impl LifecyclePolicyProjectionCacheRefresher
         for RemovalFailingLifecyclePolicyProjectionCacheRefresher
     {
+        async fn invalidate_before_credential_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -3038,6 +3093,16 @@ mod tests {
     impl LifecyclePolicyProjectionCacheRefresher
         for PublishFailingLifecyclePolicyProjectionCacheRefresher
     {
+        async fn invalidate_before_credential_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
