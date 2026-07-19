@@ -1444,9 +1444,6 @@ impl RebornLocalExtensionManagementPort {
                 caller,
             )
             .await?;
-            self.policy_projection_cache_refresher()
-                .refresh_after_lifecycle_removal(&removal_scope, &removed_extension_id)
-                .await?;
             let lifecycle_package_present = self
                 .lifecycle_service
                 .lock()
@@ -1454,6 +1451,12 @@ impl RebornLocalExtensionManagementPort {
                 .registry()
                 .get_extension(&extension_id)
                 .is_some();
+            let lifecycle_package_before_remove =
+                if installation.is_some() && lifecycle_package_present {
+                    Some(self.lifecycle_package(&extension_id).await?)
+                } else {
+                    None
+                };
             let response = if installation.is_some() && lifecycle_package_present {
                 self.remove_locked(package_ref.clone(), caller).await
             } else {
@@ -1483,6 +1486,44 @@ impl RebornLocalExtensionManagementPort {
                     },
                 ))
             }?;
+            if let Err(error) = self
+                .policy_projection_cache_refresher()
+                .refresh_after_lifecycle_removal(&removal_scope, &removed_extension_id)
+                .await
+            {
+                if let Some(installation) = installation.as_ref() {
+                    if let Some(package) = lifecycle_package_before_remove.as_ref() {
+                        let previous_state = installation.activation_state();
+                        if let Err(restore_error) = self
+                            .restore_lifecycle_package(package, previous_state)
+                            .await
+                        {
+                            return Err(compensation_failure(
+                                "extension remove policy projection invalidation failed and lifecycle restore failed",
+                                error,
+                                restore_error,
+                            ));
+                        }
+                        if let Err(restore_error) =
+                            self.restore_active_publication(package, previous_state)
+                        {
+                            return Err(compensation_failure(
+                                "extension remove policy projection invalidation failed and active publication restore failed",
+                                error,
+                                restore_error,
+                            ));
+                        }
+                    }
+                    if let Err(restore_error) = self.restore_installation(installation).await {
+                        return Err(compensation_failure(
+                            "extension remove policy projection invalidation failed and installation restore failed",
+                            error,
+                            restore_error,
+                        ));
+                    }
+                }
+                return Err(error);
+            }
             // `remove_locked` retains the manifest as a cleanup tombstone. A
             // membership-only removal leaves the shared installation in place,
             // so its manifest remains too.
@@ -2739,6 +2780,14 @@ mod tests {
         ExtensionRemovalCleanupContext, ExtensionRemovalCleanupRegistry,
         ExtensionRemovalCleanupRequirement,
     };
+    use crate::matrix_outbound_targets::{
+        MatrixConfiguredRoomRoute, MatrixOutboundTargetProviderConfig,
+    };
+    use crate::matrix_product_outbound::{
+        FilesystemMatrixPolicySnapshotSource, MatrixLifecyclePolicyProjectionCacheRefresher,
+        MatrixPolicySnapshotSource, matrix_policy_projection_cache_path_for_provider,
+        matrix_policy_projection_resource_scope_for_provider,
+    };
     use async_trait::async_trait;
     use ironclaw_extensions::{
         ExtensionLifecycleEvent, ExtensionLifecycleEventSink, ExtensionLifecycleService,
@@ -2756,6 +2805,11 @@ mod tests {
         TrustClass, UserId,
     };
     use ironclaw_host_runtime::{SPAWN_SUBAGENT_CAPABILITY_ID, builtin_first_party_package};
+    use ironclaw_matrix_adapter::installation_policy::{
+        ArtifactSha256, ComponentArtifactId, MatrixInstallationPolicyRejection,
+        MatrixRuntimeArtifactEvidence, MatrixUserId, WitPackageName, WitWorldName,
+    };
+    use ironclaw_product_adapters::{AdapterInstallationId, ProductAdapterId};
     use ironclaw_product_workflow::{
         LifecycleExtensionRuntimeKind, LifecycleExtensionSource, LifecycleProductAction,
         LifecycleProductContext, LifecycleProductFacade, LifecycleProductSurfaceContext,
@@ -3655,6 +3709,81 @@ mod tests {
             extension_id,
             &ExtensionId::new("matrix-product-adapter").expect("valid extension id")
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_remove_via_port_invalidates_authoritative_filesystem_projection() {
+        let (_dir, _storage_root, port, _active_registry, installation_store, filesystem) =
+            matrix_extension_management_fixture_with_refresher(Arc::new(
+                RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+            ));
+        let package_ref = matrix_lifecycle_package_ref();
+        let scope = matrix_lifecycle_resource_scope();
+        let installation_id =
+            AdapterInstallationId::new("matrix-product-adapter").expect("installation");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!matrix-lifecycle-remove:example.org".to_string(),
+                subject_user_id: scope.user_id.clone(),
+                matrix_sender_user_id: MatrixUserId::new("@matrix-lifecycle-remove:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let root_filesystem: Arc<dyn RootFilesystem> = filesystem.clone();
+        let refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::new(
+                root_filesystem,
+                installation_store.clone(),
+                vec![provider.clone()],
+                matrix_lifecycle_artifact_evidence(),
+                "matrix-lifecycle-policy-owner".to_string(),
+            )
+            .expect("real Matrix refresher config"),
+        );
+        port.set_policy_projection_cache_refresher(refresher);
+
+        port.install(package_ref.clone(), &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        port.activate_with_prechecked_credentials_for_test(
+            package_ref.clone(),
+            ExtensionActivationMode::Static,
+        )
+        .await
+        .expect("activate Matrix ProductAdapter extension");
+
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(filesystem),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect("activation publishes authoritative projection");
+
+        port.remove(package_ref, &scope, Some(&lifecycle_owner()))
+            .await
+            .expect("remove Matrix ProductAdapter extension");
+
+        let error = source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect_err("actual removal invalidates authoritative projection");
+        assert!(matches!(
+            error,
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
     }
 
     #[tokio::test]
@@ -9168,6 +9297,20 @@ output_schema_ref = "schemas/run.output.json"
             mission_id: None,
             thread_id: None,
             invocation_id: InvocationId::new(),
+        }
+    }
+
+    fn matrix_lifecycle_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
+        MatrixRuntimeArtifactEvidence {
+            artifact_id: ComponentArtifactId::new("matrix-lifecycle-component")
+                .expect("artifact id"),
+            artifact_sha256: ArtifactSha256::new(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .expect("artifact sha"),
+            wit_package: WitPackageName::new("near:matrix-lifecycle-adapter@0.1.0")
+                .expect("wit package"),
+            wit_world: WitWorldName::new("matrix-lifecycle-product-adapter").expect("wit world"),
         }
     }
 

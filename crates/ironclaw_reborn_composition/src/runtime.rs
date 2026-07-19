@@ -3453,6 +3453,13 @@ pub async fn build_reborn_runtime(
                 .to_string(),
         });
     }
+    if !matrix_outbound_target_providers.is_empty() && matrix_policy_projection_cache.is_none() {
+        return Err(RebornRuntimeError::InvalidArgument {
+            reason:
+                "RebornRuntimeInput.matrix_outbound_target_providers requires matrix_policy_projection_cache"
+                    .to_string(),
+        });
+    }
 
     let validated_identity = validate_runtime_identity(identity)?;
     services_input = services_input.with_local_runtime_identity(
