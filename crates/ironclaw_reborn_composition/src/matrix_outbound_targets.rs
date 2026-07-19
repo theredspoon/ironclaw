@@ -17,6 +17,7 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 
+use crate::matrix_outbound::MatrixPolicyProviderScope;
 use crate::matrix_outbound::MatrixRoomId;
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{
@@ -71,6 +72,7 @@ pub(crate) struct MatrixHostReplyTargetPolicy {
 pub(crate) struct ResolvedMatrixOutboundTarget {
     pub(crate) installation_id: AdapterInstallationId,
     pub(crate) policy_provider_scope_key: String,
+    pub(crate) policy_provider_scope: MatrixPolicyProviderScope,
     pub(crate) room_id: MatrixRoomId,
     pub(crate) reply_target_binding_ref: ReplyTargetBindingRef,
 }
@@ -121,6 +123,7 @@ impl MatrixHostProductOutboundTargetResolver {
                 Some(ResolvedMatrixOutboundTarget {
                     installation_id: provider.installation_id.clone(),
                     policy_provider_scope_key: provider.policy_provider_scope_key.clone(),
+                    policy_provider_scope: provider.policy_provider_scope(),
                     room_id: route.room_id.clone(),
                     reply_target_binding_ref: requested_target.clone(),
                 })
@@ -285,6 +288,14 @@ impl MatrixHostOutboundTargetProvider {
         caller.tenant_id == self.tenant_id
             && caller.agent_id.as_ref() == Some(&self.agent_id)
             && caller.project_id == self.project_id
+    }
+
+    fn policy_provider_scope(&self) -> MatrixPolicyProviderScope {
+        MatrixPolicyProviderScope {
+            tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
+            project_id: self.project_id.clone(),
+        }
     }
 
     fn route_key_for_target_id<'a>(

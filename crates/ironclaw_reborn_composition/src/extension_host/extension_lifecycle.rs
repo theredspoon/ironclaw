@@ -53,7 +53,13 @@ pub(crate) trait ExtensionCredentialCleanup: Send + Sync {
 
 #[async_trait]
 pub(crate) trait LifecyclePolicyProjectionCacheRefresher: Send + Sync {
-    async fn refresh_after_lifecycle_activation(
+    async fn prepare_lifecycle_activation_refresh(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError>;
+
+    async fn publish_prepared_lifecycle_activation_refresh(
         &self,
         scope: &ResourceScope,
         extension_id: &ExtensionId,
@@ -71,7 +77,15 @@ struct NoopLifecyclePolicyProjectionCacheRefresher;
 
 #[async_trait]
 impl LifecyclePolicyProjectionCacheRefresher for NoopLifecyclePolicyProjectionCacheRefresher {
-    async fn refresh_after_lifecycle_activation(
+    async fn prepare_lifecycle_activation_refresh(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn publish_prepared_lifecycle_activation_refresh(
         &self,
         _scope: &ResourceScope,
         _extension_id: &ExtensionId,
@@ -1192,8 +1206,12 @@ impl RebornLocalExtensionManagementPort {
             // claimant already activated this exact package. Treat that state
             // as the authoritative success instead of re-publishing and
             // risking a conflicting failure followed by credential rollback.
-            self.policy_projection_cache_refresher()
-                .refresh_after_lifecycle_activation(scope, extension_id)
+            let refresher = self.policy_projection_cache_refresher();
+            refresher
+                .prepare_lifecycle_activation_refresh(scope, extension_id)
+                .await?;
+            refresher
+                .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
                 .await?;
             return Ok(activation_success_response(
                 package_ref,
@@ -1216,9 +1234,9 @@ impl RebornLocalExtensionManagementPort {
             }
             return Err(map_extension_installation_error(error));
         }
-        if let Err(error) = self
-            .policy_projection_cache_refresher()
-            .refresh_after_lifecycle_activation(scope, extension_id)
+        let policy_projection_refresher = self.policy_projection_cache_refresher();
+        if let Err(error) = policy_projection_refresher
+            .prepare_lifecycle_activation_refresh(scope, extension_id)
             .await
         {
             let mut rollback_error: Option<ProductWorkflowError> = None;
@@ -1257,7 +1275,7 @@ impl RebornLocalExtensionManagementPort {
             {
                 rollback_error = Some(disable_error);
             }
-            let activation_state_restored = if let Err(cleanup_error) = self
+            if let Err(cleanup_error) = self
                 .installation_store
                 .set_activation_state(installation_id, previous_state)
                 .await
@@ -1270,25 +1288,6 @@ impl RebornLocalExtensionManagementPort {
                     ),
                     None => map_extension_installation_error(cleanup_error),
                 });
-                false
-            } else {
-                true
-            };
-            if previous_state != ExtensionActivationState::Enabled && activation_state_restored {
-                if let Err(invalidation_error) = self
-                    .policy_projection_cache_refresher()
-                    .refresh_after_lifecycle_removal(scope, extension_id)
-                    .await
-                {
-                    rollback_error = Some(match rollback_error {
-                        Some(existing) => compensation_failure(
-                            "extension activation failed to publish active package and policy projection rollback failed",
-                            existing,
-                            invalidation_error,
-                        ),
-                        None => invalidation_error,
-                    });
-                }
             }
             if let Some(rollback_error) = rollback_error {
                 return Err(compensation_failure(
@@ -1299,6 +1298,9 @@ impl RebornLocalExtensionManagementPort {
             }
             return Err(error);
         }
+        policy_projection_refresher
+            .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
+            .await?;
 
         Ok(activation_success_response(
             package_ref,
@@ -1442,6 +1444,9 @@ impl RebornLocalExtensionManagementPort {
                 caller,
             )
             .await?;
+            self.policy_projection_cache_refresher()
+                .refresh_after_lifecycle_removal(&removal_scope, &removed_extension_id)
+                .await?;
             let lifecycle_package_present = self
                 .lifecycle_service
                 .lock()
@@ -1489,9 +1494,6 @@ impl RebornLocalExtensionManagementPort {
             }
             response
         };
-        self.policy_projection_cache_refresher()
-            .refresh_after_lifecycle_removal(&removal_scope, &removed_extension_id)
-            .await?;
         if matches!(
             response.payload.as_ref(),
             Some(LifecycleProductPayload::ExtensionRemove { removed: false })
@@ -2765,7 +2767,11 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum LifecyclePolicyProjectionRefreshCall {
-        Activation {
+        PrepareActivation {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
+        PublishActivation {
             scope: ResourceScope,
             extension_id: ExtensionId,
         },
@@ -2798,7 +2804,7 @@ mod tests {
 
     #[async_trait]
     impl LifecyclePolicyProjectionCacheRefresher for RecordingLifecyclePolicyProjectionCacheRefresher {
-        async fn refresh_after_lifecycle_activation(
+        async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
             extension_id: &ExtensionId,
@@ -2806,7 +2812,22 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(LifecyclePolicyProjectionRefreshCall::Activation {
+                .push(LifecyclePolicyProjectionRefreshCall::PrepareActivation {
+                    scope: scope.clone(),
+                    extension_id: extension_id.clone(),
+                });
+            Ok(())
+        }
+
+        async fn publish_prepared_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(LifecyclePolicyProjectionRefreshCall::PublishActivation {
                     scope: scope.clone(),
                     extension_id: extension_id.clone(),
                 });
@@ -2847,13 +2868,26 @@ mod tests {
 
     #[async_trait]
     impl LifecyclePolicyProjectionCacheRefresher for FailingLifecyclePolicyProjectionCacheRefresher {
-        async fn refresh_after_lifecycle_activation(
+        async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
             extension_id: &ExtensionId,
         ) -> Result<(), ProductWorkflowError> {
             self.calls
-                .refresh_after_lifecycle_activation(scope, extension_id)
+                .prepare_lifecycle_activation_refresh(scope, extension_id)
+                .await?;
+            Err(ProductWorkflowError::Transient {
+                reason: "test policy projection refresh failed".to_string(),
+            })
+        }
+
+        async fn publish_prepared_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
                 .await?;
             Err(ProductWorkflowError::Transient {
                 reason: "test policy projection refresh failed".to_string(),
@@ -2894,14 +2928,81 @@ mod tests {
     impl LifecyclePolicyProjectionCacheRefresher
         for RemovalFailingLifecyclePolicyProjectionCacheRefresher
     {
-        async fn refresh_after_lifecycle_activation(
+        async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
             extension_id: &ExtensionId,
         ) -> Result<(), ProductWorkflowError> {
             self.calls
-                .refresh_after_lifecycle_activation(scope, extension_id)
+                .prepare_lifecycle_activation_refresh(scope, extension_id)
                 .await
+        }
+
+        async fn publish_prepared_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
+                .await
+        }
+
+        async fn refresh_after_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .refresh_after_lifecycle_removal(scope, extension_id)
+                .await?;
+            Err(ProductWorkflowError::Transient {
+                reason: "test policy projection invalidation failed".to_string(),
+            })
+        }
+    }
+
+    struct PublishFailingLifecyclePolicyProjectionCacheRefresher {
+        calls: RecordingLifecyclePolicyProjectionCacheRefresher,
+    }
+
+    impl PublishFailingLifecyclePolicyProjectionCacheRefresher {
+        fn new() -> Self {
+            Self {
+                calls: RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+            }
+        }
+
+        fn calls(&self) -> Vec<LifecyclePolicyProjectionRefreshCall> {
+            self.calls.calls()
+        }
+    }
+
+    #[async_trait]
+    impl LifecyclePolicyProjectionCacheRefresher
+        for PublishFailingLifecyclePolicyProjectionCacheRefresher
+    {
+        async fn prepare_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .prepare_lifecycle_activation_refresh(scope, extension_id)
+                .await
+        }
+
+        async fn publish_prepared_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
+                .await?;
+            Err(ProductWorkflowError::Transient {
+                reason: "test policy projection marker publication failed".to_string(),
+            })
         }
 
         async fn refresh_after_lifecycle_removal(
@@ -3239,14 +3340,21 @@ mod tests {
             .expect("activate Matrix ProductAdapter extension");
 
         let calls = refresher.calls();
-        assert_eq!(calls.len(), 1);
-        let LifecyclePolicyProjectionRefreshCall::Activation {
+        assert_eq!(calls.len(), 2);
+        let LifecyclePolicyProjectionRefreshCall::PrepareActivation {
             scope,
             extension_id,
         } = &calls[0]
         else {
-            panic!("expected activation refresh call, got {calls:?}");
+            panic!("expected activation prepare call, got {calls:?}");
         };
+        assert_eq!(
+            calls[1],
+            LifecyclePolicyProjectionRefreshCall::PublishActivation {
+                scope: scope.clone(),
+                extension_id: extension_id.clone(),
+            }
+        );
         assert_eq!(scope.user_id, lifecycle_owner());
         assert_eq!(
             scope.tenant_id,
@@ -3267,7 +3375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_lifecycle_activation_refresh_failure_rolls_back_enabled_and_publish_state() {
+    async fn matrix_lifecycle_activation_prepare_failure_rolls_back_enabled_and_publish_state() {
         let refresher = Arc::new(FailingLifecyclePolicyProjectionCacheRefresher::new());
         let (_dir, _storage_root, port, active_registry, installation_store, _filesystem) =
             matrix_extension_management_fixture_with_refresher(refresher.clone());
@@ -3281,7 +3389,7 @@ mod tests {
             ExtensionActivationMode::Static,
         )
         .await
-        .expect_err("activation reports policy projection refresh failure");
+        .expect_err("activation reports policy projection prepare failure");
 
         assert_ne!(
             installation_store
@@ -3305,7 +3413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_lifecycle_publish_failure_invalidates_policy_projection_after_rollback() {
+    async fn matrix_lifecycle_publish_failure_leaves_prepared_policy_non_authoritative() {
         let refresher = Arc::new(RecordingLifecyclePolicyProjectionCacheRefresher::default());
         let (_dir, _storage_root, port, active_registry, installation_store) =
             extension_management_port_fixture_with_catalog_service_and_trust_policy(
@@ -3351,21 +3459,15 @@ mod tests {
         );
         assert_eq!(
             refresher.calls(),
-            vec![
-                LifecyclePolicyProjectionRefreshCall::Activation {
-                    scope: scope.clone(),
-                    extension_id: extension_id.clone(),
-                },
-                LifecyclePolicyProjectionRefreshCall::Removal {
-                    scope,
-                    extension_id,
-                },
-            ]
+            vec![LifecyclePolicyProjectionRefreshCall::PrepareActivation {
+                scope,
+                extension_id,
+            }]
         );
     }
 
     #[tokio::test]
-    async fn matrix_lifecycle_publish_failure_reports_policy_projection_invalidation_failure() {
+    async fn matrix_lifecycle_publish_failure_does_not_depend_on_policy_invalidation() {
         let refresher = Arc::new(RemovalFailingLifecyclePolicyProjectionCacheRefresher::new());
         let (_dir, _storage_root, port, _active_registry, installation_store) =
             extension_management_port_fixture_with_catalog_service_and_trust_policy(
@@ -3389,20 +3491,12 @@ mod tests {
                 &lifecycle_owner(),
             )
             .await
-            .expect_err("publish failure reports invalidation failure");
+            .expect_err("publish failure is reported directly");
 
-        let ProductWorkflowError::Transient { reason } = error else {
-            panic!("expected compensation failure, got {error}");
-        };
+        let reason = error.to_string();
         assert!(
-            reason.contains(
-                "extension activation failed to publish active package and rollback failed"
-            ),
-            "unexpected compensation failure: {reason}"
-        );
-        assert!(
-            reason.contains("test policy projection invalidation failed"),
-            "unexpected compensation failure: {reason}"
+            !reason.contains("test policy projection invalidation failed"),
+            "publish rollback must not rely on policy invalidation: {reason}"
         );
         assert_eq!(
             installation_store
@@ -3415,7 +3509,70 @@ mod tests {
                 .activation_state(),
             ExtensionActivationState::Installed
         );
-        assert_eq!(refresher.calls().len(), 2);
+        assert_eq!(refresher.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_marker_publish_failure_after_active_publish_does_not_roll_back() {
+        let refresher = Arc::new(PublishFailingLifecyclePolicyProjectionCacheRefresher::new());
+        let (_dir, _storage_root, port, active_registry, installation_store, _filesystem) =
+            matrix_extension_management_fixture_with_refresher(refresher.clone());
+        let package_ref = matrix_lifecycle_package_ref();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension");
+        let installation_id =
+            ExtensionInstallationId::new("matrix-product-adapter").expect("installation");
+
+        port.install(package_ref.clone(), &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        let error = port
+            .activate_with_prechecked_credentials_for_test(
+                package_ref,
+                ExtensionActivationMode::Static,
+            )
+            .await
+            .expect_err("activation reports marker publication failure");
+
+        let ProductWorkflowError::Transient { reason } = error else {
+            panic!("expected marker publication failure, got {error}");
+        };
+        assert!(
+            reason.contains("test policy projection marker publication failed"),
+            "unexpected marker publication failure: {reason}"
+        );
+        assert_eq!(
+            installation_store
+                .get_installation(&installation_id)
+                .await
+                .expect("installation lookup")
+                .expect("installation remains")
+                .activation_state(),
+            ExtensionActivationState::Enabled,
+            "post-publish marker failure must not roll lifecycle state back into stale cache authority"
+        );
+        assert!(
+            active_registry
+                .snapshot()
+                .get_extension(&extension_id)
+                .is_some(),
+            "post-publish marker failure must not unpublish the active Matrix extension"
+        );
+        let calls = refresher.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(
+            &calls[0],
+            LifecyclePolicyProjectionRefreshCall::PrepareActivation {
+                extension_id: recorded,
+                ..
+            } if recorded == &extension_id
+        ));
+        assert!(matches!(
+            &calls[1],
+            LifecyclePolicyProjectionRefreshCall::PublishActivation {
+                extension_id: recorded,
+                ..
+            } if recorded == &extension_id
+        ));
     }
 
     #[tokio::test]
@@ -3443,7 +3600,7 @@ mod tests {
         .await
         .expect("idempotent activation refreshes and succeeds");
 
-        assert_eq!(refresher.calls().len(), 1);
+        assert_eq!(refresher.calls().len(), 2);
     }
 
     #[tokio::test]
@@ -3498,6 +3655,62 @@ mod tests {
             extension_id,
             &ExtensionId::new("matrix-product-adapter").expect("valid extension id")
         );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_remove_invalidation_failure_does_not_commit_removal() {
+        let refresher = Arc::new(RemovalFailingLifecyclePolicyProjectionCacheRefresher::new());
+        let (_dir, _storage_root, port, active_registry, installation_store, _filesystem) =
+            matrix_extension_management_fixture_with_refresher(refresher.clone());
+        let package_ref = matrix_lifecycle_package_ref();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension");
+        let installation_id =
+            ExtensionInstallationId::new("matrix-product-adapter").expect("installation");
+
+        port.install(package_ref.clone(), &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        port.activate_with_prechecked_credentials_for_test(
+            package_ref.clone(),
+            ExtensionActivationMode::Static,
+        )
+        .await
+        .expect("activate Matrix ProductAdapter extension");
+
+        let error = port
+            .remove(
+                package_ref,
+                &matrix_lifecycle_resource_scope(),
+                Some(&lifecycle_owner()),
+            )
+            .await
+            .expect_err("remove must report policy projection invalidation failure");
+
+        let ProductWorkflowError::Transient { reason } = error else {
+            panic!("expected invalidation failure, got {error}");
+        };
+        assert!(
+            reason.contains("test policy projection invalidation failed"),
+            "unexpected invalidation failure: {reason}"
+        );
+        assert_eq!(
+            installation_store
+                .get_installation(&installation_id)
+                .await
+                .expect("installation lookup")
+                .expect("installation remains")
+                .activation_state(),
+            ExtensionActivationState::Enabled,
+            "failed invalidation must not tear down lifecycle state"
+        );
+        assert!(
+            active_registry
+                .snapshot()
+                .get_extension(&extension_id)
+                .is_some(),
+            "failed invalidation must not unpublish the active Matrix extension"
+        );
+        assert_eq!(refresher.calls().len(), 3);
     }
 
     /// A complete uploaded WASM tool bundle zip in the `InstalledLocal`-legal

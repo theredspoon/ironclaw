@@ -47,10 +47,14 @@ use ironclaw_turns::{
 use crate::input::RebornBuildInput;
 use crate::matrix_outbound::{
     DeliveryReasonCode, FilesystemMatrixOutboundMetadataStore, FilesystemMatrixPendingIntentStore,
+    MatrixPolicyProviderScope,
 };
 use crate::matrix_product_outbound::{
     MatrixProductOutboundDeliveryInput, matrix_policy_projection_cache_path_for_route_scope,
+    matrix_policy_projection_commit_marker_entry,
+    matrix_policy_projection_commit_marker_path_for_cache_path,
     matrix_policy_projection_resource_scope,
+    matrix_policy_projection_resource_scope_for_provider_scope,
 };
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{OutboundDeliveryTargetProvider, OutboundDeliveryTargetRegistrationOutcome};
@@ -450,6 +454,8 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
     let host_home = root.path().join("host-home");
     std::fs::create_dir_all(&host_home).expect("host home");
     let tenant_id = TenantId::new("runtime-matrix-live-caller-tenant").expect("tenant");
+    let lifecycle_tenant_id =
+        TenantId::new("runtime-matrix-live-caller-lifecycle-tenant").expect("lifecycle tenant");
     let user_id = UserId::new("runtime-matrix-live-caller-owner").expect("user");
     let agent_id = AgentId::new("runtime-matrix-live-caller-agent").expect("agent");
     let project_id = ProjectId::new("runtime-matrix-live-caller-project").expect("project");
@@ -500,6 +506,18 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
         Some(project_id.clone()),
         ThreadId::new("runtime-matrix-live-caller-thread").expect("thread"),
     );
+    let lifecycle_scope = TurnScope::new(
+        lifecycle_tenant_id,
+        Some(agent_id.clone()),
+        Some(project_id.clone()),
+        ThreadId::new("runtime-matrix-live-caller-lifecycle-thread").expect("thread"),
+    )
+    .to_resource_scope();
+    let policy_provider_scope = MatrixPolicyProviderScope {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        project_id: Some(project_id.clone()),
+    };
     let mut policy_cache = MatrixInstallationProjectionCache::new();
     policy_cache
         .insert_projection(
@@ -509,22 +527,37 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
         )
         .expect("policy projection");
     let policy_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
+    let policy_cache_scope = matrix_policy_projection_resource_scope_for_provider_scope(
+        &lifecycle_scope,
+        &policy_provider_scope,
+    );
+    let policy_cache_path = matrix_policy_projection_cache_path_for_route_scope(
+        &tenant_id,
+        Some(&agent_id),
+        Some(&project_id),
+        &installation_id,
+    )
+    .expect("policy cache path");
+    let policy_cache_bytes = policy_cache.to_json_bytes().expect("policy cache json");
     policy_filesystem
         .put(
-            &matrix_policy_projection_resource_scope(&workflow_scope.to_resource_scope()),
-            &matrix_policy_projection_cache_path_for_route_scope(
-                &tenant_id,
-                Some(&agent_id),
-                Some(&project_id),
-                &installation_id,
-            )
-            .expect("policy cache path"),
-            Entry::bytes(policy_cache.to_json_bytes().expect("policy cache json"))
-                .with_content_type(ContentType::json()),
+            &policy_cache_scope,
+            &policy_cache_path,
+            Entry::bytes(policy_cache_bytes.clone()).with_content_type(ContentType::json()),
             CasExpectation::Any,
         )
         .await
         .expect("write Matrix policy projection cache");
+    policy_filesystem
+        .put(
+            &policy_cache_scope,
+            &matrix_policy_projection_commit_marker_path_for_cache_path(&policy_cache_path)
+                .expect("policy cache commit marker path"),
+            matrix_policy_projection_commit_marker_entry(&policy_cache_bytes),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write Matrix policy projection cache commit marker");
     let extension_installation_store = local_runtime
         .extension_management
         .as_ref()
@@ -627,6 +660,14 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
         retry_context.route().matrix_metadata().room_fingerprint,
         pending_command.room_id.fingerprint()
     );
+    assert_eq!(
+        retry_context
+            .route()
+            .matrix_metadata()
+            .policy_provider_scope
+            .as_ref(),
+        Some(&policy_provider_scope)
+    );
     runtime.shutdown().await.expect("runtime shutdown");
 }
 
@@ -694,22 +735,36 @@ async fn local_dev_runtime_matrix_product_outbound_disabled_extension_fails_befo
             1_710_000_000_001,
         )
         .expect("policy projection");
-    crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem))
+    let policy_cache_bytes = policy_cache.to_json_bytes().expect("policy cache json");
+    let policy_cache_path = matrix_policy_projection_cache_path_for_route_scope(
+        &tenant_id,
+        Some(&agent_id),
+        Some(&project_id),
+        &installation_id,
+    )
+    .expect("policy cache path");
+    let policy_cache_scope =
+        matrix_policy_projection_resource_scope(&workflow_scope.to_resource_scope());
+    let policy_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
+    policy_filesystem
         .put(
-            &matrix_policy_projection_resource_scope(&workflow_scope.to_resource_scope()),
-            &matrix_policy_projection_cache_path_for_route_scope(
-                &tenant_id,
-                Some(&agent_id),
-                Some(&project_id),
-                &installation_id,
-            )
-            .expect("policy cache path"),
-            Entry::bytes(policy_cache.to_json_bytes().expect("policy cache json"))
-                .with_content_type(ContentType::json()),
+            &policy_cache_scope,
+            &policy_cache_path,
+            Entry::bytes(policy_cache_bytes.clone()).with_content_type(ContentType::json()),
             CasExpectation::Any,
         )
         .await
         .expect("write Matrix policy projection cache");
+    policy_filesystem
+        .put(
+            &policy_cache_scope,
+            &matrix_policy_projection_commit_marker_path_for_cache_path(&policy_cache_path)
+                .expect("policy cache commit marker path"),
+            matrix_policy_projection_commit_marker_entry(&policy_cache_bytes),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write Matrix policy projection cache commit marker");
     local_runtime
         .extension_management
         .as_ref()

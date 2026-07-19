@@ -1,4 +1,5 @@
 use super::*;
+use ironclaw_host_api::{AgentId, ProjectId, TenantId};
 
 #[async_trait]
 pub trait MatrixOutboundMetadataStore: Send + Sync {
@@ -96,6 +97,15 @@ struct StoredMatrixRouteMetadataV1 {
     credential_handle_fingerprint: String,
     reply_target_binding_ref: ReplyTargetBindingRef,
     allowed_command_kinds: Vec<MatrixCommandKind>,
+    #[serde(default)]
+    policy_provider_scope: Option<StoredMatrixPolicyProviderScopeV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixPolicyProviderScopeV1 {
+    tenant_id: TenantId,
+    agent_id: AgentId,
+    project_id: Option<ProjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +219,10 @@ impl From<&MatrixRouteMetadata> for StoredMatrixRouteMetadataV1 {
             credential_handle_fingerprint: metadata.credential_handle_fingerprint.clone(),
             reply_target_binding_ref: metadata.reply_target_binding_ref.clone(),
             allowed_command_kinds: metadata.allowed_command_kinds.clone(),
+            policy_provider_scope: metadata
+                .policy_provider_scope
+                .as_ref()
+                .map(StoredMatrixPolicyProviderScopeV1::from),
         }
     }
 }
@@ -223,6 +237,27 @@ impl From<StoredMatrixRouteMetadataV1> for MatrixRouteMetadata {
             credential_handle_fingerprint: metadata.credential_handle_fingerprint,
             reply_target_binding_ref: metadata.reply_target_binding_ref,
             allowed_command_kinds: metadata.allowed_command_kinds,
+            policy_provider_scope: metadata.policy_provider_scope.map(Into::into),
+        }
+    }
+}
+
+impl From<&MatrixPolicyProviderScope> for StoredMatrixPolicyProviderScopeV1 {
+    fn from(scope: &MatrixPolicyProviderScope) -> Self {
+        Self {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone(),
+            project_id: scope.project_id.clone(),
+        }
+    }
+}
+
+impl From<StoredMatrixPolicyProviderScopeV1> for MatrixPolicyProviderScope {
+    fn from(scope: StoredMatrixPolicyProviderScopeV1) -> Self {
+        Self {
+            tenant_id: scope.tenant_id,
+            agent_id: scope.agent_id,
+            project_id: scope.project_id,
         }
     }
 }

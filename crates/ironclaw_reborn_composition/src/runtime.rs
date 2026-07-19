@@ -1929,9 +1929,11 @@ impl RebornRuntime {
                 reason: format!("Matrix policy projection cache path is invalid: {error}"),
             })?;
         let matrix_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
-        let policy_scope = crate::matrix_product_outbound::matrix_policy_projection_resource_scope(
-            &input.delivery.resolution_request.scope.to_resource_scope(),
-        );
+        let policy_scope =
+            crate::matrix_product_outbound::matrix_policy_projection_resource_scope_for_provider_scope(
+                &input.delivery.resolution_request.scope.to_resource_scope(),
+                &resolved_target.policy_provider_scope,
+            );
         let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
             Arc::clone(&matrix_filesystem),
             policy_scope,
@@ -2050,6 +2052,7 @@ impl RebornRuntime {
                     ),
                     reply_target_binding_ref: resolved_target.reply_target_binding_ref,
                     allowed_command_kinds: vec![MatrixCommandKind::SendText],
+                    policy_provider_scope: Some(resolved_target.policy_provider_scope),
                 },
             );
             let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);

@@ -6,7 +6,8 @@ use crate::matrix_product_outbound::{
 };
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
 use crate::matrix_product_outbound::{
-    matrix_policy_projection_cache_path_for_route_scope, matrix_policy_projection_resource_scope,
+    matrix_policy_projection_cache_path_for_route,
+    matrix_policy_projection_resource_scope_for_route,
 };
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
 use ironclaw_matrix_adapter::installation_policy::{
@@ -267,18 +268,9 @@ where
     ) -> Result<(), DeliveryError> {
         validate_retry_execution_context(context.route(), context.grant())
             .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
-        let installation_id =
-            AdapterInstallationId::new(context.route().installation_id.clone())
-                .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
-        let cache_path = matrix_policy_projection_cache_path_for_route_scope(
-            &context.route().scope().tenant_id,
-            context.route().scope().agent_id.as_ref(),
-            context.route().scope().project_id.as_ref(),
-            &installation_id,
-        )
-        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
-        let policy_scope =
-            matrix_policy_projection_resource_scope(&context.route().scope().to_resource_scope());
+        let cache_path = matrix_policy_projection_cache_path_for_route(context.route())
+            .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        let policy_scope = matrix_policy_projection_resource_scope_for_route(context.route());
         let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
             Arc::clone(&self.filesystem),
             policy_scope,
