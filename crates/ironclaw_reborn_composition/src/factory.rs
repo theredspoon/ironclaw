@@ -198,8 +198,7 @@ use crate::local_dev_mounts::{
     skill_management_mount_view, system_extensions_lifecycle_mount_view, workspace_mount_view,
 };
 use crate::matrix_outbound_targets::{
-    FilesystemMatrixRoomBindingStore, MatrixRoomBindingStore,
-    validate_matrix_outbound_target_provider_configs_for_runtime,
+    FilesystemMatrixRoomBindingStore, validate_matrix_outbound_target_provider_configs_for_runtime,
 };
 use crate::matrix_product_outbound::MatrixLifecyclePolicyProjectionCacheRefresher;
 use crate::product_auth::credentials::product_auth_providers::{
@@ -1023,7 +1022,7 @@ pub struct RebornLocalDevApprovalTestParts {
 
 #[derive(Clone)]
 pub(crate) struct MatrixStartupPolicyProjectionCache {
-    pub(crate) target_source: Arc<dyn MatrixRoomBindingStore>,
+    pub(crate) target_source: Arc<FilesystemMatrixRoomBindingStore>,
     pub(crate) refresher: Arc<MatrixLifecyclePolicyProjectionCacheRefresher>,
 }
 
@@ -1461,8 +1460,8 @@ fn production_config(
 /// keeps its historical local filesystem/libSQL default.
 async fn build_matrix_startup_policy_projection_cache_refresher(
     config: Option<MatrixStartupPolicyProjectionCacheConfig>,
-    filesystem: Arc<dyn RootFilesystem>,
-    installation_store: Arc<dyn ExtensionInstallationStore>,
+    filesystem: Arc<CompositeRootFilesystem>,
+    installation_store: SharedExtensionInstallationStore,
 ) -> Result<Option<MatrixStartupPolicyProjectionCache>, RebornBuildError> {
     let Some(config) = config else {
         return Ok(None);
@@ -1477,7 +1476,7 @@ async fn build_matrix_startup_policy_projection_cache_refresher(
         .map(|provider| provider.tenant_id.clone())
         .collect::<Vec<_>>();
     let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
-        Arc::clone(&filesystem),
+        filesystem.clone(),
         tenant_ids,
     ));
     target_source
@@ -1486,7 +1485,6 @@ async fn build_matrix_startup_policy_projection_cache_refresher(
         .map_err(|error| RebornBuildError::InvalidConfig {
             reason: format!("Matrix room binding store seed failed: {error}"),
         })?;
-    let target_source: Arc<dyn MatrixRoomBindingStore> = target_source;
     let refresher = Arc::new(
         MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
             filesystem,
@@ -2019,8 +2017,8 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     let matrix_startup_policy_projection_cache =
         build_matrix_startup_policy_projection_cache_refresher(
             matrix_startup_policy_projection_cache,
-            Arc::clone(&extension_filesystem),
-            Arc::clone(&extension_installation_store) as Arc<dyn ExtensionInstallationStore>,
+            Arc::clone(&filesystem),
+            Arc::clone(&extension_installation_store),
         )
         .await?;
     let lifecycle_policy_projection_cache_refresher = matrix_startup_policy_projection_cache

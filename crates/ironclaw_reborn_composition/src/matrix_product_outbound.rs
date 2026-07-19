@@ -128,13 +128,16 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         })
     }
 
-    pub(crate) fn from_shared_target_source(
+    pub(crate) fn from_shared_target_source<S>(
         filesystem: Arc<dyn RootFilesystem>,
         installation_store: Arc<dyn ExtensionInstallationStore>,
-        target_source: Arc<dyn MatrixRoomBindingStore>,
+        target_source: Arc<S>,
         artifact_evidence: MatrixRuntimeArtifactEvidence,
         policy_owner_actor: String,
-    ) -> Result<Self, ProductWorkflowError> {
+    ) -> Result<Self, ProductWorkflowError>
+    where
+        S: MatrixRoomBindingStore + 'static,
+    {
         Ok(Self {
             filesystem: Arc::new(ScopedFilesystem::new(
                 filesystem,

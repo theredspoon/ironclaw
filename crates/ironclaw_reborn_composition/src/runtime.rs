@@ -127,7 +127,7 @@ use crate::matrix_outbound::{
     MatrixRetrySchedule, MatrixRouteMetadata, MatrixRoutePolicyOwnerToken, SealedDeliveryGrant,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use crate::matrix_outbound_targets::{FilesystemMatrixRoomBindingStore, MatrixRoomBindingStore};
+use crate::matrix_outbound_targets::FilesystemMatrixRoomBindingStore;
 use crate::matrix_outbound_targets::{
     MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
     MatrixRoomBindingAuthority, MatrixRoomBindingMutationContext, MatrixRoomBindingRemovalOutcome,
@@ -584,7 +584,6 @@ async fn build_matrix_runtime_policy_projection_cache(
         .map_err(|error| RebornRuntimeError::InvalidArgument {
             reason: format!("Matrix room binding store seed failed: {error}"),
         })?;
-    let target_source: Arc<dyn MatrixRoomBindingStore> = target_source;
     let refresher = Arc::new(
         MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
             filesystem,
@@ -3894,7 +3893,7 @@ pub async fn build_reborn_runtime(
     ) {
         (Some(target_source), Some(refresher)) => {
             Some(Arc::new(MatrixRoomBindingAuthority::new_with_audit_log(
-                Arc::clone(target_source),
+                target_source.clone(),
                 Arc::clone(refresher),
                 Arc::clone(&audit_log),
             )))
