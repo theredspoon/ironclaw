@@ -264,6 +264,11 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                 .provider_has_removed_room_binding(&write.provider)
                 .await?
             {
+                self.invalidate_projection_cache_body(
+                    &write.provider_scope,
+                    &write.provider_cache_path,
+                )
+                .await?;
                 self.invalidate_projection_commit_markers(&[(
                     write.provider_scope.clone(),
                     write.commit_marker_path.clone(),
@@ -349,6 +354,8 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                     &target_providers,
                 )?
             {
+                self.invalidate_projection_cache_body(&provider_scope, &provider_cache_path)
+                    .await?;
                 self.invalidate_projection_commit_markers(&[(
                     provider_scope.clone(),
                     commit_marker_path.clone(),
