@@ -145,7 +145,8 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             });
         }
         for write in &writes {
-            self.filesystem
+            if let Err(error) = self
+                .filesystem
                 .put(
                     &write.provider_scope,
                     &write.commit_marker_path,
@@ -153,7 +154,14 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                     CasExpectation::Any,
                 )
                 .await
-                .map_err(map_matrix_policy_projection_cache_error)?;
+            {
+                self.invalidate_projection_cache_body(
+                    &write.provider_scope,
+                    &write.provider_cache_path,
+                )
+                .await?;
+                return Err(map_matrix_policy_projection_cache_error(error));
+            }
         }
         let mut written = Vec::new();
         for write in &writes {
@@ -313,6 +321,26 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                 .await
                 .map_err(map_matrix_policy_projection_cache_error)?;
         }
+        Ok(())
+    }
+
+    async fn invalidate_projection_cache_body(
+        &self,
+        provider_scope: &ResourceScope,
+        provider_cache_path: &ScopedPath,
+    ) -> Result<(), ProductWorkflowError> {
+        let empty_bytes = MatrixInstallationProjectionCache::new()
+            .to_json_bytes()
+            .map_err(map_matrix_policy_projection_cache_error)?;
+        self.filesystem
+            .put(
+                provider_scope,
+                provider_cache_path,
+                Entry::bytes(empty_bytes).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await
+            .map_err(map_matrix_policy_projection_cache_error)?;
         Ok(())
     }
 
@@ -1569,6 +1597,108 @@ mod tests {
                 .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
                 .await
                 .expect_err("provider b marker must not become authoritative after write failure"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_room_removal_tombstone_failure_fails_closed_for_stale_room()
+    {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider_with_stale_room = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![
+                MatrixConfiguredRoomRoute {
+                    room_id: "!fresh-room-a:example.org".to_string(),
+                    subject_user_id: UserId::new("user:fresh-room-a").expect("actor a"),
+                    matrix_sender_user_id: MatrixUserId::new("@fresh-room-a:example.org")
+                        .expect("matrix sender a"),
+                },
+                MatrixConfiguredRoomRoute {
+                    room_id: "!stale-room-b:example.org".to_string(),
+                    subject_user_id: UserId::new("user:stale-room-b").expect("actor b"),
+                    matrix_sender_user_id: MatrixUserId::new("@stale-room-b:example.org")
+                        .expect("matrix sender b"),
+                },
+            ],
+        };
+        let provider_after_room_removal = MatrixOutboundTargetProviderConfig {
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!fresh-room-a:example.org".to_string(),
+                subject_user_id: UserId::new("user:fresh-room-a").expect("actor a"),
+                matrix_sender_user_id: MatrixUserId::new("@fresh-room-a:example.org")
+                    .expect("matrix sender a"),
+            }],
+            ..provider_with_stale_room.clone()
+        };
+        let initial_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            backend.clone(),
+            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
+            vec![provider_with_stale_room.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("initial refresher config");
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let policy_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_with_stale_room);
+        let cache_path =
+            matrix_policy_projection_cache_path_for_provider(&provider_with_stale_room)
+                .expect("cache path");
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+
+        initial_refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect("initial projection with rooms A and B");
+
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend.clone()),
+            policy_scope,
+            cache_path,
+        );
+        let initial_snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+        assert!(
+            initial_snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!stale-room-b:example.org"),
+            "setup must publish stale room B before the removal refresh"
+        );
+
+        let failing_backend = Arc::new(FailOnNthPutFilesystem::new(backend, [1]));
+        let removal_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            failing_backend,
+            store,
+            vec![provider_after_room_removal],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("removal refresher config");
+        removal_refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect_err("room removal refresh cannot publish the invalidation tombstone");
+
+        let rejection = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect_err(
+                "failed room removal refresh must fail closed instead of serving stale room B",
+            );
+        assert!(matches!(
+            rejection,
             MatrixInstallationPolicyRejection::InstallationNotFound
         ));
     }
