@@ -531,6 +531,8 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         let provider_cache_path = matrix_policy_projection_cache_path_for_removal_request(request)?;
         let commit_marker_path =
             matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+        self.invalidate_projection_cache_body(&provider_scope, &provider_cache_path)
+            .await?;
         self.filesystem
             .put(
                 &provider_scope,

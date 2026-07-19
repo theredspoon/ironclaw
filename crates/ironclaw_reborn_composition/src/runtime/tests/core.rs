@@ -3334,6 +3334,10 @@ async fn production_runtime_fallback_refreshes_stale_matrix_manifest_projection(
             Arc::clone(&graph.filesystem) as Arc<dyn ironclaw_filesystem::RootFilesystem>,
             Arc::clone(&graph.extension_installation_store),
         ),
+        #[cfg(feature = "postgres")]
+        crate::factory::RebornProductionRuntimeServices::Postgres(_) => {
+            panic!("production fallback test must use libSQL storage")
+        }
     };
     seed_matrix_runtime_manifest(
         installation_store.as_ref(),
@@ -3377,6 +3381,10 @@ async fn production_runtime_fallback_refreshes_stale_matrix_manifest_projection(
     {
         crate::factory::RebornProductionRuntimeServices::LibSql(graph) => {
             Arc::clone(&graph.filesystem)
+        }
+        #[cfg(feature = "postgres")]
+        crate::factory::RebornProductionRuntimeServices::Postgres(_) => {
+            panic!("production fallback test must use libSQL storage")
         }
     };
     let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(

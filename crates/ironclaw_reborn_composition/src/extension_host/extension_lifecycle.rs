@@ -69,6 +69,15 @@ pub(crate) trait LifecyclePolicyProjectionCacheRefresher: Send + Sync {
         extension_id: &ExtensionId,
     ) -> Result<(), ProductWorkflowError>;
 
+    async fn invalidate_before_lifecycle_removal(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+            .await
+    }
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         scope: &ResourceScope,
@@ -1524,6 +1533,9 @@ impl RebornLocalExtensionManagementPort {
                 } else {
                     None
                 };
+            self.policy_projection_cache_refresher()
+                .invalidate_before_lifecycle_removal(&removal_scope, &removed_extension_id)
+                .await?;
             let response = if installation.is_some() && lifecycle_package_present {
                 self.remove_locked(package_ref.clone(), caller).await
             } else {
@@ -2958,6 +2970,10 @@ mod tests {
             scope: ResourceScope,
             extension_id: ExtensionId,
         },
+        InvalidateBeforeLifecycleRemoval {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
         PublishManifest {
             scope: ResourceScope,
             extension_id: ExtensionId,
@@ -3048,6 +3064,23 @@ mod tests {
             Ok(())
         }
 
+        async fn invalidate_before_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    LifecyclePolicyProjectionRefreshCall::InvalidateBeforeLifecycleRemoval {
+                        scope: scope.clone(),
+                        extension_id: extension_id.clone(),
+                    },
+                );
+            Ok(())
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -3119,7 +3152,10 @@ mod tests {
         ) -> Result<(), ProductWorkflowError> {
             self.calls
                 .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
-                .await
+                .await?;
+            Err(ProductWorkflowError::Transient {
+                reason: "test policy projection invalidation failed".to_string(),
+            })
         }
 
         async fn invalidate_before_manifest_lifecycle_mutation(
@@ -3139,6 +3175,16 @@ mod tests {
         ) -> Result<(), ProductWorkflowError> {
             self.calls
                 .publish_after_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn invalidate_before_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_lifecycle_removal(scope, extension_id)
                 .await
         }
 
@@ -3232,6 +3278,19 @@ mod tests {
                 .await
         }
 
+        async fn invalidate_before_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_lifecycle_removal(scope, extension_id)
+                .await?;
+            Err(ProductWorkflowError::Transient {
+                reason: "test policy projection invalidation failed".to_string(),
+            })
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -3259,10 +3318,150 @@ mod tests {
         ) -> Result<(), ProductWorkflowError> {
             self.calls
                 .refresh_after_lifecycle_removal(scope, extension_id)
+                .await
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RemovalInvalidationState {
+        installation_state: Option<ExtensionActivationState>,
+        active_published: bool,
+    }
+
+    struct RemovalStateRecordingLifecyclePolicyProjectionCacheRefresher {
+        calls: RecordingLifecyclePolicyProjectionCacheRefresher,
+        installation_store: Arc<InMemoryExtensionInstallationStore>,
+        active_registry: Arc<SharedExtensionRegistry>,
+        installation_id: ExtensionInstallationId,
+        extension_id: ExtensionId,
+        removal_invalidation_state: StdMutex<Option<RemovalInvalidationState>>,
+    }
+
+    impl RemovalStateRecordingLifecyclePolicyProjectionCacheRefresher {
+        fn new(
+            installation_store: Arc<InMemoryExtensionInstallationStore>,
+            active_registry: Arc<SharedExtensionRegistry>,
+            installation_id: ExtensionInstallationId,
+            extension_id: ExtensionId,
+        ) -> Self {
+            Self {
+                calls: RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+                installation_store,
+                active_registry,
+                installation_id,
+                extension_id,
+                removal_invalidation_state: StdMutex::new(None),
+            }
+        }
+
+        fn calls(&self) -> Vec<LifecyclePolicyProjectionRefreshCall> {
+            self.calls.calls()
+        }
+
+        fn removal_invalidation_state(&self) -> Option<RemovalInvalidationState> {
+            self.removal_invalidation_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        async fn record_removal_invalidation_state(&self) {
+            let installation_state = self
+                .installation_store
+                .get_installation(&self.installation_id)
+                .await
+                .expect("installation lookup during removal invalidation")
+                .map(|installation| installation.activation_state());
+            let active_published = self
+                .active_registry
+                .snapshot()
+                .get_extension(&self.extension_id)
+                .is_some();
+            *self
+                .removal_invalidation_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(RemovalInvalidationState {
+                    installation_state,
+                    active_published,
+                });
+        }
+    }
+
+    #[async_trait]
+    impl LifecyclePolicyProjectionCacheRefresher
+        for RemovalStateRecordingLifecyclePolicyProjectionCacheRefresher
+    {
+        async fn invalidate_before_credential_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn invalidate_before_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn publish_after_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_after_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn invalidate_before_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_lifecycle_removal(scope, extension_id)
                 .await?;
-            Err(ProductWorkflowError::Transient {
-                reason: "test policy projection invalidation failed".to_string(),
-            })
+            self.record_removal_invalidation_state().await;
+            Ok(())
+        }
+
+        async fn prepare_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .prepare_lifecycle_activation_refresh(scope, extension_id)
+                .await
+        }
+
+        async fn publish_prepared_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
+                .await
+        }
+
+        async fn refresh_after_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .refresh_after_lifecycle_removal(scope, extension_id)
+                .await
         }
     }
 
@@ -3313,6 +3512,16 @@ mod tests {
         ) -> Result<(), ProductWorkflowError> {
             self.calls
                 .publish_after_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn invalidate_before_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_lifecycle_removal(scope, extension_id)
                 .await
         }
 
@@ -4305,11 +4514,20 @@ mod tests {
         .expect("remove Matrix ProductAdapter extension");
 
         let calls = refresher.calls();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(
+            &calls[0],
+            LifecyclePolicyProjectionRefreshCall::InvalidateBeforeLifecycleRemoval {
+                scope,
+                extension_id,
+            } if scope.user_id == lifecycle_owner()
+                && extension_id
+                    == &ExtensionId::new("matrix-product-adapter").expect("valid extension id")
+        ));
         let LifecyclePolicyProjectionRefreshCall::Removal {
             scope,
             extension_id,
-        } = &calls[0]
+        } = &calls[1]
         else {
             panic!("expected removal refresh call, got {calls:?}");
         };
@@ -4329,6 +4547,64 @@ mod tests {
         assert_eq!(
             extension_id,
             &ExtensionId::new("matrix-product-adapter").expect("valid extension id")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_remove_preinvalidates_before_durable_removal() {
+        let (_dir, _storage_root, port, active_registry, installation_store, _filesystem) =
+            matrix_extension_management_fixture_with_refresher(Arc::new(
+                RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+            ));
+        let package_ref = matrix_lifecycle_package_ref();
+        let scope = matrix_lifecycle_resource_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension");
+        let installation_id =
+            ExtensionInstallationId::new("matrix-product-adapter").expect("installation");
+        let refresher = Arc::new(
+            RemovalStateRecordingLifecyclePolicyProjectionCacheRefresher::new(
+                installation_store.clone(),
+                active_registry,
+                installation_id,
+                extension_id.clone(),
+            ),
+        );
+
+        port.install(package_ref.clone(), &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        port.activate_with_prechecked_credentials_for_test(
+            package_ref.clone(),
+            ExtensionActivationMode::Static,
+        )
+        .await
+        .expect("activate Matrix ProductAdapter extension");
+        port.set_policy_projection_cache_refresher(refresher.clone());
+
+        port.remove(package_ref, &scope, Some(&lifecycle_owner()))
+            .await
+            .expect("remove Matrix ProductAdapter extension");
+
+        assert_eq!(
+            refresher.calls(),
+            vec![
+                LifecyclePolicyProjectionRefreshCall::InvalidateBeforeLifecycleRemoval {
+                    scope: scope.clone(),
+                    extension_id: extension_id.clone(),
+                },
+                LifecyclePolicyProjectionRefreshCall::Removal {
+                    scope,
+                    extension_id,
+                },
+            ]
+        );
+        assert_eq!(
+            refresher.removal_invalidation_state(),
+            Some(RemovalInvalidationState {
+                installation_state: Some(ExtensionActivationState::Enabled),
+                active_published: true,
+            }),
+            "removal invalidation must run before lifecycle state or active publication is torn down"
         );
     }
 
@@ -4413,6 +4689,7 @@ mod tests {
         let (_dir, _storage_root, port, active_registry, installation_store, _filesystem) =
             matrix_extension_management_fixture_with_refresher(refresher.clone());
         let package_ref = matrix_lifecycle_package_ref();
+        let scope = matrix_lifecycle_resource_scope();
         let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension");
         let installation_id =
             ExtensionInstallationId::new("matrix-product-adapter").expect("installation");
@@ -4429,11 +4706,7 @@ mod tests {
         refresher.calls.clear();
 
         let error = port
-            .remove(
-                package_ref,
-                &matrix_lifecycle_resource_scope(),
-                Some(&lifecycle_owner()),
-            )
+            .remove(package_ref, &scope, Some(&lifecycle_owner()))
             .await
             .expect_err("remove must report policy projection invalidation failure");
 
@@ -4461,7 +4734,15 @@ mod tests {
                 .is_some(),
             "failed invalidation must not unpublish the active Matrix extension"
         );
-        assert_eq!(refresher.calls().len(), 1);
+        assert_eq!(
+            refresher.calls(),
+            vec![
+                LifecyclePolicyProjectionRefreshCall::InvalidateBeforeLifecycleRemoval {
+                    scope,
+                    extension_id,
+                }
+            ]
+        );
     }
 
     /// A complete uploaded WASM tool bundle zip in the `InstalledLocal`-legal

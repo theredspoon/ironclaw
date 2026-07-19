@@ -1219,7 +1219,7 @@ async fn matrix_lifecycle_pre_invalidation_uses_removal_request_when_snapshot_is
         .expect("publish initial cache");
 
     let source = FilesystemMatrixPolicySnapshotSource::new(
-        crate::wrap_scoped(backend),
+        crate::wrap_scoped(backend.clone()),
         matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
         matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
     );
@@ -1230,6 +1230,25 @@ async fn matrix_lifecycle_pre_invalidation_uses_removal_request_when_snapshot_is
         )
         .await
         .expect("initial snapshot resolves");
+
+    let provider_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+    let provider_cache_path =
+        matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path");
+    let scoped = crate::wrap_scoped(backend.clone());
+    let initial_body = scoped
+        .get(&provider_scope, &provider_cache_path)
+        .await
+        .expect("initial projection body lookup")
+        .expect("initial projection body")
+        .entry
+        .body;
+    assert_ne!(
+        initial_body,
+        MatrixInstallationProjectionCache::new()
+            .to_json_bytes()
+            .expect("empty projection bytes"),
+        "initial projection body must contain the stale room before invalidation"
+    );
 
     let empty_target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
         Arc::clone(&root),
@@ -1272,6 +1291,19 @@ async fn matrix_lifecycle_pre_invalidation_uses_removal_request_when_snapshot_is
             .await
             .expect_err("request-derived pre-invalidation tombstones the exact marker"),
         MatrixInstallationPolicyRejection::InstallationNotFound
+    );
+    assert_eq!(
+        scoped
+            .get(&provider_scope, &provider_cache_path)
+            .await
+            .expect("invalidated projection body lookup")
+            .expect("invalidated projection body")
+            .entry
+            .body,
+        MatrixInstallationProjectionCache::new()
+            .to_json_bytes()
+            .expect("empty projection bytes"),
+        "request-derived pre-invalidation must clear the stale projection body"
     );
 }
 
