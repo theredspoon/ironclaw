@@ -408,6 +408,22 @@ impl LifecyclePolicyProjectionCacheRefresher
         Ok(())
     }
 
+    async fn invalidate_before_manifest_lifecycle_mutation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn publish_after_manifest_lifecycle_mutation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        Ok(())
+    }
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         _scope: &ResourceScope,

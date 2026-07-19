@@ -13,12 +13,10 @@ use ironclaw_extensions::{
     InstallationOwner, ManifestHash, ManifestSource,
 };
 use ironclaw_filesystem::{FilesystemError, RootFilesystem};
-#[cfg(test)]
-use ironclaw_host_api::InvocationId;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityId, EffectKind, ExtensionId, NetworkTargetPattern,
-    PermissionMode, ResourceScope, RuntimeCredentialAuthRequirement, RuntimeCredentialRequirement,
-    RuntimeHttpEgress, UserId, VirtualPath, sha256_digest_token,
+    CapabilityDescriptor, CapabilityId, EffectKind, ExtensionId, InvocationId,
+    NetworkTargetPattern, PermissionMode, ResourceScope, RuntimeCredentialAuthRequirement,
+    RuntimeCredentialRequirement, RuntimeHttpEgress, UserId, VirtualPath, sha256_digest_token,
 };
 use ironclaw_product_adapter_registry::PRODUCT_ADAPTER_HOST_API_ID;
 use ironclaw_product_workflow::{
@@ -59,6 +57,18 @@ pub(crate) trait LifecyclePolicyProjectionCacheRefresher: Send + Sync {
         extension_id: &ExtensionId,
     ) -> Result<(), ProductWorkflowError>;
 
+    async fn invalidate_before_manifest_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError>;
+
+    async fn publish_after_manifest_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError>;
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         scope: &ResourceScope,
@@ -91,6 +101,22 @@ impl LifecyclePolicyProjectionCacheRefresher for NoopLifecyclePolicyProjectionCa
         Ok(())
     }
 
+    async fn invalidate_before_manifest_lifecycle_mutation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn publish_after_manifest_lifecycle_mutation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        Ok(())
+    }
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         _scope: &ResourceScope,
@@ -114,6 +140,11 @@ impl LifecyclePolicyProjectionCacheRefresher for NoopLifecyclePolicyProjectionCa
     ) -> Result<(), ProductWorkflowError> {
         Ok(())
     }
+}
+
+pub(crate) fn noop_lifecycle_policy_projection_cache_refresher()
+-> Arc<dyn LifecyclePolicyProjectionCacheRefresher> {
+    Arc::new(NoopLifecyclePolicyProjectionCacheRefresher)
 }
 
 #[async_trait]
@@ -278,6 +309,8 @@ pub(crate) async fn restore_extension_lifecycle_state(
     installation_store: &Arc<dyn ExtensionInstallationStore>,
     lifecycle_service: &Arc<Mutex<ExtensionLifecycleService>>,
     active_extensions: &ActiveExtensionPublisher,
+    restore_scope: &ResourceScope,
+    policy_projection_cache_refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
 ) -> Result<(), ProductWorkflowError> {
     for installation in installation_store
         .list_installations()
@@ -323,6 +356,8 @@ pub(crate) async fn restore_extension_lifecycle_state(
                 &available,
                 &installation,
                 hash_error,
+                restore_scope,
+                policy_projection_cache_refresher.as_ref(),
             )
             .await?;
         }
@@ -847,6 +882,21 @@ impl RebornLocalExtensionManagementPort {
         package_ref: LifecyclePackageRef,
         caller: &UserId,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
+        let scope =
+            ResourceScope::local_default(caller.clone(), InvocationId::new()).map_err(|error| {
+                ProductWorkflowError::Transient {
+                    reason: format!("extension install scope is invalid: {error}"),
+                }
+            })?;
+        self.install_for_scope(package_ref, &scope, caller).await
+    }
+
+    pub(crate) async fn install_for_scope(
+        &self,
+        package_ref: LifecyclePackageRef,
+        scope: &ResourceScope,
+        caller: &UserId,
+    ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
         // Snapshot the package before taking `operation_lock`. The catalog
         // lock must not be held across installation-store, filesystem, or
         // credential awaits. Acquiring the read lock first preserves the
@@ -884,7 +934,7 @@ impl RebornLocalExtensionManagementPort {
                     .map_err(map_extension_installation_error)?;
             }
             None => {
-                self.install_fresh_locked(&available, caller).await?;
+                self.install_fresh_locked(&available, scope, caller).await?;
             }
         }
 
@@ -911,6 +961,7 @@ impl RebornLocalExtensionManagementPort {
     async fn install_fresh_locked(
         &self,
         available: &AvailableExtensionPackage,
+        scope: &ResourceScope,
         caller: &UserId,
     ) -> Result<(), ProductWorkflowError> {
         // An orphaned manifest row without an installation still counts as
@@ -947,7 +998,7 @@ impl RebornLocalExtensionManagementPort {
             }
             return Err(error);
         }
-        if let Err(error) = self.persist_install_plan(plan).await {
+        if let Err(error) = self.persist_install_plan(plan, scope).await {
             if let Err(cleanup_error) = self
                 .delete_materialized_extension_files(&available.package.id)
                 .await
@@ -2150,8 +2201,14 @@ impl RebornLocalExtensionManagementPort {
     async fn persist_install_plan(
         &self,
         plan: ExtensionInstallPlan,
+        scope: &ResourceScope,
     ) -> Result<(), ProductWorkflowError> {
         let extension_id = plan.installation.extension_id().clone();
+        let installation_id = plan.installation.installation_id().clone();
+        let policy_projection_refresher = self.policy_projection_cache_refresher();
+        policy_projection_refresher
+            .invalidate_before_manifest_lifecycle_mutation(scope, &extension_id)
+            .await?;
         if let Err(error) = self
             .installation_store
             .upsert_manifest(plan.manifest_record)
@@ -2179,6 +2236,37 @@ impl RebornLocalExtensionManagementPort {
                 ));
             }
             return Err(map_extension_installation_error(error));
+        }
+        if let Err(error) = policy_projection_refresher
+            .publish_after_manifest_lifecycle_mutation(scope, &extension_id)
+            .await
+        {
+            let mut rollback_error: Option<ProductWorkflowError> = None;
+            if let Err(error) = self
+                .installation_store
+                .delete_installation(&installation_id)
+                .await
+            {
+                rollback_error = Some(map_extension_installation_error(error));
+            }
+            if let Err(error) = self.installation_store.delete_manifest(&extension_id).await {
+                rollback_error = Some(match rollback_error {
+                    Some(existing) => compensation_failure(
+                        "extension manifest lifecycle refresh failed and durable install rollback failed",
+                        existing,
+                        map_extension_installation_error(error),
+                    ),
+                    None => map_extension_installation_error(error),
+                });
+            }
+            if let Some(rollback_error) = rollback_error {
+                return Err(compensation_failure(
+                    "extension manifest lifecycle refresh failed and rollback failed",
+                    error,
+                    rollback_error,
+                ));
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -2315,6 +2403,8 @@ async fn migrate_host_bundled_manifest_hash(
     available: &AvailableExtensionPackage,
     installation: &ExtensionInstallation,
     hash_error: ProductWorkflowError,
+    restore_scope: &ResourceScope,
+    policy_projection_cache_refresher: &dyn LifecyclePolicyProjectionCacheRefresher,
 ) -> Result<(), ProductWorkflowError> {
     let stored_manifest = match installation_store
         .get_manifest(installation.extension_id())
@@ -2336,13 +2426,36 @@ async fn migrate_host_bundled_manifest_hash(
         "bundled extension manifest hash changed; migrating stored installation to new manifest hash"
     );
     let migration_plan = prepare_manifest_migration(available, installation)?;
-    installation_store
+    let extension_id = migration_plan.installation.extension_id().clone();
+    policy_projection_cache_refresher
+        .invalidate_before_manifest_lifecycle_mutation(restore_scope, &extension_id)
+        .await?;
+    if let Err(error) = installation_store
         .upsert_manifest_and_installation(
             migration_plan.manifest_record,
             migration_plan.installation,
         )
         .await
-        .map_err(map_extension_installation_error)
+    {
+        return Err(map_extension_installation_error(error));
+    }
+    if let Err(error) = policy_projection_cache_refresher
+        .publish_after_manifest_lifecycle_mutation(restore_scope, &extension_id)
+        .await
+    {
+        if let Err(restore_error) = installation_store
+            .upsert_manifest_and_installation(stored_manifest, installation.clone())
+            .await
+        {
+            return Err(compensation_failure(
+                "extension manifest migration refresh failed and durable restore failed",
+                error,
+                map_extension_installation_error(restore_error),
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn validate_restored_manifest_hash(
@@ -2841,6 +2954,14 @@ mod tests {
             scope: ResourceScope,
             extension_id: ExtensionId,
         },
+        InvalidateBeforeManifestLifecycleMutation {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
+        PublishManifest {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
         PrepareActivation {
             scope: ResourceScope,
             extension_id: ExtensionId,
@@ -2892,6 +3013,38 @@ mod tests {
                         extension_id: extension_id.clone(),
                     },
                 );
+            Ok(())
+        }
+
+        async fn invalidate_before_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    LifecyclePolicyProjectionRefreshCall::InvalidateBeforeManifestLifecycleMutation {
+                        scope: scope.clone(),
+                        extension_id: extension_id.clone(),
+                    },
+                );
+            Ok(())
+        }
+
+        async fn publish_after_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(LifecyclePolicyProjectionRefreshCall::PublishManifest {
+                    scope: scope.clone(),
+                    extension_id: extension_id.clone(),
+                });
             Ok(())
         }
 
@@ -2969,6 +3122,26 @@ mod tests {
                 .await
         }
 
+        async fn invalidate_before_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn publish_after_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_after_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -3039,6 +3212,26 @@ mod tests {
                 .await
         }
 
+        async fn invalidate_before_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn publish_after_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_after_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
         async fn prepare_lifecycle_activation_refresh(
             &self,
             scope: &ResourceScope,
@@ -3100,6 +3293,26 @@ mod tests {
         ) -> Result<(), ProductWorkflowError> {
             self.calls
                 .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn invalidate_before_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .invalidate_before_manifest_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn publish_after_manifest_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .publish_after_manifest_lifecycle_mutation(scope, extension_id)
                 .await
         }
 
@@ -3452,6 +3665,7 @@ mod tests {
             )
             .await
             .expect("install Matrix ProductAdapter extension");
+        refresher.clear();
         facade
             .execute(
                 matrix_lifecycle_surface_context(),
@@ -3496,6 +3710,341 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_egress_manifest_lifecycle_install_invokes_manifest_hooks_with_operation_scope()
+    {
+        let refresher = Arc::new(RecordingLifecyclePolicyProjectionCacheRefresher::default());
+        let (_dir, _storage_root, port, _active_registry, _installation_store, _filesystem) =
+            matrix_extension_management_fixture_with_refresher(refresher.clone());
+        let package_ref = matrix_lifecycle_package_ref();
+        let scope = matrix_lifecycle_resource_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension");
+
+        port.install_for_scope(package_ref, &scope, &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension through lifecycle source owner");
+
+        assert_eq!(
+            refresher.calls(),
+            vec![
+                LifecyclePolicyProjectionRefreshCall::InvalidateBeforeManifestLifecycleMutation {
+                    scope: scope.clone(),
+                    extension_id: extension_id.clone(),
+                },
+                LifecyclePolicyProjectionRefreshCall::PublishManifest {
+                    scope,
+                    extension_id,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_egress_manifest_lifecycle_install_uses_matrix_refresher_and_non_matrix_noops() {
+        let (_dir, _storage_root, port, _active_registry, installation_store, filesystem) =
+            matrix_extension_management_fixture_with_refresher(Arc::new(
+                RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+            ));
+        let package_ref = matrix_lifecycle_package_ref();
+        let scope = matrix_lifecycle_resource_scope();
+        let installation_id =
+            AdapterInstallationId::new("matrix-product-adapter").expect("installation");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!matrix-lifecycle-install:example.org".to_string(),
+                subject_user_id: scope.user_id.clone(),
+                matrix_sender_user_id: MatrixUserId::new("@matrix-lifecycle-install:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let root_filesystem: Arc<dyn RootFilesystem> = filesystem.clone();
+        let matrix_refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::new(
+                root_filesystem,
+                installation_store.clone(),
+                vec![provider.clone()],
+                matrix_lifecycle_artifact_evidence(),
+                "matrix-lifecycle-policy-owner".to_string(),
+            )
+            .expect("real Matrix refresher config"),
+        );
+        port.set_policy_projection_cache_refresher(matrix_refresher);
+
+        port.install_for_scope(package_ref, &scope, &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension through lifecycle source owner");
+
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(filesystem.clone()),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        let error = source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect_err("installed-but-disabled lifecycle state must publish fail-closed cache");
+        assert!(matches!(
+            error,
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+
+        let (_dir, _storage_root, non_matrix_port, _active_registry, non_matrix_store) =
+            extension_management_port_fixture_with_catalog_service_and_trust_policy(
+                AvailableExtensionCatalog::from_packages(vec![fixture_extension_package()]),
+                ExtensionLifecycleService::new(ExtensionRegistry::new()),
+                Arc::new(HostTrustPolicy::fail_closed()),
+            );
+        let non_matrix_refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::new(
+                {
+                    let root: Arc<dyn RootFilesystem> = filesystem.clone();
+                    root
+                },
+                non_matrix_store.clone(),
+                vec![provider.clone()],
+                matrix_lifecycle_artifact_evidence(),
+                "matrix-lifecycle-policy-owner".to_string(),
+            )
+            .expect("real Matrix refresher config"),
+        );
+        non_matrix_port.set_policy_projection_cache_refresher(non_matrix_refresher);
+        let policy_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+        let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+        let scoped = crate::wrap_scoped(filesystem.clone());
+        let before = scoped
+            .get(&policy_scope, &cache_path)
+            .await
+            .expect("cache lookup before non-Matrix install");
+
+        non_matrix_port
+            .install_for_scope(
+                LifecyclePackageRef::new(LifecyclePackageKind::Extension, "fixture")
+                    .expect("fixture package ref"),
+                &scope,
+                &lifecycle_owner(),
+            )
+            .await
+            .expect("non-Matrix lifecycle manifest persistence must not touch Matrix projection");
+
+        let after = scoped
+            .get(&policy_scope, &cache_path)
+            .await
+            .expect("cache lookup after non-Matrix install");
+        assert_eq!(
+            before.map(|entry| entry.entry.body),
+            after.map(|entry| entry.entry.body)
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_egress_manifest_restore_migration_refreshes_projection_to_new_manifest() {
+        let (_dir, _storage_root, port, _active_registry, installation_store, filesystem) =
+            matrix_extension_management_fixture_with_refresher(Arc::new(
+                RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+            ));
+        let scope = matrix_lifecycle_resource_scope();
+        let installation_id =
+            AdapterInstallationId::new("matrix-product-adapter").expect("installation");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!matrix-lifecycle-restore:example.org".to_string(),
+                subject_user_id: scope.user_id.clone(),
+                matrix_sender_user_id: MatrixUserId::new("@matrix-lifecycle-restore:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let root_filesystem: Arc<dyn RootFilesystem> = filesystem.clone();
+        let matrix_refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::new(
+                root_filesystem,
+                installation_store.clone(),
+                vec![provider.clone()],
+                matrix_lifecycle_artifact_evidence(),
+                "matrix-lifecycle-policy-owner".to_string(),
+            )
+            .expect("real Matrix refresher config"),
+        );
+        port.set_policy_projection_cache_refresher(matrix_refresher.clone());
+        let package_ref = matrix_lifecycle_package_ref();
+        port.install_for_scope(package_ref.clone(), &scope, &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        port.activate_with_prechecked_credentials_for_test(
+            package_ref,
+            ExtensionActivationMode::Static,
+        )
+        .await
+        .expect("activate Matrix ProductAdapter extension");
+
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(filesystem.clone()),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        let initial_snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial Matrix policy snapshot");
+        assert_eq!(initial_snapshot.homeserver.host(), "matrix.example.org");
+        assert_eq!(
+            initial_snapshot.credential_handle.as_str(),
+            "matrix-access-token"
+        );
+
+        let changed_available = matrix_product_adapter_package_with_egress(
+            "matrix.changed.example.org",
+            "matrix-rotated-access-token",
+        );
+        let changed_catalog = AvailableExtensionCatalog::from_packages(vec![changed_available]);
+        let restored_lifecycle = Arc::new(Mutex::new(ExtensionLifecycleService::new(
+            ExtensionRegistry::new(),
+        )));
+        let restored_active_registry =
+            Arc::new(SharedExtensionRegistry::new(ExtensionRegistry::new()));
+        let restored_active_extensions = test_active_extension_publisher(
+            Arc::clone(&restored_active_registry),
+            test_extension_trust_policy(),
+        );
+        let installation_store_trait: Arc<dyn ExtensionInstallationStore> =
+            installation_store.clone();
+        let policy_refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher> =
+            matrix_refresher.clone();
+
+        restore_extension_lifecycle_state(
+            &changed_catalog,
+            &port.filesystem,
+            &installation_store_trait,
+            &restored_lifecycle,
+            &restored_active_extensions,
+            &scope,
+            policy_refresher,
+        )
+        .await
+        .expect("restore migrates Matrix manifest and refreshes projection");
+
+        let migrated_snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("migrated Matrix policy snapshot");
+        assert_eq!(
+            migrated_snapshot.homeserver.host(),
+            "matrix.changed.example.org"
+        );
+        assert_eq!(
+            migrated_snapshot.credential_handle.as_str(),
+            "matrix-rotated-access-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_egress_manifest_restore_migration_with_removed_egress_fails_closed_projection()
+    {
+        let (_dir, _storage_root, port, _active_registry, installation_store, filesystem) =
+            matrix_extension_management_fixture_with_refresher(Arc::new(
+                RecordingLifecyclePolicyProjectionCacheRefresher::default(),
+            ));
+        let scope = matrix_lifecycle_resource_scope();
+        let installation_id =
+            AdapterInstallationId::new("matrix-product-adapter").expect("installation");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!matrix-lifecycle-removed-egress:example.org".to_string(),
+                subject_user_id: scope.user_id.clone(),
+                matrix_sender_user_id: MatrixUserId::new(
+                    "@matrix-lifecycle-removed-egress:example.org",
+                )
+                .expect("matrix sender"),
+            }],
+        };
+        let root_filesystem: Arc<dyn RootFilesystem> = filesystem.clone();
+        let matrix_refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::new(
+                root_filesystem,
+                installation_store.clone(),
+                vec![provider.clone()],
+                matrix_lifecycle_artifact_evidence(),
+                "matrix-lifecycle-policy-owner".to_string(),
+            )
+            .expect("real Matrix refresher config"),
+        );
+        port.set_policy_projection_cache_refresher(matrix_refresher.clone());
+        let package_ref = matrix_lifecycle_package_ref();
+        port.install_for_scope(package_ref.clone(), &scope, &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        port.activate_with_prechecked_credentials_for_test(
+            package_ref,
+            ExtensionActivationMode::Static,
+        )
+        .await
+        .expect("activate Matrix ProductAdapter extension");
+
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(filesystem.clone()),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial Matrix policy snapshot");
+
+        let removed_egress_catalog = AvailableExtensionCatalog::from_packages(vec![
+            matrix_product_adapter_package_without_egress(),
+        ]);
+        let restored_lifecycle = Arc::new(Mutex::new(ExtensionLifecycleService::new(
+            ExtensionRegistry::new(),
+        )));
+        let restored_active_registry =
+            Arc::new(SharedExtensionRegistry::new(ExtensionRegistry::new()));
+        let restored_active_extensions = test_active_extension_publisher(
+            Arc::clone(&restored_active_registry),
+            test_extension_trust_policy(),
+        );
+        let installation_store_trait: Arc<dyn ExtensionInstallationStore> =
+            installation_store.clone();
+        let policy_refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher> =
+            matrix_refresher.clone();
+
+        restore_extension_lifecycle_state(
+            &removed_egress_catalog,
+            &port.filesystem,
+            &installation_store_trait,
+            &restored_lifecycle,
+            &restored_active_extensions,
+            &scope,
+            policy_refresher,
+        )
+        .await
+        .expect("restore migrates Matrix manifest after source-owned egress removal");
+
+        let error = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect_err("removed Matrix egress authority must fail closed");
+        assert!(matches!(
+            error,
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+    }
+
+    #[tokio::test]
     async fn matrix_lifecycle_activation_prepare_failure_rolls_back_enabled_and_publish_state() {
         let refresher = Arc::new(FailingLifecyclePolicyProjectionCacheRefresher::new());
         let (_dir, _storage_root, port, active_registry, installation_store, _filesystem) =
@@ -3505,6 +4054,7 @@ mod tests {
         port.install(package_ref.clone(), &lifecycle_owner())
             .await
             .expect("install Matrix ProductAdapter extension");
+        refresher.calls.clear();
         port.activate_with_prechecked_credentials_for_test(
             package_ref,
             ExtensionActivationMode::Static,
@@ -3550,6 +4100,7 @@ mod tests {
         port.install(package_ref.clone(), &lifecycle_owner())
             .await
             .expect("install Matrix ProductAdapter extension");
+        refresher.clear();
         port.activate_with_credential_gate_for_scope(
             package_ref,
             ExtensionActivationMode::Static,
@@ -3603,6 +4154,7 @@ mod tests {
         port.install(package_ref.clone(), &lifecycle_owner())
             .await
             .expect("install Matrix ProductAdapter extension");
+        refresher.calls.clear();
         let error = port
             .activate_with_credential_gate_for_scope(
                 package_ref,
@@ -3646,6 +4198,7 @@ mod tests {
         port.install(package_ref.clone(), &lifecycle_owner())
             .await
             .expect("install Matrix ProductAdapter extension");
+        refresher.calls.clear();
         let error = port
             .activate_with_prechecked_credentials_for_test(
                 package_ref,
@@ -3706,6 +4259,7 @@ mod tests {
         port.install(package_ref.clone(), &lifecycle_owner())
             .await
             .expect("install Matrix ProductAdapter extension");
+        refresher.clear();
         port.activate_with_prechecked_credentials_for_test(
             package_ref.clone(),
             ExtensionActivationMode::Static,
@@ -3872,6 +4426,7 @@ mod tests {
         )
         .await
         .expect("activate Matrix ProductAdapter extension");
+        refresher.calls.clear();
 
         let error = port
             .remove(
@@ -3906,7 +4461,7 @@ mod tests {
                 .is_some(),
             "failed invalidation must not unpublish the active Matrix extension"
         );
-        assert_eq!(refresher.calls().len(), 3);
+        assert_eq!(refresher.calls().len(), 1);
     }
 
     /// A complete uploaded WASM tool bundle zip in the `InstalledLocal`-legal
@@ -6003,6 +6558,8 @@ output_schema_ref = "schemas/run.output.json"
             &installation_store,
             &restored_lifecycle,
             &restored_active_extensions,
+            &restore_lifecycle_resource_scope(),
+            noop_lifecycle_policy_projection_cache_refresher(),
         )
         .await
         .expect("restore enabled extension lifecycle state");
@@ -6079,6 +6636,8 @@ output_schema_ref = "schemas/run.output.json"
             &installation_store_trait,
             &restored_lifecycle,
             &restored_active_extensions,
+            &restore_lifecycle_resource_scope(),
+            noop_lifecycle_policy_projection_cache_refresher(),
         )
         .await
         .expect("retired slack_user install is cleaned up during restore");
@@ -6176,6 +6735,8 @@ output_schema_ref = "schemas/run.output.json"
             &installation_store,
             &restored_lifecycle,
             &restored_active_extensions,
+            &restore_lifecycle_resource_scope(),
+            noop_lifecycle_policy_projection_cache_refresher(),
         )
         .await
         .expect("restore succeeds by skipping the orphan installation");
@@ -6244,6 +6805,8 @@ output_schema_ref = "schemas/run.output.json"
             &installation_store,
             &restored_lifecycle,
             &restored_active_extensions,
+            &restore_lifecycle_resource_scope(),
+            noop_lifecycle_policy_projection_cache_refresher(),
         )
         .await
         .expect("restore extension lifecycle state");
@@ -6290,6 +6853,8 @@ output_schema_ref = "schemas/run.output.json"
             Arc::clone(&restored_trust_policy),
         );
         let installation_store: Arc<dyn ExtensionInstallationStore> = installation_store;
+        let refresher = Arc::new(RecordingLifecyclePolicyProjectionCacheRefresher::default());
+        let restore_scope = restore_lifecycle_resource_scope();
 
         restore_extension_lifecycle_state(
             &changed_catalog,
@@ -6297,6 +6862,8 @@ output_schema_ref = "schemas/run.output.json"
             &installation_store,
             &restored_lifecycle,
             &restored_active_extensions,
+            &restore_scope,
+            refresher.clone(),
         )
         .await
         .expect("host-bundled manifest hash mismatch migrates");
@@ -6332,6 +6899,19 @@ output_schema_ref = "schemas/run.output.json"
                 .snapshot()
                 .get_extension(&extension_id)
                 .is_some()
+        );
+        assert_eq!(
+            refresher.calls(),
+            vec![
+                LifecyclePolicyProjectionRefreshCall::InvalidateBeforeManifestLifecycleMutation {
+                    scope: restore_scope.clone(),
+                    extension_id: extension_id.clone(),
+                },
+                LifecyclePolicyProjectionRefreshCall::PublishManifest {
+                    scope: restore_scope,
+                    extension_id,
+                },
+            ]
         );
     }
 
@@ -6378,6 +6958,8 @@ output_schema_ref = "schemas/run.output.json"
             &installation_store,
             &restored_lifecycle,
             &restored_active_extensions,
+            &restore_lifecycle_resource_scope(),
+            noop_lifecycle_policy_projection_cache_refresher(),
         )
         .await
         .expect_err("non-host-bundled manifest hash mismatch fails closed");
@@ -9265,6 +9847,11 @@ output_schema_ref = "schemas/run.output.json"
         UserId::new("lifecycle-owner").expect("valid user")
     }
 
+    fn restore_lifecycle_resource_scope() -> ResourceScope {
+        ResourceScope::local_default(lifecycle_owner(), InvocationId::new())
+            .expect("valid restore lifecycle scope")
+    }
+
     fn test_extension_trust_policy() -> Arc<HostTrustPolicy> {
         Arc::new(
             HostTrustPolicy::new(vec![Box::new(ironclaw_trust::AdminConfig::new())])
@@ -9391,6 +9978,51 @@ output_schema_ref = "schemas/run.output.json"
     }
 
     fn matrix_product_adapter_package() -> AvailableExtensionPackage {
+        matrix_product_adapter_package_with_egress("matrix.example.org", "matrix-access-token")
+    }
+
+    fn matrix_product_adapter_package_without_egress() -> AvailableExtensionPackage {
+        let manifest = format!(
+            r#"
+schema_version = "{schema}"
+id = "matrix-product-adapter"
+name = "Matrix"
+version = "0.1.0"
+description = "Matrix ProductAdapter lifecycle fixture with removed egress"
+trust = "first_party_requested"
+
+[runtime]
+kind = "wasm"
+module = "wasm/fixture.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "shared_secret_header"
+header_name = "x-matrix-webhook-secret"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages", "external_final_reply_push"]
+"#,
+            schema = ironclaw_extensions::MANIFEST_SCHEMA_VERSION
+        );
+        let mut package = fixture_extension_package_from_manifest_with_product_adapter_contracts(
+            &manifest,
+            "matrix-product-adapter",
+        );
+        package.surface_kinds = vec![LifecycleExtensionSurfaceKind::ExternalChannel];
+        package
+    }
+
+    fn matrix_product_adapter_package_with_egress(
+        homeserver_host: &str,
+        credential_handle: &str,
+    ) -> AvailableExtensionPackage {
         let manifest = format!(
             r#"
 schema_version = "{schema}"
@@ -9419,11 +10051,11 @@ header_name = "x-matrix-webhook-secret"
 flags = ["inbound_messages", "external_final_reply_push"]
 
 [[product_adapter.inbound.required_credentials]]
-handle = "matrix-access-token"
+handle = "{credential_handle}"
 
 [[product_adapter.inbound.egress]]
-host = "matrix.example.org"
-credential_handle = "matrix-access-token"
+host = "{homeserver_host}"
+credential_handle = "{credential_handle}"
 "#,
             schema = ironclaw_extensions::MANIFEST_SCHEMA_VERSION
         );

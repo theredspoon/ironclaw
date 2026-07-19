@@ -17,6 +17,7 @@ use ironclaw_host_api::{CapabilityId, SecretHandle};
 #[cfg(all(test, feature = "slack-v2-host-beta"))]
 use ironclaw_host_runtime::HostRuntimeHttpEgressPort;
 use ironclaw_host_runtime::TenantSandboxProcessPort;
+use ironclaw_matrix_adapter::installation_policy::MatrixRuntimeArtifactEvidence;
 #[cfg(any(test, feature = "test-support"))]
 use ironclaw_network::NetworkHttpEgress;
 use ironclaw_trust::HostTrustPolicy;
@@ -34,6 +35,7 @@ use ironclaw_reborn_event_store::{PostgresPoolTlsOptions, RebornPostgresSslMode}
 use crate::RebornBuildError;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use crate::matrix_outbound::MatrixRetryWorkerSettings;
+use crate::matrix_outbound_targets::MatrixOutboundTargetProviderConfig;
 use crate::product_auth::oauth::google_oauth::google_provider_spec;
 use crate::product_auth::oauth::notion_oauth::notion_provider_spec;
 use crate::product_auth::oauth::oauth_dcr::OAuthDcrProviderConfig;
@@ -127,6 +129,13 @@ pub(crate) struct MatrixRetryProductionConfig {
     pub(crate) credential_secret: SecretHandle,
     pub(crate) credential_handle_fingerprint: String,
     pub(crate) capability_id: CapabilityId,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MatrixStartupPolicyProjectionCacheConfig {
+    pub(crate) target_providers: Vec<MatrixOutboundTargetProviderConfig>,
+    pub(crate) artifact_evidence: MatrixRuntimeArtifactEvidence,
+    pub(crate) policy_owner_actor: String,
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -269,6 +278,8 @@ pub struct RebornBuildInput {
     pub(crate) product_auth_ports: Option<RebornProductAuthServicePorts>,
     pub(crate) oauth_provider_configs: Vec<OAuthProviderBackendConfig>,
     pub(crate) oauth_dcr_provider_configs: Vec<OAuthDcrProviderBackendConfig>,
+    pub(crate) matrix_startup_policy_projection_cache:
+        Option<MatrixStartupPolicyProjectionCacheConfig>,
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     pub(crate) matrix_retry_production_config: Option<MatrixRetryProductionConfig>,
     #[cfg(feature = "slack-v2-host-beta")]
@@ -701,6 +712,14 @@ impl RebornBuildInput {
         self
     }
 
+    pub(crate) fn with_matrix_startup_policy_projection_cache(
+        mut self,
+        config: MatrixStartupPolicyProjectionCacheConfig,
+    ) -> Self {
+        self.matrix_startup_policy_projection_cache = Some(config);
+        self
+    }
+
     pub fn require_runtime_http_egress(mut self) -> Self {
         self.require_runtime_http_egress = true;
         self
@@ -883,6 +902,7 @@ impl RebornBuildInput {
             product_auth_ports: None,
             oauth_provider_configs: Vec::new(),
             oauth_dcr_provider_configs: Vec::new(),
+            matrix_startup_policy_projection_cache: None,
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             matrix_retry_production_config: None,
             #[cfg(feature = "slack-v2-host-beta")]

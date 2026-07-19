@@ -22,8 +22,9 @@ use ironclaw_auth::{
 use ironclaw_events::{DurableAuditLog, EventStreamKey, InMemoryDurableAuditLog, ReadScope};
 use ironclaw_extensions::{
     ExtensionActivationState, ExtensionInstallation, ExtensionInstallationId,
-    ExtensionManifestRecord, ExtensionManifestRef, InMemoryExtensionInstallationStore,
-    InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash, ManifestSource,
+    ExtensionInstallationStore, ExtensionManifestRecord, ExtensionManifestRef,
+    InMemoryExtensionInstallationStore, InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash,
+    ManifestSource,
 };
 use ironclaw_filesystem::{
     BackendCapabilities, DirEntry, FileStat, FilesystemError, FilesystemOperation, InMemoryBackend,
@@ -277,7 +278,6 @@ async fn matrix_lifecycle_refresher_rebuilds_shared_source_snapshot_after_room_b
         matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
         matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
     );
-
     refresher
         .refresh_after_lifecycle_activation(&scope, &extension_id)
         .await
@@ -1326,7 +1326,6 @@ async fn matrix_lifecycle_prepared_publish_refuses_stale_body_after_room_binding
         matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
         matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
     );
-
     refresher
         .prepare_lifecycle_activation_refresh(&scope, &extension_id)
         .await
@@ -3422,6 +3421,28 @@ impl LifecyclePolicyProjectionCacheRefresher for CountingLifecyclePolicyProjecti
             .await
     }
 
+    async fn invalidate_before_manifest_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        self.invalidates.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .invalidate_before_manifest_lifecycle_mutation(scope, extension_id)
+            .await
+    }
+
+    async fn publish_after_manifest_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        self.publishes.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .publish_after_manifest_lifecycle_mutation(scope, extension_id)
+            .await
+    }
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         scope: &ResourceScope,
@@ -3892,12 +3913,24 @@ fn matrix_runtime_manifest_record() -> ExtensionManifestRecord {
 fn matrix_runtime_manifest_record_with_credential(
     credential_handle: &str,
 ) -> ExtensionManifestRecord {
+    matrix_runtime_manifest_record_with_egress_host(
+        "matrix.source.example.org",
+        "sha256:matrix-source-backed",
+        credential_handle,
+    )
+}
+
+fn matrix_runtime_manifest_record_with_egress_host(
+    egress_host: &str,
+    manifest_hash: &str,
+    credential_handle: &str,
+) -> ExtensionManifestRecord {
     product_adapter_manifest_record_with_credential(
         "matrix-product-adapter",
         "Matrix",
         "Matrix source-backed projection fixture",
-        "matrix.source.example.org",
-        "sha256:matrix-source-backed",
+        egress_host,
+        manifest_hash,
         credential_handle,
     )
 }
@@ -3905,12 +3938,24 @@ fn matrix_runtime_manifest_record_with_credential(
 fn non_matrix_runtime_manifest_record_with_credential(
     credential_handle: &str,
 ) -> ExtensionManifestRecord {
+    non_matrix_runtime_manifest_record_with_egress_host(
+        "github.source.example.org",
+        "sha256:non-matrix-source-backed",
+        credential_handle,
+    )
+}
+
+fn non_matrix_runtime_manifest_record_with_egress_host(
+    egress_host: &str,
+    manifest_hash: &str,
+    credential_handle: &str,
+) -> ExtensionManifestRecord {
     product_adapter_manifest_record_with_credential(
         "github",
         "GitHub",
         "Non-Matrix source-backed projection fixture",
-        "github.source.example.org",
-        "sha256:non-matrix-source-backed",
+        egress_host,
+        manifest_hash,
         credential_handle,
     )
 }
