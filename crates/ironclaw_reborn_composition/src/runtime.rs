@@ -43,7 +43,7 @@ use ironclaw_first_party_extension_ports::{
 use ironclaw_host_api::{
     ActionResultSummary, ActionSummary, AgentId, ApprovalRequestId, AuditEnvelope, AuditEventId,
     AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, ExtensionId,
-    InvocationId, Principal, ResourceScope, TenantId, ThreadId, UserId,
+    InvocationId, Principal, ProjectId, ResourceScope, TenantId, ThreadId, UserId,
 };
 use ironclaw_loop_host::{
     AwaitEdgeSettler, AwaitEdgeWriter, CapabilityAllowSet, CapabilityResolveError,
@@ -125,8 +125,10 @@ use crate::matrix_outbound::{
 };
 use crate::matrix_outbound_targets::{
     FilesystemMatrixRoomBindingStore, MatrixHostProductOutboundTargetResolver,
-    MatrixHostReplyTargetPolicy, MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest,
-    MatrixRoomBindingStore, register_matrix_outbound_target_provider_source,
+    MatrixHostReplyTargetPolicy, MatrixRoomBindingAuthority, MatrixRoomBindingMutationContext,
+    MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore,
+    MatrixRoomBindingUpdateOutcome, MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome,
+    MatrixRoomBindingUpsertRequest, register_matrix_outbound_target_provider_source,
 };
 use crate::matrix_product_outbound::{
     FilesystemMatrixPolicySnapshotSource, MATRIX_PRODUCT_ADAPTER_EXTENSION_ID,
@@ -756,6 +758,7 @@ pub struct RebornRuntime {
     matrix_room_binding_store: Option<Arc<dyn MatrixRoomBindingStore>>,
     matrix_policy_projection_cache_refresher:
         Option<Arc<MatrixLifecyclePolicyProjectionCacheRefresher>>,
+    matrix_room_binding_authority: Option<Arc<MatrixRoomBindingAuthority>>,
     matrix_product_outbound_target_resolver: Option<Arc<MatrixHostProductOutboundTargetResolver>>,
     budget_event_projection: Option<crate::observability::budget_events::BudgetEventProjection>,
     poll_settings: PollSettings,
@@ -1011,6 +1014,14 @@ fn trigger_poller_authorization_required_error() -> RebornRuntimeError {
         reason: "trigger poller cannot be enabled without a fire-time creator access checker"
             .to_string(),
     }
+}
+
+fn matrix_product_adapter_extension_id() -> Result<ExtensionId, RebornRuntimeError> {
+    ExtensionId::new(MATRIX_PRODUCT_ADAPTER_EXTENSION_ID).map_err(|error| {
+        RebornRuntimeError::InvalidArgument {
+            reason: format!("Matrix ProductAdapter extension id is invalid: {error}"),
+        }
+    })
 }
 
 /// Validate the temporary trigger-poller authorizer shape after the caller has
@@ -1948,6 +1959,75 @@ impl RebornRuntime {
                 ),
             })?;
         Ok(outcome)
+    }
+
+    pub async fn upsert_matrix_room_binding(
+        &self,
+        request: MatrixRoomBindingUpsertRequest,
+    ) -> Result<MatrixRoomBindingUpsertOutcome, RebornRuntimeError> {
+        let Some(authority) = self.matrix_room_binding_authority.as_ref() else {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "Matrix room binding authority is not configured".to_string(),
+            });
+        };
+        let scope = self.matrix_room_binding_mutation_scope(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.clone(),
+        );
+        let extension_id = matrix_product_adapter_extension_id()?;
+        authority
+            .upsert_room_binding(
+                MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(scope, extension_id),
+                request,
+            )
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!("Matrix room binding upsert failed: {error}"),
+            })
+    }
+
+    pub async fn update_matrix_room_binding(
+        &self,
+        request: MatrixRoomBindingUpdateRequest,
+    ) -> Result<MatrixRoomBindingUpdateOutcome, RebornRuntimeError> {
+        let Some(authority) = self.matrix_room_binding_authority.as_ref() else {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "Matrix room binding authority is not configured".to_string(),
+            });
+        };
+        let scope = self.matrix_room_binding_mutation_scope(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.clone(),
+        );
+        let extension_id = matrix_product_adapter_extension_id()?;
+        authority
+            .update_room_binding(
+                MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(scope, extension_id),
+                request,
+            )
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!("Matrix room binding update failed: {error}"),
+            })
+    }
+
+    fn matrix_room_binding_mutation_scope(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<ProjectId>,
+    ) -> ResourceScope {
+        ResourceScope {
+            tenant_id: tenant_id.clone(),
+            user_id: self.actor_user_id.clone(),
+            agent_id: Some(agent_id.clone()),
+            project_id,
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
     }
 
     pub async fn prepare_matrix_product_outbound(
@@ -3654,6 +3734,16 @@ pub async fn build_reborn_runtime(
         } else {
             None
         };
+    let matrix_room_binding_authority = match (
+        &matrix_room_binding_store,
+        &matrix_policy_projection_cache_refresher,
+    ) {
+        (Some(target_source), Some(refresher)) => Some(Arc::new(MatrixRoomBindingAuthority::new(
+            Arc::clone(target_source),
+            Arc::clone(refresher),
+        ))),
+        _ => None,
+    };
 
     // Extract the pre-minted scheduler wake wiring from the production composition path
     // (minted in `build_production_shaped`) so it can be handed to
@@ -4629,6 +4719,7 @@ pub async fn build_reborn_runtime(
         outbound_delivery_target_registry: Some(outbound_delivery_target_registry),
         matrix_room_binding_store,
         matrix_policy_projection_cache_refresher,
+        matrix_room_binding_authority,
         matrix_product_outbound_target_resolver,
         budget_event_projection,
         poll_settings: poll,
