@@ -473,9 +473,10 @@ use crate::input::RebornBuildInput;
 #[cfg(feature = "libsql")]
 use crate::observability::hooks::HooksActivationConfig;
 use crate::runtime_input::{
-    PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TriggerFireAccessCheck,
-    TriggerFireAccessChecker, TriggerFireAccessDecision, TriggerFireAccessError,
-    TriggerPollerSettings,
+    MatrixOutboundRoomTargetConfig, MatrixOutboundTargetMountConfig,
+    MatrixOutboundTargetMountConfigInput, PollSettings, RebornRuntimeIdentity, RebornRuntimeInput,
+    TriggerFireAccessCheck, TriggerFireAccessChecker, TriggerFireAccessDecision,
+    TriggerFireAccessError, TriggerPollerSettings,
 };
 use crate::webui::facade::build_webui_services;
 use crate::{RebornCompositionProfile, RebornReadiness, RebornReadinessState, RebornRuntimeError};
@@ -2558,6 +2559,74 @@ async fn build_reborn_runtime_allows_validated_production_readiness() {
     );
 }
 
+#[tokio::test]
+async fn build_reborn_runtime_rejects_matrix_outbound_mount_without_policy_cache() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let host_home = root.path().join("host-home");
+    std::fs::create_dir_all(&host_home).expect("host home");
+    let tenant_id = TenantId::new("runtime-matrix-cache-required-tenant").expect("tenant");
+    let agent_id = AgentId::new("runtime-matrix-cache-required-agent").expect("agent");
+    let user_id = UserId::new("runtime-matrix-cache-required-user").expect("user");
+
+    let input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev_with_profile(
+            RebornCompositionProfile::LocalDevYolo,
+            "runtime-matrix-cache-required-owner",
+            root.path().join("local-dev"),
+        )
+        .with_runtime_policy(
+            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
+        )
+        .with_local_dev_confirmed_host_home_root(host_home),
+    )
+    .with_identity(RebornRuntimeIdentity {
+        tenant_id: tenant_id.as_str().to_string(),
+        agent_id: agent_id.as_str().to_string(),
+        source_binding_id: "runtime-matrix-cache-required-source".to_string(),
+        reply_target_binding_id: "runtime-matrix-cache-required-reply".to_string(),
+    })
+    .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
+        MatrixOutboundTargetMountConfigInput {
+            tenant_id,
+            agent_id,
+            project_id: None,
+            installation_id: AdapterInstallationId::new(
+                "runtime-matrix-cache-required-installation",
+            )
+            .expect("installation"),
+            room_targets: vec![MatrixOutboundRoomTargetConfig::new(
+                crate::matrix_outbound::MatrixRoomId::new("!cache-required:matrix.example")
+                    .expect("valid Matrix room id"),
+                user_id,
+                ironclaw_matrix_adapter::installation_policy::MatrixUserId::new(
+                    "@cache-required:example.org",
+                )
+                .expect("matrix sender"),
+            )],
+        },
+    ));
+
+    let error = match build_reborn_runtime(input).await {
+        Ok(runtime) => {
+            runtime.shutdown().await.expect("runtime shutdown");
+            panic!(
+                "Matrix outbound target mounts without policy projection cache must fail closed"
+            );
+        }
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            RebornRuntimeError::InvalidArgument { ref reason }
+                if reason.contains("matrix_outbound_target_providers")
+                    && reason.contains("matrix_policy_projection_cache")
+        ),
+        "unexpected error: {error:#}"
+    );
+}
+
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn build_reborn_runtime_spawns_and_shuts_down_configured_matrix_retry_worker() {
@@ -2752,6 +2821,10 @@ async fn production_runtime_registers_matrix_outbound_target_mount() {
                 crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
                     .expect("valid Matrix room id"),
                 user_id.clone(),
+                ironclaw_matrix_adapter::installation_policy::MatrixUserId::new(
+                    "@runtime:example.org",
+                )
+                .expect("matrix sender"),
             )],
         },
     ));

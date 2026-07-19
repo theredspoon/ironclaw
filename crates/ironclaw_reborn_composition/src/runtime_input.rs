@@ -28,6 +28,9 @@ use ironclaw_host_api::{AgentId, ProjectId, TenantId, Timestamp, UserId};
 #[cfg(any(test, feature = "test-support"))]
 use ironclaw_loop_host::HostManagedModelGateway;
 use ironclaw_loop_host::HostSkillContextSource;
+use ironclaw_matrix_adapter::installation_policy::{
+    MatrixInstallationPolicyRejection, MatrixRuntimeArtifactEvidence, MatrixUserId,
+};
 use ironclaw_reborn_config::BudgetDefaults;
 #[cfg(feature = "root-llm-provider")]
 use ironclaw_reborn_config::RebornBootConfig;
@@ -106,13 +109,25 @@ pub struct MatrixOutboundTargetMountConfigInput {
 pub struct MatrixOutboundRoomTargetConfig {
     room_id: MatrixRoomId,
     subject_user_id: UserId,
+    matrix_sender_user_id: MatrixUserId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixPolicyProjectionCacheConfig {
+    pub(crate) artifact_evidence: MatrixRuntimeArtifactEvidence,
+    pub(crate) policy_owner_actor: String,
 }
 
 impl MatrixOutboundRoomTargetConfig {
-    pub fn new(room_id: MatrixRoomId, subject_user_id: UserId) -> Self {
+    pub fn new(
+        room_id: MatrixRoomId,
+        subject_user_id: UserId,
+        matrix_sender_user_id: MatrixUserId,
+    ) -> Self {
         Self {
             room_id,
             subject_user_id,
+            matrix_sender_user_id,
         }
     }
 }
@@ -129,6 +144,22 @@ impl MatrixOutboundTargetMountConfig {
     }
 }
 
+impl MatrixPolicyProjectionCacheConfig {
+    pub fn new(
+        artifact_evidence: MatrixRuntimeArtifactEvidence,
+        policy_owner_actor: impl Into<String>,
+    ) -> Result<Self, MatrixInstallationPolicyRejection> {
+        let policy_owner_actor = policy_owner_actor.into();
+        if policy_owner_actor.is_empty() || policy_owner_actor.chars().any(|c| c.is_control()) {
+            return Err(MatrixInstallationPolicyRejection::InvalidPolicyValue);
+        }
+        Ok(Self {
+            artifact_evidence,
+            policy_owner_actor,
+        })
+    }
+}
+
 impl From<MatrixOutboundTargetMountConfig> for MatrixOutboundTargetProviderConfig {
     fn from(config: MatrixOutboundTargetMountConfig) -> Self {
         Self {
@@ -142,6 +173,7 @@ impl From<MatrixOutboundTargetMountConfig> for MatrixOutboundTargetProviderConfi
                 .map(|target| MatrixConfiguredRoomRoute {
                     room_id: target.room_id.as_str().to_string(),
                     subject_user_id: target.subject_user_id,
+                    matrix_sender_user_id: target.matrix_sender_user_id,
                 })
                 .collect(),
         }
@@ -500,6 +532,7 @@ pub struct RebornRuntimeInput {
     pub regex_skill_activation_enabled: bool,
     pub skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     pub(crate) matrix_outbound_target_providers: Vec<MatrixOutboundTargetProviderConfig>,
+    pub(crate) matrix_policy_projection_cache: Option<MatrixPolicyProjectionCacheConfig>,
     /// Hook-framework activation knobs. Default OFF. Callers resolve
     /// environment or config into this typed value once at the edge.
     pub hooks: HooksActivationConfig,
@@ -569,6 +602,7 @@ impl RebornRuntimeInput {
             regex_skill_activation_enabled: true,
             skill_context_source: None,
             matrix_outbound_target_providers: Vec::new(),
+            matrix_policy_projection_cache: None,
             hooks: HooksActivationConfig::default(),
             budget_defaults: None,
             budget_event_observer: None,
@@ -766,6 +800,14 @@ impl RebornRuntimeInput {
                 .into_iter()
                 .map(MatrixOutboundTargetProviderConfig::from),
         );
+        self
+    }
+
+    pub fn with_matrix_policy_projection_cache(
+        mut self,
+        config: MatrixPolicyProjectionCacheConfig,
+    ) -> Self {
+        self.matrix_policy_projection_cache = Some(config);
         self
     }
 

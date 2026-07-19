@@ -1,13 +1,25 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
+use ironclaw_common::hashing::sha256_hex;
 use ironclaw_extensions::ExtensionInstallationStore;
-use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
-use ironclaw_host_api::{ResourceScope, ScopedPath};
+use ironclaw_filesystem::{CasExpectation, ContentType, Entry, RootFilesystem, ScopedFilesystem};
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+use ironclaw_host_api::{AgentId, ProjectId, TenantId};
+use ironclaw_host_api::{ExtensionId, ResourceScope, ScopedPath};
 use ironclaw_matrix_adapter::installation_policy::{
-    MatrixActivationState, MatrixInstallationPolicyRejection, MatrixInstallationProjectionCache,
-    MatrixOutboundPolicyCheck, MatrixPolicySnapshot, MatrixRoomId, authorize_matrix_outbound,
-    ensure_matrix_extension_lifecycle_enabled,
+    EgressTargetIndex, InstallationAuditMetadata, MatrixActivationState, MatrixHomeserverOrigin,
+    MatrixInstallationPolicy, MatrixInstallationPolicyRejection, MatrixInstallationProjectionCache,
+    MatrixOutboundPolicyCheck, MatrixPolicySnapshot, MatrixProductAdapterInstallation,
+    MatrixRoomId, MatrixRuntimeArtifactEvidence, authorize_matrix_outbound,
+    ensure_matrix_extension_lifecycle_enabled, project_matrix_installation_from_runtime_entry,
+};
+use ironclaw_product_adapter_registry::{
+    ProductAdapterRuntimeEntry, list_enabled_product_adapter_entries,
 };
 use ironclaw_product_adapters::redaction::RedactedString;
 use ironclaw_product_adapters::{
@@ -19,12 +31,533 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_product_workflow::{
     ProductOutboundDeliveryError, ProductOutboundDeliveryOutcome, ProductOutboundDeliveryRequest,
-    ProductOutboundStatusUpdateFailure, ProductOutboundTargetResolver,
+    ProductOutboundStatusUpdateFailure, ProductOutboundTargetResolver, ProductWorkflowError,
     ProductWorkflowError as ProductOutboundWorkflowError, prepare_and_render_product_outbound,
 };
 
-pub const MATRIX_POLICY_PROJECTION_CACHE_PATH: &str =
-    "/outbound/matrix/policy/installation-projection-cache.json";
+use crate::extension_host::extension_lifecycle::LifecyclePolicyProjectionCacheRefresher;
+use crate::matrix_outbound::MatrixPolicyProviderScope;
+use crate::matrix_outbound_targets::{
+    MatrixOutboundTargetProviderConfig, matrix_policy_provider_scope_key,
+};
+
+const MATRIX_PRODUCT_ADAPTER_EXTENSION_ID: &str = "matrix-product-adapter";
+pub const MATRIX_POLICY_PROJECTION_CACHE_ROOT: &str = "/tenant-shared/matrix/policy";
+const MATRIX_POLICY_PROJECTION_COMMIT_MARKER_TOMBSTONE: &[u8] = b"invalidated\n";
+
+struct MatrixPolicyProjectionCacheWrite {
+    provider_scope: ResourceScope,
+    provider_cache_path: ScopedPath,
+    commit_marker_path: ScopedPath,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MatrixLifecyclePolicyProjectionCacheRefresher {
+    filesystem: Arc<ScopedFilesystem<dyn RootFilesystem>>,
+    installation_store: Arc<dyn ExtensionInstallationStore>,
+    target_providers: Vec<MatrixOutboundTargetProviderConfig>,
+    artifact_evidence: MatrixRuntimeArtifactEvidence,
+    policy_owner_actor: String,
+}
+
+impl MatrixLifecyclePolicyProjectionCacheRefresher {
+    pub(crate) fn new(
+        filesystem: Arc<dyn RootFilesystem>,
+        installation_store: Arc<dyn ExtensionInstallationStore>,
+        target_providers: Vec<MatrixOutboundTargetProviderConfig>,
+        artifact_evidence: MatrixRuntimeArtifactEvidence,
+        policy_owner_actor: String,
+    ) -> Result<Self, ProductWorkflowError> {
+        Ok(Self {
+            filesystem: Arc::new(ScopedFilesystem::new(
+                filesystem,
+                crate::invocation_mount_view,
+            )),
+            installation_store,
+            target_providers,
+            artifact_evidence,
+            policy_owner_actor,
+        })
+    }
+
+    async fn refresh_projection_cache(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+        force_write_empty: bool,
+        publish_markers: bool,
+    ) -> Result<(), ProductWorkflowError> {
+        if extension_id.as_str() != MATRIX_PRODUCT_ADAPTER_EXTENSION_ID {
+            return Ok(());
+        }
+        if self.target_providers.is_empty() {
+            return Ok(());
+        }
+        let entries = list_enabled_product_adapter_entries(self.installation_store.as_ref())
+            .await
+            .map_err(map_matrix_policy_projection_cache_error)?;
+        let matching_entries = entries
+            .into_iter()
+            .filter(|entry| entry.installation().extension_id() == extension_id)
+            .collect::<Vec<_>>();
+        let mut writes = Vec::new();
+        for provider in &self.target_providers {
+            let provider_scope =
+                matrix_policy_projection_resource_scope_for_provider(scope, provider);
+            let provider_cache_path = matrix_policy_projection_cache_path_for_provider(provider)?;
+            let commit_marker_path =
+                matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+            let mut cache = MatrixInstallationProjectionCache::new();
+            let mut projected = false;
+            for entry in &matching_entries {
+                let installation_id =
+                    AdapterInstallationId::new(entry.installation().installation_id().as_str())
+                        .map_err(map_matrix_policy_projection_cache_error)?;
+                if provider.installation_id != installation_id {
+                    continue;
+                }
+                projected = true;
+                let at_ms = matrix_policy_projection_timestamp_ms();
+                let installation = project_matrix_installation_from_runtime_entry(
+                    entry,
+                    self.artifact_evidence.clone(),
+                    self.matrix_policy_from_runtime_entry(entry, provider)?,
+                    InstallationAuditMetadata::new(&self.policy_owner_actor, at_ms)
+                        .map_err(map_matrix_policy_projection_rejection)?,
+                )
+                .map_err(map_matrix_policy_projection_rejection)?;
+                cache
+                    .insert_projection(installation, &self.policy_owner_actor, at_ms)
+                    .map_err(map_matrix_policy_projection_rejection)?;
+            }
+            if !projected && !force_write_empty {
+                continue;
+            }
+            let bytes = cache
+                .to_json_bytes()
+                .map_err(map_matrix_policy_projection_cache_error)?;
+            writes.push(MatrixPolicyProjectionCacheWrite {
+                provider_scope,
+                provider_cache_path,
+                commit_marker_path,
+                bytes,
+            });
+        }
+        for write in &writes {
+            self.filesystem
+                .put(
+                    &write.provider_scope,
+                    &write.commit_marker_path,
+                    Entry::bytes(MATRIX_POLICY_PROJECTION_COMMIT_MARKER_TOMBSTONE.to_vec()),
+                    CasExpectation::Any,
+                )
+                .await
+                .map_err(map_matrix_policy_projection_cache_error)?;
+        }
+        let mut written = Vec::new();
+        for write in &writes {
+            if let Err(error) = self
+                .filesystem
+                .put(
+                    &write.provider_scope,
+                    &write.provider_cache_path,
+                    Entry::bytes(write.bytes.clone()).with_content_type(ContentType::json()),
+                    CasExpectation::Any,
+                )
+                .await
+            {
+                if !force_write_empty && publish_markers {
+                    self.invalidate_written_projection_caches(&written).await?;
+                }
+                return Err(map_matrix_policy_projection_cache_error(error));
+            }
+            written.push((
+                write.provider_scope.clone(),
+                write.provider_cache_path.clone(),
+                write.commit_marker_path.clone(),
+            ));
+        }
+        if !publish_markers {
+            return Ok(());
+        }
+        let mut committed_markers = Vec::new();
+        for write in &writes {
+            if let Err(error) = self
+                .filesystem
+                .put(
+                    &write.provider_scope,
+                    &write.commit_marker_path,
+                    matrix_policy_projection_commit_marker_entry(&write.bytes),
+                    CasExpectation::Any,
+                )
+                .await
+            {
+                self.invalidate_projection_commit_markers(&committed_markers)
+                    .await?;
+                return Err(map_matrix_policy_projection_cache_error(error));
+            }
+            committed_markers.push((
+                write.provider_scope.clone(),
+                write.commit_marker_path.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn publish_prepared_projection_cache(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        if extension_id.as_str() != MATRIX_PRODUCT_ADAPTER_EXTENSION_ID {
+            return Ok(());
+        }
+        if self.target_providers.is_empty() {
+            return Ok(());
+        }
+        let entries = list_enabled_product_adapter_entries(self.installation_store.as_ref())
+            .await
+            .map_err(map_matrix_policy_projection_cache_error)?;
+        let matching_entries = entries
+            .into_iter()
+            .filter(|entry| entry.installation().extension_id() == extension_id)
+            .collect::<Vec<_>>();
+        let mut committed_markers = Vec::new();
+        for provider in &self.target_providers {
+            if !matching_entries.iter().any(|entry| {
+                AdapterInstallationId::new(entry.installation().installation_id().as_str())
+                    .map(|installation_id| installation_id == provider.installation_id)
+                    .unwrap_or(false)
+            }) {
+                continue;
+            }
+            let provider_scope =
+                matrix_policy_projection_resource_scope_for_provider(scope, provider);
+            let provider_cache_path = matrix_policy_projection_cache_path_for_provider(provider)?;
+            let commit_marker_path =
+                matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+            let body = self
+                .filesystem
+                .get(&provider_scope, &provider_cache_path)
+                .await
+                .map_err(map_matrix_policy_projection_cache_error)?
+                .ok_or_else(|| ProductWorkflowError::Transient {
+                    reason:
+                        "Matrix policy projection cache refresh failed: staged cache body missing"
+                            .to_string(),
+                })?
+                .entry
+                .body;
+            if let Err(error) = self
+                .filesystem
+                .put(
+                    &provider_scope,
+                    &commit_marker_path,
+                    matrix_policy_projection_commit_marker_entry(&body),
+                    CasExpectation::Any,
+                )
+                .await
+            {
+                self.invalidate_projection_commit_markers(&committed_markers)
+                    .await?;
+                return Err(map_matrix_policy_projection_cache_error(error));
+            }
+            committed_markers.push((provider_scope, commit_marker_path));
+        }
+        Ok(())
+    }
+
+    async fn invalidate_projection_commit_markers(
+        &self,
+        committed_markers: &[(ResourceScope, ScopedPath)],
+    ) -> Result<(), ProductWorkflowError> {
+        for (provider_scope, commit_marker_path) in committed_markers {
+            self.filesystem
+                .put(
+                    provider_scope,
+                    commit_marker_path,
+                    Entry::bytes(MATRIX_POLICY_PROJECTION_COMMIT_MARKER_TOMBSTONE.to_vec()),
+                    CasExpectation::Any,
+                )
+                .await
+                .map_err(map_matrix_policy_projection_cache_error)?;
+        }
+        Ok(())
+    }
+
+    async fn invalidate_written_projection_caches(
+        &self,
+        written: &[(ResourceScope, ScopedPath, ScopedPath)],
+    ) -> Result<(), ProductWorkflowError> {
+        let empty_bytes = MatrixInstallationProjectionCache::new()
+            .to_json_bytes()
+            .map_err(map_matrix_policy_projection_cache_error)?;
+        for (provider_scope, provider_cache_path, commit_marker_path) in written {
+            self.filesystem
+                .put(
+                    provider_scope,
+                    commit_marker_path,
+                    Entry::bytes(MATRIX_POLICY_PROJECTION_COMMIT_MARKER_TOMBSTONE.to_vec()),
+                    CasExpectation::Any,
+                )
+                .await
+                .map_err(map_matrix_policy_projection_cache_error)?;
+            self.filesystem
+                .put(
+                    provider_scope,
+                    provider_cache_path,
+                    Entry::bytes(empty_bytes.clone()).with_content_type(ContentType::json()),
+                    CasExpectation::Any,
+                )
+                .await
+                .map_err(map_matrix_policy_projection_cache_error)?;
+        }
+        Ok(())
+    }
+
+    fn matrix_policy_from_runtime_entry(
+        &self,
+        entry: &ProductAdapterRuntimeEntry,
+        provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<MatrixInstallationPolicy, ProductWorkflowError> {
+        let installation_id =
+            AdapterInstallationId::new(entry.installation().installation_id().as_str())
+                .map_err(map_matrix_policy_projection_cache_error)?;
+        let room_routes = self
+            .target_providers
+            .iter()
+            .filter(|candidate| {
+                candidate.tenant_id == provider.tenant_id
+                    && candidate.agent_id == provider.agent_id
+                    && candidate.project_id == provider.project_id
+                    && candidate.installation_id == installation_id
+            })
+            .flat_map(|provider| provider.configured_room_routes.iter());
+        let mut allowed_rooms = BTreeSet::new();
+        let mut allowed_senders = BTreeSet::new();
+        for route in room_routes {
+            allowed_rooms.insert(
+                MatrixRoomId::new(route.room_id.clone())
+                    .map_err(map_matrix_policy_projection_rejection)?,
+            );
+            allowed_senders.insert(route.matrix_sender_user_id.clone());
+        }
+        let (egress_target_index, target) = entry
+            .adapter()
+            .declared_egress()
+            .iter()
+            .enumerate()
+            .find(|(_, target)| target.credential_handle.is_some())
+            .ok_or_else(|| ProductWorkflowError::InvalidBindingRequest {
+                reason: "Matrix ProductAdapter entry declares no credentialed egress target"
+                    .to_string(),
+            })?;
+        let credential_handle = target.credential_handle.clone().ok_or_else(|| {
+            ProductWorkflowError::InvalidBindingRequest {
+                reason: "Matrix ProductAdapter egress target has no credential handle".to_string(),
+            }
+        })?;
+        let target_index =
+            u32::try_from(egress_target_index).map_err(map_matrix_policy_projection_cache_error)?;
+        MatrixInstallationPolicy::new(
+            MatrixHomeserverOrigin::parse(format!("https://{}", target.host.as_str()))
+                .map_err(map_matrix_policy_projection_rejection)?,
+            allowed_rooms,
+            allowed_senders,
+            EgressTargetIndex::new(target_index),
+            credential_handle,
+        )
+        .map_err(map_matrix_policy_projection_rejection)
+    }
+
+    #[cfg(test)]
+    async fn refresh_after_lifecycle_activation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.refresh_projection_cache(scope, extension_id, false, true)
+            .await
+    }
+}
+
+#[async_trait]
+impl LifecyclePolicyProjectionCacheRefresher for MatrixLifecyclePolicyProjectionCacheRefresher {
+    async fn prepare_lifecycle_activation_refresh(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.refresh_projection_cache(scope, extension_id, false, false)
+            .await
+    }
+
+    async fn publish_prepared_lifecycle_activation_refresh(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.publish_prepared_projection_cache(scope, extension_id)
+            .await
+    }
+
+    async fn refresh_after_lifecycle_removal(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.refresh_projection_cache(scope, extension_id, true, true)
+            .await
+    }
+}
+
+pub(crate) fn matrix_policy_projection_cache_path_for_provider(
+    provider: &MatrixOutboundTargetProviderConfig,
+) -> Result<ScopedPath, ProductWorkflowError> {
+    matrix_policy_projection_cache_path_for_provider_key(&matrix_policy_provider_scope_key(
+        &provider.tenant_id,
+        &provider.agent_id,
+        provider.project_id.as_ref(),
+        &provider.installation_id,
+    ))
+}
+
+pub(crate) fn matrix_policy_projection_cache_path_for_provider_key(
+    provider_scope_key: &str,
+) -> Result<ScopedPath, ProductWorkflowError> {
+    ScopedPath::new(format!(
+        "{MATRIX_POLICY_PROJECTION_CACHE_ROOT}/{provider_scope_key}/installation-projection-cache.json"
+    ))
+    .map_err(|error| ProductWorkflowError::Transient {
+        reason: format!("Matrix policy projection cache path is invalid: {error}"),
+    })
+}
+
+pub(crate) fn matrix_policy_projection_commit_marker_path_for_cache_path(
+    cache_path: &ScopedPath,
+) -> Result<ScopedPath, ProductWorkflowError> {
+    ScopedPath::new(format!("{}.commit", cache_path.as_str())).map_err(|error| {
+        ProductWorkflowError::Transient {
+            reason: format!(
+                "Matrix policy projection cache commit marker path is invalid: {error}"
+            ),
+        }
+    })
+}
+
+pub(crate) fn matrix_policy_projection_commit_marker_entry(cache_bytes: &[u8]) -> Entry {
+    Entry::bytes(matrix_policy_projection_commit_marker_bytes(cache_bytes))
+}
+
+fn matrix_policy_projection_commit_marker_bytes(cache_bytes: &[u8]) -> Vec<u8> {
+    format!("sha256:{}\n", sha256_hex(cache_bytes)).into_bytes()
+}
+
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+pub(crate) fn matrix_policy_projection_cache_path_for_route_scope(
+    tenant_id: &TenantId,
+    agent_id: Option<&AgentId>,
+    project_id: Option<&ProjectId>,
+    installation_id: &AdapterInstallationId,
+) -> Result<ScopedPath, ProductWorkflowError> {
+    let Some(agent_id) = agent_id else {
+        return Err(ProductWorkflowError::InvalidBindingRequest {
+            reason: "Matrix policy projection cache requires an agent-scoped provider".to_string(),
+        });
+    };
+    matrix_policy_projection_cache_path_for_provider_key(&matrix_policy_provider_scope_key(
+        tenant_id,
+        agent_id,
+        project_id,
+        installation_id,
+    ))
+}
+
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+pub(crate) fn matrix_policy_projection_resource_scope(scope: &ResourceScope) -> ResourceScope {
+    scope.tenant_shared_managed_scope()
+}
+
+pub(crate) fn matrix_policy_projection_resource_scope_for_provider(
+    scope: &ResourceScope,
+    provider: &MatrixOutboundTargetProviderConfig,
+) -> ResourceScope {
+    matrix_policy_projection_resource_scope_for_provider_scope(
+        scope,
+        &MatrixPolicyProviderScope {
+            tenant_id: provider.tenant_id.clone(),
+            agent_id: provider.agent_id.clone(),
+            project_id: provider.project_id.clone(),
+        },
+    )
+}
+
+pub(crate) fn matrix_policy_projection_resource_scope_for_provider_scope(
+    scope: &ResourceScope,
+    provider_scope: &MatrixPolicyProviderScope,
+) -> ResourceScope {
+    provider_scope.to_policy_resource_scope(scope)
+}
+
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+pub(crate) fn matrix_policy_projection_cache_path_for_route(
+    route: &crate::matrix_outbound::FrozenProductDeliveryRoute,
+) -> Result<ScopedPath, ProductWorkflowError> {
+    let installation_id = AdapterInstallationId::new(route.installation_id.clone())
+        .map_err(map_matrix_policy_projection_cache_error)?;
+    if let Some(provider_scope) = route.matrix_metadata().policy_provider_scope.as_ref() {
+        return matrix_policy_projection_cache_path_for_route_scope(
+            &provider_scope.tenant_id,
+            Some(&provider_scope.agent_id),
+            provider_scope.project_id.as_ref(),
+            &installation_id,
+        );
+    }
+    matrix_policy_projection_cache_path_for_route_scope(
+        &route.scope().tenant_id,
+        route.scope().agent_id.as_ref(),
+        route.scope().project_id.as_ref(),
+        &installation_id,
+    )
+}
+
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+pub(crate) fn matrix_policy_projection_resource_scope_for_route(
+    route: &crate::matrix_outbound::FrozenProductDeliveryRoute,
+) -> ResourceScope {
+    let route_scope = route.scope().to_resource_scope();
+    route
+        .matrix_metadata()
+        .policy_provider_scope
+        .as_ref()
+        .map(|provider_scope| {
+            matrix_policy_projection_resource_scope_for_provider_scope(&route_scope, provider_scope)
+        })
+        .unwrap_or_else(|| matrix_policy_projection_resource_scope(&route_scope))
+}
+
+fn matrix_policy_projection_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn map_matrix_policy_projection_rejection(
+    error: MatrixInstallationPolicyRejection,
+) -> ProductWorkflowError {
+    ProductWorkflowError::Transient {
+        reason: format!("Matrix policy projection cache refresh failed: {error}"),
+    }
+}
+
+fn map_matrix_policy_projection_cache_error(error: impl std::fmt::Display) -> ProductWorkflowError {
+    ProductWorkflowError::Transient {
+        reason: format!("Matrix policy projection cache refresh failed: {error}"),
+    }
+}
 
 pub trait MatrixOutboundPolicyAuthorizer: Send + Sync {
     fn authorize_matrix_outbound(
@@ -83,6 +616,53 @@ where
     }
 }
 
+impl<F> FilesystemMatrixPolicySnapshotSource<F>
+where
+    F: RootFilesystem + Send + Sync + ?Sized,
+{
+    pub async fn resolve_enabled_matrix_policy_snapshot_for_installation(
+        &self,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection> {
+        let installation = self
+            .matrix_policy_installation(installation_id)
+            .await?
+            .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
+        matrix_policy_snapshot_from_installation(installation)
+    }
+
+    async fn matrix_policy_installation(
+        &self,
+        installation_id: &AdapterInstallationId,
+    ) -> Result<Option<MatrixProductAdapterInstallation>, MatrixInstallationPolicyRejection> {
+        let entry = self
+            .filesystem
+            .get(&self.scope, &self.cache_path)
+            .await
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?
+            .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
+        let commit_marker_path =
+            matrix_policy_projection_commit_marker_path_for_cache_path(&self.cache_path)
+                .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        let Some(commit_marker) = self
+            .filesystem
+            .get(&self.scope, &commit_marker_path)
+            .await
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?
+        else {
+            return Ok(None);
+        };
+        if commit_marker.entry.body
+            != matrix_policy_projection_commit_marker_bytes(&entry.entry.body)
+        {
+            return Ok(None);
+        }
+        let cache = MatrixInstallationProjectionCache::from_json_bytes(&entry.entry.body)
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        Ok(cache.installation(installation_id).cloned())
+    }
+}
+
 #[async_trait]
 impl<F> MatrixPolicySnapshotSource for FilesystemMatrixPolicySnapshotSource<F>
 where
@@ -93,40 +673,39 @@ where
         adapter_id: &ProductAdapterId,
         installation_id: &AdapterInstallationId,
     ) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection> {
-        let entry = self
-            .filesystem
-            .get(&self.scope, &self.cache_path)
-            .await
-            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?
-            .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
-        let cache = MatrixInstallationProjectionCache::from_json_bytes(&entry.entry.body)
-            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
-        let installation = cache
-            .installation(installation_id)
+        let installation = self
+            .matrix_policy_installation(installation_id)
+            .await?
             .ok_or(MatrixInstallationPolicyRejection::InstallationNotFound)?;
         if &installation.adapter_id != adapter_id {
             return Err(MatrixInstallationPolicyRejection::AdapterMismatch);
         }
-        match installation.activation {
-            MatrixActivationState::Enabled => {}
-            MatrixActivationState::Disabled => {
-                return Err(MatrixInstallationPolicyRejection::InstallationDisabled);
-            }
-            MatrixActivationState::Deleting => {
-                return Err(MatrixInstallationPolicyRejection::InstallationDeleting);
-            }
-        }
-        Ok(MatrixPolicySnapshot {
-            adapter_id: installation.adapter_id.clone(),
-            installation_id: installation.installation_id.clone(),
-            homeserver: installation.policy.homeserver.clone(),
-            allowed_rooms: installation.policy.allowed_rooms.clone(),
-            allowed_senders: installation.policy.allowed_senders.clone(),
-            egress_target_index: installation.policy.egress_target_index,
-            credential_handle: installation.policy.credential_handle.clone(),
-            policy_revision: installation.policy_revision,
-        })
+        matrix_policy_snapshot_from_installation(installation)
     }
+}
+
+fn matrix_policy_snapshot_from_installation(
+    installation: MatrixProductAdapterInstallation,
+) -> Result<MatrixPolicySnapshot, MatrixInstallationPolicyRejection> {
+    match installation.activation {
+        MatrixActivationState::Enabled => {}
+        MatrixActivationState::Disabled => {
+            return Err(MatrixInstallationPolicyRejection::InstallationDisabled);
+        }
+        MatrixActivationState::Deleting => {
+            return Err(MatrixInstallationPolicyRejection::InstallationDeleting);
+        }
+    }
+    Ok(MatrixPolicySnapshot {
+        adapter_id: installation.adapter_id,
+        installation_id: installation.installation_id,
+        homeserver: installation.policy.homeserver,
+        allowed_rooms: installation.policy.allowed_rooms,
+        allowed_senders: installation.policy.allowed_senders,
+        egress_target_index: installation.policy.egress_target_index,
+        credential_handle: installation.policy.credential_handle,
+        policy_revision: installation.policy_revision,
+    })
 }
 
 pub struct MatrixProductOutboundEntrypoint<'a> {
@@ -483,4 +1062,806 @@ fn record_matrix_product_outbound_workflow_failure(
         reason = %source,
         "matrix product outbound shared workflow stage failed"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ironclaw_extensions::{
+        ExtensionActivationState, ExtensionInstallation, ExtensionInstallationId,
+        ExtensionManifestRecord, ExtensionManifestRef, InMemoryExtensionInstallationStore,
+        InstallationOwner, MANIFEST_SCHEMA_VERSION, ManifestHash, ManifestSource,
+    };
+    use ironclaw_filesystem::{
+        BackendCapabilities, DirEntry, FileStat, FilesystemError, FilesystemOperation,
+        InMemoryBackend, RecordVersion, RootFilesystem,
+    };
+    use ironclaw_host_api::{
+        AgentId, ExtensionId, InvocationId, ProjectId, ResourceScope, TenantId, UserId, VirtualPath,
+    };
+    use ironclaw_matrix_adapter::installation_policy::{
+        ArtifactSha256, ComponentArtifactId, MatrixUserId, WitPackageName, WitWorldName,
+    };
+    use ironclaw_product_adapters::{AdapterInstallationId, ProductAdapterId};
+
+    use super::*;
+    use crate::matrix_outbound_targets::{
+        MatrixConfiguredRoomRoute, MatrixOutboundTargetProviderConfig,
+    };
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_projects_cache_from_runtime_sources_not_static_policy() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let source_room = "!source-backed-room:example.org";
+        let source_sender = "@source-backed-user:example.org";
+        let actor_user_id = "user:source-backed-agent";
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: source_room.to_string(),
+                subject_user_id: UserId::new(actor_user_id).expect("actor user id"),
+                matrix_sender_user_id: MatrixUserId::new(source_sender).expect("matrix sender"),
+            }],
+        };
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store,
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let scope = matrix_source_backed_scope();
+
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope,
+                &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+            )
+            .await
+            .expect("refresh projection cache");
+
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider_key(
+                &crate::matrix_outbound_targets::matrix_policy_provider_scope_key(
+                    &TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+                    &AgentId::new("matrix-source-backed-agent").expect("agent"),
+                    Some(&ProjectId::new("matrix-source-backed-project").expect("project")),
+                    &installation_id,
+                ),
+            )
+            .expect("cache path"),
+        );
+        let snapshot = source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter id"),
+                &installation_id,
+            )
+            .await
+            .expect("source-backed snapshot");
+        assert_eq!(snapshot.installation_id, installation_id);
+        assert_eq!(snapshot.homeserver.host(), "matrix.source.example.org");
+        assert!(
+            snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == source_room)
+        );
+        assert!(
+            snapshot
+                .allowed_senders
+                .iter()
+                .any(|sender| sender.as_str() == source_sender)
+        );
+        assert_eq!(snapshot.allowed_rooms.len(), 1);
+        assert_eq!(snapshot.allowed_senders.len(), 1);
+        assert!(
+            !snapshot
+                .allowed_senders
+                .iter()
+                .any(|sender| sender.as_str() == actor_user_id),
+            "Matrix policy must not derive senders from IronClaw actor ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_keeps_same_installation_providers_scope_isolated() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider_a = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!provider-a:example.org".to_string(),
+                subject_user_id: UserId::new("user:provider-a").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@provider-a:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let provider_b = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-other-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-other-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!provider-b:example.org".to_string(),
+                subject_user_id: UserId::new("user:provider-b").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@provider-b:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store,
+            vec![provider_a.clone(), provider_b.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let scope = matrix_source_backed_scope();
+
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope,
+                &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+            )
+            .await
+            .expect("refresh projection cache");
+
+        let scoped = crate::wrap_scoped(backend);
+        let source_a = FilesystemMatrixPolicySnapshotSource::new(
+            Arc::clone(&scoped),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_a),
+            matrix_policy_projection_cache_path_for_provider(&provider_a).expect("path a"),
+        );
+        let source_b = FilesystemMatrixPolicySnapshotSource::new(
+            scoped,
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_b),
+            matrix_policy_projection_cache_path_for_provider(&provider_b).expect("path b"),
+        );
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let snapshot_a = source_a
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("snapshot a");
+        let snapshot_b = source_b
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("snapshot b");
+
+        assert!(
+            snapshot_a
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!provider-a:example.org")
+        );
+        assert!(
+            !snapshot_a
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!provider-b:example.org")
+        );
+        assert!(
+            snapshot_b
+                .allowed_senders
+                .iter()
+                .any(|sender| sender.as_str() == "@provider-b:example.org")
+        );
+        assert!(
+            !snapshot_b
+                .allowed_senders
+                .iter()
+                .any(|sender| sender.as_str() == "@provider-a:example.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_uses_provider_tenant_shared_scope_for_each_provider() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider_a = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-provider-tenant-a").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!provider-tenant-a:example.org".to_string(),
+                subject_user_id: UserId::new("user:provider-tenant-a").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@provider-tenant-a:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let provider_b = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-provider-tenant-b").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!provider-tenant-b:example.org".to_string(),
+                subject_user_id: UserId::new("user:provider-tenant-b").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@provider-tenant-b:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let lifecycle_scope = matrix_source_backed_scope();
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store,
+            vec![provider_a.clone(), provider_b.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+
+        refresher
+            .refresh_after_lifecycle_activation(
+                &lifecycle_scope,
+                &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+            )
+            .await
+            .expect("refresh projection cache");
+
+        let scoped = crate::wrap_scoped(backend);
+        let lifecycle_tenant_scope = matrix_policy_projection_resource_scope(&lifecycle_scope);
+        let provider_a_scope =
+            matrix_policy_projection_resource_scope_for_provider(&lifecycle_scope, &provider_a);
+        let provider_b_scope =
+            matrix_policy_projection_resource_scope_for_provider(&lifecycle_scope, &provider_b);
+        let provider_a_path = matrix_policy_projection_cache_path_for_provider(&provider_a)
+            .expect("provider a cache path");
+        let provider_b_path = matrix_policy_projection_cache_path_for_provider(&provider_b)
+            .expect("provider b cache path");
+
+        assert!(
+            scoped
+                .get(&provider_a_scope, &provider_a_path)
+                .await
+                .expect("provider a scoped cache lookup")
+                .is_some(),
+            "provider A cache must land in provider A tenant-shared scope"
+        );
+        assert!(
+            scoped
+                .get(&provider_b_scope, &provider_b_path)
+                .await
+                .expect("provider b scoped cache lookup")
+                .is_some(),
+            "provider B cache must land in provider B tenant-shared scope"
+        );
+        assert!(
+            scoped
+                .get(&lifecycle_tenant_scope, &provider_a_path)
+                .await
+                .expect("lifecycle scoped provider a cache lookup")
+                .is_none(),
+            "provider cache must not be written under the lifecycle caller tenant"
+        );
+        assert!(
+            scoped
+                .get(&lifecycle_tenant_scope, &provider_b_path)
+                .await
+                .expect("lifecycle scoped provider b cache lookup")
+                .is_none(),
+            "provider cache must not be written under the lifecycle caller tenant"
+        );
+
+        let source_a = FilesystemMatrixPolicySnapshotSource::new(
+            Arc::clone(&scoped),
+            provider_a_scope,
+            provider_a_path,
+        );
+        let source_b =
+            FilesystemMatrixPolicySnapshotSource::new(scoped, provider_b_scope, provider_b_path);
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let snapshot_a = source_a
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("provider a snapshot");
+        let snapshot_b = source_b
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("provider b snapshot");
+
+        assert!(
+            snapshot_a
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!provider-tenant-a:example.org")
+        );
+        assert!(
+            snapshot_b
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!provider-tenant-b:example.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_partial_write_failure_is_fail_closed_when_cleanup_fails() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let failing_backend = Arc::new(FailOnNthPutFilesystem::new(backend.clone(), [4, 5]));
+        let root: Arc<dyn RootFilesystem> = failing_backend;
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider_a = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!partial-provider-a:example.org".to_string(),
+                subject_user_id: UserId::new("user:partial-provider-a").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@partial-provider-a:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let provider_b = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-partial-other-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-partial-other-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!partial-provider-b:example.org".to_string(),
+                subject_user_id: UserId::new("user:partial-provider-b").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@partial-provider-b:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let scope = matrix_source_backed_scope();
+        let provider_a_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_a);
+        let provider_a_path = matrix_policy_projection_cache_path_for_provider(&provider_a)
+            .expect("provider a cache path");
+        let provider_b_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_b);
+        let provider_b_path = matrix_policy_projection_cache_path_for_provider(&provider_b)
+            .expect("provider b cache path");
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store,
+            vec![provider_a, provider_b],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope,
+                &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+            )
+            .await
+            .expect_err("second provider write fails");
+
+        let scoped = crate::wrap_scoped(backend);
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let provider_a_source = FilesystemMatrixPolicySnapshotSource::new(
+            Arc::clone(&scoped),
+            provider_a_scope,
+            provider_a_path,
+        );
+        let provider_b_source =
+            FilesystemMatrixPolicySnapshotSource::new(scoped, provider_b_scope, provider_b_path);
+
+        assert!(matches!(
+            provider_a_source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("provider a cache must be invalidated after partial failure"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+        assert!(matches!(
+            provider_b_source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("provider b cache must not become authoritative after write failure"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_partial_marker_publish_failure_stays_post_publish_only() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let failing_backend = Arc::new(FailOnNthPutFilesystem::new(backend.clone(), [6, 7]));
+        let root: Arc<dyn RootFilesystem> = failing_backend;
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider_a = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!marker-provider-a:example.org".to_string(),
+                subject_user_id: UserId::new("user:marker-provider-a").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@marker-provider-a:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let provider_b = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-marker-other-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-marker-other-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!marker-provider-b:example.org".to_string(),
+                subject_user_id: UserId::new("user:marker-provider-b").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@marker-provider-b:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let scope = matrix_source_backed_scope();
+        let provider_a_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_a);
+        let provider_a_path = matrix_policy_projection_cache_path_for_provider(&provider_a)
+            .expect("provider a cache path");
+        let provider_b_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider_b);
+        let provider_b_path = matrix_policy_projection_cache_path_for_provider(&provider_b)
+            .expect("provider b cache path");
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store,
+            vec![provider_a, provider_b],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+
+        refresher
+            .prepare_lifecycle_activation_refresh(&scope, &extension_id)
+            .await
+            .expect("prepare writes staged bodies under tombstoned markers");
+        let error = refresher
+            .publish_prepared_lifecycle_activation_refresh(&scope, &extension_id)
+            .await
+            .expect_err("second provider marker publish fails");
+        let ProductWorkflowError::Transient { reason } = error else {
+            panic!("expected marker write failure, got {error}");
+        };
+        assert!(
+            reason.contains("test projection cache write failed"),
+            "unexpected marker write failure: {reason}"
+        );
+
+        let scoped = crate::wrap_scoped(backend);
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let provider_a_source = FilesystemMatrixPolicySnapshotSource::new(
+            Arc::clone(&scoped),
+            provider_a_scope,
+            provider_a_path,
+        );
+        let provider_b_source =
+            FilesystemMatrixPolicySnapshotSource::new(scoped, provider_b_scope, provider_b_path);
+
+        provider_a_source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("provider a marker was published before cleanup failed");
+        assert!(matches!(
+            provider_b_source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("provider b marker must not become authoritative after write failure"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_removal_invalidates_provider_cache_namespace() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!remove-cache:example.org".to_string(),
+                subject_user_id: UserId::new("user:remove-cache").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@remove-cache:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let scope = matrix_source_backed_scope();
+        let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+        let policy_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope,
+                &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+            )
+            .await
+            .expect("activation refresh");
+        store
+            .set_activation_state(
+                &ExtensionInstallationId::new("matrix-source-backed-install")
+                    .expect("installation id"),
+                ExtensionActivationState::Disabled,
+            )
+            .await
+            .expect("disable matrix installation");
+        refresher
+            .refresh_after_lifecycle_removal(
+                &scope,
+                &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+            )
+            .await
+            .expect("removal refresh");
+
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            policy_scope,
+            cache_path,
+        );
+        let error = source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect_err("removal invalidates provider cache");
+        assert!(matches!(
+            error,
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        ));
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_refresher_ignores_unrelated_extension_lifecycle() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id,
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!unrelated:example.org".to_string(),
+                subject_user_id: UserId::new("user:unrelated").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@unrelated:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store,
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let scope = matrix_source_backed_scope();
+
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope,
+                &ExtensionId::new("github").expect("extension id"),
+            )
+            .await
+            .expect("unrelated extension refresh is ignored");
+
+        let scoped = crate::wrap_scoped(backend);
+        let missing = scoped
+            .get(
+                &matrix_policy_projection_resource_scope(&scope),
+                &matrix_policy_projection_cache_path_for_provider(&provider).expect("path"),
+            )
+            .await
+            .expect("cache lookup");
+        assert!(missing.is_none());
+    }
+
+    async fn seed_enabled_matrix_runtime_entry(store: &InMemoryExtensionInstallationStore) {
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        store
+            .upsert_manifest(matrix_runtime_manifest_record())
+            .await
+            .expect("upsert manifest");
+        store
+            .upsert_installation(
+                ExtensionInstallation::new(
+                    ExtensionInstallationId::new("matrix-source-backed-install")
+                        .expect("installation id"),
+                    extension_id.clone(),
+                    ExtensionActivationState::Enabled,
+                    ExtensionManifestRef::new(
+                        extension_id,
+                        Some(ManifestHash::new("sha256:matrix-source-backed").expect("hash")),
+                    ),
+                    Vec::new(),
+                    chrono::Utc::now(),
+                    InstallationOwner::Tenant,
+                )
+                .expect("installation"),
+            )
+            .await
+            .expect("upsert installation");
+    }
+
+    fn matrix_runtime_manifest_record() -> ExtensionManifestRecord {
+        let host_ports =
+            ironclaw_host_runtime::default_host_port_catalog().expect("default host port catalog");
+        let contracts =
+            crate::extension_host::host_api_contracts::product_extension_host_api_contract_registry()
+                .expect("host API contracts");
+        ExtensionManifestRecord::from_toml_with_contracts(
+            format!(
+                r#"
+schema_version = "{schema}"
+id = "matrix-product-adapter"
+name = "Matrix"
+version = "0.1.0"
+description = "Matrix source-backed projection fixture"
+trust = "first_party_requested"
+
+[runtime]
+kind = "wasm"
+module = "wasm/matrix.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "shared_secret_header"
+header_name = "x-matrix-webhook-secret"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages", "external_final_reply_push"]
+
+[[product_adapter.inbound.required_credentials]]
+handle = "matrix-source-access-token"
+
+[[product_adapter.inbound.egress]]
+host = "matrix.source.example.org"
+credential_handle = "matrix-source-access-token"
+"#,
+                schema = MANIFEST_SCHEMA_VERSION
+            )
+            .as_str(),
+            ManifestSource::HostBundled,
+            &host_ports,
+            Some(ManifestHash::new("sha256:matrix-source-backed").expect("hash")),
+            &contracts,
+        )
+        .expect("manifest")
+    }
+
+    fn matrix_source_backed_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
+        MatrixRuntimeArtifactEvidence {
+            artifact_id: ComponentArtifactId::new("matrix-source-backed-component")
+                .expect("artifact id"),
+            artifact_sha256: ArtifactSha256::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("artifact sha"),
+            wit_package: WitPackageName::new("near:source-backed-adapter@0.1.0")
+                .expect("wit package"),
+            wit_world: WitWorldName::new("source-backed-product-adapter").expect("wit world"),
+        }
+    }
+
+    fn matrix_source_backed_scope() -> ResourceScope {
+        ResourceScope {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            user_id: UserId::new("matrix-source-backed-owner").expect("user"),
+            agent_id: Some(AgentId::new("matrix-source-backed-agent").expect("agent")),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
+    }
+
+    struct FailOnNthPutFilesystem {
+        inner: Arc<InMemoryBackend>,
+        fail_on_puts: Vec<usize>,
+        put_count: Mutex<usize>,
+    }
+
+    impl FailOnNthPutFilesystem {
+        fn new(inner: Arc<InMemoryBackend>, fail_on_puts: impl IntoIterator<Item = usize>) -> Self {
+            Self {
+                inner,
+                fail_on_puts: fail_on_puts.into_iter().collect(),
+                put_count: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RootFilesystem for FailOnNthPutFilesystem {
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn put(
+            &self,
+            path: &VirtualPath,
+            entry: Entry,
+            cas: CasExpectation,
+        ) -> Result<RecordVersion, FilesystemError> {
+            {
+                let mut put_count = self
+                    .put_count
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *put_count += 1;
+                if self.fail_on_puts.contains(&*put_count) {
+                    return Err(FilesystemError::Backend {
+                        path: path.clone(),
+                        operation: FilesystemOperation::WriteFile,
+                        reason: "test projection cache write failed".to_string(),
+                    });
+                }
+            }
+            self.inner.put(path, entry, cas).await
+        }
+
+        async fn get(
+            &self,
+            path: &VirtualPath,
+        ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError> {
+            self.inner.get(path).await
+        }
+
+        async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+            self.inner.list_dir(path).await
+        }
+
+        async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+            self.inner.stat(path).await
+        }
+
+        async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+            self.inner.delete(path).await
+        }
+    }
 }

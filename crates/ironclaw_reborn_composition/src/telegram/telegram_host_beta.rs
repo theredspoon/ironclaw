@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use ironclaw_conversations::RebornFilesystemConversationServices;
-use ironclaw_host_api::ExtensionId;
+use ironclaw_host_api::{ExtensionId, ResourceScope};
 use ironclaw_product_workflow::{
     IdempotencyLedger, LifecyclePackageKind, LifecyclePackageRef, LifecyclePhase,
     RebornFilesystemIdempotencyLedger,
@@ -72,6 +72,7 @@ impl PublicRouteDrain for TelegramUpdatesRouteDrain {
 
 struct DynamicTelegramChannelSetupActivation {
     extension_management: Arc<RebornLocalExtensionManagementPort>,
+    setup_scope: ResourceScope,
 }
 
 #[async_trait::async_trait]
@@ -81,7 +82,7 @@ impl TelegramChannelSetupActivation for DynamicTelegramChannelSetupActivation {
     ) -> Result<(), TelegramChannelSetupActivationError> {
         let package_ref = LifecyclePackageRef::new(LifecyclePackageKind::Extension, "telegram")
             .map_err(telegram_setup_activation_error)?;
-        let caller = self.extension_management.tenant_operator_user_id().clone();
+        let caller = self.setup_scope.user_id.clone();
         let projection = self
             .extension_management
             .project(package_ref.clone(), &caller)
@@ -91,7 +92,12 @@ impl TelegramChannelSetupActivation for DynamicTelegramChannelSetupActivation {
             return Ok(());
         }
         self.extension_management
-            .activate(package_ref, ExtensionActivationMode::Static, &caller)
+            .activate_for_scope(
+                package_ref,
+                ExtensionActivationMode::Static,
+                &self.setup_scope,
+                &caller,
+            )
             .await
             .map_err(telegram_setup_activation_error)?;
         Ok(())
@@ -166,8 +172,10 @@ pub async fn build_telegram_host_runtime_mounts(
         .extension_management
         .as_ref()
         .map(|management| {
+            let setup_scope = telegram_host_scope_template(&config);
             Arc::new(DynamicTelegramChannelSetupActivation {
                 extension_management: Arc::clone(management),
+                setup_scope,
             }) as Arc<dyn TelegramChannelSetupActivation>
         });
     let provider_key = telegram_outbound_delivery_target_provider_key(&config);

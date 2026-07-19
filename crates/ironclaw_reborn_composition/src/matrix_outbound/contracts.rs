@@ -1,4 +1,5 @@
 use super::*;
+use ironclaw_host_api::{AgentId, ProjectId, TenantId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +138,28 @@ impl MatrixMessageBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixPolicyProviderScope {
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
+    pub project_id: Option<ProjectId>,
+}
+
+impl MatrixPolicyProviderScope {
+    pub(crate) fn to_policy_resource_scope(&self, base_scope: &ResourceScope) -> ResourceScope {
+        ResourceScope {
+            tenant_id: self.tenant_id.clone(),
+            user_id: base_scope.user_id.clone(),
+            agent_id: Some(self.agent_id.clone()),
+            project_id: self.project_id.clone(),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: base_scope.invocation_id,
+        }
+        .tenant_shared_managed_scope()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatrixRouteMetadata {
     pub policy_revision: String,
     pub homeserver_origin_fingerprint: String,
@@ -145,6 +168,7 @@ pub struct MatrixRouteMetadata {
     pub credential_handle_fingerprint: String,
     pub reply_target_binding_ref: ReplyTargetBindingRef,
     pub allowed_command_kinds: Vec<MatrixCommandKind>,
+    pub policy_provider_scope: Option<MatrixPolicyProviderScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

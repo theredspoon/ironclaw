@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use ironclaw_common::hashing::sha256_hex;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
+use ironclaw_matrix_adapter::installation_policy::MatrixUserId;
 use ironclaw_outbound::{
     CommunicationDeliveryIntent, OutboundError, ReplyTargetBindingClaim,
     ReplyTargetBindingValidator, ReplyTargetValidationRequest, RunNotificationOrigin,
@@ -16,6 +17,7 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 
+use crate::matrix_outbound::MatrixPolicyProviderScope;
 use crate::matrix_outbound::MatrixRoomId;
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{
@@ -27,6 +29,7 @@ use crate::outbound::{
 pub(crate) struct MatrixConfiguredRoomRoute {
     pub(crate) room_id: String,
     pub(crate) subject_user_id: UserId,
+    pub(crate) matrix_sender_user_id: MatrixUserId,
 }
 
 /// Host-trusted Matrix outbound target configuration.
@@ -52,6 +55,7 @@ pub(crate) struct MatrixHostOutboundTargetProvider {
     configured_room_routes: Vec<ValidatedMatrixConfiguredRoomRoute>,
     room_target_id_prefix: String,
     room_binding_ref_prefix: String,
+    policy_provider_scope_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,8 @@ pub(crate) struct MatrixHostReplyTargetPolicy {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMatrixOutboundTarget {
     pub(crate) installation_id: AdapterInstallationId,
+    pub(crate) policy_provider_scope_key: String,
+    pub(crate) policy_provider_scope: MatrixPolicyProviderScope,
     pub(crate) room_id: MatrixRoomId,
     pub(crate) reply_target_binding_ref: ReplyTargetBindingRef,
 }
@@ -116,6 +122,8 @@ impl MatrixHostProductOutboundTargetResolver {
             if route.subject_user_id == request.actor.user_id {
                 Some(ResolvedMatrixOutboundTarget {
                     installation_id: provider.installation_id.clone(),
+                    policy_provider_scope_key: provider.policy_provider_scope_key.clone(),
+                    policy_provider_scope: provider.policy_provider_scope(),
                     room_id: route.room_id.clone(),
                     reply_target_binding_ref: requested_target.clone(),
                 })
@@ -240,6 +248,12 @@ impl MatrixHostOutboundTargetProvider {
         let room_target_id_prefix = format!("matrix:room:{}:", config.installation_id.as_str());
         let room_binding_ref_prefix =
             format!("reply:matrix:room:{}:", config.installation_id.as_str());
+        let policy_provider_scope_key = matrix_policy_provider_scope_key(
+            &config.tenant_id,
+            &config.agent_id,
+            config.project_id.as_ref(),
+            &config.installation_id,
+        );
         let configured_room_routes = config
             .configured_room_routes
             .iter()
@@ -266,6 +280,7 @@ impl MatrixHostOutboundTargetProvider {
             configured_room_routes,
             room_target_id_prefix,
             room_binding_ref_prefix,
+            policy_provider_scope_key,
         })
     }
 
@@ -273,6 +288,14 @@ impl MatrixHostOutboundTargetProvider {
         caller.tenant_id == self.tenant_id
             && caller.agent_id.as_ref() == Some(&self.agent_id)
             && caller.project_id == self.project_id
+    }
+
+    fn policy_provider_scope(&self) -> MatrixPolicyProviderScope {
+        MatrixPolicyProviderScope {
+            tenant_id: self.tenant_id.clone(),
+            agent_id: self.agent_id.clone(),
+            project_id: self.project_id.clone(),
+        }
     }
 
     fn route_key_for_target_id<'a>(
@@ -395,20 +418,30 @@ pub(crate) fn register_matrix_outbound_target_provider(
     registry.register_provider(provider_key, std::sync::Arc::new(provider))
 }
 
-fn matrix_outbound_target_provider_key(config: &MatrixOutboundTargetProviderConfig) -> String {
+pub(crate) fn matrix_policy_provider_scope_key(
+    tenant_id: &TenantId,
+    agent_id: &AgentId,
+    project_id: Option<&ProjectId>,
+    installation_id: &AdapterInstallationId,
+) -> String {
     let mut input = Vec::new();
-    push_route_key_segment(&mut input, config.tenant_id.as_str());
-    push_route_key_segment(&mut input, config.agent_id.as_str());
-    push_route_key_segment(
-        &mut input,
-        config
-            .project_id
-            .as_ref()
-            .map(ProjectId::as_str)
-            .unwrap_or(""),
-    );
-    push_route_key_segment(&mut input, config.installation_id.as_str());
-    format!("matrix:outbound-target-provider:{}", sha256_hex(&input))
+    push_route_key_segment(&mut input, tenant_id.as_str());
+    push_route_key_segment(&mut input, agent_id.as_str());
+    push_route_key_segment(&mut input, project_id.map(ProjectId::as_str).unwrap_or(""));
+    push_route_key_segment(&mut input, installation_id.as_str());
+    sha256_hex(&input)
+}
+
+fn matrix_outbound_target_provider_key(config: &MatrixOutboundTargetProviderConfig) -> String {
+    format!(
+        "matrix:outbound-target-provider:{}",
+        matrix_policy_provider_scope_key(
+            &config.tenant_id,
+            &config.agent_id,
+            config.project_id.as_ref(),
+            &config.installation_id,
+        )
+    )
 }
 
 fn matrix_route_key(
@@ -466,6 +499,7 @@ fn matrix_target_backend_error() -> RebornServicesError {
 mod tests {
     use ironclaw_event_projections::ProjectionScope;
     use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+    use ironclaw_matrix_adapter::installation_policy::MatrixUserId;
     use ironclaw_outbound::{
         CommunicationDeliveryIntent, CommunicationDeliveryResolutionRequest, CommunicationModality,
         RequestedOutboundContext, RequestedOutboundKind, RunNotificationContext,
@@ -496,6 +530,8 @@ mod tests {
     const OTHER_INSTALLATION: &str = "inst_other";
     const ROOM: &str = "!room:example.org";
     const OTHER_ROOM: &str = "!other:example.org";
+    const MATRIX_USER: &str = "@alice:example.org";
+    const OTHER_MATRIX_USER: &str = "@bob:example.org";
 
     fn caller(user_id: &str) -> WebUiAuthenticatedCaller {
         WebUiAuthenticatedCaller::new(
@@ -537,18 +573,24 @@ mod tests {
         }
     }
 
+    fn room_route(
+        room_id: &str,
+        subject_user_id: &str,
+        matrix_sender_user_id: &str,
+    ) -> MatrixConfiguredRoomRoute {
+        MatrixConfiguredRoomRoute {
+            room_id: room_id.to_string(),
+            subject_user_id: UserId::new(subject_user_id).expect("subject user"),
+            matrix_sender_user_id: MatrixUserId::new(matrix_sender_user_id).expect("matrix sender"),
+        }
+    }
+
     fn build_provider(installation_id: &str) -> MatrixHostOutboundTargetProvider {
         MatrixHostOutboundTargetProvider::new(provider_config(
             installation_id,
             vec![
-                MatrixConfiguredRoomRoute {
-                    room_id: ROOM.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                },
-                MatrixConfiguredRoomRoute {
-                    room_id: OTHER_ROOM.to_string(),
-                    subject_user_id: UserId::new(OTHER_USER).expect("other user"),
-                },
+                room_route(ROOM, USER, MATRIX_USER),
+                room_route(OTHER_ROOM, OTHER_USER, OTHER_MATRIX_USER),
             ],
         ))
         .expect("valid Matrix target provider config")
@@ -601,13 +643,7 @@ mod tests {
 
         let outcome = super::register_matrix_outbound_target_provider(
             &registry,
-            provider_config(
-                INSTALLATION,
-                vec![MatrixConfiguredRoomRoute {
-                    room_id: ROOM.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                }],
-            ),
+            provider_config(INSTALLATION, vec![room_route(ROOM, USER, MATRIX_USER)]),
         )
         .expect("Matrix outbound target provider should register");
 
@@ -636,19 +672,10 @@ mod tests {
             .next()
             .expect("second installation target");
         let resolver = MatrixHostProductOutboundTargetResolver::new([
-            provider_config(
-                INSTALLATION,
-                vec![MatrixConfiguredRoomRoute {
-                    room_id: ROOM.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                }],
-            ),
+            provider_config(INSTALLATION, vec![room_route(ROOM, USER, MATRIX_USER)]),
             provider_config(
                 OTHER_INSTALLATION,
-                vec![MatrixConfiguredRoomRoute {
-                    room_id: ROOM.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                }],
+                vec![room_route(ROOM, USER, MATRIX_USER)],
             ),
         ])
         .expect("multi-installation resolver");
@@ -677,19 +704,10 @@ mod tests {
             .next()
             .expect("second installation target");
         let resolver = MatrixHostProductOutboundTargetResolver::new([
-            provider_config(
-                INSTALLATION,
-                vec![MatrixConfiguredRoomRoute {
-                    room_id: ROOM.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                }],
-            ),
+            provider_config(INSTALLATION, vec![room_route(ROOM, USER, MATRIX_USER)]),
             provider_config(
                 OTHER_INSTALLATION,
-                vec![MatrixConfiguredRoomRoute {
-                    room_id: ROOM.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                }],
+                vec![room_route(ROOM, USER, MATRIX_USER)],
             ),
         ])
         .expect("multi-installation resolver");
@@ -711,10 +729,7 @@ mod tests {
     async fn matrix_reply_target_policy_denies_projection_access() {
         let resolver = MatrixHostProductOutboundTargetResolver::new([provider_config(
             INSTALLATION,
-            vec![MatrixConfiguredRoomRoute {
-                room_id: ROOM.to_string(),
-                subject_user_id: UserId::new(USER).expect("user"),
-            }],
+            vec![room_route(ROOM, USER, MATRIX_USER)],
         )])
         .expect("resolver");
         let policy = MatrixHostReplyTargetPolicy::new(resolver);
@@ -739,22 +754,13 @@ mod tests {
     async fn matrix_private_provider_key_scopes_same_installation_across_tenants() {
         let registry = MutableOutboundDeliveryTargetRegistry::default();
         let installation_id = INSTALLATION;
-        let first = provider_config(
-            installation_id,
-            vec![MatrixConfiguredRoomRoute {
-                room_id: ROOM.to_string(),
-                subject_user_id: UserId::new(USER).expect("user"),
-            }],
-        );
+        let first = provider_config(installation_id, vec![room_route(ROOM, USER, MATRIX_USER)]);
         let second = MatrixOutboundTargetProviderConfig {
             tenant_id: TenantId::new(OTHER_TENANT).expect("other tenant"),
             agent_id: AgentId::new(AGENT).expect("agent"),
             project_id: Some(ProjectId::new(PROJECT).expect("project")),
             installation_id: AdapterInstallationId::new(installation_id).expect("installation"),
-            configured_room_routes: vec![MatrixConfiguredRoomRoute {
-                room_id: OTHER_ROOM.to_string(),
-                subject_user_id: UserId::new(USER).expect("user"),
-            }],
+            configured_room_routes: vec![room_route(OTHER_ROOM, USER, MATRIX_USER)],
         };
 
         assert_eq!(
@@ -965,10 +971,7 @@ mod tests {
         ] {
             let result = MatrixHostOutboundTargetProvider::new(provider_config(
                 INSTALLATION,
-                vec![MatrixConfiguredRoomRoute {
-                    room_id: invalid_room_id.to_string(),
-                    subject_user_id: UserId::new(USER).expect("user"),
-                }],
+                vec![room_route(invalid_room_id, USER, MATRIX_USER)],
             ));
 
             assert!(

@@ -65,7 +65,7 @@ use ironclaw_host_api::{
     ResourceScope, RuntimeHttpEgress, UserId, VirtualPath,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_host_api::{HostApiError, MountAlias, MountGrant, ScopedPath};
+use ironclaw_host_api::{HostApiError, MountAlias, MountGrant};
 use ironclaw_host_runtime::{
     CapabilitySurfaceVersion, FirstPartyCapabilityRegistry, HostProcessPort,
     HostRuntimeHttpEgressPort, HostRuntimeServices, PostEditCheckConfig,
@@ -84,11 +84,9 @@ use ironclaw_outbound::CommunicationPreferenceRepository;
 // no-durable outbound wiring now share the one `FilesystemOutboundStateStore`
 // (over a libsql/postgres or in-memory backend), so this import is
 // unconditional, not gated behind the durable-backend features.
-use ironclaw_outbound::FilesystemOutboundStateStore;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_outbound::OutboundStateStore;
 #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
 use ironclaw_outbound::{DeliveredGateRouteStore, TriggeredRunDeliveryStore};
+use ironclaw_outbound::{FilesystemOutboundStateStore, OutboundStateStore};
 use ironclaw_processes::ProcessServices;
 #[cfg(any(
     feature = "slack-v2-host-beta",
@@ -5116,14 +5114,8 @@ where
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: format!("Matrix retry worker endpoint invalid: {error:?}"),
     })?;
-    let policy_cache_path =
-        ScopedPath::new(crate::matrix_product_outbound::MATRIX_POLICY_PROJECTION_CACHE_PATH)
-            .map_err(|error| RebornBuildError::InvalidConfig {
-                reason: format!("Matrix policy projection cache path is invalid: {error}"),
-            })?;
     let retry_send_authorizer = crate::matrix_outbound::MatrixFilesystemRetrySendAuthorizer::new(
         Arc::clone(&scoped_filesystem),
-        policy_cache_path,
     );
     let bundle = crate::matrix_outbound::MatrixRetryProductionDependencyBundle::new(
         crate::matrix_outbound::MatrixRetryProductionDependencyBundleInput {

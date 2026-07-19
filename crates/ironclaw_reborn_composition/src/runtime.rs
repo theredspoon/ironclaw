@@ -43,7 +43,7 @@ use ironclaw_first_party_extension_ports::{
 use ironclaw_host_api::{
     ActionResultSummary, ActionSummary, AgentId, ApprovalRequestId, AuditEnvelope, AuditEventId,
     AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, ExtensionId,
-    InvocationId, Principal, ResourceScope, ScopedPath, TenantId, ThreadId, UserId,
+    InvocationId, Principal, ResourceScope, TenantId, ThreadId, UserId,
 };
 use ironclaw_loop_host::{
     AwaitEdgeSettler, AwaitEdgeWriter, CapabilityAllowSet, CapabilityResolveError,
@@ -60,8 +60,7 @@ use ironclaw_outbound::{CommunicationPreferenceRepository, OutboundPolicyService
 use ironclaw_product_adapters::redaction::RedactedString;
 use ironclaw_product_adapters::{
     AuthRequirement, DeliveryStatus, EgressRequest, EgressResponse, OutboundDeliverySink,
-    ProductAdapterId, ProductRenderOutcome, ProjectionStream, ProtocolHttpEgress,
-    ProtocolHttpEgressError,
+    ProductRenderOutcome, ProjectionStream, ProtocolHttpEgress, ProtocolHttpEgressError,
 };
 use ironclaw_product_workflow::{
     ApprovalBlockedTurnRun, ApprovalInteractionScope, ApprovalInteractionService,
@@ -129,9 +128,9 @@ use crate::matrix_outbound_targets::{
     register_matrix_outbound_target_provider,
 };
 use crate::matrix_product_outbound::{
-    FilesystemMatrixPolicySnapshotSource, MATRIX_POLICY_PROJECTION_CACHE_PATH,
-    MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
-    MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
+    FilesystemMatrixPolicySnapshotSource, MatrixLifecyclePolicyProjectionCacheRefresher,
+    MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryInput,
+    MatrixProductOutboundEntrypoint,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
@@ -1922,29 +1921,34 @@ impl RebornRuntime {
             .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
                 reason: "Matrix product outbound requested target is not configured".to_string(),
             })?;
-        let cache_path = ScopedPath::new(MATRIX_POLICY_PROJECTION_CACHE_PATH).map_err(|error| {
-            MatrixProductOutboundDeliveryError::Unavailable {
+        let cache_path =
+            crate::matrix_product_outbound::matrix_policy_projection_cache_path_for_provider_key(
+                &resolved_target.policy_provider_scope_key,
+            )
+            .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
                 reason: format!("Matrix policy projection cache path is invalid: {error}"),
-            }
-        })?;
+            })?;
         let matrix_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
+        let policy_scope =
+            crate::matrix_product_outbound::matrix_policy_projection_resource_scope_for_provider_scope(
+                &input.delivery.resolution_request.scope.to_resource_scope(),
+                &resolved_target.policy_provider_scope,
+            );
         let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
             Arc::clone(&matrix_filesystem),
-            input.delivery.resolution_request.scope.to_resource_scope(),
+            policy_scope,
             cache_path,
         );
-        let adapter_id = ProductAdapterId::new("matrix").map_err(|error| {
-            MatrixProductOutboundDeliveryError::Unavailable {
-                reason: format!("Matrix adapter id is invalid: {error}"),
-            }
-        })?;
         let snapshot = snapshot_source
-            .resolve_matrix_policy_snapshot(&adapter_id, &resolved_target.installation_id)
+            .resolve_enabled_matrix_policy_snapshot_for_installation(
+                &resolved_target.installation_id,
+            )
             .await
             .map_err(|rejection| MatrixProductOutboundDeliveryError::Policy {
                 rejection,
                 status_update_error: None,
             })?;
+        let adapter_id = snapshot.adapter_id.clone();
         let adapter = MatrixProductAdapter::new(MatrixProductAdapterConfig {
             adapter_id: adapter_id.clone(),
             installation_id: resolved_target.installation_id.clone(),
@@ -2048,6 +2052,7 @@ impl RebornRuntime {
                     ),
                     reply_target_binding_ref: resolved_target.reply_target_binding_ref,
                     allowed_command_kinds: vec![MatrixCommandKind::SendText],
+                    policy_provider_scope: Some(resolved_target.policy_provider_scope),
                 },
             );
             let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
@@ -3405,6 +3410,7 @@ pub async fn build_reborn_runtime(
         regex_skill_activation_enabled,
         skill_context_source: configured_skill_context_source,
         matrix_outbound_target_providers,
+        matrix_policy_projection_cache,
         hooks: hooks_config,
         budget_defaults,
         budget_event_observer,
@@ -3445,6 +3451,13 @@ pub async fn build_reborn_runtime(
         return Err(RebornRuntimeError::InvalidArgument {
             reason: "RebornRuntimeInput.services must include a resolved runtime policy"
                 .to_string(),
+        });
+    }
+    if !matrix_outbound_target_providers.is_empty() && matrix_policy_projection_cache.is_none() {
+        return Err(RebornRuntimeError::InvalidArgument {
+            reason:
+                "RebornRuntimeInput.matrix_outbound_target_providers requires matrix_policy_projection_cache"
+                    .to_string(),
         });
     }
 
@@ -3516,6 +3529,39 @@ pub async fn build_reborn_runtime(
             .await?;
     }
     enforce_runtime_cutover_gate(profile, &services.readiness)?;
+    if let Some(config) = matrix_policy_projection_cache {
+        let local_runtime =
+            services
+                .local_runtime
+                .as_ref()
+                .ok_or(RebornRuntimeError::InvalidArgument {
+                reason:
+                    "Matrix policy projection cache refresh requires lifecycle runtime substrate"
+                        .to_string(),
+            })?;
+        let extension_management =
+            local_runtime
+                .extension_management
+                .as_ref()
+                .ok_or(RebornRuntimeError::InvalidArgument {
+                reason:
+                    "Matrix policy projection cache refresh requires extension lifecycle management"
+                        .to_string(),
+            })?;
+        let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> =
+            local_runtime.extension_filesystem.clone();
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            filesystem,
+            extension_management.installation_store(),
+            matrix_outbound_target_providers.clone(),
+            config.artifact_evidence,
+            config.policy_owner_actor,
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("Matrix policy projection cache refresh configuration failed: {error}"),
+        })?;
+        extension_management.set_policy_projection_cache_refresher(Arc::new(refresher));
+    }
 
     // Extract the pre-minted scheduler wake wiring from the production composition path
     // (minted in `build_production_shaped`) so it can be handed to

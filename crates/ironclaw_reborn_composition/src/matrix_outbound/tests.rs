@@ -7,6 +7,10 @@ use crate::matrix_product_outbound::{
     FilesystemMatrixPolicySnapshotSource, MatrixOutboundPolicyAuthorizer,
     MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
     MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
+    matrix_policy_projection_cache_path_for_route_scope,
+    matrix_policy_projection_commit_marker_entry,
+    matrix_policy_projection_commit_marker_path_for_cache_path,
+    matrix_policy_projection_resource_scope_for_provider_scope,
 };
 use async_trait::async_trait;
 use ironclaw_event_projections::ProjectionCursor;
@@ -324,6 +328,7 @@ fn route() -> FrozenProductDeliveryRoute {
             credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             reply_target_binding_ref: binding(),
             allowed_command_kinds: vec![MatrixCommandKind::SendText],
+            policy_provider_scope: None,
         },
     )
 }
@@ -345,6 +350,7 @@ fn route_for_homeserver_origin(origin: &str) -> FrozenProductDeliveryRoute {
             credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             reply_target_binding_ref: binding(),
             allowed_command_kinds: vec![MatrixCommandKind::SendText],
+            policy_provider_scope: None,
         },
     )
 }
@@ -658,6 +664,29 @@ fn matrix_metadata_filesystem(
     )])
     .expect("mount view");
     Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts))
+}
+
+fn tenant_scoped_matrix_metadata_filesystem(
+    backend: Arc<InMemoryBackend>,
+) -> Arc<ScopedFilesystem<InMemoryBackend>> {
+    Arc::new(ScopedFilesystem::new(backend, |scope| {
+        let tenant_root = format!(
+            "/engine/matrix-outbound-test/tenants/{}",
+            scope.tenant_id.as_str()
+        );
+        MountView::new(vec![
+            MountGrant::new(
+                MountAlias::new("/outbound").expect("alias"),
+                VirtualPath::new(format!("{tenant_root}/outbound")).expect("target"),
+                MountPermissions::read_write_list_delete(),
+            ),
+            MountGrant::new(
+                MountAlias::new("/tenant-shared").expect("alias"),
+                VirtualPath::new(format!("{tenant_root}/tenant-shared")).expect("target"),
+                MountPermissions::read_write_list_delete(),
+            ),
+        ])
+    }))
 }
 
 async fn put_pending_intent_bytes(
@@ -1163,16 +1192,26 @@ async fn filesystem_matrix_policy_snapshot_source_reads_projection_cache_via_sco
     let resource_scope = scope().to_resource_scope();
     let cache_path = ScopedPath::new("/outbound/matrix/policy/installation-projection-cache.json")
         .expect("policy cache path");
+    let cache_bytes = cache.to_json_bytes().expect("policy cache json");
     filesystem
         .put(
             &resource_scope,
             &cache_path,
-            Entry::bytes(cache.to_json_bytes().expect("policy cache json"))
-                .with_content_type(ContentType::json()),
+            Entry::bytes(cache_bytes.clone()).with_content_type(ContentType::json()),
             CasExpectation::Any,
         )
         .await
         .expect("write policy projection cache");
+    filesystem
+        .put(
+            &resource_scope,
+            &matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path)
+                .expect("policy cache commit marker path"),
+            matrix_policy_projection_commit_marker_entry(&cache_bytes),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write policy projection cache commit marker");
 
     let source = FilesystemMatrixPolicySnapshotSource::new(
         Arc::clone(&filesystem),
@@ -2009,6 +2048,7 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
             credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
             reply_target_binding_ref: workflow_reply_target(),
             allowed_command_kinds: vec![MatrixCommandKind::SendText],
+            policy_provider_scope: None,
         },
     );
     let grant = SealedDeliveryGrant::mint_for_matrix(&owner, &route);
@@ -3857,7 +3897,10 @@ fn source_backed_retry_policy_snapshot(
             command.room_id.as_str(),
         )
         .expect("room")]),
-        allowed_senders: std::collections::BTreeSet::new(),
+        allowed_senders: std::collections::BTreeSet::from([AdapterMatrixUserId::new(
+            "@alice:example.org",
+        )
+        .expect("sender")]),
         egress_target_index: AdapterEgressTargetIndex::new(route.metadata.egress_target_index),
         credential_handle: ironclaw_product_adapters::EgressCredentialHandle::new(
             "credential-handle-1",
@@ -3872,6 +3915,120 @@ fn source_backed_retry_policy_snapshot(
         )
         .expect("policy revision"),
     }
+}
+
+#[tokio::test]
+async fn matrix_retry_filesystem_reauthorization_reads_provider_tenant_shared_policy_scope() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let filesystem = tenant_scoped_matrix_metadata_filesystem(Arc::clone(&backend));
+    let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
+        Arc::clone(&filesystem),
+        outbound_state_store(),
+    ));
+    let pending_store = Arc::new(FilesystemMatrixPendingIntentStore::new(Arc::clone(
+        &filesystem,
+    )));
+    let provider_scope = MatrixPolicyProviderScope {
+        tenant_id: TenantId::new("matrix-retry-provider-tenant").expect("provider tenant"),
+        agent_id: AgentId::new("matrix-retry-provider-agent").expect("provider agent"),
+        project_id: Some(
+            ProjectId::new("matrix-retry-provider-project").expect("provider project"),
+        ),
+    };
+    let lifecycle_scope = TurnScope::new_with_owner(
+        TenantId::new("matrix-retry-lifecycle-tenant").expect("lifecycle tenant"),
+        Some(provider_scope.agent_id.clone()),
+        provider_scope.project_id.clone(),
+        ThreadId::new("matrix-retry-lifecycle-thread").expect("lifecycle thread"),
+        Some(UserId::new("matrix-retry-lifecycle-user").expect("lifecycle user")),
+    )
+    .to_resource_scope();
+    let mut route = source_backed_retry_route();
+    route.metadata.policy_provider_scope = Some(provider_scope.clone());
+    let command = command();
+    let mut cache = MatrixInstallationProjectionCache::new();
+    cache
+        .insert_projection(
+            matrix_projection_installation(&source_backed_retry_policy_snapshot(&route)),
+            "matrix-retry-policy-owner",
+            1_710_000_000_002,
+        )
+        .expect("policy projection");
+    let cache_scope = matrix_policy_projection_resource_scope_for_provider_scope(
+        &lifecycle_scope,
+        &provider_scope,
+    );
+    let cache_path = matrix_policy_projection_cache_path_for_route_scope(
+        &provider_scope.tenant_id,
+        Some(&provider_scope.agent_id),
+        provider_scope.project_id.as_ref(),
+        &AdapterInstallationId::new(route.installation_id.clone()).expect("installation id"),
+    )
+    .expect("policy cache path");
+    let cache_bytes = cache.to_json_bytes().expect("policy cache json");
+    filesystem
+        .put(
+            &cache_scope,
+            &cache_path,
+            Entry::bytes(cache_bytes.clone()).with_content_type(ContentType::json()),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write provider-scoped policy cache");
+    filesystem
+        .put(
+            &cache_scope,
+            &matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path)
+                .expect("policy cache commit marker path"),
+            matrix_policy_projection_commit_marker_entry(&cache_bytes),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write provider-scoped policy cache commit marker");
+    assert!(
+        filesystem
+            .get(&route.scope().to_resource_scope(), &cache_path)
+            .await
+            .expect("route-scoped policy cache lookup")
+            .is_none(),
+        "fixture must not seed the route/request tenant policy scope"
+    );
+    let schedule = retry_schedule(&route);
+    let due_at =
+        schedule.recorded_at + chrono::Duration::from_std(schedule.retry_after).expect("due");
+    pending_store
+        .persist_pending_command(
+            route.scope().clone(),
+            route.delivery_id,
+            route.delivery_id.as_uuid(),
+            command,
+        )
+        .await
+        .expect("persist pending command");
+    metadata_store
+        .record_retry_scheduled(schedule, retry_context(&route))
+        .await
+        .expect("persist retry schedule and context");
+
+    let port = Arc::new(RecordingMatrixDeliveryPort::default());
+    let work_port = retry_work_port(
+        Arc::clone(&metadata_store),
+        pending_store,
+        Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+        Arc::new(FakeMatrixCredentialResolver::with_credential(
+            ResolvedCredentialHandle {
+                credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
+            },
+        )),
+        Arc::new(MatrixFilesystemRetrySendAuthorizer::new(filesystem)),
+    );
+
+    work_port
+        .execute_due_retry(route.scope().clone(), route.delivery_id, due_at)
+        .await
+        .expect("retry reads provider-scoped policy cache");
+
+    assert_eq!(port.calls().len(), 1);
 }
 
 struct SourceBackedRetryReauthorizationFixture {

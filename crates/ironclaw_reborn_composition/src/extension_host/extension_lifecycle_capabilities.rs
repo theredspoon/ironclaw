@@ -201,10 +201,11 @@ impl FirstPartyCapabilityHandler for ExtensionLifecycleToolHandler {
                     request.services.runtime_http_egress.clone(),
                 );
                 self.extension_management
-                    .activate_with_credential_gate(
+                    .activate_with_credential_gate_for_scope(
                         package_ref,
                         mode,
                         credential_gate,
+                        &request.scope,
                         &request.scope.user_id,
                     )
                     .await
