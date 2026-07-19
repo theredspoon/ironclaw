@@ -1,10 +1,15 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use ironclaw_common::hashing::sha256_hex;
+use ironclaw_events::DurableAuditLog;
 use ironclaw_filesystem::{
-    CasExpectation, ContentType, Entry, FilesystemError, RootFilesystem, ScopedFilesystem,
+    CasExpectation, ContentType, Entry, FILESYSTEM_CAS_RETRIES, FilesystemError, RootFilesystem,
+    ScopedFilesystem,
 };
 use ironclaw_host_api::{
-    AgentId, ExtensionId, ProjectId, ResourceScope, ScopedPath, TenantId, UserId, VirtualPath,
+    ActionResultSummary, ActionSummary, AgentId, AuditEnvelope, AuditEventId, AuditStage,
+    CorrelationId, DecisionSummary, EffectKind, ExtensionId, Principal, ProjectId, ResourceScope,
+    ScopedPath, TenantId, UserId, VirtualPath,
 };
 use ironclaw_matrix_adapter::installation_policy::MatrixUserId;
 use ironclaw_outbound::{
@@ -319,6 +324,7 @@ pub(crate) struct MatrixRoomBindingMutationContext {
 pub(crate) struct MatrixRoomBindingAuthority {
     target_source: Arc<dyn MatrixRoomBindingStore>,
     refresher: Arc<MatrixLifecyclePolicyProjectionCacheRefresher>,
+    audit_log: Option<Arc<dyn DurableAuditLog>>,
 }
 
 impl MatrixRoomBindingMutationContext {
@@ -360,12 +366,23 @@ impl MatrixRoomBindingAuthority {
         Self {
             target_source,
             refresher: refresher.into(),
+            audit_log: None,
         }
+    }
+
+    pub(crate) fn new_with_audit_log(
+        target_source: Arc<dyn MatrixRoomBindingStore>,
+        refresher: impl Into<Arc<MatrixLifecyclePolicyProjectionCacheRefresher>>,
+        audit_log: Arc<dyn DurableAuditLog>,
+    ) -> Self {
+        let mut authority = Self::new(target_source, refresher);
+        authority.audit_log = Some(audit_log);
+        authority
     }
 
     pub(crate) async fn upsert_room_binding(
         &self,
-        context: MatrixRoomBindingMutationContext,
+        context: &MatrixRoomBindingMutationContext,
         request: MatrixRoomBindingUpsertRequest,
     ) -> Result<MatrixRoomBindingUpsertOutcome, ProductWorkflowError> {
         context.authorize(
@@ -373,6 +390,14 @@ impl MatrixRoomBindingAuthority {
             &request.agent_id,
             request.project_id.as_ref(),
         )?;
+        self.refresher
+            .invalidate_before_target_binding_upsert(
+                &context.scope,
+                &context.extension_id,
+                &request,
+            )
+            .await?;
+        let target = matrix_room_binding_upsert_audit_target(&request);
         let outcome = self
             .target_source
             .upsert_room_binding(request)
@@ -381,12 +406,55 @@ impl MatrixRoomBindingAuthority {
         self.refresher
             .refresh_after_target_binding_mutation(&context.scope, &context.extension_id)
             .await?;
+        self.append_matrix_room_binding_mutation_audit(
+            context,
+            MATRIX_ROOM_BINDING_UPSERT_AUDIT_KIND,
+            target,
+            format!("{outcome:?}"),
+        )
+        .await?;
+        Ok(outcome)
+    }
+
+    pub(crate) async fn remove_room_binding(
+        &self,
+        context: &MatrixRoomBindingMutationContext,
+        request: MatrixRoomBindingRemovalRequest,
+    ) -> Result<MatrixRoomBindingRemovalOutcome, ProductWorkflowError> {
+        context.authorize(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.as_ref(),
+        )?;
+        self.refresher
+            .invalidate_before_target_binding_removal(
+                &context.scope,
+                &context.extension_id,
+                &request,
+            )
+            .await?;
+        let target = matrix_room_binding_removal_audit_target(&request);
+        let outcome = self
+            .target_source
+            .remove_room_binding(request)
+            .await
+            .map_err(map_matrix_target_store_workflow_error)?;
+        self.refresher
+            .refresh_after_target_binding_mutation(&context.scope, &context.extension_id)
+            .await?;
+        self.append_matrix_room_binding_mutation_audit(
+            context,
+            MATRIX_ROOM_BINDING_REMOVAL_AUDIT_KIND,
+            target,
+            format!("{outcome:?}"),
+        )
+        .await?;
         Ok(outcome)
     }
 
     pub(crate) async fn update_room_binding(
         &self,
-        context: MatrixRoomBindingMutationContext,
+        context: &MatrixRoomBindingMutationContext,
         request: MatrixRoomBindingUpdateRequest,
     ) -> Result<MatrixRoomBindingUpdateOutcome, ProductWorkflowError> {
         context.authorize(
@@ -408,6 +476,7 @@ impl MatrixRoomBindingAuthority {
                 },
             )
             .await?;
+        let target = matrix_room_binding_update_audit_target(&request);
         let outcome = self
             .target_source
             .update_room_binding(request)
@@ -416,8 +485,120 @@ impl MatrixRoomBindingAuthority {
         self.refresher
             .refresh_after_target_binding_mutation(&context.scope, &context.extension_id)
             .await?;
+        self.append_matrix_room_binding_mutation_audit(
+            context,
+            MATRIX_ROOM_BINDING_UPDATE_AUDIT_KIND,
+            target,
+            format!("{outcome:?}"),
+        )
+        .await?;
         Ok(outcome)
     }
+
+    async fn append_matrix_room_binding_mutation_audit(
+        &self,
+        context: &MatrixRoomBindingMutationContext,
+        kind: &str,
+        target: String,
+        status: String,
+    ) -> Result<(), ProductWorkflowError> {
+        let Some(audit_log) = self.audit_log.as_ref() else {
+            return Ok(());
+        };
+        let scope = &context.scope;
+        audit_log
+            .append(AuditEnvelope {
+                event_id: AuditEventId::new(),
+                correlation_id: CorrelationId::new(),
+                stage: AuditStage::After,
+                timestamp: Utc::now(),
+                tenant_id: scope.tenant_id.clone(),
+                user_id: scope.user_id.clone(),
+                agent_id: scope.agent_id.clone(),
+                project_id: scope.project_id.clone(),
+                mission_id: scope.mission_id.clone(),
+                thread_id: scope.thread_id.clone(),
+                invocation_id: scope.invocation_id,
+                process_id: None,
+                approval_request_id: None,
+                extension_id: Some(context.extension_id.clone()),
+                action: ActionSummary {
+                    kind: kind.to_string(),
+                    target: Some(target),
+                    effects: vec![EffectKind::ExternalWrite],
+                },
+                decision: DecisionSummary {
+                    kind: "allowed".to_string(),
+                    reason: None,
+                    actor: Some(Principal::HostRuntime),
+                },
+                result: Some(ActionResultSummary {
+                    success: true,
+                    status: Some(status),
+                    output_bytes: None,
+                }),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| ProductWorkflowError::Transient {
+                reason: format!(
+                    "could not record Matrix room binding mutation audit event: {error}"
+                ),
+            })
+    }
+}
+
+const MATRIX_ROOM_BINDING_UPSERT_AUDIT_KIND: &str = "matrix_room_binding_upsert";
+const MATRIX_ROOM_BINDING_REMOVAL_AUDIT_KIND: &str = "matrix_room_binding_remove";
+const MATRIX_ROOM_BINDING_UPDATE_AUDIT_KIND: &str = "matrix_room_binding_update";
+
+fn matrix_room_binding_upsert_audit_target(request: &MatrixRoomBindingUpsertRequest) -> String {
+    format!(
+        "tenant={};agent={};project={};installation={};room_sha256={};subject={}",
+        request.tenant_id.as_str(),
+        request.agent_id.as_str(),
+        request
+            .project_id
+            .as_ref()
+            .map(ProjectId::as_str)
+            .unwrap_or("<none>"),
+        request.installation_id.as_str(),
+        sha256_hex(request.room_id.as_str().as_bytes()),
+        request.subject_user_id.as_str()
+    )
+}
+
+fn matrix_room_binding_removal_audit_target(request: &MatrixRoomBindingRemovalRequest) -> String {
+    format!(
+        "tenant={};agent={};project={};installation={};room_sha256={};subject={}",
+        request.tenant_id.as_str(),
+        request.agent_id.as_str(),
+        request
+            .project_id
+            .as_ref()
+            .map(ProjectId::as_str)
+            .unwrap_or("<none>"),
+        request.installation_id.as_str(),
+        sha256_hex(request.room_id.as_str().as_bytes()),
+        request.subject_user_id.as_str()
+    )
+}
+
+fn matrix_room_binding_update_audit_target(request: &MatrixRoomBindingUpdateRequest) -> String {
+    format!(
+        "tenant={};agent={};project={};installation={};previous_room_sha256={};new_room_sha256={};subject={}",
+        request.tenant_id.as_str(),
+        request.agent_id.as_str(),
+        request
+            .project_id
+            .as_ref()
+            .map(ProjectId::as_str)
+            .unwrap_or("<none>"),
+        request.installation_id.as_str(),
+        sha256_hex(request.previous_room_id.as_str().as_bytes()),
+        sha256_hex(request.new_room_id.as_str().as_bytes()),
+        request.subject_user_id.as_str()
+    )
 }
 
 #[cfg(test)]
@@ -774,51 +955,50 @@ impl FilesystemMatrixRoomBindingStore {
         else {
             return Ok(Vec::new());
         };
-        let stored: StoredMatrixRoomBindingTenantIndex =
-            serde_json::from_slice(&versioned.entry.body)
-                .map_err(|_| matrix_target_backend_error())?;
-        stored
-            .tenant_ids
-            .into_iter()
-            .map(TenantId::new)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| matrix_target_backend_error())
+        tenant_ids_from_index_entry(&versioned.entry)
     }
 
     async fn write_tenant_index(&self) -> Result<(), RebornServicesError> {
-        let mut merged = self.tenant_ids()?;
-        for tenant_id in self.read_tenant_index().await? {
-            if !merged.iter().any(|known| known == &tenant_id) {
-                merged.push(tenant_id);
+        let path = Self::tenant_index_path()?;
+        for _ in 0..FILESYSTEM_CAS_RETRIES {
+            let versioned = self
+                .root_filesystem
+                .get(&path)
+                .await
+                .map_err(map_matrix_target_filesystem_error)?;
+            let (indexed, version) = match versioned {
+                Some(versioned) => (
+                    tenant_ids_from_index_entry(&versioned.entry)?,
+                    Some(versioned.version),
+                ),
+                None => (Vec::new(), None),
+            };
+            let mut merged = self.tenant_ids()?;
+            for tenant_id in indexed {
+                if !merged.iter().any(|known| known == &tenant_id) {
+                    merged.push(tenant_id);
+                }
+            }
+            merged.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            merged.dedup_by(|left, right| left.as_str() == right.as_str());
+            {
+                let mut tenant_ids = self
+                    .tenant_ids
+                    .write()
+                    .map_err(|_| matrix_target_backend_error())?;
+                *tenant_ids = merged.clone();
+            }
+            let entry = tenant_index_entry(merged)?;
+            let cas = version
+                .map(CasExpectation::Version)
+                .unwrap_or(CasExpectation::Absent);
+            match self.root_filesystem.put(&path, entry, cas).await {
+                Ok(_) => return Ok(()),
+                Err(FilesystemError::VersionMismatch { .. }) => continue,
+                Err(error) => return Err(map_matrix_target_filesystem_error(error)),
             }
         }
-        merged.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        merged.dedup_by(|left, right| left.as_str() == right.as_str());
-        {
-            let mut tenant_ids = self
-                .tenant_ids
-                .write()
-                .map_err(|_| matrix_target_backend_error())?;
-            *tenant_ids = merged.clone();
-        }
-        let tenant_ids = merged
-            .into_iter()
-            .map(|tenant_id| tenant_id.as_str().to_string())
-            .collect::<Vec<_>>();
-        let stored = StoredMatrixRoomBindingTenantIndex { tenant_ids };
-        let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
-        // The current filesystem path exposes unconditional put but no
-        // compare-and-swap loop hook, so read-merge-write is the best available
-        // protection against dropping tenant IDs recorded by peer processes.
-        self.root_filesystem
-            .put(
-                &Self::tenant_index_path()?,
-                Entry::bytes(bytes).with_content_type(ContentType::json()),
-                CasExpectation::Any,
-            )
-            .await
-            .map(|_| ())
-            .map_err(map_matrix_target_filesystem_error)
+        Err(matrix_target_backend_error())
     }
 
     fn scope_for_tenant(&self, tenant_id: &TenantId) -> Result<ResourceScope, RebornServicesError> {
@@ -931,8 +1111,8 @@ impl FilesystemMatrixRoomBindingStore {
         let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
         self.filesystem
             .put(
-                &scope,
-                &path,
+                scope,
+                path,
                 Entry::bytes(bytes).with_content_type(ContentType::json()),
                 CasExpectation::Any,
             )
@@ -1946,6 +2126,27 @@ fn matrix_target_config_error() -> RebornServicesError {
     }
 }
 
+fn tenant_ids_from_index_entry(entry: &Entry) -> Result<Vec<TenantId>, RebornServicesError> {
+    let stored: StoredMatrixRoomBindingTenantIndex =
+        serde_json::from_slice(&entry.body).map_err(|_| matrix_target_backend_error())?;
+    stored
+        .tenant_ids
+        .into_iter()
+        .map(TenantId::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| matrix_target_backend_error())
+}
+
+fn tenant_index_entry(tenant_ids: Vec<TenantId>) -> Result<Entry, RebornServicesError> {
+    let tenant_ids = tenant_ids
+        .into_iter()
+        .map(|tenant_id| tenant_id.as_str().to_string())
+        .collect::<Vec<_>>();
+    let stored = StoredMatrixRoomBindingTenantIndex { tenant_ids };
+    let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
+    Ok(Entry::bytes(bytes).with_content_type(ContentType::json()))
+}
+
 fn matrix_target_backend_error() -> RebornServicesError {
     RebornServicesError {
         code: RebornServicesErrorCode::Unavailable,
@@ -1983,8 +2184,11 @@ fn matrix_target_filesystem_not_found(error: &FilesystemError) -> bool {
 #[cfg(test)]
 mod tests {
     use ironclaw_event_projections::ProjectionScope;
-    use ironclaw_filesystem::{InMemoryBackend, RootFilesystem};
-    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
+    use ironclaw_filesystem::{
+        CasExpectation, DirEntry, Entry, FileStat, FilesystemError, InMemoryBackend, RecordVersion,
+        RootFilesystem,
+    };
+    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId, VirtualPath};
     use ironclaw_matrix_adapter::installation_policy::MatrixUserId;
     use ironclaw_outbound::{
         CommunicationDeliveryIntent, CommunicationDeliveryResolutionRequest, CommunicationModality,
@@ -1995,7 +2199,10 @@ mod tests {
     use ironclaw_product_adapters::AdapterInstallationId;
     use ironclaw_product_workflow::{RebornOutboundDeliveryTargetId, WebUiAuthenticatedCaller};
     use ironclaw_turns::{ReplyTargetBindingRef, TurnActor, TurnScope};
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use crate::matrix_outbound_targets::{
         FilesystemMatrixRoomBindingStore, MatrixConfiguredRoomRoute,
@@ -2124,6 +2331,65 @@ mod tests {
                     },
                 },
             }),
+        }
+    }
+
+    struct TenantIndexConflictFilesystem {
+        inner: Arc<InMemoryBackend>,
+        conflict_once: AtomicBool,
+        conflicting_tenant: TenantId,
+    }
+
+    impl TenantIndexConflictFilesystem {
+        fn new(inner: Arc<InMemoryBackend>, conflicting_tenant: TenantId) -> Self {
+            Self {
+                inner,
+                conflict_once: AtomicBool::new(false),
+                conflicting_tenant,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RootFilesystem for TenantIndexConflictFilesystem {
+        fn capabilities(&self) -> ironclaw_filesystem::BackendCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn put(
+            &self,
+            path: &VirtualPath,
+            entry: Entry,
+            cas: CasExpectation,
+        ) -> Result<RecordVersion, FilesystemError> {
+            if path.as_str() == super::MATRIX_ROOM_BINDING_TENANT_INDEX
+                && !self.conflict_once.swap(true, Ordering::SeqCst)
+            {
+                self.inner
+                    .put(
+                        path,
+                        super::tenant_index_entry(vec![self.conflicting_tenant.clone()])
+                            .expect("conflicting tenant index entry"),
+                        CasExpectation::Any,
+                    )
+                    .await?;
+            }
+            self.inner.put(path, entry, cas).await
+        }
+
+        async fn get(
+            &self,
+            path: &VirtualPath,
+        ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError> {
+            self.inner.get(path).await
+        }
+
+        async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+            self.inner.list_dir(path).await
+        }
+
+        async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+            self.inner.stat(path).await
         }
     }
 
@@ -2362,12 +2628,11 @@ mod tests {
             ],
         )])
         .expect("shared Matrix target source");
-        let store: Arc<dyn super::MatrixRoomBindingStore> = Arc::new(source.clone());
-        let provider = MatrixHostOutboundTargetProvider::from_shared_source(Arc::clone(&store))
-            .expect("provider");
-        let resolver =
-            MatrixHostProductOutboundTargetResolver::from_shared_source(Arc::clone(&store))
-                .expect("resolver");
+        let store = Arc::new(source.clone());
+        let provider =
+            MatrixHostOutboundTargetProvider::from_shared_source(store.clone()).expect("provider");
+        let resolver = MatrixHostProductOutboundTargetResolver::from_shared_source(store.clone())
+            .expect("resolver");
 
         let listed = provider
             .list_outbound_delivery_targets(&caller(USER))
@@ -2436,12 +2701,11 @@ mod tests {
             ],
         )])
         .expect("shared Matrix target source");
-        let store: Arc<dyn super::MatrixRoomBindingStore> = Arc::new(source.clone());
-        let provider = MatrixHostOutboundTargetProvider::from_shared_source(Arc::clone(&store))
-            .expect("provider");
-        let resolver =
-            MatrixHostProductOutboundTargetResolver::from_shared_source(Arc::clone(&store))
-                .expect("resolver");
+        let store = Arc::new(source.clone());
+        let provider =
+            MatrixHostOutboundTargetProvider::from_shared_source(store.clone()).expect("provider");
+        let resolver = MatrixHostProductOutboundTargetResolver::from_shared_source(store.clone())
+            .expect("resolver");
 
         let alice_initial = provider
             .list_outbound_delivery_targets(&caller(USER))
@@ -2536,8 +2800,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filesystem_matrix_room_binding_store_tenant_index_retries_cas_conflict() {
+        let inner = Arc::new(InMemoryBackend::default());
+        let conflicting_tenant = TenantId::new(OTHER_TENANT).expect("other tenant");
+        let filesystem = Arc::new(TenantIndexConflictFilesystem::new(
+            inner,
+            conflicting_tenant.clone(),
+        ));
+        let tenant_id = TenantId::new(TENANT).expect("tenant");
+        let store = FilesystemMatrixRoomBindingStore::new(filesystem, []);
+
+        store
+            .remember_tenant(tenant_id.clone())
+            .await
+            .expect("tenant index write retries after CAS conflict");
+
+        let mut tenants = store
+            .read_tenant_index()
+            .await
+            .expect("read tenant index after conflict retry");
+        tenants.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+
+        assert_eq!(tenants, vec![tenant_id, conflicting_tenant]);
+    }
+
+    #[tokio::test]
     async fn filesystem_matrix_room_binding_store_tombstone_survives_reload_and_seed() {
-        let filesystem: Arc<dyn RootFilesystem> = Arc::new(InMemoryBackend::default());
+        let filesystem = Arc::new(InMemoryBackend::default());
         let tenant_id = TenantId::new(TENANT).expect("tenant");
         let config = provider_config(
             INSTALLATION,
@@ -2547,21 +2836,19 @@ mod tests {
                 room_route(ROOM_B, USER, MATRIX_USER),
             ],
         );
-        let store =
-            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
+        let store = FilesystemMatrixRoomBindingStore::new(filesystem.clone(), [tenant_id.clone()]);
         store
             .seed_from_configs(std::slice::from_ref(&config))
             .await
             .expect("seed filesystem Matrix room binding store");
 
         let reloaded =
-            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
-        let store_ref: Arc<dyn super::MatrixRoomBindingStore> = Arc::new(reloaded.clone());
-        let provider = MatrixHostOutboundTargetProvider::from_shared_source(Arc::clone(&store_ref))
+            FilesystemMatrixRoomBindingStore::new(filesystem.clone(), [tenant_id.clone()]);
+        let store_ref = Arc::new(reloaded.clone());
+        let provider = MatrixHostOutboundTargetProvider::from_shared_source(store_ref.clone())
             .expect("provider");
-        let resolver =
-            MatrixHostProductOutboundTargetResolver::from_shared_source(Arc::clone(&store_ref))
-                .expect("resolver");
+        let resolver = MatrixHostProductOutboundTargetResolver::from_shared_source(store_ref)
+            .expect("resolver");
 
         let alice_initial = provider
             .list_outbound_delivery_targets(&caller(USER))
@@ -2611,7 +2898,7 @@ mod tests {
         );
 
         let post_delete_reload =
-            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
+            FilesystemMatrixRoomBindingStore::new(filesystem.clone(), [tenant_id.clone()]);
         assert!(
             post_delete_reload
                 .provider_has_removed_room_binding(&config)

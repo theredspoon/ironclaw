@@ -174,7 +174,7 @@ use crate::extension_host::{
     extension_installation_store::FilesystemExtensionInstallationStore,
     extension_lifecycle::{
         ActiveExtensionPublisher, ExtensionCredentialCleanup, RebornLocalExtensionManagementPort,
-        restore_extension_lifecycle_state,
+        SharedExtensionInstallationStore, restore_extension_lifecycle_state,
     },
     extension_lifecycle_capabilities::{
         extend_builtin_first_party_package, insert_handlers as insert_extension_lifecycle_handlers,
@@ -1188,7 +1188,9 @@ pub(crate) struct RebornProductionRuntimeStoreGraph<F>
 where
     F: RootFilesystem + 'static,
 {
+    pub(crate) filesystem: Arc<F>,
     pub(crate) scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    pub(crate) extension_installation_store: SharedExtensionInstallationStore,
     /// Registry used by the production host runtime for extension descriptors.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<ExtensionRegistry>,
@@ -1935,7 +1937,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         })?,
     );
     let extension_filesystem: Arc<dyn RootFilesystem> = filesystem.clone();
-    let extension_installation_store: Arc<dyn ExtensionInstallationStore> = Arc::new(
+    let extension_installation_store: SharedExtensionInstallationStore = Arc::new(
         FilesystemExtensionInstallationStore::load_at(
             extension_filesystem.clone(),
             extension_installation_state_path,
@@ -5228,6 +5230,23 @@ where
     let process_backend = production_wiring.runtime_policy.process_backend;
     let extension_registry = production_builtin_extension_registry(process_backend)?;
     let extension_registry = Arc::new(extension_registry);
+    let extension_installation_state_path =
+        FilesystemExtensionInstallationStore::default_state_path().map_err(|error| {
+            RebornBuildError::InvalidConfig {
+                reason: format!("production extension installation state path is invalid: {error}"),
+            }
+        })?;
+    let extension_filesystem: Arc<dyn RootFilesystem> = stores.filesystem.clone();
+    let extension_installation_store: Arc<dyn ExtensionInstallationStore> = Arc::new(
+        FilesystemExtensionInstallationStore::load_at(
+            extension_filesystem,
+            extension_installation_state_path,
+        )
+        .await
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("production extension installation state could not be loaded: {error}"),
+        })?,
+    );
     let BudgetSinks {
         budget_event_sink,
         broadcast_budget_event_sink,
@@ -5260,7 +5279,9 @@ where
     let event_log = Arc::clone(&event_stores.events);
     let audit_log = Arc::clone(&event_stores.audit);
     let production_runtime_graph = Arc::new(RebornProductionRuntimeStoreGraph {
+        filesystem: Arc::clone(&stores.filesystem),
         scoped_filesystem: Arc::clone(&stores.scoped_filesystem),
+        extension_installation_store,
         extension_registry: Arc::clone(&extension_registry),
         turn_state: Arc::clone(&turn_state),
         checkpoint_state_store: Arc::clone(&checkpoint_state_store),

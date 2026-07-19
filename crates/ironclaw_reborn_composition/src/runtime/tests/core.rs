@@ -483,7 +483,10 @@ use crate::runtime_input::{
     TriggerFireAccessError, TriggerPollerSettings,
 };
 use crate::webui::facade::build_webui_services;
-use crate::{RebornCompositionProfile, RebornReadiness, RebornReadinessState, RebornRuntimeError};
+use crate::{
+    MatrixRoomBindingUpsertOutcome, MatrixRoomBindingUpsertRequest, RebornCompositionProfile,
+    RebornReadiness, RebornReadinessState, RebornRuntimeError,
+};
 
 use super::{
     RebornSkillSourceKind, TRUSTED_LAPTOP_ACCESS_AUDIT_KIND, TRUSTED_LAPTOP_ACCESS_AUDIT_STATUS,
@@ -2730,7 +2733,7 @@ async fn build_reborn_runtime_spawns_and_shuts_down_configured_matrix_retry_work
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
-async fn production_runtime_rejects_matrix_outbound_target_mount_without_lifecycle_substrate() {
+async fn production_runtime_mounts_matrix_room_binding_authority_from_production_store_graph() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(
         libsql::Builder::new_local(dir.path().join("reborn.db"))
@@ -2741,6 +2744,17 @@ async fn production_runtime_rejects_matrix_outbound_target_mount_without_lifecyc
     let tenant_id = TenantId::new("runtime-production-matrix-target-tenant").expect("tenant");
     let user_id = UserId::new("runtime-production-matrix-target-user").expect("user");
     let agent_id = AgentId::new("runtime-production-matrix-target-agent").expect("agent");
+    let installation_id =
+        AdapterInstallationId::new("runtime-production-matrix-target-installation")
+            .expect("installation");
+    let seeded_room_id = crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
+        .expect("valid Matrix room id");
+    let upserted_room_id =
+        crate::matrix_outbound::MatrixRoomId::new("!runtime-upserted:matrix.example")
+            .expect("valid Matrix room id");
+    let matrix_sender_user_id =
+        ironclaw_matrix_adapter::installation_policy::MatrixUserId::new("@runtime:example.org")
+            .expect("matrix sender");
     let matrix_retry_scope = TurnScope::new_with_owner(
         tenant_id.clone(),
         Some(agent_id.clone()),
@@ -2819,40 +2833,37 @@ async fn production_runtime_rejects_matrix_outbound_target_mount_without_lifecyc
             tenant_id: tenant_id.clone(),
             agent_id: agent_id.clone(),
             project_id: None,
-            installation_id: AdapterInstallationId::new(
-                "runtime-production-matrix-target-installation",
-            )
-            .expect("installation"),
+            installation_id: installation_id.clone(),
             room_targets: vec![crate::MatrixOutboundRoomTargetConfig::new(
-                crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
-                    .expect("valid Matrix room id"),
+                seeded_room_id,
                 user_id.clone(),
-                ironclaw_matrix_adapter::installation_policy::MatrixUserId::new(
-                    "@runtime:example.org",
-                )
-                .expect("matrix sender"),
+                matrix_sender_user_id.clone(),
             )],
         },
     ));
 
-    let error = match build_reborn_runtime(input).await {
-        Ok(runtime) => {
-            runtime.shutdown().await.expect("runtime shutdown");
-            panic!(
-                "Matrix outbound target mounts in production require lifecycle substrate for policy projection refresh"
-            );
-        }
-        Err(error) => error,
-    };
+    let runtime = build_reborn_runtime(input)
+        .await
+        .expect("production Matrix target mount should use production runtime store graph");
 
-    assert!(
-        matches!(
-            error,
-            RebornRuntimeError::InvalidArgument { ref reason }
-                if reason.contains("Matrix policy projection cache refresh requires lifecycle runtime substrate")
-        ),
-        "unexpected error: {error:#}"
-    );
+    let outcome = runtime
+        .upsert_matrix_room_binding(MatrixRoomBindingUpsertRequest {
+            tenant_id,
+            agent_id,
+            project_id: None,
+            installation_id,
+            room_id: upserted_room_id,
+            subject_user_id: user_id,
+            matrix_sender_user_id,
+        })
+        .await
+        .expect("production Matrix room binding authority should mutate through active graph");
+    assert_eq!(outcome, MatrixRoomBindingUpsertOutcome::Created);
+
+    tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
+        .await
+        .expect("runtime shutdown should not hang")
+        .expect("runtime shutdown");
 }
 
 fn runtime_matrix_target_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
