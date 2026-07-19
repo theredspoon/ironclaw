@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use ironclaw_auth::{
     AuthContinuationRef, AuthErrorCode, AuthProductError, CredentialAccountLabel,
-    CredentialAccountSelectionRequest,
+    CredentialAccountSelectionRequest, CredentialOwnership,
 };
 use ironclaw_product_workflow::{
     ExtensionCredentialSetupService, ExtensionCredentialStatusRequest,
@@ -78,6 +78,11 @@ impl ExtensionCredentialSetupService for ProductAuthExtensionCredentialSetup {
             AuthContinuationRef::SetupOnly,
             expires_at,
         );
+        let lifecycle_extension = request.existing_account.as_ref().and_then(|binding| {
+            (binding.ownership == CredentialOwnership::ExtensionOwned
+                && binding.owner_extension.as_ref() == Some(&request.requester_extension))
+            .then(|| request.requester_extension.clone())
+        });
         if let Some(binding) = request.existing_account {
             setup = setup.with_update_binding(binding);
         }
@@ -86,15 +91,20 @@ impl ExtensionCredentialSetupService for ProductAuthExtensionCredentialSetup {
             .request_manual_token_setup(setup)
             .await
             .map_err(map_auth_error)?;
-        let submitted = self
-            .product_auth
-            .submit_manual_token(RebornManualTokenSubmitRequest::new(
-                request.scope,
-                challenge.interaction_id,
-                request.secret,
-            ))
-            .await
-            .map_err(map_auth_error)?;
+        let submit_request = RebornManualTokenSubmitRequest::new(
+            request.scope,
+            challenge.interaction_id,
+            request.secret,
+        );
+        let submitted = match lifecycle_extension {
+            Some(extension_id) => {
+                self.product_auth
+                    .submit_manual_token_for_lifecycle_extension(submit_request, extension_id)
+                    .await
+            }
+            None => self.product_auth.submit_manual_token(submit_request).await,
+        }
+        .map_err(map_auth_error)?;
         Ok(submitted.account_id)
     }
 }

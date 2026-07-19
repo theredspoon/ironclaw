@@ -17,12 +17,13 @@ use ironclaw_auth::{
     CredentialAccountListPage, CredentialAccountListRequest, CredentialAccountLookupRequest,
     CredentialAccountProjection, CredentialAccountRecordSource, CredentialAccountSelectionRequest,
     CredentialAccountService, CredentialAccountStatus, CredentialAccountUpdateBinding,
-    CredentialRecoveryProjection, CredentialRecoveryRequest, CredentialRefreshReport,
-    CredentialRefreshRequest, CredentialSetupService, InMemoryAuthProductServices,
-    ManualTokenSetupRequest, NewAuthFlow, OAuthAuthorizationUrl, OAuthCallbackClaimRequest,
-    OAuthCallbackFailureInput, OAuthCallbackInput, OAuthCompletionCompensationOutcome,
-    OAuthCompletionCompensationRequest, OAuthExchangeCleanupRequest, OAuthProviderCallbackRequest,
-    OAuthProviderExchangeContext, OAuthProviderIdentity, OpaqueStateHash, PkceVerifierHash,
+    CredentialOwnership, CredentialRecoveryProjection, CredentialRecoveryRequest,
+    CredentialRefreshReport, CredentialRefreshRequest, CredentialSetupService,
+    InMemoryAuthProductServices, ManualTokenSetupRequest, NewAuthFlow, OAuthAuthorizationUrl,
+    OAuthCallbackClaimRequest, OAuthCallbackFailureInput, OAuthCallbackInput,
+    OAuthCompletionCompensationOutcome, OAuthCompletionCompensationRequest,
+    OAuthExchangeCleanupRequest, OAuthProviderCallbackRequest, OAuthProviderExchangeContext,
+    OAuthProviderIdentity, OpaqueStateHash, PkceVerifierHash,
     ProviderBackedCredentialAccountService, ProviderCallbackOutcome, ProviderScope,
     SecretCleanupReport, SecretCleanupRequest, SecretCleanupService, SecretSubmitRequest,
     SecretSubmitResult, Timestamp, TurnGateAuthFlowQuery, TurnRunRef, scope_matches,
@@ -552,7 +553,28 @@ impl CredentialAccountService for LifecycleAwareCredentialAccountService {
         &self,
         request: ironclaw_auth::NewCredentialAccount,
     ) -> Result<ironclaw_auth::CredentialAccount, AuthProductError> {
-        self.inner.create_account(request).await
+        let scope = request.scope.clone();
+        let extension_id = request.owner_extension.clone();
+        if let Some(extension_id) = extension_id.as_ref() {
+            invalidate_before_credential_mutation_with_refresher(
+                clone_policy_projection_refresher(&self.refresher),
+                &scope,
+                extension_id,
+            )
+            .await?;
+        }
+        let account = self.inner.create_account(request).await?;
+        if account.status == CredentialAccountStatus::Configured
+            && let Some(extension_id) = extension_id.as_ref()
+        {
+            refresh_after_credential_mutation_with_refresher(
+                clone_policy_projection_refresher(&self.refresher),
+                &scope,
+                extension_id,
+            )
+            .await?;
+        }
+        Ok(account)
     }
 
     async fn get_account(
@@ -636,7 +658,7 @@ impl CredentialAccountService for LifecycleAwareCredentialAccountService {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CredentialRefreshLifecycleFreshnessOwner {
-    WrapperOwned,
+    WrapperOwned(ExtensionId),
     FacadeOwned(ExtensionId),
 }
 
@@ -1333,8 +1355,10 @@ impl RebornProductAuthServices {
             .get_account(lookup)
             .await?
             .ok_or(AuthProductError::CredentialMissing)?;
-        if account.owner_extension.is_some() {
-            return Ok(Some(CredentialRefreshLifecycleFreshnessOwner::WrapperOwned));
+        if let Some(owner_extension) = account.owner_extension {
+            return Ok(Some(
+                CredentialRefreshLifecycleFreshnessOwner::WrapperOwned(owner_extension),
+            ));
         }
         Ok(request
             .requester_extension
@@ -1391,6 +1415,27 @@ impl RebornProductAuthServices {
         }) else {
             return Ok(None);
         };
+        Self::lifecycle_extension_for_continuation(&flow.continuation).map(|extension| {
+            extension.or_else(|| {
+                flow.update_binding.as_ref().and_then(|binding| {
+                    (binding.ownership == CredentialOwnership::ExtensionOwned)
+                        .then(|| binding.owner_extension.clone())
+                        .flatten()
+                })
+            })
+        })
+    }
+
+    async fn lifecycle_extension_for_provider_denied_callback(
+        &self,
+        scope: &AuthProductScope,
+        flow_id: AuthFlowId,
+    ) -> Result<Option<ExtensionId>, AuthProductError> {
+        let flow = self
+            .flow_manager
+            .get_flow(scope, flow_id)
+            .await?
+            .ok_or(AuthProductError::UnknownOrExpiredFlow)?;
         Self::lifecycle_extension_for_continuation(&flow.continuation)
     }
 
@@ -1407,9 +1452,13 @@ impl RebornProductAuthServices {
             .lifecycle_freshness_owner_for_credential_refresh(&request)
             .await
             .map_err(RebornCredentialLifecycleError::from)?;
-        if let Some(CredentialRefreshLifecycleFreshnessOwner::FacadeOwned(extension_id)) =
-            lifecycle_freshness_owner.as_ref()
-        {
+        if let Some(extension_id) = match lifecycle_freshness_owner.as_ref() {
+            Some(CredentialRefreshLifecycleFreshnessOwner::WrapperOwned(extension_id))
+            | Some(CredentialRefreshLifecycleFreshnessOwner::FacadeOwned(extension_id)) => {
+                Some(extension_id)
+            }
+            None => None,
+        } {
             self.invalidate_before_extension_credential_lifecycle_mutation(
                 &request.scope,
                 extension_id,
@@ -1756,19 +1805,35 @@ impl RebornProductAuthServices {
                     (completed, true)
                 }
             }
-            RebornOAuthCallbackOutcome::ProviderDenied => self
-                .flow_manager
-                .complete_oauth_callback(
-                    &request.scope,
-                    OAuthCallbackInput {
-                        flow_id: request.flow_id,
-                        opaque_state_hash: request.opaque_state_hash,
-                        outcome: ProviderCallbackOutcome::Denied,
-                    },
-                )
-                .await
-                .map(|completed| (completed, true))
-                .map_err(RebornOAuthCallbackError::from)?,
+            RebornOAuthCallbackOutcome::ProviderDenied => {
+                let lifecycle_extension = self
+                    .lifecycle_extension_for_provider_denied_callback(
+                        &request.scope,
+                        request.flow_id,
+                    )
+                    .await
+                    .map_err(RebornOAuthCallbackError::from)?;
+                if let Some(extension_id) = lifecycle_extension.as_ref() {
+                    self.invalidate_before_extension_credential_lifecycle_mutation(
+                        &request.scope,
+                        extension_id,
+                    )
+                    .await
+                    .map_err(RebornOAuthCallbackError::from)?;
+                }
+                self.flow_manager
+                    .complete_oauth_callback(
+                        &request.scope,
+                        OAuthCallbackInput {
+                            flow_id: request.flow_id,
+                            opaque_state_hash: request.opaque_state_hash,
+                            outcome: ProviderCallbackOutcome::Denied,
+                        },
+                    )
+                    .await
+                    .map(|completed| (completed, true))
+                    .map_err(RebornOAuthCallbackError::from)?
+            }
             RebornOAuthCallbackOutcome::Malformed => {
                 self.flow_manager
                     .fail_oauth_callback(
@@ -2092,12 +2157,33 @@ impl RebornProductAuthServices {
         &self,
         request: RebornManualTokenSubmitRequest,
     ) -> Result<RebornManualTokenSubmitResponse, RebornManualTokenError> {
+        self.submit_manual_token_with_lifecycle_extension(request, None)
+            .await
+    }
+
+    pub(crate) async fn submit_manual_token_for_lifecycle_extension(
+        &self,
+        request: RebornManualTokenSubmitRequest,
+        extension_id: ExtensionId,
+    ) -> Result<RebornManualTokenSubmitResponse, RebornManualTokenError> {
+        self.submit_manual_token_with_lifecycle_extension(request, Some(extension_id))
+            .await
+    }
+
+    async fn submit_manual_token_with_lifecycle_extension(
+        &self,
+        request: RebornManualTokenSubmitRequest,
+        lifecycle_extension_override: Option<ExtensionId>,
+    ) -> Result<RebornManualTokenSubmitResponse, RebornManualTokenError> {
         let scope = request.scope;
         let interaction_id = request.interaction_id;
-        let lifecycle_extension = self
-            .lifecycle_extension_for_manual_token_submit(&scope, interaction_id)
-            .await
-            .map_err(RebornManualTokenError::from)?;
+        let lifecycle_extension = match lifecycle_extension_override {
+            Some(extension_id) => Some(extension_id),
+            None => self
+                .lifecycle_extension_for_manual_token_submit(&scope, interaction_id)
+                .await
+                .map_err(RebornManualTokenError::from)?,
+        };
         if let Some(extension_id) = lifecycle_extension.as_ref() {
             self.invalidate_before_extension_credential_lifecycle_mutation(&scope, extension_id)
                 .await
