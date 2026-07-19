@@ -183,6 +183,11 @@ pub(crate) trait MatrixRoomBindingStore: Send + Sync + fmt::Debug {
         &self,
         request: MatrixRoomBindingRemovalRequest,
     ) -> Result<MatrixRoomBindingRemovalOutcome, RebornServicesError>;
+
+    async fn provider_has_removed_room_binding(
+        &self,
+        provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<bool, RebornServicesError>;
 }
 
 #[cfg(test)]
@@ -206,6 +211,8 @@ struct StoredMatrixRoomBinding {
     room_id: String,
     subject_user_id: String,
     matrix_sender_user_id: String,
+    #[serde(default)]
+    deleted: bool,
 }
 
 const MATRIX_ROOM_BINDING_STORE_ROOT: &str = "/tenant-shared/matrix/room-bindings";
@@ -356,6 +363,13 @@ impl MatrixRoomBindingStore for MutableMatrixOutboundTargetProviders {
             Ok(MatrixRoomBindingRemovalOutcome::NotFound)
         }
     }
+
+    async fn provider_has_removed_room_binding(
+        &self,
+        _provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<bool, RebornServicesError> {
+        Ok(false)
+    }
 }
 
 impl FilesystemMatrixRoomBindingStore {
@@ -366,7 +380,7 @@ impl FilesystemMatrixRoomBindingStore {
         Self {
             filesystem: Arc::new(ScopedFilesystem::new(
                 filesystem,
-                crate::invocation_mount_view,
+                crate::matrix_room_binding_store_mount_view,
             )),
             tenant_ids: Arc::new(RwLock::new(Vec::new())),
         }
@@ -524,6 +538,9 @@ impl FilesystemMatrixRoomBindingStore {
     async fn write_binding(&self, binding: &MatrixRoomBinding) -> Result<(), RebornServicesError> {
         let scope = self.scope_for_tenant(&binding.tenant_id)?;
         let path = Self::binding_path(binding)?;
+        if self.binding_path_has_tombstone(&scope, &path).await? {
+            return Ok(());
+        }
         let stored = StoredMatrixRoomBinding::from_binding(binding);
         let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
         self.filesystem
@@ -536,6 +553,75 @@ impl FilesystemMatrixRoomBindingStore {
             .await
             .map(|_| ())
             .map_err(map_matrix_target_filesystem_error)
+    }
+
+    async fn write_binding_tombstone(
+        &self,
+        request: &MatrixRoomBindingRemovalRequest,
+    ) -> Result<(), RebornServicesError> {
+        let scope = self.scope_for_tenant(&request.tenant_id)?;
+        let path = Self::binding_path_for_key(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.as_ref(),
+            &request.installation_id,
+            &request.room_id,
+            &request.subject_user_id,
+        )?;
+        let stored = StoredMatrixRoomBinding::tombstone_from_request(request);
+        let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
+        self.filesystem
+            .put(
+                &scope,
+                &path,
+                Entry::bytes(bytes).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await
+            .map_err(map_matrix_target_filesystem_error)?;
+        if !self.binding_path_has_tombstone(&scope, &path).await? {
+            return Err(matrix_target_backend_error());
+        }
+        Ok(())
+    }
+
+    async fn binding_path_has_tombstone(
+        &self,
+        scope: &ResourceScope,
+        path: &ScopedPath,
+    ) -> Result<bool, RebornServicesError> {
+        let Some(versioned) = self
+            .filesystem
+            .get(scope, path)
+            .await
+            .map_err(map_matrix_target_filesystem_error)?
+        else {
+            return Ok(false);
+        };
+        let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
+            .map_err(|_| matrix_target_backend_error())?;
+        Ok(stored.is_deleted())
+    }
+
+    async fn binding_key_has_tombstone(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        installation_id: &AdapterInstallationId,
+        room_id: &MatrixRoomId,
+        subject_user_id: &UserId,
+    ) -> Result<bool, RebornServicesError> {
+        let scope = self.scope_for_tenant(tenant_id)?;
+        let path = Self::binding_path_for_key(
+            tenant_id,
+            agent_id,
+            project_id,
+            installation_id,
+            room_id,
+            subject_user_id,
+        )?;
+        self.binding_path_has_tombstone(&scope, &path).await
     }
 
     async fn read_bindings_for_tenant(
@@ -571,6 +657,9 @@ impl FilesystemMatrixRoomBindingStore {
             };
             let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
                 .map_err(|_| matrix_target_backend_error())?;
+            if stored.is_deleted() {
+                continue;
+            }
             let binding = stored.into_binding()?;
             if &binding.tenant_id == tenant_id {
                 bindings.push(binding);
@@ -593,7 +682,28 @@ impl StoredMatrixRoomBinding {
             room_id: binding.room_id.as_str().to_string(),
             subject_user_id: binding.subject_user_id.as_str().to_string(),
             matrix_sender_user_id: binding.matrix_sender_user_id.as_str().to_string(),
+            deleted: false,
         }
+    }
+
+    fn tombstone_from_request(request: &MatrixRoomBindingRemovalRequest) -> Self {
+        Self {
+            tenant_id: request.tenant_id.as_str().to_string(),
+            agent_id: request.agent_id.as_str().to_string(),
+            project_id: request
+                .project_id
+                .as_ref()
+                .map(|project_id| project_id.as_str().to_string()),
+            installation_id: request.installation_id.as_str().to_string(),
+            room_id: request.room_id.as_str().to_string(),
+            subject_user_id: request.subject_user_id.as_str().to_string(),
+            matrix_sender_user_id: String::new(),
+            deleted: true,
+        }
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.deleted
     }
 
     fn into_binding(self) -> Result<MatrixRoomBinding, RebornServicesError> {
@@ -676,6 +786,9 @@ impl MatrixRoomBindingStore for FilesystemMatrixRoomBindingStore {
         };
         let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
             .map_err(|_| matrix_target_backend_error())?;
+        if stored.is_deleted() {
+            return Ok(None);
+        }
         stored.into_binding().map(Some)
     }
 
@@ -692,13 +805,49 @@ impl MatrixRoomBindingStore for FilesystemMatrixRoomBindingStore {
             &request.subject_user_id,
         )?;
         let scope = self.scope_for_tenant(&request.tenant_id)?;
-        match self.filesystem.delete(&scope, &path).await {
-            Ok(()) => Ok(MatrixRoomBindingRemovalOutcome::Removed),
-            Err(error) if matrix_target_filesystem_not_found(&error) => {
-                Ok(MatrixRoomBindingRemovalOutcome::NotFound)
+        let existing = self
+            .filesystem
+            .get(&scope, &path)
+            .await
+            .map_err(map_matrix_target_filesystem_error)?;
+        let outcome = match existing {
+            Some(versioned) => {
+                let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
+                    .map_err(|_| matrix_target_backend_error())?;
+                if stored.is_deleted() {
+                    MatrixRoomBindingRemovalOutcome::NotFound
+                } else {
+                    MatrixRoomBindingRemovalOutcome::Removed
+                }
             }
-            Err(error) => Err(map_matrix_target_filesystem_error(error)),
+            None => MatrixRoomBindingRemovalOutcome::NotFound,
+        };
+        self.write_binding_tombstone(&request).await?;
+        Ok(outcome)
+    }
+
+    async fn provider_has_removed_room_binding(
+        &self,
+        provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<bool, RebornServicesError> {
+        for route in &provider.configured_room_routes {
+            let room_id = MatrixRoomId::new(route.room_id.clone())
+                .map_err(|_| matrix_target_config_error())?;
+            if self
+                .binding_key_has_tombstone(
+                    &provider.tenant_id,
+                    &provider.agent_id,
+                    provider.project_id.as_ref(),
+                    &provider.installation_id,
+                    &room_id,
+                    &route.subject_user_id,
+                )
+                .await?
+            {
+                return Ok(true);
+            }
         }
+        Ok(false)
     }
 }
 
@@ -771,7 +920,9 @@ impl MatrixHostProductOutboundTargetResolver {
                 Some(ResolvedMatrixOutboundTarget {
                     installation_id: provider_config.installation_id.clone(),
                     policy_provider_scope_key: provider_config.policy_provider_scope_key.clone(),
-                    policy_provider_scope: provider.policy_provider_scope(),
+                    policy_provider_scope: matrix_policy_provider_scope_from_config(
+                        provider_config,
+                    ),
                     room_id: route.room_id.clone(),
                     reply_target_binding_ref: requested_target.clone(),
                 })
@@ -793,7 +944,7 @@ impl MatrixHostProductOutboundTargetResolver {
             Some(ResolvedMatrixOutboundTarget {
                 installation_id: provider_config.installation_id.clone(),
                 policy_provider_scope_key: provider_config.policy_provider_scope_key.clone(),
-                policy_provider_scope: provider.policy_provider_scope(),
+                policy_provider_scope: matrix_policy_provider_scope_from_config(provider_config),
                 room_id: route.room_id.clone(),
                 reply_target_binding_ref: target.clone(),
             })
@@ -984,17 +1135,6 @@ impl MatrixHostOutboundTargetProvider {
             && caller.project_id == config.project_id
     }
 
-    fn policy_provider_scope(&self) -> MatrixPolicyProviderScope {
-        let config = self
-            .static_config()
-            .expect("policy scope is only available for static Matrix target providers");
-        MatrixPolicyProviderScope {
-            tenant_id: config.tenant_id.clone(),
-            agent_id: config.agent_id.clone(),
-            project_id: config.project_id.clone(),
-        }
-    }
-
     fn route_key_for_target_id<'a>(
         &self,
         target_id: &'a RebornOutboundDeliveryTargetId,
@@ -1028,12 +1168,12 @@ impl MatrixHostOutboundTargetProvider {
         route: &ValidatedMatrixConfiguredRoomRoute,
     ) -> Result<OutboundDeliveryTargetEntry, RebornServicesError> {
         debug_assert!(route.room_id.as_str().starts_with('!'));
+        let Some(config) = self.static_config() else {
+            return Err(matrix_target_backend_error());
+        };
         let target_id = RebornOutboundDeliveryTargetId::new(format!(
             "{}{}",
-            self.static_config()
-                .expect("entry construction is only available for static Matrix target providers")
-                .room_target_id_prefix,
-            route.route_key
+            config.room_target_id_prefix, route.route_key
         ))
         .map_err(|_| matrix_target_backend_error())?;
         Ok(OutboundDeliveryTargetEntry {
@@ -1051,12 +1191,7 @@ impl MatrixHostOutboundTargetProvider {
             },
             reply_target_binding_ref: ReplyTargetBindingRef::new(format!(
                 "{}{}",
-                self.static_config()
-                    .expect(
-                        "entry construction is only available for static Matrix target providers"
-                    )
-                    .room_binding_ref_prefix,
-                route.route_key
+                config.room_binding_ref_prefix, route.route_key
             ))
             .map_err(|_| matrix_target_backend_error())?,
         })
@@ -1124,8 +1259,10 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
         if !self.caller_matches_provider_context(caller) {
             return Ok(Vec::new());
         }
-        self.static_config()
-            .expect("static source is required after shared source branch")
+        let Some(config) = self.static_config() else {
+            return Err(matrix_target_backend_error());
+        };
+        config
             .configured_room_routes
             .iter()
             .filter(|route| route.subject_user_id == caller.user_id)
@@ -1230,6 +1367,16 @@ fn matrix_provider_configs_from_bindings(
     }
     validate_matrix_outbound_target_provider_configs(&configs)?;
     Ok(configs)
+}
+
+fn matrix_policy_provider_scope_from_config(
+    config: &MatrixHostOutboundTargetProviderConfig,
+) -> MatrixPolicyProviderScope {
+    MatrixPolicyProviderScope {
+        tenant_id: config.tenant_id.clone(),
+        agent_id: config.agent_id.clone(),
+        project_id: config.project_id.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -1898,7 +2045,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_matrix_room_binding_store_persists_reload_and_fresh_reads_after_delete() {
+    async fn filesystem_matrix_room_binding_store_tombstone_survives_reload_and_seed() {
         let filesystem: Arc<dyn RootFilesystem> = Arc::new(InMemoryBackend::default());
         let tenant_id = TenantId::new(TENANT).expect("tenant");
         let config = provider_config(
@@ -1968,12 +2115,19 @@ mod tests {
                     subject_user_id: UserId::new(USER).expect("user"),
                 })
                 .await
-                .expect("delete alice shared-room binding"),
+                .expect("remove alice shared-room binding"),
             MatrixRoomBindingRemovalOutcome::Removed
         );
 
         let post_delete_reload =
-            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id]);
+            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
+        assert!(
+            post_delete_reload
+                .provider_has_removed_room_binding(&config)
+                .await
+                .expect("provider tombstone lookup"),
+            "provider tombstone must remain durable for stale refresh guards"
+        );
         assert!(
             post_delete_reload
                 .resolve_room_binding(
@@ -2001,6 +2155,35 @@ mod tests {
                 .await
                 .expect("bob binding lookup after alice delete")
                 .is_some()
+        );
+        let post_delete_scope = post_delete_reload
+            .scope_for_tenant(&tenant_id)
+            .expect("post-delete scope");
+        let seed_marker_path =
+            FilesystemMatrixRoomBindingStore::seed_marker_path().expect("seed marker path");
+        post_delete_reload
+            .filesystem
+            .delete(&post_delete_scope, &seed_marker_path)
+            .await
+            .expect("remove seed marker to force reseed path");
+        post_delete_reload
+            .seed_from_configs(std::slice::from_ref(&config))
+            .await
+            .expect("reseed must not overwrite tombstoned Matrix room binding");
+        assert!(
+            post_delete_reload
+                .resolve_room_binding(
+                    &TenantId::new(TENANT).expect("tenant"),
+                    &AgentId::new(AGENT).expect("agent"),
+                    Some(&ProjectId::new(PROJECT).expect("project")),
+                    &AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                    &crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string()).expect("room"),
+                    &UserId::new(USER).expect("user"),
+                )
+                .await
+                .expect("alice binding lookup after reseed")
+                .is_none(),
+            "config seed must not resurrect a removed binding"
         );
 
         let alice_after_delete = provider
