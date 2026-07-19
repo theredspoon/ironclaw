@@ -1,5 +1,9 @@
 // arch-exempt: large_file, shared product-auth callback and cleanup service, plan #5905
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -11,14 +15,14 @@ use ironclaw_auth::{
     AuthProductError, AuthProductScope, AuthProviderClient, AuthProviderId,
     CredentialAccountChoiceRequest, CredentialAccountId, CredentialAccountLabel,
     CredentialAccountListPage, CredentialAccountListRequest, CredentialAccountLookupRequest,
-    CredentialAccountProjection, CredentialAccountRecordSource, CredentialAccountService,
-    CredentialAccountStatus, CredentialAccountUpdateBinding, CredentialRecoveryProjection,
-    CredentialRecoveryRequest, CredentialRefreshReport, CredentialRefreshRequest,
-    CredentialSetupService, InMemoryAuthProductServices, ManualTokenSetupRequest, NewAuthFlow,
-    OAuthAuthorizationUrl, OAuthCallbackClaimRequest, OAuthCallbackFailureInput,
-    OAuthCallbackInput, OAuthCompletionCompensationOutcome, OAuthCompletionCompensationRequest,
-    OAuthExchangeCleanupRequest, OAuthProviderCallbackRequest, OAuthProviderExchangeContext,
-    OAuthProviderIdentity, OpaqueStateHash, PkceVerifierHash,
+    CredentialAccountProjection, CredentialAccountRecordSource, CredentialAccountSelectionRequest,
+    CredentialAccountService, CredentialAccountStatus, CredentialAccountUpdateBinding,
+    CredentialRecoveryProjection, CredentialRecoveryRequest, CredentialRefreshReport,
+    CredentialRefreshRequest, CredentialSetupService, InMemoryAuthProductServices,
+    ManualTokenSetupRequest, NewAuthFlow, OAuthAuthorizationUrl, OAuthCallbackClaimRequest,
+    OAuthCallbackFailureInput, OAuthCallbackInput, OAuthCompletionCompensationOutcome,
+    OAuthCompletionCompensationRequest, OAuthExchangeCleanupRequest, OAuthProviderCallbackRequest,
+    OAuthProviderExchangeContext, OAuthProviderIdentity, OpaqueStateHash, PkceVerifierHash,
     ProviderBackedCredentialAccountService, ProviderCallbackOutcome, ProviderScope,
     SecretCleanupReport, SecretCleanupRequest, SecretCleanupService, SecretSubmitRequest,
     SecretSubmitResult, Timestamp, TurnGateAuthFlowQuery, TurnRunRef, scope_matches,
@@ -28,10 +32,11 @@ use ironclaw_product_adapters::AuthPromptChallengeKind;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
-use ironclaw_host_api::{ExtensionId, UserId};
+use ironclaw_host_api::{ExtensionId, ResourceScope, UserId};
 use ironclaw_turns::{TurnRunId, TurnScope};
 
 use crate::RebornBuildError;
+use crate::extension_host::extension_lifecycle::LifecyclePolicyProjectionCacheRefresher;
 use crate::product_auth::credentials::manual_token_flow::{
     PortBackedManualTokenFlowService, RebornManualTokenFlowService,
 };
@@ -387,6 +392,254 @@ impl CredentialAccountRecordSource for UnsupportedCredentialAccountRecordSource 
     }
 }
 
+#[derive(Debug, Default)]
+struct NoopLifecyclePolicyProjectionCacheRefresherForProductAuth;
+
+#[async_trait]
+impl LifecyclePolicyProjectionCacheRefresher
+    for NoopLifecyclePolicyProjectionCacheRefresherForProductAuth
+{
+    async fn invalidate_before_credential_lifecycle_mutation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn prepare_lifecycle_activation_refresh(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn publish_prepared_lifecycle_activation_refresh(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn refresh_after_lifecycle_removal(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+        Ok(())
+    }
+}
+
+fn map_policy_projection_error(
+    error: ironclaw_product_workflow::ProductWorkflowError,
+    extension_id: &ExtensionId,
+    action: &'static str,
+) -> AuthProductError {
+    tracing::warn!(
+        %error,
+        extension_id = %extension_id,
+        action,
+        "credential lifecycle policy projection refresh failed"
+    );
+    AuthProductError::BackendUnavailable
+}
+
+async fn invalidate_before_credential_mutation_with_refresher(
+    refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
+    scope: &AuthProductScope,
+    extension_id: &ExtensionId,
+) -> Result<(), AuthProductError> {
+    refresher
+        .invalidate_before_credential_lifecycle_mutation(&scope.resource, extension_id)
+        .await
+        .map_err(|error| map_policy_projection_error(error, extension_id, "invalidate"))
+}
+
+async fn refresh_after_credential_mutation_with_refresher(
+    refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
+    scope: &AuthProductScope,
+    extension_id: &ExtensionId,
+) -> Result<(), AuthProductError> {
+    refresher
+        .prepare_lifecycle_activation_refresh(&scope.resource, extension_id)
+        .await
+        .map_err(|error| map_policy_projection_error(error, extension_id, "prepare"))?;
+    refresher
+        .publish_prepared_lifecycle_activation_refresh(&scope.resource, extension_id)
+        .await
+        .map_err(|error| map_policy_projection_error(error, extension_id, "publish"))
+}
+
+fn clone_policy_projection_refresher(
+    slot: &Arc<RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
+) -> Arc<dyn LifecyclePolicyProjectionCacheRefresher> {
+    slot.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+struct LifecycleAwareCredentialSetupService {
+    inner: Arc<dyn CredentialSetupService>,
+    refresher: Arc<RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
+}
+
+impl LifecycleAwareCredentialSetupService {
+    fn new(
+        inner: Arc<dyn CredentialSetupService>,
+        refresher: Arc<RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
+    ) -> Self {
+        Self { inner, refresher }
+    }
+}
+
+#[async_trait]
+impl CredentialSetupService for LifecycleAwareCredentialSetupService {
+    async fn create_or_update_account(
+        &self,
+        request: ironclaw_auth::CredentialAccountMutation,
+    ) -> Result<ironclaw_auth::CredentialAccount, AuthProductError> {
+        let (scope, extension_id) = match &request {
+            ironclaw_auth::CredentialAccountMutation::Create(account) => {
+                (account.scope.clone(), account.owner_extension.clone())
+            }
+            ironclaw_auth::CredentialAccountMutation::Update(update) => (
+                update.account.scope.clone(),
+                update.account.owner_extension.clone(),
+            ),
+        };
+        if let Some(extension_id) = extension_id.as_ref() {
+            invalidate_before_credential_mutation_with_refresher(
+                clone_policy_projection_refresher(&self.refresher),
+                &scope,
+                extension_id,
+            )
+            .await?;
+        }
+        let account = self.inner.create_or_update_account(request).await?;
+        if account.status == CredentialAccountStatus::Configured
+            && let Some(extension_id) = extension_id.as_ref()
+        {
+            refresh_after_credential_mutation_with_refresher(
+                clone_policy_projection_refresher(&self.refresher),
+                &scope,
+                extension_id,
+            )
+            .await?;
+        }
+        Ok(account)
+    }
+}
+
+struct LifecycleAwareCredentialAccountService {
+    inner: Arc<dyn CredentialAccountService>,
+    refresher: Arc<RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
+}
+
+impl LifecycleAwareCredentialAccountService {
+    fn new(
+        inner: Arc<dyn CredentialAccountService>,
+        refresher: Arc<RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
+    ) -> Self {
+        Self { inner, refresher }
+    }
+}
+
+#[async_trait]
+impl CredentialAccountService for LifecycleAwareCredentialAccountService {
+    async fn create_account(
+        &self,
+        request: ironclaw_auth::NewCredentialAccount,
+    ) -> Result<ironclaw_auth::CredentialAccount, AuthProductError> {
+        self.inner.create_account(request).await
+    }
+
+    async fn get_account(
+        &self,
+        request: CredentialAccountLookupRequest,
+    ) -> Result<Option<ironclaw_auth::CredentialAccount>, AuthProductError> {
+        self.inner.get_account(request).await
+    }
+
+    async fn list_accounts(
+        &self,
+        request: CredentialAccountListRequest,
+    ) -> Result<CredentialAccountListPage, AuthProductError> {
+        self.inner.list_accounts(request).await
+    }
+
+    async fn update_status(
+        &self,
+        scope: &AuthProductScope,
+        account_id: CredentialAccountId,
+        status: CredentialAccountStatus,
+    ) -> Result<ironclaw_auth::CredentialAccount, AuthProductError> {
+        let extension_id = self
+            .inner
+            .get_account(CredentialAccountLookupRequest::new(
+                scope.clone(),
+                account_id,
+            ))
+            .await?
+            .and_then(|account| account.owner_extension);
+        if let Some(extension_id) = extension_id.as_ref() {
+            invalidate_before_credential_mutation_with_refresher(
+                clone_policy_projection_refresher(&self.refresher),
+                scope,
+                extension_id,
+            )
+            .await?;
+        }
+        let account = self.inner.update_status(scope, account_id, status).await?;
+        if account.status == CredentialAccountStatus::Configured
+            && let Some(extension_id) = extension_id.as_ref()
+        {
+            refresh_after_credential_mutation_with_refresher(
+                clone_policy_projection_refresher(&self.refresher),
+                scope,
+                extension_id,
+            )
+            .await?;
+        }
+        Ok(account)
+    }
+
+    async fn select_unique_configured_account(
+        &self,
+        request: CredentialAccountSelectionRequest,
+    ) -> Result<CredentialAccountProjection, AuthProductError> {
+        self.inner.select_unique_configured_account(request).await
+    }
+
+    async fn project_credential_recovery(
+        &self,
+        request: CredentialRecoveryRequest,
+    ) -> Result<CredentialRecoveryProjection, AuthProductError> {
+        self.inner.project_credential_recovery(request).await
+    }
+
+    async fn select_configured_account(
+        &self,
+        request: CredentialAccountChoiceRequest,
+    ) -> Result<CredentialAccountProjection, AuthProductError> {
+        self.inner.select_configured_account(request).await
+    }
+
+    async fn refresh_account(
+        &self,
+        request: CredentialRefreshRequest,
+    ) -> Result<CredentialRefreshReport, AuthProductError> {
+        self.inner.refresh_account(request).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialRefreshLifecycleFreshnessOwner {
+    WrapperOwned,
+    FacadeOwned(ExtensionId),
+}
+
 #[derive(Clone)]
 pub struct RebornProductAuthServicePorts {
     flow_manager: Arc<dyn AuthFlowManager>,
@@ -583,6 +836,8 @@ pub struct RebornProductAuthServices {
     /// by product-auth issue #4112 and remains genuinely optional until the
     /// durable backend exposes the same scoped projection as the in-memory port.
     flow_record_source: Option<Arc<dyn AuthFlowRecordSource>>,
+    policy_projection_cache_refresher:
+        Arc<RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
 }
 
 impl std::fmt::Debug for RebornProductAuthServices {
@@ -620,7 +875,8 @@ impl std::fmt::Debug for RebornProductAuthServices {
             )
             .field("flow_record_source", &self.flow_record_source.is_some())
             .field("dcr_oauth_registry", &self.dcr_oauth_registry.is_some())
-            .field("oauth_gate_registry", &self.oauth_gate_registry.is_some());
+            .field("oauth_gate_registry", &self.oauth_gate_registry.is_some())
+            .field("policy_projection_cache_refresher", &"<wired>");
         dbg.finish()
     }
 }
@@ -635,6 +891,21 @@ impl RebornProductAuthServices {
         cleanup_service: Arc<dyn SecretCleanupService>,
         continuation_dispatcher: Arc<dyn RebornAuthContinuationDispatcher>,
     ) -> Self {
+        let policy_projection_cache_refresher: Arc<
+            RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>,
+        > = Arc::new(RwLock::new(Arc::new(
+            NoopLifecyclePolicyProjectionCacheRefresherForProductAuth,
+        )));
+        let credential_setup_service: Arc<dyn CredentialSetupService> =
+            Arc::new(LifecycleAwareCredentialSetupService::new(
+                credential_setup_service,
+                Arc::clone(&policy_projection_cache_refresher),
+            ));
+        let credential_account_service: Arc<dyn CredentialAccountService> =
+            Arc::new(LifecycleAwareCredentialAccountService::new(
+                credential_account_service,
+                Arc::clone(&policy_projection_cache_refresher),
+            ));
         let manual_token_flow_service = Arc::new(PortBackedManualTokenFlowService::new(
             flow_manager.clone(),
             interaction_service.clone(),
@@ -656,6 +927,7 @@ impl RebornProductAuthServices {
             dcr_oauth_registry: None,
             oauth_gate_registry: None,
             flow_record_source: None,
+            policy_projection_cache_refresher,
         }
     }
 
@@ -884,6 +1156,25 @@ impl RebornProductAuthServices {
         self
     }
 
+    pub(crate) fn set_policy_projection_cache_refresher(
+        &self,
+        refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
+    ) {
+        *self
+            .policy_projection_cache_refresher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = refresher;
+    }
+
+    fn policy_projection_cache_refresher(
+        &self,
+    ) -> Arc<dyn LifecyclePolicyProjectionCacheRefresher> {
+        self.policy_projection_cache_refresher
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Wire the secret store used by the inline OAuth refresh margin check
     /// (A2). When set, the refresher reads `expires_at` metadata from the
     /// store and skips an unnecessary token-endpoint round-trip when the
@@ -980,6 +1271,129 @@ impl RebornProductAuthServices {
         self.flow_record_source.is_some()
     }
 
+    async fn invalidate_before_extension_credential_lifecycle_mutation(
+        &self,
+        scope: &AuthProductScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), AuthProductError> {
+        self.policy_projection_cache_refresher()
+            .invalidate_before_credential_lifecycle_mutation(&scope.resource, extension_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    extension_id = %extension_id,
+                    "credential lifecycle policy projection invalidation failed"
+                );
+                AuthProductError::BackendUnavailable
+            })
+    }
+
+    async fn refresh_after_extension_credential_lifecycle_mutation(
+        &self,
+        scope: &AuthProductScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), AuthProductError> {
+        let refresher = self.policy_projection_cache_refresher();
+        refresher
+            .prepare_lifecycle_activation_refresh(&scope.resource, extension_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    extension_id = %extension_id,
+                    "credential lifecycle policy projection prepare failed"
+                );
+                AuthProductError::BackendUnavailable
+            })?;
+        refresher
+            .publish_prepared_lifecycle_activation_refresh(&scope.resource, extension_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    extension_id = %extension_id,
+                    "credential lifecycle policy projection publish failed"
+                );
+                AuthProductError::BackendUnavailable
+            })
+    }
+
+    async fn lifecycle_freshness_owner_for_credential_refresh(
+        &self,
+        request: &CredentialRefreshRequest,
+    ) -> Result<Option<CredentialRefreshLifecycleFreshnessOwner>, AuthProductError> {
+        let mut lookup =
+            CredentialAccountLookupRequest::new(request.scope.clone(), request.account_id);
+        if let Some(requester_extension) = request.requester_extension.clone() {
+            lookup = lookup.for_extension(requester_extension);
+        }
+        let account = self
+            .credential_account_service
+            .get_account(lookup)
+            .await?
+            .ok_or(AuthProductError::CredentialMissing)?;
+        if account.owner_extension.is_some() {
+            return Ok(Some(CredentialRefreshLifecycleFreshnessOwner::WrapperOwned));
+        }
+        Ok(request
+            .requester_extension
+            .clone()
+            .map(CredentialRefreshLifecycleFreshnessOwner::FacadeOwned))
+    }
+
+    fn lifecycle_extension_for_continuation(
+        continuation: &AuthContinuationRef,
+    ) -> Result<Option<ExtensionId>, AuthProductError> {
+        let AuthContinuationRef::LifecycleActivation { package_ref } = continuation else {
+            return Ok(None);
+        };
+        ExtensionId::new(package_ref.as_str())
+            .map(Some)
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    package_ref = %package_ref.as_str(),
+                    "lifecycle credential continuation package ref is not a valid extension id"
+                );
+                AuthProductError::BackendUnavailable
+            })
+    }
+
+    async fn lifecycle_extension_for_manual_token_submit(
+        &self,
+        scope: &AuthProductScope,
+        interaction_id: AuthInteractionId,
+    ) -> Result<Option<ExtensionId>, AuthProductError> {
+        let Some(source) = &self.flow_record_source else {
+            return Ok(None);
+        };
+        let Some(thread_id) = scope.resource.thread_id.clone() else {
+            return Ok(None);
+        };
+        let flows = source
+            .flows_for_owner(AuthFlowOwnerScope {
+                tenant_id: scope.resource.tenant_id.clone(),
+                user_id: scope.resource.user_id.clone(),
+                agent_id: scope.resource.agent_id.clone(),
+                project_id: scope.resource.project_id.clone(),
+                thread_id,
+            })
+            .await?;
+        let Some(flow) = flows.into_iter().find(|flow| {
+            flow.continuation_emitted_at.is_none()
+                && scope_matches(scope, &flow.scope)
+                && matches!(
+                    &flow.challenge,
+                    Some(AuthChallenge::ManualTokenRequired { interaction_id: id, .. })
+                        if id == &interaction_id
+                )
+        }) else {
+            return Ok(None);
+        };
+        Self::lifecycle_extension_for_continuation(&flow.continuation)
+    }
+
     /// Refresh a credential account through the injected product-auth port.
     ///
     /// Concrete account services own the durable account update and provider
@@ -989,10 +1403,38 @@ impl RebornProductAuthServices {
         &self,
         request: CredentialRefreshRequest,
     ) -> Result<CredentialRefreshReport, RebornCredentialLifecycleError> {
-        self.credential_account_service
+        let lifecycle_freshness_owner = self
+            .lifecycle_freshness_owner_for_credential_refresh(&request)
+            .await
+            .map_err(RebornCredentialLifecycleError::from)?;
+        if let Some(CredentialRefreshLifecycleFreshnessOwner::FacadeOwned(extension_id)) =
+            lifecycle_freshness_owner.as_ref()
+        {
+            self.invalidate_before_extension_credential_lifecycle_mutation(
+                &request.scope,
+                extension_id,
+            )
+            .await
+            .map_err(RebornCredentialLifecycleError::from)?;
+        }
+        let request_scope = request.scope.clone();
+        let report = self
+            .credential_account_service
             .refresh_account(request)
             .await
-            .map_err(RebornCredentialLifecycleError::from)
+            .map_err(RebornCredentialLifecycleError::from)?;
+        if report.account.status == CredentialAccountStatus::Configured
+            && let Some(CredentialRefreshLifecycleFreshnessOwner::FacadeOwned(extension_id)) =
+                lifecycle_freshness_owner.as_ref()
+        {
+            self.refresh_after_extension_credential_lifecycle_mutation(
+                &request_scope,
+                extension_id,
+            )
+            .await
+            .map_err(RebornCredentialLifecycleError::from)?;
+        }
+        Ok(report)
     }
 
     /// List redacted credential account projections through the injected
@@ -1046,6 +1488,12 @@ impl RebornProductAuthServices {
         &self,
         request: SecretCleanupRequest,
     ) -> Result<SecretCleanupReport, RebornCredentialLifecycleError> {
+        self.invalidate_before_extension_credential_lifecycle_mutation(
+            &request.scope,
+            &request.extension_id,
+        )
+        .await
+        .map_err(RebornCredentialLifecycleError::from)?;
         let report = self
             .cleanup_service
             .cleanup_for_lifecycle(request)
@@ -1221,6 +1669,17 @@ impl RebornProductAuthServices {
                     }
                     provider_identity = exchange.provider_identity.clone();
                     let exchange_for_cleanup = exchange.clone();
+                    let lifecycle_extension =
+                        Self::lifecycle_extension_for_continuation(&claimed.continuation)
+                            .map_err(RebornOAuthCallbackError::from)?;
+                    if let Some(extension_id) = lifecycle_extension.as_ref() {
+                        self.invalidate_before_extension_credential_lifecycle_mutation(
+                            &request.scope,
+                            extension_id,
+                        )
+                        .await
+                        .map_err(RebornOAuthCallbackError::from)?;
+                    }
                     let completed = match self
                         .flow_manager
                         .complete_oauth_callback(
@@ -1286,6 +1745,14 @@ impl RebornProductAuthServices {
                             return Err(error.into());
                         }
                     };
+                    if let Some(extension_id) = lifecycle_extension.as_ref() {
+                        self.refresh_after_extension_credential_lifecycle_mutation(
+                            &request.scope,
+                            extension_id,
+                        )
+                        .await
+                        .map_err(RebornOAuthCallbackError::from)?;
+                    }
                     (completed, true)
                 }
             }
@@ -1627,6 +2094,15 @@ impl RebornProductAuthServices {
     ) -> Result<RebornManualTokenSubmitResponse, RebornManualTokenError> {
         let scope = request.scope;
         let interaction_id = request.interaction_id;
+        let lifecycle_extension = self
+            .lifecycle_extension_for_manual_token_submit(&scope, interaction_id)
+            .await
+            .map_err(RebornManualTokenError::from)?;
+        if let Some(extension_id) = lifecycle_extension.as_ref() {
+            self.invalidate_before_extension_credential_lifecycle_mutation(&scope, extension_id)
+                .await
+                .map_err(RebornManualTokenError::from)?;
+        }
         let submit = self
             .manual_token_flow_service
             .submit_manual_token_flow(
@@ -1650,6 +2126,13 @@ impl RebornProductAuthServices {
             .await
             .map_err(ContinuationDispatchFailure::into_auth_error)
             .map_err(RebornManualTokenError::from)?;
+        if result.status == CredentialAccountStatus::Configured
+            && let Some(extension_id) = lifecycle_extension.as_ref()
+        {
+            self.refresh_after_extension_credential_lifecycle_mutation(&scope, extension_id)
+                .await
+                .map_err(RebornManualTokenError::from)?;
+        }
 
         Ok(RebornManualTokenSubmitResponse {
             account_id: result.account_id,
@@ -2114,12 +2597,12 @@ mod tests {
         CredentialAccount, CredentialAccountChoiceRequest, CredentialAccountId,
         CredentialAccountListPage, CredentialAccountListRequest, CredentialAccountLookupRequest,
         CredentialAccountMutation, CredentialAccountProjection, CredentialAccountSelectionRequest,
-        CredentialAccountStatus, CredentialRecoveryProjection, CredentialRecoveryRequest,
-        CredentialRefreshReport, CredentialRefreshRequest, NewAuthFlow, NewCredentialAccount,
-        OAuthCallbackClaimRequest, OAuthCallbackFailureInput, OAuthCallbackInput,
-        OAuthProviderCallbackRequest, OAuthProviderExchange, OAuthProviderRefresh,
-        OAuthProviderRefreshRequest, SecretCleanupReport, SecretCleanupRequest,
-        SecretSubmitRequest, SecretSubmitResult,
+        CredentialAccountStatus, CredentialOwnership, CredentialRecoveryProjection,
+        CredentialRecoveryRequest, CredentialRefreshReport, CredentialRefreshRequest, NewAuthFlow,
+        NewCredentialAccount, OAuthCallbackClaimRequest, OAuthCallbackFailureInput,
+        OAuthCallbackInput, OAuthProviderCallbackRequest, OAuthProviderExchange,
+        OAuthProviderRefresh, OAuthProviderRefreshRequest, SecretCleanupReport,
+        SecretCleanupRequest, SecretSubmitRequest, SecretSubmitResult,
     };
 
     struct SharedAuthTestDouble;
@@ -2357,13 +2840,15 @@ mod tests {
             arc_data_ptr(&services.interaction_service()),
             arc_data_ptr(&interaction_service)
         );
-        assert_eq!(
+        assert_ne!(
             arc_data_ptr(&services.credential_setup_service()),
-            arc_data_ptr(&credential_setup_service)
+            arc_data_ptr(&credential_setup_service),
+            "credential setup is lifecycle-wrapped"
         );
-        assert_eq!(
+        assert_ne!(
             arc_data_ptr(&services.credential_account_service()),
-            arc_data_ptr(&credential_account_service)
+            arc_data_ptr(&credential_account_service),
+            "credential accounts are lifecycle-wrapped"
         );
         assert_eq!(
             arc_data_ptr(&services.provider_client()),
@@ -2432,16 +2917,66 @@ mod tests {
 
         assert_eq!(arc_data_ptr(&services.flow_manager()), shared_ptr);
         assert_eq!(arc_data_ptr(&services.interaction_service()), shared_ptr);
-        assert_eq!(
+        assert_ne!(
             arc_data_ptr(&services.credential_setup_service()),
-            shared_ptr
+            shared_ptr,
+            "credential setup is lifecycle-wrapped"
         );
-        assert_eq!(
+        assert_ne!(
             arc_data_ptr(&services.credential_account_service()),
-            shared_ptr
+            shared_ptr,
+            "credential accounts are lifecycle-wrapped"
         );
         assert_eq!(arc_data_ptr(&services.provider_client()), shared_ptr);
         assert_eq!(arc_data_ptr(&services.cleanup_service()), shared_ptr);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_wrapped_credential_ports_forward_to_inner_services() {
+        let shared = Arc::new(InMemoryAuthProductServices::new());
+        let services = RebornProductAuthServices::from_shared(
+            shared.clone(),
+            Arc::new(NoopAuthContinuationDispatcher),
+        );
+        let scope = test_auth_product_scope();
+        let provider = AuthProviderId::new("wrapped-port-provider").expect("provider");
+        let account = services
+            .credential_setup_service()
+            .create_or_update_account(CredentialAccountMutation::Create(NewCredentialAccount {
+                scope: scope.clone(),
+                provider: provider.clone(),
+                label: CredentialAccountLabel::new("wrapped account").expect("label"),
+                status: CredentialAccountStatus::Configured,
+                ownership: CredentialOwnership::UserReusable,
+                owner_extension: None,
+                granted_extensions: Vec::new(),
+                access_secret: Some(
+                    ironclaw_host_api::SecretHandle::new("wrapped-access").expect("secret handle"),
+                ),
+                refresh_secret: None,
+                scopes: Vec::new(),
+            }))
+            .await
+            .expect("wrapped setup forwards create");
+
+        let loaded = services
+            .credential_account_service()
+            .get_account(CredentialAccountLookupRequest::new(
+                scope.clone(),
+                account.id,
+            ))
+            .await
+            .expect("wrapped account service forwards lookup")
+            .expect("created account");
+        assert_eq!(loaded.id, account.id);
+        assert_eq!(loaded.provider, provider);
+
+        let revoked = services
+            .credential_account_service()
+            .update_status(&scope, account.id, CredentialAccountStatus::Revoked)
+            .await
+            .expect("wrapped account service forwards status update");
+        assert_eq!(revoked.status, CredentialAccountStatus::Revoked);
     }
 
     #[tokio::test]
@@ -2600,13 +3135,15 @@ mod tests {
 
         assert_eq!(arc_data_ptr(&services.flow_manager()), shared_ptr);
         assert_eq!(arc_data_ptr(&services.interaction_service()), shared_ptr);
-        assert_eq!(
+        assert_ne!(
             arc_data_ptr(&services.credential_setup_service()),
-            shared_ptr
+            shared_ptr,
+            "credential setup is lifecycle-wrapped"
         );
-        assert_eq!(
+        assert_ne!(
             arc_data_ptr(&services.credential_account_service()),
-            shared_ptr
+            shared_ptr,
+            "credential accounts are lifecycle-wrapped"
         );
         assert_eq!(arc_data_ptr(&services.provider_client()), provider_ptr);
         assert_eq!(arc_data_ptr(&services.cleanup_service()), shared_ptr);

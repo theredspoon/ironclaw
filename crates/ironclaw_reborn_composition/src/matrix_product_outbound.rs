@@ -243,6 +243,16 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                 )
                 .await
             {
+                self.invalidate_projection_cache_body(
+                    &write.provider_scope,
+                    &write.provider_cache_path,
+                )
+                .await?;
+                self.invalidate_projection_commit_markers(&[(
+                    write.provider_scope.clone(),
+                    write.commit_marker_path.clone(),
+                )])
+                .await?;
                 if !force_write_empty && publish_markers {
                     self.invalidate_written_projection_caches(&written).await?;
                 }
@@ -617,6 +627,27 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         Ok(())
     }
 
+    pub(crate) async fn invalidate_before_credential_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        if extension_id.as_str() != MATRIX_PRODUCT_ADAPTER_EXTENSION_ID {
+            return Ok(());
+        }
+        let target_providers = self.target_provider_source.snapshot().await?;
+        let mut markers = Vec::new();
+        for provider in &target_providers {
+            let provider_scope =
+                matrix_policy_projection_resource_scope_for_provider(scope, provider);
+            let provider_cache_path = matrix_policy_projection_cache_path_for_provider(provider)?;
+            let commit_marker_path =
+                matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+            markers.push((provider_scope, commit_marker_path));
+        }
+        self.invalidate_projection_commit_markers(&markers).await
+    }
+
     #[cfg(test)]
     async fn refresh_after_lifecycle_activation(
         &self,
@@ -639,6 +670,19 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
 
 #[async_trait]
 impl LifecyclePolicyProjectionCacheRefresher for MatrixLifecyclePolicyProjectionCacheRefresher {
+    async fn invalidate_before_credential_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        MatrixLifecyclePolicyProjectionCacheRefresher::invalidate_before_credential_lifecycle_mutation(
+            self,
+            scope,
+            extension_id,
+        )
+        .await
+    }
+
     async fn prepare_lifecycle_activation_refresh(
         &self,
         scope: &ResourceScope,
@@ -1343,9 +1387,26 @@ fn record_matrix_product_outbound_workflow_failure(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
+    use chrono::Utc;
+    use ironclaw_auth::{
+        AuthFlowManager, AuthInteractionService, AuthProductError, AuthProductScope,
+        AuthProviderClient, AuthProviderId, AuthSurface, CredentialAccount,
+        CredentialAccountChoiceRequest, CredentialAccountId, CredentialAccountLabel,
+        CredentialAccountListPage, CredentialAccountListRequest, CredentialAccountLookupRequest,
+        CredentialAccountMutation, CredentialAccountProjection, CredentialAccountSelectionRequest,
+        CredentialAccountService, CredentialAccountStatus, CredentialOwnership,
+        CredentialRecoveryProjection, CredentialRecoveryRequest, CredentialRefreshReport,
+        CredentialRefreshRequest, CredentialSetupService, InMemoryAuthProductServices,
+        NewCredentialAccount, OAuthProviderCallbackRequest, OAuthProviderExchange,
+        OAuthProviderExchangeContext, OAuthProviderRefresh, OAuthProviderRefreshRequest,
+        SecretCleanupAction, SecretCleanupRequest, SecretCleanupService,
+    };
     use ironclaw_events::{DurableAuditLog, EventStreamKey, InMemoryDurableAuditLog, ReadScope};
     use ironclaw_extensions::{
         ExtensionActivationState, ExtensionInstallation, ExtensionInstallationId,
@@ -1357,15 +1418,19 @@ mod tests {
         InMemoryBackend, RecordVersion, RootFilesystem,
     };
     use ironclaw_host_api::{
-        AgentId, ExtensionId, InvocationId, ProjectId, ResourceScope, TenantId, UserId, VirtualPath,
+        AgentId, ExtensionId, InvocationId, ProjectId, ResourceScope, SecretHandle, TenantId,
+        UserId, VirtualPath,
     };
     use ironclaw_matrix_adapter::installation_policy::{
         ArtifactSha256, ComponentArtifactId, MatrixUserId, WitPackageName, WitWorldName,
     };
-    use ironclaw_product_adapters::{AdapterInstallationId, ProductAdapterId};
+    use ironclaw_product_adapters::{
+        AdapterInstallationId, EgressCredentialHandle, ProductAdapterId,
+    };
     use ironclaw_product_workflow::{
         RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind,
     };
+    use ironclaw_secrets::InMemorySecretStore;
 
     use super::*;
     use crate::matrix_outbound_targets::{
@@ -3294,6 +3359,993 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_product_auth_setup_rebind_preinvalidates_before_durable_mutation_and_publishes_new_handle()
+     {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store.clone(), backend.clone()).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect("initial snapshot")
+                .credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("old handle")
+        );
+
+        let setup = Arc::new(RebindingCredentialSetupService::new(
+            store,
+            source.clone(),
+            adapter_id.clone(),
+            installation_id.clone(),
+            "matrix-source-rotated-token",
+        ));
+        let product_auth =
+            product_auth_with_ports(setup.clone(), Arc::new(InMemoryAuthProductServices::new()));
+        product_auth.set_policy_projection_cache_refresher(refresher);
+
+        product_auth
+            .credential_setup_service()
+            .create_or_update_account(CredentialAccountMutation::Update(
+                ironclaw_auth::CredentialAccountUpdate {
+                    account_id: CredentialAccountId::new(),
+                    account: new_lifecycle_account(
+                        scope.clone(),
+                        "matrix-oauth",
+                        CredentialAccountStatus::Configured,
+                        Some(matrix_product_adapter_extension_id()),
+                        Some("matrix-source-rotated-token"),
+                    ),
+                },
+            ))
+            .await
+            .expect("source-owner credential rebind mutation");
+
+        assert!(
+            setup.saw_preinvalidated_projection(),
+            "Matrix projection must be pre-invalidated before durable credential rebind"
+        );
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect("rebound snapshot")
+                .credential_handle,
+            EgressCredentialHandle::new("matrix-source-rotated-token").expect("new handle")
+        );
+        assert_eq!(provider.installation_id, installation_id);
+    }
+
+    #[tokio::test]
+    async fn matrix_product_auth_revocation_preinvalidates_and_leaves_policy_snapshot_failed_closed()
+     {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, _provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store, backend).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+
+        let account_id = CredentialAccountId::new();
+        let account = credential_account_from_new(
+            account_id,
+            new_lifecycle_account(
+                scope.clone(),
+                "matrix-oauth",
+                CredentialAccountStatus::Configured,
+                Some(matrix_product_adapter_extension_id()),
+                Some("matrix-source-access-token"),
+            ),
+        );
+        let accounts = Arc::new(RevokingCredentialAccountService::new(
+            account,
+            source.clone(),
+            adapter_id.clone(),
+            installation_id.clone(),
+        ));
+        let product_auth = product_auth_with_ports(
+            Arc::new(InMemoryAuthProductServices::new()),
+            accounts.clone(),
+        );
+        product_auth.set_policy_projection_cache_refresher(refresher);
+
+        product_auth
+            .credential_account_service()
+            .update_status(&scope, account_id, CredentialAccountStatus::Revoked)
+            .await
+            .expect("source-owner credential revocation");
+
+        assert!(
+            accounts.saw_preinvalidated_projection(),
+            "Matrix projection must be pre-invalidated before durable credential revocation"
+        );
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("revoked Matrix credential must leave policy snapshot failed closed"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_product_auth_refresh_provider_success_preinvalidates_and_publishes_rotated_handle()
+     {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, _provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store.clone(), backend).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect("initial snapshot")
+                .credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("old handle")
+        );
+
+        let shared = Arc::new(InMemoryAuthProductServices::new());
+        let mut account = new_lifecycle_account(
+            scope.clone(),
+            "matrix-oauth",
+            CredentialAccountStatus::Expired,
+            Some(matrix_product_adapter_extension_id()),
+            Some("matrix-source-access-token"),
+        );
+        account.refresh_secret =
+            Some(SecretHandle::new("matrix-source-refresh-token").expect("refresh handle"));
+        let account = shared
+            .create_account(account)
+            .await
+            .expect("create extension-owned Matrix credential");
+        let setup = Arc::new(MatrixRefreshCredentialSetupService::new(
+            shared.clone(),
+            store,
+            source.clone(),
+            adapter_id.clone(),
+            installation_id.clone(),
+        ));
+        let provider_client: Arc<dyn AuthProviderClient> =
+            Arc::new(FakeRefreshProviderClient::success(
+                "matrix-oauth",
+                "matrix-source-rotated-token",
+                Some("matrix-source-rotated-refresh-token"),
+            ));
+        let product_auth =
+            product_auth_refresh_facade(shared.clone(), setup.clone(), provider_client);
+        let counting_refresher = Arc::new(CountingLifecyclePolicyProjectionCacheRefresher::new(
+            refresher,
+        ));
+        product_auth.set_policy_projection_cache_refresher(counting_refresher.clone());
+
+        let report = product_auth
+            .refresh_credential_account(
+                CredentialRefreshRequest::new(
+                    scope.clone(),
+                    AuthProviderId::new("matrix-oauth").expect("provider"),
+                    account.id,
+                )
+                .for_extension(matrix_product_adapter_extension_id()),
+            )
+            .await
+            .expect("provider refresh succeeds through product-auth facade");
+
+        assert!(report.refreshed);
+        assert_eq!(report.account.status, CredentialAccountStatus::Configured);
+        assert!(
+            setup.saw_preinvalidated_projection(),
+            "Matrix projection must be pre-invalidated before provider refresh persists the rotated handle"
+        );
+        assert_eq!(
+            counting_refresher.invalidate_count(),
+            1,
+            "extension-owned provider refresh invalidation is owned by the lifecycle-aware setup wrapper"
+        );
+        assert_eq!(
+            counting_refresher.prepare_count(),
+            1,
+            "extension-owned provider refresh prepare is owned by the lifecycle-aware setup wrapper"
+        );
+        assert_eq!(
+            counting_refresher.publish_count(),
+            1,
+            "extension-owned provider refresh publish is owned by the lifecycle-aware setup wrapper"
+        );
+        let stored = shared
+            .get_account(
+                CredentialAccountLookupRequest::new(scope.clone(), account.id)
+                    .for_extension(matrix_product_adapter_extension_id()),
+            )
+            .await
+            .expect("lookup refreshed account")
+            .expect("refreshed account");
+        assert_eq!(
+            stored.access_secret.as_ref().map(SecretHandle::as_str),
+            Some("matrix-source-rotated-token")
+        );
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect("refreshed Matrix snapshot")
+                .credential_handle,
+            EgressCredentialHandle::new("matrix-source-rotated-token").expect("new handle")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_product_auth_refresh_provider_invalid_grant_preinvalidates_and_fails_closed() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, _provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store.clone(), backend).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+
+        let shared = Arc::new(InMemoryAuthProductServices::new());
+        let mut account = new_lifecycle_account(
+            scope.clone(),
+            "matrix-oauth",
+            CredentialAccountStatus::Expired,
+            Some(matrix_product_adapter_extension_id()),
+            Some("matrix-source-access-token"),
+        );
+        account.refresh_secret =
+            Some(SecretHandle::new("matrix-source-refresh-token").expect("refresh handle"));
+        let account = shared
+            .create_account(account)
+            .await
+            .expect("create extension-owned Matrix credential");
+        let setup = Arc::new(MatrixRefreshCredentialSetupService::new(
+            shared.clone(),
+            store,
+            source.clone(),
+            adapter_id.clone(),
+            installation_id.clone(),
+        ));
+        let provider_client: Arc<dyn AuthProviderClient> =
+            Arc::new(FakeRefreshProviderClient::invalid_grant());
+        let product_auth =
+            product_auth_refresh_facade(shared.clone(), setup.clone(), provider_client);
+        let counting_refresher = Arc::new(CountingLifecyclePolicyProjectionCacheRefresher::new(
+            refresher,
+        ));
+        product_auth.set_policy_projection_cache_refresher(counting_refresher.clone());
+
+        let report = product_auth
+            .refresh_credential_account(
+                CredentialRefreshRequest::new(
+                    scope.clone(),
+                    AuthProviderId::new("matrix-oauth").expect("provider"),
+                    account.id,
+                )
+                .for_extension(matrix_product_adapter_extension_id()),
+            )
+            .await
+            .expect("invalid_grant terminalizes through product-auth facade");
+
+        assert!(!report.refreshed);
+        assert_eq!(report.account.status, CredentialAccountStatus::Revoked);
+        assert!(
+            setup.saw_preinvalidated_projection(),
+            "Matrix projection must be pre-invalidated before invalid_grant revokes the credential"
+        );
+        assert_eq!(
+            counting_refresher.invalidate_count(),
+            1,
+            "invalid_grant revocation invalidation is owned by the lifecycle-aware setup wrapper"
+        );
+        assert_eq!(
+            counting_refresher.prepare_count(),
+            0,
+            "revoked invalid_grant refresh must not publish a configured lifecycle projection"
+        );
+        assert_eq!(
+            counting_refresher.publish_count(),
+            0,
+            "revoked invalid_grant refresh must remain failed closed"
+        );
+        let stored = shared
+            .get_account(
+                CredentialAccountLookupRequest::new(scope, account.id)
+                    .for_extension(matrix_product_adapter_extension_id()),
+            )
+            .await
+            .expect("lookup revoked account")
+            .expect("revoked account");
+        assert_eq!(stored.status, CredentialAccountStatus::Revoked);
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("invalid_grant must leave Matrix policy snapshot failed closed"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_product_auth_cleanup_preinvalidates_and_leaves_policy_snapshot_failed_closed() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, _provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store, backend).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+
+        let shared = Arc::new(InMemoryAuthProductServices::new());
+        let account = shared
+            .create_account(new_lifecycle_account(
+                scope.clone(),
+                "matrix-oauth",
+                CredentialAccountStatus::Configured,
+                Some(matrix_product_adapter_extension_id()),
+                Some("matrix-source-access-token"),
+            ))
+            .await
+            .expect("create Matrix lifecycle-owned credential");
+        let product_auth = crate::RebornProductAuthServices::from_shared(
+            shared.clone(),
+            Arc::new(NoopMatrixAuthContinuationDispatcher),
+        );
+        product_auth.set_policy_projection_cache_refresher(refresher);
+
+        let report = product_auth
+            .cleanup_credentials_for_lifecycle(SecretCleanupRequest {
+                scope: scope.clone(),
+                extension_id: matrix_product_adapter_extension_id(),
+                provider: None,
+                action: SecretCleanupAction::Uninstall,
+            })
+            .await
+            .expect("Matrix credential cleanup through product-auth facade");
+
+        assert_eq!(report.revoked_accounts, vec![account.id]);
+        let cleaned = shared
+            .get_account(
+                CredentialAccountLookupRequest::new(scope, account.id)
+                    .for_extension(matrix_product_adapter_extension_id()),
+            )
+            .await
+            .expect("load cleaned account")
+            .expect("cleaned account remains as revoked metadata");
+        assert_eq!(cleaned.status, CredentialAccountStatus::Revoked);
+        assert!(cleaned.access_secret.is_none());
+        assert!(cleaned.refresh_secret.is_none());
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("cleanup must leave Matrix policy snapshot failed closed"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn non_matrix_product_auth_setup_mutation_leaves_matrix_projection_body_and_marker_unchanged()
+     {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store, backend.clone()).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        let policy_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope.resource, &provider);
+        let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+        let marker_path = matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path)
+            .expect("marker path");
+        let scoped = crate::wrap_scoped(backend);
+        let initial_body = scoped
+            .get(&policy_scope, &cache_path)
+            .await
+            .expect("initial body lookup")
+            .expect("initial body")
+            .entry
+            .body;
+        let initial_marker = scoped
+            .get(&policy_scope, &marker_path)
+            .await
+            .expect("initial marker lookup")
+            .expect("initial marker")
+            .entry
+            .body;
+
+        let product_auth = product_auth_with_ports(
+            Arc::new(PassthroughCredentialSetupService),
+            Arc::new(InMemoryAuthProductServices::new()),
+        );
+        product_auth.set_policy_projection_cache_refresher(refresher);
+        product_auth
+            .credential_setup_service()
+            .create_or_update_account(CredentialAccountMutation::Update(
+                ironclaw_auth::CredentialAccountUpdate {
+                    account_id: CredentialAccountId::new(),
+                    account: new_lifecycle_account(
+                        scope.clone(),
+                        "github",
+                        CredentialAccountStatus::Configured,
+                        Some(ExtensionId::new("github").expect("extension")),
+                        Some("github-rotated-token"),
+                    ),
+                },
+            ))
+            .await
+            .expect("non-Matrix credential mutation");
+
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &cache_path)
+                .await
+                .expect("body lookup")
+                .expect("body")
+                .entry
+                .body,
+            initial_body
+        );
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &marker_path)
+                .await
+                .expect("marker lookup")
+                .expect("marker")
+                .entry
+                .body,
+            initial_marker
+        );
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect("Matrix projection remains authoritative")
+                .credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("matrix handle")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_matrix_product_auth_cleanup_leaves_matrix_projection_body_and_marker_unchanged() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let (scope, provider, source, refresher, adapter_id, installation_id) =
+            matrix_product_auth_lifecycle_fixture(root, store, backend.clone()).await;
+        refresher
+            .refresh_after_lifecycle_activation(
+                &scope.resource,
+                &matrix_product_adapter_extension_id(),
+            )
+            .await
+            .expect("initial Matrix projection");
+        let policy_scope =
+            matrix_policy_projection_resource_scope_for_provider(&scope.resource, &provider);
+        let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+        let marker_path = matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path)
+            .expect("marker path");
+        let scoped = crate::wrap_scoped(backend);
+        let initial_body = scoped
+            .get(&policy_scope, &cache_path)
+            .await
+            .expect("initial body lookup")
+            .expect("initial body")
+            .entry
+            .body;
+        let initial_marker = scoped
+            .get(&policy_scope, &marker_path)
+            .await
+            .expect("initial marker lookup")
+            .expect("initial marker")
+            .entry
+            .body;
+
+        let shared = Arc::new(InMemoryAuthProductServices::new());
+        let github_extension = ExtensionId::new("github").expect("extension");
+        let account = shared
+            .create_account(new_lifecycle_account(
+                scope.clone(),
+                "github",
+                CredentialAccountStatus::Configured,
+                Some(github_extension.clone()),
+                Some("github-access-token"),
+            ))
+            .await
+            .expect("create non-Matrix lifecycle-owned credential");
+        let product_auth = crate::RebornProductAuthServices::from_shared(
+            shared.clone(),
+            Arc::new(NoopMatrixAuthContinuationDispatcher),
+        );
+        product_auth.set_policy_projection_cache_refresher(refresher);
+
+        let report = product_auth
+            .cleanup_credentials_for_lifecycle(SecretCleanupRequest {
+                scope: scope.clone(),
+                extension_id: github_extension,
+                provider: None,
+                action: SecretCleanupAction::Uninstall,
+            })
+            .await
+            .expect("non-Matrix credential cleanup through product-auth facade");
+
+        assert_eq!(report.revoked_accounts, vec![account.id]);
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &cache_path)
+                .await
+                .expect("body lookup")
+                .expect("body")
+                .entry
+                .body,
+            initial_body
+        );
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &marker_path)
+                .await
+                .expect("marker lookup")
+                .expect("marker")
+                .entry
+                .body,
+            initial_marker
+        );
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect("Matrix projection remains authoritative")
+                .credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("matrix handle")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_credential_handle_rebind_invalidates_provider_projection_before_refresh() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!credential-rebind:example.org".to_string(),
+                subject_user_id: UserId::new("user:credential-rebind").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@credential-rebind:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            Arc::clone(&root),
+            store.clone(),
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+
+        refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect("initial projection");
+        let initial_snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+        assert_eq!(
+            initial_snapshot.credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("old handle")
+        );
+
+        refresher
+            .invalidate_before_credential_lifecycle_mutation(&scope, &extension_id)
+            .await
+            .expect("pre-invalidate before source-owner credential handle rebind");
+        store
+            .upsert_manifest(matrix_runtime_manifest_record_with_credential(
+                "matrix-source-rotated-token",
+            ))
+            .await
+            .expect("source-owner credential handle rebind");
+
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("credential rebind must pre-invalidate the stale committed projection"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+
+        refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect("refresh after credential handle rebind");
+        let rebound_snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("refreshed rebound snapshot");
+        assert_eq!(
+            rebound_snapshot.credential_handle,
+            EgressCredentialHandle::new("matrix-source-rotated-token").expect("new handle")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_credential_revocation_invalidates_provider_projection_and_retry_fails_closed() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!credential-revocation:example.org".to_string(),
+                subject_user_id: UserId::new("user:credential-revocation").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@credential-revocation:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store.clone(),
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("refresher config");
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+
+        refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect("initial projection");
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+
+        refresher
+            .invalidate_before_credential_lifecycle_mutation(&scope, &extension_id)
+            .await
+            .expect("pre-invalidate before source-owner credential revocation");
+        store
+            .set_activation_state(
+                &ExtensionInstallationId::new("matrix-source-backed-install")
+                    .expect("installation id"),
+                ExtensionActivationState::Disabled,
+            )
+            .await
+            .expect("source-owner credential revocation disables installation");
+
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err(
+                    "source-owner revocation must invalidate the projection before retry delivery",
+                ),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_credential_refresh_body_write_failure_removes_stale_credential_body() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!credential-refresh-failure:example.org".to_string(),
+                subject_user_id: UserId::new("user:credential-refresh-failure").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@credential-refresh-failure:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let initial_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store.clone(),
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("initial refresher config");
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let policy_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+        let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend.clone()),
+            policy_scope.clone(),
+            cache_path.clone(),
+        );
+
+        initial_refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect("initial projection");
+        let initial_snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("initial snapshot");
+        assert_eq!(
+            initial_snapshot.credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("old handle")
+        );
+
+        initial_refresher
+            .invalidate_before_credential_lifecycle_mutation(&scope, &extension_id)
+            .await
+            .expect("pre-invalidate before source-owner credential handle rebind");
+        store
+            .upsert_manifest(matrix_runtime_manifest_record_with_credential(
+                "matrix-source-rotated-token",
+            ))
+            .await
+            .expect("source-owner credential handle rebind");
+
+        let failing_backend = Arc::new(FailOnNthPutFilesystem::new(backend.clone(), [2]));
+        let failing_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            failing_backend,
+            store,
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("failing refresher config");
+        failing_refresher
+            .refresh_after_lifecycle_activation(&scope, &extension_id)
+            .await
+            .expect_err("credential refresh body write fails");
+
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+                .await
+                .expect_err("failed credential refresh must fail closed"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+
+        let scoped = crate::wrap_scoped(backend);
+        let body = scoped
+            .get(&policy_scope, &cache_path)
+            .await
+            .expect("cache body lookup")
+            .expect("cache body entry")
+            .entry
+            .body;
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            !body_text.contains("matrix-source-access-token"),
+            "failed credential refresh must not leave the stale credential cache body"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_matrix_credential_installation_mutation_does_not_touch_matrix_projection_cache() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!non-matrix-mutation:example.org".to_string(),
+                subject_user_id: UserId::new("user:non-matrix-mutation").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@non-matrix-mutation:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let initial_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            root,
+            store.clone(),
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("initial refresher config");
+        let scope = matrix_source_backed_scope();
+        let matrix_extension_id =
+            ExtensionId::new("matrix-product-adapter").expect("matrix extension id");
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let policy_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+        let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+        let marker_path = matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path)
+            .expect("marker");
+
+        initial_refresher
+            .refresh_after_lifecycle_activation(&scope, &matrix_extension_id)
+            .await
+            .expect("initial projection");
+        let scoped = crate::wrap_scoped(backend.clone());
+        let initial_body = scoped
+            .get(&policy_scope, &cache_path)
+            .await
+            .expect("initial body lookup")
+            .expect("initial body")
+            .entry
+            .body;
+        let initial_marker = scoped
+            .get(&policy_scope, &marker_path)
+            .await
+            .expect("initial marker lookup")
+            .expect("initial marker")
+            .entry
+            .body;
+
+        let non_matrix_extension_id = ExtensionId::new("github").expect("non-matrix extension id");
+        store
+            .upsert_manifest(non_matrix_runtime_manifest_record_with_credential(
+                "github-access-token",
+            ))
+            .await
+            .expect("upsert unrelated credential manifest");
+        store
+            .upsert_installation(
+                ExtensionInstallation::new(
+                    ExtensionInstallationId::new("github-source-backed-install")
+                        .expect("non-matrix installation id"),
+                    non_matrix_extension_id.clone(),
+                    ExtensionActivationState::Enabled,
+                    ExtensionManifestRef::new(
+                        non_matrix_extension_id.clone(),
+                        Some(ManifestHash::new("sha256:non-matrix-source-backed").expect("hash")),
+                    ),
+                    Vec::new(),
+                    chrono::Utc::now(),
+                    InstallationOwner::Tenant,
+                )
+                .expect("non-matrix installation"),
+            )
+            .await
+            .expect("upsert unrelated installation");
+        store
+            .upsert_manifest(non_matrix_runtime_manifest_record_with_credential(
+                "github-rotated-token",
+            ))
+            .await
+            .expect("rotate unrelated credential manifest");
+
+        let fail_on_write_backend = Arc::new(FailOnNthPutFilesystem::new(backend.clone(), [1]));
+        let unrelated_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            fail_on_write_backend,
+            store,
+            vec![provider.clone()],
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("unrelated refresher config");
+        unrelated_refresher
+            .refresh_after_lifecycle_activation(&scope, &non_matrix_extension_id)
+            .await
+            .expect("unrelated lifecycle refresh must not write Matrix projection cache");
+
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &cache_path)
+                .await
+                .expect("body lookup after unrelated mutation")
+                .expect("body after unrelated mutation")
+                .entry
+                .body,
+            initial_body
+        );
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &marker_path)
+                .await
+                .expect("marker lookup after unrelated mutation")
+                .expect("marker after unrelated mutation")
+                .entry
+                .body,
+            initial_marker
+        );
+
+        let source = FilesystemMatrixPolicySnapshotSource::new(scoped, policy_scope, cache_path);
+        let snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("Matrix projection remains readable after unrelated mutation");
+        assert_eq!(
+            snapshot.credential_handle,
+            EgressCredentialHandle::new("matrix-source-access-token").expect("matrix handle")
+        );
+    }
+
+    #[tokio::test]
     async fn matrix_lifecycle_refresher_ignores_unrelated_extension_lifecycle() {
         let store = Arc::new(InMemoryExtensionInstallationStore::default());
         seed_enabled_matrix_runtime_entry(store.as_ref()).await;
@@ -3369,7 +4421,628 @@ mod tests {
             .expect("upsert installation");
     }
 
+    type MatrixLifecycleFixture = (
+        AuthProductScope,
+        MatrixOutboundTargetProviderConfig,
+        Arc<FilesystemMatrixPolicySnapshotSource<InMemoryBackend>>,
+        Arc<MatrixLifecyclePolicyProjectionCacheRefresher>,
+        ProductAdapterId,
+        AdapterInstallationId,
+    );
+
+    async fn matrix_product_auth_lifecycle_fixture(
+        root: Arc<dyn RootFilesystem>,
+        store: Arc<InMemoryExtensionInstallationStore>,
+        backend: Arc<InMemoryBackend>,
+    ) -> MatrixLifecycleFixture {
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!product-auth-lifecycle:example.org".to_string(),
+                subject_user_id: UserId::new("user:product-auth-lifecycle").expect("actor"),
+                matrix_sender_user_id: MatrixUserId::new("@product-auth-lifecycle:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let scope = AuthProductScope::new(matrix_source_backed_scope(), AuthSurface::Api);
+        let source = Arc::new(FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope.resource, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        ));
+        let refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::new(
+                root,
+                store,
+                vec![provider.clone()],
+                matrix_source_backed_artifact_evidence(),
+                "matrix-source-backed-policy-owner".to_string(),
+            )
+            .expect("refresher config"),
+        );
+        (
+            scope,
+            provider,
+            source,
+            refresher,
+            ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+            installation_id,
+        )
+    }
+
+    fn product_auth_with_ports(
+        setup: Arc<dyn CredentialSetupService>,
+        accounts: Arc<dyn CredentialAccountService>,
+    ) -> crate::RebornProductAuthServices {
+        let shared = Arc::new(InMemoryAuthProductServices::new());
+        crate::RebornProductAuthServices::new(
+            shared.clone(),
+            shared.clone(),
+            setup,
+            accounts,
+            shared.clone(),
+            shared,
+            Arc::new(NoopMatrixAuthContinuationDispatcher),
+        )
+    }
+
+    fn product_auth_refresh_facade(
+        shared: Arc<InMemoryAuthProductServices>,
+        setup: Arc<dyn CredentialSetupService>,
+        provider_client: Arc<dyn AuthProviderClient>,
+    ) -> crate::RebornProductAuthServices {
+        let flow_manager: Arc<dyn AuthFlowManager> = shared.clone();
+        let interaction_service: Arc<dyn AuthInteractionService> = shared.clone();
+        let credential_account_service: Arc<dyn CredentialAccountService> = shared.clone();
+        let cleanup_service: Arc<dyn SecretCleanupService> = shared;
+        crate::RebornProductAuthServicePorts::new(
+            flow_manager,
+            interaction_service,
+            setup,
+            credential_account_service,
+            provider_client.clone(),
+            cleanup_service,
+        )
+        .into_services(
+            Arc::new(NoopMatrixAuthContinuationDispatcher),
+            Arc::new(InMemorySecretStore::new()),
+        )
+        .with_provider_client(provider_client)
+    }
+
+    struct CountingLifecyclePolicyProjectionCacheRefresher {
+        inner: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
+        invalidates: AtomicUsize,
+        prepares: AtomicUsize,
+        publishes: AtomicUsize,
+        removals: AtomicUsize,
+    }
+
+    impl CountingLifecyclePolicyProjectionCacheRefresher {
+        fn new(inner: Arc<dyn LifecyclePolicyProjectionCacheRefresher>) -> Self {
+            Self {
+                inner,
+                invalidates: AtomicUsize::new(0),
+                prepares: AtomicUsize::new(0),
+                publishes: AtomicUsize::new(0),
+                removals: AtomicUsize::new(0),
+            }
+        }
+
+        fn invalidate_count(&self) -> usize {
+            self.invalidates.load(Ordering::SeqCst)
+        }
+
+        fn prepare_count(&self) -> usize {
+            self.prepares.load(Ordering::SeqCst)
+        }
+
+        fn publish_count(&self) -> usize {
+            self.publishes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LifecyclePolicyProjectionCacheRefresher for CountingLifecyclePolicyProjectionCacheRefresher {
+        async fn invalidate_before_credential_lifecycle_mutation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+            self.invalidates.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+                .await
+        }
+
+        async fn prepare_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+            self.prepares.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .prepare_lifecycle_activation_refresh(scope, extension_id)
+                .await
+        }
+
+        async fn publish_prepared_lifecycle_activation_refresh(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .publish_prepared_lifecycle_activation_refresh(scope, extension_id)
+                .await
+        }
+
+        async fn refresh_after_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ironclaw_product_workflow::ProductWorkflowError> {
+            self.removals.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .refresh_after_lifecycle_removal(scope, extension_id)
+                .await
+        }
+    }
+
+    struct NoopMatrixAuthContinuationDispatcher;
+
+    #[async_trait]
+    impl crate::RebornAuthContinuationDispatcher for NoopMatrixAuthContinuationDispatcher {
+        async fn dispatch_auth_continuation(
+            &self,
+            _event: ironclaw_auth::AuthContinuationEvent,
+        ) -> Result<(), AuthProductError> {
+            Ok(())
+        }
+
+        async fn dispatch_canceled_auth_continuation(
+            &self,
+            _event: ironclaw_auth::AuthContinuationEvent,
+        ) -> Result<(), AuthProductError> {
+            Ok(())
+        }
+    }
+
+    fn matrix_product_adapter_extension_id() -> ExtensionId {
+        ExtensionId::new("matrix-product-adapter").expect("matrix extension")
+    }
+
+    fn new_lifecycle_account(
+        scope: AuthProductScope,
+        provider: &str,
+        status: CredentialAccountStatus,
+        owner_extension: Option<ExtensionId>,
+        access_secret: Option<&str>,
+    ) -> NewCredentialAccount {
+        NewCredentialAccount {
+            scope,
+            provider: AuthProviderId::new(provider).expect("provider"),
+            label: CredentialAccountLabel::new(format!("{provider} account")).expect("label"),
+            status,
+            ownership: if owner_extension.is_some() {
+                CredentialOwnership::ExtensionOwned
+            } else {
+                CredentialOwnership::UserReusable
+            },
+            owner_extension,
+            granted_extensions: Vec::new(),
+            access_secret: access_secret
+                .map(|handle| SecretHandle::new(handle).expect("secret handle")),
+            refresh_secret: None,
+            scopes: Vec::new(),
+        }
+    }
+
+    fn credential_account_from_new(
+        id: CredentialAccountId,
+        account: NewCredentialAccount,
+    ) -> CredentialAccount {
+        let now = Utc::now();
+        CredentialAccount {
+            id,
+            scope: account.scope,
+            provider: account.provider,
+            label: account.label,
+            status: account.status,
+            ownership: account.ownership,
+            owner_extension: account.owner_extension,
+            granted_extensions: account.granted_extensions,
+            access_secret: account.access_secret,
+            refresh_secret: account.refresh_secret,
+            scopes: account.scopes,
+            provider_identity: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    struct RebindingCredentialSetupService {
+        store: Arc<InMemoryExtensionInstallationStore>,
+        source: Arc<dyn MatrixPolicySnapshotSource>,
+        adapter_id: ProductAdapterId,
+        installation_id: AdapterInstallationId,
+        new_handle: String,
+        saw_preinvalidated_projection: AtomicBool,
+    }
+
+    impl RebindingCredentialSetupService {
+        fn new(
+            store: Arc<InMemoryExtensionInstallationStore>,
+            source: Arc<dyn MatrixPolicySnapshotSource>,
+            adapter_id: ProductAdapterId,
+            installation_id: AdapterInstallationId,
+            new_handle: &str,
+        ) -> Self {
+            Self {
+                store,
+                source,
+                adapter_id,
+                installation_id,
+                new_handle: new_handle.to_string(),
+                saw_preinvalidated_projection: AtomicBool::new(false),
+            }
+        }
+
+        fn saw_preinvalidated_projection(&self) -> bool {
+            self.saw_preinvalidated_projection.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl CredentialSetupService for RebindingCredentialSetupService {
+        async fn create_or_update_account(
+            &self,
+            request: CredentialAccountMutation,
+        ) -> Result<CredentialAccount, AuthProductError> {
+            if self
+                .source
+                .resolve_matrix_policy_snapshot(&self.adapter_id, &self.installation_id)
+                .await
+                .is_err()
+            {
+                self.saw_preinvalidated_projection
+                    .store(true, Ordering::SeqCst);
+            }
+            self.store
+                .upsert_manifest(matrix_runtime_manifest_record_with_credential(
+                    &self.new_handle,
+                ))
+                .await
+                .map_err(|_| AuthProductError::BackendUnavailable)?;
+            let (account_id, account) = match request {
+                CredentialAccountMutation::Create(account) => (CredentialAccountId::new(), account),
+                CredentialAccountMutation::Update(update) => (update.account_id, update.account),
+            };
+            Ok(credential_account_from_new(account_id, account))
+        }
+    }
+
+    struct MatrixRefreshCredentialSetupService {
+        inner: Arc<InMemoryAuthProductServices>,
+        store: Arc<InMemoryExtensionInstallationStore>,
+        source: Arc<dyn MatrixPolicySnapshotSource>,
+        adapter_id: ProductAdapterId,
+        installation_id: AdapterInstallationId,
+        saw_preinvalidated_projection: AtomicBool,
+    }
+
+    impl MatrixRefreshCredentialSetupService {
+        fn new(
+            inner: Arc<InMemoryAuthProductServices>,
+            store: Arc<InMemoryExtensionInstallationStore>,
+            source: Arc<dyn MatrixPolicySnapshotSource>,
+            adapter_id: ProductAdapterId,
+            installation_id: AdapterInstallationId,
+        ) -> Self {
+            Self {
+                inner,
+                store,
+                source,
+                adapter_id,
+                installation_id,
+                saw_preinvalidated_projection: AtomicBool::new(false),
+            }
+        }
+
+        fn saw_preinvalidated_projection(&self) -> bool {
+            self.saw_preinvalidated_projection.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl CredentialSetupService for MatrixRefreshCredentialSetupService {
+        async fn create_or_update_account(
+            &self,
+            request: CredentialAccountMutation,
+        ) -> Result<CredentialAccount, AuthProductError> {
+            if self
+                .source
+                .resolve_matrix_policy_snapshot(&self.adapter_id, &self.installation_id)
+                .await
+                .is_err()
+            {
+                self.saw_preinvalidated_projection
+                    .store(true, Ordering::SeqCst);
+            }
+            let account = match &request {
+                CredentialAccountMutation::Create(account) => account,
+                CredentialAccountMutation::Update(update) => &update.account,
+            };
+            if account.status == CredentialAccountStatus::Configured
+                && account
+                    .owner_extension
+                    .as_ref()
+                    .is_some_and(|extension_id| {
+                        extension_id == &matrix_product_adapter_extension_id()
+                    })
+                && let Some(access_secret) = account.access_secret.as_ref()
+            {
+                self.store
+                    .upsert_manifest(matrix_runtime_manifest_record_with_credential(
+                        access_secret.as_str(),
+                    ))
+                    .await
+                    .map_err(|_| AuthProductError::BackendUnavailable)?;
+            }
+            self.inner.create_or_update_account(request).await
+        }
+    }
+
+    enum FakeRefreshProviderResult {
+        Success {
+            provider: AuthProviderId,
+            access_secret: SecretHandle,
+            refresh_secret: Option<SecretHandle>,
+        },
+        InvalidGrant,
+    }
+
+    struct FakeRefreshProviderClient {
+        result: FakeRefreshProviderResult,
+    }
+
+    impl FakeRefreshProviderClient {
+        fn success(provider: &str, access_secret: &str, refresh_secret: Option<&str>) -> Self {
+            Self {
+                result: FakeRefreshProviderResult::Success {
+                    provider: AuthProviderId::new(provider).expect("provider"),
+                    access_secret: SecretHandle::new(access_secret).expect("access handle"),
+                    refresh_secret: refresh_secret
+                        .map(|handle| SecretHandle::new(handle).expect("refresh handle")),
+                },
+            }
+        }
+
+        fn invalid_grant() -> Self {
+            Self {
+                result: FakeRefreshProviderResult::InvalidGrant,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AuthProviderClient for FakeRefreshProviderClient {
+        async fn exchange_callback(
+            &self,
+            _context: OAuthProviderExchangeContext,
+            _request: OAuthProviderCallbackRequest,
+        ) -> Result<OAuthProviderExchange, AuthProductError> {
+            Err(AuthProductError::BackendUnavailable)
+        }
+
+        async fn refresh_token(
+            &self,
+            request: OAuthProviderRefreshRequest,
+        ) -> Result<OAuthProviderRefresh, AuthProductError> {
+            match &self.result {
+                FakeRefreshProviderResult::Success {
+                    provider,
+                    access_secret,
+                    refresh_secret,
+                } => Ok(OAuthProviderRefresh {
+                    provider: provider.clone(),
+                    access_secret: access_secret.clone(),
+                    refresh_secret: refresh_secret.clone(),
+                    scopes: request.scopes,
+                }),
+                FakeRefreshProviderResult::InvalidGrant => Err(AuthProductError::InvalidGrant),
+            }
+        }
+    }
+
+    struct PassthroughCredentialSetupService;
+
+    #[async_trait]
+    impl CredentialSetupService for PassthroughCredentialSetupService {
+        async fn create_or_update_account(
+            &self,
+            request: CredentialAccountMutation,
+        ) -> Result<CredentialAccount, AuthProductError> {
+            let (account_id, account) = match request {
+                CredentialAccountMutation::Create(account) => (CredentialAccountId::new(), account),
+                CredentialAccountMutation::Update(update) => (update.account_id, update.account),
+            };
+            Ok(credential_account_from_new(account_id, account))
+        }
+    }
+
+    struct RevokingCredentialAccountService {
+        account: StdMutex<CredentialAccount>,
+        source: Arc<dyn MatrixPolicySnapshotSource>,
+        adapter_id: ProductAdapterId,
+        installation_id: AdapterInstallationId,
+        saw_preinvalidated_projection: AtomicBool,
+    }
+
+    impl RevokingCredentialAccountService {
+        fn new(
+            account: CredentialAccount,
+            source: Arc<dyn MatrixPolicySnapshotSource>,
+            adapter_id: ProductAdapterId,
+            installation_id: AdapterInstallationId,
+        ) -> Self {
+            Self {
+                account: StdMutex::new(account),
+                source,
+                adapter_id,
+                installation_id,
+                saw_preinvalidated_projection: AtomicBool::new(false),
+            }
+        }
+
+        fn saw_preinvalidated_projection(&self) -> bool {
+            self.saw_preinvalidated_projection.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl CredentialAccountService for RevokingCredentialAccountService {
+        async fn create_account(
+            &self,
+            request: NewCredentialAccount,
+        ) -> Result<CredentialAccount, AuthProductError> {
+            Ok(credential_account_from_new(
+                CredentialAccountId::new(),
+                request,
+            ))
+        }
+
+        async fn get_account(
+            &self,
+            _request: CredentialAccountLookupRequest,
+        ) -> Result<Option<CredentialAccount>, AuthProductError> {
+            Ok(Some(
+                self.account
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ))
+        }
+
+        async fn list_accounts(
+            &self,
+            _request: CredentialAccountListRequest,
+        ) -> Result<CredentialAccountListPage, AuthProductError> {
+            Ok(CredentialAccountListPage {
+                accounts: vec![
+                    self.account
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .projection(),
+                ],
+                next_cursor: None,
+            })
+        }
+
+        async fn update_status(
+            &self,
+            _scope: &AuthProductScope,
+            _account_id: CredentialAccountId,
+            status: CredentialAccountStatus,
+        ) -> Result<CredentialAccount, AuthProductError> {
+            if self
+                .source
+                .resolve_matrix_policy_snapshot(&self.adapter_id, &self.installation_id)
+                .await
+                .is_err()
+            {
+                self.saw_preinvalidated_projection
+                    .store(true, Ordering::SeqCst);
+            }
+            let mut account = self
+                .account
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            account.status = status;
+            account.updated_at = Utc::now();
+            Ok(account.clone())
+        }
+
+        async fn select_unique_configured_account(
+            &self,
+            _request: CredentialAccountSelectionRequest,
+        ) -> Result<CredentialAccountProjection, AuthProductError> {
+            Ok(self
+                .account
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .projection())
+        }
+
+        async fn project_credential_recovery(
+            &self,
+            _request: CredentialRecoveryRequest,
+        ) -> Result<CredentialRecoveryProjection, AuthProductError> {
+            Err(AuthProductError::BackendUnavailable)
+        }
+
+        async fn select_configured_account(
+            &self,
+            _request: CredentialAccountChoiceRequest,
+        ) -> Result<CredentialAccountProjection, AuthProductError> {
+            Ok(self
+                .account
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .projection())
+        }
+
+        async fn refresh_account(
+            &self,
+            _request: CredentialRefreshRequest,
+        ) -> Result<CredentialRefreshReport, AuthProductError> {
+            Err(AuthProductError::BackendUnavailable)
+        }
+    }
+
     fn matrix_runtime_manifest_record() -> ExtensionManifestRecord {
+        matrix_runtime_manifest_record_with_credential("matrix-source-access-token")
+    }
+
+    fn matrix_runtime_manifest_record_with_credential(
+        credential_handle: &str,
+    ) -> ExtensionManifestRecord {
+        product_adapter_manifest_record_with_credential(
+            "matrix-product-adapter",
+            "Matrix",
+            "Matrix source-backed projection fixture",
+            "matrix.source.example.org",
+            "sha256:matrix-source-backed",
+            credential_handle,
+        )
+    }
+
+    fn non_matrix_runtime_manifest_record_with_credential(
+        credential_handle: &str,
+    ) -> ExtensionManifestRecord {
+        product_adapter_manifest_record_with_credential(
+            "github",
+            "GitHub",
+            "Non-Matrix source-backed projection fixture",
+            "github.source.example.org",
+            "sha256:non-matrix-source-backed",
+            credential_handle,
+        )
+    }
+
+    fn product_adapter_manifest_record_with_credential(
+        extension_id: &str,
+        name: &str,
+        description: &str,
+        egress_host: &str,
+        manifest_hash: &str,
+        credential_handle: &str,
+    ) -> ExtensionManifestRecord {
         let host_ports =
             ironclaw_host_runtime::default_host_port_catalog().expect("default host port catalog");
         let contracts =
@@ -3379,10 +5052,10 @@ mod tests {
             format!(
                 r#"
 schema_version = "{schema}"
-id = "matrix-product-adapter"
-name = "Matrix"
+id = "{extension_id}"
+name = "{name}"
 version = "0.1.0"
-description = "Matrix source-backed projection fixture"
+description = "{description}"
 trust = "first_party_requested"
 
 [runtime]
@@ -3404,18 +5077,23 @@ header_name = "x-matrix-webhook-secret"
 flags = ["inbound_messages", "external_final_reply_push"]
 
 [[product_adapter.inbound.required_credentials]]
-handle = "matrix-source-access-token"
+handle = "{credential_handle}"
 
 [[product_adapter.inbound.egress]]
-host = "matrix.source.example.org"
-credential_handle = "matrix-source-access-token"
+host = "{egress_host}"
+credential_handle = "{credential_handle}"
 "#,
-                schema = MANIFEST_SCHEMA_VERSION
+                schema = MANIFEST_SCHEMA_VERSION,
+                extension_id = extension_id,
+                name = name,
+                description = description,
+                egress_host = egress_host,
+                credential_handle = credential_handle,
             )
             .as_str(),
             ManifestSource::HostBundled,
             &host_ports,
-            Some(ManifestHash::new("sha256:matrix-source-backed").expect("hash")),
+            Some(ManifestHash::new(manifest_hash).expect("hash")),
             &contracts,
         )
         .expect("manifest")

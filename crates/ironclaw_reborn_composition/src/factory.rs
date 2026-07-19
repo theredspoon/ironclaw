@@ -1402,14 +1402,13 @@ fn compose_product_auth_services(
         secret_store,
         nearai_mcp_host_managed_scope,
     } = input;
-    let ports = match provider_composition.client {
-        Some(provider_client) => ports.with_provider_client(provider_client),
-        None => ports,
-    };
     let mut services = ports.into_services(
         auth_continuation_dispatcher(turn_coordinator, blocked_auth_snapshot_source, lifecycle),
         secret_store,
     );
+    if let Some(provider_client) = provider_composition.client {
+        services = services.with_provider_client(provider_client);
+    }
     if let Some(sink) = security_audit_sink {
         services = services.with_security_audit_sink(sink);
     }
@@ -1833,11 +1832,11 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
                     .clone()
                     .unwrap_or_else(|| Arc::new(UnavailableAuthProviderClient));
                 // Wrap the credential-account service in
-                // `ProviderBackedCredentialAccountService` (via `with_provider_client`) so the
-                // runtime token-refresh path (`refresh_account`) routes through the OAuth
-                // provider client. `from_shared_with_provider` stores the provider client in a
-                // separate field but does NOT wrap the account service, so without this the
-                // durable `FilesystemAuthProductServices::refresh_account` stub returns
+                // `ProviderBackedCredentialAccountService` after `into_services` installs the
+                // lifecycle-aware setup/account ports. `from_shared_with_provider` stores the
+                // provider client in a separate field but does NOT wrap the account service, so
+                // without the final `with_provider_client` the durable
+                // `FilesystemAuthProductServices::refresh_account` stub returns
                 // `BackendUnavailable` — Google OAuth access tokens are never refreshed and every
                 // capability call reauths once the 1h access token expires. The sibling branch
                 // routes through `compose_product_auth_services`, which applies the same wrap.
@@ -1845,7 +1844,6 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
                     Arc::clone(&durable_services),
                     Arc::clone(&provider_client),
                 )
-                .with_provider_client(Arc::clone(&provider_client))
                 .into_services(
                     auth_continuation_dispatcher(
                         turn_coordinator.clone(),
