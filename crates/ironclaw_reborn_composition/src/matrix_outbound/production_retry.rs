@@ -1,15 +1,20 @@
 use super::*;
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
-use crate::matrix_product_outbound::FilesystemMatrixPolicySnapshotSource;
 use crate::matrix_product_outbound::{
-    DefaultMatrixOutboundPolicyAuthorizer, MatrixOutboundPolicyAuthorizer,
-    MatrixPolicySnapshotSource,
+    DefaultMatrixOutboundPolicyAuthorizer, FilesystemMatrixPolicySnapshotSource,
+    MatrixOutboundPolicyAuthorizer, MatrixPolicySnapshotSource,
 };
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+use crate::matrix_product_outbound::{
+    matrix_policy_projection_cache_path_for_route_scope, matrix_policy_projection_resource_scope,
+};
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 use ironclaw_matrix_adapter::installation_policy::{
     EgressTargetIndex as AdapterEgressTargetIndex, MatrixInstallationPolicyRejection,
     MatrixOutboundPolicyCheck as AdapterMatrixOutboundPolicyCheck,
     MatrixPolicySnapshot as AdapterMatrixPolicySnapshot, PolicyRevision as AdapterPolicyRevision,
 };
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 use ironclaw_product_adapters::{AdapterInstallationId, ProductAdapterId};
 
 // Executes one Matrix retry schedule. Production worker ticks use the
@@ -237,7 +242,6 @@ impl MatrixRetrySendAuthorizer for MatrixSnapshotRetrySendAuthorizer {
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
 pub(crate) struct MatrixFilesystemRetrySendAuthorizer<F: ?Sized> {
     filesystem: Arc<ScopedFilesystem<F>>,
-    cache_path: ScopedPath,
 }
 
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
@@ -245,11 +249,8 @@ impl<F> MatrixFilesystemRetrySendAuthorizer<F>
 where
     F: RootFilesystem + ?Sized,
 {
-    pub(crate) fn new(filesystem: Arc<ScopedFilesystem<F>>, cache_path: ScopedPath) -> Self {
-        Self {
-            filesystem,
-            cache_path,
-        }
+    pub(crate) fn new(filesystem: Arc<ScopedFilesystem<F>>) -> Self {
+        Self { filesystem }
     }
 }
 
@@ -266,15 +267,28 @@ where
     ) -> Result<(), DeliveryError> {
         validate_retry_execution_context(context.route(), context.grant())
             .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        let installation_id =
+            AdapterInstallationId::new(context.route().installation_id.clone())
+                .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        let cache_path = matrix_policy_projection_cache_path_for_route_scope(
+            &context.route().scope().tenant_id,
+            context.route().scope().agent_id.as_ref(),
+            context.route().scope().project_id.as_ref(),
+            &installation_id,
+        )
+        .map_err(|_| DeliveryError::new(DeliveryReasonCode::UnauthorizedTarget))?;
+        let policy_scope =
+            matrix_policy_projection_resource_scope(&context.route().scope().to_resource_scope());
         let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
             Arc::clone(&self.filesystem),
-            context.route().scope().to_resource_scope(),
-            self.cache_path.clone(),
+            policy_scope,
+            cache_path,
         );
         authorize_retry_send_from_policy_snapshot_source(context, command, &snapshot_source).await
     }
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 async fn authorize_retry_send_from_policy_snapshot_source(
     context: &MatrixRetryExecutionContext,
     command: &MatrixOutboundCommand,
@@ -298,6 +312,7 @@ async fn authorize_retry_send_from_policy_snapshot_source(
         })
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 fn retry_matrix_outbound_policy_check(
     context: &MatrixRetryExecutionContext,
     command: &MatrixOutboundCommand,
@@ -343,6 +358,7 @@ fn retry_matrix_outbound_policy_check(
     })
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 fn verify_retry_fingerprint(
     expected_fingerprint: &str,
     current_value: &[u8],
@@ -355,10 +371,12 @@ fn verify_retry_fingerprint(
     }
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 fn matrix_retry_sha256_fingerprint(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
 
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
 fn delivery_reason_for_matrix_policy_rejection(
     rejection: MatrixInstallationPolicyRejection,
 ) -> DeliveryReasonCode {

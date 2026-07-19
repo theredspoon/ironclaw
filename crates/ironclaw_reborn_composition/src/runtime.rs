@@ -43,7 +43,7 @@ use ironclaw_first_party_extension_ports::{
 use ironclaw_host_api::{
     ActionResultSummary, ActionSummary, AgentId, ApprovalRequestId, AuditEnvelope, AuditEventId,
     AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, ExtensionId,
-    InvocationId, Principal, ResourceScope, ScopedPath, TenantId, ThreadId, UserId,
+    InvocationId, Principal, ResourceScope, TenantId, ThreadId, UserId,
 };
 use ironclaw_loop_host::{
     AwaitEdgeSettler, AwaitEdgeWriter, CapabilityAllowSet, CapabilityResolveError,
@@ -128,9 +128,9 @@ use crate::matrix_outbound_targets::{
     register_matrix_outbound_target_provider,
 };
 use crate::matrix_product_outbound::{
-    FilesystemMatrixPolicySnapshotSource, MATRIX_POLICY_PROJECTION_CACHE_PATH,
-    MatrixLifecyclePolicyProjectionCacheRefresher, MatrixProductOutboundDeliveryError,
-    MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
+    FilesystemMatrixPolicySnapshotSource, MatrixLifecyclePolicyProjectionCacheRefresher,
+    MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryInput,
+    MatrixProductOutboundEntrypoint,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
@@ -1921,15 +1921,20 @@ impl RebornRuntime {
             .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
                 reason: "Matrix product outbound requested target is not configured".to_string(),
             })?;
-        let cache_path = ScopedPath::new(MATRIX_POLICY_PROJECTION_CACHE_PATH).map_err(|error| {
-            MatrixProductOutboundDeliveryError::Unavailable {
+        let cache_path =
+            crate::matrix_product_outbound::matrix_policy_projection_cache_path_for_provider_key(
+                &resolved_target.policy_provider_scope_key,
+            )
+            .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
                 reason: format!("Matrix policy projection cache path is invalid: {error}"),
-            }
-        })?;
+            })?;
         let matrix_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
+        let policy_scope = crate::matrix_product_outbound::matrix_policy_projection_resource_scope(
+            &input.delivery.resolution_request.scope.to_resource_scope(),
+        );
         let snapshot_source = FilesystemMatrixPolicySnapshotSource::new(
             Arc::clone(&matrix_filesystem),
-            input.delivery.resolution_request.scope.to_resource_scope(),
+            policy_scope,
             cache_path,
         );
         let snapshot = snapshot_source

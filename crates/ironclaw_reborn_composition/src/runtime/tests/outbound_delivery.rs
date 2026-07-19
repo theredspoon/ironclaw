@@ -10,8 +10,7 @@ use ironclaw_extensions::{
 };
 use ironclaw_filesystem::{CasExpectation, ContentType, Entry};
 use ironclaw_host_api::{
-    AgentId, CapabilityId, ExtensionId, HostPortCatalog, ProjectId, ScopedPath, TenantId, ThreadId,
-    UserId,
+    AgentId, CapabilityId, ExtensionId, HostPortCatalog, ProjectId, TenantId, ThreadId, UserId,
 };
 use ironclaw_loop_host::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
@@ -50,7 +49,8 @@ use crate::matrix_outbound::{
     DeliveryReasonCode, FilesystemMatrixOutboundMetadataStore, FilesystemMatrixPendingIntentStore,
 };
 use crate::matrix_product_outbound::{
-    MATRIX_POLICY_PROJECTION_CACHE_PATH, MatrixProductOutboundDeliveryInput,
+    MatrixProductOutboundDeliveryInput, matrix_policy_projection_cache_path_for_route_scope,
+    matrix_policy_projection_resource_scope,
 };
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
 use crate::outbound::{OutboundDeliveryTargetProvider, OutboundDeliveryTargetRegistrationOutcome};
@@ -352,6 +352,7 @@ async fn local_dev_runtime_registers_private_matrix_outbound_target_provider_at_
                 crate::matrix_outbound::MatrixRoomId::new("!runtime-room:example.org")
                     .expect("valid Matrix room id"),
                 user_id.clone(),
+                MatrixUserId::new("@runtime-target:example.org").expect("matrix sender"),
             )],
         },
     ));
@@ -407,6 +408,7 @@ async fn local_dev_runtime_accepts_multiple_matrix_outbound_installations() {
                 crate::matrix_outbound::MatrixRoomId::new("!runtime-alpha:example.org")
                     .expect("alpha room"),
                 user_id.clone(),
+                MatrixUserId::new("@runtime-alpha:example.org").expect("matrix sender"),
             )],
         }),
         MatrixOutboundTargetMountConfig::new(MatrixOutboundTargetMountConfigInput {
@@ -419,6 +421,7 @@ async fn local_dev_runtime_accepts_multiple_matrix_outbound_installations() {
                 crate::matrix_outbound::MatrixRoomId::new("!runtime-beta:example.org")
                     .expect("beta room"),
                 user_id.clone(),
+                MatrixUserId::new("@runtime-beta:example.org").expect("matrix sender"),
             )],
         }),
     ]);
@@ -480,6 +483,7 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
             room_targets: vec![MatrixOutboundRoomTargetConfig::new(
                 crate::matrix_outbound::MatrixRoomId::new(room_id).expect("room"),
                 user_id.clone(),
+                MatrixUserId::new("@runtime:example.org").expect("matrix sender"),
             )],
         },
     ));
@@ -507,8 +511,14 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
     let policy_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
     policy_filesystem
         .put(
-            &workflow_scope.to_resource_scope(),
-            &ScopedPath::new(MATRIX_POLICY_PROJECTION_CACHE_PATH).expect("policy cache path"),
+            &matrix_policy_projection_resource_scope(&workflow_scope.to_resource_scope()),
+            &matrix_policy_projection_cache_path_for_route_scope(
+                &tenant_id,
+                Some(&agent_id),
+                Some(&project_id),
+                &installation_id,
+            )
+            .expect("policy cache path"),
             Entry::bytes(policy_cache.to_json_bytes().expect("policy cache json"))
                 .with_content_type(ContentType::json()),
             CasExpectation::Any,
@@ -659,6 +669,7 @@ async fn local_dev_runtime_matrix_product_outbound_disabled_extension_fails_befo
             room_targets: vec![MatrixOutboundRoomTargetConfig::new(
                 crate::matrix_outbound::MatrixRoomId::new(room_id).expect("room"),
                 user_id.clone(),
+                MatrixUserId::new("@runtime:example.org").expect("matrix sender"),
             )],
         },
     ));
@@ -685,8 +696,14 @@ async fn local_dev_runtime_matrix_product_outbound_disabled_extension_fails_befo
         .expect("policy projection");
     crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem))
         .put(
-            &workflow_scope.to_resource_scope(),
-            &ScopedPath::new(MATRIX_POLICY_PROJECTION_CACHE_PATH).expect("policy cache path"),
+            &matrix_policy_projection_resource_scope(&workflow_scope.to_resource_scope()),
+            &matrix_policy_projection_cache_path_for_route_scope(
+                &tenant_id,
+                Some(&agent_id),
+                Some(&project_id),
+                &installation_id,
+            )
+            .expect("policy cache path"),
             Entry::bytes(policy_cache.to_json_bytes().expect("policy cache json"))
                 .with_content_type(ContentType::json()),
             CasExpectation::Any,
@@ -776,6 +793,7 @@ async fn local_dev_runtime_rejects_duplicate_matrix_outbound_target_provider_sco
                 crate::matrix_outbound::MatrixRoomId::new("!runtime-duplicate-room:example.org")
                     .expect("valid Matrix room id"),
                 user_id,
+                MatrixUserId::new("@runtime-duplicate:example.org").expect("matrix sender"),
             )],
         });
 

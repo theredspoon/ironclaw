@@ -2752,6 +2752,10 @@ async fn production_runtime_registers_matrix_outbound_target_mount() {
                 crate::matrix_outbound::MatrixRoomId::new("!room:matrix.example")
                     .expect("valid Matrix room id"),
                 user_id.clone(),
+                ironclaw_matrix_adapter::installation_policy::MatrixUserId::new(
+                    "@runtime:example.org",
+                )
+                .expect("matrix sender"),
             )],
         },
     ));
