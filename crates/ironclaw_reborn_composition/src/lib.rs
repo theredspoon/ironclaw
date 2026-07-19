@@ -220,9 +220,10 @@ pub use runtime::{
 pub use runtime_input::{
     CredentialRefreshSettings, DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
     DEFAULT_TURN_RUNNER_POLL_INTERVAL, MatrixOutboundRoomTargetConfig,
-    MatrixOutboundTargetMountConfig, MatrixOutboundTargetMountConfigInput, PollSettings,
-    RebornRuntimeIdentity, RebornRuntimeInput, TriggerFireAccessCheck, TriggerFireAccessChecker,
-    TriggerFireAccessDecision, TriggerFireAccessError, TriggerPollerSettings, TurnRunnerSettings,
+    MatrixOutboundTargetMountConfig, MatrixOutboundTargetMountConfigInput,
+    MatrixPolicyProjectionCacheConfig, PollSettings, RebornRuntimeIdentity, RebornRuntimeInput,
+    TriggerFireAccessCheck, TriggerFireAccessChecker, TriggerFireAccessDecision,
+    TriggerFireAccessError, TriggerPollerSettings, TurnRunnerSettings,
 };
 #[cfg(feature = "root-llm-provider")]
 pub use runtime_input::{RebornProviderFactory, ResolvedRebornLlm};

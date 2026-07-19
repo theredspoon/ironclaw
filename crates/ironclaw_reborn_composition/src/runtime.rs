@@ -60,8 +60,7 @@ use ironclaw_outbound::{CommunicationPreferenceRepository, OutboundPolicyService
 use ironclaw_product_adapters::redaction::RedactedString;
 use ironclaw_product_adapters::{
     AuthRequirement, DeliveryStatus, EgressRequest, EgressResponse, OutboundDeliverySink,
-    ProductAdapterId, ProductRenderOutcome, ProjectionStream, ProtocolHttpEgress,
-    ProtocolHttpEgressError,
+    ProductRenderOutcome, ProjectionStream, ProtocolHttpEgress, ProtocolHttpEgressError,
 };
 use ironclaw_product_workflow::{
     ApprovalBlockedTurnRun, ApprovalInteractionScope, ApprovalInteractionService,
@@ -130,7 +129,7 @@ use crate::matrix_outbound_targets::{
 };
 use crate::matrix_product_outbound::{
     FilesystemMatrixPolicySnapshotSource, MATRIX_POLICY_PROJECTION_CACHE_PATH,
-    MatrixPolicySnapshotSource, MatrixProductOutboundDeliveryError,
+    MatrixLifecyclePolicyProjectionCacheRefresher, MatrixProductOutboundDeliveryError,
     MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -1933,18 +1932,16 @@ impl RebornRuntime {
             input.delivery.resolution_request.scope.to_resource_scope(),
             cache_path,
         );
-        let adapter_id = ProductAdapterId::new("matrix").map_err(|error| {
-            MatrixProductOutboundDeliveryError::Unavailable {
-                reason: format!("Matrix adapter id is invalid: {error}"),
-            }
-        })?;
         let snapshot = snapshot_source
-            .resolve_matrix_policy_snapshot(&adapter_id, &resolved_target.installation_id)
+            .resolve_enabled_matrix_policy_snapshot_for_installation(
+                &resolved_target.installation_id,
+            )
             .await
             .map_err(|rejection| MatrixProductOutboundDeliveryError::Policy {
                 rejection,
                 status_update_error: None,
             })?;
+        let adapter_id = snapshot.adapter_id.clone();
         let adapter = MatrixProductAdapter::new(MatrixProductAdapterConfig {
             adapter_id: adapter_id.clone(),
             installation_id: resolved_target.installation_id.clone(),
@@ -3405,6 +3402,7 @@ pub async fn build_reborn_runtime(
         regex_skill_activation_enabled,
         skill_context_source: configured_skill_context_source,
         matrix_outbound_target_providers,
+        matrix_policy_projection_cache,
         hooks: hooks_config,
         budget_defaults,
         budget_event_observer,
@@ -3516,6 +3514,39 @@ pub async fn build_reborn_runtime(
             .await?;
     }
     enforce_runtime_cutover_gate(profile, &services.readiness)?;
+    if let Some(config) = matrix_policy_projection_cache {
+        let local_runtime =
+            services
+                .local_runtime
+                .as_ref()
+                .ok_or(RebornRuntimeError::InvalidArgument {
+                reason:
+                    "Matrix policy projection cache refresh requires lifecycle runtime substrate"
+                        .to_string(),
+            })?;
+        let extension_management =
+            local_runtime
+                .extension_management
+                .as_ref()
+                .ok_or(RebornRuntimeError::InvalidArgument {
+                reason:
+                    "Matrix policy projection cache refresh requires extension lifecycle management"
+                        .to_string(),
+            })?;
+        let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> =
+            local_runtime.extension_filesystem.clone();
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+            filesystem,
+            extension_management.installation_store(),
+            matrix_outbound_target_providers.clone(),
+            config.artifact_evidence,
+            config.policy_owner_actor,
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("Matrix policy projection cache refresh configuration failed: {error}"),
+        })?;
+        extension_management.set_policy_projection_cache_refresher(Arc::new(refresher));
+    }
 
     // Extract the pre-minted scheduler wake wiring from the production composition path
     // (minted in `build_production_shaped`) so it can be handed to

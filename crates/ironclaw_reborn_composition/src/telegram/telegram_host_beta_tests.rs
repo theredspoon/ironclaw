@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
-use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_host::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
     HostManagedModelResponse,
@@ -79,6 +79,27 @@ fn host_config() -> TelegramHostRuntimeConfig {
         UserId::new(OPERATOR).expect("operator"), // safety: test-only fixture
         Some("https://ironclaw.example".to_string()),
     )
+}
+
+#[test]
+fn telegram_runtime_setup_scope_uses_configured_operator_runtime_identity() {
+    let project_id = ProjectId::new("telegram-host-project").expect("project");
+    let config = TelegramHostRuntimeConfig::new(
+        TenantId::new(TENANT).expect("tenant"),
+        AgentId::new(AGENT).expect("agent"),
+        Some(project_id.clone()),
+        UserId::new(OPERATOR).expect("operator"),
+        Some("https://ironclaw.example".to_string()),
+    );
+
+    let scope = telegram_host_scope_template(&config);
+
+    assert_eq!(scope.tenant_id.as_str(), TENANT);
+    assert_eq!(scope.user_id.as_str(), OPERATOR);
+    assert_eq!(scope.agent_id.as_ref().map(|id| id.as_str()), Some(AGENT));
+    assert_eq!(scope.project_id.as_ref(), Some(&project_id));
+    assert!(scope.thread_id.is_none());
+    assert!(scope.mission_id.is_none());
 }
 
 /// Caller-level guard for the T7 assembly: mounts build against a real

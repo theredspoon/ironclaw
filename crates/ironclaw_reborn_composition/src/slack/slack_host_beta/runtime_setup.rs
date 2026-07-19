@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ironclaw_conversations::RebornFilesystemConversationServices;
-use ironclaw_host_api::{AgentId, ProjectId, TenantId};
+use ironclaw_host_api::{AgentId, ProjectId, ResourceScope, TenantId};
 use ironclaw_outbound::TriggeredRunDeliveryStore;
 use ironclaw_product_adapters::{AdapterInstallationId, EgressCredentialHandle};
 use ironclaw_product_workflow::{
@@ -146,7 +146,10 @@ pub(super) async fn build_runtime_mounts(
     );
     if let Some(extension_management) = &parts.local_runtime.extension_management {
         channel_routes = channel_routes.with_setup_activation(Arc::new(
-            DynamicSlackChannelSetupActivation::new(Arc::clone(extension_management)),
+            DynamicSlackChannelSetupActivation::new(
+                Arc::clone(extension_management),
+                setup_service.runtime_setup_scope(),
+            ),
         ));
     }
 
@@ -229,12 +232,17 @@ pub(super) async fn build_runtime_mounts(
 
 struct DynamicSlackChannelSetupActivation {
     extension_management: Arc<RebornLocalExtensionManagementPort>,
+    setup_scope: ResourceScope,
 }
 
 impl DynamicSlackChannelSetupActivation {
-    fn new(extension_management: Arc<RebornLocalExtensionManagementPort>) -> Self {
+    fn new(
+        extension_management: Arc<RebornLocalExtensionManagementPort>,
+        setup_scope: ResourceScope,
+    ) -> Self {
         Self {
             extension_management,
+            setup_scope,
         }
     }
 }
@@ -248,7 +256,7 @@ impl SlackChannelSetupActivation for DynamicSlackChannelSetupActivation {
             .map_err(slack_setup_activation_error)?;
         // Slack is a tenant-shared channel; host setup activates it as the
         // tenant operator so it operates the shared install (#5459 P1).
-        let caller = self.extension_management.tenant_operator_user_id().clone();
+        let caller = self.setup_scope.user_id.clone();
         let projection = self
             .extension_management
             .project(package_ref.clone(), &caller)
@@ -263,8 +271,19 @@ impl SlackChannelSetupActivation for DynamicSlackChannelSetupActivation {
         // account exists. Companion activation is owned by the post-OAuth
         // activate path (WebUI activateExtension after the connect flow),
         // which routes through activate_with_credential_gate.
+        //
+        // The setup save is a tenant/operator runtime operation, so activation
+        // uses the same tenant, agent, project, and operator identity as the
+        // Slack setup secret scope instead of a local-default fallback. If the
+        // setup operator diverges from the runtime tenant operator, activation
+        // fails through the normal tenant-install authorization check.
         self.extension_management
-            .activate(package_ref, ExtensionActivationMode::Static, &caller)
+            .activate_for_scope(
+                package_ref,
+                ExtensionActivationMode::Static,
+                &self.setup_scope,
+                &caller,
+            )
             .await
             .map_err(slack_setup_activation_error)?;
         Ok(())
@@ -1169,6 +1188,31 @@ mod tests {
                 .expect("scope resolves")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn slack_runtime_setup_scope_uses_configured_operator_runtime_identity() {
+        let project_id = ProjectId::new("project:slack").unwrap();
+        let setup_service = SlackSetupService::new(
+            TenantId::new("tenant:slack").unwrap(),
+            AgentId::new("agent:slack").unwrap(),
+            Some(project_id.clone()),
+            UserId::new("user:operator").unwrap(),
+            Arc::new(InMemorySetupStore::empty()),
+            Arc::new(InMemorySecretStore::default()),
+        );
+
+        let scope = setup_service.runtime_setup_scope();
+
+        assert_eq!(scope.tenant_id.as_str(), "tenant:slack");
+        assert_eq!(scope.user_id.as_str(), "user:operator");
+        assert_eq!(
+            scope.agent_id.as_ref().map(|id| id.as_str()),
+            Some("agent:slack")
+        );
+        assert_eq!(scope.project_id.as_ref(), Some(&project_id));
+        assert!(scope.thread_id.is_none());
+        assert!(scope.mission_id.is_none());
     }
 
     fn setup_record(revision: u64) -> SlackInstallationSetup {

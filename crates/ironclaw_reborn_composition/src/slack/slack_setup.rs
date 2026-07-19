@@ -195,6 +195,18 @@ impl SlackSetupService {
         &self.operator_user_id
     }
 
+    pub(crate) fn runtime_setup_scope(&self) -> ResourceScope {
+        ResourceScope {
+            tenant_id: self.tenant_id.clone(),
+            user_id: self.operator_user_id.clone(),
+            agent_id: Some(self.agent_id.clone()),
+            project_id: self.project_id.clone(),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
+    }
+
     pub(crate) async fn current_setup(
         &self,
     ) -> Result<Option<SlackInstallationSetup>, SlackSetupError> {
@@ -574,15 +586,7 @@ impl SlackSetupService {
     }
 
     fn secret_scope(&self) -> ResourceScope {
-        ResourceScope {
-            tenant_id: self.tenant_id.clone(),
-            user_id: self.operator_user_id.clone(),
-            agent_id: Some(self.agent_id.clone()),
-            project_id: self.project_id.clone(),
-            mission_id: None,
-            thread_id: None,
-            invocation_id: InvocationId::new(),
-        }
+        self.runtime_setup_scope()
     }
 }
 

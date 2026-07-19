@@ -13,6 +13,8 @@ use ironclaw_extensions::{
     InstallationOwner, ManifestHash, ManifestSource,
 };
 use ironclaw_filesystem::{FilesystemError, RootFilesystem};
+#[cfg(test)]
+use ironclaw_host_api::InvocationId;
 use ironclaw_host_api::{
     CapabilityDescriptor, CapabilityId, EffectKind, ExtensionId, NetworkTargetPattern,
     PermissionMode, ResourceScope, RuntimeCredentialAuthRequirement, RuntimeCredentialRequirement,
@@ -47,6 +49,43 @@ pub(crate) trait ExtensionCredentialCleanup: Send + Sync {
         &self,
         request: SecretCleanupRequest,
     ) -> Result<SecretCleanupReport, RebornServicesError>;
+}
+
+#[async_trait]
+pub(crate) trait LifecyclePolicyProjectionCacheRefresher: Send + Sync {
+    async fn refresh_after_lifecycle_activation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError>;
+
+    async fn refresh_after_lifecycle_removal(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError>;
+}
+
+#[derive(Debug, Default)]
+struct NoopLifecyclePolicyProjectionCacheRefresher;
+
+#[async_trait]
+impl LifecyclePolicyProjectionCacheRefresher for NoopLifecyclePolicyProjectionCacheRefresher {
+    async fn refresh_after_lifecycle_activation(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        Ok(())
+    }
+
+    async fn refresh_after_lifecycle_removal(
+        &self,
+        _scope: &ResourceScope,
+        _extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -137,6 +176,11 @@ pub(crate) struct RebornLocalExtensionManagementPort {
     /// sources. Descriptors are declared during composition; sources connect
     /// only when their host surface is mounted.
     account_setups: ExtensionAccountSetupRegistry,
+    /// Composition-owned projection hook. Lifecycle owns when activation/removal
+    /// changes should refresh or invalidate downstream projections, but it must
+    /// not synthesize product-specific policy contents.
+    policy_projection_cache_refresher:
+        Arc<std::sync::RwLock<Arc<dyn LifecyclePolicyProjectionCacheRefresher>>>,
 }
 
 /// Concurrent `import_bundle` decodes allowed before further uploads wait.
@@ -330,6 +374,9 @@ impl RebornLocalExtensionManagementPort {
             tenant_operator_user_id,
             removal_cleanup: Arc::new(ExtensionRemovalCleanupRegistry::empty()),
             account_setups: ExtensionAccountSetupRegistry::default(),
+            policy_projection_cache_refresher: Arc::new(std::sync::RwLock::new(Arc::new(
+                NoopLifecyclePolicyProjectionCacheRefresher,
+            ))),
         }
     }
 
@@ -354,8 +401,30 @@ impl RebornLocalExtensionManagementPort {
         self
     }
 
+    pub(crate) fn set_policy_projection_cache_refresher(
+        &self,
+        refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
+    ) {
+        let mut guard = self
+            .policy_projection_cache_refresher
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = refresher;
+    }
+
     pub(crate) fn installation_store(&self) -> Arc<dyn ExtensionInstallationStore> {
         Arc::clone(&self.installation_store)
+    }
+
+    fn policy_projection_cache_refresher(
+        &self,
+    ) -> Arc<dyn LifecyclePolicyProjectionCacheRefresher> {
+        Arc::clone(
+            &self
+                .policy_projection_cache_refresher
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Test-support access to the extension installation store.
@@ -872,17 +941,36 @@ impl RebornLocalExtensionManagementPort {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn activate(
         &self,
         package_ref: LifecyclePackageRef,
         mode: ExtensionActivationMode,
         caller: &UserId,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
-        let credential_gate = UnavailableExtensionActivationCredentialGate;
-        self.activate_inner(package_ref, mode, &credential_gate, caller)
+        let scope =
+            ResourceScope::local_default(caller.clone(), InvocationId::new()).map_err(|error| {
+                ProductWorkflowError::Transient {
+                    reason: format!("extension activation scope is invalid: {error}"),
+                }
+            })?;
+        self.activate_for_scope(package_ref, mode, &scope, caller)
             .await
     }
 
+    pub(crate) async fn activate_for_scope(
+        &self,
+        package_ref: LifecyclePackageRef,
+        mode: ExtensionActivationMode,
+        scope: &ResourceScope,
+        caller: &UserId,
+    ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
+        let credential_gate = UnavailableExtensionActivationCredentialGate;
+        self.activate_inner(package_ref, mode, &credential_gate, scope, caller)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn activate_with_credential_gate(
         &self,
         package_ref: LifecyclePackageRef,
@@ -890,7 +978,31 @@ impl RebornLocalExtensionManagementPort {
         credential_gate: impl ExtensionActivationCredentialGate,
         caller: &UserId,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
-        self.activate_inner(package_ref, mode, &credential_gate, caller)
+        let scope =
+            ResourceScope::local_default(caller.clone(), InvocationId::new()).map_err(|error| {
+                ProductWorkflowError::Transient {
+                    reason: format!("extension activation scope is invalid: {error}"),
+                }
+            })?;
+        self.activate_with_credential_gate_for_scope(
+            package_ref,
+            mode,
+            credential_gate,
+            &scope,
+            caller,
+        )
+        .await
+    }
+
+    pub(crate) async fn activate_with_credential_gate_for_scope(
+        &self,
+        package_ref: LifecyclePackageRef,
+        mode: ExtensionActivationMode,
+        credential_gate: impl ExtensionActivationCredentialGate,
+        scope: &ResourceScope,
+        caller: &UserId,
+    ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
+        self.activate_inner(package_ref, mode, &credential_gate, scope, caller)
             .await
     }
 
@@ -903,7 +1015,13 @@ impl RebornLocalExtensionManagementPort {
         let credential_gate =
             crate::extension_host::extension_activation_credentials::PrecheckedExtensionActivationCredentialGate;
         let caller = self.tenant_operator_user_id.clone();
-        self.activate_inner(package_ref, mode, &credential_gate, &caller)
+        let scope =
+            ResourceScope::local_default(caller.clone(), InvocationId::new()).map_err(|error| {
+                ProductWorkflowError::Transient {
+                    reason: format!("extension activation scope is invalid: {error}"),
+                }
+            })?;
+        self.activate_inner(package_ref, mode, &credential_gate, &scope, &caller)
             .await
     }
 
@@ -912,6 +1030,7 @@ impl RebornLocalExtensionManagementPort {
         package_ref: LifecyclePackageRef,
         mode: ExtensionActivationMode,
         credential_gate: &dyn ExtensionActivationCredentialGate,
+        scope: &ResourceScope,
         caller: &UserId,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
         let (extension_id, installation_id) = extension_ids_from_package_ref(&package_ref)?;
@@ -951,6 +1070,7 @@ impl RebornLocalExtensionManagementPort {
                             &installation_id,
                             installation.activation_state(),
                             package,
+                            scope,
                         )
                         .await;
                 }
@@ -1046,6 +1166,7 @@ impl RebornLocalExtensionManagementPort {
             &installation_id,
             installation.activation_state(),
             active_package,
+            scope,
         )
         .await
     }
@@ -1057,6 +1178,7 @@ impl RebornLocalExtensionManagementPort {
         installation_id: &ExtensionInstallationId,
         previous_state: ExtensionActivationState,
         active_package: ExtensionPackage,
+        scope: &ResourceScope,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
         if previous_state == ExtensionActivationState::Enabled
             && self
@@ -1114,6 +1236,9 @@ impl RebornLocalExtensionManagementPort {
             }
             return Err(error);
         }
+        self.policy_projection_cache_refresher()
+            .refresh_after_lifecycle_activation(scope, extension_id)
+            .await?;
 
         Ok(activation_success_response(
             package_ref,
@@ -1304,6 +1429,9 @@ impl RebornLocalExtensionManagementPort {
             }
             response
         };
+        self.policy_projection_cache_refresher()
+            .refresh_after_lifecycle_removal(&removal_scope, &removed_extension_id)
+            .await?;
         if matches!(
             response.payload.as_ref(),
             Some(LifecycleProductPayload::ExtensionRemove { removed: false })
@@ -2575,6 +2703,72 @@ mod tests {
 
     mod private_install_tests;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum LifecyclePolicyProjectionRefreshCall {
+        Activation {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
+        Removal {
+            scope: ResourceScope,
+            extension_id: ExtensionId,
+        },
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingLifecyclePolicyProjectionCacheRefresher {
+        calls: StdMutex<Vec<LifecyclePolicyProjectionRefreshCall>>,
+    }
+
+    impl RecordingLifecyclePolicyProjectionCacheRefresher {
+        fn calls(&self) -> Vec<LifecyclePolicyProjectionRefreshCall> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn clear(&self) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    #[async_trait]
+    impl LifecyclePolicyProjectionCacheRefresher for RecordingLifecyclePolicyProjectionCacheRefresher {
+        async fn refresh_after_lifecycle_activation(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(LifecyclePolicyProjectionRefreshCall::Activation {
+                    scope: scope.clone(),
+                    extension_id: extension_id.clone(),
+                });
+            Ok(())
+        }
+
+        async fn refresh_after_lifecycle_removal(
+            &self,
+            scope: &ResourceScope,
+            extension_id: &ExtensionId,
+        ) -> Result<(), ProductWorkflowError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(LifecyclePolicyProjectionRefreshCall::Removal {
+                    scope: scope.clone(),
+                    extension_id: extension_id.clone(),
+                });
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn lifecycle_owner_projections_reject_duplicate_extension_ids() {
         let (_dir, _storage_root, port, _active_registry, installation_store) =
@@ -2852,6 +3046,128 @@ mod tests {
             !storage_root
                 .join("system/extensions/fixture/wasm/fixture.wasm")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_activation_refreshes_policy_projection_cache_with_operation_scope() {
+        let refresher = Arc::new(RecordingLifecyclePolicyProjectionCacheRefresher::default());
+        let (_dir, _storage_root, port, _active_registry, _installation_store, filesystem) =
+            matrix_extension_management_fixture_with_refresher(refresher.clone());
+        let root_filesystem: Arc<dyn RootFilesystem> = filesystem;
+        let skill_management = Arc::new(
+            crate::extension_host::lifecycle::RebornLocalSkillManagementPort::new(
+                lifecycle_owner(),
+                root_filesystem,
+                MountView::new(vec![MountGrant::new(
+                    MountAlias::new("/skills").expect("valid alias"),
+                    VirtualPath::new("/projects/skills").expect("valid path"),
+                    MountPermissions::read_write_list_delete(),
+                )])
+                .expect("valid mount view"),
+            ),
+        );
+        let facade =
+            crate::extension_host::lifecycle::RebornLocalLifecycleFacade::new(skill_management)
+                .with_extension_management(port);
+        let package_ref = matrix_lifecycle_package_ref();
+
+        facade
+            .execute(
+                matrix_lifecycle_surface_context(),
+                LifecycleProductAction::ExtensionInstall {
+                    package_ref: package_ref.clone(),
+                },
+            )
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        facade
+            .execute(
+                matrix_lifecycle_surface_context(),
+                LifecycleProductAction::ExtensionActivate { package_ref },
+            )
+            .await
+            .expect("activate Matrix ProductAdapter extension");
+
+        let calls = refresher.calls();
+        assert_eq!(calls.len(), 1);
+        let LifecyclePolicyProjectionRefreshCall::Activation {
+            scope,
+            extension_id,
+        } = &calls[0]
+        else {
+            panic!("expected activation refresh call, got {calls:?}");
+        };
+        assert_eq!(scope.user_id, lifecycle_owner());
+        assert_eq!(
+            scope.tenant_id,
+            TenantId::new("matrix-lifecycle-tenant").expect("valid tenant")
+        );
+        assert_eq!(
+            scope.agent_id,
+            Some(AgentId::new("matrix-lifecycle-agent").expect("valid agent"))
+        );
+        assert_eq!(
+            scope.project_id,
+            Some(ProjectId::new("matrix-lifecycle-project").expect("valid project"))
+        );
+        assert_eq!(
+            extension_id,
+            &ExtensionId::new("matrix-product-adapter").expect("valid extension id")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_lifecycle_remove_invalidates_policy_projection_cache() {
+        let refresher = Arc::new(RecordingLifecyclePolicyProjectionCacheRefresher::default());
+        let (_dir, _storage_root, port, _active_registry, _installation_store, _filesystem) =
+            matrix_extension_management_fixture_with_refresher(refresher.clone());
+        let package_ref = matrix_lifecycle_package_ref();
+
+        port.install(package_ref.clone(), &lifecycle_owner())
+            .await
+            .expect("install Matrix ProductAdapter extension");
+        port.activate_with_prechecked_credentials_for_test(
+            package_ref.clone(),
+            ExtensionActivationMode::Static,
+        )
+        .await
+        .expect("activate Matrix ProductAdapter extension");
+        refresher.clear();
+
+        port.remove(
+            package_ref,
+            &matrix_lifecycle_resource_scope(),
+            Some(&lifecycle_owner()),
+        )
+        .await
+        .expect("remove Matrix ProductAdapter extension");
+
+        let calls = refresher.calls();
+        assert_eq!(calls.len(), 1);
+        let LifecyclePolicyProjectionRefreshCall::Removal {
+            scope,
+            extension_id,
+        } = &calls[0]
+        else {
+            panic!("expected removal refresh call, got {calls:?}");
+        };
+        assert_eq!(scope.user_id, lifecycle_owner());
+        assert_eq!(
+            scope.tenant_id,
+            TenantId::new("matrix-lifecycle-tenant").expect("valid tenant")
+        );
+        assert_eq!(
+            scope.agent_id,
+            Some(AgentId::new("matrix-lifecycle-agent").expect("valid agent"))
+        );
+        assert_eq!(
+            scope.project_id,
+            Some(ProjectId::new("matrix-lifecycle-project").expect("valid project"))
+        );
+        assert_eq!(
+            extension_id,
+            &ExtensionId::new("matrix-product-adapter").expect("valid extension id")
         );
     }
 
@@ -4812,6 +5128,8 @@ output_schema_ref = "schemas/run.output.json"
                 &installation_id,
                 ExtensionActivationState::Enabled,
                 fixture_extension_package().package,
+                &ResourceScope::local_default(lifecycle_owner(), InvocationId::new())
+                    .expect("valid activation scope"),
             )
             .await
             .expect_err("publish failure is reported");
@@ -8229,6 +8547,140 @@ output_schema_ref = "schemas/run.output.json"
 
     fn fixture_extension_package() -> AvailableExtensionPackage {
         fixture_extension_package_from_manifest(fixture_extension_manifest())
+    }
+
+    fn matrix_lifecycle_package_ref() -> LifecyclePackageRef {
+        LifecyclePackageRef::new(LifecyclePackageKind::Extension, "matrix-product-adapter")
+            .expect("valid Matrix package ref")
+    }
+
+    fn matrix_extension_management_fixture_with_refresher(
+        refresher: Arc<dyn LifecyclePolicyProjectionCacheRefresher>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<RebornLocalExtensionManagementPort>,
+        Arc<SharedExtensionRegistry>,
+        Arc<InMemoryExtensionInstallationStore>,
+        Arc<DiskFilesystem>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("local-dev");
+        std::fs::create_dir_all(storage_root.join("system/extensions")).expect("storage root");
+        std::fs::create_dir_all(storage_root.join("tenants")).expect("tenant storage root");
+
+        let mut filesystem = DiskFilesystem::new();
+        filesystem
+            .mount_local(
+                VirtualPath::new("/tenants").expect("valid tenant virtual path"),
+                HostPath::from_path_buf(storage_root.join("tenants")),
+            )
+            .expect("mount tenant storage root");
+        filesystem
+            .mount_local(
+                VirtualPath::new("/projects").expect("valid virtual path"),
+                HostPath::from_path_buf(storage_root.clone()),
+            )
+            .expect("mount storage root");
+        filesystem
+            .mount_local(
+                VirtualPath::new("/system/extensions").expect("valid virtual path"),
+                HostPath::from_path_buf(storage_root.join("system/extensions")),
+            )
+            .expect("mount system extensions");
+        let filesystem = Arc::new(filesystem);
+        let root_filesystem: Arc<dyn RootFilesystem> = filesystem.clone();
+        let active_registry = Arc::new(SharedExtensionRegistry::new(ExtensionRegistry::new()));
+        let installation_store = Arc::new(InMemoryExtensionInstallationStore::default());
+        let extension_management = Arc::new(RebornLocalExtensionManagementPort::new(
+            root_filesystem,
+            AvailableExtensionCatalog::from_packages(vec![matrix_product_adapter_package()]),
+            installation_store.clone(),
+            Arc::new(Mutex::new(ExtensionLifecycleService::new(
+                ExtensionRegistry::new(),
+            ))),
+            test_active_extension_publisher(
+                Arc::clone(&active_registry),
+                test_extension_trust_policy(),
+            ),
+            None,
+            lifecycle_owner(),
+        ));
+        extension_management.set_policy_projection_cache_refresher(refresher);
+        (
+            dir,
+            storage_root,
+            extension_management,
+            active_registry,
+            installation_store,
+            filesystem,
+        )
+    }
+
+    fn matrix_lifecycle_resource_scope() -> ResourceScope {
+        ResourceScope {
+            tenant_id: TenantId::new("matrix-lifecycle-tenant").expect("valid tenant"),
+            user_id: lifecycle_owner(),
+            agent_id: Some(AgentId::new("matrix-lifecycle-agent").expect("valid agent")),
+            project_id: Some(ProjectId::new("matrix-lifecycle-project").expect("valid project")),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
+    }
+
+    fn matrix_lifecycle_surface_context() -> LifecycleProductContext {
+        LifecycleProductContext::Surface(LifecycleProductSurfaceContext {
+            tenant_id: TenantId::new("matrix-lifecycle-tenant").expect("valid tenant"),
+            user_id: lifecycle_owner(),
+            agent_id: Some(AgentId::new("matrix-lifecycle-agent").expect("valid agent")),
+            project_id: Some(ProjectId::new("matrix-lifecycle-project").expect("valid project")),
+        })
+    }
+
+    fn matrix_product_adapter_package() -> AvailableExtensionPackage {
+        let manifest = format!(
+            r#"
+schema_version = "{schema}"
+id = "matrix-product-adapter"
+name = "Matrix"
+version = "0.1.0"
+description = "Matrix ProductAdapter lifecycle fixture"
+trust = "first_party_requested"
+
+[runtime]
+kind = "wasm"
+module = "wasm/fixture.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "shared_secret_header"
+header_name = "x-matrix-webhook-secret"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages", "external_final_reply_push"]
+
+[[product_adapter.inbound.required_credentials]]
+handle = "matrix-access-token"
+
+[[product_adapter.inbound.egress]]
+host = "matrix.example.org"
+credential_handle = "matrix-access-token"
+"#,
+            schema = ironclaw_extensions::MANIFEST_SCHEMA_VERSION
+        );
+        let mut package = fixture_extension_package_from_manifest_with_product_adapter_contracts(
+            &manifest,
+            "matrix-product-adapter",
+        );
+        package.surface_kinds = vec![LifecycleExtensionSurfaceKind::ExternalChannel];
+        package
     }
 
     fn fixture_extension_package_with_description(description: &str) -> AvailableExtensionPackage {

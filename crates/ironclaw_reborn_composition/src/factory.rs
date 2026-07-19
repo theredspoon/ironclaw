@@ -84,11 +84,9 @@ use ironclaw_outbound::CommunicationPreferenceRepository;
 // no-durable outbound wiring now share the one `FilesystemOutboundStateStore`
 // (over a libsql/postgres or in-memory backend), so this import is
 // unconditional, not gated behind the durable-backend features.
-use ironclaw_outbound::FilesystemOutboundStateStore;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_outbound::OutboundStateStore;
 #[cfg(any(feature = "slack-v2-host-beta", feature = "telegram-v2-host-beta"))]
 use ironclaw_outbound::{DeliveredGateRouteStore, TriggeredRunDeliveryStore};
+use ironclaw_outbound::{FilesystemOutboundStateStore, OutboundStateStore};
 use ironclaw_processes::ProcessServices;
 #[cfg(any(
     feature = "slack-v2-host-beta",

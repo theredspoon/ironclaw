@@ -1,7 +1,9 @@
 use super::*;
+#[cfg(any(test, feature = "libsql", feature = "postgres"))]
+use crate::matrix_product_outbound::FilesystemMatrixPolicySnapshotSource;
 use crate::matrix_product_outbound::{
-    DefaultMatrixOutboundPolicyAuthorizer, FilesystemMatrixPolicySnapshotSource,
-    MatrixOutboundPolicyAuthorizer, MatrixPolicySnapshotSource,
+    DefaultMatrixOutboundPolicyAuthorizer, MatrixOutboundPolicyAuthorizer,
+    MatrixPolicySnapshotSource,
 };
 use ironclaw_matrix_adapter::installation_policy::{
     EgressTargetIndex as AdapterEgressTargetIndex, MatrixInstallationPolicyRejection,

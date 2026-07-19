@@ -337,13 +337,14 @@ pub(crate) async fn bootstrap_nearai_mcp(
     match phase {
         LifecyclePhase::Discovered | LifecyclePhase::Installed => {
             extension_management
-                .activate_with_credential_gate(
+                .activate_with_credential_gate_for_scope(
                     package_ref,
                     ExtensionActivationMode::Static,
                     RuntimeExtensionActivationCredentialGate::new(
-                        resource_scope,
+                        resource_scope.clone(),
                         product_auth.runtime_credential_account_selection_service(),
                     ),
+                    &resource_scope,
                     &bootstrap_caller,
                 )
                 .await
