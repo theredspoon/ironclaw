@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use ironclaw_common::hashing::sha256_hex;
-use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
+use ironclaw_filesystem::{
+    CasExpectation, ContentType, Entry, FilesystemError, RootFilesystem, ScopedFilesystem,
+};
+use ironclaw_host_api::{AgentId, ProjectId, ResourceScope, ScopedPath, TenantId, UserId};
 use ironclaw_matrix_adapter::installation_policy::MatrixUserId;
 use ironclaw_outbound::{
     CommunicationDeliveryIntent, OutboundError, ReplyTargetBindingClaim,
@@ -16,6 +19,9 @@ use ironclaw_product_workflow::{
     WebUiAuthenticatedCaller,
 };
 use ironclaw_turns::ReplyTargetBindingRef;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::sync::{Arc, RwLock};
 
 use crate::matrix_outbound::MatrixPolicyProviderScope;
 use crate::matrix_outbound::MatrixRoomId;
@@ -46,8 +52,36 @@ pub(crate) struct MatrixOutboundTargetProviderConfig {
     pub(crate) configured_room_routes: Vec<MatrixConfiguredRoomRoute>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct MatrixHostOutboundTargetProvider {
+    source: MatrixHostOutboundTargetProviderSource,
+}
+
+#[derive(Clone)]
+enum MatrixHostOutboundTargetProviderSource {
+    Static(MatrixHostOutboundTargetProviderConfig),
+    Store(Arc<dyn MatrixRoomBindingStore>),
+}
+
+impl fmt::Debug for MatrixHostOutboundTargetProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatrixHostOutboundTargetProvider")
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl fmt::Debug for MatrixHostOutboundTargetProviderSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Static(config) => f.debug_tuple("Static").field(config).finish(),
+            Self::Store(store) => f.debug_tuple("Store").field(store).finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MatrixHostOutboundTargetProviderConfig {
     tenant_id: TenantId,
     agent_id: AgentId,
     project_id: Option<ProjectId>,
@@ -58,9 +92,34 @@ pub(crate) struct MatrixHostOutboundTargetProvider {
     policy_provider_scope_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct MatrixHostProductOutboundTargetResolver {
-    providers: Vec<MatrixHostOutboundTargetProvider>,
+    source: MatrixHostProductOutboundTargetResolverSource,
+}
+
+#[derive(Clone)]
+enum MatrixHostProductOutboundTargetResolverSource {
+    #[cfg(test)]
+    Static(Vec<MatrixHostOutboundTargetProvider>),
+    Store(Arc<dyn MatrixRoomBindingStore>),
+}
+
+impl fmt::Debug for MatrixHostProductOutboundTargetResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MatrixHostProductOutboundTargetResolver")
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl fmt::Debug for MatrixHostProductOutboundTargetResolverSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(test)]
+            Self::Static(providers) => f.debug_tuple("Static").field(providers).finish(),
+            Self::Store(store) => f.debug_tuple("Store").field(store).finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +143,716 @@ struct ValidatedMatrixConfiguredRoomRoute {
     route_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatrixRoomBinding {
+    pub(crate) tenant_id: TenantId,
+    pub(crate) agent_id: AgentId,
+    pub(crate) project_id: Option<ProjectId>,
+    pub(crate) installation_id: AdapterInstallationId,
+    pub(crate) room_id: MatrixRoomId,
+    pub(crate) subject_user_id: UserId,
+    pub(crate) matrix_sender_user_id: MatrixUserId,
+}
+
+#[async_trait]
+pub(crate) trait MatrixRoomBindingStore: Send + Sync + fmt::Debug {
+    async fn snapshot_provider_configs(
+        &self,
+    ) -> Result<Vec<MatrixOutboundTargetProviderConfig>, RebornServicesError>;
+
+    async fn list_room_bindings(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        subject_user_id: &UserId,
+    ) -> Result<Vec<MatrixRoomBinding>, RebornServicesError>;
+
+    #[cfg(test)]
+    async fn resolve_room_binding(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        installation_id: &AdapterInstallationId,
+        room_id: &MatrixRoomId,
+        subject_user_id: &UserId,
+    ) -> Result<Option<MatrixRoomBinding>, RebornServicesError>;
+
+    async fn remove_room_binding(
+        &self,
+        request: MatrixRoomBindingRemovalRequest,
+    ) -> Result<MatrixRoomBindingRemovalOutcome, RebornServicesError>;
+
+    async fn provider_has_removed_room_binding(
+        &self,
+        provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<bool, RebornServicesError>;
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct MutableMatrixOutboundTargetProviders {
+    configs: Arc<RwLock<Vec<MatrixOutboundTargetProviderConfig>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilesystemMatrixRoomBindingStore {
+    filesystem: Arc<ScopedFilesystem<dyn RootFilesystem>>,
+    tenant_ids: Arc<RwLock<Vec<TenantId>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredMatrixRoomBinding {
+    tenant_id: String,
+    agent_id: String,
+    project_id: Option<String>,
+    installation_id: String,
+    room_id: String,
+    subject_user_id: String,
+    matrix_sender_user_id: String,
+    #[serde(default)]
+    deleted: bool,
+}
+
+const MATRIX_ROOM_BINDING_STORE_ROOT: &str = "/tenant-shared/matrix/room-bindings";
+const MATRIX_ROOM_BINDING_STORE_SEED_MARKER: &str =
+    "/tenant-shared/matrix/room-bindings/.seeded.json";
+const MATRIX_ROOM_BINDING_STORE_ACTOR: &str = "user:matrix-room-binding-store";
+const MATRIX_ROOM_BINDING_STORE_MAX_RECORDS: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRoomBindingRemovalRequest {
+    pub tenant_id: TenantId,
+    pub agent_id: AgentId,
+    pub project_id: Option<ProjectId>,
+    pub installation_id: AdapterInstallationId,
+    pub room_id: MatrixRoomId,
+    pub subject_user_id: UserId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixRoomBindingRemovalOutcome {
+    Removed,
+    NotFound,
+}
+
+#[cfg(test)]
+impl MutableMatrixOutboundTargetProviders {
+    pub(crate) fn new(
+        configs: impl IntoIterator<Item = MatrixOutboundTargetProviderConfig>,
+    ) -> Result<Self, RebornServicesError> {
+        let configs = configs.into_iter().collect::<Vec<_>>();
+        validate_matrix_outbound_target_provider_configs(&configs)?;
+        Ok(Self {
+            configs: Arc::new(RwLock::new(configs)),
+        })
+    }
+
+    pub(crate) fn snapshot(
+        &self,
+    ) -> Result<Vec<MatrixOutboundTargetProviderConfig>, RebornServicesError> {
+        self.configs
+            .read()
+            .map(|configs| configs.clone())
+            .map_err(|_| matrix_target_backend_error())
+    }
+
+    pub(crate) async fn remove_room_binding(
+        &self,
+        request: MatrixRoomBindingRemovalRequest,
+    ) -> Result<MatrixRoomBindingRemovalOutcome, RebornServicesError> {
+        MatrixRoomBindingStore::remove_room_binding(self, request).await
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl MatrixRoomBindingStore for MutableMatrixOutboundTargetProviders {
+    async fn snapshot_provider_configs(
+        &self,
+    ) -> Result<Vec<MatrixOutboundTargetProviderConfig>, RebornServicesError> {
+        self.snapshot()
+    }
+
+    async fn list_room_bindings(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        subject_user_id: &UserId,
+    ) -> Result<Vec<MatrixRoomBinding>, RebornServicesError> {
+        let configs = self
+            .configs
+            .read()
+            .map_err(|_| matrix_target_backend_error())?;
+        configs
+            .iter()
+            .filter(|config| {
+                &config.tenant_id == tenant_id
+                    && &config.agent_id == agent_id
+                    && config.project_id.as_ref() == project_id
+            })
+            .flat_map(|config| {
+                config
+                    .configured_room_routes
+                    .iter()
+                    .filter(move |route| &route.subject_user_id == subject_user_id)
+                    .map(move |route| (config, route))
+            })
+            .map(|(config, route)| {
+                MatrixRoomId::new(route.room_id.clone())
+                    .map_err(|_| matrix_target_config_error())
+                    .map(|room_id| MatrixRoomBinding {
+                        tenant_id: config.tenant_id.clone(),
+                        agent_id: config.agent_id.clone(),
+                        project_id: config.project_id.clone(),
+                        installation_id: config.installation_id.clone(),
+                        room_id,
+                        subject_user_id: route.subject_user_id.clone(),
+                        matrix_sender_user_id: route.matrix_sender_user_id.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    async fn resolve_room_binding(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        installation_id: &AdapterInstallationId,
+        room_id: &MatrixRoomId,
+        subject_user_id: &UserId,
+    ) -> Result<Option<MatrixRoomBinding>, RebornServicesError> {
+        Ok(self
+            .list_room_bindings(tenant_id, agent_id, project_id, subject_user_id)
+            .await?
+            .into_iter()
+            .find(|binding| {
+                &binding.installation_id == installation_id && &binding.room_id == room_id
+            }))
+    }
+
+    async fn remove_room_binding(
+        &self,
+        request: MatrixRoomBindingRemovalRequest,
+    ) -> Result<MatrixRoomBindingRemovalOutcome, RebornServicesError> {
+        let mut configs = self
+            .configs
+            .write()
+            .map_err(|_| matrix_target_backend_error())?;
+        let mut removed = false;
+        for config in configs.iter_mut().filter(|config| {
+            config.tenant_id == request.tenant_id
+                && config.agent_id == request.agent_id
+                && config.project_id == request.project_id
+                && config.installation_id == request.installation_id
+        }) {
+            let before = config.configured_room_routes.len();
+            config.configured_room_routes.retain(|route| {
+                route.room_id != request.room_id.as_str()
+                    || route.subject_user_id != request.subject_user_id
+            });
+            removed |= config.configured_room_routes.len() != before;
+        }
+        if removed {
+            Ok(MatrixRoomBindingRemovalOutcome::Removed)
+        } else {
+            Ok(MatrixRoomBindingRemovalOutcome::NotFound)
+        }
+    }
+
+    async fn provider_has_removed_room_binding(
+        &self,
+        _provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<bool, RebornServicesError> {
+        Ok(false)
+    }
+}
+
+impl FilesystemMatrixRoomBindingStore {
+    pub(crate) fn new(
+        filesystem: Arc<dyn RootFilesystem>,
+        tenant_ids: impl IntoIterator<Item = TenantId>,
+    ) -> Self {
+        Self {
+            filesystem: Arc::new(ScopedFilesystem::new(
+                filesystem,
+                crate::matrix_room_binding_store_mount_view,
+            )),
+            tenant_ids: Arc::new(RwLock::new(Vec::new())),
+        }
+        .with_tenant_ids(tenant_ids)
+    }
+
+    fn with_tenant_ids(self, tenant_ids: impl IntoIterator<Item = TenantId>) -> Self {
+        if let Ok(mut known) = self.tenant_ids.write() {
+            for tenant_id in tenant_ids {
+                if !known.iter().any(|known| known == &tenant_id) {
+                    known.push(tenant_id);
+                }
+            }
+        }
+        self
+    }
+
+    pub(crate) async fn seed_from_configs(
+        &self,
+        configs: &[MatrixOutboundTargetProviderConfig],
+    ) -> Result<(), RebornServicesError> {
+        validate_matrix_outbound_target_provider_configs(configs)?;
+        {
+            let mut tenant_ids = self
+                .tenant_ids
+                .write()
+                .map_err(|_| matrix_target_backend_error())?;
+            for config in configs {
+                if !tenant_ids
+                    .iter()
+                    .any(|tenant_id| tenant_id == &config.tenant_id)
+                {
+                    tenant_ids.push(config.tenant_id.clone());
+                }
+            }
+        }
+        let tenants = self.tenant_ids()?;
+        for tenant_id in tenants {
+            if self.seed_marker_exists(&tenant_id).await? {
+                continue;
+            }
+            for config in configs
+                .iter()
+                .filter(|config| config.tenant_id == tenant_id)
+            {
+                for route in &config.configured_room_routes {
+                    let room_id = MatrixRoomId::new(route.room_id.clone())
+                        .map_err(|_| matrix_target_config_error())?;
+                    let binding = MatrixRoomBinding {
+                        tenant_id: config.tenant_id.clone(),
+                        agent_id: config.agent_id.clone(),
+                        project_id: config.project_id.clone(),
+                        installation_id: config.installation_id.clone(),
+                        room_id,
+                        subject_user_id: route.subject_user_id.clone(),
+                        matrix_sender_user_id: route.matrix_sender_user_id.clone(),
+                    };
+                    self.write_binding(&binding).await?;
+                }
+            }
+            self.write_seed_marker(&tenant_id).await?;
+        }
+        Ok(())
+    }
+
+    fn tenant_ids(&self) -> Result<Vec<TenantId>, RebornServicesError> {
+        self.tenant_ids
+            .read()
+            .map(|tenant_ids| tenant_ids.clone())
+            .map_err(|_| matrix_target_backend_error())
+    }
+
+    fn scope_for_tenant(&self, tenant_id: &TenantId) -> Result<ResourceScope, RebornServicesError> {
+        Ok(ResourceScope {
+            tenant_id: tenant_id.clone(),
+            user_id: UserId::new(MATRIX_ROOM_BINDING_STORE_ACTOR)
+                .map_err(|_| matrix_target_backend_error())?,
+            agent_id: None,
+            project_id: None,
+            mission_id: None,
+            thread_id: None,
+            invocation_id: ironclaw_host_api::InvocationId::new(),
+        })
+    }
+
+    fn root_path() -> Result<ScopedPath, RebornServicesError> {
+        ScopedPath::new(MATRIX_ROOM_BINDING_STORE_ROOT).map_err(|_| matrix_target_backend_error())
+    }
+
+    fn seed_marker_path() -> Result<ScopedPath, RebornServicesError> {
+        ScopedPath::new(MATRIX_ROOM_BINDING_STORE_SEED_MARKER)
+            .map_err(|_| matrix_target_backend_error())
+    }
+
+    fn binding_path(binding: &MatrixRoomBinding) -> Result<ScopedPath, RebornServicesError> {
+        Self::binding_path_for_key(
+            &binding.tenant_id,
+            &binding.agent_id,
+            binding.project_id.as_ref(),
+            &binding.installation_id,
+            &binding.room_id,
+            &binding.subject_user_id,
+        )
+    }
+
+    fn binding_path_for_key(
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        installation_id: &AdapterInstallationId,
+        room_id: &MatrixRoomId,
+        subject_user_id: &UserId,
+    ) -> Result<ScopedPath, RebornServicesError> {
+        let mut input = Vec::new();
+        push_route_key_segment(&mut input, tenant_id.as_str());
+        push_route_key_segment(&mut input, agent_id.as_str());
+        push_route_key_segment(&mut input, project_id.map(ProjectId::as_str).unwrap_or(""));
+        push_route_key_segment(&mut input, installation_id.as_str());
+        push_route_key_segment(&mut input, room_id.as_str());
+        push_route_key_segment(&mut input, subject_user_id.as_str());
+        ScopedPath::new(format!(
+            "{MATRIX_ROOM_BINDING_STORE_ROOT}/{}.json",
+            sha256_hex(&input)
+        ))
+        .map_err(|_| matrix_target_backend_error())
+    }
+
+    async fn seed_marker_exists(&self, tenant_id: &TenantId) -> Result<bool, RebornServicesError> {
+        let scope = self.scope_for_tenant(tenant_id)?;
+        let path = Self::seed_marker_path()?;
+        match self.filesystem.get(&scope, &path).await {
+            Ok(entry) => Ok(entry.is_some()),
+            Err(error) if matrix_target_filesystem_not_found(&error) => Ok(false),
+            Err(error) => Err(map_matrix_target_filesystem_error(error)),
+        }
+    }
+
+    async fn write_seed_marker(&self, tenant_id: &TenantId) -> Result<(), RebornServicesError> {
+        let scope = self.scope_for_tenant(tenant_id)?;
+        let path = Self::seed_marker_path()?;
+        let bytes = serde_json::to_vec(&serde_json::json!({ "seeded": true }))
+            .map_err(|_| matrix_target_backend_error())?;
+        self.filesystem
+            .put(
+                &scope,
+                &path,
+                Entry::bytes(bytes).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_matrix_target_filesystem_error)
+    }
+
+    async fn write_binding(&self, binding: &MatrixRoomBinding) -> Result<(), RebornServicesError> {
+        let scope = self.scope_for_tenant(&binding.tenant_id)?;
+        let path = Self::binding_path(binding)?;
+        if self.binding_path_has_tombstone(&scope, &path).await? {
+            return Ok(());
+        }
+        let stored = StoredMatrixRoomBinding::from_binding(binding);
+        let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
+        self.filesystem
+            .put(
+                &scope,
+                &path,
+                Entry::bytes(bytes).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_matrix_target_filesystem_error)
+    }
+
+    async fn write_binding_tombstone(
+        &self,
+        request: &MatrixRoomBindingRemovalRequest,
+    ) -> Result<(), RebornServicesError> {
+        let scope = self.scope_for_tenant(&request.tenant_id)?;
+        let path = Self::binding_path_for_key(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.as_ref(),
+            &request.installation_id,
+            &request.room_id,
+            &request.subject_user_id,
+        )?;
+        let stored = StoredMatrixRoomBinding::tombstone_from_request(request);
+        let bytes = serde_json::to_vec(&stored).map_err(|_| matrix_target_backend_error())?;
+        self.filesystem
+            .put(
+                &scope,
+                &path,
+                Entry::bytes(bytes).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await
+            .map_err(map_matrix_target_filesystem_error)?;
+        if !self.binding_path_has_tombstone(&scope, &path).await? {
+            return Err(matrix_target_backend_error());
+        }
+        Ok(())
+    }
+
+    async fn binding_path_has_tombstone(
+        &self,
+        scope: &ResourceScope,
+        path: &ScopedPath,
+    ) -> Result<bool, RebornServicesError> {
+        let Some(versioned) = self
+            .filesystem
+            .get(scope, path)
+            .await
+            .map_err(map_matrix_target_filesystem_error)?
+        else {
+            return Ok(false);
+        };
+        let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
+            .map_err(|_| matrix_target_backend_error())?;
+        Ok(stored.is_deleted())
+    }
+
+    async fn binding_key_has_tombstone(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        installation_id: &AdapterInstallationId,
+        room_id: &MatrixRoomId,
+        subject_user_id: &UserId,
+    ) -> Result<bool, RebornServicesError> {
+        let scope = self.scope_for_tenant(tenant_id)?;
+        let path = Self::binding_path_for_key(
+            tenant_id,
+            agent_id,
+            project_id,
+            installation_id,
+            room_id,
+            subject_user_id,
+        )?;
+        self.binding_path_has_tombstone(&scope, &path).await
+    }
+
+    async fn read_bindings_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<MatrixRoomBinding>, RebornServicesError> {
+        let scope = self.scope_for_tenant(tenant_id)?;
+        let root_path = Self::root_path()?;
+        let entries = match self
+            .filesystem
+            .list_dir_bounded(&scope, &root_path, MATRIX_ROOM_BINDING_STORE_MAX_RECORDS)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(error) if matrix_target_filesystem_not_found(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(map_matrix_target_filesystem_error(error)),
+        };
+        let mut bindings = Vec::new();
+        for entry in entries {
+            let name = entry.name.as_str();
+            if name.starts_with('.') || !name.ends_with(".json") {
+                continue;
+            }
+            let path = ScopedPath::new(format!("{MATRIX_ROOM_BINDING_STORE_ROOT}/{name}"))
+                .map_err(|_| matrix_target_backend_error())?;
+            let Some(versioned) = self
+                .filesystem
+                .get(&scope, &path)
+                .await
+                .map_err(map_matrix_target_filesystem_error)?
+            else {
+                continue;
+            };
+            let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
+                .map_err(|_| matrix_target_backend_error())?;
+            if stored.is_deleted() {
+                continue;
+            }
+            let binding = stored.into_binding()?;
+            if &binding.tenant_id == tenant_id {
+                bindings.push(binding);
+            }
+        }
+        Ok(bindings)
+    }
+}
+
+impl StoredMatrixRoomBinding {
+    fn from_binding(binding: &MatrixRoomBinding) -> Self {
+        Self {
+            tenant_id: binding.tenant_id.as_str().to_string(),
+            agent_id: binding.agent_id.as_str().to_string(),
+            project_id: binding
+                .project_id
+                .as_ref()
+                .map(|project_id| project_id.as_str().to_string()),
+            installation_id: binding.installation_id.as_str().to_string(),
+            room_id: binding.room_id.as_str().to_string(),
+            subject_user_id: binding.subject_user_id.as_str().to_string(),
+            matrix_sender_user_id: binding.matrix_sender_user_id.as_str().to_string(),
+            deleted: false,
+        }
+    }
+
+    fn tombstone_from_request(request: &MatrixRoomBindingRemovalRequest) -> Self {
+        Self {
+            tenant_id: request.tenant_id.as_str().to_string(),
+            agent_id: request.agent_id.as_str().to_string(),
+            project_id: request
+                .project_id
+                .as_ref()
+                .map(|project_id| project_id.as_str().to_string()),
+            installation_id: request.installation_id.as_str().to_string(),
+            room_id: request.room_id.as_str().to_string(),
+            subject_user_id: request.subject_user_id.as_str().to_string(),
+            matrix_sender_user_id: String::new(),
+            deleted: true,
+        }
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+
+    fn into_binding(self) -> Result<MatrixRoomBinding, RebornServicesError> {
+        Ok(MatrixRoomBinding {
+            tenant_id: TenantId::new(self.tenant_id).map_err(|_| matrix_target_backend_error())?,
+            agent_id: AgentId::new(self.agent_id).map_err(|_| matrix_target_backend_error())?,
+            project_id: self
+                .project_id
+                .map(ProjectId::new)
+                .transpose()
+                .map_err(|_| matrix_target_backend_error())?,
+            installation_id: AdapterInstallationId::new(self.installation_id)
+                .map_err(|_| matrix_target_backend_error())?,
+            room_id: MatrixRoomId::new(self.room_id).map_err(|_| matrix_target_backend_error())?,
+            subject_user_id: UserId::new(self.subject_user_id)
+                .map_err(|_| matrix_target_backend_error())?,
+            matrix_sender_user_id: MatrixUserId::new(self.matrix_sender_user_id)
+                .map_err(|_| matrix_target_backend_error())?,
+        })
+    }
+}
+
+#[async_trait]
+impl MatrixRoomBindingStore for FilesystemMatrixRoomBindingStore {
+    async fn snapshot_provider_configs(
+        &self,
+    ) -> Result<Vec<MatrixOutboundTargetProviderConfig>, RebornServicesError> {
+        let mut bindings = Vec::new();
+        for tenant_id in self.tenant_ids()? {
+            bindings.extend(self.read_bindings_for_tenant(&tenant_id).await?);
+        }
+        matrix_provider_configs_from_bindings(bindings)
+    }
+
+    async fn list_room_bindings(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        subject_user_id: &UserId,
+    ) -> Result<Vec<MatrixRoomBinding>, RebornServicesError> {
+        Ok(self
+            .read_bindings_for_tenant(tenant_id)
+            .await?
+            .into_iter()
+            .filter(|binding| {
+                &binding.agent_id == agent_id
+                    && binding.project_id.as_ref() == project_id
+                    && &binding.subject_user_id == subject_user_id
+            })
+            .collect())
+    }
+
+    #[cfg(test)]
+    async fn resolve_room_binding(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: &AgentId,
+        project_id: Option<&ProjectId>,
+        installation_id: &AdapterInstallationId,
+        room_id: &MatrixRoomId,
+        subject_user_id: &UserId,
+    ) -> Result<Option<MatrixRoomBinding>, RebornServicesError> {
+        let path = Self::binding_path_for_key(
+            tenant_id,
+            agent_id,
+            project_id,
+            installation_id,
+            room_id,
+            subject_user_id,
+        )?;
+        let scope = self.scope_for_tenant(tenant_id)?;
+        let Some(versioned) = self
+            .filesystem
+            .get(&scope, &path)
+            .await
+            .map_err(map_matrix_target_filesystem_error)?
+        else {
+            return Ok(None);
+        };
+        let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
+            .map_err(|_| matrix_target_backend_error())?;
+        if stored.is_deleted() {
+            return Ok(None);
+        }
+        stored.into_binding().map(Some)
+    }
+
+    async fn remove_room_binding(
+        &self,
+        request: MatrixRoomBindingRemovalRequest,
+    ) -> Result<MatrixRoomBindingRemovalOutcome, RebornServicesError> {
+        let path = Self::binding_path_for_key(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.as_ref(),
+            &request.installation_id,
+            &request.room_id,
+            &request.subject_user_id,
+        )?;
+        let scope = self.scope_for_tenant(&request.tenant_id)?;
+        let existing = self
+            .filesystem
+            .get(&scope, &path)
+            .await
+            .map_err(map_matrix_target_filesystem_error)?;
+        let outcome = match existing {
+            Some(versioned) => {
+                let stored: StoredMatrixRoomBinding = serde_json::from_slice(&versioned.entry.body)
+                    .map_err(|_| matrix_target_backend_error())?;
+                if stored.is_deleted() {
+                    MatrixRoomBindingRemovalOutcome::NotFound
+                } else {
+                    MatrixRoomBindingRemovalOutcome::Removed
+                }
+            }
+            None => MatrixRoomBindingRemovalOutcome::NotFound,
+        };
+        self.write_binding_tombstone(&request).await?;
+        Ok(outcome)
+    }
+
+    async fn provider_has_removed_room_binding(
+        &self,
+        provider: &MatrixOutboundTargetProviderConfig,
+    ) -> Result<bool, RebornServicesError> {
+        for route in &provider.configured_room_routes {
+            let room_id = MatrixRoomId::new(route.room_id.clone())
+                .map_err(|_| matrix_target_config_error())?;
+            if self
+                .binding_key_has_tombstone(
+                    &provider.tenant_id,
+                    &provider.agent_id,
+                    provider.project_id.as_ref(),
+                    &provider.installation_id,
+                    &room_id,
+                    &route.subject_user_id,
+                )
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
 impl MatrixHostProductOutboundTargetResolver {
+    #[cfg(test)]
     pub(crate) fn new(
         configs: impl IntoIterator<Item = MatrixOutboundTargetProviderConfig>,
     ) -> Result<Self, RebornServicesError> {
@@ -92,13 +860,41 @@ impl MatrixHostProductOutboundTargetResolver {
             .into_iter()
             .map(MatrixHostOutboundTargetProvider::new)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { providers })
+        Ok(Self {
+            source: MatrixHostProductOutboundTargetResolverSource::Static(providers),
+        })
     }
 
-    pub(crate) fn resolve_requested_target(
+    pub(crate) fn from_shared_source(
+        target_source: Arc<dyn MatrixRoomBindingStore>,
+    ) -> Result<Self, RebornServicesError> {
+        Ok(Self {
+            source: MatrixHostProductOutboundTargetResolverSource::Store(target_source),
+        })
+    }
+
+    async fn providers_for_read(
+        &self,
+    ) -> Result<Vec<MatrixHostOutboundTargetProvider>, RebornServicesError> {
+        match &self.source {
+            MatrixHostProductOutboundTargetResolverSource::Store(target_source) => target_source
+                .snapshot_provider_configs()
+                .await?
+                .into_iter()
+                .map(MatrixHostOutboundTargetProvider::new)
+                .collect(),
+            #[cfg(test)]
+            MatrixHostProductOutboundTargetResolverSource::Static(providers) => {
+                Ok(providers.clone())
+            }
+        }
+    }
+
+    pub(crate) async fn resolve_requested_target(
         &self,
         request: &ironclaw_outbound::CommunicationDeliveryResolutionRequest,
     ) -> Option<ResolvedMatrixOutboundTarget> {
+        let providers = self.providers_for_read().await.ok()?;
         let requested_target = match &request.intent {
             CommunicationDeliveryIntent::RequestedOutbound(context) => &context.requested_target,
             CommunicationDeliveryIntent::RunNotification(context) => match &context.origin {
@@ -110,10 +906,11 @@ impl MatrixHostProductOutboundTargetResolver {
                 | RunNotificationOrigin::SystemEvent { .. } => return None,
             },
         };
-        self.providers.iter().find_map(|provider| {
-            if provider.tenant_id != request.scope.tenant_id
-                || Some(&provider.agent_id) != request.scope.agent_id.as_ref()
-                || provider.project_id != request.scope.project_id
+        providers.iter().find_map(|provider| {
+            let provider_config = provider.static_config()?;
+            if provider_config.tenant_id != request.scope.tenant_id
+                || Some(&provider_config.agent_id) != request.scope.agent_id.as_ref()
+                || provider_config.project_id != request.scope.project_id
             {
                 return None;
             }
@@ -121,9 +918,11 @@ impl MatrixHostProductOutboundTargetResolver {
             let route = provider.configured_route_for_key(route_key)?;
             if route.subject_user_id == request.actor.user_id {
                 Some(ResolvedMatrixOutboundTarget {
-                    installation_id: provider.installation_id.clone(),
-                    policy_provider_scope_key: provider.policy_provider_scope_key.clone(),
-                    policy_provider_scope: provider.policy_provider_scope(),
+                    installation_id: provider_config.installation_id.clone(),
+                    policy_provider_scope_key: provider_config.policy_provider_scope_key.clone(),
+                    policy_provider_scope: matrix_policy_provider_scope_from_config(
+                        provider_config,
+                    ),
                     room_id: route.room_id.clone(),
                     reply_target_binding_ref: requested_target.clone(),
                 })
@@ -133,29 +932,35 @@ impl MatrixHostProductOutboundTargetResolver {
         })
     }
 
-    fn resolve_target(
+    async fn resolve_target(
         &self,
         target: &ReplyTargetBindingRef,
-    ) -> Option<(
-        &MatrixHostOutboundTargetProvider,
-        &ValidatedMatrixConfiguredRoomRoute,
-    )> {
-        self.providers.iter().find_map(|provider| {
+    ) -> Option<ResolvedMatrixOutboundTarget> {
+        let providers = self.providers_for_read().await.ok()?;
+        providers.iter().find_map(|provider| {
+            let provider_config = provider.static_config()?;
             let route_key = provider.route_key_for_reply_target_binding_ref(target)?;
-            provider
-                .configured_route_for_key(route_key)
-                .map(|route| (provider, route))
+            let route = provider.configured_route_for_key(route_key)?;
+            Some(ResolvedMatrixOutboundTarget {
+                installation_id: provider_config.installation_id.clone(),
+                policy_provider_scope_key: provider_config.policy_provider_scope_key.clone(),
+                policy_provider_scope: matrix_policy_provider_scope_from_config(provider_config),
+                room_id: route.room_id.clone(),
+                reply_target_binding_ref: target.clone(),
+            })
         })
     }
 
-    fn resolve_candidate(
+    async fn resolve_candidate(
         &self,
         request: &ReplyTargetValidationRequest,
-    ) -> Option<&ValidatedMatrixConfiguredRoomRoute> {
-        self.providers.iter().find_map(|provider| {
-            if provider.tenant_id != request.candidate.tenant_id
-                || Some(&provider.agent_id) != request.candidate.agent_id.as_ref()
-                || provider.project_id != request.candidate.project_id
+    ) -> Option<ValidatedMatrixConfiguredRoomRoute> {
+        let providers = self.providers_for_read().await.ok()?;
+        providers.iter().find_map(|provider| {
+            let provider_config = provider.static_config()?;
+            if provider_config.tenant_id != request.candidate.tenant_id
+                || Some(&provider_config.agent_id) != request.candidate.agent_id.as_ref()
+                || provider_config.project_id != request.candidate.project_id
             {
                 return None;
             }
@@ -163,7 +968,7 @@ impl MatrixHostProductOutboundTargetResolver {
                 provider.route_key_for_reply_target_binding_ref(&request.candidate.target)?;
             let route = provider.configured_route_for_key(route_key)?;
             if route.subject_user_id == request.actor.user_id {
-                Some(route)
+                Some(route.clone())
             } else {
                 None
             }
@@ -196,7 +1001,7 @@ impl ReplyTargetBindingValidator for MatrixHostReplyTargetPolicy {
         &self,
         request: ReplyTargetValidationRequest,
     ) -> Result<ReplyTargetBindingClaim, OutboundError> {
-        if self.resolver.resolve_candidate(&request).is_some() {
+        if self.resolver.resolve_candidate(&request).await.is_some() {
             Ok(ReplyTargetBindingClaim::new(request.candidate.target))
         } else {
             Err(OutboundError::AccessDenied)
@@ -219,7 +1024,7 @@ impl ProductOutboundTargetResolver for MatrixHostProductOutboundTargetResolver {
                 ironclaw_product_workflow::ProductWorkflowError::OutboundTargetNotDirectMessage,
             );
         }
-        let (_provider, route) = self.resolve_target(target.target()).ok_or_else(|| {
+        let resolved = self.resolve_target(target.target()).await.ok_or_else(|| {
             ironclaw_product_workflow::ProductWorkflowError::BindingRequired {
                 reason: "Matrix outbound target binding is not configured".to_string(),
             }
@@ -227,7 +1032,7 @@ impl ProductOutboundTargetResolver for MatrixHostProductOutboundTargetResolver {
         Ok(VerifiedProductOutboundTargetMetadata {
             external_conversation_ref: ExternalConversationRef::new(
                 None,
-                route.room_id.as_str(),
+                resolved.room_id.as_str(),
                 None,
                 None,
             )
@@ -245,6 +1050,14 @@ impl MatrixHostOutboundTargetProvider {
     pub(crate) fn new(
         config: MatrixOutboundTargetProviderConfig,
     ) -> Result<Self, RebornServicesError> {
+        Self::config_from_provider_config(config).map(|config| Self {
+            source: MatrixHostOutboundTargetProviderSource::Static(config),
+        })
+    }
+
+    fn config_from_provider_config(
+        config: MatrixOutboundTargetProviderConfig,
+    ) -> Result<MatrixHostOutboundTargetProviderConfig, RebornServicesError> {
         let room_target_id_prefix = format!("matrix:room:{}:", config.installation_id.as_str());
         let room_binding_ref_prefix =
             format!("reply:matrix:room:{}:", config.installation_id.as_str());
@@ -272,7 +1085,7 @@ impl MatrixHostOutboundTargetProvider {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        Ok(MatrixHostOutboundTargetProviderConfig {
             tenant_id: config.tenant_id,
             agent_id: config.agent_id,
             project_id: config.project_id,
@@ -284,39 +1097,68 @@ impl MatrixHostOutboundTargetProvider {
         })
     }
 
-    fn caller_matches_provider_context(&self, caller: &WebUiAuthenticatedCaller) -> bool {
-        caller.tenant_id == self.tenant_id
-            && caller.agent_id.as_ref() == Some(&self.agent_id)
-            && caller.project_id == self.project_id
+    pub(crate) fn from_shared_source(
+        target_source: Arc<dyn MatrixRoomBindingStore>,
+    ) -> Result<Self, RebornServicesError> {
+        Ok(Self {
+            source: MatrixHostOutboundTargetProviderSource::Store(target_source),
+        })
     }
 
-    fn policy_provider_scope(&self) -> MatrixPolicyProviderScope {
-        MatrixPolicyProviderScope {
-            tenant_id: self.tenant_id.clone(),
-            agent_id: self.agent_id.clone(),
-            project_id: self.project_id.clone(),
+    async fn providers_for_read(
+        &self,
+    ) -> Result<Vec<MatrixHostOutboundTargetProvider>, RebornServicesError> {
+        match &self.source {
+            MatrixHostOutboundTargetProviderSource::Store(target_source) => target_source
+                .snapshot_provider_configs()
+                .await?
+                .into_iter()
+                .map(MatrixHostOutboundTargetProvider::new)
+                .collect(),
+            MatrixHostOutboundTargetProviderSource::Static(_) => Ok(vec![self.clone()]),
         }
+    }
+
+    fn static_config(&self) -> Option<&MatrixHostOutboundTargetProviderConfig> {
+        match &self.source {
+            MatrixHostOutboundTargetProviderSource::Static(config) => Some(config),
+            MatrixHostOutboundTargetProviderSource::Store(_) => None,
+        }
+    }
+
+    fn caller_matches_provider_context(&self, caller: &WebUiAuthenticatedCaller) -> bool {
+        let Some(config) = self.static_config() else {
+            return false;
+        };
+        caller.tenant_id == config.tenant_id
+            && caller.agent_id.as_ref() == Some(&config.agent_id)
+            && caller.project_id == config.project_id
     }
 
     fn route_key_for_target_id<'a>(
         &self,
         target_id: &'a RebornOutboundDeliveryTargetId,
     ) -> Option<&'a str> {
-        target_id.as_str().strip_prefix(&self.room_target_id_prefix)
+        target_id
+            .as_str()
+            .strip_prefix(&self.static_config()?.room_target_id_prefix)
     }
 
     fn route_key_for_reply_target_binding_ref<'a>(
         &self,
         target: &'a ReplyTargetBindingRef,
     ) -> Option<&'a str> {
-        target.as_str().strip_prefix(&self.room_binding_ref_prefix)
+        target
+            .as_str()
+            .strip_prefix(&self.static_config()?.room_binding_ref_prefix)
     }
 
     fn configured_route_for_key(
         &self,
         route_key: &str,
     ) -> Option<&ValidatedMatrixConfiguredRoomRoute> {
-        self.configured_room_routes
+        self.static_config()?
+            .configured_room_routes
             .iter()
             .find(|route| route.route_key == route_key)
     }
@@ -326,9 +1168,12 @@ impl MatrixHostOutboundTargetProvider {
         route: &ValidatedMatrixConfiguredRoomRoute,
     ) -> Result<OutboundDeliveryTargetEntry, RebornServicesError> {
         debug_assert!(route.room_id.as_str().starts_with('!'));
+        let Some(config) = self.static_config() else {
+            return Err(matrix_target_backend_error());
+        };
         let target_id = RebornOutboundDeliveryTargetId::new(format!(
             "{}{}",
-            self.room_target_id_prefix, route.route_key
+            config.room_target_id_prefix, route.route_key
         ))
         .map_err(|_| matrix_target_backend_error())?;
         Ok(OutboundDeliveryTargetEntry {
@@ -346,9 +1191,25 @@ impl MatrixHostOutboundTargetProvider {
             },
             reply_target_binding_ref: ReplyTargetBindingRef::new(format!(
                 "{}{}",
-                self.room_binding_ref_prefix, route.route_key
+                config.room_binding_ref_prefix, route.route_key
             ))
             .map_err(|_| matrix_target_backend_error())?,
+        })
+    }
+
+    fn provider_for_binding(
+        binding: MatrixRoomBinding,
+    ) -> Result<MatrixHostOutboundTargetProvider, RebornServicesError> {
+        MatrixHostOutboundTargetProvider::new(MatrixOutboundTargetProviderConfig {
+            tenant_id: binding.tenant_id,
+            agent_id: binding.agent_id,
+            project_id: binding.project_id,
+            installation_id: binding.installation_id,
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: binding.room_id.as_str().to_string(),
+                subject_user_id: binding.subject_user_id,
+                matrix_sender_user_id: binding.matrix_sender_user_id,
+            }],
         })
     }
 
@@ -376,10 +1237,33 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
         &self,
         caller: &WebUiAuthenticatedCaller,
     ) -> Result<Vec<OutboundDeliveryTargetEntry>, RebornServicesError> {
+        if let MatrixHostOutboundTargetProviderSource::Store(target_source) = &self.source {
+            let Some(agent_id) = caller.agent_id.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let bindings = target_source
+                .list_room_bindings(
+                    &caller.tenant_id,
+                    agent_id,
+                    caller.project_id.as_ref(),
+                    &caller.user_id,
+                )
+                .await?;
+            let mut entries = Vec::with_capacity(bindings.len());
+            for binding in bindings {
+                let provider = Self::provider_for_binding(binding)?;
+                entries.extend(provider.list_outbound_delivery_targets(caller).await?);
+            }
+            return Ok(entries);
+        }
         if !self.caller_matches_provider_context(caller) {
             return Ok(Vec::new());
         }
-        self.configured_room_routes
+        let Some(config) = self.static_config() else {
+            return Err(matrix_target_backend_error());
+        };
+        config
+            .configured_room_routes
             .iter()
             .filter(|route| route.subject_user_id == caller.user_id)
             .map(|route| self.entry_for_room_route(route))
@@ -391,6 +1275,20 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
         caller: &WebUiAuthenticatedCaller,
         target_id: &RebornOutboundDeliveryTargetId,
     ) -> Result<Option<OutboundDeliveryTargetEntry>, RebornServicesError> {
+        if matches!(
+            self.source,
+            MatrixHostOutboundTargetProviderSource::Store(_)
+        ) {
+            for provider in self.providers_for_read().await? {
+                if let Some(entry) = provider
+                    .resolve_outbound_delivery_target(caller, target_id)
+                    .await?
+                {
+                    return Ok(Some(entry));
+                }
+            }
+            return Ok(None);
+        }
         let Some(route_key) = self.route_key_for_target_id(target_id) else {
             return Ok(None);
         };
@@ -402,6 +1300,20 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
         caller: &WebUiAuthenticatedCaller,
         target: &ReplyTargetBindingRef,
     ) -> Result<Option<OutboundDeliveryTargetEntry>, RebornServicesError> {
+        if matches!(
+            self.source,
+            MatrixHostOutboundTargetProviderSource::Store(_)
+        ) {
+            for provider in self.providers_for_read().await? {
+                if let Some(entry) = provider
+                    .resolve_reply_target_binding(caller, target)
+                    .await?
+                {
+                    return Ok(Some(entry));
+                }
+            }
+            return Ok(None);
+        }
         let Some(route_key) = self.route_key_for_reply_target_binding_ref(target) else {
             return Ok(None);
         };
@@ -409,6 +1321,65 @@ impl OutboundDeliveryTargetProvider for MatrixHostOutboundTargetProvider {
     }
 }
 
+fn validate_matrix_outbound_target_provider_configs(
+    configs: &[MatrixOutboundTargetProviderConfig],
+) -> Result<(), RebornServicesError> {
+    configs
+        .iter()
+        .cloned()
+        .map(MatrixHostOutboundTargetProvider::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(())
+}
+
+pub(crate) fn validate_matrix_outbound_target_provider_configs_for_runtime(
+    configs: &[MatrixOutboundTargetProviderConfig],
+) -> Result<(), RebornServicesError> {
+    validate_matrix_outbound_target_provider_configs(configs)
+}
+
+fn matrix_provider_configs_from_bindings(
+    bindings: Vec<MatrixRoomBinding>,
+) -> Result<Vec<MatrixOutboundTargetProviderConfig>, RebornServicesError> {
+    let mut configs: Vec<MatrixOutboundTargetProviderConfig> = Vec::new();
+    for binding in bindings {
+        let route = MatrixConfiguredRoomRoute {
+            room_id: binding.room_id.as_str().to_string(),
+            subject_user_id: binding.subject_user_id,
+            matrix_sender_user_id: binding.matrix_sender_user_id,
+        };
+        if let Some(config) = configs.iter_mut().find(|config| {
+            config.tenant_id == binding.tenant_id
+                && config.agent_id == binding.agent_id
+                && config.project_id == binding.project_id
+                && config.installation_id == binding.installation_id
+        }) {
+            config.configured_room_routes.push(route);
+        } else {
+            configs.push(MatrixOutboundTargetProviderConfig {
+                tenant_id: binding.tenant_id,
+                agent_id: binding.agent_id,
+                project_id: binding.project_id,
+                installation_id: binding.installation_id,
+                configured_room_routes: vec![route],
+            });
+        }
+    }
+    validate_matrix_outbound_target_provider_configs(&configs)?;
+    Ok(configs)
+}
+
+fn matrix_policy_provider_scope_from_config(
+    config: &MatrixHostOutboundTargetProviderConfig,
+) -> MatrixPolicyProviderScope {
+    MatrixPolicyProviderScope {
+        tenant_id: config.tenant_id.clone(),
+        agent_id: config.agent_id.clone(),
+        project_id: config.project_id.clone(),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn register_matrix_outbound_target_provider(
     registry: &MutableOutboundDeliveryTargetRegistry,
     config: MatrixOutboundTargetProviderConfig,
@@ -416,6 +1387,17 @@ pub(crate) fn register_matrix_outbound_target_provider(
     let provider_key = matrix_outbound_target_provider_key(&config);
     let provider = MatrixHostOutboundTargetProvider::new(config)?;
     registry.register_provider(provider_key, std::sync::Arc::new(provider))
+}
+
+pub(crate) fn register_matrix_outbound_target_provider_source(
+    registry: &MutableOutboundDeliveryTargetRegistry,
+    target_source: Arc<dyn MatrixRoomBindingStore>,
+) -> Result<OutboundDeliveryTargetRegistrationOutcome, RebornServicesError> {
+    let provider = MatrixHostOutboundTargetProvider::from_shared_source(target_source)?;
+    registry.register_provider(
+        "matrix:outbound-target-provider:shared".to_string(),
+        std::sync::Arc::new(provider),
+    )
 }
 
 pub(crate) fn matrix_policy_provider_scope_key(
@@ -432,6 +1414,7 @@ pub(crate) fn matrix_policy_provider_scope_key(
     sha256_hex(&input)
 }
 
+#[cfg(test)]
 fn matrix_outbound_target_provider_key(config: &MatrixOutboundTargetProviderConfig) -> String {
     format!(
         "matrix:outbound-target-provider:{}",
@@ -495,9 +1478,21 @@ fn matrix_target_backend_error() -> RebornServicesError {
     }
 }
 
+fn map_matrix_target_filesystem_error(error: FilesystemError) -> RebornServicesError {
+    if matrix_target_filesystem_not_found(&error) {
+        return matrix_target_backend_error();
+    }
+    matrix_target_backend_error()
+}
+
+fn matrix_target_filesystem_not_found(error: &FilesystemError) -> bool {
+    matches!(error, FilesystemError::NotFound { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use ironclaw_event_projections::ProjectionScope;
+    use ironclaw_filesystem::{InMemoryBackend, RootFilesystem};
     use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
     use ironclaw_matrix_adapter::installation_policy::MatrixUserId;
     use ironclaw_outbound::{
@@ -509,11 +1504,14 @@ mod tests {
     use ironclaw_product_adapters::AdapterInstallationId;
     use ironclaw_product_workflow::{RebornOutboundDeliveryTargetId, WebUiAuthenticatedCaller};
     use ironclaw_turns::{ReplyTargetBindingRef, TurnActor, TurnScope};
+    use std::sync::Arc;
 
     use crate::matrix_outbound_targets::{
-        MatrixConfiguredRoomRoute, MatrixHostOutboundTargetProvider,
-        MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
-        MatrixOutboundTargetProviderConfig,
+        FilesystemMatrixRoomBindingStore, MatrixConfiguredRoomRoute,
+        MatrixHostOutboundTargetProvider, MatrixHostProductOutboundTargetResolver,
+        MatrixHostReplyTargetPolicy, MatrixOutboundTargetProviderConfig,
+        MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore,
+        MutableMatrixOutboundTargetProviders,
     };
     use crate::outbound::{
         MutableOutboundDeliveryTargetRegistry, OutboundDeliveryTargetProvider,
@@ -530,6 +1528,7 @@ mod tests {
     const OTHER_INSTALLATION: &str = "inst_other";
     const ROOM: &str = "!room:example.org";
     const OTHER_ROOM: &str = "!other:example.org";
+    const ROOM_B: &str = "!room-b:example.org";
     const MATRIX_USER: &str = "@alice:example.org";
     const OTHER_MATRIX_USER: &str = "@bob:example.org";
 
@@ -684,6 +1683,7 @@ mod tests {
             .resolve_requested_target(&delivery_resolution_request(
                 second_target.reply_target_binding_ref,
             ))
+            .await
             .expect("requested Matrix target resolves");
 
         assert_eq!(
@@ -716,6 +1716,7 @@ mod tests {
             .resolve_requested_target(&live_source_route_resolution_request(
                 second_target.reply_target_binding_ref,
             ))
+            .await
             .expect("live source-route Matrix target resolves");
 
         assert_eq!(
@@ -857,6 +1858,358 @@ mod tests {
                 .summary
                 .target_id,
             listed.summary.target_id
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_removal_shared_source_drops_listing_resolution_and_resolver() {
+        let source = MutableMatrixOutboundTargetProviders::new([provider_config(
+            INSTALLATION,
+            vec![
+                room_route(ROOM, USER, MATRIX_USER),
+                room_route(ROOM_B, USER, MATRIX_USER),
+            ],
+        )])
+        .expect("shared Matrix target source");
+        let store: Arc<dyn super::MatrixRoomBindingStore> = Arc::new(source.clone());
+        let provider = MatrixHostOutboundTargetProvider::from_shared_source(Arc::clone(&store))
+            .expect("provider");
+        let resolver =
+            MatrixHostProductOutboundTargetResolver::from_shared_source(Arc::clone(&store))
+                .expect("resolver");
+
+        let listed = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("initial target list");
+        assert_eq!(listed.len(), 2);
+        let mut room_b_binding = None;
+        for target in &listed {
+            let Some(resolved) = resolver
+                .resolve_requested_target(&delivery_resolution_request(
+                    target.reply_target_binding_ref.clone(),
+                ))
+                .await
+            else {
+                continue;
+            };
+            if resolved.room_id.as_str() == ROOM_B {
+                room_b_binding = Some(target.reply_target_binding_ref.clone());
+                break;
+            }
+        }
+        let room_b_binding = room_b_binding.expect("room B binding should initially resolve");
+
+        let outcome = source
+            .remove_room_binding(MatrixRoomBindingRemovalRequest {
+                tenant_id: TenantId::new(TENANT).expect("tenant"),
+                agent_id: AgentId::new(AGENT).expect("agent"),
+                project_id: Some(ProjectId::new(PROJECT).expect("project")),
+                installation_id: AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                room_id: crate::matrix_outbound::MatrixRoomId::new(ROOM_B.to_string())
+                    .expect("room B"),
+                subject_user_id: UserId::new(USER).expect("user"),
+            })
+            .await
+            .expect("room B removal");
+        assert_eq!(outcome, MatrixRoomBindingRemovalOutcome::Removed);
+
+        let after_removal = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("target list after room B removal");
+        assert_eq!(after_removal.len(), 1);
+        assert!(
+            provider
+                .resolve_reply_target_binding(&caller(USER), &room_b_binding)
+                .await
+                .expect("room B binding lookup after removal")
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_requested_target(&delivery_resolution_request(room_b_binding))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_removal_is_scoped_to_subject_in_shared_room() {
+        let source = MutableMatrixOutboundTargetProviders::new([provider_config(
+            INSTALLATION,
+            vec![
+                room_route(ROOM, USER, MATRIX_USER),
+                room_route(ROOM, OTHER_USER, OTHER_MATRIX_USER),
+                room_route(ROOM_B, USER, MATRIX_USER),
+            ],
+        )])
+        .expect("shared Matrix target source");
+        let store: Arc<dyn super::MatrixRoomBindingStore> = Arc::new(source.clone());
+        let provider = MatrixHostOutboundTargetProvider::from_shared_source(Arc::clone(&store))
+            .expect("provider");
+        let resolver =
+            MatrixHostProductOutboundTargetResolver::from_shared_source(Arc::clone(&store))
+                .expect("resolver");
+
+        let alice_initial = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("alice initial target list");
+        let bob_initial = provider
+            .list_outbound_delivery_targets(&caller(OTHER_USER))
+            .await
+            .expect("bob initial target list");
+        assert_eq!(alice_initial.len(), 2);
+        assert_eq!(bob_initial.len(), 1);
+        let mut alice_room_binding = None;
+        for target in &alice_initial {
+            let Some(resolved) = resolver
+                .resolve_requested_target(&delivery_resolution_request(
+                    target.reply_target_binding_ref.clone(),
+                ))
+                .await
+            else {
+                continue;
+            };
+            if resolved.room_id.as_str() == ROOM {
+                alice_room_binding = Some(target.reply_target_binding_ref.clone());
+                break;
+            }
+        }
+        let alice_room_binding =
+            alice_room_binding.expect("alice shared-room binding initially resolves");
+        let bob_room_binding = bob_initial[0].reply_target_binding_ref.clone();
+
+        assert_eq!(
+            store
+                .resolve_room_binding(
+                    &TenantId::new(TENANT).expect("tenant"),
+                    &AgentId::new(AGENT).expect("agent"),
+                    Some(&ProjectId::new(PROJECT).expect("project")),
+                    &AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                    &crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string()).expect("room"),
+                    &UserId::new(OTHER_USER).expect("other user"),
+                )
+                .await
+                .expect("store resolves bob room binding")
+                .expect("bob room binding")
+                .subject_user_id
+                .as_str(),
+            OTHER_USER
+        );
+
+        let outcome = source
+            .remove_room_binding(MatrixRoomBindingRemovalRequest {
+                tenant_id: TenantId::new(TENANT).expect("tenant"),
+                agent_id: AgentId::new(AGENT).expect("agent"),
+                project_id: Some(ProjectId::new(PROJECT).expect("project")),
+                installation_id: AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                room_id: crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string()).expect("room"),
+                subject_user_id: UserId::new(USER).expect("user"),
+            })
+            .await
+            .expect("alice shared-room removal");
+        assert_eq!(outcome, MatrixRoomBindingRemovalOutcome::Removed);
+
+        let alice_after_removal = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("alice target list after removal");
+        let bob_after_removal = provider
+            .list_outbound_delivery_targets(&caller(OTHER_USER))
+            .await
+            .expect("bob target list after removal");
+        assert_eq!(alice_after_removal.len(), 1);
+        assert_eq!(bob_after_removal.len(), 1);
+        assert!(
+            provider
+                .resolve_reply_target_binding(&caller(USER), &alice_room_binding)
+                .await
+                .expect("alice shared-room binding lookup after removal")
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_requested_target(&delivery_resolution_request(alice_room_binding))
+                .await
+                .is_none()
+        );
+        assert!(
+            provider
+                .resolve_reply_target_binding(&caller(OTHER_USER), &bob_room_binding)
+                .await
+                .expect("bob shared-room binding lookup after alice removal")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_matrix_room_binding_store_tombstone_survives_reload_and_seed() {
+        let filesystem: Arc<dyn RootFilesystem> = Arc::new(InMemoryBackend::default());
+        let tenant_id = TenantId::new(TENANT).expect("tenant");
+        let config = provider_config(
+            INSTALLATION,
+            vec![
+                room_route(ROOM, USER, MATRIX_USER),
+                room_route(ROOM, OTHER_USER, OTHER_MATRIX_USER),
+                room_route(ROOM_B, USER, MATRIX_USER),
+            ],
+        );
+        let store =
+            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
+        store
+            .seed_from_configs(std::slice::from_ref(&config))
+            .await
+            .expect("seed filesystem Matrix room binding store");
+
+        let reloaded =
+            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
+        let store_ref: Arc<dyn super::MatrixRoomBindingStore> = Arc::new(reloaded.clone());
+        let provider = MatrixHostOutboundTargetProvider::from_shared_source(Arc::clone(&store_ref))
+            .expect("provider");
+        let resolver =
+            MatrixHostProductOutboundTargetResolver::from_shared_source(Arc::clone(&store_ref))
+                .expect("resolver");
+
+        let alice_initial = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("alice persisted target list");
+        let bob_initial = provider
+            .list_outbound_delivery_targets(&caller(OTHER_USER))
+            .await
+            .expect("bob persisted target list");
+        assert_eq!(alice_initial.len(), 2);
+        assert_eq!(bob_initial.len(), 1);
+
+        let mut alice_shared_room_binding = None;
+        for target in &alice_initial {
+            let Some(resolved) = resolver
+                .resolve_requested_target(&delivery_resolution_request(
+                    target.reply_target_binding_ref.clone(),
+                ))
+                .await
+            else {
+                continue;
+            };
+            if resolved.room_id.as_str() == ROOM {
+                alice_shared_room_binding = Some(target.reply_target_binding_ref.clone());
+                break;
+            }
+        }
+        let alice_shared_room_binding =
+            alice_shared_room_binding.expect("alice shared-room binding resolves before delete");
+        let bob_shared_room_binding = bob_initial[0].reply_target_binding_ref.clone();
+
+        assert_eq!(
+            reloaded
+                .remove_room_binding(MatrixRoomBindingRemovalRequest {
+                    tenant_id: tenant_id.clone(),
+                    agent_id: AgentId::new(AGENT).expect("agent"),
+                    project_id: Some(ProjectId::new(PROJECT).expect("project")),
+                    installation_id: AdapterInstallationId::new(INSTALLATION)
+                        .expect("installation"),
+                    room_id: crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string())
+                        .expect("room"),
+                    subject_user_id: UserId::new(USER).expect("user"),
+                })
+                .await
+                .expect("remove alice shared-room binding"),
+            MatrixRoomBindingRemovalOutcome::Removed
+        );
+
+        let post_delete_reload =
+            FilesystemMatrixRoomBindingStore::new(Arc::clone(&filesystem), [tenant_id.clone()]);
+        assert!(
+            post_delete_reload
+                .provider_has_removed_room_binding(&config)
+                .await
+                .expect("provider tombstone lookup"),
+            "provider tombstone must remain durable for stale refresh guards"
+        );
+        assert!(
+            post_delete_reload
+                .resolve_room_binding(
+                    &TenantId::new(TENANT).expect("tenant"),
+                    &AgentId::new(AGENT).expect("agent"),
+                    Some(&ProjectId::new(PROJECT).expect("project")),
+                    &AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                    &crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string()).expect("room"),
+                    &UserId::new(USER).expect("user"),
+                )
+                .await
+                .expect("alice binding lookup after delete")
+                .is_none()
+        );
+        assert!(
+            post_delete_reload
+                .resolve_room_binding(
+                    &TenantId::new(TENANT).expect("tenant"),
+                    &AgentId::new(AGENT).expect("agent"),
+                    Some(&ProjectId::new(PROJECT).expect("project")),
+                    &AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                    &crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string()).expect("room"),
+                    &UserId::new(OTHER_USER).expect("other user"),
+                )
+                .await
+                .expect("bob binding lookup after alice delete")
+                .is_some()
+        );
+        let post_delete_scope = post_delete_reload
+            .scope_for_tenant(&tenant_id)
+            .expect("post-delete scope");
+        let seed_marker_path =
+            FilesystemMatrixRoomBindingStore::seed_marker_path().expect("seed marker path");
+        post_delete_reload
+            .filesystem
+            .delete(&post_delete_scope, &seed_marker_path)
+            .await
+            .expect("remove seed marker to force reseed path");
+        post_delete_reload
+            .seed_from_configs(std::slice::from_ref(&config))
+            .await
+            .expect("reseed must not overwrite tombstoned Matrix room binding");
+        assert!(
+            post_delete_reload
+                .resolve_room_binding(
+                    &TenantId::new(TENANT).expect("tenant"),
+                    &AgentId::new(AGENT).expect("agent"),
+                    Some(&ProjectId::new(PROJECT).expect("project")),
+                    &AdapterInstallationId::new(INSTALLATION).expect("installation"),
+                    &crate::matrix_outbound::MatrixRoomId::new(ROOM.to_string()).expect("room"),
+                    &UserId::new(USER).expect("user"),
+                )
+                .await
+                .expect("alice binding lookup after reseed")
+                .is_none(),
+            "config seed must not resurrect a removed binding"
+        );
+
+        let alice_after_delete = provider
+            .list_outbound_delivery_targets(&caller(USER))
+            .await
+            .expect("alice target list after durable delete");
+        assert_eq!(alice_after_delete.len(), 1);
+        assert!(
+            provider
+                .resolve_reply_target_binding(&caller(USER), &alice_shared_room_binding)
+                .await
+                .expect("provider resolve after durable delete")
+                .is_none()
+        );
+        assert!(
+            resolver
+                .resolve_requested_target(&delivery_resolution_request(alice_shared_room_binding))
+                .await
+                .is_none()
+        );
+        assert!(
+            provider
+                .resolve_reply_target_binding(&caller(OTHER_USER), &bob_shared_room_binding)
+                .await
+                .expect("bob provider resolve after alice durable delete")
+                .is_some()
         );
     }
 

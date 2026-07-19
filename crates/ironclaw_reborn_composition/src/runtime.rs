@@ -124,13 +124,14 @@ use crate::matrix_outbound::{
     MatrixRetrySchedule, MatrixRouteMetadata, MatrixRoutePolicyOwnerToken, SealedDeliveryGrant,
 };
 use crate::matrix_outbound_targets::{
-    MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
-    register_matrix_outbound_target_provider,
+    FilesystemMatrixRoomBindingStore, MatrixHostProductOutboundTargetResolver,
+    MatrixHostReplyTargetPolicy, MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest,
+    MatrixRoomBindingStore, register_matrix_outbound_target_provider_source,
 };
 use crate::matrix_product_outbound::{
-    FilesystemMatrixPolicySnapshotSource, MatrixLifecyclePolicyProjectionCacheRefresher,
-    MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryInput,
-    MatrixProductOutboundEntrypoint,
+    FilesystemMatrixPolicySnapshotSource, MATRIX_PRODUCT_ADAPTER_EXTENSION_ID,
+    MatrixLifecyclePolicyProjectionCacheRefresher, MatrixProductOutboundDeliveryError,
+    MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
@@ -752,6 +753,9 @@ pub struct RebornRuntime {
     trigger_conversation_pairing:
         Option<Arc<dyn ironclaw_conversations::ConversationActorPairingService>>,
     outbound_delivery_target_registry: Option<Arc<MutableOutboundDeliveryTargetRegistry>>,
+    matrix_room_binding_store: Option<Arc<dyn MatrixRoomBindingStore>>,
+    matrix_policy_projection_cache_refresher:
+        Option<Arc<MatrixLifecyclePolicyProjectionCacheRefresher>>,
     matrix_product_outbound_target_resolver: Option<Arc<MatrixHostProductOutboundTargetResolver>>,
     budget_event_projection: Option<crate::observability::budget_events::BudgetEventProjection>,
     poll_settings: PollSettings,
@@ -1892,6 +1896,60 @@ impl RebornRuntime {
             })
     }
 
+    pub async fn remove_matrix_room_binding(
+        &self,
+        request: MatrixRoomBindingRemovalRequest,
+    ) -> Result<MatrixRoomBindingRemovalOutcome, RebornRuntimeError> {
+        let Some(target_source) = self.matrix_room_binding_store.as_ref() else {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "Matrix outbound target provider source is not configured".to_string(),
+            });
+        };
+        let Some(refresher) = self.matrix_policy_projection_cache_refresher.as_ref() else {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "Matrix policy projection cache refresher is not configured".to_string(),
+            });
+        };
+        let scope = ResourceScope {
+            tenant_id: request.tenant_id.clone(),
+            user_id: self.actor_user_id.clone(),
+            agent_id: Some(request.agent_id.clone()),
+            project_id: request.project_id.clone(),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        };
+        let extension_id =
+            ExtensionId::new(MATRIX_PRODUCT_ADAPTER_EXTENSION_ID).map_err(|error| {
+                RebornRuntimeError::InvalidArgument {
+                    reason: format!("Matrix ProductAdapter extension id is invalid: {error}"),
+                }
+            })?;
+        refresher
+            .invalidate_before_target_binding_removal(&scope, &extension_id, &request)
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "Matrix policy projection cache pre-invalidation before room binding removal failed: {error}"
+                ),
+            })?;
+        let outcome = target_source
+            .remove_room_binding(request)
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!("Matrix room binding removal failed: {error}"),
+            })?;
+        refresher
+            .refresh_after_target_binding_mutation(&scope, &extension_id)
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "Matrix policy projection cache refresh after room binding removal failed: {error}"
+                ),
+            })?;
+        Ok(outcome)
+    }
+
     pub async fn prepare_matrix_product_outbound(
         &self,
         input: MatrixProductOutboundDeliveryInput,
@@ -1918,6 +1976,7 @@ impl RebornRuntime {
             })?;
         let resolved_target = target_resolver
             .resolve_requested_target(&input.delivery.resolution_request)
+            .await
             .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
                 reason: "Matrix product outbound requested target is not configured".to_string(),
             })?;
@@ -3453,12 +3512,21 @@ pub async fn build_reborn_runtime(
                 .to_string(),
         });
     }
-    if !matrix_outbound_target_providers.is_empty() && matrix_policy_projection_cache.is_none() {
+    let has_matrix_outbound_target_providers = !matrix_outbound_target_providers.is_empty();
+    if has_matrix_outbound_target_providers && matrix_policy_projection_cache.is_none() {
         return Err(RebornRuntimeError::InvalidArgument {
             reason:
                 "RebornRuntimeInput.matrix_outbound_target_providers requires matrix_policy_projection_cache"
                     .to_string(),
         });
+    }
+    if has_matrix_outbound_target_providers {
+        crate::matrix_outbound_targets::validate_matrix_outbound_target_provider_configs_for_runtime(
+            &matrix_outbound_target_providers,
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("Matrix outbound target provider configuration failed: {error}"),
+        })?;
     }
 
     let validated_identity = validate_runtime_identity(identity)?;
@@ -3483,18 +3551,6 @@ pub async fn build_reborn_runtime(
     }
     let trusted_laptop_access = services_input.grants_trusted_laptop_access();
     let owner_id = services_input.owner_id().to_string();
-    let matrix_product_outbound_target_resolver = if matrix_outbound_target_providers.is_empty() {
-        None
-    } else {
-        Some(Arc::new(
-            MatrixHostProductOutboundTargetResolver::new(matrix_outbound_target_providers.clone())
-                .map_err(|error| RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "Matrix product outbound target resolver configuration failed: {error}"
-                    ),
-                })?,
-        ))
-    };
     // Thread per-user and per-origin concurrency caps from TurnRunnerSettings into the
     // turn-state store. The factory reads these when constructing the store so limits
     // are applied from the very first claim.
@@ -3529,9 +3585,10 @@ pub async fn build_reborn_runtime(
             .await?;
     }
     enforce_runtime_cutover_gate(profile, &services.readiness)?;
-    if let Some(config) = matrix_policy_projection_cache {
-        let local_runtime =
-            services
+    let mut matrix_room_binding_store: Option<Arc<dyn MatrixRoomBindingStore>> = None;
+    let matrix_policy_projection_cache_refresher =
+        if let Some(config) = matrix_policy_projection_cache {
+            let local_runtime = services
                 .local_runtime
                 .as_ref()
                 .ok_or(RebornRuntimeError::InvalidArgument {
@@ -3539,8 +3596,7 @@ pub async fn build_reborn_runtime(
                     "Matrix policy projection cache refresh requires lifecycle runtime substrate"
                         .to_string(),
             })?;
-        let extension_management =
-            local_runtime
+            let extension_management = local_runtime
                 .extension_management
                 .as_ref()
                 .ok_or(RebornRuntimeError::InvalidArgument {
@@ -3548,20 +3604,56 @@ pub async fn build_reborn_runtime(
                     "Matrix policy projection cache refresh requires extension lifecycle management"
                         .to_string(),
             })?;
-        let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> =
-            local_runtime.extension_filesystem.clone();
-        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
-            filesystem,
-            extension_management.installation_store(),
-            matrix_outbound_target_providers.clone(),
-            config.artifact_evidence,
-            config.policy_owner_actor,
-        )
-        .map_err(|error| RebornRuntimeError::InvalidArgument {
-            reason: format!("Matrix policy projection cache refresh configuration failed: {error}"),
-        })?;
-        extension_management.set_policy_projection_cache_refresher(Arc::new(refresher));
-    }
+            let filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem> =
+                local_runtime.extension_filesystem.clone();
+            let tenant_ids = matrix_outbound_target_providers
+                .iter()
+                .map(|config| config.tenant_id.clone())
+                .collect::<Vec<_>>();
+            let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+                filesystem.clone(),
+                tenant_ids,
+            ));
+            target_source
+                .seed_from_configs(&matrix_outbound_target_providers)
+                .await
+                .map_err(|error| RebornRuntimeError::InvalidArgument {
+                    reason: format!("Matrix room binding store seed failed: {error}"),
+                })?;
+            let target_source: Arc<dyn MatrixRoomBindingStore> = target_source;
+            matrix_room_binding_store = Some(Arc::clone(&target_source));
+            let refresher = Arc::new(
+                MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+                    filesystem,
+                    extension_management.installation_store(),
+                    Arc::clone(&target_source),
+                    config.artifact_evidence,
+                    config.policy_owner_actor,
+                )
+                .map_err(|error| RebornRuntimeError::InvalidArgument {
+                    reason: format!(
+                        "Matrix policy projection cache refresh configuration failed: {error}"
+                    ),
+                })?,
+            );
+            extension_management.set_policy_projection_cache_refresher(refresher.clone());
+            Some(refresher)
+        } else {
+            None
+        };
+    let matrix_product_outbound_target_resolver =
+        if let Some(target_source) = matrix_room_binding_store.clone() {
+            Some(Arc::new(
+                MatrixHostProductOutboundTargetResolver::from_shared_source(target_source)
+                    .map_err(|error| RebornRuntimeError::InvalidArgument {
+                        reason: format!(
+                            "Matrix product outbound target resolver configuration failed: {error}"
+                        ),
+                    })?,
+            ))
+        } else {
+            None
+        };
 
     // Extract the pre-minted scheduler wake wiring from the production composition path
     // (minted in `build_production_shaped`) so it can be handed to
@@ -3880,30 +3972,28 @@ pub async fn build_reborn_runtime(
     // One registry is created with the runtime store parts for both local and
     // production profiles. The trigger-create hook validates per-trigger
     // delivery targets against the same registry product hosts register into.
-    if !matrix_outbound_target_providers.is_empty() {
-        for config in matrix_outbound_target_providers {
-            let outcome = register_matrix_outbound_target_provider(
-                &outbound_delivery_target_registry,
-                config,
-            )
-            .map_err(|error| {
-                tracing::warn!(
-                    target = "ironclaw::reborn::matrix_outbound_targets",
-                    error = %error,
-                    "Matrix outbound delivery target provider registration failed"
-                );
-                RebornRuntimeError::InvalidArgument {
-                    reason: format!(
-                        "Matrix outbound delivery target provider registration failed: {error}"
-                    ),
-                }
-            })?;
-            if outcome == OutboundDeliveryTargetRegistrationOutcome::Replaced {
-                return Err(RebornRuntimeError::InvalidArgument {
-                    reason: "duplicate Matrix outbound delivery target provider registration"
-                        .to_string(),
-                });
+    if let Some(target_source) = matrix_room_binding_store.clone() {
+        let outcome = register_matrix_outbound_target_provider_source(
+            &outbound_delivery_target_registry,
+            target_source,
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                target = "ironclaw::reborn::matrix_outbound_targets",
+                error = %error,
+                "Matrix outbound delivery target provider registration failed"
+            );
+            RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "Matrix outbound delivery target provider registration failed: {error}"
+                ),
             }
+        })?;
+        if outcome == OutboundDeliveryTargetRegistrationOutcome::Replaced {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "duplicate Matrix outbound delivery target provider registration"
+                    .to_string(),
+            });
         }
     }
     let provider: Arc<dyn OutboundDeliveryTargetProvider> =
@@ -4537,6 +4627,8 @@ pub async fn build_reborn_runtime(
         #[cfg(any(test, feature = "test-support"))]
         trigger_conversation_pairing: trigger_conversation_pairing_value,
         outbound_delivery_target_registry: Some(outbound_delivery_target_registry),
+        matrix_room_binding_store,
+        matrix_policy_projection_cache_refresher,
         matrix_product_outbound_target_resolver,
         budget_event_projection,
         poll_settings: poll,

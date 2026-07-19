@@ -7,6 +7,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_auth::{GOOGLE_CALENDAR_EVENTS_SCOPE, GOOGLE_CALENDAR_READONLY_SCOPE};
+use ironclaw_matrix_adapter::installation_policy::{
+    ArtifactSha256, ComponentArtifactId, MatrixRuntimeArtifactEvidence, WitPackageName,
+    WitWorldName,
+};
 
 #[test]
 fn persistent_grantee_resolver_maps_outbound_delivery_target_set_to_synthetic_provider() {
@@ -2726,7 +2730,7 @@ async fn build_reborn_runtime_spawns_and_shuts_down_configured_matrix_retry_work
 
 #[cfg(feature = "libsql")]
 #[tokio::test]
-async fn production_runtime_registers_matrix_outbound_target_mount() {
+async fn production_runtime_rejects_matrix_outbound_target_mount_without_lifecycle_substrate() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(
         libsql::Builder::new_local(dir.path().join("reborn.db"))
@@ -2734,10 +2738,6 @@ async fn production_runtime_registers_matrix_outbound_target_mount() {
             .await
             .expect("libsql db"),
     );
-    let gateway = Arc::new(RecordingGateway {
-        reply: "validated production runtime with matrix target".to_string(),
-        requests: Arc::new(StdMutex::new(Vec::new())),
-    });
     let tenant_id = TenantId::new("runtime-production-matrix-target-tenant").expect("tenant");
     let user_id = UserId::new("runtime-production-matrix-target-user").expect("user");
     let agent_id = AgentId::new("runtime-production-matrix-target-agent").expect("agent");
@@ -2807,7 +2807,13 @@ async fn production_runtime_registers_matrix_outbound_target_mount() {
         source_binding_id: "runtime-production-matrix-target-source".to_string(),
         reply_target_binding_id: "runtime-production-matrix-target-reply".to_string(),
     })
-    .with_model_gateway_override(gateway)
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_target_artifact_evidence(),
+            "runtime-production-matrix-target-policy-owner",
+        )
+        .expect("Matrix policy projection cache config"),
+    )
     .with_matrix_outbound_target_mount(crate::MatrixOutboundTargetMountConfig::new(
         crate::MatrixOutboundTargetMountConfigInput {
             tenant_id: tenant_id.clone(),
@@ -2829,30 +2835,39 @@ async fn production_runtime_registers_matrix_outbound_target_mount() {
         },
     ));
 
-    let runtime = build_reborn_runtime(input)
-        .await
-        .expect("production runtime should build with Matrix target mount");
-    let provider = runtime
-        .outbound_delivery_target_provider()
-        .expect("production runtime outbound target provider");
-    let listed = provider
-        .list_outbound_delivery_targets(&WebUiAuthenticatedCaller::new(
-            tenant_id,
-            user_id,
-            Some(agent_id),
-            None,
-        ))
-        .await
-        .expect("Matrix target listing");
+    let error = match build_reborn_runtime(input).await {
+        Ok(runtime) => {
+            runtime.shutdown().await.expect("runtime shutdown");
+            panic!(
+                "Matrix outbound target mounts in production require lifecycle substrate for policy projection refresh"
+            );
+        }
+        Err(error) => error,
+    };
 
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].summary.channel.as_str(), "matrix");
-    assert!(listed[0].capabilities.final_replies);
+    assert!(
+        matches!(
+            error,
+            RebornRuntimeError::InvalidArgument { ref reason }
+                if reason.contains("Matrix policy projection cache refresh requires lifecycle runtime substrate")
+        ),
+        "unexpected error: {error:#}"
+    );
+}
 
-    tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
-        .await
-        .expect("Matrix retry worker shutdown should not hang")
-        .expect("runtime shutdown");
+fn runtime_matrix_target_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
+    MatrixRuntimeArtifactEvidence {
+        artifact_id: ComponentArtifactId::new("runtime-production-matrix-target-component")
+            .expect("artifact id"),
+        artifact_sha256: ArtifactSha256::new(
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("artifact sha"),
+        wit_package: WitPackageName::new("near:runtime-production-matrix-target@0.1.0")
+            .expect("wit package"),
+        wit_world: WitWorldName::new("runtime-production-matrix-target-product-adapter")
+            .expect("wit world"),
+    }
 }
 
 /// Regression guard for Firat's review: a trajectory observer is only wired

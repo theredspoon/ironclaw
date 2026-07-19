@@ -158,6 +158,9 @@ pub use local_runtime_profile::{
     local_dev_runtime_policy, local_dev_yolo_runtime_policy, local_runtime_build_input,
     local_runtime_build_input_with_options,
 };
+pub use matrix_outbound_targets::{
+    MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest,
+};
 pub use observability::budget::build_default_budget_accountant;
 pub use observability::budget_events::{BudgetEventObserver, TracingBudgetEventObserver};
 pub use observability::hooks::{
@@ -742,6 +745,11 @@ fn invocation_mount_view_for_segments(
         VirtualPath::new(format!("/tenants/{tenant_id}/shared/reborn-identity"))?,
         MountPermissions::read_write_list_delete(),
     ));
+    grants.push(MountGrant::new(
+        MountAlias::new("/tenant-shared/matrix/room-bindings")?,
+        VirtualPath::new(format!("/tenants/{tenant_id}/shared/matrix/room-bindings"))?,
+        MountPermissions::read_only(),
+    ));
     #[cfg(feature = "slack-v2-host-beta")]
     grants.push(MountGrant::new(
         MountAlias::new("/tenant-shared/slack-channel-routes")?,
@@ -756,6 +764,17 @@ fn invocation_mount_view_for_segments(
         ));
     }
     MountView::new(grants)
+}
+
+pub(crate) fn matrix_room_binding_store_mount_view(
+    scope: &ResourceScope,
+) -> Result<MountView, ironclaw_host_api::HostApiError> {
+    let tenant_id = resource_scope_path_segment(scope.tenant_id.as_str());
+    MountView::new(vec![MountGrant::new(
+        MountAlias::new("/tenant-shared/matrix/room-bindings")?,
+        VirtualPath::new(format!("/tenants/{tenant_id}/shared/matrix/room-bindings"))?,
+        MountPermissions::read_write_list_delete(),
+    )])
 }
 
 #[cfg(all(
@@ -1005,7 +1024,9 @@ pub fn open_reborn_postgres_pool_with_max_size(
 #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
 mod mount_view_tests {
     use super::*;
-    use ironclaw_filesystem::{FilesystemError, FilesystemOperation, InMemoryBackend};
+    use ironclaw_filesystem::{
+        CasExpectation, Entry, FilesystemError, FilesystemOperation, InMemoryBackend,
+    };
     use ironclaw_host_api::{
         AgentId, InvocationId, MissionId, ProjectId, ScopedPath, TenantId, ThreadId, UserId,
     };
@@ -1093,6 +1114,82 @@ mod mount_view_tests {
         );
         assert_eq!(grant.alias.as_str(), "/tenant-shared/slack-channel-routes");
         assert_eq!(grant.permissions, MountPermissions::read_only());
+    }
+
+    #[test]
+    fn invocation_mount_view_exposes_matrix_room_bindings_read_only() {
+        let scope = sample_scope();
+        let view = invocation_mount_view(&scope).unwrap();
+        let (resolved, grant) = view
+            .resolve_with_grant(
+                &ScopedPath::new("/tenant-shared/matrix/room-bindings/binding.json").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.as_str(),
+            &format!(
+                "/tenants/{}/shared/matrix/room-bindings/binding.json",
+                scope.tenant_id.as_str()
+            )
+        );
+        assert_eq!(grant.alias.as_str(), "/tenant-shared/matrix/room-bindings");
+        assert!(grant.permissions.read);
+        assert!(grant.permissions.list);
+        assert!(!grant.permissions.write);
+        assert!(!grant.permissions.delete);
+    }
+
+    #[tokio::test]
+    async fn invocation_mount_view_denies_matrix_room_binding_write_and_delete() {
+        let scope = sample_scope();
+        let filesystem = ScopedFilesystem::new(Arc::new(InMemoryBackend::default()), |scope| {
+            invocation_mount_view(scope)
+        });
+        let path = ScopedPath::new("/tenant-shared/matrix/room-bindings/binding.json").unwrap();
+
+        let write_error = filesystem
+            .put(
+                &scope,
+                &path,
+                Entry::bytes(br#"{"binding":true}"#.to_vec()),
+                CasExpectation::Any,
+            )
+            .await
+            .expect_err("ordinary invocation must not write Matrix room binding authority");
+        assert!(matches!(
+            write_error,
+            FilesystemError::PermissionDenied {
+                operation: FilesystemOperation::WriteFile,
+                ..
+            }
+        ));
+
+        let delete_error = filesystem
+            .delete(&scope, &path)
+            .await
+            .expect_err("ordinary invocation must not delete Matrix room binding authority");
+        assert!(matches!(
+            delete_error,
+            FilesystemError::PermissionDenied {
+                operation: FilesystemOperation::Delete,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn matrix_room_binding_store_mount_view_keeps_host_write_delete_authority() {
+        let scope = sample_scope();
+        let view = matrix_room_binding_store_mount_view(&scope).unwrap();
+        let (_resolved, grant) = view
+            .resolve_with_grant(
+                &ScopedPath::new("/tenant-shared/matrix/room-bindings/binding.json").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            grant.permissions,
+            MountPermissions::read_write_list_delete()
+        );
     }
 
     #[cfg(feature = "slack-v2-host-beta")]
