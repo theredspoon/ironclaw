@@ -160,6 +160,8 @@ pub use local_runtime_profile::{
 };
 pub use matrix_outbound_targets::{
     MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest,
+    MatrixRoomBindingUpdateOutcome, MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome,
+    MatrixRoomBindingUpsertRequest,
 };
 pub use observability::budget::build_default_budget_accountant;
 pub use observability::budget_events::{BudgetEventObserver, TracingBudgetEventObserver};

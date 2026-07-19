@@ -153,6 +153,8 @@ use install_policy::{
 
 const RETIRED_SLACK_USER_EXTENSION_ID: &str = "slack_user";
 
+pub(crate) type SharedExtensionInstallationStore = Arc<dyn ExtensionInstallationStore>;
+
 // This port is deliberately scoped to LocalSingleUser composition. The
 // lifecycle service models the installed extension set, while active_registry
 // is the model-visible capability surface read by host runtime dispatch.

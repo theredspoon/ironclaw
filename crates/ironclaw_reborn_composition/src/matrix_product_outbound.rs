@@ -39,7 +39,7 @@ use crate::extension_host::extension_lifecycle::LifecyclePolicyProjectionCacheRe
 use crate::matrix_outbound::MatrixPolicyProviderScope;
 use crate::matrix_outbound_targets::{
     MatrixOutboundTargetProviderConfig, MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore,
-    matrix_policy_provider_scope_key,
+    MatrixRoomBindingUpsertRequest, matrix_policy_provider_scope_key,
 };
 
 pub(crate) const MATRIX_PRODUCT_ADAPTER_EXTENSION_ID: &str = "matrix-product-adapter";
@@ -506,6 +506,34 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         Ok(())
     }
 
+    async fn invalidate_projection_commit_marker_for_upsert_request(
+        &self,
+        scope: &ResourceScope,
+        request: &MatrixRoomBindingUpsertRequest,
+    ) -> Result<(), ProductWorkflowError> {
+        let provider_scope = matrix_policy_projection_resource_scope_for_provider_scope(
+            scope,
+            &MatrixPolicyProviderScope {
+                tenant_id: request.tenant_id.clone(),
+                agent_id: request.agent_id.clone(),
+                project_id: request.project_id.clone(),
+            },
+        );
+        let provider_cache_path = matrix_policy_projection_cache_path_for_upsert_request(request)?;
+        let commit_marker_path =
+            matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+        self.filesystem
+            .put(
+                &provider_scope,
+                &commit_marker_path,
+                Entry::bytes(MATRIX_POLICY_PROJECTION_COMMIT_MARKER_TOMBSTONE.to_vec()),
+                CasExpectation::Any,
+            )
+            .await
+            .map_err(map_matrix_policy_projection_cache_error)?;
+        Ok(())
+    }
+
     fn matrix_policy_from_runtime_entry(
         &self,
         entry: &ProductAdapterRuntimeEntry,
@@ -571,6 +599,20 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             return Ok(());
         }
         self.invalidate_projection_commit_marker_for_removal_request(scope, request)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_before_target_binding_upsert(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+        request: &MatrixRoomBindingUpsertRequest,
+    ) -> Result<(), ProductWorkflowError> {
+        if extension_id.as_str() != MATRIX_PRODUCT_ADAPTER_EXTENSION_ID {
+            return Ok(());
+        }
+        self.invalidate_projection_commit_marker_for_upsert_request(scope, request)
             .await?;
         Ok(())
     }
@@ -649,6 +691,17 @@ pub(crate) fn matrix_policy_projection_cache_path_for_provider_key(
 
 fn matrix_policy_projection_cache_path_for_removal_request(
     request: &MatrixRoomBindingRemovalRequest,
+) -> Result<ScopedPath, ProductWorkflowError> {
+    matrix_policy_projection_cache_path_for_provider_key(&matrix_policy_provider_scope_key(
+        &request.tenant_id,
+        &request.agent_id,
+        request.project_id.as_ref(),
+        &request.installation_id,
+    ))
+}
+
+fn matrix_policy_projection_cache_path_for_upsert_request(
+    request: &MatrixRoomBindingUpsertRequest,
 ) -> Result<ScopedPath, ProductWorkflowError> {
     matrix_policy_projection_cache_path_for_provider_key(&matrix_policy_provider_scope_key(
         &request.tenant_id,
@@ -1292,6 +1345,8 @@ fn record_matrix_product_outbound_workflow_failure(
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
+    use ironclaw_events::{DurableAuditLog, EventStreamKey, InMemoryDurableAuditLog, ReadScope};
     use ironclaw_extensions::{
         ExtensionActivationState, ExtensionInstallation, ExtensionInstallationId,
         ExtensionManifestRecord, ExtensionManifestRef, InMemoryExtensionInstallationStore,
@@ -1308,13 +1363,107 @@ mod tests {
         ArtifactSha256, ComponentArtifactId, MatrixUserId, WitPackageName, WitWorldName,
     };
     use ironclaw_product_adapters::{AdapterInstallationId, ProductAdapterId};
+    use ironclaw_product_workflow::{
+        RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind,
+    };
 
     use super::*;
     use crate::matrix_outbound_targets::{
         FilesystemMatrixRoomBindingStore, MatrixConfiguredRoomRoute,
-        MatrixOutboundTargetProviderConfig, MatrixRoomBindingRemovalOutcome,
-        MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore,
+        MatrixOutboundTargetProviderConfig, MatrixRoomBindingAuthority,
+        MatrixRoomBindingMutationContext, MatrixRoomBindingRemovalOutcome,
+        MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore, MatrixRoomBindingUpdateOutcome,
+        MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome,
+        MatrixRoomBindingUpsertRequest,
     };
+
+    #[derive(Debug)]
+    struct FailingMatrixRoomBindingUpdateStore {
+        inner: Arc<dyn MatrixRoomBindingStore>,
+    }
+
+    #[async_trait]
+    impl MatrixRoomBindingStore for FailingMatrixRoomBindingUpdateStore {
+        async fn snapshot_provider_configs(
+            &self,
+        ) -> Result<Vec<MatrixOutboundTargetProviderConfig>, RebornServicesError> {
+            self.inner.snapshot_provider_configs().await
+        }
+
+        async fn list_room_bindings(
+            &self,
+            tenant_id: &TenantId,
+            agent_id: &AgentId,
+            project_id: Option<&ProjectId>,
+            subject_user_id: &UserId,
+        ) -> Result<Vec<crate::matrix_outbound_targets::MatrixRoomBinding>, RebornServicesError>
+        {
+            self.inner
+                .list_room_bindings(tenant_id, agent_id, project_id, subject_user_id)
+                .await
+        }
+
+        async fn resolve_room_binding(
+            &self,
+            tenant_id: &TenantId,
+            agent_id: &AgentId,
+            project_id: Option<&ProjectId>,
+            installation_id: &AdapterInstallationId,
+            room_id: &crate::matrix_outbound::MatrixRoomId,
+            subject_user_id: &UserId,
+        ) -> Result<Option<crate::matrix_outbound_targets::MatrixRoomBinding>, RebornServicesError>
+        {
+            self.inner
+                .resolve_room_binding(
+                    tenant_id,
+                    agent_id,
+                    project_id,
+                    installation_id,
+                    room_id,
+                    subject_user_id,
+                )
+                .await
+        }
+
+        async fn remove_room_binding(
+            &self,
+            request: MatrixRoomBindingRemovalRequest,
+        ) -> Result<MatrixRoomBindingRemovalOutcome, RebornServicesError> {
+            self.inner.remove_room_binding(request).await
+        }
+
+        async fn upsert_room_binding(
+            &self,
+            request: MatrixRoomBindingUpsertRequest,
+        ) -> Result<MatrixRoomBindingUpsertOutcome, RebornServicesError> {
+            self.inner.upsert_room_binding(request).await
+        }
+
+        async fn update_room_binding(
+            &self,
+            _request: MatrixRoomBindingUpdateRequest,
+        ) -> Result<MatrixRoomBindingUpdateOutcome, RebornServicesError> {
+            Err(matrix_room_binding_test_backend_error())
+        }
+
+        async fn provider_has_removed_room_binding(
+            &self,
+            provider: &MatrixOutboundTargetProviderConfig,
+        ) -> Result<bool, RebornServicesError> {
+            self.inner.provider_has_removed_room_binding(provider).await
+        }
+    }
+
+    fn matrix_room_binding_test_backend_error() -> RebornServicesError {
+        RebornServicesError {
+            code: RebornServicesErrorCode::Unavailable,
+            kind: RebornServicesErrorKind::ServiceUnavailable,
+            status_code: 503,
+            retryable: true,
+            field: None,
+            validation_code: None,
+        }
+    }
 
     #[tokio::test]
     async fn matrix_lifecycle_refresher_projects_cache_from_runtime_sources_not_static_policy() {
@@ -1440,8 +1589,8 @@ mod tests {
             .expect("seed filesystem Matrix target source");
         let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
             root,
-            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
-            target_source.clone() as Arc<dyn MatrixRoomBindingStore>,
+            store.clone(),
+            target_source.clone(),
             matrix_source_backed_artifact_evidence(),
             "matrix-source-backed-policy-owner".to_string(),
         )
@@ -1523,6 +1672,853 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_room_binding_authority_upsert_create_refreshes_provider_policy_projection() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []));
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            Arc::clone(&root),
+            store.clone(),
+            target_source.clone(),
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("shared-source refresher config");
+        let audit_log = Arc::new(InMemoryDurableAuditLog::new());
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let authority = MatrixRoomBindingAuthority::new_with_audit_log(
+            target_source,
+            refresher,
+            audit_log.clone(),
+        );
+        let request = MatrixRoomBindingUpsertRequest {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: AdapterInstallationId::new("matrix-source-backed-install")
+                .expect("installation id"),
+            room_id: crate::matrix_outbound::MatrixRoomId::new(
+                "!authority-upsert-create:example.org".to_string(),
+            )
+            .expect("room"),
+            subject_user_id: UserId::new("user:authority-upsert-create").expect("subject"),
+            matrix_sender_user_id: MatrixUserId::new("@authority-upsert-create:example.org")
+                .expect("matrix sender"),
+        };
+
+        let outcome = authority
+            .upsert_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id.clone(),
+                ),
+                request.clone(),
+            )
+            .await
+            .expect("host-owned upsert creates binding and refreshes projection");
+        assert_eq!(outcome, MatrixRoomBindingUpsertOutcome::Created);
+
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: request.tenant_id.clone(),
+            agent_id: request.agent_id.clone(),
+            project_id: request.project_id.clone(),
+            installation_id: request.installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: request.room_id.as_str().to_string(),
+                subject_user_id: request.subject_user_id.clone(),
+                matrix_sender_user_id: request.matrix_sender_user_id.clone(),
+            }],
+        };
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        let snapshot = source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &request.installation_id,
+            )
+            .await
+            .expect("upsert refresh publishes provider-scoped projection");
+        assert!(
+            snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == request.room_id.as_str())
+        );
+
+        let audit = audit_log
+            .read_after_cursor(
+                &EventStreamKey::new(
+                    scope.tenant_id.clone(),
+                    scope.user_id.clone(),
+                    scope.agent_id.clone(),
+                ),
+                &ReadScope::any(),
+                None,
+                10,
+            )
+            .await
+            .expect("audit replay");
+        assert_eq!(audit.entries.len(), 1);
+        let record = &audit.entries[0].record;
+        assert_eq!(record.action.kind, "matrix_room_binding_upsert");
+        let target = record.action.target.as_ref().expect("audit target");
+        assert!(target.contains("room_sha256="));
+        assert!(!target.contains(request.room_id.as_str()));
+        assert_eq!(
+            record
+                .result
+                .as_ref()
+                .and_then(|result| result.status.as_deref()),
+            Some("Created")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_denies_cross_scope_upsert_context() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []));
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            root,
+            store,
+            target_source.clone(),
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("shared-source refresher config");
+        let scope = matrix_source_backed_scope();
+        let mut foreign_scope = scope.clone();
+        foreign_scope.tenant_id = TenantId::new("matrix-foreign-tenant").expect("foreign tenant");
+        let authority = MatrixRoomBindingAuthority::new(target_source.clone(), refresher);
+
+        let error = authority
+            .upsert_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    foreign_scope,
+                    ExtensionId::new("matrix-product-adapter").expect("extension id"),
+                ),
+                MatrixRoomBindingUpsertRequest {
+                    tenant_id: scope.tenant_id.clone(),
+                    agent_id: scope.agent_id.clone().expect("agent"),
+                    project_id: scope.project_id.clone(),
+                    installation_id: AdapterInstallationId::new("matrix-source-backed-install")
+                        .expect("installation id"),
+                    room_id: crate::matrix_outbound::MatrixRoomId::new(
+                        "!authority-denied:example.org".to_string(),
+                    )
+                    .expect("room"),
+                    subject_user_id: UserId::new("user:authority-denied").expect("subject"),
+                    matrix_sender_user_id: MatrixUserId::new("@authority-denied:example.org")
+                        .expect("matrix sender"),
+                },
+            )
+            .await
+            .expect_err("foreign mutation context must not authorize request scope");
+
+        assert!(matches!(error, ProductWorkflowError::BindingAccessDenied));
+        assert!(
+            target_source
+                .snapshot_provider_configs()
+                .await
+                .expect("snapshot after denied request")
+                .is_empty(),
+            "denied requests must not mutate the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_remove_refreshes_projection_and_appends_redacted_audit()
+    {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let stale_room = crate::matrix_outbound::MatrixRoomId::new(
+            "!authority-remove-stale:example.org".to_string(),
+        )
+        .expect("stale room");
+        let fresh_room = crate::matrix_outbound::MatrixRoomId::new(
+            "!authority-remove-fresh:example.org".to_string(),
+        )
+        .expect("fresh room");
+        let stale_subject = UserId::new("user:authority-remove-stale").expect("stale subject");
+        let fresh_subject = UserId::new("user:authority-remove-fresh").expect("fresh subject");
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+            agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+            project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![
+                MatrixConfiguredRoomRoute {
+                    room_id: stale_room.as_str().to_string(),
+                    subject_user_id: stale_subject.clone(),
+                    matrix_sender_user_id: MatrixUserId::new("@authority-remove-stale:example.org")
+                        .expect("stale matrix sender"),
+                },
+                MatrixConfiguredRoomRoute {
+                    room_id: fresh_room.as_str().to_string(),
+                    subject_user_id: fresh_subject,
+                    matrix_sender_user_id: MatrixUserId::new("@authority-remove-fresh:example.org")
+                        .expect("fresh matrix sender"),
+                },
+            ],
+        };
+        let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+            Arc::clone(&root),
+            [provider.tenant_id.clone()],
+        ));
+        target_source
+            .seed_from_configs(std::slice::from_ref(&provider))
+            .await
+            .expect("seed target source");
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            Arc::clone(&root),
+            store,
+            target_source.clone(),
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("shared-source refresher config");
+        let audit_log = Arc::new(InMemoryDurableAuditLog::new());
+        let authority = MatrixRoomBindingAuthority::new_with_audit_log(
+            target_source.clone(),
+            refresher,
+            audit_log.clone(),
+        );
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+
+        let outcome = authority
+            .remove_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id,
+                ),
+                MatrixRoomBindingRemovalRequest {
+                    tenant_id: provider.tenant_id.clone(),
+                    agent_id: provider.agent_id.clone(),
+                    project_id: provider.project_id.clone(),
+                    installation_id: installation_id.clone(),
+                    room_id: stale_room.clone(),
+                    subject_user_id: stale_subject,
+                },
+            )
+            .await
+            .expect("authority removal refreshes projection");
+        assert_eq!(outcome, MatrixRoomBindingRemovalOutcome::Removed);
+
+        let snapshot = source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect("refreshed snapshot after removal");
+        assert!(
+            snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == fresh_room.as_str())
+        );
+        assert!(
+            !snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == stale_room.as_str())
+        );
+
+        let audit = audit_log
+            .read_after_cursor(
+                &EventStreamKey::new(
+                    scope.tenant_id.clone(),
+                    scope.user_id.clone(),
+                    scope.agent_id.clone(),
+                ),
+                &ReadScope::any(),
+                None,
+                10,
+            )
+            .await
+            .expect("audit replay");
+        assert_eq!(audit.entries.len(), 1);
+        let record = &audit.entries[0].record;
+        assert_eq!(record.action.kind, "matrix_room_binding_remove");
+        let target = record.action.target.as_ref().expect("audit target");
+        assert!(target.contains("room_sha256="));
+        assert!(!target.contains(stale_room.as_str()));
+        assert_eq!(
+            record
+                .result
+                .as_ref()
+                .and_then(|result| result.status.as_deref()),
+            Some("Removed")
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_update_refreshes_projection_and_deauthorizes_stale_room()
+    {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []));
+        let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            Arc::clone(&root),
+            store.clone(),
+            target_source.clone(),
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("shared-source refresher config");
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let authority = MatrixRoomBindingAuthority::new(target_source, refresher);
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let subject_user_id = UserId::new("user:authority-update").expect("subject");
+
+        authority
+            .upsert_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id.clone(),
+                ),
+                MatrixRoomBindingUpsertRequest {
+                    tenant_id: scope.tenant_id.clone(),
+                    agent_id: scope.agent_id.clone().expect("agent"),
+                    project_id: scope.project_id.clone(),
+                    installation_id: installation_id.clone(),
+                    room_id: crate::matrix_outbound::MatrixRoomId::new(
+                        "!authority-update-stale:example.org".to_string(),
+                    )
+                    .expect("stale room"),
+                    subject_user_id: subject_user_id.clone(),
+                    matrix_sender_user_id: MatrixUserId::new("@authority-update:example.org")
+                        .expect("matrix sender"),
+                },
+            )
+            .await
+            .expect("initial upsert");
+        let update = MatrixRoomBindingUpdateRequest {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            previous_room_id: crate::matrix_outbound::MatrixRoomId::new(
+                "!authority-update-stale:example.org".to_string(),
+            )
+            .expect("stale room"),
+            subject_user_id: subject_user_id.clone(),
+            new_room_id: crate::matrix_outbound::MatrixRoomId::new(
+                "!authority-update-fresh:example.org".to_string(),
+            )
+            .expect("fresh room"),
+            new_matrix_sender_user_id: MatrixUserId::new("@authority-update:example.org")
+                .expect("matrix sender"),
+        };
+
+        let outcome = authority
+            .update_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id,
+                ),
+                update,
+            )
+            .await
+            .expect("host-owned update refreshes projection");
+        assert_eq!(outcome, MatrixRoomBindingUpdateOutcome::Updated);
+
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: "!authority-update-fresh:example.org".to_string(),
+                subject_user_id,
+                matrix_sender_user_id: MatrixUserId::new("@authority-update:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        let snapshot = source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect("updated projection");
+        assert!(
+            snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!authority-update-fresh:example.org")
+        );
+        assert!(
+            !snapshot
+                .allowed_rooms
+                .iter()
+                .any(|room| room.as_str() == "!authority-update-stale:example.org"),
+            "host-owned update refresh must remove stale room authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_upsert_update_refresh_failure_invalidates_stale_projection()
+     {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []));
+        let initial_refresher =
+            MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+                Arc::clone(&root),
+                store.clone(),
+                target_source.clone(),
+                matrix_source_backed_artifact_evidence(),
+                "matrix-source-backed-policy-owner".to_string(),
+            )
+            .expect("initial shared-source refresher config");
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let room_id =
+            crate::matrix_outbound::MatrixRoomId::new("!authority-upsert-update:example.org")
+                .expect("room");
+        let subject_user_id = UserId::new("user:authority-upsert-update").expect("subject");
+        let initial_sender =
+            MatrixUserId::new("@authority-upsert-update-old:example.org").expect("old sender");
+        let updated_sender =
+            MatrixUserId::new("@authority-upsert-update-new:example.org").expect("new sender");
+
+        MatrixRoomBindingAuthority::new(target_source.clone(), initial_refresher)
+            .upsert_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id.clone(),
+                ),
+                MatrixRoomBindingUpsertRequest {
+                    tenant_id: scope.tenant_id.clone(),
+                    agent_id: scope.agent_id.clone().expect("agent"),
+                    project_id: scope.project_id.clone(),
+                    installation_id: installation_id.clone(),
+                    room_id: room_id.clone(),
+                    subject_user_id: subject_user_id.clone(),
+                    matrix_sender_user_id: initial_sender,
+                },
+            )
+            .await
+            .expect("initial upsert publishes stale projection");
+
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: room_id.as_str().to_string(),
+                subject_user_id: subject_user_id.clone(),
+                matrix_sender_user_id: updated_sender.clone(),
+            }],
+        };
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend.clone()),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect("initial projection resolves before update");
+
+        let failing_backend = Arc::new(FailOnNthPutFilesystem::new(backend, [2]));
+        let failing_refresher =
+            MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+                failing_backend,
+                store,
+                target_source.clone(),
+                matrix_source_backed_artifact_evidence(),
+                "matrix-source-backed-policy-owner".to_string(),
+            )
+            .expect("failing shared-source refresher config");
+        MatrixRoomBindingAuthority::new(target_source.clone(), failing_refresher)
+            .upsert_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id,
+                ),
+                MatrixRoomBindingUpsertRequest {
+                    tenant_id: scope.tenant_id.clone(),
+                    agent_id: scope.agent_id.clone().expect("agent"),
+                    project_id: scope.project_id.clone(),
+                    installation_id: installation_id.clone(),
+                    room_id: room_id.clone(),
+                    subject_user_id: subject_user_id.clone(),
+                    matrix_sender_user_id: updated_sender.clone(),
+                },
+            )
+            .await
+            .expect_err("refresh failure after upsert-as-update should surface");
+
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(
+                    &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                    &installation_id,
+                )
+                .await
+                .expect_err("pre-invalidation must hide stale projection after refresh failure"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+        let stored = target_source
+            .resolve_room_binding(
+                &scope.tenant_id,
+                scope.agent_id.as_ref().expect("agent"),
+                scope.project_id.as_ref(),
+                &installation_id,
+                &room_id,
+                &subject_user_id,
+            )
+            .await
+            .expect("binding lookup after failed refresh")
+            .expect("store mutation should have happened before refresh failed");
+        assert_eq!(stored.matrix_sender_user_id, updated_sender);
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_update_failure_invalidates_stale_room_projection() {
+        let store = Arc::new(InMemoryExtensionInstallationStore::default());
+        seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend.clone();
+        let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []));
+        let refresher = Arc::new(
+            MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+                Arc::clone(&root),
+                store.clone(),
+                target_source.clone(),
+                matrix_source_backed_artifact_evidence(),
+                "matrix-source-backed-policy-owner".to_string(),
+            )
+            .expect("shared-source refresher config"),
+        );
+        let scope = matrix_source_backed_scope();
+        let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let subject_user_id = UserId::new("user:authority-update-failure").expect("subject");
+        let stale_room_id = crate::matrix_outbound::MatrixRoomId::new(
+            "!authority-update-failure-stale:example.org".to_string(),
+        )
+        .expect("stale room");
+        let initial_authority =
+            MatrixRoomBindingAuthority::new(target_source.clone(), Arc::clone(&refresher));
+
+        initial_authority
+            .upsert_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id.clone(),
+                ),
+                MatrixRoomBindingUpsertRequest {
+                    tenant_id: scope.tenant_id.clone(),
+                    agent_id: scope.agent_id.clone().expect("agent"),
+                    project_id: scope.project_id.clone(),
+                    installation_id: installation_id.clone(),
+                    room_id: stale_room_id.clone(),
+                    subject_user_id: subject_user_id.clone(),
+                    matrix_sender_user_id: MatrixUserId::new(
+                        "@authority-update-failure:example.org",
+                    )
+                    .expect("matrix sender"),
+                },
+            )
+            .await
+            .expect("initial upsert");
+
+        let provider = MatrixOutboundTargetProviderConfig {
+            tenant_id: scope.tenant_id.clone(),
+            agent_id: scope.agent_id.clone().expect("agent"),
+            project_id: scope.project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: stale_room_id.as_str().to_string(),
+                subject_user_id: subject_user_id.clone(),
+                matrix_sender_user_id: MatrixUserId::new("@authority-update-failure:example.org")
+                    .expect("matrix sender"),
+            }],
+        };
+        let source = FilesystemMatrixPolicySnapshotSource::new(
+            crate::wrap_scoped(backend),
+            matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+        );
+        source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect("initial stale projection resolves");
+
+        let failing_source = Arc::new(FailingMatrixRoomBindingUpdateStore {
+            inner: target_source,
+        });
+        let failing_authority = MatrixRoomBindingAuthority::new(failing_source, refresher);
+        failing_authority
+            .update_room_binding(
+                &MatrixRoomBindingMutationContext::for_host_owned_matrix_admin(scope, extension_id),
+                MatrixRoomBindingUpdateRequest {
+                    tenant_id: provider.tenant_id,
+                    agent_id: provider.agent_id,
+                    project_id: provider.project_id,
+                    installation_id: installation_id.clone(),
+                    previous_room_id: stale_room_id,
+                    subject_user_id,
+                    new_room_id: crate::matrix_outbound::MatrixRoomId::new(
+                        "!authority-update-failure-fresh:example.org".to_string(),
+                    )
+                    .expect("fresh room"),
+                    new_matrix_sender_user_id: MatrixUserId::new(
+                        "@authority-update-failure:example.org",
+                    )
+                    .expect("matrix sender"),
+                },
+            )
+            .await
+            .expect_err("update store failure should be returned");
+
+        assert_eq!(
+            source
+                .resolve_matrix_policy_snapshot(
+                    &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                    &installation_id,
+                )
+                .await
+                .expect_err("pre-invalidation must fail closed before update errors"),
+            MatrixInstallationPolicyRejection::InstallationNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_discovers_durable_binding_after_restart_without_startup_provider_config()
+     {
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend;
+        let initial_source = Arc::new(FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []));
+        let scope = matrix_source_backed_scope();
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        initial_source
+            .upsert_room_binding(MatrixRoomBindingUpsertRequest {
+                tenant_id: scope.tenant_id.clone(),
+                agent_id: scope.agent_id.clone().expect("agent"),
+                project_id: scope.project_id.clone(),
+                installation_id: installation_id.clone(),
+                room_id: crate::matrix_outbound::MatrixRoomId::new(
+                    "!durable-discovery:example.org".to_string(),
+                )
+                .expect("room"),
+                subject_user_id: UserId::new("user:durable-discovery").expect("subject"),
+                matrix_sender_user_id: MatrixUserId::new("@durable-discovery:example.org")
+                    .expect("matrix sender"),
+            })
+            .await
+            .expect("host-owned upsert writes durable binding and tenant index");
+
+        let restarted_source = FilesystemMatrixRoomBindingStore::new(root, []);
+        let configs = restarted_source
+            .snapshot_provider_configs()
+            .await
+            .expect("restart discovery must use durable authority, not startup provider config");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].installation_id, installation_id);
+        assert_eq!(configs[0].configured_room_routes.len(), 1);
+        assert_eq!(
+            configs[0].configured_room_routes[0].room_id,
+            "!durable-discovery:example.org"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_discovers_mixed_startup_and_durable_only_tenants() {
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend;
+        let durable_tenant_id = TenantId::new("matrix-durable-only-tenant").expect("tenant");
+        let startup_tenant_id = TenantId::new("matrix-startup-tenant").expect("tenant");
+        let agent_id = AgentId::new("matrix-source-backed-agent").expect("agent");
+        let project_id = Some(ProjectId::new("matrix-source-backed-project").expect("project"));
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+
+        let initial_source = FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), []);
+        initial_source
+            .upsert_room_binding(MatrixRoomBindingUpsertRequest {
+                tenant_id: durable_tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                project_id: project_id.clone(),
+                installation_id: installation_id.clone(),
+                room_id: crate::matrix_outbound::MatrixRoomId::new(
+                    "!durable-only-tenant:example.org".to_string(),
+                )
+                .expect("room"),
+                subject_user_id: UserId::new("user:durable-only-tenant").expect("subject"),
+                matrix_sender_user_id: MatrixUserId::new("@durable-only-tenant:example.org")
+                    .expect("matrix sender"),
+            })
+            .await
+            .expect("write durable-only tenant binding");
+
+        let restarted_source =
+            FilesystemMatrixRoomBindingStore::new(root, [startup_tenant_id.clone()]);
+        restarted_source
+            .seed_from_configs(&[MatrixOutboundTargetProviderConfig {
+                tenant_id: startup_tenant_id,
+                agent_id,
+                project_id,
+                installation_id,
+                configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                    room_id: "!startup-tenant:example.org".to_string(),
+                    subject_user_id: UserId::new("user:startup-tenant").expect("subject"),
+                    matrix_sender_user_id: MatrixUserId::new("@startup-tenant:example.org")
+                        .expect("matrix sender"),
+                }],
+            }])
+            .await
+            .expect("seed startup tenant binding");
+
+        let mut room_ids = restarted_source
+            .snapshot_provider_configs()
+            .await
+            .expect("snapshot should merge startup and durable tenant discovery")
+            .into_iter()
+            .flat_map(|provider| {
+                provider
+                    .configured_room_routes
+                    .into_iter()
+                    .map(|route| route.room_id)
+            })
+            .collect::<Vec<_>>();
+        room_ids.sort();
+
+        assert_eq!(
+            room_ids,
+            vec![
+                "!durable-only-tenant:example.org".to_string(),
+                "!startup-tenant:example.org".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_room_binding_authority_tombstone_blocks_bootstrap_resurrection_until_explicit_upsert_rebind()
+     {
+        let backend = Arc::new(InMemoryBackend::default());
+        let root: Arc<dyn RootFilesystem> = backend;
+        let tenant_id = TenantId::new("matrix-source-backed-tenant").expect("tenant");
+        let agent_id = AgentId::new("matrix-source-backed-agent").expect("agent");
+        let project_id = Some(ProjectId::new("matrix-source-backed-project").expect("project"));
+        let installation_id =
+            AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+        let room_id =
+            crate::matrix_outbound::MatrixRoomId::new("!tombstone-rebind:example.org".to_string())
+                .expect("room");
+        let subject_user_id = UserId::new("user:tombstone-rebind").expect("subject");
+        let matrix_sender_user_id =
+            MatrixUserId::new("@tombstone-rebind:example.org").expect("matrix sender");
+        let bootstrap = MatrixOutboundTargetProviderConfig {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: project_id.clone(),
+            installation_id: installation_id.clone(),
+            configured_room_routes: vec![MatrixConfiguredRoomRoute {
+                room_id: room_id.as_str().to_string(),
+                subject_user_id: subject_user_id.clone(),
+                matrix_sender_user_id: matrix_sender_user_id.clone(),
+            }],
+        };
+
+        let source = FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), [tenant_id.clone()]);
+        source
+            .seed_from_configs(std::slice::from_ref(&bootstrap))
+            .await
+            .expect("initial bootstrap seed");
+        source
+            .remove_room_binding(MatrixRoomBindingRemovalRequest {
+                tenant_id: tenant_id.clone(),
+                agent_id: agent_id.clone(),
+                project_id: project_id.clone(),
+                installation_id: installation_id.clone(),
+                room_id: room_id.clone(),
+                subject_user_id: subject_user_id.clone(),
+            })
+            .await
+            .expect("host-owned removal tombstones binding");
+
+        let restarted_bootstrap_source =
+            FilesystemMatrixRoomBindingStore::new(Arc::clone(&root), [tenant_id.clone()]);
+        restarted_bootstrap_source
+            .seed_from_configs(std::slice::from_ref(&bootstrap))
+            .await
+            .expect("bootstrap config cannot override tombstone");
+        assert!(
+            restarted_bootstrap_source
+                .snapshot_provider_configs()
+                .await
+                .expect("snapshot after bootstrap")
+                .is_empty(),
+            "tombstoned binding must not be resurrected by startup config"
+        );
+
+        let outcome = restarted_bootstrap_source
+            .upsert_room_binding(MatrixRoomBindingUpsertRequest {
+                tenant_id,
+                agent_id,
+                project_id,
+                installation_id,
+                room_id,
+                subject_user_id,
+                matrix_sender_user_id,
+            })
+            .await
+            .expect("explicit host-owned upsert rebind may clear tombstone");
+        assert_eq!(outcome, MatrixRoomBindingUpsertOutcome::ReboundTombstone);
+        assert_eq!(
+            restarted_bootstrap_source
+                .snapshot_provider_configs()
+                .await
+                .expect("snapshot after explicit rebind")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn matrix_lifecycle_pre_invalidation_uses_removal_request_when_snapshot_is_empty() {
         let store = Arc::new(InMemoryExtensionInstallationStore::default());
         seed_enabled_matrix_runtime_entry(store.as_ref()).await;
@@ -1546,7 +2542,7 @@ mod tests {
         let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
         let initial_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
             Arc::clone(&root),
-            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
+            store.clone(),
             vec![provider.clone()],
             matrix_source_backed_artifact_evidence(),
             "matrix-source-backed-policy-owner".to_string(),
@@ -1652,8 +2648,8 @@ mod tests {
             .expect("seed target source");
         let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
             root,
-            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
-            target_source.clone() as Arc<dyn MatrixRoomBindingStore>,
+            store.clone(),
+            target_source.clone(),
             matrix_source_backed_artifact_evidence(),
             "matrix-source-backed-policy-owner".to_string(),
         )
@@ -2161,7 +3157,7 @@ mod tests {
         };
         let initial_refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
             backend.clone(),
-            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
+            store.clone(),
             vec![provider_with_stale_room.clone()],
             matrix_source_backed_artifact_evidence(),
             "matrix-source-backed-policy-owner".to_string(),
@@ -2246,7 +3242,7 @@ mod tests {
         };
         let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
             root,
-            Arc::clone(&store) as Arc<dyn ExtensionInstallationStore>,
+            store.clone(),
             vec![provider.clone()],
             matrix_source_backed_artifact_evidence(),
             "matrix-source-backed-policy-owner".to_string(),
