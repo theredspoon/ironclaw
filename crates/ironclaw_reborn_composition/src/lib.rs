@@ -158,6 +158,9 @@ pub use local_runtime_profile::{
     local_dev_runtime_policy, local_dev_yolo_runtime_policy, local_runtime_build_input,
     local_runtime_build_input_with_options,
 };
+pub use matrix_outbound_targets::{
+    MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest,
+};
 pub use observability::budget::build_default_budget_accountant;
 pub use observability::budget_events::{BudgetEventObserver, TracingBudgetEventObserver};
 pub use observability::hooks::{
@@ -740,6 +743,11 @@ fn invocation_mount_view_for_segments(
         // delete-less grant above.
         MountAlias::new("/tenant-shared/reborn-identity")?,
         VirtualPath::new(format!("/tenants/{tenant_id}/shared/reborn-identity"))?,
+        MountPermissions::read_write_list_delete(),
+    ));
+    grants.push(MountGrant::new(
+        MountAlias::new("/tenant-shared/matrix/room-bindings")?,
+        VirtualPath::new(format!("/tenants/{tenant_id}/shared/matrix/room-bindings"))?,
         MountPermissions::read_write_list_delete(),
     ));
     #[cfg(feature = "slack-v2-host-beta")]
