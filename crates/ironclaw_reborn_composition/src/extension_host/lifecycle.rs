@@ -364,7 +364,10 @@ impl RebornLocalLifecycleFacade {
                     return unsupported_projection(Some(package_ref));
                 };
                 let caller = lifecycle_caller(&context)?;
-                extension_management.install(package_ref, &caller).await
+                let scope = lifecycle_resource_scope(&context)?;
+                extension_management
+                    .install_for_scope(package_ref, &scope, &caller)
+                    .await
             }
             LifecycleProductAction::ExtensionActivate { package_ref } => {
                 let Some(extension_management) = &self.extension_management else {

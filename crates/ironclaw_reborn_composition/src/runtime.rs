@@ -126,17 +126,21 @@ use crate::matrix_outbound::{
     MatrixOutboundMetadataStore, MatrixPendingIntentBridgeContext, MatrixRetryExecutionContext,
     MatrixRetrySchedule, MatrixRouteMetadata, MatrixRoutePolicyOwnerToken, SealedDeliveryGrant,
 };
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use crate::matrix_outbound_targets::FilesystemMatrixRoomBindingStore;
 use crate::matrix_outbound_targets::{
-    FilesystemMatrixRoomBindingStore, MatrixHostProductOutboundTargetResolver,
-    MatrixHostReplyTargetPolicy, MatrixRoomBindingAuthority, MatrixRoomBindingMutationContext,
-    MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore,
-    MatrixRoomBindingUpdateOutcome, MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome,
-    MatrixRoomBindingUpsertRequest, register_matrix_outbound_target_provider_source,
+    MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
+    MatrixRoomBindingAuthority, MatrixRoomBindingMutationContext, MatrixRoomBindingRemovalOutcome,
+    MatrixRoomBindingRemovalRequest, MatrixRoomBindingUpdateOutcome,
+    MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome, MatrixRoomBindingUpsertRequest,
+    register_matrix_outbound_target_provider_source,
 };
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use crate::matrix_product_outbound::MatrixLifecyclePolicyProjectionCacheRefresher;
 use crate::matrix_product_outbound::{
     FilesystemMatrixPolicySnapshotSource, MATRIX_PRODUCT_ADAPTER_EXTENSION_ID,
-    MatrixLifecyclePolicyProjectionCacheRefresher, MatrixProductOutboundDeliveryError,
-    MatrixProductOutboundDeliveryInput, MatrixProductOutboundEntrypoint,
+    MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryInput,
+    MatrixProductOutboundEntrypoint,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::outbound::outbound_preferences::OutboundDeliveryTargetEntry;
@@ -200,6 +204,9 @@ use crate::automation::trigger_poller::{
     SnapshotActiveRunLookup, TRIGGER_POLLER_SHUTDOWN_TIMEOUT, TriggerPollerCompositionDeps,
     TriggerPollerRuntimeHandle, spawn_trigger_poller,
 };
+use crate::input::MatrixStartupPolicyProjectionCacheConfig;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use crate::runtime_input::MatrixPolicyProjectionCacheConfig;
 use crate::runtime_input::{
     PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TriggerPollerAuthorizerConfig,
     TriggerPollerSettings,
@@ -243,10 +250,13 @@ impl HostUserProfileSource for MemoryBackedUserProfileSourceAdapter {
 
 struct RuntimeStoreParts<'a> {
     local_runtime: Option<&'a crate::factory::RebornLocalRuntimeServices>,
-    filesystem: Arc<dyn ironclaw_filesystem::RootFilesystem>,
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    matrix_policy_projection_filesystem: Option<Arc<dyn RootFilesystem>>,
     extension_installation_store: Option<SharedExtensionInstallationStore>,
     local_extension_management:
         Option<Arc<crate::extension_host::extension_lifecycle::RebornLocalExtensionManagementPort>>,
+    matrix_startup_policy_projection_cache:
+        Option<crate::factory::MatrixStartupPolicyProjectionCache>,
     turn_state_store: Arc<dyn RuntimeTurnStateStore>,
     checkpoint_state_store: Arc<dyn ironclaw_turns::CheckpointStateStore>,
     loop_checkpoint_store: Arc<dyn ironclaw_turns::LoopCheckpointStore>,
@@ -405,12 +415,18 @@ fn local_runtime_parts(
 
     RuntimeStoreParts {
         local_runtime: Some(local_runtime),
-        filesystem: local_runtime.extension_filesystem.clone(),
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        matrix_policy_projection_filesystem: Some(
+            Arc::clone(&local_runtime.extension_filesystem) as Arc<dyn RootFilesystem>
+        ),
         extension_installation_store: local_runtime
             .extension_management
             .as_ref()
             .map(|extension_management| extension_management.installation_store()),
         local_extension_management: local_runtime.extension_management.clone(),
+        matrix_startup_policy_projection_cache: local_runtime
+            .matrix_startup_policy_projection_cache
+            .clone(),
         turn_state_store: Arc::clone(&local_runtime.turn_state) as Arc<dyn RuntimeTurnStateStore>,
         checkpoint_state_store: Arc::clone(&local_runtime.checkpoint_state_store),
         loop_checkpoint_store: Arc::clone(&local_runtime.loop_checkpoint_store),
@@ -457,9 +473,12 @@ where
 
     RuntimeStoreParts {
         local_runtime: None,
-        filesystem: graph.filesystem.clone(),
+        matrix_policy_projection_filesystem: Some(
+            Arc::clone(&graph.filesystem) as Arc<dyn RootFilesystem>
+        ),
         extension_installation_store: Some(Arc::clone(&graph.extension_installation_store)),
         local_extension_management: None,
+        matrix_startup_policy_projection_cache: None,
         turn_state_store: Arc::clone(&graph.turn_state) as Arc<dyn RuntimeTurnStateStore>,
         checkpoint_state_store: Arc::clone(&graph.checkpoint_state_store),
         loop_checkpoint_store: Arc::clone(&graph.turn_state)
@@ -542,6 +561,45 @@ fn enforce_runtime_cutover_gate(
         }
         RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo => Ok(()),
     }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+async fn build_matrix_runtime_policy_projection_cache(
+    config: &MatrixPolicyProjectionCacheConfig,
+    target_providers: &[crate::matrix_outbound_targets::MatrixOutboundTargetProviderConfig],
+    filesystem: Arc<dyn RootFilesystem>,
+    installation_store: SharedExtensionInstallationStore,
+) -> Result<crate::factory::MatrixStartupPolicyProjectionCache, RebornRuntimeError> {
+    let tenant_ids = target_providers
+        .iter()
+        .map(|provider| provider.tenant_id.clone())
+        .collect::<Vec<_>>();
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&filesystem),
+        tenant_ids,
+    ));
+    target_source
+        .seed_from_configs(target_providers)
+        .await
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("Matrix room binding store seed failed: {error}"),
+        })?;
+    let refresher = Arc::new(
+        MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            filesystem,
+            installation_store,
+            Arc::clone(&target_source),
+            config.artifact_evidence.clone(),
+            config.policy_owner_actor.clone(),
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("Matrix policy projection cache refresh configuration failed: {error}"),
+        })?,
+    );
+    Ok(crate::factory::MatrixStartupPolicyProjectionCache {
+        target_source,
+        refresher,
+    })
 }
 
 /// Guard: production and migration-dry-run compositions always pre-mint
@@ -3626,6 +3684,15 @@ pub async fn build_reborn_runtime(
         ..InMemoryTurnStateStoreLimits::default()
     };
     services_input = services_input.with_turn_state_store_limits(turn_state_limits);
+    if let Some(config) = matrix_policy_projection_cache.as_ref() {
+        services_input = services_input.with_matrix_startup_policy_projection_cache(
+            MatrixStartupPolicyProjectionCacheConfig {
+                target_providers: matrix_outbound_target_providers.clone(),
+                artifact_evidence: config.artifact_evidence.clone(),
+                policy_owner_actor: config.policy_owner_actor.clone(),
+            },
+        );
+    }
     let actor_user_id =
         UserId::new(owner_id.clone()).map_err(|reason| RebornRuntimeError::InvalidArgument {
             reason: format!("user id: {reason}"),
@@ -3713,9 +3780,11 @@ pub async fn build_reborn_runtime(
     };
     let RuntimeStoreParts {
         local_runtime,
-        filesystem,
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        matrix_policy_projection_filesystem,
         extension_installation_store,
         local_extension_management,
+        matrix_startup_policy_projection_cache,
         turn_state_store,
         checkpoint_state_store,
         loop_checkpoint_store,
@@ -3734,42 +3803,65 @@ pub async fn build_reborn_runtime(
         outbound_delivery_target_registry,
     } = runtime_parts;
     let (matrix_room_binding_store, matrix_policy_projection_cache_refresher) =
-        if let Some(config) = matrix_policy_projection_cache {
+        if let Some(config) = matrix_policy_projection_cache.as_ref() {
             let extension_installation_store = extension_installation_store
                 .ok_or(RebornRuntimeError::InvalidArgument {
                 reason:
                     "Matrix policy projection cache refresh requires extension installation store"
                         .to_string(),
             })?;
-            let tenant_ids = matrix_outbound_target_providers
-                .iter()
-                .map(|config| config.tenant_id.clone())
-                .collect::<Vec<_>>();
-            let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
-                Arc::clone(&filesystem),
-                tenant_ids,
-            ));
-            target_source
-                .seed_from_configs(&matrix_outbound_target_providers)
+            #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+            let _ = (&config, &extension_installation_store);
+            let used_runtime_fallback = matrix_startup_policy_projection_cache.is_none();
+            let cache =
+                if let Some(cache) = matrix_startup_policy_projection_cache {
+                    cache
+                } else {
+                    #[cfg(any(feature = "libsql", feature = "postgres"))]
+                    {
+                        let filesystem = matrix_policy_projection_filesystem
+                            .ok_or(RebornRuntimeError::InvalidArgument {
+                            reason:
+                                "Matrix policy projection cache refresh requires runtime filesystem"
+                                    .to_string(),
+                        })?;
+                        build_matrix_runtime_policy_projection_cache(
+                            config,
+                            &matrix_outbound_target_providers,
+                            filesystem,
+                            extension_installation_store,
+                        )
+                        .await?
+                    }
+                    #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+                    {
+                        return Err(RebornRuntimeError::InvalidArgument {
+                    reason: "Matrix policy projection cache was not built during startup restore"
+                        .to_string(),
+                });
+                    }
+                };
+            let target_source = cache.target_source;
+            let refresher = cache.refresher;
+            if used_runtime_fallback {
+                let lifecycle_scope = ResourceScope {
+                    tenant_id: validated_identity.tenant_id.clone(),
+                    user_id: actor_user_id.clone(),
+                    agent_id: Some(validated_identity.agent_id.clone()),
+                    project_id: default_project_id.clone(),
+                    mission_id: None,
+                    thread_id: None,
+                    invocation_id: InvocationId::new(),
+                };
+                refresher
+                .refresh_runtime_fallback_projection_cache(&lifecycle_scope)
                 .await
                 .map_err(|error| RebornRuntimeError::InvalidArgument {
-                    reason: format!("Matrix room binding store seed failed: {error}"),
-                })?;
-            let target_source: Arc<dyn MatrixRoomBindingStore> = target_source;
-            let refresher = Arc::new(
-                MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
-                    filesystem,
-                    extension_installation_store,
-                    Arc::clone(&target_source),
-                    config.artifact_evidence,
-                    config.policy_owner_actor,
-                )
-                .map_err(|error| RebornRuntimeError::InvalidArgument {
                     reason: format!(
-                        "Matrix policy projection cache refresh configuration failed: {error}"
+                        "Matrix runtime fallback policy projection cache refresh failed: {error}"
                     ),
-                })?,
-            );
+                })?;
+            }
             if let Some(extension_management) = local_extension_management.as_ref() {
                 extension_management.set_policy_projection_cache_refresher(refresher.clone());
             }
@@ -3801,7 +3893,7 @@ pub async fn build_reborn_runtime(
     ) {
         (Some(target_source), Some(refresher)) => {
             Some(Arc::new(MatrixRoomBindingAuthority::new_with_audit_log(
-                Arc::clone(target_source),
+                target_source.clone(),
                 Arc::clone(refresher),
                 Arc::clone(&audit_log),
             )))

@@ -128,13 +128,16 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         })
     }
 
-    pub(crate) fn from_shared_target_source(
+    pub(crate) fn from_shared_target_source<S>(
         filesystem: Arc<dyn RootFilesystem>,
         installation_store: Arc<dyn ExtensionInstallationStore>,
-        target_source: Arc<dyn MatrixRoomBindingStore>,
+        target_source: Arc<S>,
         artifact_evidence: MatrixRuntimeArtifactEvidence,
         policy_owner_actor: String,
-    ) -> Result<Self, ProductWorkflowError> {
+    ) -> Result<Self, ProductWorkflowError>
+    where
+        S: MatrixRoomBindingStore + 'static,
+    {
         Ok(Self {
             filesystem: Arc::new(ScopedFilesystem::new(
                 filesystem,
@@ -184,12 +187,17 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                 if provider.installation_id != installation_id {
                     continue;
                 }
+                let Some(policy) =
+                    self.matrix_policy_from_runtime_entry(entry, provider, &target_providers)?
+                else {
+                    continue;
+                };
                 projected = true;
                 let at_ms = matrix_policy_projection_timestamp_ms();
                 let installation = project_matrix_installation_from_runtime_entry(
                     entry,
                     self.artifact_evidence.clone(),
-                    self.matrix_policy_from_runtime_entry(entry, provider, &target_providers)?,
+                    policy,
                     InstallationAuditMetadata::new(&self.policy_owner_actor, at_ms)
                         .map_err(map_matrix_policy_projection_rejection)?,
                 )
@@ -336,11 +344,30 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             }) {
                 continue;
             }
+            let matching_entry = matching_entries.iter().find(|entry| {
+                AdapterInstallationId::new(entry.installation().installation_id().as_str())
+                    .map(|installation_id| installation_id == provider.installation_id)
+                    .unwrap_or(false)
+            });
             let provider_scope =
                 matrix_policy_projection_resource_scope_for_provider(scope, provider);
             let provider_cache_path = matrix_policy_projection_cache_path_for_provider(provider)?;
             let commit_marker_path =
                 matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+            if let Some(entry) = matching_entry
+                && self
+                    .matrix_policy_from_runtime_entry(entry, provider, &target_providers)?
+                    .is_none()
+            {
+                self.invalidate_projection_cache_body(&provider_scope, &provider_cache_path)
+                    .await?;
+                self.invalidate_projection_commit_markers(&[(
+                    provider_scope.clone(),
+                    commit_marker_path.clone(),
+                )])
+                .await?;
+                continue;
+            }
             let body = self
                 .filesystem
                 .get(&provider_scope, &provider_cache_path)
@@ -411,8 +438,11 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         let Some(installation) = cache.installation(&provider.installation_id) else {
             return Ok(false);
         };
-        let current_policy =
-            self.matrix_policy_from_runtime_entry(entry, provider, target_providers)?;
+        let Some(current_policy) =
+            self.matrix_policy_from_runtime_entry(entry, provider, target_providers)?
+        else {
+            return Ok(false);
+        };
         Ok(installation.policy.homeserver == current_policy.homeserver
             && installation.policy.allowed_rooms == current_policy.allowed_rooms
             && installation.policy.allowed_senders == current_policy.allowed_senders
@@ -504,6 +534,8 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         let provider_cache_path = matrix_policy_projection_cache_path_for_removal_request(request)?;
         let commit_marker_path =
             matrix_policy_projection_commit_marker_path_for_cache_path(&provider_cache_path)?;
+        self.invalidate_projection_cache_body(&provider_scope, &provider_cache_path)
+            .await?;
         self.filesystem
             .put(
                 &provider_scope,
@@ -549,7 +581,7 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         entry: &ProductAdapterRuntimeEntry,
         provider: &MatrixOutboundTargetProviderConfig,
         target_providers: &[MatrixOutboundTargetProviderConfig],
-    ) -> Result<MatrixInstallationPolicy, ProductWorkflowError> {
+    ) -> Result<Option<MatrixInstallationPolicy>, ProductWorkflowError> {
         let installation_id =
             AdapterInstallationId::new(entry.installation().installation_id().as_str())
                 .map_err(map_matrix_policy_projection_cache_error)?;
@@ -571,16 +603,15 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             );
             allowed_senders.insert(route.matrix_sender_user_id.clone());
         }
-        let (egress_target_index, target) = entry
+        let Some((egress_target_index, target)) = entry
             .adapter()
             .declared_egress()
             .iter()
             .enumerate()
             .find(|(_, target)| target.credential_handle.is_some())
-            .ok_or_else(|| ProductWorkflowError::InvalidBindingRequest {
-                reason: "Matrix ProductAdapter entry declares no credentialed egress target"
-                    .to_string(),
-            })?;
+        else {
+            return Ok(None);
+        };
         let credential_handle = target.credential_handle.clone().ok_or_else(|| {
             ProductWorkflowError::InvalidBindingRequest {
                 reason: "Matrix ProductAdapter egress target has no credential handle".to_string(),
@@ -596,6 +627,7 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             EgressTargetIndex::new(target_index),
             credential_handle,
         )
+        .map(Some)
         .map_err(map_matrix_policy_projection_rejection)
     }
 
@@ -666,6 +698,20 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         self.refresh_projection_cache(scope, extension_id, true, true)
             .await
     }
+
+    pub(crate) async fn refresh_runtime_fallback_projection_cache(
+        &self,
+        scope: &ResourceScope,
+    ) -> Result<(), ProductWorkflowError> {
+        let extension_id =
+            ExtensionId::new(MATRIX_PRODUCT_ADAPTER_EXTENSION_ID).map_err(|error| {
+                ProductWorkflowError::Transient {
+                    reason: format!("Matrix ProductAdapter extension id is invalid: {error}"),
+                }
+            })?;
+        self.refresh_projection_cache(scope, &extension_id, true, true)
+            .await
+    }
 }
 
 #[async_trait]
@@ -681,6 +727,24 @@ impl LifecyclePolicyProjectionCacheRefresher for MatrixLifecyclePolicyProjection
             extension_id,
         )
         .await
+    }
+
+    async fn invalidate_before_manifest_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.invalidate_before_credential_lifecycle_mutation(scope, extension_id)
+            .await
+    }
+
+    async fn publish_after_manifest_lifecycle_mutation(
+        &self,
+        scope: &ResourceScope,
+        extension_id: &ExtensionId,
+    ) -> Result<(), ProductWorkflowError> {
+        self.refresh_projection_cache(scope, extension_id, true, true)
+            .await
     }
 
     async fn prepare_lifecycle_activation_refresh(

@@ -32,10 +32,8 @@ use ironclaw_conversations::{InboundTurnError, RebornFilesystemConversationServi
 use ironclaw_events::{DurableAuditLog, DurableEventLog};
 #[cfg(not(any(feature = "libsql", feature = "postgres")))]
 use ironclaw_events::{InMemoryDurableAuditLog, InMemoryDurableEventLog};
-use ironclaw_extensions::{
-    ExtensionInstallationStore, ExtensionLifecycleService, ExtensionRegistry,
-    SharedExtensionRegistry,
-};
+use ironclaw_extensions::ExtensionInstallationStore;
+use ironclaw_extensions::{ExtensionLifecycleService, ExtensionRegistry, SharedExtensionRegistry};
 #[cfg(not(feature = "libsql"))]
 use ironclaw_filesystem::InMemoryBackend;
 #[cfg(feature = "libsql")]
@@ -173,8 +171,10 @@ use crate::extension_host::{
     },
     extension_installation_store::FilesystemExtensionInstallationStore,
     extension_lifecycle::{
-        ActiveExtensionPublisher, ExtensionCredentialCleanup, RebornLocalExtensionManagementPort,
-        SharedExtensionInstallationStore, restore_extension_lifecycle_state,
+        ActiveExtensionPublisher, ExtensionCredentialCleanup,
+        LifecyclePolicyProjectionCacheRefresher, RebornLocalExtensionManagementPort,
+        SharedExtensionInstallationStore, noop_lifecycle_policy_projection_cache_refresher,
+        restore_extension_lifecycle_state,
     },
     extension_lifecycle_capabilities::{
         extend_builtin_first_party_package, insert_handlers as insert_extension_lifecycle_handlers,
@@ -184,7 +184,10 @@ use crate::extension_host::{
         ProductAuthRuntimeGsuiteCredentialStager, register_bundled_gsuite_first_party_handlers,
     },
 };
-use crate::input::{RebornLocalRuntimeIdentity, RebornRuntimeProcessBinding, RebornStorageInput};
+use crate::input::{
+    MatrixStartupPolicyProjectionCacheConfig, RebornLocalRuntimeIdentity,
+    RebornRuntimeProcessBinding, RebornStorageInput,
+};
 use crate::lifecycle_auth_continuation::{
     LifecycleAuthContinuationDispatcher, LifecycleProductFacadeSlot,
 };
@@ -194,6 +197,10 @@ use crate::local_dev_mounts::{
     ambient_workspace_mount_view, memory_mount_view, scoped_skill_context_mount_view,
     skill_management_mount_view, system_extensions_lifecycle_mount_view, workspace_mount_view,
 };
+use crate::matrix_outbound_targets::{
+    FilesystemMatrixRoomBindingStore, validate_matrix_outbound_target_provider_configs_for_runtime,
+};
+use crate::matrix_product_outbound::MatrixLifecyclePolicyProjectionCacheRefresher;
 use crate::product_auth::credentials::product_auth_providers::{
     OAuthProviderComposition, compose_provider_client,
 };
@@ -1013,6 +1020,12 @@ pub struct RebornLocalDevApprovalTestParts {
     pub capability_leases: Arc<dyn ironclaw_authorization::CapabilityLeaseStore>,
 }
 
+#[derive(Clone)]
+pub(crate) struct MatrixStartupPolicyProjectionCache {
+    pub(crate) target_source: Arc<FilesystemMatrixRoomBindingStore>,
+    pub(crate) refresher: Arc<MatrixLifecyclePolicyProjectionCacheRefresher>,
+}
+
 pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) extension_lifecycle_surface_context: LifecycleProductSurfaceContext,
     pub(crate) owner_user_id: UserId,
@@ -1121,6 +1134,7 @@ pub(crate) struct RebornLocalRuntimeServices {
     // wiring need scoped storage/registry ownership before this is reused
     // outside local-dev composition. Tracked in #4091.
     pub(crate) extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
+    pub(crate) matrix_startup_policy_projection_cache: Option<MatrixStartupPolicyProjectionCache>,
     /// Late-binding slot for the per-caller channel-connection facade. Created
     /// empty here and shared with the extension-lifecycle capability handler so
     /// an inbound-channel activation can check whether the caller has already
@@ -1444,6 +1458,51 @@ fn production_config(
 /// hosted-single-tenant. Hosted single-tenant supplies a durable Postgres
 /// backend through `RebornStorageInput::HostedSingleTenantPostgres`; local-dev
 /// keeps its historical local filesystem/libSQL default.
+async fn build_matrix_startup_policy_projection_cache_refresher(
+    config: Option<MatrixStartupPolicyProjectionCacheConfig>,
+    filesystem: Arc<CompositeRootFilesystem>,
+    installation_store: SharedExtensionInstallationStore,
+) -> Result<Option<MatrixStartupPolicyProjectionCache>, RebornBuildError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    validate_matrix_outbound_target_provider_configs_for_runtime(&config.target_providers)
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("Matrix outbound target provider configuration failed: {error}"),
+        })?;
+    let tenant_ids = config
+        .target_providers
+        .iter()
+        .map(|provider| provider.tenant_id.clone())
+        .collect::<Vec<_>>();
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        filesystem.clone(),
+        tenant_ids,
+    ));
+    target_source
+        .seed_from_configs(&config.target_providers)
+        .await
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("Matrix room binding store seed failed: {error}"),
+        })?;
+    let refresher = Arc::new(
+        MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            filesystem,
+            installation_store,
+            Arc::clone(&target_source),
+            config.artifact_evidence,
+            config.policy_owner_actor,
+        )
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("Matrix policy projection cache refresh configuration failed: {error}"),
+        })?,
+    );
+    Ok(Some(MatrixStartupPolicyProjectionCache {
+        target_source,
+        refresher,
+    }))
+}
+
 async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, RebornBuildError> {
     #[cfg(all(test, feature = "slack-v2-host-beta"))]
     let host_runtime_http_egress_for_test = input.host_runtime_http_egress_for_test.clone();
@@ -1457,6 +1516,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
+        matrix_startup_policy_projection_cache,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
             matrix_retry_production_config: _,
         #[cfg(feature = "slack-v2-host-beta")]
@@ -1954,12 +2014,27 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         local_dev_trust_policy,
         local_dev_trust_invalidation_bus,
     );
+    let matrix_startup_policy_projection_cache =
+        build_matrix_startup_policy_projection_cache_refresher(
+            matrix_startup_policy_projection_cache,
+            Arc::clone(&filesystem),
+            Arc::clone(&extension_installation_store),
+        )
+        .await?;
+    let lifecycle_policy_projection_cache_refresher = matrix_startup_policy_projection_cache
+        .as_ref()
+        .map(|cache| {
+            Arc::clone(&cache.refresher) as Arc<dyn LifecyclePolicyProjectionCacheRefresher>
+        })
+        .unwrap_or_else(noop_lifecycle_policy_projection_cache_refresher);
     restore_extension_lifecycle_state(
         &available_extensions,
         &extension_filesystem,
         &extension_installation_store,
         &extension_lifecycle_service,
         &active_extensions,
+        &nearai_mcp_owner_scope,
+        lifecycle_policy_projection_cache_refresher,
     )
     .await
     .map_err(|error| RebornBuildError::InvalidConfig {
@@ -2063,6 +2138,8 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         {
             local_runtime.admin_secret_provisioner = admin_secret_provisioner;
         }
+        local_runtime.matrix_startup_policy_projection_cache =
+            matrix_startup_policy_projection_cache.clone();
     } else {
         return Err(RebornBuildError::InvalidConfig {
             reason: "local-dev extension lifecycle facade could not be attached".to_string(),
@@ -2619,6 +2696,7 @@ async fn build_local_dev_store_graph(
         budget_gate_store,
         skill_management,
         extension_management: None,
+        matrix_startup_policy_projection_cache: None,
         #[cfg(any(
             feature = "slack-v2-host-beta",
             feature = "telegram-v2-host-beta",
@@ -2813,6 +2891,7 @@ async fn build_local_dev_store_graph(
         budget_gate_store,
         skill_management,
         extension_management: None,
+        matrix_startup_policy_projection_cache: None,
         #[cfg(any(
             feature = "slack-v2-host-beta",
             feature = "telegram-v2-host-beta",
@@ -4389,6 +4468,7 @@ async fn build_production_shaped(
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
+        matrix_startup_policy_projection_cache: _,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         matrix_retry_production_config,
         #[cfg(feature = "slack-v2-host-beta")]
@@ -6147,6 +6227,9 @@ mod tests {
             budget_gate_store: Arc::clone(&base_runtime.budget_gate_store),
             skill_management: Arc::clone(&base_runtime.skill_management),
             extension_management: base_runtime.extension_management.clone(),
+            matrix_startup_policy_projection_cache: base_runtime
+                .matrix_startup_policy_projection_cache
+                .clone(),
             #[cfg(any(
                 feature = "slack-v2-host-beta",
                 feature = "telegram-v2-host-beta",
