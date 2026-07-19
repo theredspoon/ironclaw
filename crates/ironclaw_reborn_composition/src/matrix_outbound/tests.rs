@@ -686,7 +686,6 @@ fn tenant_scoped_matrix_metadata_filesystem(
                 MountPermissions::read_write_list_delete(),
             ),
         ])
-        .map_err(Into::into)
     }))
 }
 
