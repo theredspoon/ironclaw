@@ -9,6 +9,11 @@ use ironclaw_extensions::{
     ManifestHash, ManifestSource,
 };
 use ironclaw_filesystem::{CasExpectation, ContentType, Entry};
+#[cfg(feature = "libsql")]
+use ironclaw_host_api::runtime_policy::{
+    ApprovalPolicy, AuditMode, DeploymentMode, EffectiveRuntimePolicy, FilesystemBackendKind,
+    NetworkMode, ProcessBackendKind, RuntimeProfile, SecretMode,
+};
 use ironclaw_host_api::{
     AgentId, CapabilityId, ExtensionId, HostPortCatalog, ProjectId, TenantId, ThreadId, UserId,
 };
@@ -49,6 +54,8 @@ use ironclaw_turns::{
     run_profile::{LoopCapabilityPort, ProviderToolCall, RegisterProviderToolCallRequest},
 };
 
+#[cfg(feature = "libsql")]
+use crate::RebornRuntimeProcessBinding;
 use crate::input::RebornBuildInput;
 use crate::matrix_outbound::{
     DeliveryReasonCode, FilesystemMatrixOutboundMetadataStore, FilesystemMatrixPendingIntentStore,
@@ -81,13 +88,52 @@ struct OutboundDeliveryTriggerGateway {
 }
 
 #[cfg(feature = "libsql")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RecordingRuntimeNetworkEgress {
     requests: StdMutex<Vec<NetworkHttpRequest>>,
+    response: StdMutex<NetworkHttpResponse>,
 }
 
 #[cfg(feature = "libsql")]
 impl RecordingRuntimeNetworkEgress {
+    fn matrix_success() -> Self {
+        Self::with_response(
+            200,
+            br#"{"event_id":"$event:runtime-production-delivery-proof"}"#.to_vec(),
+        )
+    }
+
+    fn malformed_success_evidence() -> Self {
+        Self::with_response(200, br#"{"ok":true}"#.to_vec())
+    }
+
+    fn set_malformed_success_evidence(&self) {
+        *self
+            .response
+            .lock()
+            .expect("Matrix runtime network response lock poisoned") =
+            Self::malformed_success_evidence()
+                .response
+                .into_inner()
+                .expect("fresh response lock");
+    }
+
+    fn with_response(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            requests: StdMutex::new(Vec::new()),
+            response: StdMutex::new(NetworkHttpResponse {
+                status,
+                headers: Vec::new(),
+                body,
+                usage: NetworkUsage {
+                    request_bytes: 128,
+                    response_bytes: 64,
+                    resolved_ip: None,
+                },
+            }),
+        }
+    }
+
     fn requests(&self) -> Vec<NetworkHttpRequest> {
         self.requests
             .lock()
@@ -107,15 +153,34 @@ impl NetworkHttpEgress for RecordingRuntimeNetworkEgress {
             .lock()
             .expect("Matrix runtime network requests lock poisoned")
             .push(request);
-        Ok(NetworkHttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: br#"{"event_id":"$event:runtime-production-delivery-proof"}"#.to_vec(),
-            usage: NetworkUsage {
-                request_bytes: 128,
-                response_bytes: 64,
-                resolved_ip: None,
-            },
+        Ok(self
+            .response
+            .lock()
+            .expect("Matrix runtime network response lock poisoned")
+            .clone())
+    }
+}
+
+#[cfg(feature = "libsql")]
+#[derive(Debug)]
+struct RecordingSandboxTransport;
+
+#[cfg(feature = "libsql")]
+#[async_trait]
+impl ironclaw_host_runtime::SandboxCommandTransport for RecordingSandboxTransport {
+    async fn run_command(
+        &self,
+        _request: ironclaw_host_runtime::CommandExecutionRequest,
+    ) -> Result<
+        ironclaw_host_runtime::CommandExecutionOutput,
+        ironclaw_host_runtime::RuntimeProcessError,
+    > {
+        Ok(ironclaw_host_runtime::CommandExecutionOutput {
+            output: String::new(),
+            saved_output: None,
+            exit_code: 0,
+            sandboxed: true,
+            duration: Duration::ZERO,
         })
     }
 }
@@ -922,7 +987,7 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
             delivery: runtime_matrix_delivery_request(
                 workflow_scope.clone(),
                 user_id.clone(),
-                reply_target,
+                reply_target.clone(),
             ),
             payload: runtime_matrix_payload(),
             projection_cursor: ProductProjectionCursor::new("cursor:runtime-matrix-live-caller")
@@ -996,8 +1061,12 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
 #[tokio::test]
 async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_production_retry_worker() {
     let root = tempfile::tempdir().expect("tempdir");
-    let host_home = root.path().join("host-home");
-    std::fs::create_dir_all(&host_home).expect("host home");
+    let db = Arc::new(
+        libsql::Builder::new_local(root.path().join("reborn.db"))
+            .build()
+            .await
+            .expect("libsql db"),
+    );
     let tenant_id = TenantId::new("runtime-matrix-production-proof-tenant").expect("tenant");
     let user_id = UserId::new("runtime-matrix-production-proof-owner").expect("user");
     let agent_id = AgentId::new("runtime-matrix-production-proof-agent").expect("agent");
@@ -1013,7 +1082,18 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         ThreadId::new("runtime-matrix-production-proof-thread").expect("thread"),
         Some(user_id.clone()),
     );
-    let network_egress = Arc::new(RecordingRuntimeNetworkEgress::default());
+    let discovery_root = TurnScope::new_with_owner(
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        Some(project_id.clone()),
+        ThreadId::new("runtime-matrix-production-proof-discovery-root").expect("thread"),
+        Some(user_id.clone()),
+    );
+    assert_ne!(
+        discovery_root, workflow_scope,
+        "fixture must not prelist the exact delivery TurnScope"
+    );
+    let network_egress = Arc::new(RecordingRuntimeNetworkEgress::matrix_success());
     let credential_handle_fingerprint = format!(
         "sha256:{}",
         ironclaw_common::hashing::sha256_hex(b"matrix-access-token")
@@ -1021,15 +1101,33 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
     let credential_secret =
         SecretHandle::new("matrix_access_token").expect("Matrix credential secret handle");
     let input = RebornRuntimeInput::from_services(
-        RebornBuildInput::local_dev_with_profile(
-            RebornCompositionProfile::LocalDevYolo,
-            user_id.as_str(),
-            root.path().join("local-dev"),
+        RebornBuildInput::libsql(
+            RebornCompositionProfile::Production,
+            "runtime-matrix-production-proof-owner",
+            db,
+            root.path().join("events.db").to_string_lossy(),
+            None,
+            ironclaw_secrets::SecretMaterial::from("01234567890123456789012345678901"),
         )
-        .with_runtime_policy(
-            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
-        )
-        .with_local_dev_confirmed_host_home_root(host_home)
+        .with_production_trust_policy(Arc::new(
+            crate::builtin_first_party_trust_policy().expect("trust policy"),
+        ))
+        .with_runtime_policy(EffectiveRuntimePolicy {
+            deployment: DeploymentMode::HostedMultiTenant,
+            requested_profile: RuntimeProfile::SecureDefault,
+            resolved_profile: RuntimeProfile::SecureDefault,
+            filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+            process_backend: ProcessBackendKind::TenantSandbox,
+            network_mode: NetworkMode::Deny,
+            secret_mode: SecretMode::BrokeredHandles,
+            approval_policy: ApprovalPolicy::AskAlways,
+            audit_mode: AuditMode::Standard,
+        })
+        .with_runtime_process_binding(RebornRuntimeProcessBinding::tenant_sandbox(Arc::new(
+            ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
+                RecordingSandboxTransport,
+            )),
+        )))
         .with_network_http_egress_for_test(network_egress.clone())
         .with_matrix_retry_production_config(
             crate::input::MatrixRetryWorkerProductionConfig::new(
@@ -1041,7 +1139,7 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
                         tick_jitter_max: Duration::ZERO,
                         max_entries_per_scope: 10,
                     },
-                    scopes: vec![workflow_scope.clone()],
+                    scopes: vec![discovery_root],
                     homeserver_origin: "https://matrix.example.org".to_string(),
                     credential_secret: credential_secret.clone(),
                     credential_handle_fingerprint: credential_handle_fingerprint.clone(),
@@ -1081,6 +1179,10 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
 
     let mut runtime = build_reborn_runtime(input).await.expect("runtime builds");
     assert!(
+        runtime.services.local_runtime.is_none(),
+        "fixture must use production-shaped services"
+    );
+    assert!(
         runtime.matrix_retry_worker_is_running_for_test(),
         "Matrix retry production config should spawn the production retry worker"
     );
@@ -1089,15 +1191,18 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         .seed_local_dev_secret(
             workflow_scope.to_resource_scope(),
             credential_secret,
-            "runtime-matrix-access-token".to_string(),
+            "matrix-access-token".to_string(),
         )
         .await
         .expect("seed Matrix credential material");
-    let local_runtime = runtime
+    let production_runtime = runtime
         .services
-        .local_runtime
+        .production_runtime
         .as_ref()
-        .expect("local runtime services");
+        .expect("production runtime services");
+    let policy_filesystem = production_runtime.scoped_filesystem();
+    let outbound_state = production_runtime.outbound_state();
+    let extension_installation_store = production_runtime.extension_installation_store();
     let lifecycle_scope = workflow_scope.to_resource_scope();
     let policy_provider_scope = MatrixPolicyProviderScope {
         tenant_id: tenant_id.clone(),
@@ -1112,7 +1217,6 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
             1_710_000_000_001,
         )
         .expect("policy projection");
-    let policy_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
     let policy_cache_scope = matrix_policy_projection_resource_scope_for_provider_scope(
         &lifecycle_scope,
         &policy_provider_scope,
@@ -1144,11 +1248,7 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         )
         .await
         .expect("write Matrix policy projection cache commit marker");
-    local_runtime
-        .extension_management
-        .as_ref()
-        .expect("extension management")
-        .installation_store()
+    extension_installation_store
         .upsert_manifest_and_installation(
             runtime_matrix_extension_manifest(),
             ExtensionInstallation::new(
@@ -1188,7 +1288,7 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
             delivery: runtime_matrix_delivery_request(
                 workflow_scope.clone(),
                 user_id.clone(),
-                reply_target,
+                reply_target.clone(),
             ),
             payload: runtime_matrix_payload(),
             projection_cursor: ProductProjectionCursor::new(
@@ -1207,22 +1307,41 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         panic!("expected Matrix runtime caller to render a deferred delivery");
     };
 
-    let report = runtime
-        .execute_due_matrix_retry_once_for_test(workflow_scope.clone(), attempt.delivery_id)
+    let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+        Arc::clone(&policy_filesystem),
+        Arc::clone(&outbound_state),
+    );
+    let retry_schedule = metadata_store
+        .load_retry_schedule(workflow_scope.clone(), attempt.delivery_id)
         .await
-        .expect("runtime should expose a one-shot production Matrix retry drain for tests");
-    assert_eq!(report.scopes_scanned, 1);
+        .expect("load Matrix initial retry schedule")
+        .expect("runtime caller persists a due R003A schedule");
+    assert_eq!(retry_schedule.attempt_number, 0);
+    assert_eq!(retry_schedule.retry_after, Duration::ZERO);
+    assert_eq!(retry_schedule.reason, DeliveryReasonCode::MatrixTimeout);
+    let due_tick = retry_schedule.recorded_at
+        + chrono::Duration::from_std(retry_schedule.retry_after).expect("retry delay");
+    assert_eq!(
+        due_tick, retry_schedule.recorded_at,
+        "initial Matrix retry schedule must be due immediately"
+    );
+
+    let report = runtime
+        .execute_matrix_retry_tick_once_for_test(due_tick)
+        .await
+        .expect("runtime should expose the configured production Matrix retry tick for tests");
+    assert_eq!(report.scopes_scanned, 2);
     assert_eq!(report.due_schedules, 1);
     assert_eq!(
         report.attempted, 1,
         "production retry proof must consume the durable due schedule through the worker"
     );
+    let requests = network_egress.requests();
     assert_eq!(report.delivered, 1);
     assert_eq!(report.retry_scheduled, 0);
     assert_eq!(report.skipped, 0);
     assert_eq!(report.failed, 0);
 
-    let requests = network_egress.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].method, NetworkMethod::Put);
     assert!(requests[0].url.contains("/_matrix/client/v3/rooms/"));
@@ -1242,16 +1361,19 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         "Matrix retry must not leak the adapter credential handle into HTTP headers"
     );
 
-    let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
-        crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem)),
-        Arc::clone(&local_runtime.outbound_state),
-    );
     let status = metadata_store
         .load_delivery_status(workflow_scope.clone(), attempt.delivery_id)
         .await
         .expect("load Matrix shared outbound status")
         .expect("Matrix shared outbound status should be recorded");
     assert_eq!(status.status, OutboundDeliveryStatus::Delivered);
+    let shared_attempts = outbound_state
+        .list_delivery_attempts(workflow_scope.clone())
+        .await
+        .expect("load shared outbound attempts");
+    assert_eq!(shared_attempts.len(), 1);
+    assert_eq!(shared_attempts[0].delivery_id, attempt.delivery_id);
+    assert_eq!(shared_attempts[0].status, OutboundDeliveryStatus::Delivered);
     assert!(
         metadata_store
             .load_retry_schedule(workflow_scope.clone(), attempt.delivery_id)
@@ -1261,7 +1383,7 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         "worker delivery should consume the durable retry schedule"
     );
     let evidence = metadata_store
-        .load_evidence(workflow_scope, attempt.delivery_id)
+        .load_evidence(workflow_scope.clone(), attempt.delivery_id)
         .await
         .expect("load Matrix delivery evidence")
         .expect("Matrix evidence should be persisted");
@@ -1286,6 +1408,89 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
     assert_ne!(
         evidence.installation_scoped_credential_ref,
         "matrix-access-token"
+    );
+
+    network_egress.set_malformed_success_evidence();
+    let negative_outcome = runtime
+        .prepare_matrix_product_outbound(MatrixProductOutboundDeliveryInput {
+            delivery: runtime_matrix_delivery_request(
+                workflow_scope.clone(),
+                user_id.clone(),
+                reply_target,
+            ),
+            payload: runtime_matrix_payload(),
+            projection_cursor: ProductProjectionCursor::new(
+                "cursor:runtime-matrix-production-negative-proof",
+            )
+            .expect("projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect("Matrix negative proof final reply is persisted as pending retry intent");
+    let ProductOutboundDeliveryOutcome::Rendered {
+        attempt: negative_attempt,
+        render_outcome: ProductRenderOutcome::Deferred,
+    } = negative_outcome
+    else {
+        panic!("expected Matrix runtime caller to render a deferred negative delivery");
+    };
+    let negative_schedule = metadata_store
+        .load_retry_schedule(workflow_scope.clone(), negative_attempt.delivery_id)
+        .await
+        .expect("load negative Matrix initial retry schedule")
+        .expect("negative proof starts with a due schedule");
+    assert_eq!(negative_schedule.retry_after, Duration::ZERO);
+    let negative_due_tick = negative_schedule.recorded_at;
+    let negative_report = runtime
+        .execute_matrix_retry_tick_once_for_test(negative_due_tick)
+        .await
+        .expect("negative proof retry tick uses configured production dependencies");
+    assert_eq!(negative_report.due_schedules, 1);
+    assert_eq!(negative_report.attempted, 1);
+    assert_eq!(negative_report.delivered, 0);
+    assert_eq!(negative_report.retry_scheduled, 1);
+    assert_eq!(negative_report.failed, 0);
+    let negative_requests = network_egress.requests();
+    assert_eq!(negative_requests.len(), 2);
+    assert!(
+        metadata_store
+            .load_evidence(workflow_scope.clone(), negative_attempt.delivery_id)
+            .await
+            .expect("load negative Matrix evidence")
+            .is_none(),
+        "malformed success evidence must not be recorded as delivered evidence"
+    );
+    let negative_status = metadata_store
+        .load_delivery_status(workflow_scope.clone(), negative_attempt.delivery_id)
+        .await
+        .expect("load negative Matrix delivery status");
+    assert!(
+        !matches!(
+            negative_status.as_ref().map(|status| status.status),
+            Some(OutboundDeliveryStatus::Delivered)
+        ),
+        "malformed success evidence must not mark Matrix metadata delivered"
+    );
+    let negative_shared_attempt = outbound_state
+        .list_delivery_attempts(workflow_scope.clone())
+        .await
+        .expect("load negative shared outbound attempts")
+        .into_iter()
+        .find(|attempt| attempt.delivery_id == negative_attempt.delivery_id)
+        .expect("negative shared outbound attempt should exist");
+    assert_eq!(
+        negative_shared_attempt.status,
+        OutboundDeliveryStatus::Pending
+    );
+    let rescheduled = metadata_store
+        .load_retry_schedule(workflow_scope.clone(), negative_attempt.delivery_id)
+        .await
+        .expect("load rescheduled Matrix retry")
+        .expect("malformed success evidence should keep retry state");
+    assert_eq!(rescheduled.attempt_number, 1);
+    assert_eq!(
+        rescheduled.reason,
+        DeliveryReasonCode::MatrixMalformedResponse
     );
 
     runtime.shutdown().await.expect("runtime shutdown");

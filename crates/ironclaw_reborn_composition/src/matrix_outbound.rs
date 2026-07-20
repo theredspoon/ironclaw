@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_common::hashing::sha256_hex;
 use ironclaw_filesystem::{
-    CasApply, CasUpdateError, ContentType, Entry, FileType, FilesystemError, RootFilesystem,
-    ScopedFilesystem, cas_update,
+    CasApply, CasExpectation, CasUpdateError, ContentType, Entry, FileType, FilesystemError,
+    RootFilesystem, ScopedFilesystem, cas_update,
 };
 use ironclaw_host_api::{
     CapabilityId, ExtensionId, NetworkMethod, NetworkPolicy, NetworkScheme, NetworkTargetPattern,

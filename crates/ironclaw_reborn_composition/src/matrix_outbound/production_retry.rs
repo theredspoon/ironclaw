@@ -435,6 +435,11 @@ impl MatrixHttpDeliveryEndpointResolver for MatrixStaticHttpEndpointResolver {
 
 #[async_trait]
 pub trait MatrixRetryWorkPort: Send + Sync {
+    async fn list_retry_scopes(
+        &self,
+        discovery_roots: &[TurnScope],
+    ) -> Result<Vec<TurnScope>, MatrixOutboundContractError>;
+
     async fn list_due_retry_schedules(
         &self,
         scope: TurnScope,
@@ -526,10 +531,10 @@ impl MatrixRetryProductionDependencyBundle {
         &self.settings
     }
 
-    pub(crate) fn worker_deps(&self, scopes: Vec<TurnScope>) -> MatrixRetryWorkerDeps {
+    pub(crate) fn worker_deps(&self, discovery_roots: Vec<TurnScope>) -> MatrixRetryWorkerDeps {
         MatrixRetryWorkerDeps {
             work_port: Arc::clone(&self.work_port),
-            scopes,
+            discovery_roots,
         }
     }
 }
@@ -577,6 +582,15 @@ impl<F> MatrixRetryWorkPort for MatrixRetryProductionWorkPort<F>
 where
     F: RootFilesystem + Send + Sync + 'static,
 {
+    async fn list_retry_scopes(
+        &self,
+        discovery_roots: &[TurnScope],
+    ) -> Result<Vec<TurnScope>, MatrixOutboundContractError> {
+        self.metadata_store
+            .list_indexed_retry_scopes(discovery_roots)
+            .await
+    }
+
     async fn list_due_retry_schedules(
         &self,
         scope: TurnScope,
@@ -662,7 +676,7 @@ where
 #[derive(Clone)]
 pub struct MatrixRetryWorkerDeps {
     pub work_port: Arc<dyn MatrixRetryWorkPort>,
-    pub scopes: Vec<TurnScope>,
+    pub discovery_roots: Vec<TurnScope>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -715,9 +729,9 @@ pub fn spawn_matrix_retry_worker(
         return Ok(None);
     }
     settings.validate()?;
-    if deps.scopes.is_empty() {
+    if deps.discovery_roots.is_empty() {
         return Err(MatrixOutboundContractError::Backend(
-            "matrix retry worker requires at least one scope".to_string(),
+            "matrix retry worker requires at least one discovery root".to_string(),
         ));
     }
     let cancel = CancellationToken::new();
@@ -764,11 +778,20 @@ pub async fn matrix_retry_worker_tick_once(
     cancel: &CancellationToken,
 ) -> Result<MatrixRetryWorkerTickReport, MatrixOutboundContractError> {
     settings.validate()?;
+    if deps.discovery_roots.is_empty() {
+        return Err(MatrixOutboundContractError::Backend(
+            "matrix retry worker requires at least one discovery root".to_string(),
+        ));
+    }
+    let retry_scopes = deps
+        .work_port
+        .list_retry_scopes(&deps.discovery_roots)
+        .await?;
     let mut report = MatrixRetryWorkerTickReport {
-        scopes_scanned: deps.scopes.len(),
+        scopes_scanned: retry_scopes.len(),
         ..MatrixRetryWorkerTickReport::default()
     };
-    for scope in &deps.scopes {
+    for scope in &retry_scopes {
         if cancel.is_cancelled() {
             break;
         }

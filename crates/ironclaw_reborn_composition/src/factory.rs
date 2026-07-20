@@ -1214,6 +1214,7 @@ where
     pub(crate) thread_service: Arc<dyn SessionThreadService>,
     pub(crate) trigger_repository: Arc<dyn TriggerRepository>,
     pub(crate) outbound_preferences: Arc<dyn CommunicationPreferenceRepository>,
+    pub(crate) outbound_state: Arc<dyn OutboundStateStore>,
     pub(crate) resource_governor: Arc<dyn ResourceGovernor>,
     pub(crate) budget_gate_store: Arc<dyn BudgetGateStore>,
     pub(crate) broadcast_budget_event_sink: Arc<BroadcastBudgetEventSink>,
@@ -1247,6 +1248,48 @@ impl RebornProductionRuntimeServices {
             Self::LibSql(graph) => Arc::clone(&graph.turn_state) as _,
             #[cfg(feature = "postgres")]
             Self::Postgres(graph) => Arc::clone(&graph.turn_state) as _,
+        }
+    }
+
+    pub(crate) fn scoped_filesystem(&self) -> Arc<ScopedFilesystem<dyn RootFilesystem>> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => {
+                let root: Arc<dyn RootFilesystem> = graph.filesystem.clone();
+                Arc::new(ScopedFilesystem::new(root, crate::invocation_mount_view))
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => {
+                let root: Arc<dyn RootFilesystem> = graph.filesystem.clone();
+                Arc::new(ScopedFilesystem::new(root, crate::invocation_mount_view))
+            }
+        }
+    }
+
+    pub(crate) fn extension_installation_store(&self) -> Arc<dyn ExtensionInstallationStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.extension_installation_store) as _,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.extension_installation_store) as _,
+        }
+    }
+
+    pub(crate) fn outbound_preferences(&self) -> Arc<dyn CommunicationPreferenceRepository> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.outbound_preferences),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.outbound_preferences),
+        }
+    }
+
+    pub(crate) fn outbound_state(&self) -> Arc<dyn OutboundStateStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.outbound_state),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.outbound_state),
         }
     }
 }
@@ -4474,7 +4517,7 @@ async fn build_production_shaped(
         #[cfg(all(test, feature = "slack-v2-host-beta"))]
             host_runtime_http_egress_for_test: _,
         #[cfg(any(test, feature = "test-support"))]
-            network_http_egress_for_test: _,
+        network_http_egress_for_test,
         product_auth_ports,
         oauth_provider_configs,
         oauth_dcr_provider_configs,
@@ -4559,6 +4602,8 @@ async fn build_production_shaped(
                 oauth_provider_configs,
                 oauth_dcr_provider_configs,
                 matrix_retry_production_config,
+                #[cfg(any(test, feature = "test-support"))]
+                network_http_egress_for_test,
                 #[cfg(feature = "slack-v2-host-beta")]
                 slack_personal_oauth_lazy_slot,
                 owner_id,
@@ -4607,6 +4652,8 @@ async fn build_production_shaped(
                 oauth_provider_configs,
                 oauth_dcr_provider_configs,
                 matrix_retry_production_config,
+                #[cfg(any(test, feature = "test-support"))]
+                network_http_egress_for_test,
                 #[cfg(feature = "slack-v2-host-beta")]
                 slack_personal_oauth_lazy_slot,
                 owner_id,
@@ -4653,6 +4700,8 @@ struct RebornProductionBuildContext {
     oauth_provider_configs: Vec<crate::input::OAuthProviderBackendConfig>,
     oauth_dcr_provider_configs: Vec<crate::input::OAuthDcrProviderBackendConfig>,
     matrix_retry_production_config: Option<crate::input::MatrixRetryProductionConfig>,
+    #[cfg(any(test, feature = "test-support"))]
+    network_http_egress_for_test: Option<Arc<dyn ironclaw_network::NetworkHttpEgress>>,
     #[cfg(feature = "slack-v2-host-beta")]
     slack_personal_oauth_lazy_slot:
         Option<crate::slack::slack_setup::SlackPersonalSetupServiceSlot>,
@@ -5192,7 +5241,7 @@ where
         })?;
     if config.scopes.is_empty() {
         return Err(RebornBuildError::InvalidConfig {
-            reason: "Matrix retry worker requires at least one retry scope".to_string(),
+            reason: "Matrix retry worker requires at least one retry discovery root".to_string(),
         });
     }
     let endpoint = crate::matrix_outbound::MatrixHttpDeliveryEndpoint::new(
@@ -5286,6 +5335,8 @@ where
         oauth_provider_configs,
         oauth_dcr_provider_configs,
         matrix_retry_production_config,
+        #[cfg(any(test, feature = "test-support"))]
+        network_http_egress_for_test,
         #[cfg(feature = "slack-v2-host-beta")]
         slack_personal_oauth_lazy_slot,
         owner_id,
@@ -5376,6 +5427,7 @@ where
         thread_service,
         trigger_repository: Arc::clone(&trigger_repository),
         outbound_preferences: Arc::clone(&stores.outbound_preferences),
+        outbound_state: Arc::clone(&stores.outbound_state),
         resource_governor: production_resource_governor,
         budget_gate_store,
         broadcast_budget_event_sink,
@@ -5411,19 +5463,35 @@ where
     .with_persistent_approval_policies(stores.persistent_approval_policies)
     .with_secret_store(Arc::clone(&stores.secret_credentials.secret_store))
     .with_credential_broker(stores.secret_credentials.credential_broker)
-    .with_security_audit_sink(Arc::new(ironclaw_events::TracingSecurityAuditSink))
-    .try_with_host_http_egress_with_body_store(
+    .with_security_audit_sink(Arc::new(ironclaw_events::TracingSecurityAuditSink));
+    #[cfg(any(test, feature = "test-support"))]
+    let services = if let Some(network_http_egress) = network_http_egress_for_test {
+        services.try_with_host_http_egress_with_body_store(
+            TestNetworkHttpEgress(network_http_egress),
+            Arc::clone(&stores.scoped_filesystem),
+        )?
+    } else {
+        services.try_with_host_http_egress_with_body_store(
+            ironclaw_network::PolicyNetworkHttpEgress::new(
+                ironclaw_network::ReqwestNetworkTransport::default(),
+            ),
+            Arc::clone(&stores.scoped_filesystem),
+        )?
+    };
+    #[cfg(not(any(test, feature = "test-support")))]
+    let services = services.try_with_host_http_egress_with_body_store(
         ironclaw_network::PolicyNetworkHttpEgress::new(
             ironclaw_network::ReqwestNetworkTransport::default(),
         ),
         Arc::clone(&stores.scoped_filesystem),
-    )?
-    .with_resource_governor(Arc::clone(&resource_governor))
-    .with_production_reborn_event_stores(event_stores)
-    .with_filesystem_run_state(Arc::clone(&stores.scoped_filesystem))
-    .with_turn_state_and_transition_port(Arc::clone(&turn_state))
-    .with_run_profile_resolver(planned_run_profile_resolver()?)
-    .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
+    )?;
+    let services = services
+        .with_resource_governor(Arc::clone(&resource_governor))
+        .with_production_reborn_event_stores(event_stores)
+        .with_filesystem_run_state(Arc::clone(&stores.scoped_filesystem))
+        .with_turn_state_and_transition_port(Arc::clone(&turn_state))
+        .with_run_profile_resolver(planned_run_profile_resolver()?)
+        .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let services = attach_hosted_mcp_runtime(services)?;
     let provider_composition = compose_provider_client(
