@@ -806,6 +806,8 @@ pub struct RebornRuntime {
         Option<crate::product_auth::credentials::credential_refresh_worker::CredentialRefreshWorkerRuntimeHandle>,
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     matrix_retry_worker_handle: Option<crate::matrix_outbound::MatrixRetryWorkerRuntimeHandle>,
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    matrix_retry_worker_ready: crate::factory::MatrixRetryWorkerReady,
     trace_flush_worker: crate::observability::trace_capture::TraceQueueFlushWorkerHandle,
     #[cfg(feature = "root-llm-provider")]
     skill_learning_extraction_tasks:
@@ -1573,6 +1575,49 @@ impl RebornRuntime {
         {
             false
         }
+    }
+
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    pub(crate) async fn execute_due_matrix_retry_once_for_test(
+        &self,
+        scope: ironclaw_turns::TurnScope,
+        delivery_id: ironclaw_outbound::OutboundDeliveryId,
+    ) -> Result<
+        crate::matrix_outbound::MatrixRetryWorkerTickReport,
+        crate::matrix_outbound::MatrixOutboundContractError,
+    > {
+        let crate::factory::MatrixRetryWorkerReady::Ready { settings, deps } =
+            &self.matrix_retry_worker_ready
+        else {
+            return Err(
+                crate::matrix_outbound::MatrixOutboundContractError::Backend(
+                    "Matrix retry worker is not configured".to_string(),
+                ),
+            );
+        };
+        let deps = crate::matrix_outbound::MatrixRetryWorkerDeps {
+            work_port: Arc::clone(&deps.work_port),
+            scopes: vec![scope.clone()],
+        };
+        let due_tick = Utc::now() + chrono::Duration::seconds(120);
+        let report = crate::matrix_outbound::matrix_retry_worker_tick_once(
+            settings,
+            &deps,
+            due_tick,
+            &CancellationToken::new(),
+        )
+        .await?;
+        if report.attempted == 0 {
+            deps.work_port
+                .execute_due_retry(scope, delivery_id, due_tick)
+                .await
+                .map_err(|error| {
+                    crate::matrix_outbound::MatrixOutboundContractError::Backend(format!(
+                        "Matrix retry execution failed: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(report)
     }
 
     /// Seed a bare `secret_handle` secret for an owner scope so keyed
@@ -4775,6 +4820,8 @@ pub async fn build_reborn_runtime(
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     let _ = credential_refresh;
 
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    let matrix_retry_worker_ready = services.matrix_retry_worker.clone();
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     let matrix_retry_worker_handle = match std::mem::replace(
         &mut services.matrix_retry_worker,
@@ -4838,6 +4885,8 @@ pub async fn build_reborn_runtime(
         credential_refresh_worker_handle,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         matrix_retry_worker_handle,
+        #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+        matrix_retry_worker_ready,
         trace_flush_worker,
         #[cfg(feature = "root-llm-provider")]
         skill_learning_extraction_tasks,

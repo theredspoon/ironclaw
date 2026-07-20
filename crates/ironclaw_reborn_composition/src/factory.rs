@@ -581,6 +581,7 @@ pub(crate) enum CredentialRefreshWorkerReady {
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
+#[derive(Clone)]
 pub(crate) enum MatrixRetryWorkerReady {
     Ready {
         settings: crate::matrix_outbound::MatrixRetryWorkerSettings,
@@ -1518,7 +1519,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         oauth_dcr_provider_configs,
         matrix_startup_policy_projection_cache,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
-            matrix_retry_production_config: _,
+        matrix_retry_production_config,
         #[cfg(feature = "slack-v2-host-beta")]
         slack_personal_oauth_lazy_slot,
         nearai_mcp_bootstrap_config,
@@ -2186,6 +2187,15 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
     })?;
     services = services.with_first_party_capabilities(Arc::new(first_party_registry));
 
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    let matrix_retry_worker = build_matrix_retry_worker_ready(
+        matrix_retry_production_config,
+        local_dev_scoped_filesystem(Arc::clone(&store_graph.local_runtime.extension_filesystem)),
+        Arc::clone(&store_graph.local_runtime.outbound_state),
+        Arc::clone(&secret_store),
+        services.host_runtime_http_egress_port(),
+    )?;
+
     #[cfg(any(test, feature = "test-support"))]
     let local_dev_wasm_runtime_credential_provider_captured =
         services.wasm_runtime_credential_provider_captured_for_test();
@@ -2212,7 +2222,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         credential_refresh_worker: CredentialRefreshWorkerReady::Absent,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
-        matrix_retry_worker: MatrixRetryWorkerReady::Absent,
+        matrix_retry_worker,
     })
 }
 

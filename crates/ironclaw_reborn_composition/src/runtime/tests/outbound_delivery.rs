@@ -12,6 +12,8 @@ use ironclaw_filesystem::{CasExpectation, ContentType, Entry};
 use ironclaw_host_api::{
     AgentId, CapabilityId, ExtensionId, HostPortCatalog, ProjectId, TenantId, ThreadId, UserId,
 };
+#[cfg(feature = "libsql")]
+use ironclaw_host_api::{NetworkMethod, SecretHandle};
 use ironclaw_loop_host::{
     HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
     HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
@@ -24,6 +26,8 @@ use ironclaw_matrix_adapter::installation_policy::{
     MatrixRuntimeArtifactEvidence, MatrixUserId, PolicyRevision, StaticManifestBinding,
     WitPackageName, WitWorldName,
 };
+#[cfg(feature = "libsql")]
+use ironclaw_network::{NetworkHttpEgress, NetworkHttpRequest, NetworkHttpResponse, NetworkUsage};
 use ironclaw_outbound::{
     CommunicationDeliveryIntent, CommunicationDeliveryResolutionRequest, CommunicationModality,
     OutboundDeliveryStatus, PrepareCommunicationDeliveryRequest, ProjectionUpdateRef,
@@ -74,6 +78,46 @@ const RUNTIME_SEND_TIMEOUT: Duration = Duration::from_secs(20);
 struct OutboundDeliveryTriggerGateway {
     calls: StdMutex<usize>,
     requests: StdMutex<Vec<HostManagedModelRequest>>,
+}
+
+#[cfg(feature = "libsql")]
+#[derive(Debug, Default)]
+struct RecordingRuntimeNetworkEgress {
+    requests: StdMutex<Vec<NetworkHttpRequest>>,
+}
+
+#[cfg(feature = "libsql")]
+impl RecordingRuntimeNetworkEgress {
+    fn requests(&self) -> Vec<NetworkHttpRequest> {
+        self.requests
+            .lock()
+            .expect("Matrix runtime network requests lock poisoned")
+            .clone()
+    }
+}
+
+#[cfg(feature = "libsql")]
+#[async_trait]
+impl NetworkHttpEgress for RecordingRuntimeNetworkEgress {
+    async fn execute(
+        &self,
+        request: NetworkHttpRequest,
+    ) -> Result<NetworkHttpResponse, ironclaw_network::NetworkHttpError> {
+        self.requests
+            .lock()
+            .expect("Matrix runtime network requests lock poisoned")
+            .push(request);
+        Ok(NetworkHttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: br#"{"event_id":"$event:runtime-production-delivery-proof"}"#.to_vec(),
+            usage: NetworkUsage {
+                request_bytes: 128,
+                response_bytes: 64,
+                resolved_ip: None,
+            },
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -330,12 +374,13 @@ credential_handle = "runtime-matrix-credential"
 
 fn runtime_matrix_delivery_request(
     scope: TurnScope,
+    actor_user_id: UserId,
     reply_target: ReplyTargetBindingRef,
 ) -> PrepareCommunicationDeliveryRequest {
     PrepareCommunicationDeliveryRequest {
         resolution_request: CommunicationDeliveryResolutionRequest {
             scope,
-            actor: TurnActor::new(UserId::new("runtime-matrix-live-caller-owner").expect("user")),
+            actor: TurnActor::new(actor_user_id),
             modality: CommunicationModality::Text,
             intent: CommunicationDeliveryIntent::RunNotification(RunNotificationContext {
                 event_kind: RunNotificationEventKind::FinalReplyReady,
@@ -859,10 +904,10 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
         .expect("runtime outbound target provider");
     let listed = provider
         .list_outbound_delivery_targets(&WebUiAuthenticatedCaller::new(
-            tenant_id,
-            user_id,
-            Some(agent_id),
-            Some(project_id),
+            tenant_id.clone(),
+            user_id.clone(),
+            Some(agent_id.clone()),
+            Some(project_id.clone()),
         ))
         .await
         .expect("list Matrix target");
@@ -874,7 +919,11 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
 
     let outcome = runtime
         .prepare_matrix_product_outbound(MatrixProductOutboundDeliveryInput {
-            delivery: runtime_matrix_delivery_request(workflow_scope.clone(), reply_target),
+            delivery: runtime_matrix_delivery_request(
+                workflow_scope.clone(),
+                user_id.clone(),
+                reply_target,
+            ),
             payload: runtime_matrix_payload(),
             projection_cursor: ProductProjectionCursor::new("cursor:runtime-matrix-live-caller")
                 .expect("projection cursor"),
@@ -940,6 +989,282 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
             .as_ref(),
         Some(&policy_provider_scope)
     );
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_production_retry_worker() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let host_home = root.path().join("host-home");
+    std::fs::create_dir_all(&host_home).expect("host home");
+    let tenant_id = TenantId::new("runtime-matrix-production-proof-tenant").expect("tenant");
+    let user_id = UserId::new("runtime-matrix-production-proof-owner").expect("user");
+    let agent_id = AgentId::new("runtime-matrix-production-proof-agent").expect("agent");
+    let project_id = ProjectId::new("runtime-matrix-production-proof-project").expect("project");
+    let installation_id =
+        AdapterInstallationId::new("runtime-matrix-production-proof-installation")
+            .expect("installation");
+    let room_id = "!runtime-production-proof-room:example.org";
+    let workflow_scope = TurnScope::new_with_owner(
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        Some(project_id.clone()),
+        ThreadId::new("runtime-matrix-production-proof-thread").expect("thread"),
+        Some(user_id.clone()),
+    );
+    let network_egress = Arc::new(RecordingRuntimeNetworkEgress::default());
+    let credential_handle_fingerprint = format!(
+        "sha256:{}",
+        ironclaw_common::hashing::sha256_hex(b"matrix-access-token")
+    );
+    let credential_secret =
+        SecretHandle::new("matrix_access_token").expect("Matrix credential secret handle");
+    let input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev_with_profile(
+            RebornCompositionProfile::LocalDevYolo,
+            user_id.as_str(),
+            root.path().join("local-dev"),
+        )
+        .with_runtime_policy(
+            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
+        )
+        .with_local_dev_confirmed_host_home_root(host_home)
+        .with_network_http_egress_for_test(network_egress.clone())
+        .with_matrix_retry_production_config(
+            crate::input::MatrixRetryWorkerProductionConfig::new(
+                crate::input::MatrixRetryWorkerProductionConfigInput {
+                    settings: crate::matrix_outbound::MatrixRetryWorkerSettings {
+                        enabled: true,
+                        poll_interval: Duration::from_millis(25),
+                        startup_jitter_max: Duration::ZERO,
+                        tick_jitter_max: Duration::ZERO,
+                        max_entries_per_scope: 10,
+                    },
+                    scopes: vec![workflow_scope.clone()],
+                    homeserver_origin: "https://matrix.example.org".to_string(),
+                    credential_secret: credential_secret.clone(),
+                    credential_handle_fingerprint: credential_handle_fingerprint.clone(),
+                    capability_id: CapabilityId::new("matrix.send")
+                        .expect("Matrix send capability id"),
+                },
+            ),
+        ),
+    )
+    .with_identity(RebornRuntimeIdentity {
+        tenant_id: tenant_id.as_str().to_string(),
+        agent_id: agent_id.as_str().to_string(),
+        source_binding_id: "runtime-matrix-production-proof-source".to_string(),
+        reply_target_binding_id: "runtime-matrix-production-proof-reply".to_string(),
+    })
+    .with_default_project_id(project_id.clone())
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-owner",
+        )
+        .expect("Matrix policy projection cache config"),
+    )
+    .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
+        MatrixOutboundTargetMountConfigInput {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: Some(project_id.clone()),
+            installation_id: installation_id.clone(),
+            room_targets: vec![MatrixOutboundRoomTargetConfig::new(
+                crate::matrix_outbound::MatrixRoomId::new(room_id).expect("room"),
+                user_id.clone(),
+                MatrixUserId::new("@runtime:example.org").expect("matrix sender"),
+            )],
+        },
+    ));
+
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    runtime
+        .seed_local_dev_secret(
+            workflow_scope.to_resource_scope(),
+            credential_secret,
+            "runtime-matrix-access-token".to_string(),
+        )
+        .await
+        .expect("seed Matrix credential material");
+    let local_runtime = runtime
+        .services
+        .local_runtime
+        .as_ref()
+        .expect("local runtime services");
+    let lifecycle_scope = workflow_scope.to_resource_scope();
+    let policy_provider_scope = MatrixPolicyProviderScope {
+        tenant_id: tenant_id.clone(),
+        agent_id: agent_id.clone(),
+        project_id: Some(project_id.clone()),
+    };
+    let mut policy_cache = MatrixInstallationProjectionCache::new();
+    policy_cache
+        .insert_projection(
+            runtime_matrix_policy_installation(&installation_id, room_id),
+            "runtime-matrix-owner",
+            1_710_000_000_001,
+        )
+        .expect("policy projection");
+    let policy_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
+    let policy_cache_scope = matrix_policy_projection_resource_scope_for_provider_scope(
+        &lifecycle_scope,
+        &policy_provider_scope,
+    );
+    let policy_cache_path = matrix_policy_projection_cache_path_for_route_scope(
+        &tenant_id,
+        Some(&agent_id),
+        Some(&project_id),
+        &installation_id,
+    )
+    .expect("policy cache path");
+    let policy_cache_bytes = policy_cache.to_json_bytes().expect("policy cache json");
+    policy_filesystem
+        .put(
+            &policy_cache_scope,
+            &policy_cache_path,
+            Entry::bytes(policy_cache_bytes.clone()).with_content_type(ContentType::json()),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write Matrix policy projection cache");
+    policy_filesystem
+        .put(
+            &policy_cache_scope,
+            &matrix_policy_projection_commit_marker_path_for_cache_path(&policy_cache_path)
+                .expect("policy cache commit marker path"),
+            matrix_policy_projection_commit_marker_entry(&policy_cache_bytes),
+            CasExpectation::Any,
+        )
+        .await
+        .expect("write Matrix policy projection cache commit marker");
+    local_runtime
+        .extension_management
+        .as_ref()
+        .expect("extension management")
+        .installation_store()
+        .upsert_manifest_and_installation(
+            runtime_matrix_extension_manifest(),
+            ExtensionInstallation::new(
+                ExtensionInstallationId::new(installation_id.as_str()).expect("extension install"),
+                ExtensionId::new("matrix-component").expect("extension id"),
+                ExtensionActivationState::Enabled,
+                ExtensionManifestRef::new(
+                    ExtensionId::new("matrix-component").expect("extension id"),
+                    Some(ManifestHash::new("sha256:matrix-component").expect("manifest hash")),
+                ),
+                vec![],
+                Utc::now(),
+                InstallationOwner::Tenant,
+            )
+            .expect("extension installation"),
+        )
+        .await
+        .expect("seed extension lifecycle");
+    let reply_target = runtime
+        .outbound_delivery_target_provider()
+        .expect("runtime outbound target provider")
+        .list_outbound_delivery_targets(&WebUiAuthenticatedCaller::new(
+            tenant_id.clone(),
+            user_id.clone(),
+            Some(agent_id.clone()),
+            Some(project_id.clone()),
+        ))
+        .await
+        .expect("list Matrix target")
+        .first()
+        .expect("configured Matrix target")
+        .reply_target_binding_ref
+        .clone();
+
+    let outcome = runtime
+        .prepare_matrix_product_outbound(MatrixProductOutboundDeliveryInput {
+            delivery: runtime_matrix_delivery_request(
+                workflow_scope.clone(),
+                user_id.clone(),
+                reply_target,
+            ),
+            payload: runtime_matrix_payload(),
+            projection_cursor: ProductProjectionCursor::new(
+                "cursor:runtime-matrix-production-proof",
+            )
+            .expect("projection cursor"),
+            require_direct_message_target: false,
+        })
+        .await
+        .expect("Matrix final reply is persisted as a pending retry intent");
+    let ProductOutboundDeliveryOutcome::Rendered {
+        attempt,
+        render_outcome: ProductRenderOutcome::Deferred,
+    } = outcome
+    else {
+        panic!("expected Matrix runtime caller to render a deferred delivery");
+    };
+
+    runtime
+        .execute_due_matrix_retry_once_for_test(workflow_scope.clone(), attempt.delivery_id)
+        .await
+        .expect("runtime should expose a one-shot production Matrix retry drain for tests");
+
+    let requests = network_egress.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, NetworkMethod::Put);
+    assert!(requests[0].url.contains("/_matrix/client/v3/rooms/"));
+    assert!(requests[0].url.contains("/send/m.room.message/"));
+    assert!(
+        requests[0]
+            .headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && value.starts_with("Bearer ")),
+        "Matrix retry must send with host-staged authorization material"
+    );
+    assert!(
+        requests[0]
+            .headers
+            .iter()
+            .all(|(_, value)| !value.contains("matrix_access_token")),
+        "Matrix retry must not leak the adapter credential handle into HTTP headers"
+    );
+
+    let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
+        crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem)),
+        Arc::clone(&local_runtime.outbound_state),
+    );
+    let status = metadata_store
+        .load_delivery_status(workflow_scope.clone(), attempt.delivery_id)
+        .await
+        .expect("load Matrix shared outbound status")
+        .expect("Matrix shared outbound status should be recorded");
+    assert_eq!(status.status, OutboundDeliveryStatus::Delivered);
+    let evidence = metadata_store
+        .load_evidence(workflow_scope, attempt.delivery_id)
+        .await
+        .expect("load Matrix delivery evidence")
+        .expect("Matrix evidence should be persisted");
+    assert_eq!(evidence.delivery_id, attempt.delivery_id);
+    assert_eq!(evidence.attempt_number, 1);
+    assert_eq!(evidence.http_status, 200);
+    assert_eq!(
+        evidence.event_id_fingerprint,
+        format!(
+            "sha256:{}",
+            ironclaw_common::hashing::sha256_hex(b"$event:runtime-production-delivery-proof")
+        )
+    );
+    assert_ne!(
+        evidence.event_id_fingerprint,
+        "$event:runtime-production-delivery-proof"
+    );
+    assert_eq!(
+        evidence.installation_scoped_credential_ref,
+        credential_handle_fingerprint
+    );
+    assert_ne!(
+        evidence.installation_scoped_credential_ref,
+        "matrix-access-token"
+    );
+
     runtime.shutdown().await.expect("runtime shutdown");
 }
 
@@ -1071,10 +1396,10 @@ async fn local_dev_runtime_matrix_product_outbound_disabled_extension_fails_befo
         .outbound_delivery_target_provider()
         .expect("runtime outbound target provider")
         .list_outbound_delivery_targets(&WebUiAuthenticatedCaller::new(
-            tenant_id,
-            user_id,
-            Some(agent_id),
-            Some(project_id),
+            tenant_id.clone(),
+            user_id.clone(),
+            Some(agent_id.clone()),
+            Some(project_id.clone()),
         ))
         .await
         .expect("list Matrix target")
@@ -1085,7 +1410,11 @@ async fn local_dev_runtime_matrix_product_outbound_disabled_extension_fails_befo
 
     let error = runtime
         .prepare_matrix_product_outbound(MatrixProductOutboundDeliveryInput {
-            delivery: runtime_matrix_delivery_request(workflow_scope.clone(), reply_target),
+            delivery: runtime_matrix_delivery_request(
+                workflow_scope.clone(),
+                user_id.clone(),
+                reply_target,
+            ),
             payload: runtime_matrix_payload(),
             projection_cursor: ProductProjectionCursor::new("cursor:runtime-matrix-disabled")
                 .expect("projection cursor"),
