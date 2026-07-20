@@ -7,7 +7,9 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_common::hashing::sha256_hex;
 use ironclaw_extensions::ExtensionInstallationStore;
-use ironclaw_filesystem::{CasExpectation, ContentType, Entry, RootFilesystem, ScopedFilesystem};
+use ironclaw_filesystem::{
+    CasExpectation, ContentType, Entry, RecordVersion, RootFilesystem, ScopedFilesystem,
+};
 use ironclaw_host_api::{AgentId, ExtensionId, ProjectId, ResourceScope, ScopedPath, TenantId};
 use ironclaw_matrix_adapter::installation_policy::{
     EgressTargetIndex, InstallationAuditMetadata, MatrixActivationState, MatrixHomeserverOrigin,
@@ -737,6 +739,10 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         mut runtime_installation: MatrixProductAdapterInstallation,
         source_installation: &MatrixProductAdapterInstallation,
     ) -> MatrixProductAdapterInstallation {
+        if source_installation.policy_revision > runtime_installation.policy_revision {
+            runtime_installation.policy = source_installation.policy.clone();
+            runtime_installation.activation = source_installation.activation;
+        }
         runtime_installation.policy_revision = source_installation.policy_revision;
         runtime_installation.audit = source_installation.audit.clone();
         runtime_installation
@@ -768,12 +774,19 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         source_path: &ScopedPath,
         bytes: Vec<u8>,
     ) -> Result<(), ProductWorkflowError> {
+        let cas = self
+            .filesystem
+            .get(provider_scope, source_path)
+            .await
+            .map_err(map_matrix_policy_projection_cache_error)?
+            .map(|entry| CasExpectation::Version(entry.version))
+            .unwrap_or(CasExpectation::Absent);
         self.filesystem
             .put(
                 provider_scope,
                 source_path,
                 Entry::bytes(bytes).with_content_type(ContentType::json()),
-                CasExpectation::Any,
+                cas,
             )
             .await
             .map_err(map_matrix_policy_projection_cache_error)?;
@@ -1185,12 +1198,19 @@ impl<F> FilesystemMatrixInstallationPolicyStore<F>
 where
     F: RootFilesystem + Send + Sync + ?Sized,
 {
-    async fn load_source_cache(
+    async fn load_versioned_source_cache(
         &self,
         scope: &ResourceScope,
         request: &MatrixPolicyMutationRequest,
-    ) -> Result<(ResourceScope, ScopedPath, MatrixInstallationProjectionCache), ProductWorkflowError>
-    {
+    ) -> Result<
+        (
+            ResourceScope,
+            ScopedPath,
+            MatrixInstallationProjectionCache,
+            RecordVersion,
+        ),
+        ProductWorkflowError,
+    > {
         let (provider_scope, source_path) = self.source_scope_and_path(scope, request)?;
         let entry = self
             .filesystem
@@ -1202,7 +1222,7 @@ where
             })?;
         let cache = MatrixInstallationProjectionCache::from_json_bytes(&entry.entry.body)
             .map_err(map_matrix_policy_projection_cache_error)?;
-        Ok((provider_scope, source_path, cache))
+        Ok((provider_scope, source_path, cache, entry.version))
     }
 
     async fn save_source_cache(
@@ -1210,6 +1230,7 @@ where
         provider_scope: &ResourceScope,
         source_path: &ScopedPath,
         cache: &MatrixInstallationProjectionCache,
+        expected_version: RecordVersion,
     ) -> Result<(), ProductWorkflowError> {
         let bytes = cache
             .to_json_bytes()
@@ -1219,7 +1240,7 @@ where
                 provider_scope,
                 source_path,
                 Entry::bytes(bytes).with_content_type(ContentType::json()),
-                CasExpectation::Any,
+                CasExpectation::Version(expected_version),
             )
             .await
             .map_err(map_matrix_policy_projection_cache_error)?;
@@ -1231,8 +1252,19 @@ where
         scope: &ResourceScope,
         request: MatrixPolicyMutationRequest,
     ) -> Result<MatrixPolicyMutationOutcome, ProductWorkflowError> {
-        let (provider_scope, source_path, mut cache) =
-            self.load_source_cache(scope, &request).await?;
+        if matches!(
+            request.mutation,
+            MatrixInstallationMutation::Enable { .. }
+                | MatrixInstallationMutation::Disable
+                | MatrixInstallationMutation::Delete
+        ) {
+            return Err(ProductWorkflowError::InvalidBindingRequest {
+                reason: "Matrix policy source mutations only support policy-owner updates"
+                    .to_string(),
+            });
+        }
+        let (provider_scope, source_path, mut cache, expected_version) =
+            self.load_versioned_source_cache(scope, &request).await?;
         let previous_revision = cache
             .installation(&request.installation_id)
             .ok_or_else(|| ProductWorkflowError::InvalidBindingRequest {
@@ -1254,7 +1286,7 @@ where
                 reason: "Matrix policy source mutation removed installation".to_string(),
             })?
             .policy_revision;
-        self.save_source_cache(&provider_scope, &source_path, &cache)
+        self.save_source_cache(&provider_scope, &source_path, &cache, expected_version)
             .await?;
         Ok(MatrixPolicyMutationOutcome {
             previous_revision,
@@ -1351,6 +1383,17 @@ impl MatrixPolicyMutationAuthority {
             &request.agent_id,
             request.project_id.as_ref(),
         )?;
+        if matches!(
+            request.mutation,
+            MatrixInstallationMutation::Enable { .. }
+                | MatrixInstallationMutation::Disable
+                | MatrixInstallationMutation::Delete
+        ) {
+            return Err(ProductWorkflowError::InvalidBindingRequest {
+                reason: "Matrix policy mutation authority only supports policy-owner updates"
+                    .to_string(),
+            });
+        }
         self.refresher
             .invalidate_projection_for_policy_mutation(&context.scope, &request)
             .await?;
