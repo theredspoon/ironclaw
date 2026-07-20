@@ -34,7 +34,6 @@ use uuid::Uuid;
 
 use ironclaw_events::{DurableAuditLog, DurableEventLog, InMemoryAuditSink, RuntimeEvent};
 use ironclaw_extensions::ExtensionRegistry;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_first_party_extension_ports::{
     FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, SelectableSkillContextSource,
@@ -131,14 +130,16 @@ use crate::matrix_outbound_targets::FilesystemMatrixRoomBindingStore;
 use crate::matrix_outbound_targets::{
     MatrixHostProductOutboundTargetResolver, MatrixHostReplyTargetPolicy,
     MatrixRoomBindingAuthority, MatrixRoomBindingMutationContext, MatrixRoomBindingRemovalOutcome,
-    MatrixRoomBindingRemovalRequest, MatrixRoomBindingUpdateOutcome,
+    MatrixRoomBindingRemovalRequest, MatrixRoomBindingStore, MatrixRoomBindingUpdateOutcome,
     MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome, MatrixRoomBindingUpsertRequest,
     register_matrix_outbound_target_provider_source,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use crate::matrix_product_outbound::MatrixLifecyclePolicyProjectionCacheRefresher;
 use crate::matrix_product_outbound::{
-    FilesystemMatrixPolicySnapshotSource, MATRIX_PRODUCT_ADAPTER_EXTENSION_ID,
+    FilesystemMatrixInstallationPolicyStore, FilesystemMatrixPolicySnapshotSource,
+    MATRIX_PRODUCT_ADAPTER_EXTENSION_ID, MatrixPolicyMutationAuthority,
+    MatrixPolicyMutationContext, MatrixPolicyMutationOutcome, MatrixPolicyMutationRequest,
     MatrixProductOutboundDeliveryError, MatrixProductOutboundDeliveryInput,
     MatrixProductOutboundEntrypoint,
 };
@@ -250,7 +251,6 @@ impl HostUserProfileSource for MemoryBackedUserProfileSourceAdapter {
 
 struct RuntimeStoreParts<'a> {
     local_runtime: Option<&'a crate::factory::RebornLocalRuntimeServices>,
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
     matrix_policy_projection_filesystem: Option<Arc<dyn RootFilesystem>>,
     extension_installation_store: Option<SharedExtensionInstallationStore>,
     local_extension_management:
@@ -415,7 +415,6 @@ fn local_runtime_parts(
 
     RuntimeStoreParts {
         local_runtime: Some(local_runtime),
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         matrix_policy_projection_filesystem: Some(
             Arc::clone(&local_runtime.extension_filesystem) as Arc<dyn RootFilesystem>
         ),
@@ -830,6 +829,7 @@ pub struct RebornRuntime {
         Option<Arc<dyn ironclaw_conversations::ConversationActorPairingService>>,
     outbound_delivery_target_registry: Option<Arc<MutableOutboundDeliveryTargetRegistry>>,
     matrix_room_binding_authority: Option<Arc<MatrixRoomBindingAuthority>>,
+    matrix_policy_mutation_authority: Option<Arc<MatrixPolicyMutationAuthority>>,
     matrix_product_outbound_target_resolver: Option<Arc<MatrixHostProductOutboundTargetResolver>>,
     budget_event_projection: Option<crate::observability::budget_events::BudgetEventProjection>,
     poll_settings: PollSettings,
@@ -2053,6 +2053,32 @@ impl RebornRuntime {
             .await
             .map_err(|error| RebornRuntimeError::InvalidArgument {
                 reason: format!("Matrix room binding update failed: {error}"),
+            })
+    }
+
+    pub async fn apply_matrix_policy_mutation(
+        &self,
+        request: MatrixPolicyMutationRequest,
+    ) -> Result<MatrixPolicyMutationOutcome, RebornRuntimeError> {
+        let Some(authority) = self.matrix_policy_mutation_authority.as_ref() else {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "Matrix policy mutation authority is not configured".to_string(),
+            });
+        };
+        let scope = self.matrix_room_binding_mutation_scope(
+            &request.tenant_id,
+            &request.agent_id,
+            request.project_id.clone(),
+        );
+        let extension_id = matrix_product_adapter_extension_id()?;
+        authority
+            .apply_policy_mutation(
+                &MatrixPolicyMutationContext::for_host_owned_matrix_admin(scope, extension_id),
+                request,
+            )
+            .await
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!("Matrix policy mutation failed: {error}"),
             })
     }
 
@@ -3820,6 +3846,7 @@ pub async fn build_reborn_runtime(
                     #[cfg(any(feature = "libsql", feature = "postgres"))]
                     {
                         let filesystem = matrix_policy_projection_filesystem
+                            .clone()
                             .ok_or(RebornRuntimeError::InvalidArgument {
                             reason:
                                 "Matrix policy projection cache refresh requires runtime filesystem"
@@ -3896,6 +3923,35 @@ pub async fn build_reborn_runtime(
                 target_source.clone(),
                 Arc::clone(refresher),
                 Arc::clone(&audit_log),
+            )))
+        }
+        _ => None,
+    };
+    let matrix_policy_mutation_authority = match (
+        &matrix_policy_projection_filesystem,
+        &matrix_room_binding_store,
+        &matrix_policy_projection_cache_refresher,
+    ) {
+        (Some(filesystem), Some(target_source), Some(refresher)) => {
+            let mut allowed_tenants = HashSet::new();
+            allowed_tenants.insert(validated_identity.tenant_id.clone());
+            for provider in target_source
+                .snapshot_provider_configs()
+                .await
+                .map_err(|error| RebornRuntimeError::InvalidArgument {
+                    reason: format!(
+                        "Matrix policy mutation authority tenant discovery failed: {error}"
+                    ),
+                })?
+            {
+                allowed_tenants.insert(provider.tenant_id);
+            }
+            Some(Arc::new(MatrixPolicyMutationAuthority::new(
+                Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+                    Arc::clone(filesystem),
+                    allowed_tenants,
+                )),
+                refresher.as_ref().clone(),
             )))
         }
         _ => None,
@@ -4793,6 +4849,7 @@ pub async fn build_reborn_runtime(
         trigger_conversation_pairing: trigger_conversation_pairing_value,
         outbound_delivery_target_registry: Some(outbound_delivery_target_registry),
         matrix_room_binding_authority,
+        matrix_policy_mutation_authority,
         matrix_product_outbound_target_resolver,
         budget_event_projection,
         poll_settings: poll,

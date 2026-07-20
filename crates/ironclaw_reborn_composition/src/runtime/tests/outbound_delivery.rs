@@ -19,8 +19,9 @@ use ironclaw_loop_host::{
 use ironclaw_matrix_adapter::installation_policy::{
     ArtifactSha256, ComponentArtifactBinding, ComponentArtifactId, EgressTargetIndex,
     InstallationAuditMetadata, MatrixActivationState, MatrixHomeserverOrigin,
-    MatrixInstallationPolicy, MatrixInstallationProjectionCache, MatrixProductAdapterInstallation,
-    MatrixRoomId as AdapterMatrixRoomId, MatrixUserId, PolicyRevision, StaticManifestBinding,
+    MatrixInstallationMutation, MatrixInstallationPolicy, MatrixInstallationProjectionCache,
+    MatrixProductAdapterInstallation, MatrixRoomId as AdapterMatrixRoomId,
+    MatrixRuntimeArtifactEvidence, MatrixUserId, PolicyRevision, StaticManifestBinding,
     WitPackageName, WitWorldName,
 };
 use ironclaw_outbound::{
@@ -50,6 +51,7 @@ use crate::matrix_outbound::{
     MatrixPolicyProviderScope,
 };
 use crate::matrix_product_outbound::{
+    FilesystemMatrixPolicySnapshotSource, MatrixPolicyMutationRequest,
     MatrixProductOutboundDeliveryInput, matrix_policy_projection_cache_path_for_route_scope,
     matrix_policy_projection_commit_marker_entry,
     matrix_policy_projection_commit_marker_path_for_cache_path,
@@ -228,6 +230,18 @@ fn runtime_matrix_policy_installation(
     .expect("matrix installation projection")
 }
 
+fn runtime_matrix_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
+    MatrixRuntimeArtifactEvidence {
+        artifact_id: ComponentArtifactId::new("matrix-component").expect("artifact id"),
+        artifact_sha256: ArtifactSha256::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("artifact sha"),
+        wit_package: WitPackageName::new("near:product-adapter@0.1.0").expect("wit package"),
+        wit_world: WitWorldName::new("product-adapter-component").expect("wit world"),
+    }
+}
+
 fn runtime_matrix_extension_manifest() -> ExtensionManifestRecord {
     ExtensionManifestRecord::from_toml(
         format!(
@@ -260,6 +274,58 @@ prompt_doc_ref = "prompts/matrix/echo.md"
         Some(ManifestHash::new("sha256:matrix-component").expect("manifest hash")),
     )
     .expect("matrix manifest")
+}
+
+fn runtime_matrix_product_adapter_manifest() -> ExtensionManifestRecord {
+    let host_ports =
+        ironclaw_host_runtime::default_host_port_catalog().expect("default host port catalog");
+    let contracts =
+        crate::extension_host::host_api_contracts::product_extension_host_api_contract_registry()
+            .expect("host API contracts");
+    ExtensionManifestRecord::from_toml_with_contracts(
+        format!(
+            r#"
+schema_version = "{schema}"
+id = "matrix-product-adapter"
+name = "Matrix ProductAdapter"
+version = "0.1.0"
+description = "Matrix ProductAdapter runtime mutation test component"
+trust = "first_party_requested"
+
+[runtime]
+kind = "wasm"
+module = "wasm/matrix.wasm"
+
+[[host_api]]
+id = "ironclaw.product_adapter/v1"
+section = "product_adapter.inbound"
+
+[product_adapter.inbound]
+surface_kind = "external_channel"
+
+[product_adapter.inbound.auth]
+kind = "shared_secret_header"
+header_name = "x-matrix-webhook-secret"
+
+[product_adapter.inbound.capabilities]
+flags = ["inbound_messages", "external_final_reply_push"]
+
+[[product_adapter.inbound.required_credentials]]
+handle = "runtime-matrix-credential"
+
+[[product_adapter.inbound.egress]]
+host = "matrix.example.org"
+credential_handle = "runtime-matrix-credential"
+"#,
+            schema = MANIFEST_SCHEMA_VERSION,
+        )
+        .as_str(),
+        ManifestSource::HostBundled,
+        &host_ports,
+        Some(ManifestHash::new("sha256:runtime-matrix-product-adapter").expect("manifest hash")),
+        &contracts,
+    )
+    .expect("matrix product adapter manifest")
 }
 
 fn runtime_matrix_delivery_request(
@@ -449,6 +515,205 @@ async fn local_dev_runtime_accepts_multiple_matrix_outbound_installations() {
 }
 
 #[tokio::test]
+async fn local_dev_runtime_applies_matrix_policy_mutation_through_runtime_authority() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let host_home = root.path().join("host-home");
+    std::fs::create_dir_all(&host_home).expect("host home");
+    let tenant_id = TenantId::new("runtime-matrix-policy-tenant").expect("tenant");
+    let user_id = UserId::new("runtime-matrix-policy-owner").expect("user");
+    let agent_id = AgentId::new("runtime-matrix-policy-agent").expect("agent");
+    let project_id = ProjectId::new("runtime-matrix-policy-project").expect("project");
+    let installation_id =
+        AdapterInstallationId::new("runtime-matrix-policy-installation").expect("installation");
+    let room_id =
+        crate::matrix_outbound::MatrixRoomId::new("!runtime-policy-room:example.org".to_string())
+            .expect("room");
+    let matrix_sender = MatrixUserId::new("@runtime-policy:example.org").expect("matrix sender");
+    let input = RebornRuntimeInput::from_services(
+        RebornBuildInput::local_dev_with_profile(
+            RebornCompositionProfile::LocalDevYolo,
+            user_id.as_str(),
+            root.path().join("local-dev"),
+        )
+        .with_runtime_policy(
+            crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
+        )
+        .with_local_dev_confirmed_host_home_root(host_home),
+    )
+    .with_identity(RebornRuntimeIdentity {
+        tenant_id: tenant_id.as_str().to_string(),
+        agent_id: agent_id.as_str().to_string(),
+        source_binding_id: "runtime-matrix-policy-source".to_string(),
+        reply_target_binding_id: "runtime-matrix-policy-reply".to_string(),
+    })
+    .with_default_project_id(project_id.clone())
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-owner",
+        )
+        .expect("Matrix policy projection cache config"),
+    )
+    .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
+        MatrixOutboundTargetMountConfigInput {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: Some(project_id.clone()),
+            installation_id: installation_id.clone(),
+            room_targets: vec![MatrixOutboundRoomTargetConfig::new(
+                room_id.clone(),
+                user_id.clone(),
+                matrix_sender.clone(),
+            )],
+        },
+    ));
+
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    let local_runtime = runtime
+        .services
+        .local_runtime
+        .as_ref()
+        .expect("local runtime services");
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    local_runtime
+        .extension_management
+        .as_ref()
+        .expect("extension management")
+        .installation_store()
+        .upsert_manifest_and_installation(
+            runtime_matrix_product_adapter_manifest(),
+            ExtensionInstallation::new(
+                ExtensionInstallationId::new(installation_id.as_str()).expect("extension install"),
+                extension_id.clone(),
+                ExtensionActivationState::Enabled,
+                ExtensionManifestRef::new(
+                    extension_id,
+                    Some(
+                        ManifestHash::new("sha256:runtime-matrix-product-adapter")
+                            .expect("manifest hash"),
+                    ),
+                ),
+                vec![],
+                Utc::now(),
+                InstallationOwner::Tenant,
+            )
+            .expect("extension installation"),
+        )
+        .await
+        .expect("seed Matrix ProductAdapter lifecycle state");
+
+    let upsert = runtime
+        .upsert_matrix_room_binding(crate::MatrixRoomBindingUpsertRequest {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: Some(project_id.clone()),
+            installation_id: installation_id.clone(),
+            room_id: room_id.clone(),
+            subject_user_id: user_id.clone(),
+            matrix_sender_user_id: matrix_sender,
+        })
+        .await
+        .expect("runtime room binding mutation initializes Matrix policy source cache");
+    assert_eq!(upsert, crate::MatrixRoomBindingUpsertOutcome::Unchanged);
+
+    let policy_scope = matrix_policy_projection_resource_scope_for_provider_scope(
+        &TurnScope::new(
+            tenant_id.clone(),
+            Some(agent_id.clone()),
+            Some(project_id.clone()),
+            ThreadId::new("runtime-matrix-policy-thread").expect("thread"),
+        )
+        .to_resource_scope(),
+        &MatrixPolicyProviderScope {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: Some(project_id.clone()),
+        },
+    );
+    let policy_cache_path = matrix_policy_projection_cache_path_for_route_scope(
+        &tenant_id,
+        Some(&agent_id),
+        Some(&project_id),
+        &installation_id,
+    )
+    .expect("policy cache path");
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem)),
+        policy_scope,
+        policy_cache_path,
+    );
+    let initial_snapshot = source
+        .resolve_enabled_matrix_policy_snapshot_for_installation(&installation_id)
+        .await
+        .expect("initial runtime-published Matrix policy snapshot");
+    assert_eq!(
+        initial_snapshot.policy_revision,
+        PolicyRevision::new(1).expect("revision")
+    );
+    let policy = MatrixInstallationPolicy::new(
+        initial_snapshot.homeserver.clone(),
+        initial_snapshot.allowed_rooms.clone(),
+        initial_snapshot.allowed_senders.clone(),
+        initial_snapshot.egress_target_index,
+        initial_snapshot.credential_handle.clone(),
+    )
+    .expect("policy from snapshot");
+
+    let outcome = runtime
+        .apply_matrix_policy_mutation(MatrixPolicyMutationRequest {
+            tenant_id: tenant_id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: Some(project_id.clone()),
+            installation_id: installation_id.clone(),
+            mutation: MatrixInstallationMutation::UpdatePolicy { policy },
+            actor: user_id.as_str().to_string(),
+        })
+        .await
+        .expect("runtime policy mutation reaches MatrixPolicyMutationAuthority");
+
+    assert_eq!(
+        outcome.previous_revision,
+        PolicyRevision::new(1).expect("previous revision")
+    );
+    assert_eq!(
+        outcome.next_revision,
+        PolicyRevision::new(2).expect("next revision")
+    );
+    let refreshed_snapshot = source
+        .resolve_enabled_matrix_policy_snapshot_for_installation(&installation_id)
+        .await
+        .expect("refreshed runtime-published Matrix policy snapshot");
+    assert_eq!(refreshed_snapshot.policy_revision, outcome.next_revision);
+
+    let reconcile_upsert = runtime
+        .upsert_matrix_room_binding(crate::MatrixRoomBindingUpsertRequest {
+            tenant_id,
+            agent_id,
+            project_id: Some(project_id.clone()),
+            installation_id: installation_id.clone(),
+            room_id,
+            subject_user_id: user_id,
+            matrix_sender_user_id: MatrixUserId::new("@runtime-policy:example.org")
+                .expect("matrix sender"),
+        })
+        .await
+        .expect("runtime room binding refresh reconciles Matrix policy projection");
+    assert_eq!(
+        reconcile_upsert,
+        crate::MatrixRoomBindingUpsertOutcome::Unchanged
+    );
+    let reconciled_snapshot = source
+        .resolve_enabled_matrix_policy_snapshot_for_installation(&installation_id)
+        .await
+        .expect("reconciled Matrix policy snapshot keeps source revision");
+    assert_eq!(
+        reconciled_snapshot.policy_revision, outcome.next_revision,
+        "ReconcileFromRuntime must not demote a source-owned policy revision"
+    );
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
+#[tokio::test]
 async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
     let root = tempfile::tempdir().expect("tempdir");
     let host_home = root.path().join("host-home");
@@ -480,6 +745,13 @@ async fn local_dev_runtime_exposes_matrix_product_outbound_live_caller() {
         reply_target_binding_id: "runtime-matrix-live-caller-reply".to_string(),
     })
     .with_default_project_id(project_id.clone())
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-owner",
+        )
+        .expect("Matrix policy projection cache config"),
+    )
     .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
         MatrixOutboundTargetMountConfigInput {
             tenant_id: tenant_id.clone(),
@@ -701,6 +973,13 @@ async fn local_dev_runtime_matrix_product_outbound_disabled_extension_fails_befo
         reply_target_binding_id: "runtime-matrix-disabled-reply".to_string(),
     })
     .with_default_project_id(project_id.clone())
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-owner",
+        )
+        .expect("Matrix policy projection cache config"),
+    )
     .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
         MatrixOutboundTargetMountConfigInput {
             tenant_id: tenant_id.clone(),
