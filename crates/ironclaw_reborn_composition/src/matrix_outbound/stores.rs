@@ -80,6 +80,13 @@ struct StoredMatrixRetryExecutionContextV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMatrixRetryScopeIndexEntryV1 {
+    schema_version: u32,
+    scope: TurnScope,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredFrozenProductDeliveryRouteV1 {
     delivery_id: OutboundDeliveryId,
     scope: TurnScope,
@@ -356,7 +363,7 @@ impl StoredMatrixRetryExecutionContextV1 {
 
 pub struct FilesystemMatrixPendingIntentStore<F>
 where
-    F: RootFilesystem + 'static,
+    F: RootFilesystem + ?Sized + 'static,
 {
     filesystem: Arc<ScopedFilesystem<F>>,
 }
@@ -373,7 +380,7 @@ enum PendingRecordMutation<T> {
 
 impl<F> FilesystemMatrixPendingIntentStore<F>
 where
-    F: RootFilesystem,
+    F: RootFilesystem + ?Sized,
 {
     pub fn new(filesystem: Arc<ScopedFilesystem<F>>) -> Self {
         Self { filesystem }
@@ -532,7 +539,7 @@ where
 
 pub struct FilesystemMatrixOutboundMetadataStore<F>
 where
-    F: RootFilesystem,
+    F: RootFilesystem + ?Sized,
 {
     filesystem: Arc<ScopedFilesystem<F>>,
     outbound_state_store: Arc<dyn OutboundStateStore>,
@@ -540,7 +547,7 @@ where
 
 impl<F> FilesystemMatrixOutboundMetadataStore<F>
 where
-    F: RootFilesystem,
+    F: RootFilesystem + ?Sized,
 {
     pub fn new(
         filesystem: Arc<ScopedFilesystem<F>>,
@@ -659,6 +666,203 @@ where
             }
         }
         Ok(schedules)
+    }
+
+    async fn list_live_retry_schedules(
+        &self,
+        scope: TurnScope,
+        max_entries: usize,
+    ) -> Result<Vec<MatrixRetrySchedule>, MatrixOutboundContractError> {
+        if max_entries == 0 {
+            return Ok(Vec::new());
+        }
+
+        let resource_scope = scope.to_resource_scope();
+        let metadata_dir = matrix_metadata_dir_path()?;
+        let entries = match self
+            .filesystem
+            .list_dir(&resource_scope, &metadata_dir)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(FilesystemError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let terminal_delivery_ids = self
+            .outbound_state_store
+            .list_delivery_attempts(scope.clone())
+            .await?
+            .into_iter()
+            .filter(|attempt| is_terminal_delivery_status(attempt.status))
+            .map(|attempt| attempt.delivery_id)
+            .collect::<HashSet<_>>();
+        let mut schedules = Vec::new();
+        for entry in entries {
+            if entry.file_type != FileType::File {
+                continue;
+            }
+            let record_path = ScopedPath::new(format!("/outbound/matrix/metadata/{}", entry.name))
+                .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))?;
+            let Some(record) = self
+                .load_record_at_path(&resource_scope, &record_path)
+                .await?
+            else {
+                continue;
+            };
+            if record.scope != scope
+                || terminal_delivery_ids.contains(&record.delivery_id)
+                || record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| is_terminal_delivery_status(status.status))
+            {
+                continue;
+            }
+            let Some(schedule) = record.retry_schedule else {
+                continue;
+            };
+            schedules.push(schedule.into_schedule(record.delivery_id, record.scope));
+            if schedules.len() == max_entries {
+                break;
+            }
+        }
+        Ok(schedules)
+    }
+
+    pub async fn list_indexed_retry_scopes(
+        &self,
+        discovery_roots: &[TurnScope],
+    ) -> Result<Vec<TurnScope>, MatrixOutboundContractError> {
+        let mut seen = HashSet::new();
+        let mut scopes = Vec::new();
+        for root in discovery_roots {
+            let resource_scope = matrix_retry_scope_index_resource_scope(root);
+            for live_scope in self
+                .list_live_retry_scopes_from_metadata(root, &resource_scope)
+                .await?
+            {
+                if seen.insert(live_scope.clone()) {
+                    scopes.push(live_scope);
+                }
+            }
+            let index_dir = matrix_retry_scope_index_dir_path()?;
+            let entries = match self.filesystem.list_dir(&resource_scope, &index_dir).await {
+                Ok(entries) => entries,
+                Err(FilesystemError::NotFound { .. }) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            for entry in entries {
+                if entry.file_type != FileType::File {
+                    continue;
+                }
+                let record_path =
+                    ScopedPath::new(format!("/outbound/matrix/retry-scope-index/{}", entry.name))
+                        .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))?;
+                let Some(index_entry) = self
+                    .load_retry_scope_index_entry_at_path(&resource_scope, &record_path)
+                    .await?
+                else {
+                    continue;
+                };
+                if !same_matrix_retry_scope_index_resource_scope(
+                    &matrix_retry_scope_index_resource_scope(&index_entry.scope),
+                    &resource_scope,
+                ) {
+                    continue;
+                }
+                if self.has_live_retry_work(&index_entry.scope).await? {
+                    if seen.insert(index_entry.scope.clone()) {
+                        scopes.push(index_entry.scope);
+                    }
+                } else {
+                    let _ = self.filesystem.delete(&resource_scope, &record_path).await;
+                }
+            }
+        }
+        Ok(scopes)
+    }
+
+    async fn list_live_retry_scopes_from_metadata(
+        &self,
+        discovery_root: &TurnScope,
+        resource_scope: &ResourceScope,
+    ) -> Result<Vec<TurnScope>, MatrixOutboundContractError> {
+        let metadata_dir = matrix_metadata_dir_path()?;
+        let entries = match self
+            .filesystem
+            .list_dir(resource_scope, &metadata_dir)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(FilesystemError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let index_resource_scope = matrix_retry_scope_index_resource_scope(discovery_root);
+        let mut terminal_delivery_ids_by_scope: HashMap<TurnScope, HashSet<OutboundDeliveryId>> =
+            HashMap::new();
+        let mut seen = HashSet::new();
+        let mut scopes = Vec::new();
+        for entry in entries {
+            if entry.file_type != FileType::File {
+                continue;
+            }
+            let record_path = ScopedPath::new(format!("/outbound/matrix/metadata/{}", entry.name))
+                .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))?;
+            let Some(record) = self
+                .load_record_at_path(resource_scope, &record_path)
+                .await?
+            else {
+                continue;
+            };
+            if record.retry_schedule.is_none()
+                || !same_matrix_retry_scope_index_resource_scope(
+                    &matrix_retry_scope_index_resource_scope(&record.scope),
+                    &index_resource_scope,
+                )
+                || record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| is_terminal_delivery_status(status.status))
+            {
+                continue;
+            }
+            if !terminal_delivery_ids_by_scope.contains_key(&record.scope) {
+                let terminal_delivery_ids = self
+                    .outbound_state_store
+                    .list_delivery_attempts(record.scope.clone())
+                    .await?
+                    .into_iter()
+                    .filter(|attempt| is_terminal_delivery_status(attempt.status))
+                    .map(|attempt| attempt.delivery_id)
+                    .collect::<HashSet<_>>();
+                terminal_delivery_ids_by_scope.insert(record.scope.clone(), terminal_delivery_ids);
+            }
+            if terminal_delivery_ids_by_scope
+                .get(&record.scope)
+                .is_some_and(|terminal_delivery_ids| {
+                    terminal_delivery_ids.contains(&record.delivery_id)
+                })
+            {
+                continue;
+            }
+            if seen.insert(record.scope.clone()) {
+                let _ = self
+                    .upsert_retry_scope_index(&record.scope, Utc::now())
+                    .await;
+                scopes.push(record.scope);
+            }
+        }
+        Ok(scopes)
+    }
+
+    async fn has_live_retry_work(
+        &self,
+        scope: &TurnScope,
+    ) -> Result<bool, MatrixOutboundContractError> {
+        Ok(!self
+            .list_live_retry_schedules(scope.clone(), 1)
+            .await?
+            .is_empty())
     }
 
     pub async fn persist_retry_execution_context(
@@ -801,6 +1005,20 @@ where
         Ok(Some(record))
     }
 
+    async fn load_retry_scope_index_entry_at_path(
+        &self,
+        resource_scope: &ResourceScope,
+        path: &ScopedPath,
+    ) -> Result<Option<StoredMatrixRetryScopeIndexEntryV1>, MatrixOutboundContractError> {
+        let Some(versioned) = self.filesystem.get(resource_scope, path).await? else {
+            return Ok(None);
+        };
+        let record: StoredMatrixRetryScopeIndexEntryV1 =
+            serde_json::from_slice(&versioned.entry.body)?;
+        validate_stored_matrix_retry_scope_index_entry(&record)?;
+        Ok(Some(record))
+    }
+
     async fn mutate_record(
         &self,
         scope: TurnScope,
@@ -837,12 +1055,36 @@ where
         .await
         .map_err(map_matrix_metadata_cas_error)
     }
+
+    async fn upsert_retry_scope_index(
+        &self,
+        scope: &TurnScope,
+        updated_at: DateTime<Utc>,
+    ) -> Result<(), MatrixOutboundContractError> {
+        let resource_scope = matrix_retry_scope_index_resource_scope(scope);
+        let path = matrix_retry_scope_index_path(scope)?;
+        let record = StoredMatrixRetryScopeIndexEntryV1 {
+            schema_version: MATRIX_METADATA_SCHEMA_VERSION,
+            scope: scope.clone(),
+            updated_at,
+        };
+        validate_stored_matrix_retry_scope_index_entry(&record)?;
+        self.filesystem
+            .put(
+                &resource_scope,
+                &path,
+                Entry::bytes(serde_json::to_vec(&record)?).with_content_type(ContentType::json()),
+                CasExpectation::Any,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl<F> MatrixOutboundMetadataStore for FilesystemMatrixOutboundMetadataStore<F>
 where
-    F: RootFilesystem + 'static,
+    F: RootFilesystem + ?Sized + 'static,
 {
     async fn load_delivery_status(
         &self,
@@ -908,7 +1150,9 @@ where
             ));
             record
         })
-        .await
+        .await?;
+        self.upsert_retry_scope_index(&schedule.scope, schedule.recorded_at)
+            .await
     }
 }
 
@@ -927,6 +1171,40 @@ fn matrix_metadata_path(
 
 fn matrix_metadata_dir_path() -> Result<ScopedPath, MatrixOutboundContractError> {
     ScopedPath::new("/outbound/matrix/metadata")
+        .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
+}
+
+pub(crate) fn matrix_retry_scope_index_resource_scope(scope: &TurnScope) -> ResourceScope {
+    let mut resource_scope = scope.to_resource_scope();
+    resource_scope.thread_id = None;
+    resource_scope
+}
+
+fn same_matrix_retry_scope_index_resource_scope(
+    left: &ResourceScope,
+    right: &ResourceScope,
+) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.user_id == right.user_id
+        && left.agent_id == right.agent_id
+        && left.project_id == right.project_id
+        && left.mission_id == right.mission_id
+        && left.thread_id == right.thread_id
+}
+
+pub(crate) fn matrix_retry_scope_index_path(
+    scope: &TurnScope,
+) -> Result<ScopedPath, MatrixOutboundContractError> {
+    let scope_json = serde_json::to_vec(scope)?;
+    ScopedPath::new(format!(
+        "/outbound/matrix/retry-scope-index/{}.json",
+        sha256_hex(&scope_json)
+    ))
+    .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
+}
+
+fn matrix_retry_scope_index_dir_path() -> Result<ScopedPath, MatrixOutboundContractError> {
+    ScopedPath::new("/outbound/matrix/retry-scope-index")
         .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
 }
 
@@ -1000,6 +1278,17 @@ fn validate_stored_matrix_metadata(
             ));
         }
         context.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_stored_matrix_retry_scope_index_entry(
+    record: &StoredMatrixRetryScopeIndexEntryV1,
+) -> Result<(), MatrixOutboundContractError> {
+    if record.schema_version != MATRIX_METADATA_SCHEMA_VERSION {
+        return Err(MatrixOutboundContractError::Backend(
+            "matrix retry scope index schema mismatch".to_string(),
+        ));
     }
     Ok(())
 }

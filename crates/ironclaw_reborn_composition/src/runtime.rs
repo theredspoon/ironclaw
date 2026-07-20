@@ -806,6 +806,8 @@ pub struct RebornRuntime {
         Option<crate::product_auth::credentials::credential_refresh_worker::CredentialRefreshWorkerRuntimeHandle>,
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     matrix_retry_worker_handle: Option<crate::matrix_outbound::MatrixRetryWorkerRuntimeHandle>,
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    matrix_retry_worker_ready: crate::factory::MatrixRetryWorkerReady,
     trace_flush_worker: crate::observability::trace_capture::TraceQueueFlushWorkerHandle,
     #[cfg(feature = "root-llm-provider")]
     skill_learning_extraction_tasks:
@@ -1575,6 +1577,41 @@ impl RebornRuntime {
         }
     }
 
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    pub(crate) async fn shutdown_matrix_retry_worker_for_test(&mut self) {
+        if let Some(matrix_retry_worker) = self.matrix_retry_worker_handle.take() {
+            matrix_retry_worker
+                .shutdown(crate::matrix_outbound::MATRIX_RETRY_WORKER_SHUTDOWN_TIMEOUT)
+                .await;
+        }
+    }
+
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    pub(crate) async fn execute_matrix_retry_tick_once_for_test(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<
+        crate::matrix_outbound::MatrixRetryWorkerTickReport,
+        crate::matrix_outbound::MatrixOutboundContractError,
+    > {
+        let crate::factory::MatrixRetryWorkerReady::Ready { settings, deps } =
+            &self.matrix_retry_worker_ready
+        else {
+            return Err(
+                crate::matrix_outbound::MatrixOutboundContractError::Backend(
+                    "Matrix retry worker is not configured".to_string(),
+                ),
+            );
+        };
+        crate::matrix_outbound::matrix_retry_worker_tick_once(
+            settings,
+            deps,
+            now,
+            &CancellationToken::new(),
+        )
+        .await
+    }
+
     /// Seed a bare `secret_handle` secret for an owner scope so keyed
     /// capabilities (network + `use_secret`) can resolve their
     /// `InjectSecretOnce` obligation. `serve` uses this to write the value of
@@ -2103,20 +2140,54 @@ impl RebornRuntime {
         &self,
         input: MatrixProductOutboundDeliveryInput,
     ) -> Result<ProductOutboundDeliveryOutcome, MatrixProductOutboundDeliveryError> {
-        let local_runtime = self.services.local_runtime.as_ref().ok_or_else(|| {
-            MatrixProductOutboundDeliveryError::Unavailable {
-                reason: "Matrix product outbound caller requires local runtime services"
-                    .to_string(),
-            }
-        })?;
-        let extension_installation_store = local_runtime
-            .extension_management
-            .as_ref()
-            .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
-                reason: "Matrix product outbound caller requires extension lifecycle management"
-                    .to_string(),
-            })?
-            .installation_store();
+        let (extension_installation_store, matrix_filesystem, outbound_state, outbound_preferences) =
+            if let Some(local_runtime) = &self.services.local_runtime {
+                let extension_installation_store = local_runtime
+                    .extension_management
+                    .as_ref()
+                    .ok_or_else(|| MatrixProductOutboundDeliveryError::Unavailable {
+                        reason:
+                            "Matrix product outbound caller requires extension lifecycle management"
+                                .to_string(),
+                    })?
+                    .installation_store();
+                let extension_root: Arc<dyn RootFilesystem> =
+                    local_runtime.extension_filesystem.clone();
+                (
+                    extension_installation_store,
+                    Arc::new(ironclaw_filesystem::ScopedFilesystem::new(
+                        extension_root,
+                        crate::invocation_mount_view,
+                    )),
+                    Arc::clone(&local_runtime.outbound_state),
+                    Arc::clone(&local_runtime.outbound_preferences),
+                )
+            } else {
+                #[cfg(any(feature = "libsql", feature = "postgres"))]
+                {
+                    let production_runtime =
+                    self.services.production_runtime.as_ref().ok_or_else(|| {
+                        MatrixProductOutboundDeliveryError::Unavailable {
+                            reason:
+                                "Matrix product outbound caller requires production runtime services"
+                                    .to_string(),
+                        }
+                    })?;
+                    (
+                        production_runtime.extension_installation_store(),
+                        production_runtime.scoped_filesystem(),
+                        production_runtime.outbound_state(),
+                        production_runtime.outbound_preferences(),
+                    )
+                }
+                #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+                {
+                    return Err(MatrixProductOutboundDeliveryError::Unavailable {
+                        reason: "Matrix product outbound caller requires runtime services"
+                            .to_string(),
+                    });
+                }
+            };
         let target_resolver = self
             .matrix_product_outbound_target_resolver
             .as_ref()
@@ -2136,7 +2207,6 @@ impl RebornRuntime {
             .map_err(|error| MatrixProductOutboundDeliveryError::Unavailable {
                 reason: format!("Matrix policy projection cache path is invalid: {error}"),
             })?;
-        let matrix_filesystem = crate::wrap_scoped(Arc::clone(&local_runtime.extension_filesystem));
         let policy_scope =
             crate::matrix_product_outbound::matrix_policy_projection_resource_scope_for_provider_scope(
                 &input.delivery.resolution_request.scope.to_resource_scope(),
@@ -2180,11 +2250,8 @@ impl RebornRuntime {
             reason: format!("Matrix product adapter configuration is invalid: {error}"),
         })?;
         let target_policy = MatrixHostReplyTargetPolicy::new((**target_resolver).clone());
-        let outbound_policy = OutboundPolicyService::new(
-            local_runtime.outbound_state.as_ref(),
-            &target_policy,
-            &target_policy,
-        );
+        let outbound_policy =
+            OutboundPolicyService::new(outbound_state.as_ref(), &target_policy, &target_policy);
         let egress = MatrixDeferredRenderEgress;
         let delivery_sink = MatrixDeferredDeliverySink;
         let policy_authorizer =
@@ -2194,7 +2261,7 @@ impl RebornRuntime {
             snapshot_source: &snapshot_source,
             policy_authorizer: &policy_authorizer,
             outbound_policy: &outbound_policy,
-            communication_preferences: local_runtime.outbound_preferences.as_ref(),
+            communication_preferences: outbound_preferences.as_ref(),
             target_resolver: target_resolver.as_ref(),
             adapter: &adapter,
             egress: &egress,
@@ -2283,7 +2350,7 @@ impl RebornRuntime {
                 })?;
             let metadata_store = FilesystemMatrixOutboundMetadataStore::new(
                 matrix_filesystem,
-                Arc::clone(&local_runtime.outbound_state),
+                Arc::clone(&outbound_state),
             );
             metadata_store
                 .record_retry_scheduled(
@@ -4775,6 +4842,8 @@ pub async fn build_reborn_runtime(
     #[cfg(not(any(feature = "libsql", feature = "postgres")))]
     let _ = credential_refresh;
 
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    let matrix_retry_worker_ready = services.matrix_retry_worker.clone();
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     let matrix_retry_worker_handle = match std::mem::replace(
         &mut services.matrix_retry_worker,
@@ -4838,6 +4907,8 @@ pub async fn build_reborn_runtime(
         credential_refresh_worker_handle,
         #[cfg(any(feature = "libsql", feature = "postgres"))]
         matrix_retry_worker_handle,
+        #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+        matrix_retry_worker_ready,
         trace_flush_worker,
         #[cfg(feature = "root-llm-provider")]
         skill_learning_extraction_tasks,

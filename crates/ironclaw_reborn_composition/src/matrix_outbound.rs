@@ -5,7 +5,7 @@
 //! Matrix command intent pending; this bridge records terminal status only
 //! after a delivery port returns protocol evidence or a sanitized error.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_common::hashing::sha256_hex;
 use ironclaw_filesystem::{
-    CasApply, CasUpdateError, ContentType, Entry, FileType, FilesystemError, RootFilesystem,
-    ScopedFilesystem, cas_update,
+    CasApply, CasExpectation, CasUpdateError, ContentType, Entry, FileType, FilesystemError,
+    RootFilesystem, ScopedFilesystem, cas_update,
 };
 use ironclaw_host_api::{
     CapabilityId, ExtensionId, NetworkMethod, NetworkPolicy, NetworkScheme, NetworkTargetPattern,
