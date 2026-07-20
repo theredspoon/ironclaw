@@ -27,15 +27,17 @@ use ironclaw_extensions::{
     ManifestSource,
 };
 use ironclaw_filesystem::{
-    BackendCapabilities, DirEntry, FileStat, FilesystemError, FilesystemOperation, InMemoryBackend,
-    RecordVersion, RootFilesystem,
+    BackendCapabilities, CasExpectation, DirEntry, Entry, FileStat, FilesystemError,
+    FilesystemOperation, InMemoryBackend, RecordVersion, RootFilesystem,
 };
 use ironclaw_host_api::{
     AgentId, ExtensionId, InvocationId, ProjectId, ResourceScope, SecretHandle, TenantId, UserId,
     VirtualPath,
 };
 use ironclaw_matrix_adapter::installation_policy::{
-    ArtifactSha256, ComponentArtifactId, MatrixUserId, WitPackageName, WitWorldName,
+    ArtifactSha256, ComponentArtifactId, ComponentArtifactInspection, MatrixInstallationMutation,
+    MatrixInstallationMutationAuthority, MatrixInstallationPolicy, MatrixRoomId, MatrixUserId,
+    PolicyRevision, StaticManifestBinding, WitPackageName, WitWorldName,
 };
 use ironclaw_product_adapters::{AdapterInstallationId, EgressCredentialHandle, ProductAdapterId};
 use ironclaw_product_workflow::{
@@ -1414,6 +1416,659 @@ async fn matrix_lifecycle_prepared_publish_refuses_stale_body_after_room_binding
             .iter()
             .any(|room| room.as_str() == "!prepared-stale-room:example.org")
     );
+}
+
+#[tokio::test]
+async fn matrix_policy_authority_update_preinvalidates_before_durable_mutation_and_publishes_new_revision()
+ {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    target_source
+        .seed_from_configs(std::slice::from_ref(&provider))
+        .await
+        .expect("seed target source");
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+        Arc::clone(&root),
+        store.clone(),
+        target_source,
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("shared-source refresher config");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(backend.clone()),
+        matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+        matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+    );
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("initial source-owned projection");
+    let initial_snapshot = source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .expect("initial snapshot");
+    assert_eq!(
+        initial_snapshot.policy_revision,
+        PolicyRevision::new(1).unwrap()
+    );
+
+    let policy_store = Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    let failing_policy_store = Arc::new(FailingMatrixInstallationPolicyStore::fail_mutations(
+        policy_store.clone(),
+    ));
+    MatrixPolicyMutationAuthority::new(failing_policy_store, refresher.clone())
+        .apply_policy_mutation(
+            &MatrixPolicyMutationContext::for_host_owned_matrix_admin(
+                scope.clone(),
+                extension_id.clone(),
+            ),
+            MatrixPolicyMutationRequest {
+                tenant_id: provider.tenant_id.clone(),
+                agent_id: provider.agent_id.clone(),
+                project_id: provider.project_id.clone(),
+                installation_id: installation_id.clone(),
+                mutation: MatrixInstallationMutation::UpdatePolicy {
+                    policy: matrix_policy_from_snapshot(&initial_snapshot),
+                },
+                actor: "matrix-policy-revision-test".to_string(),
+            },
+        )
+        .await
+        .expect_err("durable policy mutation failure must surface");
+
+    assert_eq!(
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect_err("pre-invalidation must fail closed when durable policy mutation fails"),
+        MatrixInstallationPolicyRejection::InstallationNotFound
+    );
+    assert_matrix_policy_projection_invalidated(&backend, &scope, &provider).await;
+    let outcome = MatrixPolicyMutationAuthority::new(policy_store, refresher)
+        .apply_policy_mutation(
+            &MatrixPolicyMutationContext::for_host_owned_matrix_admin(scope.clone(), extension_id),
+            MatrixPolicyMutationRequest {
+                tenant_id: provider.tenant_id.clone(),
+                agent_id: provider.agent_id.clone(),
+                project_id: provider.project_id.clone(),
+                installation_id: installation_id.clone(),
+                mutation: MatrixInstallationMutation::UpdatePolicy {
+                    policy: matrix_policy_from_snapshot(&initial_snapshot),
+                },
+                actor: "matrix-policy-revision-test".to_string(),
+            },
+        )
+        .await
+        .expect("source-owned policy mutation refreshes projection");
+    assert_eq!(outcome.previous_revision, PolicyRevision::new(1).unwrap());
+    assert_eq!(outcome.next_revision, PolicyRevision::new(2).unwrap());
+    let refreshed_snapshot = source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .expect("refreshed source-owned snapshot");
+    assert_eq!(
+        refreshed_snapshot.policy_revision,
+        PolicyRevision::new(2).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn matrix_policy_authority_rejects_cross_scope_before_projection_invalidation() {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    target_source
+        .seed_from_configs(std::slice::from_ref(&provider))
+        .await
+        .expect("seed target source");
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+        Arc::clone(&root),
+        store.clone(),
+        target_source,
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("shared-source refresher config");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("initial projection initializes policy source");
+
+    let scoped = crate::wrap_scoped(backend.clone());
+    let policy_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+    let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+    let marker_path =
+        matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path).expect("marker");
+    let initial_marker = scoped
+        .get(&policy_scope, &marker_path)
+        .await
+        .expect("initial marker lookup")
+        .expect("initial marker")
+        .entry
+        .body;
+    let source =
+        FilesystemMatrixPolicySnapshotSource::new(scoped, policy_scope.clone(), cache_path.clone());
+    let initial_snapshot = source
+        .resolve_matrix_policy_snapshot(
+            &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+            &installation_id,
+        )
+        .await
+        .expect("initial snapshot");
+    let policy_store = Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+
+    let error = MatrixPolicyMutationAuthority::new(policy_store, refresher)
+        .apply_policy_mutation(
+            &MatrixPolicyMutationContext::for_host_owned_matrix_admin(scope.clone(), extension_id),
+            MatrixPolicyMutationRequest {
+                tenant_id: provider.tenant_id.clone(),
+                agent_id: AgentId::new("matrix-cross-scope-agent").expect("foreign agent"),
+                project_id: provider.project_id.clone(),
+                installation_id: installation_id.clone(),
+                mutation: MatrixInstallationMutation::UpdatePolicy {
+                    policy: matrix_policy_from_snapshot(&initial_snapshot),
+                },
+                actor: "matrix-policy-cross-scope-test".to_string(),
+            },
+        )
+        .await
+        .expect_err("cross-scope policy mutation must be rejected");
+    assert!(matches!(error, ProductWorkflowError::BindingAccessDenied));
+    assert_eq!(
+        crate::wrap_scoped(backend)
+            .get(&policy_scope, &marker_path)
+            .await
+            .expect("marker lookup after cross-scope denial")
+            .expect("marker after cross-scope denial")
+            .entry
+            .body,
+        initial_marker,
+        "cross-scope policy mutation must be rejected before projection invalidation"
+    );
+}
+
+#[tokio::test]
+async fn matrix_policy_authority_rejects_lifecycle_mutations_before_projection_invalidation() {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    target_source
+        .seed_from_configs(std::slice::from_ref(&provider))
+        .await
+        .expect("seed target source");
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+        Arc::clone(&root),
+        store.clone(),
+        target_source,
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("shared-source refresher config");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("initial projection initializes policy source");
+
+    let scoped = crate::wrap_scoped(backend.clone());
+    let policy_scope = matrix_policy_projection_resource_scope_for_provider(&scope, &provider);
+    let cache_path = matrix_policy_projection_cache_path_for_provider(&provider).expect("path");
+    let marker_path =
+        matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path).expect("marker");
+    let initial_marker = scoped
+        .get(&policy_scope, &marker_path)
+        .await
+        .expect("initial marker lookup")
+        .expect("initial marker")
+        .entry
+        .body;
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(backend),
+        policy_scope.clone(),
+        cache_path,
+    );
+    let policy_store = Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    let authority = MatrixPolicyMutationAuthority::new(policy_store, refresher);
+
+    for mutation in [
+        MatrixInstallationMutation::Enable {
+            artifact_inspection: matrix_source_backed_artifact_inspection(),
+        },
+        MatrixInstallationMutation::Disable,
+        MatrixInstallationMutation::Delete,
+    ] {
+        let error = authority
+            .apply_policy_mutation(
+                &MatrixPolicyMutationContext::for_host_owned_matrix_admin(
+                    scope.clone(),
+                    extension_id.clone(),
+                ),
+                MatrixPolicyMutationRequest {
+                    tenant_id: provider.tenant_id.clone(),
+                    agent_id: provider.agent_id.clone(),
+                    project_id: provider.project_id.clone(),
+                    installation_id: installation_id.clone(),
+                    mutation,
+                    actor: "matrix-policy-lifecycle-reject-test".to_string(),
+                },
+            )
+            .await
+            .expect_err("lifecycle policy mutation must be rejected");
+        assert!(matches!(
+            error,
+            ProductWorkflowError::InvalidBindingRequest { .. }
+        ));
+        assert_eq!(
+            scoped
+                .get(&policy_scope, &marker_path)
+                .await
+                .expect("marker lookup after lifecycle denial")
+                .expect("marker after lifecycle denial")
+                .entry
+                .body,
+            initial_marker,
+            "lifecycle policy mutation must be rejected before projection invalidation"
+        );
+        source
+            .resolve_matrix_policy_snapshot(
+                &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+                &installation_id,
+            )
+            .await
+            .expect("lifecycle denial must not tombstone committed projection");
+    }
+}
+
+#[tokio::test]
+async fn matrix_policy_source_mutation_uses_exact_version_and_rejects_stale_save() {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+        Arc::clone(&root),
+        store,
+        vec![provider.clone()],
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("refresher config");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("initial projection initializes policy source");
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(backend),
+        matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+        matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+    );
+    let initial_snapshot = source
+        .resolve_matrix_policy_snapshot(
+            &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+            &installation_id,
+        )
+        .await
+        .expect("initial snapshot");
+    let mut policy = matrix_policy_from_snapshot(&initial_snapshot);
+    policy
+        .allowed_rooms
+        .insert(MatrixRoomId::new("!source-cas-conflict:example.org").expect("source room"));
+    let request = MatrixPolicyMutationRequest {
+        tenant_id: provider.tenant_id.clone(),
+        agent_id: provider.agent_id.clone(),
+        project_id: provider.project_id.clone(),
+        installation_id: installation_id.clone(),
+        mutation: MatrixInstallationMutation::UpdatePolicy { policy },
+        actor: "matrix-policy-cas-test".to_string(),
+    };
+    let policy_store = FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    );
+    let (provider_scope, source_path, mut stale_cache, stale_version) = policy_store
+        .load_versioned_source_cache(&scope, &request)
+        .await
+        .expect("load stale source cache");
+    policy_store
+        .apply_policy_mutation_in_scope(&scope, request.clone())
+        .await
+        .expect("concurrent source mutation wins first");
+    stale_cache
+        .apply_policy_mutation(
+            &installation_id,
+            request.mutation.clone(),
+            &MatrixInstallationMutationAuthority::tenant_operator(),
+            "matrix-policy-cas-stale-writer",
+            matrix_policy_projection_timestamp_ms(),
+        )
+        .expect("prepare stale writer body");
+
+    let error = policy_store
+        .save_source_cache(&provider_scope, &source_path, &stale_cache, stale_version)
+        .await
+        .expect_err("stale source cache save must fail CAS");
+    assert!(
+        matches!(&error, ProductWorkflowError::Transient { reason } if reason.contains("version mismatch")),
+        "stale save should surface backend version mismatch, got {error:?}"
+    );
+    let (_provider_scope, _source_path, fresh_cache, _fresh_version) = policy_store
+        .load_versioned_source_cache(&scope, &request)
+        .await
+        .expect("reload source cache after CAS conflict");
+    assert_eq!(
+        fresh_cache
+            .installation(&installation_id)
+            .expect("source installation after CAS conflict")
+            .policy_revision,
+        PolicyRevision::new(2).unwrap(),
+        "stale save must not clobber the winning source mutation"
+    );
+}
+
+#[tokio::test]
+async fn matrix_policy_source_owned_fields_survive_lifecycle_runtime_reconcile() {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    target_source
+        .seed_from_configs(std::slice::from_ref(&provider))
+        .await
+        .expect("seed target source");
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+        Arc::clone(&root),
+        store.clone(),
+        target_source,
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("shared-source refresher config");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(backend),
+        matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+        matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+    );
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("initial projection initializes policy source");
+    let initial_snapshot = source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .expect("initial snapshot");
+    let source_owned_room =
+        MatrixRoomId::new("!source-owned-room:example.org").expect("source-owned room");
+    let mut source_owned_policy = matrix_policy_from_snapshot(&initial_snapshot);
+    source_owned_policy
+        .allowed_rooms
+        .insert(source_owned_room.clone());
+    let policy_store = Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    MatrixPolicyMutationAuthority::new(policy_store, refresher.clone())
+        .apply_policy_mutation(
+            &MatrixPolicyMutationContext::for_host_owned_matrix_admin(
+                scope.clone(),
+                extension_id.clone(),
+            ),
+            MatrixPolicyMutationRequest {
+                tenant_id: provider.tenant_id.clone(),
+                agent_id: provider.agent_id.clone(),
+                project_id: provider.project_id.clone(),
+                installation_id: installation_id.clone(),
+                mutation: MatrixInstallationMutation::UpdatePolicy {
+                    policy: source_owned_policy,
+                },
+                actor: "matrix-policy-source-owned-test".to_string(),
+            },
+        )
+        .await
+        .expect("source-owned policy mutation");
+
+    let mutated_snapshot = source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .expect("mutated snapshot");
+    assert!(mutated_snapshot.allowed_rooms.contains(&source_owned_room));
+    assert_eq!(
+        mutated_snapshot.policy_revision,
+        PolicyRevision::new(2).unwrap()
+    );
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("later lifecycle reconcile");
+    let reconciled_snapshot = source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .expect("reconciled snapshot");
+    assert!(
+        reconciled_snapshot
+            .allowed_rooms
+            .contains(&source_owned_room),
+        "runtime-derived reconcile must not overwrite source-owned policy fields"
+    );
+    assert_eq!(
+        reconciled_snapshot.policy_revision,
+        PolicyRevision::new(2).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn matrix_policy_prepared_publish_rejects_matching_policy_fields_with_stale_policy_revision()
+{
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    target_source
+        .seed_from_configs(std::slice::from_ref(&provider))
+        .await
+        .expect("seed target source");
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+        Arc::clone(&root),
+        store.clone(),
+        target_source,
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("shared-source refresher config");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    let adapter_id = ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter");
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(backend.clone()),
+        matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+        matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+    );
+    refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("publish initial revision body");
+    let unchanged_snapshot = source
+        .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+        .await
+        .expect("initial committed snapshot");
+    let unchanged_policy_fields = matrix_policy_from_snapshot(&unchanged_snapshot);
+    refresher
+        .prepare_lifecycle_activation_refresh(&scope, &extension_id)
+        .await
+        .expect("prepare old revision body");
+
+    let policy_store = Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    policy_store
+        .apply_policy_mutation_for_test(MatrixPolicySourceMutationRequest {
+            tenant_id: provider.tenant_id.clone(),
+            agent_id: provider.agent_id.clone(),
+            project_id: provider.project_id.clone(),
+            installation_id: installation_id.clone(),
+            mutation: MatrixInstallationMutation::UpdatePolicy {
+                policy: unchanged_policy_fields,
+            },
+            actor: "matrix-policy-revision-test".to_string(),
+        })
+        .await
+        .expect("store-level test setup bumps source revision without publishing projection");
+
+    refresher
+        .publish_prepared_lifecycle_activation_refresh(&scope, &extension_id)
+        .await
+        .expect("stale prepared publish is ignored fail-closed");
+    assert_eq!(
+        source
+            .resolve_matrix_policy_snapshot(&adapter_id, &installation_id)
+            .await
+            .expect_err("matching policy fields with stale revision must not become committed"),
+        MatrixInstallationPolicyRejection::InstallationNotFound
+    );
+}
+
+#[tokio::test]
+async fn matrix_policy_authority_refresh_failure_compensation_clears_stale_body_and_marker() {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let root: Arc<dyn RootFilesystem> = backend.clone();
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = matrix_policy_revision_freshness_provider(&installation_id);
+    let target_source = Arc::new(FilesystemMatrixRoomBindingStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    target_source
+        .seed_from_configs(std::slice::from_ref(&provider))
+        .await
+        .expect("seed target source");
+    let scope = matrix_source_backed_scope();
+    let extension_id = ExtensionId::new("matrix-product-adapter").expect("extension id");
+    let initial_refresher =
+        MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            Arc::clone(&root),
+            store.clone(),
+            target_source.clone(),
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("initial refresher");
+    initial_refresher
+        .refresh_after_lifecycle_activation(&scope, &extension_id)
+        .await
+        .expect("initial projection");
+
+    let policy_store = Arc::new(FilesystemMatrixInstallationPolicyStore::new(
+        Arc::clone(&root),
+        [provider.tenant_id.clone()],
+    ));
+    let failing_backend = Arc::new(FailOnNthPutFilesystem::new(backend.clone(), [2]));
+    let failing_refresher =
+        MatrixLifecyclePolicyProjectionCacheRefresher::from_shared_target_source(
+            failing_backend,
+            store,
+            target_source,
+            matrix_source_backed_artifact_evidence(),
+            "matrix-source-backed-policy-owner".to_string(),
+        )
+        .expect("failing refresher");
+    let source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(backend.clone()),
+        matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+        matrix_policy_projection_cache_path_for_provider(&provider).expect("cache path"),
+    );
+    let initial_snapshot = source
+        .resolve_matrix_policy_snapshot(
+            &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+            &installation_id,
+        )
+        .await
+        .expect("initial snapshot");
+    let initial_policy = matrix_policy_from_snapshot(&initial_snapshot);
+
+    MatrixPolicyMutationAuthority::new(policy_store, failing_refresher)
+        .apply_policy_mutation(
+            &MatrixPolicyMutationContext::for_host_owned_matrix_admin(scope.clone(), extension_id),
+            MatrixPolicyMutationRequest {
+                tenant_id: provider.tenant_id.clone(),
+                agent_id: provider.agent_id.clone(),
+                project_id: provider.project_id.clone(),
+                installation_id: installation_id.clone(),
+                mutation: MatrixInstallationMutation::UpdatePolicy {
+                    policy: initial_policy,
+                },
+                actor: "matrix-policy-revision-test".to_string(),
+            },
+        )
+        .await
+        .expect_err("post-mutation refresh failure must surface");
+
+    assert_matrix_policy_projection_invalidated(&backend, &scope, &provider).await;
 }
 
 #[tokio::test]
@@ -4069,6 +4724,22 @@ fn matrix_source_backed_artifact_evidence() -> MatrixRuntimeArtifactEvidence {
     }
 }
 
+fn matrix_source_backed_artifact_inspection() -> ComponentArtifactInspection {
+    ComponentArtifactInspection {
+        artifact_sha256: ArtifactSha256::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("artifact sha"),
+        wit_package: WitPackageName::new("near:source-backed-adapter@0.1.0").expect("wit package"),
+        wit_world: WitWorldName::new("source-backed-product-adapter").expect("wit world"),
+        manifest: StaticManifestBinding::new("matrix-source-backed-manifest").expect("manifest"),
+        required_exports_present: true,
+        unexpected_imports: Vec::new(),
+        direct_http_egress_import: false,
+        signature_valid: Some(true),
+    }
+}
+
 fn matrix_source_backed_scope() -> ResourceScope {
     ResourceScope {
         tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
@@ -4079,6 +4750,70 @@ fn matrix_source_backed_scope() -> ResourceScope {
         thread_id: None,
         invocation_id: InvocationId::new(),
     }
+}
+
+fn matrix_policy_revision_freshness_provider(
+    installation_id: &AdapterInstallationId,
+) -> MatrixOutboundTargetProviderConfig {
+    MatrixOutboundTargetProviderConfig {
+        tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+        agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+        project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+        installation_id: installation_id.clone(),
+        configured_room_routes: vec![MatrixConfiguredRoomRoute {
+            room_id: "!policy-revision-freshness:example.org".to_string(),
+            subject_user_id: UserId::new("user:policy-revision-freshness").expect("subject"),
+            matrix_sender_user_id: MatrixUserId::new("@policy-revision-freshness:example.org")
+                .expect("matrix sender"),
+        }],
+    }
+}
+
+fn matrix_policy_from_snapshot(snapshot: &MatrixPolicySnapshot) -> MatrixInstallationPolicy {
+    MatrixInstallationPolicy::new(
+        snapshot.homeserver.clone(),
+        snapshot.allowed_rooms.clone(),
+        snapshot.allowed_senders.clone(),
+        snapshot.egress_target_index,
+        snapshot.credential_handle.clone(),
+    )
+    .expect("policy from snapshot")
+}
+
+async fn assert_matrix_policy_projection_invalidated(
+    backend: &Arc<InMemoryBackend>,
+    scope: &ResourceScope,
+    provider: &MatrixOutboundTargetProviderConfig,
+) {
+    let scoped = crate::wrap_scoped(Arc::clone(backend));
+    let provider_scope = matrix_policy_projection_resource_scope_for_provider(scope, provider);
+    let cache_path = matrix_policy_projection_cache_path_for_provider(provider).expect("path");
+    let marker_path =
+        matrix_policy_projection_commit_marker_path_for_cache_path(&cache_path).expect("marker");
+    assert_eq!(
+        scoped
+            .get(&provider_scope, &cache_path)
+            .await
+            .expect("body lookup")
+            .expect("body after invalidation")
+            .entry
+            .body,
+        MatrixInstallationProjectionCache::new()
+            .to_json_bytes()
+            .expect("empty projection bytes"),
+        "policy freshness invalidation must clear stale projection body"
+    );
+    assert_eq!(
+        scoped
+            .get(&provider_scope, &marker_path)
+            .await
+            .expect("marker lookup")
+            .expect("marker after invalidation")
+            .entry
+            .body,
+        MATRIX_POLICY_PROJECTION_COMMIT_MARKER_TOMBSTONE,
+        "policy freshness invalidation must leave only an invalidated marker"
+    );
 }
 
 struct FailOnNthPutFilesystem {
