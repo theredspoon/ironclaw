@@ -1079,7 +1079,12 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         },
     ));
 
-    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    let mut runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    assert!(
+        runtime.matrix_retry_worker_is_running_for_test(),
+        "Matrix retry production config should spawn the production retry worker"
+    );
+    runtime.shutdown_matrix_retry_worker_for_test().await;
     runtime
         .seed_local_dev_secret(
             workflow_scope.to_resource_scope(),
@@ -1202,10 +1207,20 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         panic!("expected Matrix runtime caller to render a deferred delivery");
     };
 
-    runtime
+    let report = runtime
         .execute_due_matrix_retry_once_for_test(workflow_scope.clone(), attempt.delivery_id)
         .await
         .expect("runtime should expose a one-shot production Matrix retry drain for tests");
+    assert_eq!(report.scopes_scanned, 1);
+    assert_eq!(report.due_schedules, 1);
+    assert_eq!(
+        report.attempted, 1,
+        "production retry proof must consume the durable due schedule through the worker"
+    );
+    assert_eq!(report.delivered, 1);
+    assert_eq!(report.retry_scheduled, 0);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.failed, 0);
 
     let requests = network_egress.requests();
     assert_eq!(requests.len(), 1);
@@ -1237,6 +1252,14 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         .expect("load Matrix shared outbound status")
         .expect("Matrix shared outbound status should be recorded");
     assert_eq!(status.status, OutboundDeliveryStatus::Delivered);
+    assert!(
+        metadata_store
+            .load_retry_schedule(workflow_scope.clone(), attempt.delivery_id)
+            .await
+            .expect("load Matrix retry schedule after worker delivery")
+            .is_none(),
+        "worker delivery should consume the durable retry schedule"
+    );
     let evidence = metadata_store
         .load_evidence(workflow_scope, attempt.delivery_id)
         .await

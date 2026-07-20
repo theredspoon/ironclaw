@@ -1578,6 +1578,15 @@ impl RebornRuntime {
     }
 
     #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
+    pub(crate) async fn shutdown_matrix_retry_worker_for_test(&mut self) {
+        if let Some(matrix_retry_worker) = self.matrix_retry_worker_handle.take() {
+            matrix_retry_worker
+                .shutdown(crate::matrix_outbound::MATRIX_RETRY_WORKER_SHUTDOWN_TIMEOUT)
+                .await;
+        }
+    }
+
+    #[cfg(all(test, any(feature = "libsql", feature = "postgres")))]
     pub(crate) async fn execute_due_matrix_retry_once_for_test(
         &self,
         scope: ironclaw_turns::TurnScope,
@@ -1608,14 +1617,11 @@ impl RebornRuntime {
         )
         .await?;
         if report.attempted == 0 {
-            deps.work_port
-                .execute_due_retry(scope, delivery_id, due_tick)
-                .await
-                .map_err(|error| {
-                    crate::matrix_outbound::MatrixOutboundContractError::Backend(format!(
-                        "Matrix retry execution failed: {error:?}"
-                    ))
-                })?;
+            return Err(
+                crate::matrix_outbound::MatrixOutboundContractError::Backend(format!(
+                    "Matrix retry worker did not attempt due schedule for delivery {delivery_id}",
+                )),
+            );
         }
         Ok(report)
     }
