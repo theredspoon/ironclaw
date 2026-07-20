@@ -1128,15 +1128,6 @@ pub struct MatrixPolicyMutationOutcome {
     pub next_revision: PolicyRevision,
 }
 
-#[async_trait]
-pub(crate) trait MatrixInstallationPolicyStore: Send + Sync {
-    async fn apply_policy_mutation(
-        &self,
-        scope: &ResourceScope,
-        request: MatrixPolicyMutationRequest,
-    ) -> Result<MatrixPolicyMutationOutcome, ProductWorkflowError>;
-}
-
 pub(crate) struct FilesystemMatrixInstallationPolicyStore<F: ?Sized> {
     filesystem: Arc<ScopedFilesystem<F>>,
     allowed_tenants: BTreeSet<TenantId>,
@@ -1313,56 +1304,69 @@ where
     }
 }
 
-#[async_trait]
-impl<F> MatrixInstallationPolicyStore for FilesystemMatrixInstallationPolicyStore<F>
-where
-    F: RootFilesystem + Send + Sync + ?Sized,
-{
-    async fn apply_policy_mutation(
-        &self,
-        scope: &ResourceScope,
-        request: MatrixPolicyMutationRequest,
-    ) -> Result<MatrixPolicyMutationOutcome, ProductWorkflowError> {
-        self.apply_policy_mutation_in_scope(scope, request).await
-    }
-}
-
 #[cfg(test)]
 pub(crate) struct FailingMatrixInstallationPolicyStore;
 
 #[cfg(test)]
 impl FailingMatrixInstallationPolicyStore {
-    pub(crate) fn fail_mutations(_inner: Arc<dyn MatrixInstallationPolicyStore>) -> Self {
+    pub(crate) fn fail_mutations<T>(_inner: T) -> Self {
         Self
     }
 }
 
+pub(crate) enum MatrixInstallationPolicyStoreHandle {
+    Filesystem(Arc<FilesystemMatrixInstallationPolicyStore<dyn RootFilesystem>>),
+    #[cfg(test)]
+    Failing(FailingMatrixInstallationPolicyStore),
+}
+
+impl From<Arc<FilesystemMatrixInstallationPolicyStore<dyn RootFilesystem>>>
+    for MatrixInstallationPolicyStoreHandle
+{
+    fn from(store: Arc<FilesystemMatrixInstallationPolicyStore<dyn RootFilesystem>>) -> Self {
+        Self::Filesystem(store)
+    }
+}
+
 #[cfg(test)]
-#[async_trait]
-impl MatrixInstallationPolicyStore for FailingMatrixInstallationPolicyStore {
+impl From<Arc<FailingMatrixInstallationPolicyStore>> for MatrixInstallationPolicyStoreHandle {
+    fn from(store: Arc<FailingMatrixInstallationPolicyStore>) -> Self {
+        let _ = store;
+        Self::Failing(FailingMatrixInstallationPolicyStore)
+    }
+}
+
+impl MatrixInstallationPolicyStoreHandle {
     async fn apply_policy_mutation(
         &self,
-        _scope: &ResourceScope,
-        _request: MatrixPolicyMutationRequest,
+        scope: &ResourceScope,
+        request: MatrixPolicyMutationRequest,
     ) -> Result<MatrixPolicyMutationOutcome, ProductWorkflowError> {
-        Err(ProductWorkflowError::Transient {
-            reason: "Matrix policy source mutation failed".to_string(),
-        })
+        match self {
+            Self::Filesystem(store) => store.apply_policy_mutation_in_scope(scope, request).await,
+            #[cfg(test)]
+            Self::Failing(_) => Err(ProductWorkflowError::Transient {
+                reason: "Matrix policy source mutation failed".to_string(),
+            }),
+        }
     }
 }
 
 pub(crate) struct MatrixPolicyMutationAuthority {
-    policy_store: Arc<dyn MatrixInstallationPolicyStore>,
+    policy_store: MatrixInstallationPolicyStoreHandle,
     refresher: MatrixLifecyclePolicyProjectionCacheRefresher,
 }
 
 impl MatrixPolicyMutationAuthority {
-    pub(crate) fn new(
-        policy_store: Arc<dyn MatrixInstallationPolicyStore>,
+    pub(crate) fn new<S>(
+        policy_store: S,
         refresher: MatrixLifecyclePolicyProjectionCacheRefresher,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Into<MatrixInstallationPolicyStoreHandle>,
+    {
         Self {
-            policy_store,
+            policy_store: policy_store.into(),
             refresher,
         }
     }
