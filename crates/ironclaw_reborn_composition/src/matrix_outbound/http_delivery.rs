@@ -144,17 +144,28 @@ pub trait MatrixHttpDeliveryEndpointResolver: Send + Sync {
     ) -> Option<MatrixHttpDeliveryEndpoint>;
 }
 
-pub struct MatrixHttpDeliveryPort {
-    egress: Arc<dyn MatrixHostHttpEgress>,
-    endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
-    credential_material_provider: Arc<dyn MatrixHttpCredentialMaterialProvider>,
+pub struct MatrixHttpDeliveryPort<Egress, EndpointResolver, CredentialMaterialProvider>
+where
+    Egress: MatrixHostHttpEgress + ?Sized,
+    EndpointResolver: MatrixHttpDeliveryEndpointResolver + ?Sized,
+    CredentialMaterialProvider: MatrixHttpCredentialMaterialProvider + ?Sized,
+{
+    egress: Arc<Egress>,
+    endpoint_resolver: Arc<EndpointResolver>,
+    credential_material_provider: Arc<CredentialMaterialProvider>,
 }
 
-impl MatrixHttpDeliveryPort {
+impl<Egress, EndpointResolver, CredentialMaterialProvider>
+    MatrixHttpDeliveryPort<Egress, EndpointResolver, CredentialMaterialProvider>
+where
+    Egress: MatrixHostHttpEgress + ?Sized,
+    EndpointResolver: MatrixHttpDeliveryEndpointResolver + ?Sized,
+    CredentialMaterialProvider: MatrixHttpCredentialMaterialProvider + ?Sized,
+{
     pub fn new(
-        egress: Arc<dyn MatrixHostHttpEgress>,
-        endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
-        credential_material_provider: Arc<dyn MatrixHttpCredentialMaterialProvider>,
+        egress: Arc<Egress>,
+        endpoint_resolver: Arc<EndpointResolver>,
+        credential_material_provider: Arc<CredentialMaterialProvider>,
     ) -> Self {
         Self {
             egress,
@@ -183,7 +194,13 @@ impl MatrixHostHttpEgress for HostRuntimeHttpEgressPort {
 }
 
 #[async_trait]
-impl MatrixDeliveryPort for MatrixHttpDeliveryPort {
+impl<Egress, EndpointResolver, CredentialMaterialProvider> MatrixDeliveryPort
+    for MatrixHttpDeliveryPort<Egress, EndpointResolver, CredentialMaterialProvider>
+where
+    Egress: MatrixHostHttpEgress + ?Sized,
+    EndpointResolver: MatrixHttpDeliveryEndpointResolver + ?Sized,
+    CredentialMaterialProvider: MatrixHttpCredentialMaterialProvider + ?Sized,
+{
     async fn deliver(
         &self,
         command: ProtocolDeliveryIntent,

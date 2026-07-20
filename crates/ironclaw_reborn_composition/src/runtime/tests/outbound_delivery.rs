@@ -1330,7 +1330,7 @@ async fn runtime_matrix_pending_final_reply_is_recovered_by_configured_productio
         .execute_matrix_retry_tick_once_for_test(due_tick)
         .await
         .expect("runtime should expose the configured production Matrix retry tick for tests");
-    assert_eq!(report.scopes_scanned, 2);
+    assert_eq!(report.scopes_scanned, 1);
     assert_eq!(report.due_schedules, 1);
     assert_eq!(
         report.attempted, 1,

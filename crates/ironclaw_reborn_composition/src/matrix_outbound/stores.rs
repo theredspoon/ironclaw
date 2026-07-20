@@ -668,6 +668,67 @@ where
         Ok(schedules)
     }
 
+    async fn list_live_retry_schedules(
+        &self,
+        scope: TurnScope,
+        max_entries: usize,
+    ) -> Result<Vec<MatrixRetrySchedule>, MatrixOutboundContractError> {
+        if max_entries == 0 {
+            return Ok(Vec::new());
+        }
+
+        let resource_scope = scope.to_resource_scope();
+        let metadata_dir = matrix_metadata_dir_path()?;
+        let entries = match self
+            .filesystem
+            .list_dir(&resource_scope, &metadata_dir)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(FilesystemError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let terminal_delivery_ids = self
+            .outbound_state_store
+            .list_delivery_attempts(scope.clone())
+            .await?
+            .into_iter()
+            .filter(|attempt| is_terminal_delivery_status(attempt.status))
+            .map(|attempt| attempt.delivery_id)
+            .collect::<HashSet<_>>();
+        let mut schedules = Vec::new();
+        for entry in entries {
+            if entry.file_type != FileType::File {
+                continue;
+            }
+            let record_path = ScopedPath::new(format!("/outbound/matrix/metadata/{}", entry.name))
+                .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))?;
+            let Some(record) = self
+                .load_record_at_path(&resource_scope, &record_path)
+                .await?
+            else {
+                continue;
+            };
+            if record.scope != scope
+                || terminal_delivery_ids.contains(&record.delivery_id)
+                || record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| is_terminal_delivery_status(status.status))
+            {
+                continue;
+            }
+            let Some(schedule) = record.retry_schedule else {
+                continue;
+            };
+            schedules.push(schedule.into_schedule(record.delivery_id, record.scope));
+            if schedules.len() == max_entries {
+                break;
+            }
+        }
+        Ok(schedules)
+    }
+
     pub async fn list_indexed_retry_scopes(
         &self,
         discovery_roots: &[TurnScope],
@@ -675,10 +736,15 @@ where
         let mut seen = HashSet::new();
         let mut scopes = Vec::new();
         for root in discovery_roots {
-            if seen.insert(root.clone()) {
-                scopes.push(root.clone());
-            }
             let resource_scope = matrix_retry_scope_index_resource_scope(root);
+            for live_scope in self
+                .list_live_retry_scopes_from_metadata(root, &resource_scope)
+                .await?
+            {
+                if seen.insert(live_scope.clone()) {
+                    scopes.push(live_scope);
+                }
+            }
             let index_dir = matrix_retry_scope_index_dir_path()?;
             let entries = match self.filesystem.list_dir(&resource_scope, &index_dir).await {
                 Ok(entries) => entries,
@@ -704,12 +770,99 @@ where
                 ) {
                     continue;
                 }
-                if seen.insert(index_entry.scope.clone()) {
-                    scopes.push(index_entry.scope);
+                if self.has_live_retry_work(&index_entry.scope).await? {
+                    if seen.insert(index_entry.scope.clone()) {
+                        scopes.push(index_entry.scope);
+                    }
+                } else {
+                    let _ = self.filesystem.delete(&resource_scope, &record_path).await;
                 }
             }
         }
         Ok(scopes)
+    }
+
+    async fn list_live_retry_scopes_from_metadata(
+        &self,
+        discovery_root: &TurnScope,
+        resource_scope: &ResourceScope,
+    ) -> Result<Vec<TurnScope>, MatrixOutboundContractError> {
+        let metadata_dir = matrix_metadata_dir_path()?;
+        let entries = match self
+            .filesystem
+            .list_dir(resource_scope, &metadata_dir)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(FilesystemError::NotFound { .. }) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let index_resource_scope = matrix_retry_scope_index_resource_scope(discovery_root);
+        let mut terminal_delivery_ids_by_scope: HashMap<TurnScope, HashSet<OutboundDeliveryId>> =
+            HashMap::new();
+        let mut seen = HashSet::new();
+        let mut scopes = Vec::new();
+        for entry in entries {
+            if entry.file_type != FileType::File {
+                continue;
+            }
+            let record_path = ScopedPath::new(format!("/outbound/matrix/metadata/{}", entry.name))
+                .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))?;
+            let Some(record) = self
+                .load_record_at_path(resource_scope, &record_path)
+                .await?
+            else {
+                continue;
+            };
+            if record.retry_schedule.is_none()
+                || !same_matrix_retry_scope_index_resource_scope(
+                    &matrix_retry_scope_index_resource_scope(&record.scope),
+                    &index_resource_scope,
+                )
+                || record
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| is_terminal_delivery_status(status.status))
+            {
+                continue;
+            }
+            if !terminal_delivery_ids_by_scope.contains_key(&record.scope) {
+                let terminal_delivery_ids = self
+                    .outbound_state_store
+                    .list_delivery_attempts(record.scope.clone())
+                    .await?
+                    .into_iter()
+                    .filter(|attempt| is_terminal_delivery_status(attempt.status))
+                    .map(|attempt| attempt.delivery_id)
+                    .collect::<HashSet<_>>();
+                terminal_delivery_ids_by_scope.insert(record.scope.clone(), terminal_delivery_ids);
+            }
+            if terminal_delivery_ids_by_scope
+                .get(&record.scope)
+                .is_some_and(|terminal_delivery_ids| {
+                    terminal_delivery_ids.contains(&record.delivery_id)
+                })
+            {
+                continue;
+            }
+            if seen.insert(record.scope.clone()) {
+                let _ = self
+                    .upsert_retry_scope_index(&record.scope, Utc::now())
+                    .await;
+                scopes.push(record.scope);
+            }
+        }
+        Ok(scopes)
+    }
+
+    async fn has_live_retry_work(
+        &self,
+        scope: &TurnScope,
+    ) -> Result<bool, MatrixOutboundContractError> {
+        Ok(!self
+            .list_live_retry_schedules(scope.clone(), 1)
+            .await?
+            .is_empty())
     }
 
     pub async fn persist_retry_execution_context(
@@ -1021,7 +1174,7 @@ fn matrix_metadata_dir_path() -> Result<ScopedPath, MatrixOutboundContractError>
         .map_err(|error| MatrixOutboundContractError::Backend(error.to_string()))
 }
 
-fn matrix_retry_scope_index_resource_scope(scope: &TurnScope) -> ResourceScope {
+pub(crate) fn matrix_retry_scope_index_resource_scope(scope: &TurnScope) -> ResourceScope {
     let mut resource_scope = scope.to_resource_scope();
     resource_scope.thread_id = None;
     resource_scope
@@ -1039,7 +1192,7 @@ fn same_matrix_retry_scope_index_resource_scope(
         && left.thread_id == right.thread_id
 }
 
-fn matrix_retry_scope_index_path(
+pub(crate) fn matrix_retry_scope_index_path(
     scope: &TurnScope,
 ) -> Result<ScopedPath, MatrixOutboundContractError> {
     let scope_json = serde_json::to_vec(scope)?;

@@ -455,32 +455,52 @@ pub trait MatrixRetryWorkPort: Send + Sync {
     ) -> Result<Option<MatrixOrchestratorOutcome>, DeliveryError>;
 }
 
-pub struct MatrixRetryProductionWorkPort<F>
-where
-    F: RootFilesystem + 'static,
+pub struct MatrixRetryProductionWorkPort<
+    F,
+    DeliveryPort,
+    CredentialResolver,
+    RetryPolicyT,
+    RetrySendAuthorizer,
+> where
+    F: RootFilesystem + ?Sized + 'static,
+    DeliveryPort: MatrixDeliveryPort,
+    CredentialResolver: MatrixCredentialResolver,
+    RetryPolicyT: RetryPolicy,
+    RetrySendAuthorizer: MatrixRetrySendAuthorizer,
 {
     metadata_store: Arc<FilesystemMatrixOutboundMetadataStore<F>>,
     pending_store: Arc<FilesystemMatrixPendingIntentStore<F>>,
-    delivery_port: Arc<dyn MatrixDeliveryPort>,
-    credential_resolver: Arc<dyn MatrixCredentialResolver>,
-    retry_policy: Arc<dyn RetryPolicy>,
-    retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
+    delivery_port: Arc<DeliveryPort>,
+    credential_resolver: Arc<CredentialResolver>,
+    retry_policy: Arc<RetryPolicyT>,
+    retry_send_authorizer: Arc<RetrySendAuthorizer>,
 }
 
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
-pub(crate) struct MatrixRetryProductionDependencyBundleInput<F>
-where
+pub(crate) struct MatrixRetryProductionDependencyBundleInput<
+    F,
+    HostEgress,
+    EndpointResolver,
+    CredentialMaterialProvider,
+    RetryPolicyT,
+    RetrySendAuthorizer,
+> where
     F: RootFilesystem + 'static,
+    HostEgress: MatrixHostHttpEgress + ?Sized,
+    EndpointResolver: MatrixHttpDeliveryEndpointResolver + ?Sized,
+    CredentialMaterialProvider: MatrixHttpCredentialMaterialProvider + ?Sized,
+    RetryPolicyT: RetryPolicy,
+    RetrySendAuthorizer: MatrixRetrySendAuthorizer,
 {
     pub settings: MatrixRetryWorkerSettings,
     pub metadata_filesystem: Arc<ScopedFilesystem<F>>,
     pub pending_filesystem: Arc<ScopedFilesystem<F>>,
     pub outbound_state_store: Arc<dyn OutboundStateStore>,
-    pub host_egress: Arc<dyn MatrixHostHttpEgress>,
-    pub endpoint_resolver: Arc<dyn MatrixHttpDeliveryEndpointResolver>,
-    pub credential_material_provider: Arc<dyn MatrixHttpCredentialMaterialProvider>,
-    pub retry_policy: Arc<dyn RetryPolicy>,
-    pub retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
+    pub host_egress: Arc<HostEgress>,
+    pub endpoint_resolver: Arc<EndpointResolver>,
+    pub credential_material_provider: Arc<CredentialMaterialProvider>,
+    pub retry_policy: Arc<RetryPolicyT>,
+    pub retry_send_authorizer: Arc<RetrySendAuthorizer>,
 }
 
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
@@ -491,11 +511,30 @@ pub(crate) struct MatrixRetryProductionDependencyBundle {
 
 #[cfg(any(test, feature = "libsql", feature = "postgres"))]
 impl MatrixRetryProductionDependencyBundle {
-    pub(crate) fn new<F>(
-        input: MatrixRetryProductionDependencyBundleInput<F>,
+    pub(crate) fn new<
+        F,
+        HostEgress,
+        EndpointResolver,
+        CredentialMaterialProvider,
+        RetryPolicyT,
+        RetrySendAuthorizer,
+    >(
+        input: MatrixRetryProductionDependencyBundleInput<
+            F,
+            HostEgress,
+            EndpointResolver,
+            CredentialMaterialProvider,
+            RetryPolicyT,
+            RetrySendAuthorizer,
+        >,
     ) -> Result<Self, MatrixOutboundContractError>
     where
         F: RootFilesystem + Send + Sync + 'static,
+        HostEgress: MatrixHostHttpEgress + ?Sized + 'static,
+        EndpointResolver: MatrixHttpDeliveryEndpointResolver + ?Sized + 'static,
+        CredentialMaterialProvider: MatrixHttpCredentialMaterialProvider + ?Sized + 'static,
+        RetryPolicyT: RetryPolicy + 'static,
+        RetrySendAuthorizer: MatrixRetrySendAuthorizer + 'static,
     {
         input.settings.validate()?;
         let metadata_store = Arc::new(FilesystemMatrixOutboundMetadataStore::new(
@@ -510,13 +549,11 @@ impl MatrixRetryProductionDependencyBundle {
             input.endpoint_resolver,
             input.credential_material_provider,
         ));
-        let delivery_port_dyn: Arc<dyn MatrixDeliveryPort> = delivery_port.clone();
-        let credential_resolver: Arc<dyn MatrixCredentialResolver> =
-            Arc::new(MatrixRouteMetadataCredentialResolver);
+        let credential_resolver = Arc::new(MatrixRouteMetadataCredentialResolver);
         let work_port = Arc::new(MatrixRetryProductionWorkPort::new(
             Arc::clone(&metadata_store),
             Arc::clone(&pending_store),
-            Arc::clone(&delivery_port_dyn),
+            delivery_port,
             credential_resolver,
             input.retry_policy,
             input.retry_send_authorizer,
@@ -554,17 +591,28 @@ impl MatrixCredentialResolver for MatrixRouteMetadataCredentialResolver {
     }
 }
 
-impl<F> MatrixRetryProductionWorkPort<F>
+impl<F, DeliveryPort, CredentialResolver, RetryPolicyT, RetrySendAuthorizer>
+    MatrixRetryProductionWorkPort<
+        F,
+        DeliveryPort,
+        CredentialResolver,
+        RetryPolicyT,
+        RetrySendAuthorizer,
+    >
 where
-    F: RootFilesystem + 'static,
+    F: RootFilesystem + ?Sized + 'static,
+    DeliveryPort: MatrixDeliveryPort,
+    CredentialResolver: MatrixCredentialResolver,
+    RetryPolicyT: RetryPolicy,
+    RetrySendAuthorizer: MatrixRetrySendAuthorizer,
 {
     pub fn new(
         metadata_store: Arc<FilesystemMatrixOutboundMetadataStore<F>>,
         pending_store: Arc<FilesystemMatrixPendingIntentStore<F>>,
-        delivery_port: Arc<dyn MatrixDeliveryPort>,
-        credential_resolver: Arc<dyn MatrixCredentialResolver>,
-        retry_policy: Arc<dyn RetryPolicy>,
-        retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
+        delivery_port: Arc<DeliveryPort>,
+        credential_resolver: Arc<CredentialResolver>,
+        retry_policy: Arc<RetryPolicyT>,
+        retry_send_authorizer: Arc<RetrySendAuthorizer>,
     ) -> Self {
         Self {
             metadata_store,
@@ -578,9 +626,20 @@ where
 }
 
 #[async_trait]
-impl<F> MatrixRetryWorkPort for MatrixRetryProductionWorkPort<F>
+impl<F, DeliveryPort, CredentialResolver, RetryPolicyT, RetrySendAuthorizer> MatrixRetryWorkPort
+    for MatrixRetryProductionWorkPort<
+        F,
+        DeliveryPort,
+        CredentialResolver,
+        RetryPolicyT,
+        RetrySendAuthorizer,
+    >
 where
     F: RootFilesystem + Send + Sync + 'static,
+    DeliveryPort: MatrixDeliveryPort,
+    CredentialResolver: MatrixCredentialResolver,
+    RetryPolicyT: RetryPolicy,
+    RetrySendAuthorizer: MatrixRetrySendAuthorizer,
 {
     async fn list_retry_scopes(
         &self,
@@ -651,9 +710,20 @@ where
     }
 }
 
-impl<F> MatrixRetryProductionWorkPort<F>
+impl<F, DeliveryPort, CredentialResolver, RetryPolicyT, RetrySendAuthorizer>
+    MatrixRetryProductionWorkPort<
+        F,
+        DeliveryPort,
+        CredentialResolver,
+        RetryPolicyT,
+        RetrySendAuthorizer,
+    >
 where
-    F: RootFilesystem + 'static,
+    F: RootFilesystem + ?Sized + 'static,
+    DeliveryPort: MatrixDeliveryPort,
+    CredentialResolver: MatrixCredentialResolver,
+    RetryPolicyT: RetryPolicy,
+    RetrySendAuthorizer: MatrixRetrySendAuthorizer,
 {
     async fn record_retry_failure(
         &self,

@@ -5,7 +5,7 @@
 //! Matrix command intent pending; this bridge records terminal status only
 //! after a delivery port returns protocol evidence or a sanitized error.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;

@@ -509,13 +509,18 @@ impl MatrixRetrySendAuthorizer for RejectRetrySendAuthorizer {
     }
 }
 
-fn retry_work_port(
+fn retry_work_port<DeliveryPort, CredentialResolver, RetrySendAuthorizer>(
     metadata_store: Arc<FilesystemMatrixOutboundMetadataStore<InMemoryBackend>>,
     pending_store: Arc<FilesystemMatrixPendingIntentStore<InMemoryBackend>>,
-    delivery_port: Arc<dyn MatrixDeliveryPort>,
-    credential_resolver: Arc<dyn MatrixCredentialResolver>,
-    retry_send_authorizer: Arc<dyn MatrixRetrySendAuthorizer>,
-) -> Arc<dyn MatrixRetryWorkPort> {
+    delivery_port: Arc<DeliveryPort>,
+    credential_resolver: Arc<CredentialResolver>,
+    retry_send_authorizer: Arc<RetrySendAuthorizer>,
+) -> Arc<dyn MatrixRetryWorkPort>
+where
+    DeliveryPort: MatrixDeliveryPort + 'static,
+    CredentialResolver: MatrixCredentialResolver + 'static,
+    RetrySendAuthorizer: MatrixRetrySendAuthorizer + 'static,
+{
     Arc::new(MatrixRetryProductionWorkPort::new(
         metadata_store,
         pending_store,
@@ -3792,7 +3797,7 @@ async fn matrix_retry_worker_tick_executes_due_rehydrated_retry() {
     let work_port = retry_work_port(
         Arc::clone(&metadata_store),
         pending_store,
-        Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+        Arc::clone(&port),
         Arc::new(FakeMatrixCredentialResolver::with_credential(
             ResolvedCredentialHandle {
                 credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
@@ -3944,7 +3949,7 @@ async fn matrix_retry_worker_discovers_due_scope_not_prelisted_exactly() {
     let work_port = retry_work_port(
         Arc::clone(&metadata_store),
         pending_store,
-        Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+        Arc::clone(&port),
         Arc::new(FakeMatrixCredentialResolver::with_credential(
             ResolvedCredentialHandle {
                 credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
@@ -3971,11 +3976,90 @@ async fn matrix_retry_worker_discovers_due_scope_not_prelisted_exactly() {
     .await
     .expect("worker tick discovers indexed runtime-created delivery scope");
 
-    assert_eq!(report.scopes_scanned, 2);
+    assert_eq!(report.scopes_scanned, 1);
     assert_eq!(report.due_schedules, 1);
     assert_eq!(report.attempted, 1);
     assert_eq!(report.delivered, 1);
     assert_eq!(port.calls()[0].0, ProtocolDeliveryIntent::Matrix(command));
+}
+
+#[tokio::test]
+async fn matrix_retry_scope_discovery_recovers_missing_scope_index_from_metadata() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let filesystem = matrix_metadata_filesystem(Arc::clone(&backend));
+    let metadata_store =
+        FilesystemMatrixOutboundMetadataStore::new(Arc::clone(&filesystem), outbound_state_store());
+    let discovery_root = scope_with_thread("thread-matrix-outbound-discovery-root");
+    let delivery_scope = scope_with_thread("thread-matrix-outbound-index-missing");
+    let route = route_in_scope(delivery_scope.clone());
+    let schedule = retry_schedule(&route);
+
+    metadata_store
+        .record_retry_scheduled(schedule, retry_context(&route))
+        .await
+        .expect("persist retry metadata and index");
+    let index_resource_scope = matrix_retry_scope_index_resource_scope(&delivery_scope);
+    let index_path = matrix_retry_scope_index_path(&delivery_scope).expect("index path");
+    filesystem
+        .delete(&index_resource_scope, &index_path)
+        .await
+        .expect("delete index fixture");
+
+    let scopes = metadata_store
+        .list_indexed_retry_scopes(&[discovery_root])
+        .await
+        .expect("fallback metadata scan succeeds");
+
+    assert_eq!(scopes, vec![delivery_scope.clone()]);
+    assert!(
+        filesystem
+            .get(&index_resource_scope, &index_path)
+            .await
+            .expect("read repaired index")
+            .is_some(),
+        "metadata fallback should opportunistically repair the missing scope index"
+    );
+}
+
+#[tokio::test]
+async fn matrix_retry_scope_discovery_filters_and_prunes_terminal_scope_index() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let filesystem = matrix_metadata_filesystem(Arc::clone(&backend));
+    let metadata_store =
+        FilesystemMatrixOutboundMetadataStore::new(Arc::clone(&filesystem), outbound_state_store());
+    let delivery_scope = scope_with_thread("thread-matrix-outbound-terminal-index");
+    let route = route_in_scope(delivery_scope.clone());
+    let schedule = retry_schedule(&route);
+
+    metadata_store
+        .record_retry_scheduled(schedule, retry_context(&route))
+        .await
+        .expect("persist retry metadata and index");
+    metadata_store
+        .update_delivery_status(UpdateDeliveryStatusRequest {
+            status: OutboundDeliveryStatus::Delivered,
+            failure_kind: None,
+            ..delivery_status_request(&route, OutboundDeliveryStatus::Delivered)
+        })
+        .await
+        .expect("terminalize delivery");
+
+    let index_resource_scope = matrix_retry_scope_index_resource_scope(&delivery_scope);
+    let index_path = matrix_retry_scope_index_path(&delivery_scope).expect("index path");
+    let scopes = metadata_store
+        .list_indexed_retry_scopes(std::slice::from_ref(&delivery_scope))
+        .await
+        .expect("stale index discovery succeeds");
+
+    assert!(scopes.is_empty());
+    assert!(
+        filesystem
+            .get(&index_resource_scope, &index_path)
+            .await
+            .expect("read pruned index")
+            .is_none(),
+        "terminal-only retry scopes should be pruned from the discovery index"
+    );
 }
 
 fn source_backed_retry_route() -> FrozenProductDeliveryRoute {
@@ -4118,7 +4202,7 @@ async fn matrix_retry_filesystem_reauthorization_reads_provider_tenant_shared_po
     let work_port = retry_work_port(
         Arc::clone(&metadata_store),
         pending_store,
-        Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+        Arc::clone(&port),
         Arc::new(FakeMatrixCredentialResolver::with_credential(
             ResolvedCredentialHandle {
                 credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
@@ -4193,7 +4277,7 @@ impl SourceBackedRetryReauthorizationFixture {
         let work_port = retry_work_port(
             Arc::clone(&metadata_store),
             pending_store,
-            Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+            Arc::clone(&port),
             Arc::new(FakeMatrixCredentialResolver::with_credential(
                 ResolvedCredentialHandle {
                     credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
@@ -4410,7 +4494,7 @@ async fn matrix_retry_worker_revalidates_current_credential_before_retry_send() 
     let work_port = retry_work_port(
         Arc::clone(&metadata_store),
         pending_store,
-        Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+        Arc::clone(&port),
         Arc::new(FakeMatrixCredentialResolver::with_credential(
             ResolvedCredentialHandle {
                 credential_handle_fingerprint: canonical_fingerprint("revoked-credential"),
@@ -4483,7 +4567,7 @@ async fn matrix_retry_worker_revalidates_live_send_policy_before_retry_send() {
     let work_port = retry_work_port(
         Arc::clone(&metadata_store),
         pending_store,
-        Arc::clone(&port) as Arc<dyn MatrixDeliveryPort>,
+        Arc::clone(&port),
         Arc::new(FakeMatrixCredentialResolver::with_credential(
             ResolvedCredentialHandle {
                 credential_handle_fingerprint: canonical_fingerprint("credential-handle-1"),
