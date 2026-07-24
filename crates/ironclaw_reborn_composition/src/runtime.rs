@@ -3740,8 +3740,15 @@ pub async fn build_reborn_runtime(
         crate::matrix_outbound_targets::validate_matrix_outbound_target_provider_configs_for_runtime(
             &matrix_outbound_target_providers,
         )
-        .map_err(|error| RebornRuntimeError::InvalidArgument {
-            reason: format!("Matrix outbound target provider configuration failed: {error}"),
+        .map_err(|error| {
+            let reason = if crate::matrix_outbound_targets::is_matrix_target_duplicate_provider_scope_error(
+                &error,
+            ) {
+                "duplicate Matrix outbound target provider scope".to_string()
+            } else {
+                format!("Matrix outbound target provider configuration failed: {error}")
+            };
+            RebornRuntimeError::InvalidArgument { reason }
         })?;
     }
 

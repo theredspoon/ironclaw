@@ -27,6 +27,7 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_turns::ReplyTargetBindingRef;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
@@ -1988,6 +1989,19 @@ fn validate_matrix_outbound_target_provider_configs(
         .cloned()
         .map(MatrixHostOutboundTargetProvider::new)
         .collect::<Result<Vec<_>, _>>()?;
+
+    let mut authority_scopes = HashSet::with_capacity(configs.len());
+    for config in configs {
+        let authority_scope = (
+            &config.tenant_id,
+            &config.agent_id,
+            config.project_id.as_ref(),
+            &config.installation_id,
+        );
+        if !authority_scopes.insert(authority_scope) {
+            return Err(matrix_target_duplicate_provider_scope_error());
+        }
+    }
     Ok(())
 }
 
@@ -1995,6 +2009,15 @@ pub(crate) fn validate_matrix_outbound_target_provider_configs_for_runtime(
     configs: &[MatrixOutboundTargetProviderConfig],
 ) -> Result<(), RebornServicesError> {
     validate_matrix_outbound_target_provider_configs(configs)
+}
+
+pub(crate) fn is_matrix_target_duplicate_provider_scope_error(error: &RebornServicesError) -> bool {
+    error.code == RebornServicesErrorCode::Conflict
+        && error.kind == RebornServicesErrorKind::Duplicate
+        && error.status_code == 409
+        && !error.retryable
+        && error.field.as_deref() == Some("matrix_outbound_target_providers")
+        && error.validation_code.is_none()
 }
 
 fn matrix_provider_configs_from_bindings(
@@ -2126,6 +2149,17 @@ fn matrix_target_config_error() -> RebornServicesError {
     }
 }
 
+fn matrix_target_duplicate_provider_scope_error() -> RebornServicesError {
+    RebornServicesError {
+        code: RebornServicesErrorCode::Conflict,
+        kind: RebornServicesErrorKind::Duplicate,
+        status_code: 409,
+        retryable: false,
+        field: Some("matrix_outbound_target_providers".to_string()),
+        validation_code: None,
+    }
+}
+
 fn tenant_ids_from_index_entry(entry: &Entry) -> Result<Vec<TenantId>, RebornServicesError> {
     let stored: StoredMatrixRoomBindingTenantIndex =
         serde_json::from_slice(&entry.body).map_err(|_| matrix_target_backend_error())?;
@@ -2197,7 +2231,10 @@ mod tests {
         ThreadProjectionAccessPolicy, ThreadProjectionAccessRequest,
     };
     use ironclaw_product_adapters::AdapterInstallationId;
-    use ironclaw_product_workflow::{RebornOutboundDeliveryTargetId, WebUiAuthenticatedCaller};
+    use ironclaw_product_workflow::{
+        RebornOutboundDeliveryTargetId, RebornServicesErrorCode, RebornServicesErrorKind,
+        WebUiAuthenticatedCaller,
+    };
     use ironclaw_turns::{ReplyTargetBindingRef, TurnActor, TurnScope};
     use std::sync::{
         Arc,
@@ -2521,6 +2558,9 @@ mod tests {
             configured_room_routes: vec![room_route(OTHER_ROOM, USER, MATRIX_USER)],
         };
 
+        super::validate_matrix_outbound_target_provider_configs(&[first.clone(), second.clone()])
+            .expect("same installation in different tenants remains valid");
+
         assert_eq!(
             super::register_matrix_outbound_target_provider(&registry, first)
                 .expect("first Matrix provider registers"),
@@ -2549,6 +2589,25 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn matrix_provider_config_validation_rejects_duplicate_authority_scope() {
+        let config = provider_config(INSTALLATION, vec![room_route(ROOM, USER, MATRIX_USER)]);
+
+        let error =
+            super::validate_matrix_outbound_target_provider_configs(&[config.clone(), config])
+                .expect_err("duplicate Matrix provider authority scope must be rejected");
+
+        assert_eq!(error.code, RebornServicesErrorCode::Conflict);
+        assert_eq!(error.kind, RebornServicesErrorKind::Duplicate);
+        assert_eq!(error.status_code, 409);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.field.as_deref(),
+            Some("matrix_outbound_target_providers")
+        );
+        assert_eq!(error.validation_code, None);
     }
 
     #[tokio::test]
