@@ -72,6 +72,11 @@ pub use local_runtime_profile::{
     local_dev_runtime_policy, local_dev_yolo_runtime_policy, local_runtime_build_input,
     local_runtime_build_input_with_options,
 };
+pub use matrix_outbound_targets::{
+    MatrixRoomBindingRemovalOutcome, MatrixRoomBindingRemovalRequest,
+    MatrixRoomBindingUpdateOutcome, MatrixRoomBindingUpdateRequest, MatrixRoomBindingUpsertOutcome,
+    MatrixRoomBindingUpsertRequest,
+};
 pub use observability::budget::build_default_budget_accountant;
 pub use observability::budget_events::{BudgetEventObserver, TracingBudgetEventObserver};
 pub use observability::hooks::{
@@ -126,7 +131,9 @@ pub use runtime::{
 };
 pub use runtime_input::{
     CredentialRefreshSettings, DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
-    DEFAULT_TURN_RUNNER_POLL_INTERVAL, PollSettings, RebornRuntimeIdentity, RebornRuntimeInput,
+    DEFAULT_TURN_RUNNER_POLL_INTERVAL, MatrixOutboundRoomTargetConfig,
+    MatrixOutboundTargetMountConfig, MatrixOutboundTargetMountConfigInput,
+    MatrixPolicyProjectionCacheConfig, PollSettings, RebornRuntimeIdentity, RebornRuntimeInput,
     TriggerFireAccessCheck, TriggerFireAccessChecker, TriggerFireAccessDecision,
     TriggerFireAccessError, TriggerPollerSettings, TurnRunnerSettings,
 };
