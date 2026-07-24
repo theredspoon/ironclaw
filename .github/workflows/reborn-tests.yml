@@ -17,6 +17,11 @@ on:
     branches:
       - main
       - reborn-matrix-pilot
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
   merge_group:
     branches:
       - main
@@ -30,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: reborn-tests-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  group: reborn-tests-${{ github.event_name }}-${{ github.event.pull_request.number || github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -810,7 +815,11 @@ jobs:
           CRATE_TESTS_RESULT: ${{ needs.crate-tests.result }}
           ROOT_PARITY_RESULT: ${{ needs.root-reborn-parity-tests.result }}
           GROUP_TESTS_RESULT: ${{ needs.reborn-group-tests.result }}
+          # This matrix is the sole execution of the 27 flat
+          # reborn_integration_* suites, so its result is mandatory.
           INTEGRATION_COVERAGE_RESULT: ${{ needs.reborn-integration-coverage.result }}
+          # This job gates report processing. Its committed coverage ratchet
+          # remains soft-disabled until the floor's enforce flag is enabled.
           COVERAGE_REPORT_RESULT: ${{ needs.coverage-report.result }}
           WEBUI_TESTS_RESULT: ${{ needs.webui-v2-js-tests.result }}
           QA_FIXTURES_RESULT: ${{ needs.qa-recorded-fixtures.result }}
