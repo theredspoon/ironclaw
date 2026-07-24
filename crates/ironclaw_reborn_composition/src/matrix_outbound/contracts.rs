@@ -96,19 +96,8 @@ pub struct MatrixRoomId(String);
 impl MatrixRoomId {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixOutboundContractError> {
         let value = value.into();
-        let has_required_shape = value
-            .rsplit_once(':')
-            .map(|(localpart, server_name)| {
-                value.starts_with('!')
-                    && localpart.len() > 1
-                    && !server_name.is_empty()
-                    && value.len() <= 255
-                    && !value.chars().any(|c| c.is_control() || c.is_whitespace())
-            })
-            .unwrap_or(false);
-        if !has_required_shape {
-            return Err(MatrixOutboundContractError::InvalidRoomId);
-        }
+        ruma_common::RoomId::parse(value.as_str())
+            .map_err(|_| MatrixOutboundContractError::InvalidRoomId)?;
         Ok(Self(value))
     }
 

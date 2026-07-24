@@ -291,6 +291,17 @@ fn matrix_policy_canonicalizes_identifiers_and_rejects_aliases_private_hosts() {
 }
 
 #[test]
+fn matrix_native_policy_accepts_server_name_less_v2_room_id_without_rewriting() {
+    let room_id = "!opaquev2roomid";
+    let parsed = MatrixRoomId::new(room_id).expect("v2 room id is valid");
+    assert_eq!(parsed.as_str(), room_id);
+
+    let encoded = serde_json::to_vec(&parsed).expect("serialize room id");
+    let restored: MatrixRoomId = serde_json::from_slice(&encoded).expect("reload room id");
+    assert_eq!(restored.as_str(), room_id);
+}
+
+#[test]
 fn matrix_policy_snapshot_authorizes_outbound_and_rejects_credential_pair_mismatch() {
     let install = installation("install-alpha", MatrixActivationState::Enabled);
     let ctx = routing_context(

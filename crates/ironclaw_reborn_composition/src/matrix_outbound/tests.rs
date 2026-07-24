@@ -198,6 +198,17 @@ fn command() -> MatrixOutboundCommand {
     }
 }
 
+#[test]
+fn matrix_composition_command_accepts_server_name_less_v2_room_id_without_rewriting() {
+    let room_id = "!opaquev2roomid";
+    let parsed = MatrixRoomId::new(room_id).expect("v2 room id is valid");
+    assert_eq!(parsed.as_str(), room_id);
+
+    let encoded = serde_json::to_vec(&parsed).expect("serialize room id");
+    let restored: MatrixRoomId = serde_json::from_slice(&encoded).expect("reload room id");
+    assert_eq!(restored.as_str(), room_id);
+}
+
 fn command_with_transaction_id(transaction_id: &str) -> MatrixOutboundCommand {
     MatrixOutboundCommand {
         transaction_id: MatrixTransactionId::new(transaction_id).expect("valid transaction id"),
