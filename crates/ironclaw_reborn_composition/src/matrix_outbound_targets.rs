@@ -2593,11 +2593,14 @@ mod tests {
 
     #[test]
     fn matrix_provider_config_validation_rejects_duplicate_authority_scope() {
-        let config = provider_config(INSTALLATION, vec![room_route(ROOM, USER, MATRIX_USER)]);
+        let first = provider_config(INSTALLATION, vec![room_route(ROOM, USER, MATRIX_USER)]);
+        let second = provider_config(
+            INSTALLATION,
+            vec![room_route(OTHER_ROOM, OTHER_USER, OTHER_MATRIX_USER)],
+        );
 
-        let error =
-            super::validate_matrix_outbound_target_provider_configs(&[config.clone(), config])
-                .expect_err("duplicate Matrix provider authority scope must be rejected");
+        let error = super::validate_matrix_outbound_target_provider_configs(&[first, second])
+            .expect_err("duplicate Matrix provider authority scope must be rejected");
 
         assert_eq!(error.code, RebornServicesErrorCode::Conflict);
         assert_eq!(error.kind, RebornServicesErrorKind::Duplicate);

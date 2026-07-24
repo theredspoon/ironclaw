@@ -66,7 +66,7 @@ use ironclaw_product_workflow::{
     ApprovalResolverPort, ApprovalTurnRunLocator, AuthInteractionService,
     DefaultApprovalInteractionService, DefaultAuthInteractionService,
     OutboundPreferencesProductFacade, PersistentApprovalGranteeResolver,
-    ProductOutboundDeliveryOutcome, RunStateApprovalInteractionReadModel,
+    ProductOutboundDeliveryOutcome, RebornServicesError, RunStateApprovalInteractionReadModel,
 };
 use ironclaw_runner::loop_exit_applier::{
     ApprovalGateEvidenceStore, AwaitDependentRunEvidenceStore, ThreadCheckpointLoopExitEvidencePort,
@@ -108,7 +108,7 @@ use ironclaw_host_runtime::MemoryBackedUserProfileSource;
 #[cfg(any(test, feature = "test-support"))]
 use ironclaw_product_workflow::{
     RebornOutboundDeliveryTargetCapabilities, RebornOutboundDeliveryTargetId,
-    RebornOutboundDeliveryTargetSummary, RebornServicesError, WebUiAuthenticatedCaller,
+    RebornOutboundDeliveryTargetSummary, WebUiAuthenticatedCaller,
 };
 use ironclaw_turns::run_profile::UserProfileContext;
 
@@ -3740,15 +3740,8 @@ pub async fn build_reborn_runtime(
         crate::matrix_outbound_targets::validate_matrix_outbound_target_provider_configs_for_runtime(
             &matrix_outbound_target_providers,
         )
-        .map_err(|error| {
-            let reason = if crate::matrix_outbound_targets::is_matrix_target_duplicate_provider_scope_error(
-                &error,
-            ) {
-                "duplicate Matrix outbound target provider scope".to_string()
-            } else {
-                format!("Matrix outbound target provider configuration failed: {error}")
-            };
-            RebornRuntimeError::InvalidArgument { reason }
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: matrix_outbound_target_provider_validation_reason(&error),
         })?;
     }
 
@@ -4950,6 +4943,57 @@ pub async fn build_reborn_runtime(
         #[cfg(feature = "root-llm-provider")]
         llm_reload,
     })
+}
+
+fn matrix_outbound_target_provider_validation_reason(error: &RebornServicesError) -> String {
+    if crate::matrix_outbound_targets::is_matrix_target_duplicate_provider_scope_error(error) {
+        "duplicate Matrix outbound target provider scope".to_string()
+    } else {
+        format!("Matrix outbound target provider configuration failed: {error}")
+    }
+}
+
+#[cfg(test)]
+mod matrix_outbound_target_provider_validation_reason_tests {
+    use ironclaw_product_workflow::{
+        RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind,
+    };
+
+    use super::matrix_outbound_target_provider_validation_reason;
+
+    #[test]
+    fn duplicate_scope_maps_to_stable_runtime_reason() {
+        let error = RebornServicesError {
+            code: RebornServicesErrorCode::Conflict,
+            kind: RebornServicesErrorKind::Duplicate,
+            status_code: 409,
+            retryable: false,
+            field: Some("matrix_outbound_target_providers".to_string()),
+            validation_code: None,
+        };
+
+        assert_eq!(
+            matrix_outbound_target_provider_validation_reason(&error),
+            "duplicate Matrix outbound target provider scope"
+        );
+    }
+
+    #[test]
+    fn nonduplicate_validation_error_keeps_generic_runtime_reason() {
+        let error = RebornServicesError {
+            code: RebornServicesErrorCode::InvalidRequest,
+            kind: RebornServicesErrorKind::Validation,
+            status_code: 400,
+            retryable: false,
+            field: Some("configured_room_routes.room_id".to_string()),
+            validation_code: None,
+        };
+
+        assert_eq!(
+            matrix_outbound_target_provider_validation_reason(&error),
+            "Matrix outbound target provider configuration failed: Reborn WebUI service error: InvalidRequest"
+        );
+    }
 }
 
 /// Thin wrapper over
