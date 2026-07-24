@@ -3873,7 +3873,6 @@ pub async fn build_reborn_runtime(
     };
     let RuntimeStoreParts {
         local_runtime,
-        #[cfg(any(feature = "libsql", feature = "postgres"))]
         matrix_policy_projection_filesystem,
         extension_installation_store,
         local_extension_management,
