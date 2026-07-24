@@ -1,7 +1,8 @@
 # CI Automation Branch .gitignore
 
 # This branch is minimal by design - it should only contain:
-# - .github/workflows/ (3 automation workflows)
+# - .github/workflows/ (automation workflows)
+# - tests/ (static workflow security tests)
 # - README.md
 # - .gitignore
 
@@ -16,3 +17,6 @@
 !/.github/workflows/sync-upstream.yml
 !/.github/workflows/mirror-to-deployment-target.yml
 !/.github/workflows/auto-ff-matrix-pilot-sync.yml
+!/.github/workflows/review-authority.yml
+!/tests/
+!/tests/test_review_authority_workflow.py

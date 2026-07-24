@@ -8,11 +8,35 @@ This branch contains automation workflows only. It is the default branch for `th
 
 Three GitHub Actions workflows:
 
-| Workflow | Schedule | Purpose |
-|----------|----------|---------|
-| `sync-upstream.yml` | Hourly | Syncs `nearai/ironclaw:main` → creates PRs to `native-matrix-channel-pilot` |
-| `mirror-to-deployment-target.yml` | On push to `native-matrix-channel-pilot` | Mirrors reviewed source → deployment target |
-| `auto-ff-matrix-pilot-sync.yml` | After PR CI passes | Auto-merges sync PRs when tests pass |
+| Workflow | Event | Purpose |
+|----------|-------|---------|
+| `sync-upstream.yml` | Hourly | Fast-forwards the exact `nearai/ironclaw:main` mirror |
+| `mirror-to-deployment-target.yml` | Manual dispatch | Mirrors reviewed pilot source to the deployment target |
+| `review-authority.yml` | Pull requests targeting `reborn-matrix-pilot` | Protects the rules that decide whether a pilot pull request may merge |
+
+## Review Authority
+
+`Review Authority` is the stable required-check name for pull requests targeting
+`reborn-matrix-pilot`. GitHub runs it with `pull_request_target` so the workflow
+definition comes from this default branch, not from the pull request under
+review.
+
+The job checks out one exact, reviewed Lighthouse commit and runs its
+deterministic review-authority guard. It passes the repository, pull request
+number, exact head commit, exact base branch and base commit as quoted data.
+The guard reads changed paths and the candidate required-check policy through
+the GitHub API. The job never checks out or executes pull request code. An
+`edited` pull request event reruns the job so changing the target branch cannot
+reuse a verdict bound to the previous base.
+
+The guard rejects changes to GitHub workflow and review-authority paths, and
+this repository additionally protects `deny.toml`. An added or modified
+`.github/review/required-check-policy.json` is read as inert content and must
+pass Lighthouse's canonical schema and bounded runtime validation. It is not
+used as the authority for the pull request that proposes it.
+
+The workflow and its Lighthouse commit pin live on this automation-only default
+branch. Product pull requests cannot weaken either one.
 
 ## Product Branches
 
@@ -21,14 +45,15 @@ For product work, use these branches:
 | Branch | Purpose |
 |--------|---------|
 | `upstream-main` | Mirror of `nearai/ironclaw:main` |
-| `native-matrix-channel-pilot` | Matrix pilot source |
+| `reborn-matrix-pilot` | Reborn Matrix pilot source |
 | `matrix-channel-clean` | Upstream contribution queue |
 
 ## Maintenance
 
 **Do not merge upstream `nearai/ironclaw:main` into this branch.** The workflows here are fork-specific and do not exist upstream.
 
-Do not commit product code to this branch. Use `native-matrix-channel-pilot` or `matrix-channel-clean` instead.
+Do not commit product code to this branch. Use `reborn-matrix-pilot` or
+`matrix-channel-clean` instead.
 
 ## References
 
