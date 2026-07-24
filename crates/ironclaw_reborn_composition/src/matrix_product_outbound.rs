@@ -74,9 +74,20 @@ enum MatrixLifecycleTargetProviderSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatrixPolicySourceCacheMode {
+    #[cfg(test)]
     ReadExisting,
     ReadExistingOrInitialize,
     ReconcileFromRuntime,
+}
+
+impl MatrixPolicySourceCacheMode {
+    fn may_initialize_missing_entry(self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::ReadExisting => false,
+            Self::ReadExistingOrInitialize | Self::ReconcileFromRuntime => true,
+        }
+    }
 }
 
 impl MatrixLifecycleTargetProviderSource {
@@ -319,7 +330,12 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             }
             let source_path = matrix_policy_source_cache_path_for_provider(&write.provider)?;
             if let Err(error) = self
-                .write_source_cache_bytes(&write.provider_scope, &source_path, write.bytes.clone())
+                .write_source_cache_bytes(
+                    &write.provider_scope,
+                    &source_path,
+                    &write.provider.installation_id,
+                    write.bytes.clone(),
+                )
                 .await
             {
                 self.invalidate_projection_cache_body(
@@ -389,7 +405,7 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                         entry,
                         provider,
                         &target_providers,
-                        MatrixPolicySourceCacheMode::ReadExisting,
+                        MatrixPolicySourceCacheMode::ReadExistingOrInitialize,
                     )
                     .await?
                     .is_none()
@@ -454,7 +470,12 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
             }
             let source_path = matrix_policy_source_cache_path_for_provider(provider)?;
             if let Err(error) = self
-                .write_source_cache_bytes(&provider_scope, &source_path, body)
+                .write_source_cache_bytes(
+                    &provider_scope,
+                    &source_path,
+                    &provider.installation_id,
+                    body,
+                )
                 .await
             {
                 self.invalidate_projection_commit_markers(&committed_markers)
@@ -714,7 +735,11 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
                 .map_err(map_matrix_policy_projection_cache_error)?;
             let Some(source_installation) = cache.installation(&provider.installation_id).cloned()
             else {
-                return Ok(None);
+                return if source_mode.may_initialize_missing_entry() {
+                    Ok(runtime_installation)
+                } else {
+                    Ok(None)
+                };
             };
             if source_mode == MatrixPolicySourceCacheMode::ReconcileFromRuntime
                 && let Some(runtime_installation) = runtime_installation
@@ -772,15 +797,27 @@ impl MatrixLifecyclePolicyProjectionCacheRefresher {
         &self,
         provider_scope: &ResourceScope,
         source_path: &ScopedPath,
+        installation_id: &AdapterInstallationId,
         bytes: Vec<u8>,
     ) -> Result<(), ProductWorkflowError> {
-        let cas = self
+        let current = self
             .filesystem
             .get(provider_scope, source_path)
             .await
-            .map_err(map_matrix_policy_projection_cache_error)?
-            .map(|entry| CasExpectation::Version(entry.version))
-            .unwrap_or(CasExpectation::Absent);
+            .map_err(map_matrix_policy_projection_cache_error)?;
+        let cas = match current {
+            Some(entry) => {
+                let cache = MatrixInstallationProjectionCache::from_json_bytes(&entry.entry.body)
+                    .map_err(map_matrix_policy_projection_cache_error)?;
+                if cache.installation(installation_id).is_none() {
+                    // Runtime fallback may rebuild the published projection, but it must not
+                    // turn an existing source-owned absence into a durable source record.
+                    return Ok(());
+                }
+                CasExpectation::Version(entry.version)
+            }
+            None => CasExpectation::Absent,
+        };
         self.filesystem
             .put(
                 provider_scope,

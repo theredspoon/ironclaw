@@ -144,6 +144,106 @@ fn matrix_room_binding_test_backend_error() -> RebornServicesError {
 }
 
 #[tokio::test]
+async fn matrix_reconcile_from_runtime_initializes_installation_missing_from_existing_source_cache()
+{
+    let installation = matrix_installation_from_existing_empty_source_cache(
+        MatrixPolicySourceCacheMode::ReconcileFromRuntime,
+    )
+    .await;
+
+    assert!(
+        installation.is_some(),
+        "reconciliation may initialize a missing source entry from the validated runtime installation"
+    );
+}
+
+#[tokio::test]
+async fn matrix_read_existing_or_initialize_initializes_installation_missing_from_existing_source_cache()
+ {
+    let installation = matrix_installation_from_existing_empty_source_cache(
+        MatrixPolicySourceCacheMode::ReadExistingOrInitialize,
+    )
+    .await;
+
+    assert!(
+        installation.is_some(),
+        "startup fallback may initialize a missing source entry from the validated runtime installation"
+    );
+}
+
+#[tokio::test]
+async fn matrix_read_existing_refuses_installation_missing_from_existing_source_cache() {
+    let installation = matrix_installation_from_existing_empty_source_cache(
+        MatrixPolicySourceCacheMode::ReadExisting,
+    )
+    .await;
+
+    assert!(
+        installation.is_none(),
+        "prepared publication must remain fail-closed when the source entry is absent"
+    );
+}
+
+async fn matrix_installation_from_existing_empty_source_cache(
+    source_mode: MatrixPolicySourceCacheMode,
+) -> Option<MatrixProductAdapterInstallation> {
+    let store = Arc::new(InMemoryExtensionInstallationStore::default());
+    seed_enabled_matrix_runtime_entry(store.as_ref()).await;
+    let backend = Arc::new(InMemoryBackend::default());
+    let installation_id =
+        AdapterInstallationId::new("matrix-source-backed-install").expect("installation id");
+    let provider = MatrixOutboundTargetProviderConfig {
+        tenant_id: TenantId::new("matrix-source-backed-tenant").expect("tenant"),
+        agent_id: AgentId::new("matrix-source-backed-agent").expect("agent"),
+        project_id: Some(ProjectId::new("matrix-source-backed-project").expect("project")),
+        installation_id,
+        configured_room_routes: vec![MatrixConfiguredRoomRoute {
+            room_id: "!empty-source-cache:example.org".to_string(),
+            subject_user_id: UserId::new("user:empty-source-cache").expect("subject"),
+            matrix_sender_user_id: MatrixUserId::new("@empty-source-cache:example.org")
+                .expect("matrix sender"),
+        }],
+    };
+    let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
+        backend,
+        store.clone(),
+        vec![provider.clone()],
+        matrix_source_backed_artifact_evidence(),
+        "matrix-source-backed-policy-owner".to_string(),
+    )
+    .expect("refresher");
+    let scope = matrix_source_backed_scope();
+    refresher
+        .write_source_cache_bytes(
+            &matrix_policy_projection_resource_scope_for_provider(&scope, &provider),
+            &matrix_policy_source_cache_path_for_provider(&provider).expect("source path"),
+            &provider.installation_id,
+            MatrixInstallationProjectionCache::new()
+                .to_json_bytes()
+                .expect("empty source cache"),
+        )
+        .await
+        .expect("write existing empty source cache");
+    let entry = list_enabled_product_adapter_entries(store.as_ref())
+        .await
+        .expect("list enabled runtime entries")
+        .into_iter()
+        .next()
+        .expect("enabled runtime entry");
+
+    refresher
+        .matrix_installation_for_provider(
+            &scope,
+            &entry,
+            &provider,
+            std::slice::from_ref(&provider),
+            source_mode,
+        )
+        .await
+        .expect("resolve Matrix installation")
+}
+
+#[tokio::test]
 async fn matrix_lifecycle_refresher_projects_cache_from_runtime_sources_not_static_policy() {
     let store = Arc::new(InMemoryExtensionInstallationStore::default());
     seed_enabled_matrix_runtime_entry(store.as_ref()).await;
