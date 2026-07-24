@@ -520,6 +520,40 @@ fn local_dev_runtime_policy() -> EffectiveRuntimePolicy {
     }
 }
 
+#[cfg(feature = "libsql")]
+fn production_matrix_retry_worker_fixture(
+    fixture_id: &str,
+) -> crate::input::MatrixRetryWorkerProductionConfig {
+    let scope = TurnScope::new_with_owner(
+        TenantId::new(format!("{fixture_id}-tenant")).expect("valid Matrix retry tenant"),
+        Some(AgentId::new(format!("{fixture_id}-agent")).expect("valid Matrix retry agent")),
+        None,
+        ThreadId::new(format!("{fixture_id}-thread")).expect("valid Matrix retry thread"),
+        Some(UserId::new(format!("{fixture_id}-owner")).expect("valid Matrix retry owner")),
+    );
+
+    crate::input::MatrixRetryWorkerProductionConfig::new(
+        crate::input::MatrixRetryWorkerProductionConfigInput {
+            settings: crate::matrix_outbound::MatrixRetryWorkerSettings {
+                enabled: true,
+                poll_interval: Duration::from_millis(50),
+                startup_jitter_max: Duration::ZERO,
+                tick_jitter_max: Duration::ZERO,
+                max_entries_per_scope: 10,
+            },
+            scopes: vec![scope],
+            homeserver_origin: "https://matrix.example".to_string(),
+            credential_secret: ironclaw_host_api::SecretHandle::new("matrix_access_token")
+                .expect("valid Matrix credential secret"),
+            credential_handle_fingerprint: format!(
+                "sha256:{}",
+                ironclaw_common::hashing::sha256_hex(b"credential-handle-1")
+            ),
+            capability_id: CapabilityId::new("matrix.send").expect("valid Matrix capability id"),
+        },
+    )
+}
+
 #[derive(Debug)]
 struct RecordingGateway {
     reply: String,
@@ -2475,7 +2509,10 @@ async fn production_runtime_rejects_enabled_hooks_without_local_runtime() {
             ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
                 RecordingSandboxTransport,
             )),
-        ))),
+        )))
+        .with_matrix_retry_production_config(production_matrix_retry_worker_fixture(
+            "runtime-production-hooks",
+        )),
     )
     .with_identity(RebornRuntimeIdentity {
         tenant_id: "runtime-production-hooks-tenant".to_string(),
@@ -3519,7 +3556,10 @@ async fn build_reborn_runtime_rejects_trajectory_observer_for_production() {
             ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
                 RecordingSandboxTransport,
             )),
-        ))),
+        )))
+        .with_matrix_retry_production_config(production_matrix_retry_worker_fixture(
+            "runtime-observer-reject",
+        )),
     )
     .with_identity(RebornRuntimeIdentity {
         tenant_id: "runtime-observer-reject-tenant".to_string(),
