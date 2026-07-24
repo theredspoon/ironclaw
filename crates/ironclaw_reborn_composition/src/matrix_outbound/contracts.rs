@@ -90,7 +90,7 @@ fn matrix_room_fingerprint(room_id: &str) -> String {
     format!("sha256:{}", sha256_hex(room_id.as_bytes()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MatrixRoomId(String);
 
 impl MatrixRoomId {
@@ -107,6 +107,16 @@ impl MatrixRoomId {
 
     pub fn fingerprint(&self) -> String {
         matrix_room_fingerprint(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MatrixRoomId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 

@@ -874,10 +874,20 @@ fn matrix_policy_projection_cache_persists_and_reloads_durable_snapshot() {
     registry
         .insert_projection(installation, "operator-alpha", 1)
         .expect("project installation");
+    let durable_policy = MatrixInstallationPolicy::new(
+        homeserver("https://matrix.example.org"),
+        set([room("!opaquev2roomid")]),
+        set([user("@alice:example.org")]),
+        EgressTargetIndex::new(0),
+        credential("matrix-access-token"),
+    )
+    .expect("durable policy");
     registry
         .apply_policy_mutation(
             &installation_id,
-            MatrixInstallationMutation::UpdatePolicy { policy: policy() },
+            MatrixInstallationMutation::UpdatePolicy {
+                policy: durable_policy,
+            },
             &MatrixInstallationMutationAuthority::tenant_operator(),
             "operator-alpha",
             2,
@@ -894,6 +904,19 @@ fn matrix_policy_projection_cache_persists_and_reloads_durable_snapshot() {
             .expect("restored installation")
             .activation,
         MatrixActivationState::Enabled
+    );
+    assert_eq!(
+        restored
+            .installation(&installation_id)
+            .expect("restored installation")
+            .policy
+            .allowed_rooms
+            .iter()
+            .next()
+            .expect("restored allowed room")
+            .as_str(),
+        "!opaquev2roomid",
+        "durable policy cache reload must preserve the exact v2 room id"
     );
     assert_eq!(restored.audit_events(), registry.audit_events());
 }

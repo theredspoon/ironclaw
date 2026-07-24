@@ -184,12 +184,16 @@ fn binding() -> ReplyTargetBindingRef {
 }
 
 fn command() -> MatrixOutboundCommand {
+    command_for_room("!room:matrix.example")
+}
+
+fn command_for_room(room_id: &str) -> MatrixOutboundCommand {
     MatrixOutboundCommand {
         command_kind: MatrixCommandKind::SendText,
         transaction_id: MatrixTransactionId::new("txn-matrix-1").expect("valid txn"),
         reply_target_binding_ref: binding(),
         egress_target_index: 0,
-        room_id: MatrixRoomId::new("!room:matrix.example").expect("valid room"),
+        room_id: MatrixRoomId::new(room_id).expect("valid room"),
         body: MatrixMessageBody::new(json!({
             "msgtype": "m.text",
             "body": "hello matrix"
@@ -207,6 +211,17 @@ fn matrix_composition_command_accepts_server_name_less_v2_room_id_without_rewrit
     let encoded = serde_json::to_vec(&parsed).expect("serialize room id");
     let restored: MatrixRoomId = serde_json::from_slice(&encoded).expect("reload room id");
     assert_eq!(restored.as_str(), room_id);
+}
+
+#[test]
+fn matrix_composition_command_rejects_invalid_room_id_during_json_reload() {
+    let mut encoded = serde_json::to_value(command()).expect("serialize Matrix command");
+    encoded["room_id"] = json!("not-a-matrix-room-id");
+
+    assert!(
+        serde_json::from_value::<MatrixOutboundCommand>(encoded).is_err(),
+        "durable command reload must validate Matrix room ids through MatrixRoomId::new"
+    );
 }
 
 fn command_with_transaction_id(transaction_id: &str) -> MatrixOutboundCommand {
@@ -333,7 +348,10 @@ fn canonical_fingerprint(value: &str) -> String {
 }
 
 fn route() -> FrozenProductDeliveryRoute {
-    let command = command();
+    route_for_command(&command())
+}
+
+fn route_for_command(command: &MatrixOutboundCommand) -> FrozenProductDeliveryRoute {
     let owner = owner();
     FrozenProductDeliveryRoute::mint_for_matrix(
         &owner,
@@ -1146,11 +1164,15 @@ impl ProductAdapter for RecordingMatrixRenderAdapter<'_> {
 }
 
 fn matrix_product_adapter() -> MatrixProductAdapter {
+    matrix_product_adapter_for_room("!room:example.org")
+}
+
+fn matrix_product_adapter_for_room(room_id: &str) -> MatrixProductAdapter {
     MatrixProductAdapter::new(MatrixProductAdapterConfig {
         adapter_id: ProductAdapterId::new("matrix").expect("valid adapter id"),
         installation_id: AdapterInstallationId::new("inst_matrix").expect("valid installation id"),
         parse_policy: MatrixParsePolicy {
-            allowed_rooms: vec!["!room:example.org".to_string()],
+            allowed_rooms: vec![room_id.to_string()],
             allowed_senders: vec!["@alice:example.org".to_string()],
         },
         auth_requirement: AuthRequirement::SharedSecretHeader {
@@ -1161,15 +1183,18 @@ fn matrix_product_adapter() -> MatrixProductAdapter {
 }
 
 fn matrix_policy_snapshot() -> AdapterMatrixPolicySnapshot {
+    matrix_policy_snapshot_for_room("!room:example.org")
+}
+
+fn matrix_policy_snapshot_for_room(room_id: &str) -> AdapterMatrixPolicySnapshot {
     AdapterMatrixPolicySnapshot {
         adapter_id: ProductAdapterId::new("matrix").expect("valid adapter id"),
         installation_id: AdapterInstallationId::new("inst_matrix").expect("valid installation id"),
         homeserver: AdapterMatrixHomeserverOrigin::parse("https://matrix.example.org")
             .expect("homeserver"),
-        allowed_rooms: std::collections::BTreeSet::from([AdapterMatrixRoomId::new(
-            "!room:example.org",
-        )
-        .expect("room")]),
+        allowed_rooms: std::collections::BTreeSet::from([
+            AdapterMatrixRoomId::new(room_id).expect("room")
+        ]),
         allowed_senders: std::collections::BTreeSet::from([AdapterMatrixUserId::new(
             "@alice:example.org",
         )
@@ -1989,6 +2014,7 @@ async fn orchestrator_records_redacted_delivery_status_observability() {
 
 #[tokio::test]
 async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without_http() {
+    let room_id = "!opaquev2roomid";
     let timeline = StageTimeline::default();
     let workflow_scope = scope();
     let outbound_store = in_memory_backed_outbound_state_store();
@@ -1999,13 +2025,11 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
     validator.allow(workflow_reply_target());
     let preferences = RecordingPreferenceRepository::default();
     preferences.seed(workflow_preference_record(&workflow_scope));
-    let resolver = RecordingProductOutboundTargetResolver::for_room_with_timeline(
-        "!room:example.org",
-        timeline.clone(),
-    );
+    let resolver =
+        RecordingProductOutboundTargetResolver::for_room_with_timeline(room_id, timeline.clone());
     let access_policy = AllowAllProjectionAccessPolicy;
     let outbound_policy = OutboundPolicyService::new(&outbound_store, &access_policy, &validator);
-    let inner_adapter = matrix_product_adapter();
+    let inner_adapter = matrix_product_adapter_for_room(room_id);
     let adapter = RecordingMatrixRenderAdapter::new(&inner_adapter, timeline.clone());
     let extension_store = RecordingExtensionInstallationStore::new(
         matrix_extension_store(ExtensionActivationState::Enabled).await,
@@ -2015,7 +2039,9 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
         timeline: timeline.clone(),
         ..Default::default()
     };
-    let snapshot_source = StaticMatrixPolicySnapshotSource::default();
+    let snapshot_source = StaticMatrixPolicySnapshotSource {
+        snapshot: matrix_policy_snapshot_for_room(room_id),
+    };
     let egress = FakeProtocolHttpEgress::new(Vec::<String>::new());
     let delivery_sink = FakeOutboundDeliverySink::new();
 
@@ -2079,6 +2105,11 @@ async fn adapter_pending_matrix_intent_can_join_composition_orchestrator_without
         },
     )
     .expect("composition bridge should convert trusted Matrix intent");
+    assert_eq!(
+        command.room_id.as_str(),
+        room_id,
+        "outbound resolution, policy authorization, and adapter bridge must preserve the exact v2 room id"
+    );
     let owner = owner();
     let route = FrozenProductDeliveryRoute::mint_for_matrix(
         &owner,
@@ -2845,7 +2876,8 @@ async fn durable_matrix_metadata_store_reloads_retry_schedule_without_terminal_s
         matrix_metadata_filesystem(Arc::clone(&backend)),
         outbound_state_store(),
     );
-    let route = route();
+    let command = command_for_room("!opaquev2roomid");
+    let route = route_for_command(&command);
     let schedule = MatrixRetrySchedule {
         delivery_id: route.delivery_id,
         scope: route.scope().clone(),
@@ -2873,6 +2905,11 @@ async fn durable_matrix_metadata_store_reloads_retry_schedule_without_terminal_s
         .load_delivery_status(route.scope().clone(), route.delivery_id)
         .await
         .expect("load absent status");
+    let loaded_context = reader
+        .load_retry_execution_context(route.scope().clone(), route.delivery_id)
+        .await
+        .expect("load retry execution context")
+        .expect("retry execution context should persist across store instances");
 
     assert_eq!(loaded_schedule.delivery_id, route.delivery_id);
     assert_eq!(loaded_schedule.scope, route.scope().clone());
@@ -2882,6 +2919,11 @@ async fn durable_matrix_metadata_store_reloads_retry_schedule_without_terminal_s
         loaded_schedule.reason,
         DeliveryReasonCode::MatrixRateLimited
     );
+    assert_eq!(
+        loaded_context.route().matrix_metadata().room_fingerprint,
+        command.room_id.fingerprint(),
+        "durable retry reload must retain authorization for the exact v2 room id"
+    );
     assert_eq!(loaded_status, None);
 }
 
@@ -2890,8 +2932,8 @@ async fn durable_matrix_pending_intent_store_reloads_pending_command_across_stor
     let backend = Arc::new(InMemoryBackend::new());
     let writer =
         FilesystemMatrixPendingIntentStore::new(matrix_metadata_filesystem(Arc::clone(&backend)));
-    let route = route();
-    let command = command();
+    let command = command_for_room("!opaquev2roomid");
+    let route = route_for_command(&command);
     let attempt_id = route.delivery_id.as_uuid();
 
     writer
@@ -2912,6 +2954,7 @@ async fn durable_matrix_pending_intent_store_reloads_pending_command_across_stor
         .expect("pending command should persist across store instances");
 
     assert_eq!(loaded, command);
+    assert_eq!(loaded.room_id.as_str(), "!opaquev2roomid");
 
     let loaded_again = reader
         .take_pending_command(route.scope().clone(), route.delivery_id, attempt_id)
