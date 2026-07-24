@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "repository": "theredspoon/ironclaw",
+  "selectors": [
+    {
+      "base_branch": "reborn-matrix-pilot",
+      "paths": [
+        "^[^\\x00\\r\\n]{1,4096}$"
+      ],
+      "risk": "low",
+      "required_checks": [
+        {
+          "name": "Code Style (fmt + clippy)",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        },
+        {
+          "name": "Regression test enforcement",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        }
+      ]
+    },
+    {
+      "base_branch": "reborn-matrix-pilot",
+      "paths": [
+        "^docs/[^\\x00\\r\\n]{1,4000}$",
+        "^openwiki/[^\\x00\\r\\n]{1,4000}$"
+      ],
+      "risk": "medium",
+      "required_checks": [
+        {
+          "name": "Code Style (fmt + clippy)",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        },
+        {
+          "name": "Regression test enforcement",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        }
+      ]
+    },
+    {
+      "base_branch": "reborn-matrix-pilot",
+      "paths": [
+        "^src/[^\\x00\\r\\n]{1,4000}$",
+        "^tests/[^\\x00\\r\\n]{1,4000}$",
+        "^scripts/[^\\x00\\r\\n]{1,4000}$",
+        "^Cargo\\.toml$",
+        "^Cargo\\.lock$",
+        "^build\\.rs$",
+        "^deny\\.toml$"
+      ],
+      "risk": "high",
+      "required_checks": [
+        {
+          "name": "Code Style (fmt + clippy)",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        },
+        {
+          "name": "Regression test enforcement",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        }
+      ]
+    },
+    {
+      "base_branch": "reborn-matrix-pilot",
+      "paths": [
+        "^\\.github/[^\\x00\\r\\n]{1,4000}$",
+        "^crates/[^\\x00\\r\\n]{1,4000}$",
+        "^migrations/[^\\x00\\r\\n]{1,4000}$",
+        "^deny\\.toml$"
+      ],
+      "risk": "critical",
+      "required_checks": [
+        {
+          "name": "Code Style (fmt + clippy)",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        },
+        {
+          "name": "Regression test enforcement",
+          "app_id": 15368,
+          "app_slug": "github-actions"
+        }
+      ]
+    }
+  ]
+}
