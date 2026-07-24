@@ -227,10 +227,35 @@ class WorkflowContractTests(unittest.TestCase):
     def test_pull_request_concurrency_is_number_specific_and_update_stable(self) -> None:
         concurrency = extract_indented_block(self.workflow, "concurrency", 0)
         self.assertIn(
-            "github.event.pull_request.number || github.head_ref || github.ref",
+            "inputs.ref || github.event.pull_request.number || github.head_ref || github.ref",
             concurrency,
         )
         self.assertNotIn("github.sha", concurrency)
+
+    def test_crate_buckets_install_wasip2_target_and_pinned_wasm_tools(self) -> None:
+        crate_tests = extract_indented_block(self.workflow, "crate-tests", 2)
+        self.assertRegex(
+            crate_tests,
+            (
+                r"(?ms)^      - name: Install Rust\n"
+                r"        uses: dtolnay/rust-toolchain@"
+                r"29eef336d9b2848a0b548edc03f92a220660cdb8 # stable\n"
+                r"        with:\n"
+                r"          components: llvm-tools-preview\n"
+                r"          targets: wasm32-wasip2$"
+            ),
+        )
+        self.assertRegex(
+            crate_tests,
+            (
+                r"(?ms)^      - name: Install wasm-tools\n"
+                r"        uses: taiki-e/install-action@"
+                r"62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2\n"
+                r"        with:\n"
+                r"          tool: wasm-tools@1\.246\.2\n"
+                r"          checksum: true$"
+            ),
+        )
 
     def test_aggregate_extraction_stops_at_next_job(self) -> None:
         mutated = (
