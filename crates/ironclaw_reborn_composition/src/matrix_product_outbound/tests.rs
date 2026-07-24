@@ -180,13 +180,84 @@ async fn matrix_read_existing_refuses_installation_missing_from_existing_source_
 
     assert!(
         installation.is_none(),
-        "prepared publication must remain fail-closed when the source entry is absent"
+        "the test-only ReadExisting mode must remain fail-closed when the source entry is absent"
+    );
+}
+
+#[tokio::test]
+async fn matrix_reconcile_publishes_runtime_projection_without_rewriting_existing_source_absence() {
+    let fixture = matrix_existing_empty_source_cache_fixture().await;
+    fixture
+        .refresher
+        .refresh_after_lifecycle_activation(
+            &fixture.scope,
+            &ExtensionId::new("matrix-product-adapter").expect("extension id"),
+        )
+        .await
+        .expect("reconcile and publish runtime projection");
+
+    let projection_source = FilesystemMatrixPolicySnapshotSource::new(
+        crate::wrap_scoped(fixture.backend.clone()),
+        matrix_policy_projection_resource_scope_for_provider(&fixture.scope, &fixture.provider),
+        matrix_policy_projection_cache_path_for_provider(&fixture.provider)
+            .expect("projection path"),
+    );
+    projection_source
+        .resolve_matrix_policy_snapshot(
+            &ProductAdapterId::new("matrix-product-adapter/inbound").expect("adapter"),
+            &fixture.provider.installation_id,
+        )
+        .await
+        .expect("committed runtime projection resolves");
+
+    let source_entry = crate::wrap_scoped(fixture.backend)
+        .get(
+            &matrix_policy_projection_resource_scope_for_provider(
+                &fixture.scope,
+                &fixture.provider,
+            ),
+            &matrix_policy_source_cache_path_for_provider(&fixture.provider).expect("source path"),
+        )
+        .await
+        .expect("source cache lookup")
+        .expect("existing source cache");
+    let source_cache = MatrixInstallationProjectionCache::from_json_bytes(&source_entry.entry.body)
+        .expect("source cache");
+    assert!(
+        source_cache
+            .installation(&fixture.provider.installation_id)
+            .is_none(),
+        "runtime projection publication must preserve the existing source-owned absence"
     );
 }
 
 async fn matrix_installation_from_existing_empty_source_cache(
     source_mode: MatrixPolicySourceCacheMode,
 ) -> Option<MatrixProductAdapterInstallation> {
+    let fixture = matrix_existing_empty_source_cache_fixture().await;
+
+    fixture
+        .refresher
+        .matrix_installation_for_provider(
+            &fixture.scope,
+            &fixture.entry,
+            &fixture.provider,
+            std::slice::from_ref(&fixture.provider),
+            source_mode,
+        )
+        .await
+        .expect("resolve Matrix installation")
+}
+
+struct MatrixExistingEmptySourceCacheFixture {
+    backend: Arc<InMemoryBackend>,
+    refresher: MatrixLifecyclePolicyProjectionCacheRefresher,
+    scope: ResourceScope,
+    provider: MatrixOutboundTargetProviderConfig,
+    entry: ProductAdapterRuntimeEntry,
+}
+
+async fn matrix_existing_empty_source_cache_fixture() -> MatrixExistingEmptySourceCacheFixture {
     let store = Arc::new(InMemoryExtensionInstallationStore::default());
     seed_enabled_matrix_runtime_entry(store.as_ref()).await;
     let backend = Arc::new(InMemoryBackend::default());
@@ -205,7 +276,7 @@ async fn matrix_installation_from_existing_empty_source_cache(
         }],
     };
     let refresher = MatrixLifecyclePolicyProjectionCacheRefresher::new(
-        backend,
+        backend.clone(),
         store.clone(),
         vec![provider.clone()],
         matrix_source_backed_artifact_evidence(),
@@ -231,16 +302,13 @@ async fn matrix_installation_from_existing_empty_source_cache(
         .next()
         .expect("enabled runtime entry");
 
-    refresher
-        .matrix_installation_for_provider(
-            &scope,
-            &entry,
-            &provider,
-            std::slice::from_ref(&provider),
-            source_mode,
-        )
-        .await
-        .expect("resolve Matrix installation")
+    MatrixExistingEmptySourceCacheFixture {
+        backend,
+        refresher,
+        scope,
+        provider,
+        entry,
+    }
 }
 
 #[tokio::test]
