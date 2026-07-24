@@ -291,112 +291,138 @@ async fn reborn_trace_http_save_first_party_tool_parity() {
     harness.shutdown().await;
 }
 
-#[tokio::test]
-async fn reborn_trace_skill_management_first_party_tools_parity() {
-    let skill_install =
-        CapabilityId::new(SKILL_INSTALL_CAPABILITY_ID).expect("valid capability id");
-    let skill_list = CapabilityId::new(SKILL_LIST_CAPABILITY_ID).expect("valid capability id");
-    let skill_remove = CapabilityId::new(SKILL_REMOVE_CAPABILITY_ID).expect("valid capability id");
-    let skill_content = skill_md(SKILL_NAME, "Reborn skill management e2e");
-    let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
-        RebornModelReplayStep::ProviderToolCalls {
-            calls: vec![RebornScriptedProviderToolCall::new(
-                skill_install.clone(),
-                "call_skill_install_first_party",
-                serde_json::json!({
-                    "name": SKILL_NAME,
-                    "content": skill_content,
-                }),
-            )],
-            expected_tool_results: Vec::new(),
-        },
-        RebornModelReplayStep::ProviderToolCalls {
-            calls: vec![RebornScriptedProviderToolCall::new(
-                skill_list.clone(),
-                "call_skill_list_after_install",
-                serde_json::json!({}),
-            )],
-            expected_tool_results: Vec::new(),
-        },
-        RebornModelReplayStep::ProviderToolCalls {
-            calls: vec![RebornScriptedProviderToolCall::new(
-                skill_remove.clone(),
-                "call_skill_remove_first_party",
-                serde_json::json!({"name": SKILL_NAME}),
-            )],
-            expected_tool_results: Vec::new(),
-        },
-        RebornModelReplayStep::ProviderToolCalls {
-            calls: vec![RebornScriptedProviderToolCall::new(
-                skill_list.clone(),
-                "call_skill_list_after_remove",
-                serde_json::json!({}),
-            )],
-            expected_tool_results: Vec::new(),
-        },
-        RebornModelReplayStep::Response {
-            response: HostManagedModelResponse::assistant_reply(
-                "skill management tools trace complete",
-            ),
-            expected_tool_results: Vec::new(),
-        },
-    ]);
-    let mut harness = RebornBinaryE2EHarness::with_host_runtime_skill_management_capabilities(
-        "room-trace-skill-management-first-party-tools",
-        model_gateway,
-    )
-    .await
-    .expect("harness");
-    harness.start();
+#[test]
+fn reborn_trace_skill_management_first_party_tools_parity() {
+    let handle = std::thread::Builder::new()
+        .name("reborn_trace_skill_management_first_party_tools_parity".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio test runtime")
+                .block_on(async {
+                    let skill_install = CapabilityId::new(SKILL_INSTALL_CAPABILITY_ID)
+                        .expect("valid capability id");
+                    let skill_list =
+                        CapabilityId::new(SKILL_LIST_CAPABILITY_ID).expect("valid capability id");
+                    let skill_remove =
+                        CapabilityId::new(SKILL_REMOVE_CAPABILITY_ID).expect("valid capability id");
+                    let skill_content = skill_md(SKILL_NAME, "Reborn skill management e2e");
+                    let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
+                        RebornModelReplayStep::ProviderToolCalls {
+                            calls: vec![RebornScriptedProviderToolCall::new(
+                                skill_install.clone(),
+                                "call_skill_install_first_party",
+                                serde_json::json!({
+                                    "name": SKILL_NAME,
+                                    "content": skill_content,
+                                }),
+                            )],
+                            expected_tool_results: Vec::new(),
+                        },
+                        RebornModelReplayStep::ProviderToolCalls {
+                            calls: vec![RebornScriptedProviderToolCall::new(
+                                skill_list.clone(),
+                                "call_skill_list_after_install",
+                                serde_json::json!({}),
+                            )],
+                            expected_tool_results: Vec::new(),
+                        },
+                        RebornModelReplayStep::ProviderToolCalls {
+                            calls: vec![RebornScriptedProviderToolCall::new(
+                                skill_remove.clone(),
+                                "call_skill_remove_first_party",
+                                serde_json::json!({"name": SKILL_NAME}),
+                            )],
+                            expected_tool_results: Vec::new(),
+                        },
+                        RebornModelReplayStep::ProviderToolCalls {
+                            calls: vec![RebornScriptedProviderToolCall::new(
+                                skill_list.clone(),
+                                "call_skill_list_after_remove",
+                                serde_json::json!({}),
+                            )],
+                            expected_tool_results: Vec::new(),
+                        },
+                        RebornModelReplayStep::Response {
+                            response: HostManagedModelResponse::assistant_reply(
+                                "skill management tools trace complete",
+                            ),
+                            expected_tool_results: Vec::new(),
+                        },
+                    ]);
+                    let mut harness =
+                        RebornBinaryE2EHarness::with_host_runtime_skill_management_capabilities(
+                            "room-trace-skill-management-first-party-tools",
+                            model_gateway,
+                        )
+                        .await
+                        .expect("harness");
+                    harness.start();
 
-    let submitted = harness
-        .submit_text(
-            "event-trace-skill-management-first-party-tools",
-            "exercise skill management first-party tools",
-        )
-        .await
-        .expect("submit text");
-    harness
-        .wait_for_status_with_config(submitted.run_id, TurnStatus::Completed, reborn_e2e_wait())
-        .await
-        .expect("completed run");
-    harness
-        .assert_final_reply("skill management tools trace complete")
-        .await
-        .expect("final reply");
+                    let submitted = harness
+                        .submit_text(
+                            "event-trace-skill-management-first-party-tools",
+                            "exercise skill management first-party tools",
+                        )
+                        .await
+                        .expect("submit text");
+                    harness
+                        .wait_for_status_with_config(
+                            submitted.run_id,
+                            TurnStatus::Completed,
+                            reborn_e2e_wait(),
+                        )
+                        .await
+                        .expect("completed run");
+                    harness
+                        .assert_final_reply("skill management tools trace complete")
+                        .await
+                        .expect("final reply");
 
-    let invocations = harness.capability_invocations();
-    assert_eq!(invocations.len(), 4);
-    assert_eq!(invocations[0].capability_id, skill_install);
-    assert_eq!(invocations[1].capability_id, skill_list);
-    assert_eq!(invocations[2].capability_id, skill_remove);
-    assert_eq!(invocations[3].capability_id, skill_list);
+                    let invocations = harness.capability_invocations();
+                    assert_eq!(invocations.len(), 4);
+                    assert_eq!(invocations[0].capability_id, skill_install);
+                    assert_eq!(invocations[1].capability_id, skill_list);
+                    assert_eq!(invocations[2].capability_id, skill_remove);
+                    assert_eq!(invocations[3].capability_id, skill_list);
 
-    let results = harness.capability_results();
-    assert_eq!(results.len(), 4);
-    assert_eq!(results[0].capability_id, skill_install);
-    assert_eq!(results[0].output["installed"], serde_json::json!(true));
-    assert_eq!(results[0].output["name"], serde_json::json!(SKILL_NAME));
-    assert_skill_list_contains(&results[1].output, SKILL_NAME);
-    assert_eq!(results[2].capability_id, skill_remove);
-    assert_eq!(results[2].output["removed"], serde_json::json!(true));
-    assert_eq!(results[2].output["name"], serde_json::json!(SKILL_NAME));
-    assert_skill_list_excludes(&results[3].output, SKILL_NAME);
+                    let results = harness.capability_results();
+                    assert_eq!(results.len(), 4);
+                    assert_eq!(results[0].capability_id, skill_install);
+                    assert_eq!(results[0].output["installed"], serde_json::json!(true));
+                    assert_eq!(results[0].output["name"], serde_json::json!(SKILL_NAME));
+                    assert_skill_list_contains(&results[1].output, SKILL_NAME);
+                    assert_eq!(results[2].capability_id, skill_remove);
+                    assert_eq!(results[2].output["removed"], serde_json::json!(true));
+                    assert_eq!(results[2].output["name"], serde_json::json!(SKILL_NAME));
+                    assert_skill_list_excludes(&results[3].output, SKILL_NAME);
 
-    let requests = harness.model_requests();
-    assert_eq!(requests.len(), 5);
-    assert_eq!(tool_result_count(&requests[1]), 1);
-    assert_eq!(tool_result_count(&requests[2]), 2);
-    assert_eq!(tool_result_count(&requests[3]), 3);
-    assert_eq!(tool_result_count(&requests[4]), 4);
-    assert_milestone_order(
-        &harness.milestones(),
-        |kind| matches!(kind, LoopHostMilestoneKind::CapabilityBatchCompleted { .. }),
-        |kind| matches!(kind, LoopHostMilestoneKind::AssistantReplyFinalized { .. }),
-    );
-    harness.assert_model_exhausted();
+                    let requests = harness.model_requests();
+                    assert_eq!(requests.len(), 5);
+                    assert_eq!(tool_result_count(&requests[1]), 1);
+                    assert_eq!(tool_result_count(&requests[2]), 2);
+                    assert_eq!(tool_result_count(&requests[3]), 3);
+                    assert_eq!(tool_result_count(&requests[4]), 4);
+                    assert_milestone_order(
+                        &harness.milestones(),
+                        |kind| {
+                            matches!(kind, LoopHostMilestoneKind::CapabilityBatchCompleted { .. })
+                        },
+                        |kind| {
+                            matches!(kind, LoopHostMilestoneKind::AssistantReplyFinalized { .. })
+                        },
+                    );
+                    harness.assert_model_exhausted();
 
-    harness.shutdown().await;
+                    harness.shutdown().await;
+                });
+        })
+        .expect("spawn stack-sized test thread");
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]
