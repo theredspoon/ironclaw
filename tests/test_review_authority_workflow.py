@@ -24,6 +24,7 @@ class ReviewAuthorityWorkflowTest(unittest.TestCase):
             r"(?ms)^  pull_request_target:\s*\n    branches:\s*\n      - reborn-matrix-pilot\s*$",
         )
         self.assertNotRegex(self.workflow, r"(?m)^  pull_request:\s*$")
+        self.assertRegex(self.workflow, r"(?m)^      - edited\s*$")
 
     def test_has_minimum_read_only_permissions_and_stable_job_name(self) -> None:
         self.assertRegex(
@@ -58,9 +59,17 @@ class ReviewAuthorityWorkflowTest(unittest.TestCase):
         self.assertIn(
             "PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}", self.workflow
         )
+        self.assertIn(
+            "PR_BASE_REF: ${{ github.event.pull_request.base.ref }}", self.workflow
+        )
+        self.assertIn(
+            "PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}", self.workflow
+        )
         self.assertIn('--repository "$GITHUB_REPOSITORY"', self.workflow)
         self.assertIn('--pr "$PR_NUMBER"', self.workflow)
         self.assertIn('--expected-head "$PR_HEAD_SHA"', self.workflow)
+        self.assertIn('--expected-base-ref "$PR_BASE_REF"', self.workflow)
+        self.assertIn('--expected-base-sha "$PR_BASE_SHA"', self.workflow)
         self.assertIn("--allow-policy-change", self.workflow)
         self.assertIn("--protected-path deny.toml", self.workflow)
         self.assertIn(
@@ -103,6 +112,7 @@ class ReviewAuthorityWorkflowTest(unittest.TestCase):
         self.assertIn("Review Authority", normalized)
         self.assertIn("pull_request_target", normalized)
         self.assertIn("reborn-matrix-pilot", normalized)
+        self.assertIn("exact base branch and base commit", normalized)
         self.assertIn("never checks out or executes pull request code", normalized)
 
 

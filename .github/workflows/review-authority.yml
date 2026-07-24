@@ -9,6 +9,7 @@ on:
       - reopened
       - synchronize
       - ready_for_review
+      - edited
 
 permissions:
   contents: read
@@ -39,6 +40,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           uv run --frozen --project lighthouse-tools \
@@ -46,6 +49,8 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --pr "$PR_NUMBER" \
             --expected-head "$PR_HEAD_SHA" \
+            --expected-base-ref "$PR_BASE_REF" \
+            --expected-base-sha "$PR_BASE_SHA" \
             --schema lighthouse-tools/schemas/required-check-policy.schema.json \
             --allow-policy-change \
             --protected-path deny.toml \

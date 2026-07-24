@@ -23,9 +23,11 @@ review.
 
 The job checks out one exact, reviewed Lighthouse commit and runs its
 deterministic review-authority guard. It passes the repository, pull request
-number, and exact head commit as quoted data. The guard reads changed paths and
-the candidate required-check policy through the GitHub API. The job never
-checks out or executes pull request code.
+number, exact head commit, exact base branch and base commit as quoted data.
+The guard reads changed paths and the candidate required-check policy through
+the GitHub API. The job never checks out or executes pull request code. An
+`edited` pull request event reruns the job so changing the target branch cannot
+reuse a verdict bound to the previous base.
 
 The guard rejects changes to GitHub workflow and review-authority paths, and
 this repository additionally protects `deny.toml`. An added or modified
