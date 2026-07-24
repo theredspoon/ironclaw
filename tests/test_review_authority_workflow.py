@@ -37,6 +37,22 @@ class ReviewAuthorityWorkflowTest(unittest.TestCase):
         )
         self.assertRegex(self.workflow, r"(?m)^    name: Review Authority\s*$")
 
+    def test_job_is_guarded_to_the_expected_repository_and_pilot_base(self) -> None:
+        job = re.search(
+            r"(?ms)^  review-authority:\s*\n(?P<body>.*?)^    runs-on:",
+            self.workflow,
+        )
+        self.assertIsNotNone(job)
+        body = job.group("body")
+        self.assertIn(
+            "github.repository == 'theredspoon/ironclaw'",
+            body,
+        )
+        self.assertIn(
+            "github.event.pull_request.base.ref == 'reborn-matrix-pilot'",
+            body,
+        )
+
     def test_checks_out_only_trusted_lighthouse_at_an_exact_commit(self) -> None:
         checkout_blocks = re.findall(
             r"(?ms)^\s+- name: .*?\n\s+uses: actions/checkout@[^\n]+\n"
