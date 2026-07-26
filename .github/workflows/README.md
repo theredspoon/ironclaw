@@ -69,13 +69,6 @@ proves the pull request is documentation only or outside Reborn test scope.
 Failed, cancelled, missing, unexpectedly skipped, and unknown constituent
 results fail closed.
 
-The pilot's separate base-controlled `Review Authority` check cannot be
-installed by a pull request that targets `reborn-matrix-pilot`. GitHub loads
-`pull_request_target` workflow code from this repository's default branch,
-`ci-automation`. That guard is therefore a separate default-branch
-prerequisite; do not add a pilot-only copy that would look authoritative but
-never run.
-
 ## Deep tier (nightly)
 
 `nightly-deep-ci.yml` (04:00 UTC) reuses `platform-and-compat.yml`,
