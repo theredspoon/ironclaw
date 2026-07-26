@@ -13,7 +13,9 @@ for entry in "${components[@]}"; do
   artifact="${entry#*:}"
 
   echo "Building ProductAdapter component: ${package}"
-  cargo rustc \
+  # This wrapper owns the wasm32-wasip2 rustc flags, so it deliberately does
+  # not inherit generic host Rust flags such as coverage instrumentation.
+  env -u CARGO_ENCODED_RUSTFLAGS -u RUSTFLAGS cargo rustc \
     -p "$package" \
     --release \
     --target wasm32-wasip2 \

@@ -163,6 +163,29 @@ fn final_reply(text: &str) -> ProductOutboundPayload {
 }
 
 #[test]
+fn component_build_ignores_host_coverage_flags() {
+    let root = workspace_root();
+    let coverage_flags = [
+        ("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}instrument-coverage"),
+        ("RUSTFLAGS", "-C instrument-coverage"),
+    ];
+
+    for (variable, value) in coverage_flags {
+        let status = Command::new("./scripts/build-product-adapter-components.sh")
+            .current_dir(&root)
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTFLAGS")
+            .env(variable, value)
+            .status()
+            .unwrap_or_else(|error| panic!("spawn component build for {variable}: {error}"));
+        assert!(
+            status.success(),
+            "component build inherited {variable}: {status}"
+        );
+    }
+}
+
+#[test]
 fn matrix_component_manifest_loads_with_host_validated_contract() {
     let (_runtime, prepared) = prepared_component();
     let manifest = prepared.manifest();
