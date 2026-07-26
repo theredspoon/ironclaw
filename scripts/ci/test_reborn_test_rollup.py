@@ -224,6 +224,20 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("    if: always()", aggregate)
         self.assertIn("scripts/ci/check_reborn_test_rollup.py", aggregate)
 
+    def test_rollup_checks_out_the_requested_ref_before_running_checker(self) -> None:
+        aggregate = extract_indented_block(self.workflow, "reborn-tests", 2)
+        self.assertRegex(
+            aggregate,
+            (
+                r"(?ms)^      - name: Checkout repository\n"
+                r"        uses: actions/checkout@"
+                r"de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6\n"
+                r"        with:\n"
+                r"          ref: \$\{\{ inputs\.ref \|\| github\.sha \}\}\n"
+                r"          persist-credentials: false$"
+            ),
+        )
+
     def test_pull_request_concurrency_is_number_specific_and_update_stable(self) -> None:
         concurrency = extract_indented_block(self.workflow, "concurrency", 0)
         self.assertIn(
