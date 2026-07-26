@@ -2590,7 +2590,7 @@ fn forged_route_grant_fails_before_delivery_port() {
     let error = validate_matrix_route_grant(&command(), route, &forged_grant)
         .expect_err("forged grant must fail");
 
-    assert_eq!(error.reason, DeliveryReasonCode::StalePolicyRevision);
+    assert_eq!(error.reason, DeliveryReasonCode::UnauthorizedTarget);
 }
 
 #[test]

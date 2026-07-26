@@ -521,6 +521,13 @@ async fn local_dev_runtime_registers_private_matrix_outbound_target_provider_at_
         )
         .with_local_dev_confirmed_host_home_root(host_home),
     )
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-target-owner",
+        )
+        .expect("Matrix policy projection cache config"),
+    )
     .with_matrix_outbound_target_mount(MatrixOutboundTargetMountConfig::new(
         MatrixOutboundTargetMountConfigInput {
             tenant_id: tenant_id.clone(),
@@ -576,6 +583,13 @@ async fn local_dev_runtime_accepts_multiple_matrix_outbound_installations() {
             crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
         )
         .with_local_dev_confirmed_host_home_root(host_home),
+    )
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-multi-install-owner",
+        )
+        .expect("Matrix policy projection cache config"),
     )
     .with_matrix_outbound_target_mounts([
         MatrixOutboundTargetMountConfig::new(MatrixOutboundTargetMountConfigInput {
@@ -1698,6 +1712,13 @@ async fn local_dev_runtime_rejects_duplicate_matrix_outbound_target_provider_sco
             crate::local_dev_yolo_runtime_policy(true).expect("local-yolo policy resolves"),
         )
         .with_local_dev_confirmed_host_home_root(host_home),
+    )
+    .with_matrix_policy_projection_cache(
+        crate::MatrixPolicyProjectionCacheConfig::new(
+            runtime_matrix_artifact_evidence(),
+            "runtime-matrix-duplicate-owner",
+        )
+        .expect("Matrix policy projection cache config"),
     )
     .with_matrix_outbound_target_mounts([duplicate_config.clone(), duplicate_config]);
 
