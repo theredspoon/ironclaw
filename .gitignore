@@ -15,4 +15,3 @@
 !/.github/workflows/
 !/.github/workflows/sync-upstream.yml
 !/.github/workflows/mirror-to-deployment-target.yml
-!/.github/workflows/auto-ff-matrix-pilot-sync.yml
