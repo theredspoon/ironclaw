@@ -68,6 +68,10 @@ mod local_dev_boot;
 mod local_dev_capability_io;
 mod oauth_product_auth;
 mod outbound_delivery;
+#[cfg(all(
+    feature = "test-support",
+    any(feature = "libsql", feature = "postgres")
+))]
 mod production_runtime;
 mod project_create;
 mod projection;

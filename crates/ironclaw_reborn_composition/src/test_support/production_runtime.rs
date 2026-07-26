@@ -16,10 +16,12 @@ use ironclaw_turns::TurnScope;
 /// [`crate::RebornBuildInput::with_matrix_retry_production_config`]. Integration
 /// tests use this helper instead of duplicating crate-private configuration
 /// details.
-#[cfg(all(
-    feature = "test-support",
-    any(feature = "libsql", feature = "postgres")
-))]
+///
+/// The worker is owned by [`crate::RebornRuntime`] and stopped by
+/// [`crate::RebornRuntime::shutdown`]. Its first tick scans the isolated,
+/// newly-created fixture store for due retry schedules before attempting any
+/// delivery. Callers must use a fresh fixture store so the configured
+/// `.invalid` endpoint can never be reached by inherited retry work.
 pub fn with_production_matrix_retry_worker_for_test(
     input: crate::RebornBuildInput,
     fixture_id: &str,
@@ -42,7 +44,7 @@ pub fn with_production_matrix_retry_worker_for_test(
                 max_entries_per_scope: 1,
             },
             scopes: vec![scope],
-            homeserver_origin: "https://matrix.example".to_string(),
+            homeserver_origin: "https://matrix.invalid".to_string(),
             credential_secret: SecretHandle::new("matrix_access_token")
                 .expect("valid Matrix credential secret"),
             credential_handle_fingerprint: format!(

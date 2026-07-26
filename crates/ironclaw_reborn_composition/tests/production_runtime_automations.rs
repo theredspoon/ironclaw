@@ -63,6 +63,9 @@ impl SandboxCommandTransport for RecordingSandboxTransport {
 /// instead of a 503 ServiceUnavailable error.
 #[tokio::test]
 async fn production_runtime_webui_serves_automations_without_local_runtime() {
+    // The fresh database is also the Matrix retry worker's isolated durable
+    // store. Its first tick finds no retry schedules, so this readiness fixture
+    // cannot attempt HTTP delivery to its reserved `.invalid` endpoint.
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Arc::new(
         libsql::Builder::new_local(dir.path().join("reborn.db"))
