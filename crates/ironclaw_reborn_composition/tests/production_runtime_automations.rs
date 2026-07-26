@@ -31,7 +31,7 @@ use ironclaw_product_workflow::{WebUiAuthenticatedCaller, WebUiListAutomationsRe
 use ironclaw_reborn_composition::{
     RebornBuildInput, RebornCompositionProfile, RebornRuntimeIdentity, RebornRuntimeInput,
     RebornRuntimeProcessBinding, build_reborn_runtime, build_webui_services,
-    builtin_first_party_trust_policy,
+    builtin_first_party_trust_policy, test_support::with_production_matrix_retry_worker_for_test,
 };
 
 // ─── minimal sandbox transport stub ──────────────────────────────────────────
@@ -71,7 +71,7 @@ async fn production_runtime_webui_serves_automations_without_local_runtime() {
             .expect("libsql db"),
     );
 
-    let input = RebornRuntimeInput::from_services(
+    let input = RebornRuntimeInput::from_services(with_production_matrix_retry_worker_for_test(
         RebornBuildInput::libsql(
             RebornCompositionProfile::Production,
             "runtime-automation-prod-owner",
@@ -97,7 +97,8 @@ async fn production_runtime_webui_serves_automations_without_local_runtime() {
         .with_runtime_process_binding(RebornRuntimeProcessBinding::tenant_sandbox(Arc::new(
             TenantSandboxProcessPort::new(Arc::new(RecordingSandboxTransport)),
         ))),
-    )
+        "production-runtime-automations",
+    ))
     .with_identity(RebornRuntimeIdentity {
         tenant_id: "runtime-automation-prod-tenant".to_string(),
         agent_id: "runtime-automation-prod-agent".to_string(),

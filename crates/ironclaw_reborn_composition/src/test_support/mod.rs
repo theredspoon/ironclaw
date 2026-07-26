@@ -68,6 +68,7 @@ mod local_dev_boot;
 mod local_dev_capability_io;
 mod oauth_product_auth;
 mod outbound_delivery;
+mod production_runtime;
 mod project_create;
 mod projection;
 mod refreshing_capability_port;
@@ -113,6 +114,11 @@ pub use oauth_product_auth::{
 pub use outbound_delivery::{
     OUTBOUND_DELIVERY_TARGET_SET_CAPABILITY_ID, OUTBOUND_DELIVERY_TARGETS_LIST_CAPABILITY_ID,
 };
+#[cfg(all(
+    feature = "test-support",
+    any(feature = "libsql", feature = "postgres")
+))]
+pub use production_runtime::with_production_matrix_retry_worker_for_test;
 #[cfg(feature = "test-support")]
 pub use project_create::PROJECT_CREATE_CAPABILITY_ID;
 #[cfg(feature = "test-support")]
