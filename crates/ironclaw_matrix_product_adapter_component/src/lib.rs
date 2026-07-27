@@ -10,6 +10,10 @@ mod limits;
 mod manifest;
 mod outbound;
 
+pub const fn should_launch_nested_llvm_cov(already_under_llvm_cov: bool) -> bool {
+    !already_under_llvm_cov
+}
+
 struct MatrixProductAdapterComponent;
 
 impl exports::near::product_adapter::product_adapter::Guest for MatrixProductAdapterComponent {
