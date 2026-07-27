@@ -245,6 +245,7 @@ jobs:
           scripts/ci/test-check-hermetic-env.sh
           scripts/ci/test-classify-test-scope.sh
           scripts/ci/test-package-feature-flags.sh
+          python3 scripts/ci/test_reborn_test_rollup.py
           bash .github/scripts/test-pr-labeler.sh
 
   clippy:

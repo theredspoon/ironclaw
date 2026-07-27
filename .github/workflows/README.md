@@ -59,6 +59,16 @@ Rules for a roll-up job that is (or may become) required:
    merge-queue/push run's clippy matrix is missing any of the three feature
    lanes, so a "green but slim" regression cannot come back silently.
 
+## `reborn-matrix-pilot` test roll-up
+
+`Tests (Reborn)` also runs for pull requests targeting
+`reborn-matrix-pilot`. Its always-running aggregate delegates to
+`scripts/ci/check_reborn_test_rollup.py`: all in-scope constituent jobs must
+succeed, while `skipped` is accepted only after successful scope detection
+proves the pull request is documentation only or outside Reborn test scope.
+Failed, cancelled, missing, unexpectedly skipped, and unknown constituent
+results fail closed.
+
 ## Deep tier (nightly)
 
 `nightly-deep-ci.yml` (04:00 UTC) reuses `platform-and-compat.yml`,
