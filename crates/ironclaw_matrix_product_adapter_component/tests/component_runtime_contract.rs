@@ -25,6 +25,16 @@ const MATRIX_CREDENTIAL_HANDLE: &str = "matrix-access-token";
 
 static COMPONENT_ARTIFACT: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(unix)]
+struct WrapperFixtureDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for WrapperFixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -164,7 +174,38 @@ fn final_reply(text: &str) -> ProductOutboundPayload {
 
 #[test]
 fn component_build_ignores_host_coverage_flags() {
+    const CHILD_RUN: &str = "IRONCLAW_HOST_COVERAGE_ISOLATION_CHILD";
+
     let root = workspace_root();
+    if std::env::var_os(CHILD_RUN).is_none() {
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "llvm-cov",
+                "--no-report",
+                "-p",
+                "ironclaw_matrix_product_adapter_component",
+                "--test",
+                "component_runtime_contract",
+                "--",
+                "component_build_ignores_host_coverage_flags",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_RUN, "1")
+            .status()
+            .expect("run host coverage isolation under cargo llvm-cov");
+        assert!(
+            status.success(),
+            "host coverage isolation failed under cargo llvm-cov: {status}"
+        );
+        return;
+    }
+
+    assert!(
+        std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER").is_some(),
+        "coverage-isolation child must run under cargo llvm-cov"
+    );
     let status = Command::new("./scripts/build-product-adapter-components.sh")
         .current_dir(&root)
         .status()
@@ -186,11 +227,12 @@ fn component_build_preserves_preexisting_rustc_wrapper_without_coverage() {
 
     let root = workspace_root();
     if std::env::var_os(CHILD_RUN).is_none() {
-        let fixture_dir =
+        let fixture_path =
             std::env::temp_dir().join(format!("ironclaw-rustc-wrapper-{}", std::process::id()));
-        std::fs::create_dir_all(&fixture_dir).expect("create wrapper fixture directory");
-        let wrapper = fixture_dir.join("rustc-wrapper");
-        let log = fixture_dir.join("rustc-wrapper.log");
+        std::fs::create_dir_all(&fixture_path).expect("create wrapper fixture directory");
+        let fixture_dir = WrapperFixtureDir(fixture_path.clone());
+        let wrapper = fixture_path.join("rustc-wrapper");
+        let log = fixture_path.join("rustc-wrapper.log");
         std::fs::write(
             &wrapper,
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$IRONCLAW_PREEXISTING_WRAPPER_LOG\"\nexec /usr/bin/env \"$@\"\n",
@@ -225,6 +267,11 @@ fn component_build_preserves_preexisting_rustc_wrapper_without_coverage() {
         assert!(
             status.success(),
             "nested wrapper regression failed under cargo llvm-cov: {status}"
+        );
+        drop(fixture_dir);
+        assert!(
+            !fixture_path.exists(),
+            "wrapper fixture directory and log must be removed after the nested coverage run"
         );
         return;
     }
