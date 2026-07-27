@@ -25,6 +25,16 @@ const MATRIX_CREDENTIAL_HANDLE: &str = "matrix-access-token";
 
 static COMPONENT_ARTIFACT: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(unix)]
+struct WrapperFixtureDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for WrapperFixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -164,25 +174,135 @@ fn final_reply(text: &str) -> ProductOutboundPayload {
 
 #[test]
 fn component_build_ignores_host_coverage_flags() {
-    let root = workspace_root();
-    let coverage_flags = [
-        ("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}instrument-coverage"),
-        ("RUSTFLAGS", "-C instrument-coverage"),
-    ];
+    const CHILD_RUN: &str = "IRONCLAW_HOST_COVERAGE_ISOLATION_CHILD";
 
-    for (variable, value) in coverage_flags {
-        let status = Command::new("./scripts/build-product-adapter-components.sh")
+    let root = workspace_root();
+    if std::env::var_os(CHILD_RUN).is_none() {
+        let status = Command::new("cargo")
             .current_dir(&root)
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("RUSTFLAGS")
-            .env(variable, value)
+            .args([
+                "llvm-cov",
+                "--no-report",
+                "-p",
+                "ironclaw_matrix_product_adapter_component",
+                "--test",
+                "component_runtime_contract",
+                "--",
+                "component_build_ignores_host_coverage_flags",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_RUN, "1")
             .status()
-            .unwrap_or_else(|error| panic!("spawn component build for {variable}: {error}"));
+            .expect("run host coverage isolation under cargo llvm-cov");
         assert!(
             status.success(),
-            "component build inherited {variable}: {status}"
+            "host coverage isolation failed under cargo llvm-cov: {status}"
         );
+        return;
     }
+
+    assert!(
+        std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER").is_some(),
+        "coverage-isolation child must run under cargo llvm-cov"
+    );
+    let status = Command::new("./scripts/build-product-adapter-components.sh")
+        .current_dir(&root)
+        .status()
+        .expect("spawn component build");
+    assert!(
+        status.success(),
+        "component build inherited host compiler instrumentation: {status}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn component_build_preserves_preexisting_rustc_wrapper_without_coverage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const CHILD_RUN: &str = "IRONCLAW_PREEXISTING_WRAPPER_CHILD";
+    const WRAPPER_PATH: &str = "IRONCLAW_PREEXISTING_WRAPPER_PATH";
+    const WRAPPER_LOG: &str = "IRONCLAW_PREEXISTING_WRAPPER_LOG";
+
+    let root = workspace_root();
+    if std::env::var_os(CHILD_RUN).is_none() {
+        let fixture_path =
+            std::env::temp_dir().join(format!("ironclaw-rustc-wrapper-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture_path).expect("create wrapper fixture directory");
+        let fixture_dir = WrapperFixtureDir(fixture_path.clone());
+        let wrapper = fixture_path.join("rustc-wrapper");
+        let log = fixture_path.join("rustc-wrapper.log");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$IRONCLAW_PREEXISTING_WRAPPER_LOG\"\nexec /usr/bin/env \"$@\"\n",
+        )
+        .expect("write rustc wrapper");
+        let mut permissions = std::fs::metadata(&wrapper)
+            .expect("read wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&wrapper, permissions).expect("make rustc wrapper executable");
+
+        let status = Command::new("cargo")
+            .current_dir(&root)
+            .args([
+                "llvm-cov",
+                "--no-report",
+                "-p",
+                "ironclaw_matrix_product_adapter_component",
+                "--test",
+                "component_runtime_contract",
+                "--",
+                "component_build_preserves_preexisting_rustc_wrapper_without_coverage",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RUSTC_WRAPPER", &wrapper)
+            .env(CHILD_RUN, "1")
+            .env(WRAPPER_PATH, &wrapper)
+            .env(WRAPPER_LOG, &log)
+            .status()
+            .expect("run wrapper regression under cargo llvm-cov");
+        assert!(
+            status.success(),
+            "nested wrapper regression failed under cargo llvm-cov: {status}"
+        );
+        drop(fixture_dir);
+        assert!(
+            !fixture_path.exists(),
+            "wrapper fixture directory and log must be removed after the nested coverage run"
+        );
+        return;
+    }
+
+    let wrapper = std::env::var(WRAPPER_PATH).expect("wrapper path");
+    let log = PathBuf::from(std::env::var(WRAPPER_LOG).expect("wrapper log"));
+    let recorded_wrapper = std::env::var("__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING")
+        .expect("cargo llvm-cov pre-existing wrapper binding");
+    assert_eq!(
+        recorded_wrapper, wrapper,
+        "cargo llvm-cov must expose the wrapper that preceded its coverage wrapper"
+    );
+    std::fs::write(&log, "").expect("clear host compilation records");
+
+    let status = Command::new("./scripts/build-product-adapter-components.sh")
+        .current_dir(&root)
+        .status()
+        .expect("spawn component build with pre-existing wrapper");
+    assert!(
+        status.success(),
+        "component build failed with pre-existing rustc wrapper: {status}"
+    );
+    let invocations = std::fs::read_to_string(&log).expect("read wrapper invocations");
+    assert!(
+        invocations.contains("--target wasm32-wasip2"),
+        "nested WASM rustc invocations did not pass through the pre-existing wrapper"
+    );
+    assert!(
+        !invocations.contains("instrument-coverage") && !invocations.contains("--cfg=coverage"),
+        "pre-existing wrapper observed leaked coverage flags: {invocations}"
+    );
 }
 
 #[test]
