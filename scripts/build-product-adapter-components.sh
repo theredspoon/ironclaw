@@ -16,9 +16,10 @@ wasm_build_env=(
 # cargo-llvm-cov replaces RUSTC_WRAPPER and records any wrapper it displaced.
 # Nested wasm builds must bypass the coverage wrapper but retain that original
 # wrapper (for example, sccache).
+wasm_rustc_wrapper=
 if [[ -v __CARGO_LLVM_COV_RUSTC_WRAPPER ]]; then
   if [[ -n "${__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING:-}" ]]; then
-    wasm_build_env+=(RUSTC_WRAPPER="$__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING")
+    wasm_rustc_wrapper="$__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING"
   else
     wasm_build_env+=(-u RUSTC_WRAPPER)
   fi
@@ -29,6 +30,10 @@ while IFS= read -r variable; do
     wasm_build_env+=(-u "$variable")
   fi
 done < <(compgen -e)
+
+if [[ -n "$wasm_rustc_wrapper" ]]; then
+  wasm_build_env+=(RUSTC_WRAPPER="$wasm_rustc_wrapper")
+fi
 
 for entry in "${components[@]}"; do
   package="${entry%%:*}"
