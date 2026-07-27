@@ -17,7 +17,7 @@ wasm_build_env=(
 # Nested wasm builds must bypass the coverage wrapper but retain that original
 # wrapper (for example, sccache).
 wasm_rustc_wrapper=
-if [[ -v __CARGO_LLVM_COV_RUSTC_WRAPPER ]]; then
+if [[ -n "${__CARGO_LLVM_COV_RUSTC_WRAPPER+x}" ]]; then
   if [[ -n "${__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING:-}" ]]; then
     wasm_rustc_wrapper="$__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING"
   else
