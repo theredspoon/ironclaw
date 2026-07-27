@@ -8,6 +8,28 @@ components=(
   "ironclaw_matrix_product_adapter_component:target/wasm32-wasip2/release/ironclaw_matrix_product_adapter_component.wasm"
 )
 
+wasm_build_env=(
+  -u CARGO_ENCODED_RUSTFLAGS
+  -u RUSTFLAGS
+)
+
+# cargo-llvm-cov replaces RUSTC_WRAPPER and records any wrapper it displaced.
+# Nested wasm builds must bypass the coverage wrapper but retain that original
+# wrapper (for example, sccache).
+if [[ -v __CARGO_LLVM_COV_RUSTC_WRAPPER ]]; then
+  if [[ -n "${__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING:-}" ]]; then
+    wasm_build_env+=(RUSTC_WRAPPER="$__CARGO_LLVM_COV_RUSTC_WRAPPER_PRE_EXISTING")
+  else
+    wasm_build_env+=(-u RUSTC_WRAPPER)
+  fi
+fi
+
+while IFS= read -r variable; do
+  if [[ "$variable" == __CARGO_LLVM_COV_RUSTC_WRAPPER* ]]; then
+    wasm_build_env+=(-u "$variable")
+  fi
+done < <(compgen -e)
+
 for entry in "${components[@]}"; do
   package="${entry%%:*}"
   artifact="${entry#*:}"
@@ -15,7 +37,7 @@ for entry in "${components[@]}"; do
   echo "Building ProductAdapter component: ${package}"
   # This wrapper owns the wasm32-wasip2 rustc flags, so it deliberately does
   # not inherit generic host Rust flags such as coverage instrumentation.
-  env -u CARGO_ENCODED_RUSTFLAGS -u RUSTFLAGS cargo rustc \
+  env "${wasm_build_env[@]}" cargo rustc \
     -p "$package" \
     --release \
     --target wasm32-wasip2 \
