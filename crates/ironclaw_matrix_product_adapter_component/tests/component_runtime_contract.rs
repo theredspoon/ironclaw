@@ -3,6 +3,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use chrono::Utc;
+use ironclaw_matrix_product_adapter_component::should_launch_nested_llvm_cov;
 use ironclaw_product_adapters::{
     AdapterInstallationId, AuthRequirement, EgressRequest, ExternalActorRef,
     ExternalConversationRef, FinalReplyView, ParsedProductInbound, ProductAdapterCapabilities,
