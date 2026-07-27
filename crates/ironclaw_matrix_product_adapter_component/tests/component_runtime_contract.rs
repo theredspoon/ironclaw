@@ -174,11 +174,18 @@ fn final_reply(text: &str) -> ProductOutboundPayload {
 
 #[test]
 fn component_build_ignores_host_coverage_flags() {
-    const CHILD_RUN: &str = "IRONCLAW_HOST_COVERAGE_ISOLATION_CHILD";
-
     let root = workspace_root();
-    if std::env::var_os(CHILD_RUN).is_none() {
-        let status = Command::new("cargo")
+    let status = Command::new("./scripts/build-product-adapter-components.sh")
+        .current_dir(&root)
+        .status()
+        .expect("spawn component build");
+    assert!(
+        status.success(),
+        "component build inherited host compiler instrumentation: {status}"
+    );
+
+    if should_launch_nested_llvm_cov(std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER").is_some()) {
+        let nested_status = Command::new("cargo")
             .current_dir(&root)
             .args([
                 "llvm-cov",
@@ -192,27 +199,24 @@ fn component_build_ignores_host_coverage_flags() {
                 "--exact",
                 "--nocapture",
             ])
-            .env(CHILD_RUN, "1")
             .status()
             .expect("run host coverage isolation under cargo llvm-cov");
         assert!(
-            status.success(),
-            "host coverage isolation failed under cargo llvm-cov: {status}"
+            nested_status.success(),
+            "host coverage isolation failed under cargo llvm-cov: {nested_status}"
         );
-        return;
     }
+}
 
+#[test]
+fn nested_coverage_is_launched_only_from_plain_cargo() {
     assert!(
-        std::env::var_os("__CARGO_LLVM_COV_RUSTC_WRAPPER").is_some(),
-        "coverage-isolation child must run under cargo llvm-cov"
+        should_launch_nested_llvm_cov(false),
+        "plain cargo must launch the nested coverage proof"
     );
-    let status = Command::new("./scripts/build-product-adapter-components.sh")
-        .current_dir(&root)
-        .status()
-        .expect("spawn component build");
     assert!(
-        status.success(),
-        "component build inherited host compiler instrumentation: {status}"
+        !should_launch_nested_llvm_cov(true),
+        "an existing cargo llvm-cov run must not recursively launch another"
     );
 }
 
