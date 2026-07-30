@@ -27,6 +27,7 @@ ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_product_adapter_registry = { path = "../ironclaw_product_adapter_registry", version = "0.1.0" }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0" }
 ironclaw_wasm_product_adapters = { path = "../ironclaw_wasm_product_adapters", version = "0.1.0" }
+ruma-common = "=0.19.0"
 
 [dev-dependencies]
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0", features = ["test-support"] }

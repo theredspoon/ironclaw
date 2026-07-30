@@ -90,25 +90,14 @@ fn matrix_room_fingerprint(room_id: &str) -> String {
     format!("sha256:{}", sha256_hex(room_id.as_bytes()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MatrixRoomId(String);
 
 impl MatrixRoomId {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixOutboundContractError> {
         let value = value.into();
-        let has_required_shape = value
-            .rsplit_once(':')
-            .map(|(localpart, server_name)| {
-                value.starts_with('!')
-                    && localpart.len() > 1
-                    && !server_name.is_empty()
-                    && value.len() <= 255
-                    && !value.chars().any(|c| c.is_control() || c.is_whitespace())
-            })
-            .unwrap_or(false);
-        if !has_required_shape {
-            return Err(MatrixOutboundContractError::InvalidRoomId);
-        }
+        ruma_common::RoomId::parse(value.as_str())
+            .map_err(|_| MatrixOutboundContractError::InvalidRoomId)?;
         Ok(Self(value))
     }
 
@@ -118,6 +107,16 @@ impl MatrixRoomId {
 
     pub fn fingerprint(&self) -> String {
         matrix_room_fingerprint(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MatrixRoomId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 

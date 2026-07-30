@@ -25,8 +25,6 @@ use ironclaw_product_adapters::{
 use ironclaw_wasm_product_adapters::{EgressPolicy, EgressPolicyError, EgressPolicyTarget};
 use serde::{Deserialize, Deserializer, Serialize};
 
-const MAX_MATRIX_ROUTE_ID_BYTES: usize = 255;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatrixInstallationPolicyRejection {
@@ -330,18 +328,9 @@ pub struct MatrixRoomId(String);
 impl MatrixRoomId {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixInstallationPolicyRejection> {
         let value = value.into();
-        // Matrix localparts can be case-sensitive. Until a Matrix SDK-backed
-        // canonicalizer owns server-name normalization, store IDs verbatim and
-        // fail closed on mismatches rather than guessing.
-        if value.starts_with('!')
-            && value.len() <= MAX_MATRIX_ROUTE_ID_BYTES
-            && value.contains(':')
-            && !value.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
-            Ok(Self(value))
-        } else {
-            Err(MatrixInstallationPolicyRejection::InvalidPolicyValue)
-        }
+        ruma_common::RoomId::parse(value.as_str())
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -366,17 +355,9 @@ pub struct MatrixUserId(String);
 impl MatrixUserId {
     pub fn new(value: impl Into<String>) -> Result<Self, MatrixInstallationPolicyRejection> {
         let value = value.into();
-        // See MatrixRoomId: this policy layer intentionally avoids partial
-        // normalization that could rewrite a case-sensitive identifier.
-        if value.starts_with('@')
-            && value.len() <= MAX_MATRIX_ROUTE_ID_BYTES
-            && value.contains(':')
-            && !value.chars().any(|c| c.is_control() || c.is_whitespace())
-        {
-            Ok(Self(value))
-        } else {
-            Err(MatrixInstallationPolicyRejection::InvalidPolicyValue)
-        }
+        ruma_common::UserId::parse(value.as_str())
+            .map_err(|_| MatrixInstallationPolicyRejection::InvalidPolicyValue)?;
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {

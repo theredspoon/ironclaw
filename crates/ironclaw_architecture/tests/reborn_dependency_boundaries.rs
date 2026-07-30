@@ -8,6 +8,95 @@ use std::{
 use serde_json::Value;
 
 #[test]
+fn matrix_ruma_dependency_is_native_only() {
+    let metadata = cargo_metadata();
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must include packages");
+
+    for consumer in ["ironclaw_matrix_adapter", "ironclaw_reborn_composition"] {
+        let package = packages
+            .iter()
+            .find(|package| package["name"].as_str() == Some(consumer))
+            .unwrap_or_else(|| panic!("{consumer} must be a workspace package"));
+        let dependencies = package["dependencies"]
+            .as_array()
+            .expect("package dependencies must be an array");
+        let ruma_dependencies = dependencies
+            .iter()
+            .filter(|dependency| dependency["name"].as_str() == Some("ruma-common"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ruma_dependencies.len(),
+            1,
+            "{consumer} must declare exactly one ruma-common dependency"
+        );
+        let dependency = ruma_dependencies[0];
+        assert_eq!(
+            dependency["req"].as_str(),
+            Some("=0.19.0"),
+            "{consumer} must pin the audited ruma-common release exactly"
+        );
+        assert_eq!(
+            dependency["target"].as_str(),
+            Some("cfg(not(target_arch = \"wasm32\"))"),
+            "{consumer} must compile ruma-common only for native targets"
+        );
+        assert_eq!(
+            dependency["kind"],
+            Value::Null,
+            "{consumer} must use ruma-common as a normal native dependency"
+        );
+        assert_eq!(
+            dependency["uses_default_features"].as_bool(),
+            Some(true),
+            "{consumer} must retain ruma-common default features"
+        );
+        assert!(
+            dependency["features"].as_array().is_some_and(Vec::is_empty),
+            "{consumer} must not enable API, unstable MSC, or compatibility features"
+        );
+        assert_eq!(
+            dependency["optional"].as_bool(),
+            Some(false),
+            "{consumer} must not make native identifier validation optional"
+        );
+    }
+
+    let manifest_path = workspace_root().join("Cargo.toml");
+    let wasm_metadata_output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--offline",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            "wasm32-wasip2",
+            "--manifest-path",
+        ])
+        .arg(&manifest_path)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to resolve wasm32-wasip2 metadata: {error}"));
+    assert!(
+        wasm_metadata_output.status.success(),
+        "wasm32-wasip2 cargo metadata failed: {}",
+        String::from_utf8_lossy(&wasm_metadata_output.stderr)
+    );
+    let wasm_metadata: Value = serde_json::from_slice(&wasm_metadata_output.stdout)
+        .expect("wasm32-wasip2 cargo metadata must be JSON");
+    let wasm_packages = wasm_metadata["packages"]
+        .as_array()
+        .expect("wasm metadata must include packages");
+    assert!(
+        wasm_packages
+            .iter()
+            .all(|package| package["name"].as_str() != Some("ruma-common")),
+        "ruma-common and its native identifier-validation graph must stay outside component/WASM resolution"
+    );
+}
+
+#[test]
 fn reborn_boundary_rules_active_crates_are_workspace_members() {
     // Regression for PR #3212 review: a boundary rule whose crate has a
     // `Cargo.toml` on disk but is missing from `cargo metadata` would

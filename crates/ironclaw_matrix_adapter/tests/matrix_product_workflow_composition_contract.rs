@@ -656,6 +656,44 @@ async fn matrix_verified_inbound_enters_product_workflow_idempotency_and_binding
 }
 
 #[tokio::test]
+async fn matrix_verified_inbound_preserves_server_name_less_v2_room_id() {
+    let room_id = "!opaquev2roomid";
+    let adapter = matrix_adapter();
+    let fixture = workflow_fixture();
+    let auth_evidence =
+        ProtocolAuthEvidence::test_verified(adapter.auth_requirement().clone(), "matrix-webhook");
+
+    let ack = adapter
+        .submit_verified_inbound(
+            &fixture.workflow,
+            &[matrix_installation_with_rooms(
+                MatrixActivationState::Enabled,
+                &[room_id],
+            )],
+            matrix_homeserver(),
+            raw_matrix_message_in_room(room_id).to_string().as_bytes(),
+            &auth_evidence,
+            Utc::now(),
+        )
+        .await
+        .expect("verified Matrix inbound should accept a v2 room id");
+
+    assert!(matches!(ack, ProductInboundAck::Accepted { .. }));
+    let binding_requests = fixture.binding_service.requests();
+    assert_eq!(binding_requests.len(), 1);
+    assert_eq!(
+        binding_requests[0]
+            .external_conversation_ref
+            .conversation_id(),
+        room_id
+    );
+    assert_eq!(
+        binding_requests[0].external_event_id.as_str(),
+        "matrix:inst_matrix:room:!opaquev2roomid:event:$event:example.org"
+    );
+}
+
+#[tokio::test]
 async fn matrix_inbound_same_event_id_in_different_room_does_not_collide() {
     let adapter = matrix_adapter();
     let fixture = workflow_fixture();
