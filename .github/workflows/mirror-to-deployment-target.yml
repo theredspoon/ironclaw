@@ -90,16 +90,22 @@ jobs:
           git fetch deployment_mirror "refs/heads/${TARGET_BRANCH}:refs/remotes/deployment_mirror/${TARGET_BRANCH}"
           git fetch deployment_mirror "refs/heads/${MIRROR_BRANCH}:refs/remotes/deployment_mirror/${MIRROR_BRANCH}" || true
 
-          # Build source tree excluding .github/workflows/
-          # Deployment target maintains its own workflows independently
+          target_parent="$(git rev-parse "refs/remotes/deployment_mirror/${TARGET_BRANCH}")"
+
+          # Build source tree excluding .github/workflows/, then graft the
+          # deployment target's existing .github/workflows/ back in.
+          # Deployment target maintains its own workflows independently, and
+          # they must never be overwritten or deleted by this mirror.
           full_tree="$(git write-tree)"
           temp_index="${RUNNER_TEMP}/mirror-index"
           GIT_INDEX_FILE="${temp_index}" git read-tree "${full_tree}"
           GIT_INDEX_FILE="${temp_index}" git rm -r --cached .github/workflows 2>/dev/null || true
+          target_workflows_tree="$(git rev-parse "${target_parent}:.github/workflows" 2>/dev/null || true)"
+          if [[ -n "${target_workflows_tree}" ]]; then
+            GIT_INDEX_FILE="${temp_index}" git read-tree --prefix=.github/workflows/ "${target_workflows_tree}"
+          fi
           source_tree="$(GIT_INDEX_FILE="${temp_index}" git write-tree)"
           rm -f "${temp_index}"
-
-          target_parent="$(git rev-parse "refs/remotes/deployment_mirror/${TARGET_BRANCH}")"
           deployment_commit="$(
             git commit-tree "${source_tree}" \
               -p "${target_parent}" \
