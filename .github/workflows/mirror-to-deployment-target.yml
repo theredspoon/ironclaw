@@ -19,7 +19,6 @@ jobs:
       DEPLOYMENT_MIRROR_OWNER: ${{ vars.DEPLOYMENT_MIRROR_OWNER }}
       DEPLOYMENT_MIRROR_REPOSITORY: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}
       DEPLOYMENT_MIRROR_REPOSITORY_NAME: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
-      MIRROR_BRANCH: mirror/reborn-matrix-pilot
       SOURCE_REF: ${{ github.event.inputs.source_ref || github.ref_name }}
       TARGET_BRANCH: deployment-target
     steps:
@@ -33,6 +32,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "MIRRORED_SOURCE_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
+          case "${SOURCE_REF}" in
+            */*|"")
+              echo "SOURCE_REF must be a single path segment, got '${SOURCE_REF}'" >&2
+              exit 1
+              ;;
+          esac
+          echo "MIRROR_BRANCH=mirror/${SOURCE_REF}" >> "${GITHUB_ENV}"
 
       - name: Generate deployment mirror token
         id: mirror_token
@@ -96,7 +102,7 @@ jobs:
           deployment_commit="$(
             git commit-tree "${source_tree}" \
               -p "${target_parent}" \
-              -m "Deploy Reborn Matrix pilot source ${MIRRORED_SOURCE_SHA:0:12}" \
+              -m "Deploy ${SOURCE_REF} source ${MIRRORED_SOURCE_SHA:0:12}" \
               -m "[skip-regression-check]"
           )"
           git push --force-with-lease deployment_mirror "${deployment_commit}:refs/heads/${MIRROR_BRANCH}"
@@ -124,14 +130,14 @@ jobs:
           - source sha: \`${MIRRORED_SOURCE_SHA}\`
           - target branch: \`${TARGET_BRANCH}\`
 
-          After this PR merges, \`${DEPLOYMENT_MIRROR_REPOSITORY}:${TARGET_BRANCH}\` triggers the Reborn Matrix pilot artifact workflow.
+          After this PR merges, \`${DEPLOYMENT_MIRROR_REPOSITORY}:${TARGET_BRANCH}\` triggers the deployment artifact workflow.
           EOF
           )"
 
           if [[ -n "${existing_pr}" ]]; then
             gh pr edit "${existing_pr}" \
               --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
-              --title "Deploy Reborn Matrix pilot source ${MIRRORED_SOURCE_SHA:0:12}" \
+              --title "Deploy ${SOURCE_REF} source ${MIRRORED_SOURCE_SHA:0:12}" \
               --body "${pr_body}"
             echo "Updated existing deployment mirror PR #${existing_pr}"
           else
@@ -139,6 +145,6 @@ jobs:
               --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
               --base "${TARGET_BRANCH}" \
               --head "${MIRROR_BRANCH}" \
-              --title "Deploy Reborn Matrix pilot source ${MIRRORED_SOURCE_SHA:0:12}" \
+              --title "Deploy ${SOURCE_REF} source ${MIRRORED_SOURCE_SHA:0:12}" \
               --body "${pr_body}"
           fi
