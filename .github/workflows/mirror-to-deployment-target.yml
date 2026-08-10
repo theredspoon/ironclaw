@@ -32,12 +32,10 @@ jobs:
         run: |
           set -euo pipefail
           echo "MIRRORED_SOURCE_SHA=$(git rev-parse HEAD)" >> "${GITHUB_ENV}"
-          case "${SOURCE_REF}" in
-            */*|"")
-              echo "SOURCE_REF must be a single path segment, got '${SOURCE_REF}'" >&2
-              exit 1
-              ;;
-          esac
+          if [[ ! "${SOURCE_REF}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "SOURCE_REF must match ^[A-Za-z0-9._-]+\$ (single path segment, no whitespace), got '${SOURCE_REF}'" >&2
+            exit 1
+          fi
           echo "MIRROR_BRANCH=mirror/${SOURCE_REF}" >> "${GITHUB_ENV}"
 
       - name: Generate deployment mirror token
