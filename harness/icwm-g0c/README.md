@@ -48,6 +48,59 @@ and request capture exercise those selected control paths; unsupported
 purposes fail explicitly, and no support for the remaining capability
 vocabulary is implied.
 
+## Request-vector corpora
+
+`fixtures/REQUEST-VECTORS-v1.json` remains byte-for-byte immutable as the
+contribution-grade control fixture consumed by earlier review. It is not
+silently repaired or replaced.
+
+`fixtures/REQUEST-VECTORS-v2.json` is the corrective, candidate-neutral corpus.
+It covers 22 unique operations, including the complete Matrix room-key backup
+version lifecycle and key GET/PUT operations at the all-room, room, and session
+scopes. Requests model query parameters as ordered name/value pairs and reject
+duplicate names. The JSON Schema closes field vocabularies, collection counts,
+and fixed published policy constants. The deterministic semantic validator,
+not JSON Schema alone, measures UTF-8 byte limits, rebuilds encoded URIs,
+rejects duplicate query names, and rejects token-, authorization-, cookie-,
+password-, secret-, and credential-like names or values across headers, query
+pairs, path parameters, and bodies. The host remains solely responsible for
+later credential injection.
+
+The corpus publishes success, ordinary error, and rate-limit response grammar.
+Every operation also carries concrete ordered headers, status, body, and
+parsing expectations. Backup errors exercise `M_WRONG_ROOM_KEYS_VERSION` with
+the current version; other operations carry a bounded `M_FORBIDDEN` Matrix
+error shape.
+For `429 M_LIMIT_EXCEEDED`, v2 executes a delta-seconds `Retry-After: 120`
+header and proves it takes precedence over legacy `retry_after_ms: 5000`.
+HTTP-date parsing remains explicitly unexecuted. The bounded legacy body field
+remains represented for compatibility. Every
+candidate must consume the same corpus without candidate-specific rewrites or
+omissions.
+
+Each vector identity hashes canonical JSON for its schema version, operation,
+purpose, complete request, and response-case list. The corpus identity hashes
+the corpus schema version, exact oracle binding, limits, duplicate-key policy,
+response grammar, required operation inventory, full vectors, and capability
+expectations. `fixtures/REQUEST-VECTORS-v2.sha256` separately binds the literal
+published bytes.
+
+The isolated request-shape oracle is pinned under
+`oracles/ruma-request-v2/` to Ruma commit
+`ea3455221fd99985256b196866abb85e22ff4bdd`, `ruma-client-api 0.24.0` with
+`client`, and `ruma-common 0.19.0` with `api` and `client`, all with default features disabled, the recorded Rust/Cargo
+toolchain, and its own lockfile. It is build-only test evidence and cannot
+enter a production graph. The oracle suite constructs and compares seventeen
+public request types: sync, devices, key query/claim/upload/change, and eleven
+backup read/write/delete operations, including canonical path/query encoding. It also
+decodes the published success and Matrix-error shapes for the covered backup
+responses. Each remaining vector
+contains an exact `manual_shaping_exception`; those method, URI, and body shapes
+are not described as oracle-confirmed until the pinned public semantic request
+type is constructed. No candidate has executed the v2 corpus yet, its
+effect and failpoint coverage remains unexecuted, and publication does not
+claim Wave 2 or Gate 0 acceptance.
+
 Identifier differential tests use only the exact crates.io `ruma-common
 0.19.0` identifier parse layer. They do not invoke Ruma strict or historical
 validation modes and make no claim about those validators. This is the current
@@ -77,6 +130,9 @@ CARGO_TARGET_DIR="$target_dir" cargo test --locked --manifest-path harness/icwm-
 CARGO_TARGET_DIR="$target_dir" cargo clippy --locked --manifest-path harness/icwm-g0c/Cargo.toml --all-targets -- -D warnings
 python3 harness/icwm-g0c/verify-publication.py
 python3 harness/icwm-g0c/test_verify_publication.py
+python3 harness/icwm-g0c/validate-request-vectors-v2.py
+python3 harness/icwm-g0c/test_validate_request_vectors_v2.py
+CARGO_TARGET_DIR="$target_dir" cargo test --locked --manifest-path harness/icwm-g0c/oracles/ruma-request-v2/Cargo.toml
 ```
 
 Remove the temporary target directory after recording author or verifier

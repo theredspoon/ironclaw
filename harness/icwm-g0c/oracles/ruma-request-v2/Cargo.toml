@@ -1,0 +1,13 @@
+[package]
+name = "icwm-g0c-ruma-request-v2-oracle"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ruma-client-api = { git = "https://github.com/ruma/ruma", rev = "ea3455221fd99985256b196866abb85e22ff4bdd", default-features = false, features = ["client"] }
+ruma-common = { git = "https://github.com/ruma/ruma", rev = "ea3455221fd99985256b196866abb85e22ff4bdd", default-features = false, features = ["api", "client"] }
+serde_json = "1"
+http = "1"

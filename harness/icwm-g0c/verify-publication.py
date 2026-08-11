@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 from pathlib import Path
 
 
@@ -116,6 +117,10 @@ def validate_named_evidence(manifest: dict[str, object]) -> None:
     result_path = ROOT / "fixtures/CONTROL-RESULT.json"
     scenario = json.loads(scenario_path.read_bytes())
     result = json.loads(result_path.read_bytes())
+    vectors_v2_path = ROOT / "fixtures/REQUEST-VECTORS-v2.json"
+    vectors_v2 = json.loads(vectors_v2_path.read_bytes())
+    semantic_validator = runpy.run_path(str(ROOT / "validate-request-vectors-v2.py"))
+    semantic_validator["validate"](vectors_v2)
 
     if result["dependency_graph"]["artifact"] != "Cargo.lock":
         raise SystemExit("control dependency_graph artifact must be Cargo.lock")
@@ -149,6 +154,70 @@ def validate_named_evidence(manifest: dict[str, object]) -> None:
     for name, path in named_paths.items():
         if named_values[name] != sha256(path):
             raise SystemExit(f"named evidence hash mismatch: {name}")
+
+    detached_v2 = (ROOT / "fixtures/REQUEST-VECTORS-v2.sha256").read_text(
+        encoding="utf-8"
+    ).split()
+    if detached_v2 != [sha256(vectors_v2_path), "REQUEST-VECTORS-v2.json"]:
+        raise SystemExit("request vectors v2 detached digest mismatch")
+    oracle_lock = ROOT / vectors_v2["oracle"]["lockfile"]
+    if vectors_v2["oracle"]["lockfile_sha256"] != sha256(oracle_lock):
+        raise SystemExit("request vectors v2 oracle lock mismatch")
+
+    vector_identity_keys = (
+        "schema_version",
+        "operation",
+        "purpose",
+        "request",
+        "response_cases",
+        "responses",
+        "oracle_comparison",
+    )
+    operations: list[str] = []
+    purposes: set[str] = set()
+    for vector in vectors_v2["vectors"]:
+        identity = {key: vector[key] for key in vector_identity_keys}
+        if vector["vector_id"] != hashlib.sha256(canonical_json(identity)).hexdigest():
+            raise SystemExit(f"request vector v2 identity mismatch: {vector['operation']}")
+        operations.append(vector["operation"])
+        purposes.add(vector["purpose"])
+        request = vector["request"]
+        query_names = [pair["name"] for pair in request["query"]]
+        if len(query_names) != len(set(query_names)):
+            raise SystemExit(f"request vector v2 duplicate query key: {vector['operation']}")
+        serialized_request = canonical_json(request).lower()
+        for forbidden in (b"access_token", b"authorization", b"proxy-authorization"):
+            if forbidden in serialized_request:
+                raise SystemExit(
+                    f"request vector v2 contains credential surface: {vector['operation']}"
+                )
+    if len(operations) != len(set(operations)):
+        raise SystemExit("request vector v2 contains duplicate operations")
+    if set(operations) != set(vectors_v2["required_operations"]):
+        raise SystemExit("request vector v2 operation inventory mismatch")
+    if purposes != set(vectors_v2["capability_expectations"]):
+        raise SystemExit("request vector v2 purpose inventory mismatch")
+    if len(vectors_v2["required_purposes"]) != len(
+        set(vectors_v2["required_purposes"])
+    ) or purposes != set(vectors_v2["required_purposes"]):
+        raise SystemExit("request vector v2 required purpose inventory mismatch")
+
+    corpus_identity_keys = (
+        "schema_version",
+        "oracle",
+        "limits",
+        "duplicate_query_key_policy",
+        "response_grammar",
+        "required_operations",
+        "required_purposes",
+        "vectors",
+        "capability_expectations",
+    )
+    corpus_identity = {key: vectors_v2[key] for key in corpus_identity_keys}
+    if vectors_v2["corpus_id"] != hashlib.sha256(
+        canonical_json(corpus_identity)
+    ).hexdigest():
+        raise SystemExit("request vectors v2 corpus identity mismatch")
 
     candidate = result["candidate"]
     expected_candidate = stable_id(

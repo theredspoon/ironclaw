@@ -1,0 +1,2289 @@
+{
+  "schema_version": "icwm.g0c.request-vector-corpus.v2",
+  "corpus_id": "338c873c569faa4816785a223a6c12d4f89c1c080bf4cc83cc89dc0fa1452ad8",
+  "identity_algorithm": "Each vector is sha256 of canonical JSON for schema_version, operation, purpose, request, response_cases, responses, and oracle_comparison. The corpus is sha256 of canonical JSON for schema_version, oracle, limits, duplicate_query_key_policy, response_grammar, required_operations, required_purposes, full vectors, and capability_expectations.",
+  "candidate_contract": "same_corpus_for_every_candidate",
+  "candidate_contract_note": "Every candidate must consume these exact request and response cases without candidate-specific omissions or rewrites.",
+  "known_coverage_gaps": [
+    "No candidate adapter has executed this v2 corpus yet.",
+    "Effect and failpoint coverage remains unexecuted for these request operations.",
+    "This publication does not claim Wave 2 or Gate 0 acceptance.",
+    "HTTP-date Retry-After parsing and precedence is not executed; v2 tests only delta-seconds=120 over legacy retry_after_ms=5000."
+  ],
+  "oracle": {
+    "role": "test-only credential-free request-shape oracle; not a production dependency",
+    "repository": "https://github.com/ruma/ruma",
+    "commit": "ea3455221fd99985256b196866abb85e22ff4bdd",
+    "packages": [
+      {
+        "name": "ruma-client-api",
+        "version": "0.24.0",
+        "features": [
+          "client"
+        ]
+      },
+      {
+        "name": "ruma-common",
+        "version": "0.19.0",
+        "features": [
+          "api",
+          "client"
+        ]
+      }
+    ],
+    "features": [
+      "ruma-client-api/client",
+      "ruma-common/api",
+      "ruma-common/client"
+    ],
+    "default_features": false,
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "cargo": "1.96.0 (30a34c682 2026-05-25)",
+    "lockfile": "oracles/ruma-request-v2/Cargo.lock",
+    "lockfile_sha256": "88a49a5a3db983232d59c68ecfedaa74dd57a6f171f24bf306efbc8f816cc1e5"
+  },
+  "limits": {
+    "max_headers": 32,
+    "max_query_pairs": 32,
+    "max_name_bytes": 128,
+    "max_value_bytes": 8192,
+    "max_path_bytes": 8192,
+    "max_body_bytes": 1048576,
+    "max_retry_after_seconds": 86400,
+    "max_retry_after_ms": 86400000
+  },
+  "duplicate_query_key_policy": "reject",
+  "response_grammar": {
+    "success": {
+      "status_range": [
+        200,
+        299
+      ],
+      "headers": "ordered_name_value_pairs",
+      "body": "bounded_json_or_empty"
+    },
+    "error": {
+      "status_range": [
+        400,
+        599
+      ],
+      "headers": "ordered_name_value_pairs",
+      "body": {
+        "required": [
+          "errcode",
+          "error"
+        ]
+      }
+    },
+    "rate_limited": {
+      "status": 429,
+      "headers": {
+        "Retry-After": "delta-seconds only in v2; HTTP-date unexecuted"
+      },
+      "body": {
+        "errcode": "M_LIMIT_EXCEEDED",
+        "legacy_optional": "retry_after_ms"
+      }
+    }
+  },
+  "required_operations": [
+    "sync",
+    "keys_query",
+    "keys_claim",
+    "to_device",
+    "room_send",
+    "keys_upload",
+    "device_list",
+    "room_key_backup_version_create",
+    "room_key_backup_version_get_current",
+    "room_key_backup_version_get",
+    "room_key_backup_version_update",
+    "room_key_backup_version_delete",
+    "room_keys_get_all",
+    "room_keys_put_all",
+    "room_keys_get_room",
+    "room_keys_put_room",
+    "room_keys_get_session",
+    "room_keys_put_session",
+    "cross_signing",
+    "signatures_upload",
+    "verification",
+    "keys_changes"
+  ],
+  "required_purposes": [
+    "sync",
+    "keys_query",
+    "keys_claim",
+    "to_device",
+    "room_send",
+    "keys_upload",
+    "device_list",
+    "room_keys_backup",
+    "cross_signing",
+    "signatures_upload",
+    "verification",
+    "keys_changes"
+  ],
+  "vectors": [
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "09715ae1d08f9aeca3cb5161290885374eb87027f9bfd2fd9130b97568217f8f",
+      "operation": "sync",
+      "purpose": "sync",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/sync",
+        "path_parameters": [],
+        "query": [
+          {
+            "name": "since",
+            "value": "s0"
+          },
+          {
+            "name": "timeout",
+            "value": "30000"
+          }
+        ],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/sync?since=s0&timeout=30000"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "next_batch": "s1",
+            "rooms": {}
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "a9063093665459d831f904202d6ab4201e5e01fa54fc8a9af5a2a49214e20e9d",
+      "operation": "keys_query",
+      "purpose": "keys_query",
+      "request": {
+        "method": "POST",
+        "path": "/_matrix/client/v3/keys/query",
+        "path_parameters": [],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "device_keys": {
+            "@alice:example.org": []
+          }
+        },
+        "encoded_uri": "/_matrix/client/v3/keys/query"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "8edafff156442cc40ae6de99d19a4f0151a3923ac7ae73fa4584153fdd70f539",
+      "operation": "keys_claim",
+      "purpose": "keys_claim",
+      "request": {
+        "method": "POST",
+        "path": "/_matrix/client/v3/keys/claim",
+        "path_parameters": [],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "one_time_keys": {
+            "@alice:example.org": {
+              "ALICE": "signed_curve25519"
+            }
+          }
+        },
+        "encoded_uri": "/_matrix/client/v3/keys/claim"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "20e744a624e2baa4ad5791feecc2e9154911fdb61a1b939bc602fcb20b357047",
+      "operation": "to_device",
+      "purpose": "to_device",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/sendToDevice/{eventType}/{txnId}",
+        "path_parameters": [
+          {
+            "name": "eventType",
+            "value": "m.room.encrypted"
+          },
+          {
+            "name": "txnId",
+            "value": "txn-1"
+          }
+        ],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "messages": {}
+        },
+        "encoded_uri": "/_matrix/client/v3/sendToDevice/m.room.encrypted/txn-1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "manual_shaping_exception",
+        "reason": "The v2 corpus does not yet construct the semantic endpoint payload type needed by this operation through the pinned Ruma public API; method, encoded URI, and body are specification-shaped only and cannot be treated as oracle-confirmed."
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "7d6e1cd83a053b6f06c4676c356b8fae7692dbd0c56091d6ddd57c5f99ec9e8e",
+      "operation": "room_send",
+      "purpose": "room_send",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}",
+        "path_parameters": [
+          {
+            "name": "roomId",
+            "value": "!room:example.org"
+          },
+          {
+            "name": "eventType",
+            "value": "m.room.encrypted"
+          },
+          {
+            "name": "txnId",
+            "value": "txn-2"
+          }
+        ],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "algorithm": "m.megolm.v1.aes-sha2"
+        },
+        "encoded_uri": "/_matrix/client/v3/rooms/!room:example.org/send/m.room.encrypted/txn-2"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "manual_shaping_exception",
+        "reason": "The v2 corpus does not yet construct the semantic endpoint payload type needed by this operation through the pinned Ruma public API; method, encoded URI, and body are specification-shaped only and cannot be treated as oracle-confirmed."
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "event_id": "$event:example.org"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "4e4cb40da9ab0f74786b083fc599f9e0c173bf05aeaf8e51ebbc7acc63ddef23",
+      "operation": "keys_upload",
+      "purpose": "keys_upload",
+      "request": {
+        "method": "POST",
+        "path": "/_matrix/client/v3/keys/upload",
+        "path_parameters": [],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {},
+        "encoded_uri": "/_matrix/client/v3/keys/upload"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "25a2260b1eb7b512f9a419f200fd4585e2446a1b0d697482e48ac70e4786994a",
+      "operation": "device_list",
+      "purpose": "device_list",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/devices",
+        "path_parameters": [],
+        "query": [],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/devices"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "devices": []
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "e7c6ab766a90905abe5d25dcd3293f253ebac6e541862f7c324d6953c89f5122",
+      "operation": "room_key_backup_version_create",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "POST",
+        "path": "/_matrix/client/v3/room_keys/version",
+        "path_parameters": [],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+          "auth_data": {}
+        },
+        "encoded_uri": "/_matrix/client/v3/room_keys/version"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "version": "v 1"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "69c88499e1adffbbc1337d957b8067ee7c4d2a0c754981055a5a132a3b85315d",
+      "operation": "room_key_backup_version_get_current",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/room_keys/version",
+        "path_parameters": [],
+        "query": [],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/room_keys/version"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+            "auth_data": {},
+            "count": 0,
+            "etag": "etag-1",
+            "version": "v 1"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "3528532a05543f0d96498f0af920ffb7639b84c85e019c92d3a6240c90c47d01",
+      "operation": "room_key_backup_version_get",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/room_keys/version/{version}",
+        "path_parameters": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "query": [],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/room_keys/version/v%201"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+            "auth_data": {},
+            "count": 0,
+            "etag": "etag-1",
+            "version": "v 1"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "d81c5ef44cc102789f980202e66594da05542240c2ecbfc6eb0b7dab6c9928f1",
+      "operation": "room_key_backup_version_update",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/room_keys/version/{version}",
+        "path_parameters": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "algorithm": "m.megolm_backup.v1.curve25519-aes-sha2",
+          "auth_data": {}
+        },
+        "encoded_uri": "/_matrix/client/v3/room_keys/version/v%201"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "52be48a808f66bdc57a58785d25fe1b029c2ffdbe09d0abebc67d174ce9f8962",
+      "operation": "room_key_backup_version_delete",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "DELETE",
+        "path": "/_matrix/client/v3/room_keys/version/{version}",
+        "path_parameters": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "query": [],
+        "headers": [],
+        "body": {},
+        "encoded_uri": "/_matrix/client/v3/room_keys/version/v%201"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body",
+          "success_response_decode",
+          "matrix_error_decode"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "b29db92af10c7d328bfc689c0602603dae75be241f7e90774db276e7d5a3f009",
+      "operation": "room_keys_get_all",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/room_keys/keys",
+        "path_parameters": [],
+        "query": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/room_keys/keys?version=v+1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body",
+          "success_response_decode"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "rooms": {}
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "1a509e7ce2726a4f27ce5350e7e2e9000685689090fa6d4f6afc3f870f929eaf",
+      "operation": "room_keys_put_all",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/room_keys/keys",
+        "path_parameters": [],
+        "query": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "rooms": {}
+        },
+        "encoded_uri": "/_matrix/client/v3/room_keys/keys?version=v+1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "count": 1,
+            "etag": "etag-1"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "b0ba499a17bc587a7266c32953db4df1d3aacf47280ace62bd41ba26da90ff2a",
+      "operation": "room_keys_get_room",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/room_keys/keys/{roomId}",
+        "path_parameters": [
+          {
+            "name": "roomId",
+            "value": "!room:example.org"
+          }
+        ],
+        "query": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/room_keys/keys/!room:example.org?version=v+1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body",
+          "success_response_decode"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "sessions": {}
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "43e00f583c8f15f77bd79104c2278ad01f8e31b87a929a61f62e861242394622",
+      "operation": "room_keys_put_room",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/room_keys/keys/{roomId}",
+        "path_parameters": [
+          {
+            "name": "roomId",
+            "value": "!room:example.org"
+          }
+        ],
+        "query": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "sessions": {}
+        },
+        "encoded_uri": "/_matrix/client/v3/room_keys/keys/!room:example.org?version=v+1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "count": 1,
+            "etag": "etag-1"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "1c142190c8c8785b0482e64e9c10b45bfe72b0765112ddf570466a6da9460b70",
+      "operation": "room_keys_get_session",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+        "path_parameters": [
+          {
+            "name": "roomId",
+            "value": "!room:example.org"
+          },
+          {
+            "name": "sessionId",
+            "value": "session /1"
+          }
+        ],
+        "query": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/room_keys/keys/!room:example.org/session%20%2F1?version=v+1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body",
+          "success_response_decode"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "first_message_index": 0,
+            "forwarded_count": 0,
+            "is_verified": true,
+            "session_data": {}
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "0acae7148bd37b84f0e88af355308dc16c69900f15922f6dff801011790d16c6",
+      "operation": "room_keys_put_session",
+      "purpose": "room_keys_backup",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/room_keys/keys/{roomId}/{sessionId}",
+        "path_parameters": [
+          {
+            "name": "roomId",
+            "value": "!room:example.org"
+          },
+          {
+            "name": "sessionId",
+            "value": "session /1"
+          }
+        ],
+        "query": [
+          {
+            "name": "version",
+            "value": "v 1"
+          }
+        ],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "first_message_index": 0,
+          "forwarded_count": 0,
+          "is_verified": true,
+          "session_data": {}
+        },
+        "encoded_uri": "/_matrix/client/v3/room_keys/keys/!room:example.org/session%20%2F1?version=v+1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "count": 1,
+            "etag": "etag-1"
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 400,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION",
+            "error": "request rejected",
+            "current_version": "v 2"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_WRONG_ROOM_KEYS_VERSION"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "d699c99d731c30c22babb4be40455d7a50b3e1e4f516b6e13c72da358a1208fb",
+      "operation": "cross_signing",
+      "purpose": "cross_signing",
+      "request": {
+        "method": "POST",
+        "path": "/_matrix/client/v3/keys/device_signing/upload",
+        "path_parameters": [],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {},
+        "encoded_uri": "/_matrix/client/v3/keys/device_signing/upload"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "manual_shaping_exception",
+        "reason": "The v2 corpus does not yet construct the semantic endpoint payload type needed by this operation through the pinned Ruma public API; method, encoded URI, and body are specification-shaped only and cannot be treated as oracle-confirmed."
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "9f81507ec90c2fd6947ed3f8d576bbc9dae54ae562204f258d379cce29459b40",
+      "operation": "signatures_upload",
+      "purpose": "signatures_upload",
+      "request": {
+        "method": "POST",
+        "path": "/_matrix/client/v3/keys/signatures/upload",
+        "path_parameters": [],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {},
+        "encoded_uri": "/_matrix/client/v3/keys/signatures/upload"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "manual_shaping_exception",
+        "reason": "The v2 corpus does not yet construct the semantic endpoint payload type needed by this operation through the pinned Ruma public API; method, encoded URI, and body are specification-shaped only and cannot be treated as oracle-confirmed."
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "1d5829251884733e4550992f3c3fbe071d40b31ee6237771d9ad83407560d35c",
+      "operation": "verification",
+      "purpose": "verification",
+      "request": {
+        "method": "PUT",
+        "path": "/_matrix/client/v3/sendToDevice/{eventType}/{txnId}",
+        "path_parameters": [
+          {
+            "name": "eventType",
+            "value": "m.key.verification.start"
+          },
+          {
+            "name": "txnId",
+            "value": "txn-v"
+          }
+        ],
+        "query": [],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {},
+        "encoded_uri": "/_matrix/client/v3/sendToDevice/m.key.verification.start/txn-v"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "manual_shaping_exception",
+        "reason": "The v2 corpus does not yet construct the semantic endpoint payload type needed by this operation through the pinned Ruma public API; method, encoded URI, and body are specification-shaped only and cannot be treated as oracle-confirmed."
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {},
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    },
+    {
+      "schema_version": "icwm.g0c.request-vector.v2",
+      "vector_id": "7734ad80b11ff5a368bc499a97bed4e0bcdee72642a5cbf3b9ccbcf08243cbe4",
+      "operation": "keys_changes",
+      "purpose": "keys_changes",
+      "request": {
+        "method": "GET",
+        "path": "/_matrix/client/v3/keys/changes",
+        "path_parameters": [],
+        "query": [
+          {
+            "name": "from",
+            "value": "s0"
+          },
+          {
+            "name": "to",
+            "value": "s1"
+          }
+        ],
+        "headers": [],
+        "body": null,
+        "encoded_uri": "/_matrix/client/v3/keys/changes?from=s0&to=s1"
+      },
+      "response_cases": [
+        "success",
+        "error",
+        "rate_limited"
+      ],
+      "oracle_comparison": {
+        "mode": "ruma_outgoing_request",
+        "coverage": [
+          "method",
+          "encoded_uri",
+          "body"
+        ]
+      },
+      "responses": [
+        {
+          "kind": "success",
+          "status": 200,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "changed": [],
+            "left": []
+          },
+          "parsing": {
+            "expectation": "endpoint_success"
+          }
+        },
+        {
+          "kind": "error",
+          "status": 403,
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_FORBIDDEN",
+            "error": "request rejected"
+          },
+          "parsing": {
+            "expectation": "matrix_error",
+            "errcode": "M_FORBIDDEN"
+          }
+        },
+        {
+          "kind": "rate_limited",
+          "status": 429,
+          "headers": [
+            {
+              "name": "Retry-After",
+              "value": "120"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "errcode": "M_LIMIT_EXCEEDED",
+            "error": "rate limited",
+            "retry_after_ms": 5000
+          },
+          "parsing": {
+            "expectation": "retry_after",
+            "retry_source": "retry_after_header_precedes_legacy_body",
+            "retry_after_ms": 120000
+          }
+        }
+      ]
+    }
+  ],
+  "capability_expectations": {
+    "sync": "required",
+    "keys_query": "required",
+    "keys_claim": "required",
+    "to_device": "required",
+    "room_send": "required",
+    "keys_upload": "required",
+    "device_list": "required",
+    "room_keys_backup": "required",
+    "cross_signing": "candidate_declared",
+    "signatures_upload": "candidate_declared",
+    "verification": "candidate_declared",
+    "keys_changes": "required"
+  }
+}

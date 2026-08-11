@@ -4,6 +4,7 @@ use icwm_g0c_harness::{
     ScriptedResponse, StableId, StatefulResponder, admit_fixture_message,
     validate_matrix_identifier, validate_matrix_identifier_bytes,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn request(id: &str) -> EffectIntent {
@@ -866,6 +867,199 @@ fn request_vector_corpus_binds_every_id_to_exact_request_bytes() {
     let components: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
     assert_eq!(
         StableId::derive("request-vector-corpus", &components).as_str(),
+        corpus["corpus_id"].as_str().unwrap()
+    );
+}
+
+#[test]
+fn request_vector_v2_corpus_is_complete_candidate_neutral_and_credential_free() {
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/REQUEST-VECTORS-v2.json")).unwrap();
+    assert_eq!(
+        corpus["schema_version"],
+        "icwm.g0c.request-vector-corpus.v2"
+    );
+    assert_eq!(
+        corpus["candidate_contract"],
+        "same_corpus_for_every_candidate"
+    );
+
+    let vectors = corpus["vectors"].as_array().unwrap();
+    for vector in vectors {
+        let identity_input = serde_json::json!({
+            "schema_version": vector["schema_version"],
+            "operation": vector["operation"],
+            "purpose": vector["purpose"],
+            "request": vector["request"],
+            "response_cases": vector["response_cases"],
+            "responses": vector["responses"],
+            "oracle_comparison": vector["oracle_comparison"],
+        });
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&identity_input).unwrap())
+            ),
+            vector["vector_id"].as_str().unwrap()
+        );
+    }
+    let required: BTreeSet<&str> = corpus["required_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        required.len(),
+        corpus["required_operations"].as_array().unwrap().len()
+    );
+    let actual: BTreeSet<&str> = vectors
+        .iter()
+        .map(|vector| vector["operation"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actual.len(),
+        vectors.len(),
+        "operation names must be unique"
+    );
+    assert_eq!(
+        actual, required,
+        "required operation inventory must be exhaustive"
+    );
+
+    let expected_backup_operations = BTreeSet::from([
+        "room_key_backup_version_create",
+        "room_key_backup_version_get_current",
+        "room_key_backup_version_get",
+        "room_key_backup_version_update",
+        "room_key_backup_version_delete",
+        "room_keys_get_all",
+        "room_keys_put_all",
+        "room_keys_get_room",
+        "room_keys_put_room",
+        "room_keys_get_session",
+        "room_keys_put_session",
+    ]);
+    assert!(expected_backup_operations.is_subset(&actual));
+
+    for vector in vectors {
+        assert_eq!(vector["schema_version"], "icwm.g0c.request-vector.v2");
+        let request = &vector["request"];
+        assert!(
+            request["encoded_uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("/_matrix/")
+        );
+        assert_eq!(vector["responses"].as_array().unwrap().len(), 3);
+        assert_eq!(vector["responses"][0]["kind"], "success");
+        assert_eq!(vector["responses"][1]["kind"], "error");
+        assert_eq!(vector["responses"][2]["kind"], "rate_limited");
+        assert_eq!(vector["responses"][2]["status"], 429);
+        assert_eq!(
+            vector["responses"][2]["parsing"]["retry_source"],
+            "retry_after_header_precedes_legacy_body"
+        );
+        assert!(
+            request["path"].as_str().unwrap().len()
+                <= corpus["limits"]["max_path_bytes"].as_u64().unwrap() as usize
+        );
+        assert!(
+            serde_json::to_vec(&request["body"]).unwrap().len()
+                <= corpus["limits"]["max_body_bytes"].as_u64().unwrap() as usize
+        );
+        assert!(
+            request["headers"].as_array().unwrap().len()
+                <= corpus["limits"]["max_headers"].as_u64().unwrap() as usize
+        );
+        assert!(
+            request["query"].as_array().unwrap().len()
+                <= corpus["limits"]["max_query_pairs"].as_u64().unwrap() as usize
+        );
+        let query_names: BTreeSet<&str> = request["query"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| pair["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            query_names.len(),
+            request["query"].as_array().unwrap().len()
+        );
+        assert!(request["headers"].as_array().unwrap().iter().all(|header| {
+            !matches!(
+                header["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "authorization" | "proxy-authorization"
+            )
+        }));
+        assert!(request["query"].as_array().unwrap().iter().all(|pair| {
+            !matches!(
+                pair["name"].as_str().unwrap().to_ascii_lowercase().as_str(),
+                "access_token" | "token"
+            )
+        }));
+        let serialized_request = serde_json::to_string(request).unwrap().to_ascii_lowercase();
+        assert!(!serialized_request.contains("access_token"));
+        assert!(!serialized_request.contains("authorization"));
+        assert_eq!(
+            vector["response_cases"],
+            serde_json::json!(["success", "error", "rate_limited"])
+        );
+    }
+
+    assert_eq!(corpus["response_grammar"]["rate_limited"]["status"], 429);
+    assert_eq!(
+        corpus["response_grammar"]["rate_limited"]["headers"]["Retry-After"],
+        "delta-seconds only in v2; HTTP-date unexecuted"
+    );
+    assert_eq!(
+        corpus["response_grammar"]["rate_limited"]["body"]["legacy_optional"],
+        "retry_after_ms"
+    );
+
+    let capability_purposes: BTreeSet<&str> = corpus["capability_expectations"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let vector_purposes: BTreeSet<&str> = vectors
+        .iter()
+        .map(|vector| vector["purpose"].as_str().unwrap())
+        .collect();
+    let required_purposes: BTreeSet<&str> = corpus["required_purposes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|purpose| purpose.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        required_purposes.len(),
+        corpus["required_purposes"].as_array().unwrap().len()
+    );
+    assert_eq!(capability_purposes, vector_purposes);
+    assert_eq!(capability_purposes, required_purposes);
+
+    let corpus_identity_input = serde_json::json!({
+        "schema_version": corpus["schema_version"],
+        "oracle": corpus["oracle"],
+        "limits": corpus["limits"],
+        "duplicate_query_key_policy": corpus["duplicate_query_key_policy"],
+        "response_grammar": corpus["response_grammar"],
+        "required_operations": corpus["required_operations"],
+        "required_purposes": corpus["required_purposes"],
+        "vectors": corpus["vectors"],
+        "capability_expectations": corpus["capability_expectations"],
+    });
+    assert_eq!(
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&corpus_identity_input).unwrap())
+        ),
         corpus["corpus_id"].as_str().unwrap()
     );
 }

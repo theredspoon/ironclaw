@@ -1,5 +1,5 @@
 {
-  "aggregate_sha256": "742ee74622a4b99aec081abc984998aaa0972dd34ba6b7b987ff9fef68c4b337",
+  "aggregate_sha256": "b9155563c0455d0e09a41835d63588416760b539fe48d1645be8ee913fe21031",
   "algorithm": "sha256 of UTF-8 lines `<file-sha256><two spaces><relative-path>\\n`, entries sorted bytewise by relative path",
   "approved_ignored_common_aggregate_sha256": "e603556c99acd3de3c69b60acb74486a858993e5bb7fe9d1bd66827ea6d3d34b",
   "authority": "contribution_grade_not_gate_or_adr_acceptance",
@@ -36,14 +36,19 @@
       "sha256": "291d8261349e16571d7c0ce34e1ab65c76718e465b762035d4d8ae0901cbb415"
     },
     {
-      "bytes": 8643,
+      "bytes": 12035,
       "path": "README.md",
-      "sha256": "2c4cf600a361267a936f3f14fcfc75dec4e871a3b58db70462e21c04ddedd675"
+      "sha256": "55639c3cdbf4614765b26d1332aa52f02c2ddf5e458165fe9b452d1e061ae0a0"
     },
     {
       "bytes": 5999,
       "path": "contracts/HARNESS-RESULT.schema.json",
       "sha256": "d0689ff35aeab99db2c0354f58a7e40e938a253e8d9920d97f68bffa31688bbb"
+    },
+    {
+      "bytes": 6160,
+      "path": "contracts/REQUEST-VECTOR-v2.schema.json",
+      "sha256": "c4e2b06235c0993d52b74d952b8a64416bfdd7d8dca40cd009bd28cba69d59d4"
     },
     {
       "bytes": 1688,
@@ -76,9 +81,49 @@
       "sha256": "2422a729df9b88f8005f34e35fe2794248412b05cdca50d0d83edeb1c4193878"
     },
     {
+      "bytes": 60538,
+      "path": "fixtures/REQUEST-VECTORS-v2.json",
+      "sha256": "9e988de5ff0db08484502a611b40fa888f401b72c2e16bf259241012dbdf636b"
+    },
+    {
+      "bytes": 90,
+      "path": "fixtures/REQUEST-VECTORS-v2.sha256",
+      "sha256": "56535e0b70fb7ae80faa5bd7844eb261773ccfd89dec697bc88b9ff4d60dd9de"
+    },
+    {
+      "bytes": 24034,
+      "path": "oracles/ruma-request-v2/Cargo.lock",
+      "sha256": "88a49a5a3db983232d59c68ecfedaa74dd57a6f171f24bf306efbc8f816cc1e5"
+    },
+    {
+      "bytes": 478,
+      "path": "oracles/ruma-request-v2/Cargo.toml",
+      "sha256": "2ab0224dd6af824fa8ac240072c8da408dfc13c3140cc5ce47090d1a3dd13d38"
+    },
+    {
+      "bytes": 620,
+      "path": "oracles/ruma-request-v2/README.md",
+      "sha256": "11b3163f0a763126ffdaf538aa3fc84244b7951ab3637fef12e83276a3e5be7c"
+    },
+    {
+      "bytes": 99,
+      "path": "oracles/ruma-request-v2/src/lib.rs",
+      "sha256": "0a1970ea21d62aee7733525691fa83fa678ba9c2cd8d6ae7a4002f7c904d685d"
+    },
+    {
+      "bytes": 10162,
+      "path": "oracles/ruma-request-v2/tests/oracle_contract.rs",
+      "sha256": "bd90cb2b2d85de20af3c4d5387037f28124a7b6807db68c821b083a158ffd695"
+    },
+    {
       "bytes": 60556,
       "path": "src/lib.rs",
       "sha256": "4501eb1462fe66c21cf1677b06b915ed9760693bef9d495f44f46c55f8f3bc9d"
+    },
+    {
+      "bytes": 3048,
+      "path": "test_validate_request_vectors_v2.py",
+      "sha256": "422ee51bd3ac9446a2e6c3c31be2fc130d8ff4ff07816fe612cfe1b49b770a1a"
     },
     {
       "bytes": 6805,
@@ -86,14 +131,19 @@
       "sha256": "78c27c24a92d0f18400a621128c6aa96bafbb8ffbe692fa741498c42bcda8653"
     },
     {
-      "bytes": 49545,
+      "bytes": 56456,
       "path": "tests/contracts.rs",
-      "sha256": "a8b4e648771e29659e89456143a647a86756d0d82be3abe43696df7cfcb66348"
+      "sha256": "f9c2249151fc1f774a7a846ded2fad3b4f8222809990bc49bb2556bd35ff0989"
     },
     {
-      "bytes": 8071,
+      "bytes": 7259,
+      "path": "validate-request-vectors-v2.py",
+      "sha256": "620c104ac86ea0b0601e1d17694ed3efade6523b4724d224a442f7bdd26a6867"
+    },
+    {
+      "bytes": 11200,
       "path": "verify-publication.py",
-      "sha256": "6d0a5fb2706df31afcae694578c2e5b6922863a805365e093afdbad4621bfe5b"
+      "sha256": "e0d1f75f0ef18e83c69a8099a133f87c2b041058602dd39c24396c664085902f"
     }
   ],
   "exclusions": {

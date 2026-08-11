@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ironclaw:icwm-g0c:request-vector:v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version","corpus_id","identity_algorithm","candidate_contract","candidate_contract_note","known_coverage_gaps","oracle","limits","duplicate_query_key_policy","response_grammar","required_operations","required_purposes","vectors","capability_expectations"],
+  "properties": {
+    "schema_version": {"const":"icwm.g0c.request-vector-corpus.v2"},
+    "corpus_id": {"$ref":"#/$defs/sha256"},
+    "identity_algorithm": {"type":"string","minLength":1},
+    "candidate_contract": {"const":"same_corpus_for_every_candidate"},
+    "candidate_contract_note": {"type":"string","minLength":1},
+    "known_coverage_gaps": {"type":"array","minItems":3,"uniqueItems":true,"items":{"type":"string","minLength":1}},
+    "oracle": {"$ref":"#/$defs/oracle"},
+    "limits": {"$ref":"#/$defs/limits"},
+    "duplicate_query_key_policy": {"const":"reject"},
+    "response_grammar": {"$ref":"#/$defs/responseGrammar"},
+    "required_operations": {"type":"array","minItems":22,"maxItems":22,"uniqueItems":true,"items":{"$ref":"#/$defs/operation"}},
+    "required_purposes": {"type":"array","minItems":12,"maxItems":12,"uniqueItems":true,"items":{"$ref":"#/$defs/purpose"}},
+    "vectors": {"type":"array","minItems":22,"maxItems":22,"items":{"$ref":"#/$defs/vector"}},
+    "capability_expectations": {
+      "type":"object","minProperties":12,"maxProperties":12,
+      "propertyNames":{"$ref":"#/$defs/purpose"},
+      "additionalProperties":{"enum":["required","candidate_declared","not_applicable"]}
+    }
+  },
+  "$defs": {
+    "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+    "purpose":{"enum":["sync","keys_query","keys_claim","to_device","room_send","keys_upload","device_list","room_keys_backup","cross_signing","signatures_upload","verification","keys_changes"]},
+    "operation":{"enum":["sync","keys_query","keys_claim","to_device","room_send","keys_upload","device_list","room_key_backup_version_create","room_key_backup_version_get_current","room_key_backup_version_get","room_key_backup_version_update","room_key_backup_version_delete","room_keys_get_all","room_keys_put_all","room_keys_get_room","room_keys_put_room","room_keys_get_session","room_keys_put_session","cross_signing","signatures_upload","verification","keys_changes"]},
+    "pair":{"type":"object","additionalProperties":false,"required":["name","value"],"properties":{"name":{"type":"string","minLength":1,"maxLength":128},"value":{"type":"string","maxLength":8192}}},
+    "request":{"type":"object","additionalProperties":false,"required":["method","path","path_parameters","query","headers","body","encoded_uri"],"properties":{"method":{"enum":["GET","POST","PUT","DELETE"]},"path":{"type":"string","pattern":"^/_matrix/","maxLength":8192},"path_parameters":{"type":"array","maxItems":16,"items":{"$ref":"#/$defs/pair"}},"query":{"type":"array","maxItems":32,"items":{"$ref":"#/$defs/pair"}},"headers":{"type":"array","maxItems":32,"items":{"$ref":"#/$defs/pair"}},"body":{},"encoded_uri":{"type":"string","pattern":"^/_matrix/","maxLength":8192}}},
+    "response":{"type":"object","additionalProperties":false,"required":["kind","status","headers","body","parsing"],"properties":{"kind":{"enum":["success","error","rate_limited"]},"status":{"type":"integer","minimum":100,"maximum":599},"headers":{"type":"array","maxItems":32,"items":{"$ref":"#/$defs/pair"}},"body":{},"parsing":{"type":"object"}}},
+    "oracleComparison":{"oneOf":[{"type":"object","additionalProperties":false,"required":["mode","coverage"],"properties":{"mode":{"const":"ruma_outgoing_request"},"coverage":{"type":"array","minItems":3,"uniqueItems":true,"items":{"enum":["method","encoded_uri","body","success_response_decode","matrix_error_decode"]},"contains":{"const":"method"}}}},{"type":"object","additionalProperties":false,"required":["mode","reason"],"properties":{"mode":{"const":"manual_shaping_exception"},"reason":{"type":"string","minLength":1}}}]},
+    "vector":{"type":"object","additionalProperties":false,"required":["schema_version","vector_id","operation","purpose","request","response_cases","oracle_comparison","responses"],"properties":{"schema_version":{"const":"icwm.g0c.request-vector.v2"},"vector_id":{"$ref":"#/$defs/sha256"},"operation":{"$ref":"#/$defs/operation"},"purpose":{"$ref":"#/$defs/purpose"},"request":{"$ref":"#/$defs/request"},"response_cases":{"const":["success","error","rate_limited"]},"oracle_comparison":{"$ref":"#/$defs/oracleComparison"},"responses":{"type":"array","minItems":3,"maxItems":3,"items":{"$ref":"#/$defs/response"}}}},
+    "oracle":{"type":"object","additionalProperties":false,"required":["role","repository","commit","packages","features","default_features","rustc","cargo","lockfile","lockfile_sha256"],"properties":{"role":{"type":"string","minLength":1},"repository":{"const":"https://github.com/ruma/ruma"},"commit":{"pattern":"^[0-9a-f]{40}$"},"packages":{"const":[{"name":"ruma-client-api","version":"0.24.0","features":["client"]},{"name":"ruma-common","version":"0.19.0","features":["api","client"]}]},"features":{"const":["ruma-client-api/client","ruma-common/api","ruma-common/client"]},"default_features":{"const":false},"rustc":{"type":"string","minLength":1},"cargo":{"type":"string","minLength":1},"lockfile":{"const":"oracles/ruma-request-v2/Cargo.lock"},"lockfile_sha256":{"$ref":"#/$defs/sha256"}}},
+    "limits":{"const":{"max_headers":32,"max_query_pairs":32,"max_name_bytes":128,"max_value_bytes":8192,"max_path_bytes":8192,"max_body_bytes":1048576,"max_retry_after_seconds":86400,"max_retry_after_ms":86400000}},
+    "responseGrammar":{"const":{"success":{"status_range":[200,299],"headers":"ordered_name_value_pairs","body":"bounded_json_or_empty"},"error":{"status_range":[400,599],"headers":"ordered_name_value_pairs","body":{"required":["errcode","error"]}},"rate_limited":{"status":429,"headers":{"Retry-After":"delta-seconds only in v2; HTTP-date unexecuted"},"body":{"errcode":"M_LIMIT_EXCEEDED","legacy_optional":"retry_after_ms"}}}}
+  }
+}

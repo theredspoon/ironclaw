@@ -234,6 +234,12 @@ class IcwmG0cWorkflowContractTests(unittest.TestCase):
             ("python3", "scripts/ci/test_ws12_workflow_contracts.py"),
             ("python3", "harness/icwm-g0c/verify-publication.py"),
             ("python3", "harness/icwm-g0c/test_verify_publication.py"),
+            ("python3", "harness/icwm-g0c/validate-request-vectors-v2.py"),
+            ("python3", "harness/icwm-g0c/test_validate_request_vectors_v2.py"),
+            (
+                "cargo", "test", "--locked", "--manifest-path",
+                "harness/icwm-g0c/oracles/ruma-request-v2/Cargo.toml",
+            ),
             (
                 "cargo", "fmt", "--manifest-path", "harness/icwm-g0c/Cargo.toml",
                 "--", "--check",
@@ -260,6 +266,11 @@ class IcwmG0cWorkflowContractTests(unittest.TestCase):
                 "python3", "-m", "jsonschema", "-i",
                 "harness/icwm-g0c/fixtures/REQUEST-VECTORS-v1.json",
                 "harness/icwm-g0c/contracts/REQUEST-VECTOR.schema.json",
+            ),
+            (
+                "python3", "-m", "jsonschema", "-i",
+                "harness/icwm-g0c/fixtures/REQUEST-VECTORS-v2.json",
+                "harness/icwm-g0c/contracts/REQUEST-VECTOR-v2.schema.json",
             ),
         )
         step_commands = [self.executable_commands(step) for step in steps]
