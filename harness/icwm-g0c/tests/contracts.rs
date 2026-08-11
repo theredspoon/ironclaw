@@ -4,7 +4,7 @@ use icwm_g0c_harness::{
     ScriptedResponse, StableId, StatefulResponder, admit_fixture_message,
     validate_matrix_identifier, validate_matrix_identifier_bytes,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn request(id: &str) -> EffectIntent {
     EffectIntent::new(
@@ -156,7 +156,7 @@ fn explicit_crash_does_not_credit_an_untraversed_armed_failpoint() {
     assert_eq!(report.crashes.len(), 1);
     let reason = report.disposition_reason.unwrap();
     assert!(reason.contains("UnreachedFailpoints { count: 1 }"));
-    assert!(reason.contains("ArmedFailpointUnreached"));
+    assert!(reason.contains("ArmedFailpointUnreached { failpoint: candidate_before_prepare }"));
 
     let operation_id = StableId::derive("traversed-required-failpoint", &[]);
     let mut traversed = Harness::new(
@@ -180,6 +180,23 @@ fn explicit_crash_does_not_credit_an_untraversed_armed_failpoint() {
             .as_deref()
             .unwrap()
             .contains("UnreachedFailpoints")
+    );
+}
+
+#[test]
+fn failpoint_error_evidence_uses_stable_codes() {
+    let failpoint = Failpoint::CandidateAfterCommitBeforeAcknowledge;
+    assert_eq!(
+        failpoint.code(),
+        "candidate_after_commit_before_acknowledge"
+    );
+    assert_eq!(
+        HarnessError::InjectedFailpoint { failpoint }.to_string(),
+        "InjectedFailpoint { failpoint: candidate_after_commit_before_acknowledge }"
+    );
+    assert_eq!(
+        HarnessError::ArmedFailpointUnreached { failpoint }.to_string(),
+        "ArmedFailpointUnreached { failpoint: candidate_after_commit_before_acknowledge }"
     );
 }
 
@@ -236,6 +253,37 @@ fn stable_ids_use_typed_length_delimited_material_not_serialized_json() {
     assert_eq!(
         left.as_str(),
         "e8a72c93c99554ee0d3eba350c5128682b1440a2377df6e5afa5754fd6b8b84b"
+    );
+}
+
+#[test]
+fn harness_error_display_is_stable_and_explicit() {
+    assert_eq!(
+        HarnessError::IdentifierTooLong { bytes: 256 }.to_string(),
+        "IdentifierTooLong { bytes: 256 }"
+    );
+    assert_eq!(
+        HarnessError::InvalidIdentifier.to_string(),
+        "InvalidIdentifier"
+    );
+    assert_eq!(
+        HarnessError::InvalidAdmissionTopology.to_string(),
+        "InvalidAdmissionTopology"
+    );
+    assert_eq!(HarnessError::MissingActor.to_string(), "MissingActor");
+    assert_eq!(
+        HarnessError::MissingCapabilityDispositionReason {
+            capability: "sync".into()
+        }
+        .to_string(),
+        "MissingCapabilityDispositionReason { capability: sync }"
+    );
+    assert_eq!(
+        HarnessError::ResponderUnsupported {
+            purpose: "room_send".into()
+        }
+        .to_string(),
+        "ResponderUnsupported { purpose: room_send }"
     );
 }
 
@@ -593,7 +641,6 @@ fn responder_releases_sync_cross_signing_to_device_and_captures_requests() {
         credential_free_body: br#"{"device_keys":{}}"#.to_vec(),
     };
     vector.vector_id = vector.derived_id();
-    vector.validate_identity().unwrap();
     responder.capture_request(vector.clone());
     assert_eq!(responder.release_sync(), Some(b"sync-one".to_vec()));
     assert_eq!(responder.release_sync(), None);
@@ -824,6 +871,55 @@ fn request_vector_corpus_binds_every_id_to_exact_request_bytes() {
 }
 
 #[test]
+fn responder_support_set_matches_behavior_and_published_corpus_purposes() {
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/REQUEST-VECTORS-v1.json")).unwrap();
+    let corpus_purposes: BTreeSet<&str> = corpus["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|vector| vector["purpose"].as_str().unwrap())
+        .collect();
+    let claimed_purposes: BTreeSet<&str> = corpus["capability_expectations"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(corpus_purposes, claimed_purposes);
+
+    let supported = BTreeSet::from([
+        "sync",
+        "keys_query",
+        "keys_claim",
+        "to_device",
+        "cross_signing",
+        "signatures_upload",
+    ]);
+    for purpose in corpus_purposes {
+        assert_eq!(
+            StatefulResponder::supports_purpose(purpose),
+            supported.contains(purpose)
+        );
+        let mut vector = icwm_g0c_harness::RequestVector {
+            schema_version: "icwm.g0c.request-vector.v1".into(),
+            vector_id: StableId::derive("placeholder", &[]),
+            purpose: purpose.into(),
+            method: "POST".into(),
+            path: "/_matrix/client/v3/test".into(),
+            credential_free_body: b"{}".to_vec(),
+        };
+        vector.vector_id = vector.derived_id();
+        let result = StatefulResponder::default().respond(&vector);
+        assert_eq!(
+            matches!(result, Err(HarnessError::ResponderUnsupported { .. })),
+            !supported.contains(purpose),
+            "responder behavior for {purpose}"
+        );
+    }
+}
+
+#[test]
 fn artifact_reports_are_derived_and_checked_for_all_dispositions() {
     for disposition in [
         icwm_g0c_harness::ResultDisposition::Supported,
@@ -947,13 +1043,35 @@ fn identifier_and_admission_fixture_executes_every_case() {
             identifier_expected == "accepted",
             "harness identifier result for fixture case {case:?}"
         );
-        let admission_accepted =
-            admit_fixture_message(actor, kind, &value, trigger).unwrap_or(false);
-        assert_eq!(
-            admission_accepted,
-            admission_expected == "accepted",
-            "message admission result for fixture case {case:?}"
-        );
+        let admission = admit_fixture_message(actor, kind, &value, trigger);
+        let rejection_cause = case["admission_rejection_cause"].as_str();
+        match (admission_expected, rejection_cause) {
+            ("accepted", None) => assert_eq!(admission, Ok(true), "fixture case {case:?}"),
+            ("rejected", Some("ambient_policy")) => {
+                assert_eq!(admission, Ok(false), "fixture case {case:?}")
+            }
+            ("rejected", Some("missing_actor")) => assert_eq!(
+                admission,
+                Err(HarnessError::MissingActor),
+                "fixture case {case:?}"
+            ),
+            ("rejected", Some("invalid_identifier")) => assert_eq!(
+                admission,
+                Err(HarnessError::InvalidIdentifier),
+                "fixture case {case:?}"
+            ),
+            ("rejected", Some("identifier_too_long")) => assert_eq!(
+                admission,
+                Err(HarnessError::IdentifierTooLong { bytes: value.len() }),
+                "fixture case {case:?}"
+            ),
+            ("rejected", Some("invalid_topology")) => assert_eq!(
+                admission,
+                Err(HarnessError::InvalidAdmissionTopology),
+                "fixture case {case:?}"
+            ),
+            other => panic!("invalid admission expectation {other:?} for fixture case {case:?}"),
+        }
 
         let oracle_accepted = std::str::from_utf8(&value).ok().map(|value| match kind {
             MatrixIdentifierKind::UserId => ruma_common::UserId::parse(value).is_ok(),
@@ -1027,24 +1145,51 @@ fn published_control_result_round_trips_through_report_model() {
 }
 
 #[test]
-fn capability_not_applicable_requires_a_capability_scoped_reason() {
-    let plan = icwm_g0c_harness::RunPlan {
-        capability_dispositions: BTreeMap::from([(
-            "sync".into(),
-            icwm_g0c_harness::ResultDisposition::NotApplicable,
-        )]),
-        ..Default::default()
-    };
-    assert!(matches!(
-        Harness::new(
-            ControlAdapter::new(CandidateId::new("control", "1")),
-            vec![],
-            vec![]
+fn published_result_and_scenario_schemas_share_the_exact_failpoint_set() {
+    fn failpoints(schema: &str) -> (usize, BTreeSet<String>) {
+        let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+        let values = schema["$defs"]["failpoint"]["enum"].as_array().unwrap();
+        (
+            values.len(),
+            values
+                .iter()
+                .map(|value| value.as_str().unwrap().to_owned())
+                .collect(),
         )
-        .with_run_plan(plan),
-        Err(HarnessError::MissingCapabilityDispositionReason { capability })
-            if capability == "sync"
-    ));
+    }
+
+    let result = failpoints(include_str!("../contracts/HARNESS-RESULT.schema.json"));
+    let scenario = failpoints(include_str!("../contracts/SCENARIO.schema.json"));
+    assert_eq!(result.0, 16, "result schema failpoint cardinality");
+    assert_eq!(scenario.0, 16, "scenario schema failpoint cardinality");
+    assert_eq!(result.1.len(), result.0, "result schema duplicates");
+    assert_eq!(scenario.1.len(), scenario.0, "scenario schema duplicates");
+    assert_eq!(result.1, scenario.1, "published failpoint schema drift");
+}
+
+#[test]
+fn every_non_supported_capability_disposition_requires_a_scoped_reason() {
+    for disposition in [
+        icwm_g0c_harness::ResultDisposition::Failed,
+        icwm_g0c_harness::ResultDisposition::Uncertain,
+        icwm_g0c_harness::ResultDisposition::Infeasible,
+        icwm_g0c_harness::ResultDisposition::NotApplicable,
+    ] {
+        let plan = icwm_g0c_harness::RunPlan {
+            capability_dispositions: BTreeMap::from([("sync".into(), disposition)]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Harness::new(
+                ControlAdapter::new(CandidateId::new("control", "1")),
+                vec![],
+                vec![]
+            )
+            .with_run_plan(plan),
+            Err(HarnessError::MissingCapabilityDispositionReason { capability })
+                if capability == "sync"
+        ));
+    }
 }
 
 #[test]
@@ -1189,6 +1334,20 @@ fn publication_bindings_are_validated_separately_from_execution() {
     };
     let mut stale = bindings.clone();
     stale.scenario_hash = "0".repeat(64);
+    rejects(&stale);
+
+    let mut stale = bindings.clone();
+    let vector = stale.vector_hashes.keys().next().unwrap().clone();
+    stale.vector_hashes.insert(vector, "0".repeat(64));
+    rejects(&stale);
+
+    let mut stale = bindings.clone();
+    let evidence = stale.evidence_hashes.keys().next().unwrap().clone();
+    stale.evidence_hashes.insert(evidence, "0".repeat(64));
+    rejects(&stale);
+
+    let mut stale = bindings.clone();
+    stale.dependency_graph.sha256 = "0".repeat(64);
     rejects(&stale);
 
     let mut stale = bindings.clone();

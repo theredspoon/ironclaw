@@ -56,6 +56,9 @@ jobs:
       - name: Verify publication manifest
         run: python3 harness/icwm-g0c/verify-publication.py
 
+      - name: Test publication verifier
+        run: python3 harness/icwm-g0c/test_verify_publication.py
+
       - name: Check standalone formatting
         run: cargo fmt --manifest-path harness/icwm-g0c/Cargo.toml -- --check
 
@@ -64,6 +67,13 @@ jobs:
 
       - name: Lint standalone harness
         run: cargo clippy --locked --manifest-path harness/icwm-g0c/Cargo.toml --all-targets -- -D warnings
+
+      - name: Check standalone dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
+        with:
+          manifest-path: harness/icwm-g0c/Cargo.toml
+          command: check
+          arguments: --all-features
 
       - name: Validate published schemas and fixtures
         run: |

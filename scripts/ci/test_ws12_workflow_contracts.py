@@ -212,10 +212,28 @@ class IcwmG0cWorkflowContractTests(unittest.TestCase):
         )
         self.assertRegex(rust, r"(?m)^          toolchain: stable$")
         self.assertRegex(rust, r"(?m)^          components: (?:rustfmt, clippy|clippy, rustfmt)$")
+        deny_steps = [
+            step
+            for step in steps
+            if "uses: EmbarkStudios/cargo-deny-action@" in step
+        ]
+        self.assertEqual(len(deny_steps), 1, "expected one standalone cargo-deny step")
+        deny = deny_steps[0]
+        self.assertIn(
+            "uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25",
+            deny,
+        )
+        self.assertRegex(
+            deny,
+            r"(?m)^          manifest-path: harness/icwm-g0c/Cargo.toml$",
+        )
+        self.assertRegex(deny, r"(?m)^          command: check$")
+        self.assertRegex(deny, r"(?m)^          arguments: --all-features$")
 
         required_commands = (
             ("python3", "scripts/ci/test_ws12_workflow_contracts.py"),
             ("python3", "harness/icwm-g0c/verify-publication.py"),
+            ("python3", "harness/icwm-g0c/test_verify_publication.py"),
             (
                 "cargo", "fmt", "--manifest-path", "harness/icwm-g0c/Cargo.toml",
                 "--", "--check",

@@ -41,6 +41,13 @@ still: it contains one `matrix_request` effect and reaches no failpoint. These
 omissions remain required candidate/live-tier work and cannot be inferred from
 the existence of enum variants or schemas.
 
+`StatefulResponder` is a bounded deterministic double, not a general Matrix
+homeserver. It supports only `sync`, `keys_query`, `keys_claim`, `to_device`,
+`cross_signing`, and `signatures_upload` request purposes. Its stored replies
+and request capture exercise those selected control paths; unsupported
+purposes fail explicitly, and no support for the remaining capability
+vocabulary is implied.
+
 Identifier differential tests use only the exact crates.io `ruma-common
 0.19.0` identifier parse layer. They do not invoke Ruma strict or historical
 validation modes and make no claim about those validators. This is the current
@@ -49,10 +56,15 @@ recapture and the same `ruma-common` version resolved through the Matrix SDK
 0.18 candidate graph. It is a test-only oracle, not a production dependency or
 an architectural selection of the full SDK. The corpus records oracle parsing,
 the independent bounded harness identifier policy, and message admission as
-separate outcomes. Intentional differential cases run in both oracle/harness
-directions, while admission may impose stricter topology and actor requirements.
-Direct chats use room IDs, matching Matrix `m.direct` account-data values; the
-actor remains a user ID.
+separate outcomes. Admission is a stricter topology/actor policy applied after
+identifier parsing; its rejection does not mean the parser rejected the
+identifier. Intentional differential cases run in both oracle/harness
+directions.
+`direct_chat` is a caller-supplied trigger label. For that label, this harness
+checks only that the subject has room-ID topology and the actor has user-ID
+topology. It does not ingest `m.direct` account data, check room membership in
+that mapping, or prove that the event came from a Matrix direct-message room;
+those are upstream state/authentication responsibilities.
 
 ## Reproduce
 
@@ -64,6 +76,7 @@ target_dir="$(mktemp -d)"
 CARGO_TARGET_DIR="$target_dir" cargo test --locked --manifest-path harness/icwm-g0c/Cargo.toml
 CARGO_TARGET_DIR="$target_dir" cargo clippy --locked --manifest-path harness/icwm-g0c/Cargo.toml --all-targets -- -D warnings
 python3 harness/icwm-g0c/verify-publication.py
+python3 harness/icwm-g0c/test_verify_publication.py
 ```
 
 Remove the temporary target directory after recording author or verifier
@@ -125,6 +138,12 @@ canonical JSON for inputs, expected effects, and failpoints. Canonical JSON is
 UTF-8 with lexicographically sorted object keys and no optional whitespace.
 The publication verifier independently derives that identity and validates all
 named control-result hashes against their live artifacts.
+
+The result fixture's `scenario_hash` is a different identity: it is the raw
+SHA-256 digest of the complete `CONTROL-SCENARIO.json` bytes, including
+formatting and the embedded `scenario_id`. It binds the exact published file.
+The content-derived `scenario_id` identifies scenario semantics under the
+versioned StableId construction; neither value substitutes for the other.
 
 The containing Git commit is intentionally not embedded in either manifest.
 Exact-head review publication and the post-merge receipt bind that commit

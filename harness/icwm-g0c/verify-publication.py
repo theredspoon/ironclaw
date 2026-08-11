@@ -30,6 +30,10 @@ EXCLUDED_GENERATED_DIRECTORIES = frozenset(
         ".pytest_cache",
     }
 )
+EXPECTED_MANIFEST_EXCLUSIONS = {
+    "self_files_relative_to_harness_root": sorted(EXCLUDED_PAYLOAD_FILES),
+    "generated_directory_exact_basenames": sorted(EXCLUDED_GENERATED_DIRECTORIES),
+}
 
 
 def sha256(path: Path) -> str:
@@ -174,6 +178,8 @@ def main() -> None:
         raise SystemExit("publication manifest digest mismatch")
 
     manifest = json.loads(manifest_bytes)
+    if manifest.get("exclusions") != EXPECTED_MANIFEST_EXCLUSIONS:
+        raise SystemExit("publication manifest exclusions do not match verifier policy")
     paths = [entry["path"] for entry in manifest["entries"]]
     if paths != sorted(paths, key=lambda value: value.encode("utf-8")):
         raise SystemExit("publication manifest entries are not bytewise path-sorted")

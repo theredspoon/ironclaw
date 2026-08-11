@@ -46,13 +46,3 @@ updates:
       actions:
         patterns:
           - "*"
-
-  - package-ecosystem: cargo
-    directory: "/harness/icwm-g0c"
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      icwm-g0c-harness-dependencies:
-        patterns:
-          - "*"

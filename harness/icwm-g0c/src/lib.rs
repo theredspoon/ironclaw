@@ -22,29 +22,13 @@ pub struct StableId(String);
 impl StableId {
     pub fn derive(domain: &str, components: &[&[u8]]) -> Self {
         let mut hash = Sha256::new();
-        hash.update(
-            u64::try_from(CONTRACT_VERSION.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
+        update_stable_id_length(&mut hash, CONTRACT_VERSION.len());
         hash.update(CONTRACT_VERSION.as_bytes());
-        hash.update(
-            u64::try_from(domain.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
+        update_stable_id_length(&mut hash, domain.len());
         hash.update(domain.as_bytes());
-        hash.update(
-            u64::try_from(components.len())
-                .unwrap_or(u64::MAX)
-                .to_be_bytes(),
-        );
+        update_stable_id_length(&mut hash, components.len());
         for component in components {
-            hash.update(
-                u64::try_from(component.len())
-                    .unwrap_or(u64::MAX)
-                    .to_be_bytes(),
-            );
+            update_stable_id_length(&mut hash, component.len());
             hash.update(component);
         }
         Self(format!("{:x}", hash.finalize()))
@@ -53,6 +37,14 @@ impl StableId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn update_stable_id_length(hash: &mut Sha256, length: usize) {
+    let length = match u64::try_from(length) {
+        Ok(length) => length,
+        Err(_) => panic!("StableId input length exceeds the u64 wire prefix"),
+    };
+    hash.update(length.to_be_bytes());
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -238,6 +230,31 @@ pub enum Failpoint {
 }
 
 impl Failpoint {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::LedgerBeforeCryptoStoreAppend => "ledger_before_crypto_store_append",
+            Self::LedgerAfterCryptoStoreAppend => "ledger_after_crypto_store_append",
+            Self::LedgerUnknownCryptoStoreAppend => "ledger_unknown_crypto_store_append",
+            Self::LedgerBeforeIngressAppend => "ledger_before_ingress_append",
+            Self::LedgerAfterIngressAppend => "ledger_after_ingress_append",
+            Self::LedgerUnknownIngressAppend => "ledger_unknown_ingress_append",
+            Self::CandidateBeforePrepare => "candidate_before_prepare",
+            Self::CandidateAfterPrepare => "candidate_after_prepare",
+            Self::CandidateAfterCommitBeforeAcknowledge => {
+                "candidate_after_commit_before_acknowledge"
+            }
+            Self::ProcessBeforeEffectAppend => "process_before_effect_append",
+            Self::ProcessAfterEffectAppend => "process_after_effect_append",
+            Self::ResponseBeforePrepare => "response_before_prepare",
+            Self::ResponseAfterCommitBeforeAcknowledge => {
+                "response_after_commit_before_acknowledge"
+            }
+            Self::BeforePreparedCiphertextHandoff => "before_prepared_ciphertext_handoff",
+            Self::AfterPreparedCiphertextHandoff => "after_prepared_ciphertext_handoff",
+            Self::StaleWriterAfterTakeover => "stale_writer_after_takeover",
+        }
+    }
+
     fn is_uncertain(self) -> bool {
         matches!(
             self,
@@ -885,13 +902,7 @@ pub fn admit_fixture_message(
     validate_typed_matrix_identifier_bytes(conversation_kind, conversation)?;
     let actor = actor.ok_or(HarnessError::MissingActor)?;
     validate_typed_matrix_identifier_bytes(MatrixIdentifierKind::UserId, actor)?;
-    let topology_valid = match trigger {
-        AdmissionTrigger::DirectChat => conversation_kind == MatrixIdentifierKind::RoomId,
-        AdmissionTrigger::BotMention | AdmissionTrigger::ReplyToBot | AdmissionTrigger::Ambient => {
-            conversation_kind == MatrixIdentifierKind::RoomId
-        }
-    };
-    if !topology_valid {
+    if conversation_kind != MatrixIdentifierKind::RoomId {
         return Err(HarnessError::InvalidAdmissionTopology);
     }
     Ok(!matches!(trigger, AdmissionTrigger::Ambient))
@@ -954,6 +965,18 @@ pub struct StatefulResponder {
 }
 
 impl StatefulResponder {
+    pub fn supports_purpose(purpose: &str) -> bool {
+        matches!(
+            purpose,
+            "sync"
+                | "keys_query"
+                | "keys_claim"
+                | "to_device"
+                | "cross_signing"
+                | "signatures_upload"
+        )
+    }
+
     pub fn respond(&mut self, request: &RequestVector) -> Result<Vec<u8>, HarnessError> {
         self.capture_request(request.clone());
         match request.purpose.as_str() {
@@ -1191,7 +1214,7 @@ impl<A: CandidateAdapter> Harness<A> {
             return Err(HarnessError::MissingDispositionReason);
         }
         for (capability, disposition) in &run_plan.capability_dispositions {
-            if *disposition == ResultDisposition::NotApplicable
+            if *disposition != ResultDisposition::Supported
                 && run_plan
                     .capability_disposition_reasons
                     .get(capability)
@@ -1426,19 +1449,8 @@ impl<A: CandidateAdapter> Harness<A> {
             self.expected_effects.pop_front();
             let sequence =
                 u64::try_from(self.ledger.len()).map_err(|_| HarnessError::SequenceOverflow)?;
-            self.ledger.push(RecordedEffect {
-                sequence,
-                at_ms: self.clock.now_ms(),
-                intent: actual,
-            });
-            let kind = &self
-                .ledger
-                .last()
-                .ok_or(HarnessError::SequenceOverflow)?
-                .intent
-                .kind;
-            let after = boundary_failpoint(kind, false);
-            let unknown = match kind {
+            let after = boundary_failpoint(&actual.kind, false);
+            let unknown = match &actual.kind {
                 EffectKind::CryptoStoreWrite { .. } => {
                     Some(Failpoint::LedgerUnknownCryptoStoreAppend)
                 }
@@ -1447,8 +1459,15 @@ impl<A: CandidateAdapter> Harness<A> {
                 }
                 _ => None,
             };
-            if self.armed_failpoint == unknown && unknown.is_some() {
-                return self.trigger(unknown.ok_or(HarnessError::SequenceOverflow)?);
+            self.ledger.push(RecordedEffect {
+                sequence,
+                at_ms: self.clock.now_ms(),
+                intent: actual,
+            });
+            if let Some(unknown) = unknown
+                && self.armed_failpoint == Some(unknown)
+            {
+                return self.trigger(unknown);
             }
             if let Some(after) = after
                 && self.armed_failpoint == Some(after)
@@ -1576,7 +1595,96 @@ pub enum HarnessError {
 
 impl Display for HarnessError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{self:?}")
+        match self {
+            Self::ClockOverflow => formatter.write_str("ClockOverflow"),
+            Self::SequenceOverflow => formatter.write_str("SequenceOverflow"),
+            Self::MissingScriptedResponse => formatter.write_str("MissingScriptedResponse"),
+            Self::UnusedScriptedResponses { count } => {
+                write!(formatter, "UnusedScriptedResponses {{ count: {count} }}")
+            }
+            Self::MissingEffects { count } => {
+                write!(formatter, "MissingEffects {{ count: {count} }}")
+            }
+            Self::UnexpectedEffect { actual } => write!(
+                formatter,
+                "UnexpectedEffect {{ actual: {} }}",
+                actual.as_str()
+            ),
+            Self::ReorderedEffect { expected, actual } => write!(
+                formatter,
+                "ReorderedEffect {{ expected: {}, actual: {} }}",
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::ControlInputUnsupported { input } => {
+                write!(formatter, "ControlInputUnsupported {{ input: {input} }}")
+            }
+            Self::IdentifierTooLong { bytes } => {
+                write!(formatter, "IdentifierTooLong {{ bytes: {bytes} }}")
+            }
+            Self::InvalidIdentifier => formatter.write_str("InvalidIdentifier"),
+            Self::InvalidAdmissionTopology => formatter.write_str("InvalidAdmissionTopology"),
+            Self::InvalidPartialResponse => formatter.write_str("InvalidPartialResponse"),
+            Self::OperationAlreadyActive { operation_id } => write!(
+                formatter,
+                "OperationAlreadyActive {{ operation_id: {} }}",
+                operation_id.as_str()
+            ),
+            Self::OperationNotActive { operation_id } => write!(
+                formatter,
+                "OperationNotActive {{ operation_id: {} }}",
+                operation_id.as_str()
+            ),
+            Self::ResponderUnavailable => formatter.write_str("ResponderUnavailable"),
+            Self::ResponderRequestInvalid => formatter.write_str("ResponderRequestInvalid"),
+            Self::ResponderUnsupported { purpose } => {
+                write!(formatter, "ResponderUnsupported {{ purpose: {purpose} }}")
+            }
+            Self::RequestVectorIdentityMismatch { expected, actual } => write!(
+                formatter,
+                "RequestVectorIdentityMismatch {{ expected: {}, actual: {} }}",
+                expected.as_str(),
+                actual.as_str()
+            ),
+            Self::ArtifactExecutionMismatch => formatter.write_str("ArtifactExecutionMismatch"),
+            Self::ArtifactPublicationMismatch => formatter.write_str("ArtifactPublicationMismatch"),
+            Self::ArtifactEncoding => formatter.write_str("ArtifactEncoding"),
+            Self::MissingDispositionReason => formatter.write_str("MissingDispositionReason"),
+            Self::MissingCapabilityDispositionReason { capability } => write!(
+                formatter,
+                "MissingCapabilityDispositionReason {{ capability: {capability} }}"
+            ),
+            Self::InvalidPredeclaredDisposition => {
+                formatter.write_str("InvalidPredeclaredDisposition")
+            }
+            Self::RunPlanAfterExecutionStarted => {
+                formatter.write_str("RunPlanAfterExecutionStarted")
+            }
+            Self::RequiredFailpointsAfterExecutionStarted => {
+                formatter.write_str("RequiredFailpointsAfterExecutionStarted")
+            }
+            Self::MissingActor => formatter.write_str("MissingActor"),
+            Self::InjectedFailpoint { failpoint } => {
+                write!(
+                    formatter,
+                    "InjectedFailpoint {{ failpoint: {} }}",
+                    failpoint.code()
+                )
+            }
+            Self::ResponseLostBeforeCandidate => formatter.write_str("ResponseLostBeforeCandidate"),
+            Self::ResponseLostAfterAdapterHandling => {
+                formatter.write_str("ResponseLostAfterAdapterHandling")
+            }
+            Self::UnreachedFailpoints { count } => {
+                write!(formatter, "UnreachedFailpoints {{ count: {count} }}")
+            }
+            Self::ArmedFailpointUnreached { failpoint } => write!(
+                formatter,
+                "ArmedFailpointUnreached {{ failpoint: {} }}",
+                failpoint.code()
+            ),
+            Self::ScenarioIdentityMismatch => formatter.write_str("ScenarioIdentityMismatch"),
+        }
     }
 }
 

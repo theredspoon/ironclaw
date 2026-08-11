@@ -78,7 +78,7 @@
     "failpoints_reached": {
       "type": "array",
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1 }
+      "items": { "$ref": "#/$defs/failpoint" }
     },
     "crashes": {
       "type": "array",
@@ -88,7 +88,12 @@
         "required": ["at_ms", "reached"],
         "properties": {
           "at_ms": { "type": "integer", "minimum": 0 },
-          "reached": { "type": ["string", "null"] }
+          "reached": {
+            "anyOf": [
+              { "$ref": "#/$defs/failpoint" },
+              { "type": "null" }
+            ]
+          }
         }
       }
     },
@@ -147,6 +152,26 @@
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "gitCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "failpoint": {
+      "enum": [
+        "ledger_before_crypto_store_append",
+        "ledger_after_crypto_store_append",
+        "ledger_unknown_crypto_store_append",
+        "ledger_before_ingress_append",
+        "ledger_after_ingress_append",
+        "ledger_unknown_ingress_append",
+        "candidate_before_prepare",
+        "candidate_after_prepare",
+        "candidate_after_commit_before_acknowledge",
+        "process_before_effect_append",
+        "process_after_effect_append",
+        "response_before_prepare",
+        "response_after_commit_before_acknowledge",
+        "before_prepared_ciphertext_handoff",
+        "after_prepared_ciphertext_handoff",
+        "stale_writer_after_takeover"
+      ]
+    },
     "policyRecord": {
       "type": "object",
       "additionalProperties": false,
