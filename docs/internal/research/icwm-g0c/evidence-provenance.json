@@ -2,7 +2,7 @@
   "schema_version": "icwm.g0c.contribution-provenance.v1",
   "authority": "contribution_grade_not_gate_or_adr_acceptance",
   "governing_lighthouse_g0c_status": "Revisions Required",
-  "tested_ironclaw_source": "2d64363101ef0ff062a6345a5573ee855766552f",
+  "tested_ironclaw_source": "d83495889fdc5ce8f7f829a120f68878b6bf42e3",
   "common_harness_aggregate_sha256": "e603556c99acd3de3c69b60acb74486a858993e5bb7fe9d1bd66827ea6d3d34b",
   "ignored_evidence_access": {
     "repository_relative_root": ".work/evidence/icwm-n-g0c",

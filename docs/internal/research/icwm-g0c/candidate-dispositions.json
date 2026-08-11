@@ -3,7 +3,7 @@
   "authority": "contribution_grade_not_gate_or_adr_acceptance",
   "governing_lighthouse_g0c_status": "Revisions Required",
   "publication_package_review_status": "pending_exact_head_review",
-  "tested_source_baseline": "2d64363101ef0ff062a6345a5573ee855766552f",
+  "tested_source_baseline": "d83495889fdc5ce8f7f829a120f68878b6bf42e3",
   "approved_common_aggregate_sha256": "e603556c99acd3de3c69b60acb74486a858993e5bb7fe9d1bd66827ea6d3d34b",
   "provenance_index": "evidence-provenance.json",
   "complement_live_tier_provenance_ref": "evidence-provenance.json#/candidates/complement_live_tier",

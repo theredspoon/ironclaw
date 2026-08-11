@@ -86,7 +86,7 @@ worktree; author runs are not verification.
 ## Provenance
 
 The tested IronClaw source baseline is
-`2d64363101ef0ff062a6345a5573ee855766552f`. The approved ignored-worktree
+`d83495889fdc5ce8f7f829a120f68878b6bf42e3`. The approved ignored-worktree
 common aggregate was
 `e603556c99acd3de3c69b60acb74486a858993e5bb7fe9d1bd66827ea6d3d34b`.
 The tracked

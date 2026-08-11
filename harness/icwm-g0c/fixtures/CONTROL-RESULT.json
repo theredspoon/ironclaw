@@ -9,9 +9,9 @@
     "sha256": "9c2ffc013c58bea1d6f2c9c5357397d8c7701448e558438a57b4574c35148dd7",
     "artifact": "Cargo.lock"
   },
-  "harness_commit": "2d64363101ef0ff062a6345a5573ee855766552f",
+  "harness_commit": "d83495889fdc5ce8f7f829a120f68878b6bf42e3",
   "component_commits": {
-    "ironclaw_source_baseline": "2d64363101ef0ff062a6345a5573ee855766552f"
+    "ironclaw_source_baseline": "d83495889fdc5ce8f7f829a120f68878b6bf42e3"
   },
   "scenario_hash": "2427738c14018e932e4d4e7b30396f428056a4159c20d54ac58bdaff81f3f9ae",
   "vector_hashes": {
