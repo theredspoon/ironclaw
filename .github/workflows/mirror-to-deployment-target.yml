@@ -7,26 +7,39 @@ on:
         description: Source branch or ref to mirror into the deployment target
         required: true
         default: reborn-matrix-pilot
+  # Fires whenever "Sync upstream" finishes fast-forwarding upstream-main to
+  # nearai/ironclaw main. workflow_run is evaluated from this workflow file as
+  # it exists on the default branch, so it fires correctly even though
+  # upstream-main's tree (an exact nearai mirror) doesn't itself carry this
+  # file. See platform/docs/operations/IRONCLAW-SOURCE-ARTIFACT-PIPELINE.md.
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
 
 permissions:
   contents: read
 
 jobs:
   mirror:
-    if: github.repository == 'theredspoon/ironclaw'
+    if: >-
+      github.repository == 'theredspoon/ironclaw' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     env:
       DEPLOYMENT_MIRROR_OWNER: ${{ vars.DEPLOYMENT_MIRROR_OWNER }}
       DEPLOYMENT_MIRROR_REPOSITORY: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY }}
       DEPLOYMENT_MIRROR_REPOSITORY_NAME: ${{ vars.DEPLOYMENT_MIRROR_REPOSITORY_NAME }}
-      SOURCE_REF: ${{ github.event.inputs.source_ref || github.ref_name }}
+      # workflow_run events don't carry a useful github.ref_name for this
+      # purpose (it resolves to the default branch, not upstream-main), so an
+      # automatic sync explicitly targets upstream-main.
+      SOURCE_REF: ${{ github.event.inputs.source_ref || (github.event_name == 'workflow_run' && 'upstream-main') || github.ref_name }}
       TARGET_BRANCH: deployment-target
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.inputs.source_ref || github.ref_name }}
+          ref: ${{ github.event.inputs.source_ref || (github.event_name == 'workflow_run' && 'upstream-main') || github.ref_name }}
 
       - name: Capture mirrored source revision
         run: |
@@ -113,6 +126,7 @@ jobs:
           git push --force-with-lease deployment_mirror "${deployment_commit}:refs/heads/${MIRROR_BRANCH}"
 
       - name: Open or update deployment target PR
+        id: open_pr
         env:
           GH_TOKEN: ${{ steps.mirror_token.outputs.token }}
         run: |
@@ -136,6 +150,13 @@ jobs:
           - target branch: \`${TARGET_BRANCH}\`
 
           After this PR merges, \`${DEPLOYMENT_MIRROR_REPOSITORY}:${TARGET_BRANCH}\` triggers the deployment artifact workflow.
+
+          Opened automatically by the "Mirror to deployment target" workflow
+          and merged automatically once opened: source content is already
+          reviewed upstream via nearai/ironclaw's own PR process before it
+          ever reaches upstream-main, so no separate downstream review gate
+          applies here. The release catalog PR that follows the artifact
+          build still requires a passing LLM adversarial review before merge.
           EOF
           )"
 
@@ -144,12 +165,34 @@ jobs:
               --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
               --title "Deploy ${SOURCE_REF} source ${MIRRORED_SOURCE_SHA:0:12}" \
               --body "${pr_body}"
-            echo "Updated existing deployment mirror PR #${existing_pr}"
+            pr_number="${existing_pr}"
+            echo "Updated existing deployment mirror PR #${pr_number}"
           else
-            gh pr create \
-              --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
-              --base "${TARGET_BRANCH}" \
-              --head "${MIRROR_BRANCH}" \
-              --title "Deploy ${SOURCE_REF} source ${MIRRORED_SOURCE_SHA:0:12}" \
-              --body "${pr_body}"
+            pr_url="$(
+              gh pr create \
+                --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
+                --base "${TARGET_BRANCH}" \
+                --head "${MIRROR_BRANCH}" \
+                --title "Deploy ${SOURCE_REF} source ${MIRRORED_SOURCE_SHA:0:12}" \
+                --body "${pr_body}"
+            )"
+            pr_number="${pr_url##*/}"
+            echo "Opened new deployment mirror PR #${pr_number}"
           fi
+
+          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+
+      - name: Auto-merge deployment target PR
+        env:
+          GH_TOKEN: ${{ steps.mirror_token.outputs.token }}
+          PR_NUMBER: ${{ steps.open_pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          # deployment-target has no branch protection (no-Pro GitHub plan)
+          # and no PR-triggered CI to wait on; the artifact build and its
+          # validation happen after merge. Merging here just replaces the
+          # manual "click merge" step a human previously did for the same,
+          # already-upstream-reviewed content.
+          gh pr merge "${PR_NUMBER}" \
+            --repo "${DEPLOYMENT_MIRROR_REPOSITORY}" \
+            --merge
